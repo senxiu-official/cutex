@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:runtime-packages",
+  "title": "RuntimePackages",
+  "description": "GET /v2/runtime-packages → overview; POST /v2/runtime-packages/runs, GET /v2/runtime-packages/runs/{runId}, POST /v2/runtime-packages/runs/{runId}/revert → {run}; GET /v2/runtime-packages/runs → {runs}; host event cutex/runtimePackages/runUpdated params → runUpdated.",
+  "anyOf": [
+    { "$ref": "#/$defs/overview" },
+    { "$ref": "#/$defs/runEnvelope" },
+    { "$ref": "#/$defs/runList" },
+    { "$ref": "#/$defs/runUpdated" }
+  ],
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "packageSummary": {
+      "type": "object",
+      "required": ["manifest", "nativePath", "nativeVersion", "nativeRelease", "facadePath", "facadeRelease", "readable", "missing"],
+      "properties": {
+        "manifest": { "$ref": "#/$defs/nullableString" },
+        "nativePath": { "$ref": "#/$defs/nullableString" },
+        "nativeVersion": { "$ref": "#/$defs/nullableString" },
+        "nativeRelease": { "$ref": "#/$defs/nullableString" },
+        "facadePath": { "$ref": "#/$defs/nullableString" },
+        "facadeRelease": { "$ref": "#/$defs/nullableString" },
+        "readable": { "type": "boolean" },
+        "missing": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "outdatedAgent": {
+      "type": "object",
+      "required": ["cutexSessionId", "name", "contractVersion", "current", "runtimeStatus", "online", "busy", "busyReason", "activeTurnId", "threadStatus", "repair"],
+      "properties": {
+        "cutexSessionId": { "type": "string" },
+        "name": { "type": "string" },
+        "contractVersion": { "type": "integer" },
+        "current": { "$ref": "#/$defs/packageSummary" },
+        "runtimeStatus": { "type": "string" },
+        "online": { "type": "boolean" },
+        "busy": { "type": "boolean" },
+        "busyReason": { "enum": ["activeTurn", "threadActive", null] },
+        "activeTurnId": { "$ref": "#/$defs/nullableString" },
+        "threadStatus": { "$ref": "#/$defs/nullableString" },
+        "repair": { "type": "boolean" }
+      }
+    },
+    "runItem": {
+      "type": "object",
+      "required": [
+        "cutexSessionId", "name", "state", "step", "code", "reason", "wasOnline", "backOnline",
+        "previousRuntimeVersion", "targetRuntimeVersion", "previousFacadeRelease", "targetFacadeRelease",
+        "actionId", "committedAt", "previousContract", "targetContract", "repair"
+      ],
+      "properties": {
+        "cutexSessionId": { "type": "string" },
+        "name": { "type": "string" },
+        "state": { "enum": ["pending", "running", "moved", "skipped", "failed"] },
+        "step": { "enum": ["offline", "reconcile", "review", "apply", "revert", "online", null] },
+        "code": { "$ref": "#/$defs/nullableString" },
+        "reason": { "$ref": "#/$defs/nullableString" },
+        "wasOnline": { "type": ["boolean", "null"] },
+        "backOnline": { "type": ["boolean", "null"] },
+        "previousRuntimeVersion": { "$ref": "#/$defs/nullableString" },
+        "targetRuntimeVersion": { "$ref": "#/$defs/nullableString" },
+        "previousFacadeRelease": { "$ref": "#/$defs/nullableString" },
+        "targetFacadeRelease": { "$ref": "#/$defs/nullableString" },
+        "actionId": { "$ref": "#/$defs/nullableString" },
+        "committedAt": { "$ref": "#/$defs/nullableString" },
+        "previousContract": { "type": ["object", "null"] },
+        "targetContract": { "type": ["object", "null"] },
+        "repair": { "type": "boolean" }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "required": ["total", "pending", "moved", "skipped", "failed"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "pending": { "type": "integer", "minimum": 0 },
+        "moved": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "runKind": { "enum": ["upgrade", "revert"] },
+    "runState": { "enum": ["running", "completed", "interrupted"] },
+    "run": {
+      "type": "object",
+      "required": ["runId", "kind", "revertOf", "revertedBy", "state", "startedAt", "finishedAt", "selected", "counts", "currentAgentId", "items"],
+      "properties": {
+        "runId": { "type": "string", "pattern": "^rpu-" },
+        "kind": { "$ref": "#/$defs/runKind" },
+        "revertOf": { "$ref": "#/$defs/nullableString" },
+        "revertedBy": { "type": "array", "items": { "type": "string" } },
+        "state": { "$ref": "#/$defs/runState" },
+        "startedAt": { "type": "string" },
+        "finishedAt": { "$ref": "#/$defs/nullableString" },
+        "selected": { "$ref": "#/$defs/packageSummary" },
+        "counts": { "$ref": "#/$defs/counts" },
+        "currentAgentId": { "$ref": "#/$defs/nullableString" },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/runItem" } }
+      }
+    },
+    "overview": {
+      "type": "object",
+      "required": ["hostId", "selected", "selectedError", "agents", "activeRun", "lastRun", "revertable"],
+      "properties": {
+        "hostId": { "type": "string" },
+        "selected": { "anyOf": [{ "$ref": "#/$defs/packageSummary" }, { "type": "null" }] },
+        "selectedError": { "$ref": "#/$defs/nullableString" },
+        "agents": { "type": "array", "items": { "$ref": "#/$defs/outdatedAgent" } },
+        "activeRun": { "anyOf": [{ "$ref": "#/$defs/run" }, { "type": "null" }] },
+        "lastRun": { "anyOf": [{ "$ref": "#/$defs/run" }, { "type": "null" }] },
+        "revertable": {
+          "description": "The newest finished upgrade run while it has moved agents no revert has moved back yet.",
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["runId", "agentIds"],
+              "properties": {
+                "runId": { "type": "string" },
+                "agentIds": { "type": "array", "items": { "type": "string" } }
+              }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "runEnvelope": {
+      "type": "object",
+      "required": ["run"],
+      "properties": { "run": { "$ref": "#/$defs/run" } }
+    },
+    "runList": {
+      "type": "object",
+      "required": ["runs"],
+      "properties": { "runs": { "type": "array", "items": { "$ref": "#/$defs/run" } } }
+    },
+    "runUpdated": {
+      "description": "Host event cutex/runtimePackages/runUpdated: the run header and at most the one item that changed. GET /v2/runtime-packages/runs/{runId} has the full run.",
+      "type": "object",
+      "required": ["runId", "kind", "status", "revertOf", "startedAt", "finishedAt", "currentAgentId", "counts"],
+      "properties": {
+        "runId": { "type": "string", "pattern": "^rpu-" },
+        "kind": { "$ref": "#/$defs/runKind" },
+        "status": { "$ref": "#/$defs/runState" },
+        "revertOf": { "$ref": "#/$defs/nullableString" },
+        "startedAt": { "type": "string" },
+        "finishedAt": { "$ref": "#/$defs/nullableString" },
+        "currentAgentId": { "$ref": "#/$defs/nullableString" },
+        "counts": { "$ref": "#/$defs/counts" },
+        "item": { "$ref": "#/$defs/runItem" }
+      }
+    }
+  }
+}

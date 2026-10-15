@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:upgrade",
+  "title": "Backend upgrade",
+  "description": "Capability backend-upgrade (docs/backend-upgrade.md): GET /v2/upgrade status, POST /v2/upgrade/check|stage|apply|cancel|rollback, GET /v2/upgrade/runs[/{id}], GET|PATCH /v2/upgrade/settings and host event cutex/upgrade/updated. Owner only. Unknown fields may appear in later releases.",
+  "anyOf": [
+    { "$ref": "#/$defs/upgradeStatus" },
+    { "$ref": "#/$defs/upgradeRunResponse" },
+    { "$ref": "#/$defs/upgradeRunList" },
+    { "$ref": "#/$defs/upgradeSettingsResponse" },
+    { "$ref": "#/$defs/rollbackResponse" },
+    { "$ref": "#/$defs/stageAccepted" },
+    { "$ref": "#/$defs/upgradeEvent" }
+  ],
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "migrationClass": {
+      "enum": ["reload-safe", "rollback-safe", "one-way"],
+      "description": "reload-safe: binary swap only; rollback-safe: new stores / fields, a binary rollback is lossless (new stores are moved aside); one-way: the old binary cannot read the migrated state — explicit confirmation, never rolled back automatically."
+    },
+    "mode": {
+      "enum": ["reload", "full"],
+      "description": "reload: only the two daemons restart, native agent processes live on. full: also the runtime selection for new agents changes (new native / facade) and pinned agents move by a runtime-package run (packageRun)."
+    },
+    "packageRun": {
+      "enum": ["after", "during", "none"],
+      "description": "Full mode only. after (default): idle outdated agents move in small batches after the commit (followUp). during: runtimes go offline before the restart and move while offline. none: never automatically."
+    },
+    "phase": {
+      "enum": ["queued", "waiting-idle", "quiescing", "backing-up", "stopping", "swapping", "starting", "waiting-ready", "package-run", "restoring-online", "verifying", "rolling-back", "committed", "rolled-back", "needs-owner", "deferred", "cancelled", "failed"],
+      "description": "Terminal: committed, rolled-back, needs-owner, deferred (not idle within maxWaitSecs; nothing changed), cancelled, failed (nothing changed). The Management API is unreachable during stopping .. waiting-ready and rolling-back (event run.servicesDown)."
+    },
+    "migration": {
+      "type": "object",
+      "required": ["id", "class", "since"],
+      "properties": {
+        "id": { "type": "string" },
+        "class": { "$ref": "#/$defs/migrationClass" },
+        "since": { "type": "string", "description": "First release that runs it." },
+        "notes": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Language tag (en, zh-CN) -> text." },
+        "newStores": { "type": "array", "items": { "type": "string" }, "description": "Paths relative to the cutex home a rollback moves aside." }
+      }
+    },
+    "installed": {
+      "type": "object",
+      "required": ["release"],
+      "properties": {
+        "release": { "type": "string", "description": "Active release (unknown when undeterminable)." },
+        "sequence": { "type": "integer", "minimum": 0, "description": "Channel sequence; 0 = not installed from a signed release." },
+        "commit": { "$ref": "#/$defs/nullableString" },
+        "manifestSha256": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "available": {
+      "type": "object",
+      "required": ["release", "sequence", "tag", "manifestSha256", "class", "mode"],
+      "properties": {
+        "release": { "type": "string" },
+        "sequence": { "type": "integer" },
+        "tag": { "type": "string" },
+        "manifestSha256": { "type": "string" },
+        "publishedAt": { "$ref": "#/$defs/nullableString" },
+        "notes": { "type": "object", "additionalProperties": { "type": "string" } },
+        "class": { "$ref": "#/$defs/migrationClass" },
+        "mode": { "$ref": "#/$defs/mode" },
+        "migrations": { "type": "array", "items": { "$ref": "#/$defs/migration" }, "description": "Migrations in (installed, release]." },
+        "belowFloor": { "$ref": "#/$defs/nullableString", "description": "Set: the installed release is below the upgrade floor; install this release first." },
+        "nativeVersion": { "$ref": "#/$defs/nullableString" },
+        "claudeRuntime": { "$ref": "#/$defs/nullableString" },
+        "capabilitiesRemoved": { "type": "array", "items": { "type": "string" } },
+        "desktopMinCommit": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "check": {
+      "type": "object",
+      "required": ["name", "ok"],
+      "properties": {
+        "name": { "type": "string", "description": "integrity, version, selftest, nativeFiles, disk, rollbackTarget, …" },
+        "ok": { "type": "boolean" },
+        "detail": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "staged": {
+      "type": "object",
+      "required": ["release", "sequence", "stagedAt", "manifestSha256", "preflightOk"],
+      "properties": {
+        "release": { "type": "string" },
+        "sequence": { "type": "integer" },
+        "stagedAt": { "type": "string" },
+        "manifestSha256": { "type": "string" },
+        "preflightOk": { "type": "boolean" },
+        "preflight": { "type": "array", "items": { "$ref": "#/$defs/check" } },
+        "nativeVersion": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": { "code": { "type": "string" }, "message": { "type": "string" } }
+    },
+    "busy": {
+      "type": "object",
+      "required": ["reason"],
+      "properties": {
+        "reason": { "type": "string", "description": "activeTurn | threadActive | packageRun (later: askSubmitting, workflowRunning)." },
+        "cutexSessionId": { "$ref": "#/$defs/nullableString" },
+        "name": { "$ref": "#/$defs/nullableString" },
+        "detail": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "upgradeRun": {
+      "type": "object",
+      "required": ["runId", "kind", "fromRelease", "toRelease", "mode", "class", "phase", "createdAt", "maxWaitSecs", "packageRun", "timeline"],
+      "properties": {
+        "runId": { "type": "string", "pattern": "^upg-[0-9a-f]{12}$" },
+        "kind": { "enum": ["apply", "rollback"] },
+        "fromRelease": { "type": "string" },
+        "toRelease": { "type": "string" },
+        "mode": { "$ref": "#/$defs/mode" },
+        "class": { "$ref": "#/$defs/migrationClass" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "createdAt": { "type": "string" },
+        "finishedAt": { "$ref": "#/$defs/nullableString" },
+        "maxWaitSecs": { "type": "integer" },
+        "packageRun": { "$ref": "#/$defs/packageRun" },
+        "confirmOneWay": { "$ref": "#/$defs/nullableString" },
+        "requestedBy": { "$ref": "#/$defs/nullableString" },
+        "waitingFor": { "type": "array", "items": { "$ref": "#/$defs/busy" }, "description": "While waiting-idle: what keeps the host busy (never interrupted)." },
+        "cancelRequested": { "type": "boolean" },
+        "timeline": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["phase", "at"],
+            "properties": { "phase": { "$ref": "#/$defs/phase" }, "at": { "type": "string" }, "detail": { "type": "string" } }
+          }
+        },
+        "downtimeMs": { "type": ["integer", "null"] },
+        "backupDir": { "$ref": "#/$defs/nullableString" },
+        "packageRunId": { "$ref": "#/$defs/nullableString" },
+        "error": { "anyOf": [{ "$ref": "#/$defs/error" }, { "type": "null" }] },
+        "needsOwner": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": ["reason", "commands"],
+              "properties": { "reason": { "type": "string" }, "commands": { "type": "array", "items": { "type": "string" } } }
+            },
+            { "type": "null" }
+          ]
+        },
+        "runnerPid": { "type": ["integer", "null"] },
+        "displaced": { "type": "array", "items": { "type": "string" } },
+        "selectionBackup": { "type": "string" }
+      }
+    },
+    "followUp": {
+      "type": "object",
+      "required": ["upgradeRunId", "startedAt", "done"],
+      "properties": {
+        "upgradeRunId": { "type": "string" },
+        "startedAt": { "type": "string" },
+        "lastBatchAt": { "$ref": "#/$defs/nullableString" },
+        "packageRunIds": { "type": "array", "items": { "type": "string" } },
+        "done": { "type": "boolean" }
+      }
+    },
+    "upgradeSettings": {
+      "type": "object",
+      "required": ["channel", "source", "checkIntervalHours", "autoStage", "autoApply", "packageRun", "packageRunBatch", "maxWaitSecs"],
+      "properties": {
+        "channel": { "enum": ["release", "main"] },
+        "source": { "type": "string", "description": "Release source (read-only here; `cutex upgrade config --source`)." },
+        "checkIntervalHours": { "type": "integer", "minimum": 0, "description": "0 = never check automatically." },
+        "autoStage": { "type": "boolean" },
+        "autoApply": { "type": "boolean", "description": "Default false. Never applies a one-way release." },
+        "packageRun": { "$ref": "#/$defs/packageRun" },
+        "packageRunBatch": { "type": "integer", "minimum": 1 },
+        "maxWaitSecs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "staging": {
+      "type": ["object", "null"],
+      "required": ["release", "state"],
+      "properties": {
+        "release": { "type": "string" },
+        "state": { "enum": ["running", "failed"] },
+        "startedAt": { "type": "string" },
+        "finishedAt": { "type": "string" },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    },
+    "upgradeStatus": {
+      "type": "object",
+      "description": "GET /v2/upgrade, POST /v2/upgrade/check.",
+      "required": ["managed", "serviceManager", "build", "installedReleases", "settings", "trustedKeys"],
+      "properties": {
+        "managed": { "type": "boolean", "description": "false: hand-deployed (owner hosts); every mutation answers 409 upgrade_blocked {reason: unmanaged_install}." },
+        "base": { "$ref": "#/$defs/nullableString" },
+        "serviceManager": { "enum": ["systemd", "cutex-supervisor", "runtime-host", "none"] },
+        "build": { "type": "object", "description": "Same object as /v2/capabilities cutexBuild." },
+        "installed": { "anyOf": [{ "$ref": "#/$defs/installed" }, { "type": "null" }] },
+        "previousRelease": { "$ref": "#/$defs/nullableString", "description": "Default rollback target." },
+        "installedReleases": { "type": "array", "items": { "type": "string" } },
+        "lastCheckAt": { "$ref": "#/$defs/nullableString" },
+        "lastCheckError": { "anyOf": [{ "$ref": "#/$defs/error" }, { "type": "null" }] },
+        "available": { "anyOf": [{ "$ref": "#/$defs/available" }, { "type": "null" }] },
+        "staged": { "anyOf": [{ "$ref": "#/$defs/staged" }, { "type": "null" }] },
+        "staging": { "$ref": "#/$defs/staging", "description": "A stage started by POST /v2/upgrade/stage: running, or failed with its error (null when idle or done)." },
+        "run": { "anyOf": [{ "$ref": "#/$defs/upgradeRun" }, { "type": "null" }], "description": "The current or last run." },
+        "followUp": { "anyOf": [{ "$ref": "#/$defs/followUp" }, { "type": "null" }] },
+        "settings": { "$ref": "#/$defs/upgradeSettings" },
+        "trustedKeys": { "type": "array", "items": { "type": "string", "pattern": "^[0-9A-F]{16}$" }, "description": "minisign key ids this build trusts; empty = cannot check." }
+      }
+    },
+    "upgradeRunResponse": {
+      "type": "object",
+      "description": "POST /v2/upgrade/apply (202), POST /v2/upgrade/cancel, GET /v2/upgrade/runs/{id}.",
+      "required": ["run"],
+      "properties": { "run": { "$ref": "#/$defs/upgradeRun" } }
+    },
+    "upgradeRunList": {
+      "type": "object",
+      "required": ["runs"],
+      "properties": { "runs": { "type": "array", "items": { "$ref": "#/$defs/upgradeRun" } } }
+    },
+    "upgradeSettingsResponse": {
+      "type": "object",
+      "required": ["settings"],
+      "properties": { "settings": { "$ref": "#/$defs/upgradeSettings" } }
+    },
+    "rollbackPreview": {
+      "type": "object",
+      "required": ["from", "to", "class", "migrations", "movedAside", "sessionDataRestored"],
+      "properties": {
+        "from": { "type": "string" },
+        "to": { "type": "string" },
+        "class": { "$ref": "#/$defs/migrationClass" },
+        "migrations": { "type": "array", "items": { "$ref": "#/$defs/migration" } },
+        "movedAside": { "type": "array", "items": { "type": "string" } },
+        "selectionBackup": { "$ref": "#/$defs/nullableString" },
+        "sessionDataRestored": { "const": false }
+      }
+    },
+    "rollbackResponse": {
+      "type": "object",
+      "description": "POST /v2/upgrade/rollback: dryRun 200 {preview}; otherwise 202 {run, preview}.",
+      "required": ["preview"],
+      "properties": { "preview": { "$ref": "#/$defs/rollbackPreview" }, "run": { "$ref": "#/$defs/upgradeRun" } }
+    },
+    "stageAccepted": {
+      "type": "object",
+      "required": ["staging"],
+      "properties": { "staging": { "$ref": "#/$defs/staging" } }
+    },
+    "upgradeEvent": {
+      "type": "object",
+      "description": "Host event cutex/upgrade/updated params (re-read GET /v2/upgrade for details).",
+      "required": ["reason", "hostId", "run", "available", "staged"],
+      "properties": {
+        "reason": { "enum": ["startup", "state"] },
+        "hostId": { "type": "string" },
+        "run": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": ["runId", "kind", "phase", "fromRelease", "toRelease", "servicesDown"],
+              "properties": {
+                "runId": { "type": "string" },
+                "kind": { "enum": ["apply", "rollback"] },
+                "phase": { "$ref": "#/$defs/phase" },
+                "fromRelease": { "type": "string" },
+                "toRelease": { "type": "string" },
+                "servicesDown": { "type": "boolean" }
+              }
+            },
+            { "type": "null" }
+          ]
+        },
+        "available": { "$ref": "#/$defs/nullableString" },
+        "staged": { "$ref": "#/$defs/nullableString" },
+        "staging": { "$ref": "#/$defs/staging" }
+      }
+    }
+  }
+}

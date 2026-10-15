@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:alarms",
+  "title": "AlarmList",
+  "description": "GET /v2/alarms[?sessionId=&state=pending|all&limit=] → alarmList; GET /v2/alarms/{id} and DELETE /v2/alarms/{id} → alarmItem; host event cutex/alarms/changed → alarmsChanged (capability alarms-api).",
+  "anyOf": [{ "$ref": "#/$defs/alarmList" }, { "$ref": "#/$defs/alarmItem" }, { "$ref": "#/$defs/alarmsChanged" }],
+  "$defs": {
+    "alarm": {
+      "type": "object",
+      "required": ["id", "alarmId", "ownerKind", "ownerCutexSessionId", "ownerName", "targetCutexSessionId", "targetName", "at", "delaySeconds", "state", "attempts", "lastAttemptAt", "lastError", "messagePreview", "messageChars", "messageTruncated"],
+      "properties": {
+        "id": { "type": "string", "description": "Unique alarm id (the delivery message id, alarm-<uuid>); DELETE /v2/alarms/{id}." },
+        "alarmId": { "type": "string", "description": "The creator's name for the alarm (unique per creator only)." },
+        "ownerKind": { "enum": ["agent", "human"] },
+        "ownerCutexSessionId": { "type": ["string", "null"], "description": "The agent that set it; null when the owner set it (CLI)." },
+        "ownerName": { "type": ["string", "null"] },
+        "targetCutexSessionId": { "type": "string", "description": "The agent the alarm wakes." },
+        "targetName": { "type": ["string", "null"] },
+        "at": { "type": "string", "description": "Due time, RFC 3339 UTC." },
+        "delaySeconds": { "type": ["integer", "null"], "minimum": 1 },
+        "state": { "enum": ["scheduled", "queued", "cancelled"], "description": "queued = handed to the Agent Bus (delivered after the target's turn)." },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "lastAttemptAt": { "type": ["string", "null"] },
+        "lastError": { "type": ["string", "null"], "description": "Last failed send attempt (retried every 30 s while scheduled)." },
+        "messagePreview": { "type": "string", "description": "First 200 characters." },
+        "messageChars": { "type": "integer", "minimum": 0 },
+        "messageTruncated": { "type": "boolean" },
+        "relation": { "enum": ["outgoing", "incoming", "self"], "description": "Only with ?sessionId: that agent set it (outgoing), it wakes that agent (incoming), or both (self)." },
+        "message": { "type": "string", "description": "Full text (GET /v2/alarms/{id} only)." }
+      }
+    },
+    "alarmList": {
+      "type": "object",
+      "required": ["hostId", "alarms", "nextAt"],
+      "properties": {
+        "hostId": { "type": "string" },
+        "alarms": { "type": "array", "items": { "$ref": "#/$defs/alarm" } },
+        "nextAt": { "type": ["string", "null"], "description": "Earliest scheduled at of the filtered set (before limit)." }
+      }
+    },
+    "alarmItem": {
+      "type": "object",
+      "required": ["alarm"],
+      "properties": { "alarm": { "$ref": "#/$defs/alarm" } }
+    },
+    "alarmsChanged": {
+      "type": "object",
+      "required": ["reason", "id", "alarm", "ownerCutexSessionId", "targetCutexSessionId", "hostId"],
+      "properties": {
+        "reason": { "enum": ["created", "scheduled", "queued", "cancelled", "retrying", "removed"] },
+        "id": { "type": "string" },
+        "alarm": { "anyOf": [{ "$ref": "#/$defs/alarm" }, { "type": "null" }] },
+        "ownerCutexSessionId": { "type": ["string", "null"] },
+        "targetCutexSessionId": { "type": "string" },
+        "hostId": { "type": "string" }
+      }
+    }
+  }
+}

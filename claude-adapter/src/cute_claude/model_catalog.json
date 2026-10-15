@@ -1,0 +1,282 @@
+{
+  "version": 1,
+  "updatedAt": "2026-10-11",
+  "sourceUrls": [
+    "https://code.claude.com/docs/en/model-config",
+    "https://platform.claude.com/docs/en/about-claude/model-deprecations",
+    "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions"
+  ],
+  "models": [
+    {
+      "id": "claude-opus-5-5",
+      "displayName": "Opus 5.5",
+      "family": "opus",
+      "kind": "pinned",
+      "minCliVersion": "2.1.280",
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "displayName": "Sonnet 5.5",
+      "family": "sonnet",
+      "kind": "pinned",
+      "minCliVersion": "2.1.284",
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-fable-5-1",
+      "displayName": "Fable 5.1",
+      "family": "fable",
+      "kind": "pinned",
+      "minCliVersion": "2.1.257",
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "displayName": "Haiku 5.5",
+      "family": "haiku",
+      "kind": "pinned",
+      "minCliVersion": "2.1.293",
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-opus-5",
+      "displayName": "Opus 5",
+      "family": "opus",
+      "kind": "pinned",
+      "minCliVersion": null,
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-sonnet-5",
+      "displayName": "Sonnet 5",
+      "family": "sonnet",
+      "kind": "pinned",
+      "minCliVersion": null,
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-fable-5",
+      "displayName": "Fable 5",
+      "family": "fable",
+      "kind": "pinned",
+      "minCliVersion": null,
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-opus-4-8",
+      "displayName": "Opus 4.8",
+      "family": "opus",
+      "kind": "pinned",
+      "minCliVersion": null,
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-opus-4-7",
+      "displayName": "Opus 4.7",
+      "family": "opus",
+      "kind": "pinned",
+      "minCliVersion": null,
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-opus-4-6",
+      "displayName": "Opus 4.6",
+      "family": "opus",
+      "kind": "pinned",
+      "minCliVersion": null,
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "displayName": "Sonnet 4.6",
+      "family": "sonnet",
+      "kind": "pinned",
+      "minCliVersion": null,
+      "supportedEffortLevels": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "description": "Fixed model ID; account availability unknown."
+    },
+    {
+      "id": "claude-haiku-4-5-20251001",
+      "displayName": "Haiku 4.5",
+      "family": "haiku",
+      "kind": "pinned",
+      "minCliVersion": null,
+      "supportedEffortLevels": [],
+      "description": "Fixed dated model ID; account availability unknown."
+    },
+    {
+      "id": "claude-opus-4-5-20251101",
+      "displayName": "Opus 4.5",
+      "family": "opus",
+      "kind": "pinned",
+      "minCliVersion": null,
+      "supportedEffortLevels": [],
+      "description": "Fixed dated model ID; account availability unknown."
+    },
+    {
+      "id": "claude-sonnet-4-5-20250929",
+      "displayName": "Sonnet 4.5",
+      "family": "sonnet",
+      "kind": "pinned",
+      "minCliVersion": null,
+      "supportedEffortLevels": [],
+      "description": "Fixed dated model ID; account availability unknown. Anthropic API retirement scheduled for 2026-11-30."
+    },
+    {
+      "id": "sonnet",
+      "displayName": "Sonnet (alias)",
+      "family": "sonnet",
+      "kind": "alias",
+      "minCliVersion": null,
+      "supportedEffortLevels": null,
+      "description": "Dynamic alias; target depends on CLI, provider and configuration. Account availability unknown."
+    },
+    {
+      "id": "opus",
+      "displayName": "Opus (alias)",
+      "family": "opus",
+      "kind": "alias",
+      "minCliVersion": null,
+      "supportedEffortLevels": null,
+      "description": "Dynamic alias; target depends on CLI, provider and configuration. Account availability unknown."
+    },
+    {
+      "id": "haiku",
+      "displayName": "Haiku (alias)",
+      "family": "haiku",
+      "kind": "alias",
+      "minCliVersion": null,
+      "supportedEffortLevels": null,
+      "description": "Dynamic alias; target depends on CLI, provider and configuration. Account availability unknown."
+    },
+    {
+      "id": "fable",
+      "displayName": "Fable (alias)",
+      "family": "fable",
+      "kind": "alias",
+      "minCliVersion": null,
+      "supportedEffortLevels": null,
+      "description": "Dynamic alias; target depends on CLI, provider and configuration. Account availability unknown."
+    },
+    {
+      "id": "best",
+      "displayName": "Best (alias)",
+      "family": null,
+      "kind": "alias",
+      "minCliVersion": null,
+      "supportedEffortLevels": null,
+      "description": "Dynamic Fable or Opus selection; account availability unknown."
+    },
+    {
+      "id": "opusplan",
+      "displayName": "Opus Plan (alias)",
+      "family": null,
+      "kind": "alias",
+      "minCliVersion": null,
+      "supportedEffortLevels": null,
+      "description": "Opus during planning, Sonnet for execution; account availability unknown."
+    },
+    {
+      "id": "sonnet[1m]",
+      "displayName": "Sonnet 1M (alias)",
+      "family": "sonnet",
+      "kind": "alias",
+      "minCliVersion": null,
+      "supportedEffortLevels": null,
+      "description": "Sonnet alias with extended context where applicable; account availability unknown."
+    },
+    {
+      "id": "opus[1m]",
+      "displayName": "Opus 1M (alias)",
+      "family": "opus",
+      "kind": "alias",
+      "minCliVersion": null,
+      "supportedEffortLevels": null,
+      "description": "Opus alias with extended context where applicable; account availability unknown."
+    },
+    {
+      "id": "default",
+      "displayName": "Default (runtime choice)",
+      "description": "Clear the model override and let Claude Code select its configured default; account availability unknown.",
+      "family": null,
+      "kind": "default",
+      "minCliVersion": null,
+      "supportedEffortLevels": null
+    }
+  ]
+}

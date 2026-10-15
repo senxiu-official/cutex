@@ -1,0 +1,301 @@
+{
+ "_comment": "Public placeholder. The dev repo freezes one deployment's project migration cohort here (owner session data, compiled into src/agent_management/migration.rs). The public export ships this synthetic cohort of the same shape (34 selected, 16 of them offline) so the code and its test build; it matches no real session, so the cohort maintenance commands refuse every agent.",
+ "rows": [
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000001",
+   "native_id": "018e0000-0000-7000-8000-200000000001",
+   "formal_name": "example-agent-01",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000002",
+   "native_id": "018e0000-0000-7000-8000-200000000002",
+   "formal_name": "example-agent-02",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000003",
+   "native_id": "018e0000-0000-7000-8000-200000000003",
+   "formal_name": "example-agent-03",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000004",
+   "native_id": "018e0000-0000-7000-8000-200000000004",
+   "formal_name": "example-agent-04",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000005",
+   "native_id": "018e0000-0000-7000-8000-200000000005",
+   "formal_name": "example-agent-05",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000006",
+   "native_id": "018e0000-0000-7000-8000-200000000006",
+   "formal_name": "example-agent-06",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000007",
+   "native_id": "018e0000-0000-7000-8000-200000000007",
+   "formal_name": "example-agent-07",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000008",
+   "native_id": "018e0000-0000-7000-8000-200000000008",
+   "formal_name": "example-agent-08",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000009",
+   "native_id": "018e0000-0000-7000-8000-200000000009",
+   "formal_name": "example-agent-09",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000010",
+   "native_id": "018e0000-0000-7000-8000-200000000010",
+   "formal_name": "example-agent-10",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000011",
+   "native_id": "018e0000-0000-7000-8000-200000000011",
+   "formal_name": "example-agent-11",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000012",
+   "native_id": "018e0000-0000-7000-8000-200000000012",
+   "formal_name": "example-agent-12",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000013",
+   "native_id": "018e0000-0000-7000-8000-200000000013",
+   "formal_name": "example-agent-13",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000014",
+   "native_id": "018e0000-0000-7000-8000-200000000014",
+   "formal_name": "example-agent-14",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000015",
+   "native_id": "018e0000-0000-7000-8000-200000000015",
+   "formal_name": "example-agent-15",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000016",
+   "native_id": "018e0000-0000-7000-8000-200000000016",
+   "formal_name": "example-agent-16",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000017",
+   "native_id": "018e0000-0000-7000-8000-200000000017",
+   "formal_name": "example-agent-17",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000018",
+   "native_id": "018e0000-0000-7000-8000-200000000018",
+   "formal_name": "example-agent-18",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "online-observed"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000019",
+   "native_id": "018e0000-0000-7000-8000-200000000019",
+   "formal_name": "example-agent-19",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000020",
+   "native_id": "018e0000-0000-7000-8000-200000000020",
+   "formal_name": "example-agent-20",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000021",
+   "native_id": "018e0000-0000-7000-8000-200000000021",
+   "formal_name": "example-agent-21",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000022",
+   "native_id": "018e0000-0000-7000-8000-200000000022",
+   "formal_name": "example-agent-22",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000023",
+   "native_id": "018e0000-0000-7000-8000-200000000023",
+   "formal_name": "example-agent-23",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000024",
+   "native_id": "018e0000-0000-7000-8000-200000000024",
+   "formal_name": "example-agent-24",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000025",
+   "native_id": "018e0000-0000-7000-8000-200000000025",
+   "formal_name": "example-agent-25",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000026",
+   "native_id": "018e0000-0000-7000-8000-200000000026",
+   "formal_name": "example-agent-26",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000027",
+   "native_id": "018e0000-0000-7000-8000-200000000027",
+   "formal_name": "example-agent-27",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000028",
+   "native_id": "018e0000-0000-7000-8000-200000000028",
+   "formal_name": "example-agent-28",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000029",
+   "native_id": "018e0000-0000-7000-8000-200000000029",
+   "formal_name": "example-agent-29",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000030",
+   "native_id": "018e0000-0000-7000-8000-200000000030",
+   "formal_name": "example-agent-30",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000031",
+   "native_id": "018e0000-0000-7000-8000-200000000031",
+   "formal_name": "example-agent-31",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000032",
+   "native_id": "018e0000-0000-7000-8000-200000000032",
+   "formal_name": "example-agent-32",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000033",
+   "native_id": "018e0000-0000-7000-8000-200000000033",
+   "formal_name": "example-agent-33",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000034",
+   "native_id": "018e0000-0000-7000-8000-200000000034",
+   "formal_name": "example-agent-34",
+   "project_id": "example-project",
+   "classification": "selected",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000035",
+   "native_id": "018e0000-0000-7000-8000-200000000035",
+   "formal_name": "example-agent-35",
+   "project_id": "example-project",
+   "classification": "qualifying_retired_or_archived",
+   "status": "retired"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000036",
+   "native_id": "018e0000-0000-7000-8000-200000000036",
+   "formal_name": "example-agent-36",
+   "project_id": "example-project",
+   "classification": "excluded_no_actual_record_in_window",
+   "status": "offline"
+  },
+  {
+   "durable_id": "cutex.018e0000-0000-7000-8000-200000000037",
+   "native_id": "018e0000-0000-7000-8000-200000000037",
+   "formal_name": "example-agent-37",
+   "project_id": "example-project",
+   "classification": "unknown",
+   "status": "offline"
+  }
+ ]
+}

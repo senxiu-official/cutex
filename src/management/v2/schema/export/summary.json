@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:summary",
+  "title": "HostSummary",
+  "description": "GET /v2/summary (capability host-summary) and the data of GET /v2/summary/events SSE frames (`event:` = the name in summaryEvent.name; `id:` = summary cursor), and the result of POST /v2/summary/read {agentId} (capability summary-read).",
+  "anyOf": [{ "$ref": "#/$defs/hostSummary" }, { "$ref": "#/$defs/summaryEvent" }, { "$ref": "#/$defs/readResult" }],
+  "$defs": {
+    "utcTimestamp": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{3})?Z$", "description": "RFC 3339 UTC with Z, milliseconds" },
+    "need": {
+      "type": "object",
+      "required": ["kind", "id", "title", "at"],
+      "properties": {
+        "kind": { "enum": ["approval", "question", "input", "ownerApproval", "delegationReview", "acceptance", "ownerMessage", "ownerReply", "delegationFailed"], "description": "delegationFailed: an owner delegation that failed (notification-levels event delegation.failed.owner, needsYou in the default preset)" },
+        "id": { "type": ["string", "null"] },
+        "title": { "type": "string" },
+        "at": { "anyOf": [{ "$ref": "#/$defs/utcTimestamp" }, { "type": "null" }] },
+        "level": { "enum": ["urgent", "needsYou", "inform", "record"], "description": "Notification level of the need (capability notification-levels)" }
+      }
+    },
+    "lastTurn": {
+      "type": "object",
+      "required": ["turnId", "status", "endedAt"],
+      "properties": {
+        "turnId": { "type": "string" },
+        "status": { "enum": ["completed", "failed", "interrupted"] },
+        "endedAt": { "$ref": "#/$defs/utcTimestamp" }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "required": ["id", "name", "kind", "projectId", "provider", "status", "needs", "preview", "lastActivityAt", "lastTurn", "unreadTurns"],
+      "properties": {
+        "id": { "type": "string", "description": "cutexSessionId" },
+        "name": { "type": "string" },
+        "kind": { "enum": ["agent", "chat"] },
+        "projectId": { "type": ["string", "null"] },
+        "provider": { "type": "string", "description": "codex | claude | …" },
+        "status": { "enum": ["working", "idle", "offline", "needsInput"] },
+        "needs": { "type": "array", "items": { "$ref": "#/$defs/need" } },
+        "preview": { "type": ["string", "null"], "maxLength": 120 },
+        "lastActivityAt": { "anyOf": [{ "$ref": "#/$defs/utcTimestamp" }, { "type": "null" }] },
+        "lastTurn": { "anyOf": [{ "$ref": "#/$defs/lastTurn" }, { "type": "null" }] },
+        "unreadTurns": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "project": {
+      "type": "object",
+      "required": ["id", "name", "color"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "color": { "type": ["string", "null"] }
+      }
+    },
+    "cursor": {
+      "type": "object",
+      "required": ["streamId", "after"],
+      "properties": {
+        "streamId": { "type": "string" },
+        "after": { "type": "string", "description": "summary journal sequence; \"0\" while empty; not a /v2/events cursor" }
+      }
+    },
+    "hostSummary": {
+      "type": "object",
+      "required": ["hostId", "hostName", "instanceId", "capabilities", "cursor", "generatedAt", "projects", "agents", "needsYouCount"],
+      "properties": {
+        "hostId": { "type": "string" },
+        "instanceId": { "type": "string", "description": "random per cutex home; key a daemon by it" },
+        "hostName": { "type": "string" },
+        "capabilities": { "type": "array", "items": { "type": "string" } },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "generatedAt": { "$ref": "#/$defs/utcTimestamp" },
+        "projects": { "type": "array", "items": { "$ref": "#/$defs/project" } },
+        "agents": { "type": "array", "items": { "$ref": "#/$defs/agent" } },
+        "needsYouCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "readResult": {
+      "type": "object",
+      "required": ["agentId", "readAt", "summaryQueued", "notificationAcknowledged"],
+      "properties": {
+        "agentId": { "type": "string" },
+        "readAt": { "$ref": "#/$defs/utcTimestamp" },
+        "summaryQueued": { "type": "boolean", "description": "unreadTurns is cleared within a summary tick and announced as agentChanged" },
+        "notificationAcknowledged": { "type": "boolean", "description": "an unacknowledged notification reminder was acknowledged" }
+      }
+    },
+    "summaryEvent": {
+      "description": "One SSE frame of /v2/summary/events: {name, data}.",
+      "oneOf": [
+        { "type": "object", "required": ["name", "data"], "properties": { "name": { "const": "cutex/summary/agentChanged" }, "data": { "type": "object", "required": ["agent"], "properties": { "agent": { "$ref": "#/$defs/agent" } } } } },
+        { "type": "object", "required": ["name", "data"], "properties": { "name": { "const": "cutex/summary/agentRemoved" }, "data": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" } } } } },
+        { "type": "object", "required": ["name", "data"], "properties": { "name": { "const": "cutex/summary/turnEnded" }, "data": { "type": "object", "required": ["id", "turnId", "status", "preview"], "properties": { "id": { "type": "string" }, "turnId": { "type": "string" }, "status": { "enum": ["completed", "failed", "interrupted"] }, "preview": { "type": ["string", "null"] } } } } },
+        { "type": "object", "required": ["name", "data"], "properties": { "name": { "const": "cutex/summary/messageToOwner" }, "data": { "type": "object", "required": ["id", "preview"], "properties": { "id": { "type": "string" }, "notificationId": { "type": "string" }, "preview": { "type": ["string", "null"] }, "level": { "enum": ["info", "attention", "urgent"] }, "needsReply": { "type": "boolean" } } } }, "description": "An agent owner_notify message whose delivery includes the phone (capability owner-messages)." },
+        { "type": "object", "required": ["name", "data"], "properties": { "name": { "enum": ["cutex/summary/approvalsChanged", "cutex/summary/asksChanged"] }, "data": { "type": "object", "required": ["count"], "properties": { "count": { "type": "integer", "minimum": 0 } } } } },
+        { "type": "object", "required": ["name", "data"], "properties": { "name": { "const": "cutex/summary/resync" }, "data": { "type": "object", "required": ["reason"], "properties": { "reason": { "type": "string" } } } } },
+        { "type": "object", "required": ["name", "data"], "properties": { "name": { "const": "cutex/device/revoked" }, "data": { "type": "object", "required": ["tokenId", "revokedAt"], "properties": { "tokenId": { "type": "string" }, "revokedAt": { "$ref": "#/$defs/utcTimestamp" } } } } }
+      ]
+    }
+  }
+}

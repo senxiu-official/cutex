@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:owner-rotation",
+  "title": "Owner-initiated Director rotation",
+  "description": "Capability owner-rotation: POST/GET /v2/director-rotations, GET /v2/director-rotations/{rotationId}, POST .../{rotationId}/cancel and .../{rotationId}/continue (root), host event cutex/ownerRotation/updated {rotation}. States: requested → handoff_requested → handoff_written | timeout → successor_created → authority_rebound → predecessor_disposed → done; cancelled / failed.",
+  "anyOf": [
+    { "$ref": "#/$defs/rotationBody" },
+    { "$ref": "#/$defs/rotationList" },
+    { "$ref": "#/$defs/startRequest" }
+  ],
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "state": {
+      "enum": ["requested", "handoff_requested", "handoff_written", "timeout", "successor_created", "authority_rebound", "predecessor_disposed", "done", "cancelled", "failed"]
+    },
+    "disposition": { "enum": ["archive", "member", "operator"] },
+    "successorInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Omitted fields are inherited from the predecessor (model / reasoningEffort only while the profile is the predecessor's); the name defaults to <name>-rN+1 or <name>-r2.",
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "profile": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "reasoningEffort": { "type": "string", "minLength": 1 },
+        "cwd": { "type": "string", "minLength": 1, "description": "Absolute path." }
+      }
+    },
+    "startRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestId", "projectId", "expectedDirectorCutexSessionId", "expectedAuthorityEpoch", "predecessor"],
+      "properties": {
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "projectId": { "type": "string", "minLength": 1 },
+        "expectedDirectorCutexSessionId": { "type": "string", "minLength": 1 },
+        "expectedAuthorityEpoch": { "type": "integer", "minimum": 1 },
+        "predecessor": { "$ref": "#/$defs/disposition" },
+        "handoffTimeoutSecs": { "type": "integer", "minimum": 60, "maximum": 86400, "description": "Default 600." },
+        "successor": { "$ref": "#/$defs/successorInput" }
+      }
+    },
+    "agentRef": {
+      "type": "object",
+      "required": ["cutexSessionId", "name"],
+      "properties": {
+        "cutexSessionId": { "type": "string" },
+        "name": { "type": "string" }
+      }
+    },
+    "successorSpec": {
+      "type": "object",
+      "required": ["name", "profile", "model", "reasoningEffort", "cwd", "sandbox", "approvalPolicy"],
+      "properties": {
+        "name": { "type": "string" },
+        "profile": { "$ref": "#/$defs/nullableString" },
+        "model": { "$ref": "#/$defs/nullableString" },
+        "reasoningEffort": { "$ref": "#/$defs/nullableString" },
+        "cwd": { "type": "string" },
+        "sandbox": { "$ref": "#/$defs/nullableString" },
+        "approvalPolicy": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "handoff": {
+      "type": "object",
+      "required": ["path", "timeoutSecs", "clientUserMessageId", "requestedAt", "deadline", "writtenAt", "skipped"],
+      "properties": {
+        "path": { "type": "string", "description": "<workspace_root or Director cwd>/handoff/<UTC timestamp>.md" },
+        "timeoutSecs": { "type": "integer", "minimum": 60 },
+        "clientUserMessageId": { "type": "string" },
+        "requestedAt": { "$ref": "#/$defs/nullableString" },
+        "deadline": { "$ref": "#/$defs/nullableString" },
+        "writtenAt": { "$ref": "#/$defs/nullableString" },
+        "skipped": { "type": "boolean", "description": "The owner continued without waiting for the note." }
+      }
+    },
+    "historyEntry": {
+      "type": "object",
+      "required": ["state", "at"],
+      "properties": {
+        "state": { "$ref": "#/$defs/state" },
+        "at": { "type": "string" },
+        "note": { "type": "string" }
+      }
+    },
+    "rotation": {
+      "type": "object",
+      "required": ["rotationId", "requestId", "requestSha256", "projectId", "projectName", "state", "predecessor", "expectedAuthorityEpoch", "disposition", "successorSpec", "handoff", "successorCutexSessionId", "successorCreateStartedAt", "authorityEpoch", "predecessorDelegations", "attempts", "error", "warnings", "history", "createdAt", "updatedAt", "finishedAt", "revision"],
+      "properties": {
+        "rotationId": { "type": "string" },
+        "requestId": { "type": "string" },
+        "requestSha256": { "type": "string" },
+        "projectId": { "type": "string" },
+        "projectName": { "type": "string" },
+        "state": { "$ref": "#/$defs/state" },
+        "predecessor": { "$ref": "#/$defs/agentRef" },
+        "expectedAuthorityEpoch": { "type": "integer", "minimum": 1 },
+        "disposition": { "$ref": "#/$defs/disposition" },
+        "successorSpec": { "$ref": "#/$defs/successorSpec" },
+        "handoff": { "$ref": "#/$defs/handoff" },
+        "successorCutexSessionId": { "$ref": "#/$defs/nullableString" },
+        "successorCreateStartedAt": { "$ref": "#/$defs/nullableString" },
+        "authorityEpoch": { "type": ["integer", "null"] },
+        "predecessorDelegations": {
+          "type": "object",
+          "required": ["requested", "handling"],
+          "properties": {
+            "requested": { "type": "integer", "minimum": 0, "description": "Open delegations the predecessor requested (they stay its own)." },
+            "handling": { "type": "integer", "minimum": 0, "description": "Open delegations the predecessor handles." }
+          }
+        },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "error": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "object", "required": ["code", "message"], "properties": { "code": { "type": "string" }, "message": { "type": "string" } } }
+          ]
+        },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "history": { "type": "array", "items": { "$ref": "#/$defs/historyEntry" } },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "finishedAt": { "$ref": "#/$defs/nullableString" },
+        "revision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "rotationBody": {
+      "type": "object",
+      "description": "Route responses and the cutex/ownerRotation/updated event params.",
+      "required": ["rotation"],
+      "properties": { "rotation": { "$ref": "#/$defs/rotation" } }
+    },
+    "rotationList": {
+      "type": "object",
+      "required": ["rotations"],
+      "properties": { "rotations": { "type": "array", "items": { "$ref": "#/$defs/rotation" } } }
+    }
+  }
+}

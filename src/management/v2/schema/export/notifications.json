@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:notifications",
+  "title": "NotificationStates",
+  "description": "GET /v2/notifications/states and POST /v2/notifications/ack {threadId, reminderId}.",
+  "anyOf": [{ "$ref": "#/$defs/states" }, { "$ref": "#/$defs/ackResult" }],
+  "$defs": {
+    "sessionState": {
+      "type": "object",
+      "required": ["agentId", "threadId", "state", "unread"],
+      "properties": {
+        "agentId": { "type": "string" },
+        "agentName": { "type": "string" },
+        "threadId": { "type": "string" },
+        "priority": { "enum": ["important", "normal", "off", null] },
+        "preferenceError": { "type": "boolean" },
+        "state": { "enum": ["working", "waiting", "attention", "inactive"] },
+        "reason": { "type": ["string", "null"] },
+        "lastActivityAt": { "type": "integer", "description": "Unix seconds" },
+        "inactiveAt": { "type": "integer" },
+        "reminderId": { "type": ["string", "null"] },
+        "unread": { "type": "boolean" }
+      }
+    },
+    "states": {
+      "type": "object",
+      "required": ["schema", "generatedAt", "sessions"],
+      "properties": {
+        "schema": { "type": "string" },
+        "generatedAt": { "type": "integer", "description": "Unix seconds" },
+        "expiresAt": { "type": "integer" },
+        "healthy": { "type": "boolean" },
+        "sourceHeartbeat": { "type": ["integer", "null"] },
+        "checkpoint": {},
+        "retentionGapObserved": { "type": "boolean" },
+        "sessions": { "type": "array", "items": { "$ref": "#/$defs/sessionState" } }
+      }
+    },
+    "ackResult": {
+      "type": "object",
+      "required": ["acknowledged", "threadId", "reminderId"],
+      "properties": {
+        "acknowledged": { "type": "boolean" },
+        "threadId": { "type": "string" },
+        "reminderId": { "type": "string" }
+      }
+    }
+  }
+}

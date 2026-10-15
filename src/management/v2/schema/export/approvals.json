@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:approvals",
+  "title": "ApprovalList",
+  "description": "GET /v2/approvals[?state=all] and POST /v2/approvals/{id}/approve|deny → {approval}.",
+  "anyOf": [{ "$ref": "#/$defs/approvalList" }, { "$ref": "#/$defs/approvalDecision" }],
+  "$defs": {
+    "approval": {
+      "type": "object",
+      "required": ["approvalId", "kind", "reason", "requesterCutexSessionId", "summary", "requestSha256", "state", "createdAt"],
+      "properties": {
+        "approvalId": { "type": "string" },
+        "kind": { "enum": ["managed_service", "service_lifetime", "agent_profile", "ask_delivery", "browser_claim", "browser_open", "workflow_run"] },
+        "reason": { "type": "string" },
+        "requesterCutexSessionId": { "type": "string" },
+        "requesterName": { "type": "string" },
+        "projectId": { "type": "string" },
+        "summary": { "type": "string" },
+        "details": {},
+        "requestSha256": { "type": "string" },
+        "state": { "enum": ["pending", "approved", "denied", "consumed", "expired"] },
+        "createdAt": { "type": "string" },
+        "decidedAt": { "type": "string" },
+        "note": { "type": "string" },
+        "consumedAt": { "type": "string" }
+      }
+    },
+    "approvalList": {
+      "type": "object",
+      "required": ["hostId", "approvals"],
+      "properties": {
+        "hostId": { "type": "string" },
+        "approvals": { "type": "array", "items": { "$ref": "#/$defs/approval" } }
+      }
+    },
+    "approvalDecision": {
+      "type": "object",
+      "required": ["approval"],
+      "properties": { "approval": { "$ref": "#/$defs/approval" } }
+    }
+  }
+}

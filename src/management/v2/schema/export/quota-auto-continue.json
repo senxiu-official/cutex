@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:quota-auto-continue",
+  "title": "QuotaAutoContinue",
+  "description": "GET /v2/quota-auto-continue[?sessionId=] → quotaAutoContinueList; PATCH /v2/quota-auto-continue/{sessionId} {enabled} and DELETE /v2/quota-auto-continue/{sessionId}/pending → quotaAutoContinueItem; host event cutex/quotaAutoContinue/changed → quotaAutoContinueChanged (capability claude-quota-auto-continue).",
+  "anyOf": [
+    { "$ref": "#/$defs/quotaAutoContinueList" },
+    { "$ref": "#/$defs/quotaAutoContinueItem" },
+    { "$ref": "#/$defs/quotaAutoContinueChanged" },
+    { "$ref": "#/$defs/quotaAutoContinuePatch" }
+  ],
+  "$defs": {
+    "quotaAutoContinue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cutexSessionId", "enabled", "pending", "last"],
+      "properties": {
+        "cutexSessionId": { "type": "string" },
+        "enabled": { "type": "boolean", "description": "Per-agent switch, default true." },
+        "pending": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["at", "resetAt", "accountId", "turnId", "scheduledAt"],
+              "properties": {
+                "at": { "type": "string", "description": "When the continuation is sent (the reset + 30-119 s), RFC 3339." },
+                "resetAt": { "type": ["string", "null"], "description": "When the exhausted limit resets, RFC 3339." },
+                "accountId": { "type": ["string", "null"], "description": "Claude account of the agent (claude-accounts)." },
+                "turnId": { "type": ["string", "null"], "description": "The turn that hit the limit." },
+                "scheduledAt": { "type": "string" },
+                "estimated": { "type": "boolean", "description": "The reset was not known: resetAt is an estimate and the continuation is a probe (30 min after the failure, doubling up to 4 h, at most 8 in a row). Absent from older hosts (= false)." }
+              }
+            },
+            { "type": "null" }
+          ]
+        },
+        "last": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["at", "result", "reason", "resetAt"],
+              "properties": {
+                "at": { "type": "string" },
+                "result": { "enum": ["fired", "skipped", "cancelled", "failed"] },
+                "reason": { "type": ["string", "null"], "description": "Known values: queued / started (fired: submit disposition), resetUnknown, windowAlreadyContinued, offline, archived, runtimeRestarted, paused, asksRedelivered (skipped), owner, ownerMessage, ownerStop, runtimeOffline, disabled, turnCompleted (cancelled); failed: the submit error." },
+                "resetAt": { "type": ["string", "null"] }
+              }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "quotaAutoContinueList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostId", "sessions"],
+      "properties": {
+        "hostId": { "type": "string" },
+        "sessions": { "type": "array", "items": { "$ref": "#/$defs/quotaAutoContinue" } }
+      }
+    },
+    "quotaAutoContinueItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quotaAutoContinue"],
+      "properties": { "quotaAutoContinue": { "$ref": "#/$defs/quotaAutoContinue" } }
+    },
+    "quotaAutoContinuePatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "quotaAutoContinueChanged": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cutexSessionId", "reason", "quotaAutoContinue", "hostId"],
+      "properties": {
+        "cutexSessionId": { "type": "string" },
+        "reason": { "enum": ["scheduled", "cancelled", "fired", "skipped", "failed", "enabled", "disabled"] },
+        "quotaAutoContinue": { "$ref": "#/$defs/quotaAutoContinue" },
+        "hostId": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:skills-archive",
+  "title": "SkillsArchive",
+  "description": "Owner archive for user skills of the shared CODEX_HOME (capability skills-archive). GET /v2/codex/skills/archive → archiveList; POST /v2/codex/skills/archive {requestId, path} → archiveResult (409 skill_not_archivable with details.reason system | plugin | not_user_skill, 409 skill_read_only, 404 skill_not_found); POST /v2/codex/skills/archive/{id}/restore {requestId} → archiveResult (409 skill_name_taken | skill_root_changed | skill_already_restored | skill_archive_incomplete, 404 skill_archive_not_found). Both POSTs are idempotent by requestId (replayed: true). Skills are moved, never copied or deleted.",
+  "anyOf": [{ "$ref": "#/$defs/archiveList" }, { "$ref": "#/$defs/archiveResult" }, { "$ref": "#/$defs/archiveRequest" }, { "$ref": "#/$defs/restoreRequest" }],
+  "$defs": {
+    "archiveRequest": {
+      "type": "object",
+      "required": ["requestId", "path"],
+      "additionalProperties": false,
+      "properties": {
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "path": { "type": "string", "description": "A skill's path from skills/list: its SKILL.md or its directory (absolute)." }
+      }
+    },
+    "restoreRequest": {
+      "type": "object",
+      "required": ["requestId"],
+      "additionalProperties": false,
+      "properties": { "requestId": { "type": "string", "minLength": 1, "maxLength": 256 } }
+    },
+    "archiveRecord": {
+      "type": "object",
+      "required": ["schemaVersion", "id", "name", "dirName", "scope", "root", "originalPath", "skillMdPath", "entryKind", "archivedAt", "by", "requestId"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "id": { "type": "string", "description": "<UTC yyyymmddThhmmssZ>-<dir name>; the archive slot <cutex home>/archive/skills/<id>." },
+        "name": { "type": "string", "description": "Front-matter name (dir name when absent)." },
+        "dirName": { "type": "string" },
+        "description": { "type": ["string", "null"] },
+        "scope": { "const": "user" },
+        "root": { "enum": ["codexHome", "agentsHome"], "description": "<CODEX_HOME>/skills or ~/.agents/skills." },
+        "originalPath": { "type": "string", "description": "Where the entry was and where restore puts it back." },
+        "skillMdPath": { "type": "string" },
+        "entryKind": { "enum": ["directory", "link"], "description": "link: a symlink / junction in the root was moved, its target untouched." },
+        "linkTarget": { "type": ["string", "null"] },
+        "archivedAt": { "type": "string" },
+        "by": { "type": "string", "description": "owner, or user:<id>." },
+        "requestId": { "type": "string" },
+        "archivePath": { "type": "string", "description": "Active archives only: the moved entry." },
+        "restoredAt": { "type": "string" },
+        "restoredBy": { "type": "string" },
+        "restoreRequestId": { "type": "string" }
+      }
+    },
+    "archiveList": {
+      "type": "object",
+      "required": ["archives"],
+      "properties": { "archives": { "type": "array", "items": { "$ref": "#/$defs/archiveRecord" }, "description": "Active (not restored) archives, newest first." } }
+    },
+    "archiveResult": {
+      "type": "object",
+      "required": ["archive", "replayed"],
+      "properties": {
+        "archive": { "$ref": "#/$defs/archiveRecord" },
+        "replayed": { "type": "boolean", "description": "true: an earlier request with this requestId already did it; nothing moved now." }
+      }
+    }
+  }
+}

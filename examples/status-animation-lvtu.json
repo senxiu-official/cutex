@@ -1,0 +1,18 @@
+{
+  "width": 16,
+  "repeat": true,
+  "style": {"fg": "#74BAC3"},
+  "cursor": {"text": "▏", "blink_ms": 500, "style": {"fg": "#D9B45F"}},
+  "sequence": [
+    {"type": "lv", "interval_ms": 250},
+    {"commit": "旅", "hold_ms": 500, "style": {"fg": "#F7B3CD"}},
+    {"type": "tu", "interval_ms": 250},
+    {"commit": "途", "hold_ms": 500, "style": {"fg": "#E08EB2"}},
+    {"type": "yu", "interval_ms": 250},
+    {"commit": "愉", "hold_ms": 500, "style": {"fg": "#74BAC3"}},
+    {"type": "kuai", "interval_ms": 250},
+    {"commit": "快", "hold_ms": 3000, "style": {"fg": "#D9B45F", "bold": true}},
+    {"erase": {"interval_ms": 250}},
+    {"hold_ms": 1000}
+  ]
+}

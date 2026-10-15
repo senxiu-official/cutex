@@ -1,0 +1,14 @@
+[
+  {
+    "name": "job_submit",
+    "description": "Submit a job to your own HTTP bridge. A receipt means accepted, not business completion.",
+    "input_schema": {
+      "type": "object",
+      "properties": {"task": {"type": "string"}},
+      "required": ["task"],
+      "additionalProperties": false
+    },
+    "url": "http://127.0.0.1:8089/tool",
+    "token_env": "CUTEX_JOB_BRIDGE_TOKEN"
+  }
+]

@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:sessions",
+  "title": "SessionList",
+  "description": "GET /v2/sessions (and GET /v2/sessions/{id} → one session). Fields not listed may be added in later versions.",
+  "anyOf": [{ "$ref": "#/$defs/sessionList" }, { "$ref": "#/$defs/session" }],
+  "$defs": {
+    "sessionList": {
+      "type": "object",
+      "required": ["contractVersion", "hostId", "sessions"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "hostId": { "type": "string" },
+        "management": {},
+        "sessions": { "type": "array", "items": { "$ref": "#/$defs/session" } }
+      }
+    },
+    "appServerSchema": {
+      "type": "object",
+      "required": ["protocol", "version"],
+      "properties": {
+        "protocol": { "type": "string", "description": "codex-app-server | claude-app-server-subset" },
+        "majorVersion": { "type": "integer" },
+        "version": { "type": "string" },
+        "sha256": { "type": "string" },
+        "channel": { "type": "string" },
+        "capabilities": {},
+        "extensions": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["status", "runtimeGeneration"],
+      "properties": {
+        "backend": { "type": "string" },
+        "status": { "type": "string", "description": "online | offline | error | …" },
+        "appServerConnected": { "type": "boolean" },
+        "runtimeGeneration": { "type": "integer", "minimum": 0 },
+        "runtimeAgentId": { "type": ["string", "null"] },
+        "activeTurnId": { "type": ["string", "null"] },
+        "activeTurnObservedAt": { "type": ["string", "null"] },
+        "threadStatus": {},
+        "threadSettings": { "type": ["object", "null"] },
+        "requiresVisibleTerminal": { "type": "boolean" },
+        "tuiAttached": { "type": "boolean" },
+        "lastEventAt": { "type": ["string", "null"] },
+        "lastError": {}
+      }
+    },
+    "avatar": {
+      "type": "object",
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": { "enum": ["emoji", "color", "icon"] },
+        "value": { "type": "string" },
+        "color": { "type": "string", "pattern": "^#[0-9a-f]{6}$", "description": "Capability agent-avatar-color: circle colour of an emoji / icon avatar (a color avatar keeps its colour in value)." }
+      }
+    },
+    "session": {
+      "type": "object",
+      "required": ["contractVersion", "cutexSessionId", "revision", "lifecycle", "hostId", "displayName", "runtime"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "cutexSessionId": { "type": "string" },
+        "revision": { "type": "integer" },
+        "lifecycle": { "enum": ["active", "retired"] },
+        "retiredAt": { "type": ["string", "null"] },
+        "hostId": { "type": "string" },
+        "displayName": { "type": "string" },
+        "formalAgentName": { "type": ["string", "null"] },
+        "displayNameOverride": { "type": ["string", "null"] },
+        "note": { "type": ["string", "null"] },
+        "avatar": { "anyOf": [{ "$ref": "#/$defs/avatar" }, { "type": "null" }] },
+        "claudeAccount": {
+          "type": "object",
+          "description": "Claude sessions only (capability claude-accounts): the account the session was created on (claude-accounts.json#/$defs/sessionAccount).",
+          "required": ["id", "label", "kind", "isDefault"],
+          "properties": {
+            "id": { "type": "string" },
+            "label": { "type": ["string", "null"] },
+            "kind": { "enum": ["subscription", "api", "removed"] },
+            "isDefault": { "type": "boolean" }
+          }
+        },
+        "threadName": { "type": ["string", "null"] },
+        "cwd": { "type": ["string", "null"] },
+        "profile": { "type": ["string", "null"] },
+        "configuredProfile": { "type": ["string", "null"] },
+        "launchedProfile": { "type": ["string", "null"] },
+        "effectiveNextLaunch": { "type": "object" },
+        "groups": { "type": "array", "items": { "type": "string" } },
+        "registrationClass": {},
+        "visible": { "type": "boolean" },
+        "native": {
+          "type": "object",
+          "properties": {
+            "threadId": { "type": ["string", "null"] },
+            "schema": { "anyOf": [{ "$ref": "#/$defs/appServerSchema" }, { "type": "null" }] }
+          }
+        },
+        "runtime": { "$ref": "#/$defs/runtime" },
+        "runtimeDefaults": { "type": ["object", "null"] },
+        "activity": { "type": ["object", "null"] },
+        "focus": {},
+        "management": {},
+        "createdAt": { "type": ["string", "null"] },
+        "updatedAt": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

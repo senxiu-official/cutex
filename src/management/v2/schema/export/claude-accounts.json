@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:claude-accounts",
+  "title": "Claude accounts",
+  "description": "Capability claude-accounts: Claude Code logins (subscription) and API keys (api) a Claude profile runs on. default is the shared home every Claude session used before accounts existed. No secrets: apiKey is write-only, login runs in the owner's terminal (loginCommand).",
+  "anyOf": [
+    { "$ref": "#/$defs/accountList" },
+    { "$ref": "#/$defs/account" },
+    { "$ref": "#/$defs/removeResult" }
+  ],
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "accountId": {
+      "type": "string",
+      "pattern": "^(default|ca-[a-z0-9]{1,32})$"
+    },
+    "accountStatus": {
+      "type": "object",
+      "description": "Non-secret fields of `claude auth status` (subscription) or of the stored key (api). error: the check failed (status unknown).",
+      "required": ["loggedIn"],
+      "properties": {
+        "loggedIn": { "type": "boolean" },
+        "authMethod": { "$ref": "#/$defs/nullableString", "description": "claude.ai | api_key | …" },
+        "apiProvider": { "$ref": "#/$defs/nullableString", "description": "firstParty | anthropicCompatible | …" },
+        "apiKeySource": { "$ref": "#/$defs/nullableString" },
+        "email": { "$ref": "#/$defs/nullableString" },
+        "orgId": { "$ref": "#/$defs/nullableString" },
+        "orgName": { "$ref": "#/$defs/nullableString" },
+        "subscriptionType": { "$ref": "#/$defs/nullableString", "description": "pro | max | team | enterprise | …" },
+        "checkedAt": { "$ref": "#/$defs/nullableString" },
+        "error": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "loginCommand": {
+      "type": "object",
+      "description": "Terminal commands that log a subscription account in (desktop shows them; it never logs in itself).",
+      "required": ["cutex", "powershell", "posix", "claudeConfigDir"],
+      "properties": {
+        "cutex": { "type": "string" },
+        "powershell": { "type": "string" },
+        "posix": { "type": "string" },
+        "claudeConfigDir": { "type": "string" }
+      }
+    },
+    "apiSettings": {
+      "type": "object",
+      "required": ["keyEnv", "env", "apiKeyPresent"],
+      "properties": {
+        "baseUrl": { "$ref": "#/$defs/nullableString", "description": "ANTHROPIC_BASE_URL; null = Anthropic." },
+        "keyEnv": { "enum": ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } },
+        "apiKeyPresent": { "type": "boolean" }
+      }
+    },
+    "profileRef": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" }
+      }
+    },
+    "account": {
+      "type": "object",
+      "required": ["id", "label", "kind", "isDefault", "home", "createdAt", "api", "status", "loginCommand", "profiles", "sessions", "removable"],
+      "properties": {
+        "id": { "$ref": "#/$defs/accountId" },
+        "label": { "$ref": "#/$defs/nullableString", "description": "null for default." },
+        "kind": { "enum": ["subscription", "api"] },
+        "isDefault": { "type": "boolean" },
+        "home": { "$ref": "#/$defs/nullableString", "description": "CLAUDE_CONFIG_DIR of the account (default: the selected deployment's claude_home)." },
+        "createdAt": { "$ref": "#/$defs/nullableString" },
+        "api": { "anyOf": [{ "$ref": "#/$defs/apiSettings" }, { "type": "null" }] },
+        "status": {
+          "anyOf": [{ "$ref": "#/$defs/accountStatus" }, { "type": "null" }],
+          "description": "subscription: last POST …/status result (null = never checked); api: computed (key present)."
+        },
+        "loginCommand": { "anyOf": [{ "$ref": "#/$defs/loginCommand" }, { "type": "null" }] },
+        "profiles": { "type": "array", "items": { "$ref": "#/$defs/profileRef" }, "description": "Claude profiles bound to the account (default: Claude profiles without claudeAccount)." },
+        "sessions": {
+          "type": "object",
+          "required": ["active", "online", "retired"],
+          "properties": {
+            "active": { "type": "integer", "minimum": 0 },
+            "online": { "type": "integer", "minimum": 0 },
+            "retired": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "removable": { "type": "boolean", "description": "No bound profile and no active session (default: never)." }
+      }
+    },
+    "accountList": {
+      "type": "object",
+      "required": ["contractVersion", "accounts"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "accounts": { "type": "array", "items": { "$ref": "#/$defs/account" }, "description": "default first." }
+      }
+    },
+    "removeResult": {
+      "type": "object",
+      "required": ["id", "removed", "homeDeleted", "keptHome"],
+      "properties": {
+        "id": { "$ref": "#/$defs/accountId" },
+        "removed": { "const": true },
+        "homeDeleted": { "type": "boolean" },
+        "keptHome": { "$ref": "#/$defs/nullableString", "description": "The home kept for archived sessions (login, native history); delete with ?deleteHome=true." }
+      }
+    },
+    "sessionAccount": {
+      "type": "object",
+      "description": "claudeAccount of a Claude session resource (GET /v2/sessions…): the account its home was frozen to at creation. kind removed = the account was deregistered.",
+      "required": ["id", "label", "kind", "isDefault"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "$ref": "#/$defs/nullableString" },
+        "kind": { "enum": ["subscription", "api", "removed"] },
+        "isDefault": { "type": "boolean" }
+      }
+    },
+    "usageAmounts": {
+      "type": "object",
+      "description": "Usage ledger totals (see GET /v2/usage).",
+      "required": ["turns", "requests", "input", "cachedInput", "output", "total"],
+      "properties": {
+        "turns": { "type": "integer", "minimum": 0 },
+        "requests": { "type": "integer", "minimum": 0 },
+        "input": { "type": "integer", "minimum": 0 },
+        "cachedInput": { "type": "integer", "minimum": 0 },
+        "cacheWriteInput": { "type": "integer", "minimum": 0 },
+        "output": { "type": "integer", "minimum": 0 },
+        "reasoningOutput": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "estimatedCost": { "type": "number", "description": "In currency; absent when nothing is priced." },
+        "unpricedTokens": { "type": "integer", "minimum": 0 },
+        "unpricedRequests": { "type": "integer", "minimum": 0 },
+        "priceSources": { "type": "array", "items": { "type": "string" } },
+        "apiEquivalentUsd": { "type": "number" }
+      }
+    },
+    "apiUsage": {
+      "type": "object",
+      "description": "nativeQuota.apiUsage of GET /v2/profiles/{p}/quota for a profile on an API account (source claudeApi): ledger totals of every profile on the account.",
+      "required": ["today", "last7Days", "last30Days"],
+      "properties": {
+        "today": { "$ref": "#/$defs/usageAmounts" },
+        "last7Days": { "$ref": "#/$defs/usageAmounts" },
+        "last30Days": { "$ref": "#/$defs/usageAmounts" },
+        "currency": { "$ref": "#/$defs/nullableString" },
+        "from": { "type": "string" },
+        "to": { "type": "string" }
+      }
+    }
+  }
+}

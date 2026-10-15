@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:runtime-restore",
+  "title": "RuntimeRestoreCandidates",
+  "description": "GET /v2/runtimes/restore-candidates → restoreCandidates; DELETE /v2/runtimes/restore-candidates → restoreDismissed (capability runtime-restore-candidates). Agents whose runtime was online (owner intent, kept until a requested offline / close) when the previous Management run or host stopped uncleanly. Restore = cutex/runtime/online per agent; nothing starts automatically.",
+  "anyOf": [{ "$ref": "#/$defs/restoreCandidates" }, { "$ref": "#/$defs/restoreDismissed" }],
+  "$defs": {
+    "restoreCandidate": {
+      "type": "object",
+      "required": ["cutexSessionId", "displayName", "lastOnlineAt"],
+      "properties": {
+        "cutexSessionId": { "type": "string" },
+        "displayName": { "type": "string" },
+        "lastOnlineAt": { "type": "string", "description": "When the runtime last went online, RFC 3339." }
+      }
+    },
+    "restoreCandidates": {
+      "type": "object",
+      "required": ["hostId", "uncleanSince", "reason", "items"],
+      "properties": {
+        "hostId": { "type": "string" },
+        "uncleanSince": { "type": ["string", "null"], "description": "When a Management start found the intended runtimes offline; null when nothing is to restore." },
+        "reason": { "enum": ["host_rebooted", "runtimes_exited", null] },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/restoreCandidate" }, "description": "Still offline, not archived; an agent brought online again leaves the list." }
+      }
+    },
+    "restoreDismissed": {
+      "type": "object",
+      "required": ["dismissed"],
+      "properties": {
+        "dismissed": { "type": "integer", "minimum": 0, "description": "Offline candidates whose online intent was dropped." }
+      }
+    }
+  }
+}

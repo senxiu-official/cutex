@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:events",
+  "title": "EventPage",
+  "description": "GET /v2/events (page) and GET /v2/events/stream (SSE `cutex_management_event_v2`, data = one envelope; `cutex_management_stream_error`, data = error.json). `native.message` is a raw app-server JSON-RPC message; `cutex.params` per cutex-methods-v2.",
+  "anyOf": [{ "$ref": "#/$defs/eventPage" }, { "$ref": "#/$defs/eventEnvelope" }],
+  "$defs": {
+    "checkpoint": {
+      "type": "object",
+      "required": ["streamId", "sequence", "cursor"],
+      "properties": {
+        "streamId": { "type": "string" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "cursor": { "type": ["string", "null"] }
+      }
+    },
+    "correlation": {
+      "type": "object",
+      "properties": {
+        "runtimeGeneration": { "type": "integer" },
+        "threadId": { "type": "string" },
+        "turnId": { "type": "string" },
+        "itemId": { "type": "string" },
+        "clientUserMessageId": { "type": "string" },
+        "managementRequestId": { "type": "string" },
+        "queueId": { "type": "string" },
+        "agentBusMessageId": { "type": "string" },
+        "nativeRequestId": { "type": ["string", "integer"] }
+      }
+    },
+    "eventEnvelope": {
+      "type": "object",
+      "required": ["contractVersion", "eventId", "cursor", "streamId", "sequence", "receivedAt", "cutexSessionId", "hostId", "source", "sensitivity", "correlation"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "eventId": { "type": "string" },
+        "cursor": { "type": "string" },
+        "streamId": { "type": "string" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "receivedAt": { "type": "string" },
+        "cutexSessionId": { "type": "string" },
+        "hostId": { "type": "string" },
+        "source": { "enum": ["app_server", "cutex"] },
+        "sensitivity": { "type": "string" },
+        "schema": { "type": "object" },
+        "correlation": { "$ref": "#/$defs/correlation" },
+        "native": {
+          "type": "object",
+          "required": ["kind", "message"],
+          "properties": {
+            "kind": { "enum": ["notification", "serverRequest"] },
+            "message": {
+              "type": "object",
+              "required": ["method"],
+              "properties": {
+                "id": { "type": ["string", "integer"] },
+                "method": { "type": "string" },
+                "params": {}
+              }
+            }
+          }
+        },
+        "cutex": {
+          "type": "object",
+          "required": ["method", "params"],
+          "properties": {
+            "method": { "type": "string" },
+            "params": {}
+          }
+        }
+      }
+    },
+    "eventPage": {
+      "type": "object",
+      "required": ["contractVersion", "hostId", "streamId", "events", "nextCursor", "checkpoint", "hasMore"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "hostId": { "type": "string" },
+        "streamId": { "type": "string" },
+        "scope": {
+          "type": "object",
+          "properties": { "cutexSessionId": { "type": ["string", "null"] } }
+        },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/eventEnvelope" } },
+        "nextCursor": { "type": ["string", "null"] },
+        "checkpoint": { "$ref": "#/$defs/checkpoint" },
+        "scannedCount": { "type": "integer" },
+        "hasMore": { "type": "boolean" }
+      }
+    }
+  }
+}

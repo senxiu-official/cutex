@@ -1,0 +1,477 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:asks",
+  "title": "AskList",
+  "description": "GET /v2/asks[?state=&involving=&peer=&open=&limit=] summaries. GET /v2/asks/{id} returns {ask} with owner detail. Peer records expose portable state and local delivery diagnostics.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/askList"
+    },
+    {
+      "$ref": "#/$defs/askDetail"
+    }
+  ],
+  "$defs": {
+    "requester": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "agent",
+            "owner",
+            "peer"
+          ]
+        },
+        "peer": {
+          "type": "object",
+          "required": [
+            "peerId",
+            "label"
+          ],
+          "properties": {
+            "peerId": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            }
+          }
+        },
+        "cutexSessionId": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "peerId": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string",
+          "description": "Single-line sanitized display label."
+        },
+        "claimedCaps": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "sandbox": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "networkAccess": {
+              "type": "boolean"
+            },
+            "unrestrictedServices": {
+              "type": "boolean"
+            }
+          },
+          "description": "Capabilities claimed by the remote requester; display only, never approval authority."
+        }
+      }
+    },
+    "askSummary": {
+      "type": "object",
+      "required": [
+        "askId",
+        "title",
+        "requester",
+        "target",
+        "execution",
+        "createdAt"
+      ],
+      "properties": {
+        "askId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "requester": {
+          "$ref": "#/$defs/requester"
+        },
+        "target": {
+          "type": "string",
+          "description": "target cutexSessionId"
+        },
+        "targetName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remote": {
+          "$ref": "#/$defs/remote"
+        },
+        "projectId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution": {
+          "type": "string",
+          "description": "queued | admitted | running | pendingReview | interrupted | answered | failed | rejected | cancelled | …"
+        },
+        "hold": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "reason": {
+              "type": "string",
+              "description": "Includes peerUnreachable, peerIdentityChanged, peerVersionMismatch and peerUnknown. Unknown peer state is display-only and never drives local scheduling."
+            },
+            "raw": {
+              "type": "string"
+            }
+          }
+        },
+        "holdSince": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "review": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "awaitingAcceptance | accepted | changesRequested | abandoned"
+        },
+        "closed": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "completed | accepted | abandoned | stopped | cancelled | superseded"
+        },
+        "queuePosition": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "attempts": {
+          "type": "integer"
+        },
+        "answerId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "openQuestions": {
+          "type": "integer"
+        },
+        "attempt": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "closedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "followUpOf": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ownerQuestions": {
+          "type": "integer"
+        },
+        "answerPreview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "await": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "The handler yielded to wait for jobs (hold waitingForEvent): {jobs, until: all|any, resume: all|each, since, timeoutAt, note, attempt}"
+        },
+        "resume": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Woken, waiting for admission of the continuation: {reason: jobs|jobFailed|timeout|resumed|reopened, since, by}"
+        },
+        "jobs": {
+          "type": "array",
+          "description": "Job Service jobs bound to the delegation",
+          "items": {
+            "type": "object",
+            "required": [
+              "jobId",
+              "status"
+            ],
+            "properties": {
+              "jobId": {
+                "type": "string"
+              },
+              "source": {
+                "enum": [
+                  "auto",
+                  "explicit"
+                ]
+              },
+              "status": {
+                "type": "string",
+                "description": "running | exited | failed | cancelled | interrupted | launchUnknown"
+              },
+              "exitCode": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "ok": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "cancel": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "pending | sent | failed | notRunning"
+              }
+            }
+          }
+        },
+        "revisions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "level"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "level": {
+                "enum": [
+                  "sent",
+                  "delivered",
+                  "inContext",
+                  "acknowledged"
+                ]
+              },
+              "supersedes": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sentAt": {
+                "type": "string"
+              },
+              "acknowledgedAt": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "supersededBy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hops": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lateAnswer": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "text": false,
+            "lastError": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 512,
+              "description": "Sanitized single-line diagnostic, at most 512 UTF-8 bytes."
+            },
+            "artifactId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "preview": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "description": "Late answer metadata with local artifactId and bounded preview; no inline text and no new delivery."
+        },
+        "resultUndeliverable": {
+          "type": "boolean"
+        },
+        "interruptReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "askList": {
+      "type": "object",
+      "required": [
+        "hostId",
+        "asks",
+        "hasMore"
+      ],
+      "properties": {
+        "hostId": {
+          "type": "string"
+        },
+        "asks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/askSummary"
+          }
+        },
+        "hasMore": {
+          "type": "boolean"
+        }
+      }
+    },
+    "askDetail": {
+      "type": "object",
+      "required": [
+        "ask"
+      ],
+      "properties": {
+        "ask": {
+          "type": "object"
+        }
+      }
+    },
+    "remote": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "peerId": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "targetName": {
+          "type": "string"
+        },
+        "syncState": {
+          "type": "string"
+        },
+        "lastError": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 512,
+          "description": "Sanitized single-line diagnostic, at most 512 UTF-8 bytes."
+        },
+        "interruptReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remoteState": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "text": false,
+            "lastError": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 512,
+              "description": "Sanitized single-line diagnostic, at most 512 UTF-8 bytes."
+            }
+          },
+          "description": "Portable peer snapshot metadata; answer text is omitted. Unknown state strings are retained."
+        },
+        "lateAnswer": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "text": false,
+            "lastError": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 512,
+              "description": "Sanitized single-line diagnostic, at most 512 UTF-8 bytes."
+            },
+            "artifactId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "preview": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "description": "Late answer metadata with local artifactId and bounded preview; no inline text and no new delivery."
+        }
+      }
+    }
+  }
+}

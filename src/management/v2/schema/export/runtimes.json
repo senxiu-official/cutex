@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:runtimes",
+  "title": "Runtimes",
+  "description": "GET /v2/runtimes (capability runtimes-view): native version registry entries and Claude runtimes with the agents pinned to each. Paths are reduced to directory / file names.",
+  "anyOf": [
+    { "$ref": "#/$defs/runtimes" }
+  ],
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "cutexBuild": {
+      "type": "object",
+      "description": "Build identity of the cutex binary (same as /v2/capabilities cutexBuild). release / commit / builtAt are null on builds that did not set CUTEX_RELEASE / CUTEX_COMMIT / CUTEX_BUILD_TIME (dev builds).",
+      "required": ["version", "release", "commit", "builtAt", "profile", "channel"],
+      "properties": {
+        "version": { "type": "string", "description": "Cargo package version (not a release id)." },
+        "release": { "$ref": "#/$defs/nullableString" },
+        "commit": { "$ref": "#/$defs/nullableString" },
+        "builtAt": { "$ref": "#/$defs/nullableString" },
+        "profile": { "enum": ["release", "debug"] },
+        "channel": { "enum": ["main", "release"], "description": "Release channel the binary was built for: release (public / colleague builds, CUTEX_CHANNEL=release or the older stable) or main (default, owner / dev builds). Older daemons sent dev / stable." }
+      }
+    },
+    "agentRef": {
+      "type": "object",
+      "required": ["cutexSessionId", "name"],
+      "properties": {
+        "cutexSessionId": { "type": "string" },
+        "name": { "type": "string" }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "description": "native: one registry version (release r50, version 0.160.0-r50) or an unregistered pinned executable (no version); claude: one runtime directory (release claude-r5).",
+      "required": ["release", "selected", "missing", "agents", "agentCount"],
+      "properties": {
+        "release": { "type": "string" },
+        "version": { "type": "string" },
+        "path": { "type": "string", "description": "<release dir>/<file> (native) or the adapter directory name (claude)." },
+        "releaseDir": { "type": "string" },
+        "sha256Prefix": { "type": "string" },
+        "selected": { "type": "boolean", "description": "Used for new sessions." },
+        "latest": { "type": "boolean", "description": "Native registry latest runtime." },
+        "missing": { "type": "boolean", "description": "The recorded files no longer exist." },
+        "agents": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/agentRef" } },
+        "agentCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "runtimes": {
+      "type": "object",
+      "required": ["contractVersion", "hostId", "generatedAt", "cutex", "native", "claude", "unpinnedAgentCount"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "hostId": { "type": "string" },
+        "generatedAt": { "type": "string" },
+        "cutex": {
+          "type": "object",
+          "required": ["build"],
+          "properties": {
+            "build": { "$ref": "#/$defs/cutexBuild" },
+            "release": { "$ref": "#/$defs/nullableString", "description": "Label of the directory the executable runs from (build.release is the label it was built as)." },
+            "releaseDir": { "$ref": "#/$defs/nullableString" },
+            "executable": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        "native": { "type": "array", "items": { "$ref": "#/$defs/entry" } },
+        "claude": { "type": "array", "items": { "$ref": "#/$defs/entry" } },
+        "unpinnedAgentCount": { "type": "integer", "minimum": 0, "description": "Non-retired host agents without an explicit-launch pin (they launch on the selected package)." }
+      }
+    }
+  }
+}

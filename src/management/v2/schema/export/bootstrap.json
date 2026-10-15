@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:bootstrap",
+  "title": "SessionBootstrap",
+  "description": "GET /v2/sessions/{id}/bootstrap[?turnLimit=N][&compact=1] and GET /v2/sessions/{id}/history?limit=&cursor=[&compact=1]. `native.result` is the app-server `thread/read` result (its own generated schema); with compact=1 tool items may carry `truncated: true`.",
+  "anyOf": [{ "$ref": "#/$defs/bootstrap" }, { "$ref": "#/$defs/history" }, { "$ref": "#/$defs/historyTurn" }],
+  "$defs": {
+    "checkpoint": {
+      "type": "object",
+      "required": ["streamId", "sequence", "cursor"],
+      "properties": {
+        "streamId": { "type": "string" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "cursor": { "type": ["string", "null"] }
+      }
+    },
+    "historyPage": {
+      "type": "object",
+      "required": ["limit", "cursor", "nextCursor", "hasMore", "firstOrdinal", "turnCount"],
+      "properties": {
+        "limit": { "type": "integer" },
+        "cursor": { "type": ["string", "null"] },
+        "nextCursor": { "type": ["string", "null"] },
+        "hasMore": { "type": "boolean" },
+        "firstOrdinal": { "type": ["integer", "null"], "minimum": 1 },
+        "turnCount": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "native": {
+      "type": "object",
+      "required": ["method", "result"],
+      "properties": {
+        "method": { "const": "thread/read" },
+        "result": { "type": "object" }
+      }
+    },
+    "queuePause": {
+      "type": "object",
+      "required": ["pausedAt", "reason"],
+      "properties": {
+        "pausedAt": { "type": "string" },
+        "reason": { "enum": ["interrupted", "manual"] },
+        "turnId": { "type": ["string", "null"] }
+      }
+    },
+    "admission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "orderRevision",
+        "items"
+      ],
+      "properties": {
+        "revision": {
+          "$ref": "#/$defs/safeInteger"
+        },
+        "orderRevision": {
+          "$ref": "#/$defs/safeInteger"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/admissionItem"
+          }
+        },
+        "nextStep": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/admissionNextStep"
+          }
+        },
+        "currentTurn": {
+          "$ref": "#/$defs/admissionCurrentTurn"
+        },
+        "ridealongsHeld": {
+          "enum": [
+            "ownerStop"
+          ]
+        },
+        "ownerYielded": {
+          "type": "boolean"
+        }
+      }
+    },
+    "admissionItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id",
+        "position",
+        "enqueuedAt",
+        "state"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "owner",
+            "ask"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "enqueuedAt": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "state": {
+          "enum": [
+            "waiting",
+            "held",
+            "paused"
+          ]
+        },
+        "hold": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "includedNotes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "label"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "admissionNextStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "deliveryKind",
+        "enqueuedAt",
+        "timing"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "deliveryKind": {
+          "enum": [
+            "answer",
+            "question",
+            "alarm",
+            "tell",
+            "bus"
+          ]
+        },
+        "label": {
+          "type": ["string", "null"]
+        },
+        "enqueuedAt": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "timing": {
+          "enum": [
+            "afterTurn",
+            "nextStep"
+          ]
+        },
+        "nextStepAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "held": {
+          "enum": [
+            "ownerStop",
+            "ownerPause"
+          ]
+        },
+        "askId": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "from": {
+          "type": ["string", "null"]
+        },
+        "fromHost": {
+          "type": ["string", "null"]
+        },
+        "preview": {
+          "type": ["string", "null"],
+          "maxLength": 80
+        }
+      }
+    },
+    "admissionCurrentTurn": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "owner",
+            "ask",
+            "delivery"
+          ]
+        },
+        "askId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "safeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "cutexState": {
+      "type": "object",
+      "required": ["sessionRevision", "runtime", "userInputQueue", "pendingServerRequests", "agentBusMessages"],
+      "properties": {
+        "sessionRevision": { "type": "integer" },
+        "runtime": {
+          "type": "object",
+          "required": ["status", "runtimeGeneration"],
+          "properties": {
+            "status": { "type": "string" },
+            "runtimeGeneration": { "type": "integer" }
+          }
+        },
+        "focus": {},
+        "userInputQueue": { "type": "array", "items": { "type": "object" } },
+        "userInputQueuePause": { "anyOf": [{ "$ref": "#/$defs/queuePause" }, { "type": "null" }] },
+        "admission": { "$ref": "#/$defs/admission" },
+        "asksPaused": { "type": ["object", "null"] },
+        "pendingServerRequests": { "type": "array", "items": { "type": "object" } },
+        "agentBusMessages": { "type": "array" },
+        "agentBusSentMessages": { "type": "array" },
+        "ownerNotifications": { "type": "array", "items": { "type": "object" }, "description": "Agent → owner messages of this session, oldest first (capability owner-messages)." },
+        "latestPlan": { "type": ["object", "null"] },
+        "latestTokenUsage": { "type": ["object", "null"] }
+      }
+    },
+    "bootstrap": {
+      "type": "object",
+      "required": ["contractVersion", "cutexSessionId", "hostId", "checkpoint", "native", "cutexState"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "cutexSessionId": { "type": "string" },
+        "hostId": { "type": "string" },
+        "checkpoint": { "$ref": "#/$defs/checkpoint" },
+        "schema": { "type": ["object", "null"] },
+        "management": {},
+        "native": { "anyOf": [{ "$ref": "#/$defs/native" }, { "type": "null" }] },
+        "historyPage": { "anyOf": [{ "$ref": "#/$defs/historyPage" }, { "type": "null" }] },
+        "cutexState": { "$ref": "#/$defs/cutexState" }
+      }
+    },
+    "historyTurn": {
+      "type": "object",
+      "description": "GET /v2/sessions/{id}/history/turns/{turnId}[?compact=1]. Exactly one turn. A preview over 512 KiB is a truncated prefix with itemsView summary, truncated true, and complete false. Internal mutation consumers must use read_complete_turn, which fails on incomplete history.",
+      "required": ["contractVersion", "cutexSessionId", "threadId", "source", "turnId", "ordinal", "turnCount", "complete", "native"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "cutexSessionId": { "type": "string" },
+        "threadId": { "type": "string" },
+        "source": { "enum": ["live", "offline"] },
+        "turnId": { "type": "string" },
+        "ordinal": { "type": "integer", "minimum": 1 },
+        "turnCount": { "type": "integer", "minimum": 1 },
+        "complete": { "type": "boolean", "description": "False for a limited preview, native truncation, or compacted tool items." },
+        "native": { "$ref": "#/$defs/native" }
+      }
+    },
+    "history": {
+      "type": "object",
+      "required": ["contractVersion", "cutexSessionId", "threadId", "source", "native", "page"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "cutexSessionId": { "type": "string" },
+        "threadId": { "type": "string" },
+        "source": { "enum": ["live", "offline"] },
+        "native": { "$ref": "#/$defs/native" },
+        "page": { "$ref": "#/$defs/historyPage" },
+        "cutexState": {
+          "type": "object",
+          "properties": {
+            "latestPlan": { "type": ["object", "null"] },
+            "latestTokenUsage": { "type": ["object", "null"] }
+          }
+        }
+      }
+    }
+  }
+}

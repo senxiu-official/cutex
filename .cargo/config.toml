@@ -1,0 +1,7 @@
+# Every process cargo starts (`cargo test`, `cargo run`) and the `cutex`
+# children tests spawn refuse the OS user's real ~/.cutex in debug builds
+# (src/config/paths.rs, test-home guard). Use a private home
+# (CUTEX_TEST_PRIVATE_HOME + HOME, scripts/dev-daemon.ps1) or override with
+# CUTEX_TEST_FORBID_REAL_HOME=0 for a deliberate debug run on the real home.
+[env]
+CUTEX_TEST_FORBID_REAL_HOME = "1"

@@ -1,0 +1,69 @@
+[package]
+name = "cutex"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cutex"
+path = "src/main.rs"
+
+[features]
+# Optional private NCI integration; excluded from ordinary builds.
+# Key generation uses ring (a regular dependency: person identity verifies
+# Ed25519 signatures with it; already in the tree through rustls).
+nci-qstat = []
+archive-agent-bus-roster-test-fixture = []
+archive-conflict-test-hook = []
+stock-launch-test-hook = []
+
+[dependencies]
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+dirs = "6"
+anyhow = "1"
+fs2 = "0.4"
+libc = "0.2"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+toml = "0.8"
+url = "2"
+shlex = "1"
+sha2 = "0.10"
+jsonschema = { version = "0.30", default-features = false }
+tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
+tui-input = { version = "0.15", default-features = false }
+unicode-width = "0.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+portable-pty = "0.9"
+ring = { version = "0.17", default-features = false }
+notify = "8"
+qrcode = { version = "0.14", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+mail-auth = { version = "0.13.3", default-features = false, features = ["ring", "dns-hickory"] }
+tokio = { version = "1", features = ["rt", "time", "net"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_SystemInformation",
+] }

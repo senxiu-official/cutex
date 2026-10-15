@@ -1,0 +1,2 @@
+# Embedded schemas are hashed byte-for-byte (include_str! + sha256); keep LF on every platform.
+src/**/*.json text eol=lf

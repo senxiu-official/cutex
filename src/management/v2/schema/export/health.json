@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:health",
+  "title": "Host health",
+  "anyOf": [{"$ref":"#/$defs/report"},{"$ref":"#/$defs/result"}],
+  "$defs": {
+    "fix": {"type":"object","required":["action","safe"],"properties":{"action":{"type":"string"},"safe":{"const":true}},"additionalProperties":false},
+    "finding": {"type":"object","required":["id","code","severity","detail","fix"],"properties":{"id":{"type":"string"},"code":{"type":"string"},"severity":{"enum":["info","warn","error"]},"cutexSessionId":{"type":"string"},"detail":{"type":"object"},"fix":{"anyOf":[{"$ref":"#/$defs/fix"},{"type":"null"}]}},"additionalProperties":false},
+    "report": {"type":"object","required":["contractVersion","scannedAt","findings"],"properties":{"contractVersion":{"const":2},"scannedAt":{"type":"string"},"findings":{"type":"array","items":{"$ref":"#/$defs/finding"}}},"additionalProperties":false},
+    "request": {"type":"object","properties":{"findingIds":{"type":"array","items":{"type":"string"}},"dryRun":{"type":"boolean","default":true}},"additionalProperties":false},
+    "result": {"type":"object","required":["applied","skipped","planned","dryRun","findings"],"properties":{"applied":{"type":"array","items":{"type":"string"}},"skipped":{"type":"array","items":{"type":"object","required":["id","reason"],"properties":{"id":{"type":"string"},"reason":{"type":"string"}}}},"planned":{"type":"array","items":{"type":"object","required":["id","fix"],"properties":{"id":{"type":"string"},"fix":{"$ref":"#/$defs/fix"}}}},"dryRun":{"type":"boolean"},"findings":{"type":"array","items":{"$ref":"#/$defs/finding"}}},"additionalProperties":false}
+  }
+}

@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:artifacts",
+  "title": "Artifact store",
+  "description": "Capability artifacts (cutex-desktop docs/research/artifacts-api-v1.md): GET/POST /v2/artifact-store, GET/PATCH/DELETE /v2/artifact-store/{artifactId}, GET .../versions/{n|latest}/content, GET .../diff, POST /v2/artifact-store/resolve, GET /v2/artifact-store/usage (root). Host events cutex/artifact/published and cutex/artifact/updated; with capability artifact-show also cutex/artifact/showRequested (an agent published with show: true). Refs af-…@<n> / af-…@latest; links cutex:artifact/<ref>.",
+  "anyOf": [
+    { "$ref": "#/$defs/listResponse" },
+    { "$ref": "#/$defs/detailResponse" },
+    { "$ref": "#/$defs/contentResponse" },
+    { "$ref": "#/$defs/diffResponse" },
+    { "$ref": "#/$defs/resolveRequest" },
+    { "$ref": "#/$defs/resolveResponse" },
+    { "$ref": "#/$defs/publishRequest" },
+    { "$ref": "#/$defs/publishResponse" },
+    { "$ref": "#/$defs/patchRequest" },
+    { "$ref": "#/$defs/patchResponse" },
+    { "$ref": "#/$defs/deleteResponse" },
+    { "$ref": "#/$defs/usageResponse" }
+  ],
+  "$defs": {
+    "artifactId": { "type": "string", "pattern": "^af-[0-9a-f]{32}$" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "kind": { "enum": ["report", "figure", "table", "data", "plan", "handoff", "other"] },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "enum": ["project", "session"] },
+        "id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "displayName", "turnId"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "displayName": { "type": ["string", "null"] },
+        "turnId": { "type": ["string", "null"] }
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "sessionId", "displayName", "runtimeGeneration", "turnId", "askId", "profile", "model", "attribution", "candidates"],
+      "properties": {
+        "kind": { "enum": ["agent", "owner", "auto"] },
+        "sessionId": { "type": ["string", "null"], "description": "null for owner and for ambiguous / unknown auto captures." },
+        "displayName": { "type": ["string", "null"] },
+        "runtimeGeneration": { "type": ["integer", "null"], "minimum": 0 },
+        "turnId": { "type": ["string", "null"], "description": "null when unknown (never guessed)." },
+        "askId": { "type": ["string", "null"], "description": "The delegation holding the session's admission lease." },
+        "profile": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "attribution": { "enum": ["exclusive", "ambiguous", "unknown", null], "description": "Auto capture only." },
+        "candidates": { "type": "array", "items": { "$ref": "#/$defs/candidate" }, "description": "[] unless auto." }
+      }
+    },
+    "git": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["commit", "dirty"],
+      "properties": {
+        "commit": { "type": "string", "minLength": 7 },
+        "dirty": { "type": "boolean" }
+      }
+    },
+    "artifactVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactId", "version", "ref", "link", "storage", "sha256", "bytes", "mediaType", "sourcePath", "note", "producer", "git", "createdAt"],
+      "properties": {
+        "artifactId": { "$ref": "#/$defs/artifactId" },
+        "version": { "type": "integer", "minimum": 1 },
+        "ref": { "type": "string", "pattern": "^af-[0-9a-f]{32}@[1-9][0-9]*$" },
+        "link": { "type": "string", "pattern": "^cutex:artifact/af-[0-9a-f]{32}@[1-9][0-9]*$" },
+        "storage": { "enum": ["blob", "external"], "description": "external: over maxBlobBytes, registered by path, content not copied." },
+        "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "null for external files over hashExternalMaxBytes." },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "mediaType": { "type": "string", "minLength": 1 },
+        "sourcePath": { "type": "string" },
+        "note": { "type": ["string", "null"] },
+        "producer": { "$ref": "#/$defs/producer" },
+        "git": { "$ref": "#/$defs/git" },
+        "createdAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "artifactSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactId", "scope", "name", "kind", "latestVersion", "revision", "starred", "archivedAt", "createdAt", "updatedAt", "latest"],
+      "properties": {
+        "artifactId": { "$ref": "#/$defs/artifactId" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "$ref": "#/$defs/kind" },
+        "latestVersion": { "type": "integer", "minimum": 1 },
+        "revision": { "type": "integer", "minimum": 1, "description": "CAS for PATCH." },
+        "starred": { "type": "boolean" },
+        "archivedAt": { "type": ["string", "null"] },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" },
+        "latest": { "$ref": "#/$defs/artifactVersion" }
+      }
+    },
+    "listResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "items", "nextCursor"],
+      "properties": {
+        "scope": { "anyOf": [{ "$ref": "#/$defs/scope" }, { "type": "null" }], "description": "null when no project / session / forSession was given (every scope)." },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/artifactSummary" } },
+        "nextCursor": { "type": ["string", "null"] }
+      }
+    },
+    "detailResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact", "versions"],
+      "properties": {
+        "artifact": { "$ref": "#/$defs/artifactSummary" },
+        "versions": { "type": "array", "items": { "$ref": "#/$defs/artifactVersion" }, "description": "Newest first." }
+      }
+    },
+    "contentResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "encoding", "content", "offset", "totalBytes", "truncated", "mediaType", "sha256", "externalChanged"],
+      "properties": {
+        "version": { "type": "integer", "minimum": 1 },
+        "encoding": { "enum": ["utf8", "base64"] },
+        "content": { "type": "string", "description": "Continue at offset + the bytes this window covered (UTF-8 bytes of a utf8 window)." },
+        "offset": { "type": "integer", "minimum": 0 },
+        "totalBytes": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" },
+        "mediaType": { "type": "string" },
+        "sha256": { "type": ["string", "null"] },
+        "externalChanged": { "type": ["boolean", "null"], "description": "null for blob versions; true when the registered file no longer matches (no content then)." }
+      }
+    },
+    "diffResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "binary", "diff", "truncated"],
+      "properties": {
+        "from": { "type": "integer", "minimum": 1 },
+        "to": { "type": "integer", "minimum": 1 },
+        "binary": { "type": "boolean" },
+        "diff": { "type": ["string", "null"], "description": "Unified diff; null for binary versions and for external versions (content not stored, truncated true)." },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "resolveRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["refs"],
+      "properties": {
+        "refs": { "type": "array", "maxItems": 200, "items": { "type": "string" } }
+      }
+    },
+    "resolveItem": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ref", "ok", "artifactId", "name", "kind", "version", "latestVersion", "mediaType", "archived"],
+          "properties": {
+            "ref": { "type": "string" },
+            "ok": { "const": true },
+            "artifactId": { "$ref": "#/$defs/artifactId" },
+            "name": { "type": "string" },
+            "kind": { "$ref": "#/$defs/kind" },
+            "version": { "type": "integer", "minimum": 1 },
+            "latestVersion": { "type": "integer", "minimum": 1 },
+            "mediaType": { "type": "string" },
+            "archived": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ref", "ok", "error"],
+          "properties": {
+            "ref": { "type": "string" },
+            "ok": { "const": false },
+            "error": { "enum": ["artifact_not_found", "forbidden"] }
+          }
+        }
+      ]
+    },
+    "resolveResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["items"],
+      "properties": {
+        "items": { "type": "array", "items": { "$ref": "#/$defs/resolveItem" } }
+      }
+    },
+    "publishRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestId", "path"],
+      "properties": {
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "project": { "type": "string", "minLength": 1 },
+        "session": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1, "description": "Absolute, or relative to the scope's workspace root (project) or the session's cwd." },
+        "name": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "kind": { "$ref": "#/$defs/kind" },
+        "note": { "type": "string", "maxLength": 2000 }
+      }
+    },
+    "publishResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact", "version", "newVersion", "markdown"],
+      "properties": {
+        "artifact": { "$ref": "#/$defs/artifactSummary" },
+        "version": { "$ref": "#/$defs/artifactVersion" },
+        "newVersion": { "type": "boolean" },
+        "markdown": { "type": "string" }
+      }
+    },
+    "patchRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRevision"],
+      "properties": {
+        "expectedRevision": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "kind": { "$ref": "#/$defs/kind" },
+        "starred": { "type": "boolean" },
+        "archived": { "type": "boolean" }
+      }
+    },
+    "patchResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact"],
+      "properties": { "artifact": { "$ref": "#/$defs/artifactSummary" } }
+    },
+    "deleteResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deleted", "artifactId"],
+      "properties": {
+        "deleted": { "const": true },
+        "artifactId": { "$ref": "#/$defs/artifactId" }
+      }
+    },
+    "usageResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bytes", "blobs", "artifacts", "versions", "quotaBytes", "maxBlobBytes", "hashExternalMaxBytes"],
+      "properties": {
+        "bytes": { "type": "integer", "minimum": 0 },
+        "blobs": { "type": "integer", "minimum": 0 },
+        "artifacts": { "type": "integer", "minimum": 0 },
+        "versions": { "type": "integer", "minimum": 0 },
+        "quotaBytes": { "type": "integer", "minimum": 0 },
+        "maxBlobBytes": { "type": "integer", "minimum": 0 },
+        "hashExternalMaxBytes": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

@@ -1,0 +1,318 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:users",
+  "title": "Users",
+  "description": "GET /v2/users → userList (owner; capability users); GET|PATCH /v2/users/me → selfProfile, PATCH body selfProfilePatch, GET /v2/users/{id}/avatar → the image bytes with an ETag (capability users-self-profile); /v2/capabilities user → capabilityUser; cutex/userInput/routeAccepted params.actingUser → actingUser. Person identity (capability person-identity): GET /v2/identity/challenge → identityChallenge, POST /v2/identity/claim body identityClaim → identityClaimResult, PUT /v2/users/{id}/person-keys body personKeysPut → personKeysResult (owner); DELETE /v2/users/token-persons/{tokenId}/previous → tokenPersonPreviousCleared (owner; capability person-identity-ack). Own devices (capability user-own-devices; owner, root or a bound user, pending: 403 user_pending): GET /v2/users/me/devices → ownDevices, DELETE /v2/users/me/devices/{tokenId} → ownDeviceRevoked (404 client_token_not_found for a token not bound to the caller). Capability user-own-token: capabilityUser.token → ownToken or null (root credential).",
+  "anyOf": [
+    { "$ref": "#/$defs/userList" },
+    { "$ref": "#/$defs/selfProfile" },
+    { "$ref": "#/$defs/selfProfilePatch" },
+    { "$ref": "#/$defs/capabilityUser" },
+    { "$ref": "#/$defs/actingUser" },
+    { "$ref": "#/$defs/identityChallenge" },
+    { "$ref": "#/$defs/identityClaim" },
+    { "$ref": "#/$defs/identityClaimResult" },
+    { "$ref": "#/$defs/personKeysPut" },
+    { "$ref": "#/$defs/personKeysResult" },
+    { "$ref": "#/$defs/tokenPersonPreviousCleared" },
+    { "$ref": "#/$defs/ownDevices" },
+    { "$ref": "#/$defs/ownDeviceRevoked" }
+  ],
+  "$defs": {
+    "displayName": { "type": ["string", "null"], "maxLength": 60, "description": "Set by the user on their own desktop (PATCH /v2/users/me). Clients show displayName ?? name. Absent from hosts without users-self-profile." },
+    "avatarEtag": { "type": ["string", "null"], "pattern": "^[0-9a-f]{16}$", "description": "ETag of GET /v2/users/{id}/avatar; null = no avatar. Absent from hosts without users-self-profile." },
+    "publicKey": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$", "description": "Ed25519 public key: base64url without padding of the raw 32 bytes (the JWK x)." },
+    "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{16}$", "description": "First 16 hex digits of SHA-256 of the raw 32 key bytes." },
+    "personKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["publicKey", "fingerprint", "addedAt", "label"],
+      "properties": {
+        "publicKey": { "$ref": "#/$defs/publicKey" },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "addedAt": { "type": "string" },
+        "label": { "type": ["string", "null"], "maxLength": 60 }
+      }
+    },
+    "tokenPerson": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The person a device presented (POST /v2/identity/claim). userId = the user holding that key (null = unknown person); previousPublicKey = set when the device later presented another key (its binding never changes by that) until the owner acknowledges it (DELETE /v2/users/token-persons/{tokenId}/previous).",
+      "required": ["publicKey", "fingerprint", "userId", "displayName", "claimedAt", "previousPublicKey"],
+      "properties": {
+        "publicKey": { "$ref": "#/$defs/publicKey" },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "userId": { "type": ["string", "null"] },
+        "displayName": { "type": ["string", "null"], "maxLength": 60 },
+        "claimedAt": { "type": ["string", "null"] },
+        "previousPublicKey": { "oneOf": [{ "$ref": "#/$defs/publicKey" }, { "type": "null" }] }
+      }
+    },
+    "identityChallenge": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One use, 30 s. Sign the UTF-8 bytes of \"cutex-identity-v1\\n\" + hostId + \"\\n\" + nonce + \"\\n\" + tokenId. Errors: 429 too_many_challenges.",
+      "required": ["nonce", "hostId", "tokenId", "expiresAt"],
+      "properties": {
+        "nonce": { "type": "string" },
+        "hostId": { "type": "string" },
+        "tokenId": { "type": "string", "description": "The calling client / device token id; \"root\" for the root credential." },
+        "expiresAt": { "type": "string" }
+      }
+    },
+    "identityClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Errors: 400 invalid_request / invalid_public_key / challenge_invalid (no live nonce of this credential) / invalid_signature (the nonce is spent either way).",
+      "required": ["publicKey", "signature"],
+      "properties": {
+        "publicKey": { "type": "string", "description": "base64 or base64url of the raw 32-byte Ed25519 public key." },
+        "signature": { "type": "string", "description": "base64 or base64url of the 64-byte Ed25519 signature." },
+        "nonce": { "type": "string", "description": "The challenge nonce; omitted = every live nonce of the caller is tried (and spent)." },
+        "displayName": { "type": ["string", "null"], "minLength": 1, "maxLength": 60, "description": "Self-set name, shown to the owner on a pending device's card." }
+      }
+    },
+    "identityClaimResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "tokenId", "userId", "pending", "personUserId", "publicKey", "fingerprint"],
+      "properties": {
+        "outcome": { "enum": ["autoBound", "ownerKeyAdded", "pending", "recorded"], "description": "autoBound: a pending token was bound to the user holding the key. ownerKeyAdded: the key was added to owner (root credential, or the host's only device bound to owner). pending: unknown person, the device stays pending. recorded: recorded only (a bound token is never rebound)." },
+        "tokenId": { "type": ["string", "null"], "description": "null for the root credential." },
+        "userId": { "type": ["string", "null"], "description": "The caller's user after the claim; null = pending." },
+        "pending": { "type": "boolean" },
+        "personUserId": { "type": ["string", "null"], "description": "The user holding this key, if any." },
+        "publicKey": { "$ref": "#/$defs/publicKey" },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" }
+      }
+    },
+    "personKeysPut": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Replaces the user's keys (empty = none). Errors: 400 invalid_request / invalid_public_key, 404 user_not_found, 409 person_key_in_use (details {publicKey, userId}).",
+      "required": ["personKeys"],
+      "properties": {
+        "personKeys": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["publicKey"],
+            "properties": {
+              "publicKey": { "type": "string" },
+              "label": { "type": ["string", "null"], "maxLength": 60 }
+            }
+          }
+        }
+      }
+    },
+    "personKeysResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["userId", "personKeys"],
+      "properties": {
+        "userId": { "type": "string" },
+        "personKeys": { "type": "array", "items": { "$ref": "#/$defs/personKey" } }
+      }
+    },
+    "tokenPersonPreviousCleared": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "DELETE /v2/users/token-persons/{tokenId}/previous (owner): the owner acknowledged a device's key change. cleared = a previous key was set (idempotent); the device's current key and binding do not change. 404 client_token_not_found.",
+      "required": ["tokenId", "cleared", "previousPublicKey", "personsRevision"],
+      "properties": {
+        "tokenId": { "type": "string" },
+        "cleared": { "type": "boolean" },
+        "previousPublicKey": { "type": "null" },
+        "personsRevision": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "grant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projects", "standaloneAgents", "send"],
+      "properties": {
+        "projects": { "oneOf": [{ "const": "all" }, { "type": "array", "items": { "type": "string" } }] },
+        "standaloneAgents": { "type": "array", "items": { "type": "string" } },
+        "send": { "type": "boolean" }
+      }
+    },
+    "user": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "color", "builtin", "isOwner", "grant", "createdAt", "updatedAt"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string", "description": "The owner-set label (may be a private alias)." },
+        "color": { "type": ["string", "null"] },
+        "builtin": { "type": "boolean" },
+        "isOwner": { "type": "boolean" },
+        "grant": { "oneOf": [{ "$ref": "#/$defs/grant" }, { "type": "null" }] },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "displayName": { "$ref": "#/$defs/displayName" },
+        "avatarEtag": { "$ref": "#/$defs/avatarEtag" },
+        "personKeys": { "type": "array", "items": { "$ref": "#/$defs/personKey" }, "description": "Absent from hosts without person-identity." }
+      }
+    },
+    "userList": {
+      "type": "object",
+      "required": ["hostId", "revision", "users", "tokens", "peers", "settings"],
+      "properties": {
+        "hostId": { "type": "string" },
+        "revision": { "type": "integer" },
+        "users": { "type": "array", "items": { "$ref": "#/$defs/user" } },
+        "tokens": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["tokenId", "userId", "pending"],
+            "properties": {
+              "tokenId": { "type": "string" },
+              "userId": { "type": ["string", "null"] },
+              "pending": { "type": "boolean" },
+              "ownerName": { "type": ["string", "null"], "maxLength": 60, "description": "Owner-given display name (capability client-token-rename)." },
+              "person": { "oneOf": [{ "$ref": "#/$defs/tokenPerson" }, { "type": "null" }] }
+            }
+          }
+        },
+        "tokenPersons": { "type": "object", "additionalProperties": { "$ref": "#/$defs/publicKey" }, "description": "tokenId → presented key (person-identity)." },
+        "personsRevision": { "type": "integer" },
+        "peers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "personKeys": { "type": "array", "items": { "$ref": "#/$defs/publicKey" }, "description": "The remote owner's keys sent at pairing (person-identity)." }
+            }
+          }
+        },
+        "settings": {
+          "type": "object",
+          "required": ["ownerRequiresApproval"],
+          "properties": { "ownerRequiresApproval": { "type": "boolean" } }
+        }
+      }
+    },
+    "selfProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user"],
+      "properties": {
+        "user": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "name", "isOwner", "displayName", "avatarEtag"],
+          "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "isOwner": { "type": "boolean" },
+            "displayName": { "$ref": "#/$defs/displayName" },
+            "avatarEtag": { "$ref": "#/$defs/avatarEtag" }
+          }
+        }
+      }
+    },
+    "selfProfilePatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Omitted = keep, null = clear. Errors: 400 invalid_request / invalid_avatar, 413 avatar_too_large, 403 access_pending.",
+      "properties": {
+        "displayName": { "type": ["string", "null"], "minLength": 1, "maxLength": 60 },
+        "avatar": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["contentType", "data"],
+              "properties": {
+                "contentType": { "enum": ["image/png", "image/jpeg", "image/webp"] },
+                "data": { "type": "string", "description": "Base64 of a square image, 16..=512 px, at most 49152 bytes (desktop sends 128×128)." }
+              }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "capabilityUser": {
+      "type": "object",
+      "required": ["id", "name", "isOwner", "pending", "grant"],
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "name": { "type": ["string", "null"] },
+        "isOwner": { "type": "boolean" },
+        "pending": { "type": "boolean" },
+        "grant": { "oneOf": [{ "$ref": "#/$defs/grant" }, { "type": "null" }] },
+        "displayName": { "$ref": "#/$defs/displayName" },
+        "avatarEtag": { "$ref": "#/$defs/avatarEtag" },
+        "token": { "oneOf": [{ "$ref": "#/$defs/ownToken" }, { "type": "null" }], "description": "The client / device token this request authenticated with (capability user-own-token); null = the root credential. Present for pending devices too." }
+      }
+    },
+    "ownToken": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "deviceName", "ownerName", "platform"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "deviceName": { "type": ["string", "null"], "description": "Reported by the device at pairing." },
+        "ownerName": { "type": ["string", "null"], "maxLength": 60, "description": "Owner-given display name (capability client-token-rename)." },
+        "platform": { "type": ["string", "null"] }
+      }
+    },
+    "ownDevices": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostId", "userId", "devices"],
+      "properties": {
+        "hostId": { "type": "string" },
+        "userId": { "type": "string", "description": "The caller's user (\"owner\" for the root credential and owner-bound tokens)." },
+        "devices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "A GET /v2/users tokens[] item plus current.",
+            "required": ["tokenId", "label", "kind", "deviceName", "platform", "ownerName", "createdAt", "lastUsedAt", "lastAddress", "userId", "pending", "person", "current"],
+            "properties": {
+              "tokenId": { "type": "string" },
+              "label": { "type": "string" },
+              "kind": { "enum": ["client", "device"] },
+              "deviceName": { "type": ["string", "null"] },
+              "platform": { "type": ["string", "null"] },
+              "ownerName": { "type": ["string", "null"], "maxLength": 60 },
+              "createdAt": { "type": "string" },
+              "lastUsedAt": { "type": ["string", "null"] },
+              "lastAddress": { "type": ["string", "null"] },
+              "userId": { "type": "string" },
+              "pending": { "const": false },
+              "person": { "oneOf": [{ "$ref": "#/$defs/tokenPerson" }, { "type": "null" }] },
+              "current": { "type": "boolean", "description": "The token of this request." }
+            }
+          }
+        }
+      }
+    },
+    "ownDeviceRevoked": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tokenId", "revoked", "current"],
+      "properties": {
+        "tokenId": { "type": "string" },
+        "revoked": { "const": true },
+        "current": { "type": "boolean", "description": "true = the caller revoked its own token (this device is signed out; later requests with it get 401)." }
+      }
+    },
+    "actingUser": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "displayName": { "$ref": "#/$defs/displayName" },
+        "avatarEtag": { "$ref": "#/$defs/avatarEtag" }
+      }
+    }
+  }
+}

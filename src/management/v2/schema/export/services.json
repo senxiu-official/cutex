@@ -1,0 +1,415 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:services",
+  "title": "Services",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/serviceList"
+    },
+    {
+      "$ref": "#/$defs/lease"
+    },
+    {
+      "$ref": "#/$defs/viewTicket"
+    },
+    {
+      "type": "object",
+      "required": [
+        "service"
+      ],
+      "properties": {
+        "service": {
+          "$ref": "#/$defs/service"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "settings"
+      ],
+      "properties": {
+        "settings": {
+          "$ref": "#/$defs/settings"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "viewTicketRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "start": {
+          "type": "boolean"
+        },
+        "routing": {
+          "const": "host"
+        },
+        "login": {
+          "type": "boolean"
+        }
+      }
+    },
+    "viewTicket": {
+      "type": "object",
+      "required": [
+        "ticket",
+        "expiresAt",
+        "hostLabel",
+        "authPath"
+      ],
+      "properties": {
+        "ticket": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "hostLabel": {
+          "type": "string"
+        },
+        "login": {
+          "enum": [
+            "issued",
+            "notRunning",
+            "spawnFailed",
+            "timeout",
+            "exitStatus",
+            "noLink"
+          ]
+        },
+        "authPath": {
+          "type": "string"
+        }
+      }
+    },
+    "proxySettings": {
+      "type": "object",
+      "properties": {
+        "proxyMaxConnections": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 1024,
+          "default": 192
+        }
+      }
+    },
+    "proxyView": {
+      "type": "object",
+      "required": [
+        "proxyHost",
+        "proxyHostHeader",
+        "activeConnections",
+        "lastTrafficAt"
+      ],
+      "properties": {
+        "proxyHost": {
+          "type": "string"
+        },
+        "proxyHostHeader": {
+          "enum": [
+            "preserve",
+            "upstream"
+          ]
+        },
+        "activeConnections": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lastTrafficAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "required": [
+        "slug",
+        "displayName",
+        "host",
+        "port",
+        "runtime",
+        "lifetime",
+        "link",
+        "url",
+        "localUrl",
+        "health",
+        "proxyHost",
+        "proxyHostHeader",
+        "activeConnections",
+        "lastTrafficAt"
+      ],
+      "properties": {
+        "slug": {
+          "type": "string"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "runtime": {
+          "enum": [
+            "external",
+            "managed",
+            "static"
+          ]
+        },
+        "lifetime": {
+          "enum": [
+            "ephemeral",
+            "persistent"
+          ]
+        },
+        "link": {
+          "type": "string"
+        },
+        "proxyHost": {
+          "type": "string"
+        },
+        "root": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "localUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "leases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "activeConnections": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lastTrafficAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expiresAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idleReclaimAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "restartsLeft": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "health": {
+          "enum": [
+            "reachable",
+            "unreachable",
+            "starting",
+            "stopped",
+            "crashLooped"
+          ]
+        },
+        "proxyHostHeader": {
+          "enum": [
+            "preserve",
+            "upstream"
+          ]
+        }
+      }
+    },
+    "tombstone": {
+      "type": "object",
+      "required": [
+        "slug",
+        "displayName",
+        "ownerCutexSessionId",
+        "lifetime",
+        "reason",
+        "reclaimedAt"
+      ],
+      "properties": {
+        "slug": {
+          "type": "string"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "ownerCutexSessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lifetime": {
+          "enum": [
+            "ephemeral",
+            "persistent"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "idle",
+            "ttl",
+            "owner_archived"
+          ]
+        },
+        "reclaimedAt": {
+          "type": "string"
+        }
+      }
+    },
+    "lease": {
+      "type": "object",
+      "required": [
+        "leaseId",
+        "expiresAt",
+        "ttlSeconds"
+      ],
+      "properties": {
+        "leaseId": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "ttlSeconds": {
+          "const": 150
+        }
+      }
+    },
+    "settings": {
+      "type": "object",
+      "required": [
+        "portRangeStart",
+        "portRangeEnd",
+        "ephemeralIdleMinutes",
+        "ephemeralTtlHours",
+        "reclaimOnOwnerArchive",
+        "tombstoneDays",
+        "ephemeralMaxRestarts",
+        "proxyMaxConnections",
+        "agentExternalDefaultLifetime",
+        "agentPersistentApproval"
+      ],
+      "properties": {
+        "portRangeStart": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 65535
+        },
+        "portRangeEnd": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 65535
+        },
+        "ephemeralIdleMinutes": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 1440,
+          "default": 30
+        },
+        "ephemeralTtlHours": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 720,
+          "default": 24
+        },
+        "reclaimOnOwnerArchive": {
+          "type": "boolean",
+          "default": true
+        },
+        "tombstoneDays": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 90,
+          "default": 7
+        },
+        "ephemeralMaxRestarts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10,
+          "default": 2
+        },
+        "proxyMaxConnections": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 1024,
+          "default": 192
+        },
+        "agentExternalDefaultLifetime": {
+          "enum": [
+            "ephemeral",
+            "persistent"
+          ],
+          "default": "ephemeral"
+        },
+        "agentPersistentApproval": {
+          "enum": [
+            "ask",
+            "off"
+          ],
+          "default": "ask"
+        }
+      }
+    },
+    "serviceList": {
+      "type": "object",
+      "required": [
+        "hostId",
+        "services",
+        "settings"
+      ],
+      "properties": {
+        "hostId": {
+          "type": "string"
+        },
+        "services": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/service"
+          }
+        },
+        "settings": {
+          "$ref": "#/$defs/settings"
+        },
+        "tombstones": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tombstone"
+          }
+        }
+      }
+    }
+  }
+}

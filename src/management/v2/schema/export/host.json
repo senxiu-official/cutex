@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:host",
+  "title": "Host identity",
+  "description": "GET /v2/host (identity fields: capability host-identity): which daemon this is, in one call for a host switcher.",
+  "anyOf": [
+    { "$ref": "#/$defs/host" }
+  ],
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "cutexBuild": {
+      "type": "object",
+      "description": "Build identity of the cutex binary (same as /v2/capabilities cutexBuild). release / commit / builtAt are null on builds that did not set CUTEX_RELEASE / CUTEX_COMMIT / CUTEX_BUILD_TIME (dev builds).",
+      "required": ["version", "release", "commit", "builtAt", "profile", "channel"],
+      "properties": {
+        "version": { "type": "string", "description": "Cargo package version (not a release id)." },
+        "release": { "$ref": "#/$defs/nullableString" },
+        "commit": { "$ref": "#/$defs/nullableString" },
+        "builtAt": { "$ref": "#/$defs/nullableString" },
+        "profile": { "enum": ["release", "debug"] },
+        "channel": { "enum": ["main", "release"], "description": "Release channel the binary was built for: release (public / colleague builds, CUTEX_CHANNEL=release or the older stable) or main (default, owner / dev builds). Older daemons sent dev / stable." }
+      }
+    },
+    "host": {
+      "type": "object",
+      "required": ["schema", "hostId", "instanceId", "platform", "arch", "osVersion", "cutexBuild"],
+      "properties": {
+        "schema": { "const": "cutex/host/v1" },
+        "hostId": { "type": "string", "description": "Machine name; shared by every cutex home on the machine." },
+        "instanceId": { "type": "string", "description": "Random id created once per cutex home (<cutex home>/instance-id, e.g. ci-<32 hex>) and never changed; same as /v2/capabilities instanceId. A different value at the same address means the daemon (home) was replaced." },
+        "platform": { "type": "string", "description": "Rust std::env::consts::OS: windows, linux, macos, ..." },
+        "arch": { "type": "string", "description": "Rust std::env::consts::ARCH: x86_64, aarch64, ..." },
+        "osVersion": { "$ref": "#/$defs/nullableString", "description": "Short human OS version, best effort, e.g. \"Windows 11 Pro 10.0.26200\" or \"Ubuntu 24.04.1 LTS\" (os-release PRETTY_NAME); null when unknown." },
+        "cutexBuild": { "$ref": "#/$defs/cutexBuild" },
+        "executable": { "$ref": "#/$defs/nullableString", "description": "Path of the running cutex executable." },
+        "serviceManager": { "$ref": "#/$defs/serviceManager" },
+        "runtimes": {
+          "description": "Owner only (null for other principals or when the stores cannot be read): runtimes selected for new agents and how many agents use each.",
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/runtimes" }]
+        }
+      }
+    },
+    "serviceManager": {
+      "type": "object",
+      "description": "What keeps this daemon running (backend auto-update RFC P0).",
+      "required": ["kind", "unit", "managedInstall"],
+      "properties": {
+        "kind": { "enum": ["systemd", "cutex-supervisor", "runtime-host", "none"], "description": "systemd (Linux user units), cutex-supervisor (`cutex service run`, Windows logon task), runtime-host (owner hosts on Windows) or none (started by hand)." },
+        "unit": { "$ref": "#/$defs/nullableString", "description": "systemd unit name when known." },
+        "managedInstall": { "type": "boolean", "description": "The daemon runs from a `cutex service install` layout; only such installs can be upgraded with `cutex upgrade` / /v2/upgrade." }
+      }
+    },
+    "runtimeUse": {
+      "type": "object",
+      "required": ["release", "version", "agents", "selected", "missing"],
+      "properties": {
+        "release": { "type": "string", "description": "r53 (native) or claude-r12 (Claude runtime directory)." },
+        "version": { "$ref": "#/$defs/nullableString", "description": "Native version (0.162.1-r53); null for Claude runtimes and unregistered native builds." },
+        "agents": { "type": "integer", "minimum": 0, "description": "Non-retired agents pinned to it." },
+        "selected": { "type": "boolean", "description": "Used for new agents." },
+        "missing": { "type": "boolean", "description": "Its files no longer exist." }
+      }
+    },
+    "runtimes": {
+      "type": "object",
+      "required": ["native", "claude", "unpinnedAgents"],
+      "properties": {
+        "native": {
+          "type": "object",
+          "required": ["selected", "latest", "inUse"],
+          "properties": {
+            "selected": { "$ref": "#/$defs/nullableString" },
+            "latest": { "$ref": "#/$defs/nullableString" },
+            "inUse": { "type": "array", "items": { "$ref": "#/$defs/runtimeUse" }, "description": "Selected entry plus every entry with agents, newest first." }
+          }
+        },
+        "claude": {
+          "type": "object",
+          "required": ["selected", "inUse"],
+          "properties": {
+            "selected": { "$ref": "#/$defs/nullableString" },
+            "inUse": { "type": "array", "items": { "$ref": "#/$defs/runtimeUse" } }
+          }
+        },
+        "unpinnedAgents": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

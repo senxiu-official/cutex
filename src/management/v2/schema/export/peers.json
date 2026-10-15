@@ -1,0 +1,1406 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:peers",
+  "title": "Daemon peers and cross-host delegation",
+  "description": "Owner administration at /v2/peers and separately authenticated /peer/v1 transport. Capability peers-v2 identifies the negotiated asks.v1 protocol and safe rollback support. Tokens appear only in pairing exchange. Wire objects tolerate additive fields and unknown state strings; owner settings and policy reject unknown fields.",
+  "$defs": {
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "outboxMaxAgeHours",
+        "maxHops",
+        "refreshAgentsSecs",
+        "connectTimeoutSecs",
+        "readTimeoutSecs"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable daemon peer traffic. Disabling interrupts outgoing mirrors and retains incoming result outboxes until expiry."
+        },
+        "outboxMaxAgeHours": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 720,
+          "default": 24,
+          "description": "Maximum age of unconfirmed outgoing creates and incoming result delivery, in hours."
+        },
+        "maxHops": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 3,
+          "description": "Maximum cross-host hops. Local delegations inherit ancestry hops; sending to another host increments it."
+        },
+        "refreshAgentsSecs": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 3600,
+          "default": 60,
+          "description": "Remote directory refresh interval, in seconds."
+        },
+        "connectTimeoutSecs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60,
+          "default": 5,
+          "description": "Connection timeout per peer address, in seconds."
+        },
+        "readTimeoutSecs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300,
+          "default": 30,
+          "description": "Response read timeout, in seconds. Independent of the connection timeout."
+        }
+      }
+    },
+    "export": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "agent"
+          ],
+          "properties": {
+            "agent": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "project"
+          ],
+          "properties": {
+            "project": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "all"
+          ],
+          "properties": {
+            "all": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inbound",
+        "outbound"
+      ],
+      "properties": {
+        "inbound": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "exports",
+            "accept",
+            "assumedCaps",
+            "review",
+            "maxOpenAsks",
+            "asksPerHour"
+          ],
+          "properties": {
+            "exports": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/export"
+              },
+              "description": "Complete replacement on PATCH; [] exports nothing. Entries select an agent, project, or {all:true}.",
+              "default": []
+            },
+            "review": {
+              "enum": [
+                "always",
+                "ifTargetWider",
+                "never"
+              ],
+              "default": "always",
+              "description": "always requires owner approval for every inbound ask. ifTargetWider compares the target against the local assumedCaps ceiling. never fully trusts the peer host. Claimed requester capabilities are display-only."
+            },
+            "maxOpenAsks": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "default": 20
+            },
+            "asksPerHour": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000,
+              "default": 60
+            },
+            "accept": {
+              "type": "boolean",
+              "default": true,
+              "description": "Accept new asks from this peer when their target is exported."
+            },
+            "assumedCaps": {
+              "$ref": "#/$defs/caps",
+              "default": {
+                "sandbox": "read-only",
+                "networkAccess": false,
+                "unrestrictedServices": false
+              },
+              "description": "Local capability ceiling trusted for this peer. ifTargetWider uses this value, never the capabilities claimed in the network request."
+            }
+          }
+        },
+        "outbound": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "visibility"
+          ],
+          "properties": {
+            "visibility": {
+              "enum": [
+                "none",
+                "all"
+              ],
+              "default": "none"
+            }
+          }
+        }
+      },
+      "description": "P0.1 compatibility policy. Visibility and delivery use one local authorization boundary (policy::visible/can_deliver), ready to resolve the bound user grants in P1. Local Directory entries only; remote directory caches and mirror asks are never re-exported."
+    },
+    "peer": {
+      "type": "object",
+      "required": [
+        "peerId",
+        "label",
+        "hostId",
+        "platform",
+        "urls",
+        "enabled",
+        "status",
+        "policy",
+        "id",
+        "instanceId",
+        "state",
+        "nextProbeAt",
+        "features",
+        "lastError",
+        "userId"
+      ],
+      "properties": {
+        "peerId": {
+          "type": "string",
+          "pattern": "^ci-[a-fA-F0-9]{32}$"
+        },
+        "label": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]{1,32}$"
+        },
+        "hostId": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "urls": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "online",
+            "unreachable",
+            "identityChanged",
+            "versionMismatch",
+            "removedByPeer",
+            "pairing",
+            "credentialRejected"
+          ],
+          "description": "Internal health spelling; desktop should use state. pairing maps to pending."
+        },
+        "policy": {
+          "$ref": "#/$defs/policy"
+        },
+        "lastError": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/errorCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastSeenAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outbox": {
+          "type": "object",
+          "properties": {
+            "pending": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "oldestAgeSecs": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        },
+        "inboundTokenSha256": false,
+        "token": false,
+        "tokenForYou": false,
+        "id": {
+          "$ref": "#/$defs/instanceId"
+        },
+        "instanceId": {
+          "$ref": "#/$defs/instanceId"
+        },
+        "nextProbeAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "online",
+            "unreachable",
+            "identityChanged",
+            "versionMismatch",
+            "disabled",
+            "removedByPeer",
+            "credentialRejected"
+          ]
+        },
+        "features": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "declared",
+            "negotiated"
+          ],
+          "properties": {
+            "declared": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "negotiated": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "negotiatedFeatures": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inflight": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "outbound",
+            "inbound"
+          ],
+          "properties": {
+            "outbound": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "inbound": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "outboxPending": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outboxOldestAgeSecs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "deadLetterCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "protocol": {
+          "type": "integer"
+        },
+        "policyRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string",
+          "const": "owner",
+          "default": "owner",
+          "description": "Local account binding reserved for P1. P0.1 only accepts owner; an explicit other user is rejected with peer_user_unsupported."
+        },
+        "outboxOldestAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Stable timestamp of the oldest queued operation or event. Age is derived for display and does not trigger change events."
+        }
+      }
+    },
+    "peerList": {
+      "type": "object",
+      "required": [
+        "peers"
+      ],
+      "properties": {
+        "peers": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/peer"
+              },
+              {
+                "required": [
+                  "outboxPending",
+                  "outboxOldestAgeSecs",
+                  "deadLetterCount",
+                  "inflight",
+                  "outboxOldestAt"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    },
+    "inviteRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "targetUserId": {
+          "type": "string",
+          "const": "owner",
+          "default": "owner",
+          "description": "User on the receiving host. P0.1 defaults to owner and rejects any explicit non-owner; P1 will bind the receiver-side peer to this local user."
+        },
+        "userId": {
+          "type": "string",
+          "const": "owner",
+          "default": "owner",
+          "description": "Local account binding reserved for P1. P0.1 only accepts owner; an explicit other user is rejected with peer_user_unsupported."
+        }
+      }
+    },
+    "inviteResponse": {
+      "type": "object",
+      "required": [
+        "code",
+        "expiresAt",
+        "instanceId",
+        "hostId",
+        "urls"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "instanceId": {
+          "type": "string"
+        },
+        "hostId": {
+          "type": "string"
+        },
+        "urls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "addRequest": {
+      "type": "object",
+      "required": [
+        "url",
+        "code"
+      ],
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "targetUserId": {
+          "type": "string",
+          "const": "owner",
+          "default": "owner",
+          "description": "User on the receiving host. P0.1 defaults to owner and rejects any explicit non-owner; P1 will bind the receiver-side peer to this local user."
+        },
+        "userId": {
+          "type": "string",
+          "const": "owner",
+          "default": "owner",
+          "description": "User bound to the peer on this initiating host. P0.1 only owner; targetUserId separately selects the remote host binding."
+        }
+      }
+    },
+    "peerResponse": {
+      "type": "object",
+      "required": [
+        "peer"
+      ],
+      "properties": {
+        "peer": {
+          "$ref": "#/$defs/peer"
+        }
+      }
+    },
+    "patchRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "urls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "policy": {
+          "type": "object",
+          "properties": {
+            "inbound": {
+              "type": "object"
+            },
+            "outbound": {
+              "type": "object"
+            }
+          },
+          "description": "Partial inbound/outbound fields are merged; exports replaces the complete array."
+        }
+      }
+    },
+    "removed": {
+      "type": "object",
+      "required": [
+        "removed"
+      ],
+      "properties": {
+        "removed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "pairRequest": {
+      "type": "object",
+      "required": [
+        "code",
+        "instanceId",
+        "hostId",
+        "label",
+        "url",
+        "tokenForYou"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "instanceId": {
+          "type": "string"
+        },
+        "hostId": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "tokenForYou": {
+          "type": "string",
+          "pattern": "^cxp1\\."
+        },
+        "ownerPersonKeys": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string"
+          },
+          "description": "Person identity: the sending host's owner public keys (base64url, raw 32-byte Ed25519). When the receiving owner did not pick a user for the invite, a key held by a local user binds the peer to that user instead of owner. Ignored by hosts without person-identity."
+        },
+        "targetUserId": {
+          "type": "string",
+          "const": "owner",
+          "default": "owner",
+          "description": "User on the receiving host. P0.1 defaults to owner and rejects any explicit non-owner; P1 will bind the receiver-side peer to this local user."
+        },
+        "userId": {
+          "type": "string",
+          "const": "owner",
+          "default": "owner",
+          "description": "Reserved identity field; if supplied in P0.1 it must be owner. The receiver-side binding is selected by targetUserId."
+        }
+      }
+    },
+    "hello": {
+      "type": "object",
+      "required": [
+        "instanceId",
+        "hostId",
+        "label",
+        "protocol",
+        "features",
+        "cutexBuild"
+      ],
+      "properties": {
+        "instanceId": {
+          "type": "string"
+        },
+        "hostId": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "protocol": {
+          "type": "integer",
+          "description": "Local implementation accepts protocol 1; another integer is displayed as versionMismatch."
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Declared features. Both peers must negotiate asks.v1, asks.snapshot.v1, asks.close.v1 and agents.list.v1; missing required features suspend transport until successful hello."
+        },
+        "cutexBuild": {},
+        "platform": {
+          "type": "string"
+        }
+      }
+    },
+    "pairResponse": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/hello"
+        },
+        {
+          "type": "object",
+          "required": [
+            "tokenForYou"
+          ],
+          "properties": {
+            "tokenForYou": {
+              "type": "string",
+              "pattern": "^cxp1\\."
+            },
+            "ownerPersonKeys": {
+              "type": "array",
+              "maxItems": 8,
+              "items": {
+                "type": "string"
+              },
+              "description": "Person identity: the responding host's owner public keys (see pairRequest)."
+            }
+          }
+        }
+      ]
+    },
+    "agents": {
+      "type": "object",
+      "required": [
+        "fetchedAt",
+        "agents"
+      ],
+      "properties": {
+        "fetchedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "cutexSessionId",
+              "name",
+              "short",
+              "status",
+              "runtime"
+            ],
+            "properties": {
+              "cutexSessionId": {
+                "type": "string"
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "short": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "idle",
+                  "busy",
+                  "offline"
+                ]
+              },
+              "runtime": {
+                "enum": [
+                  "codex",
+                  "claude"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "caps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sandbox",
+        "networkAccess",
+        "unrestrictedServices"
+      ],
+      "properties": {
+        "sandbox": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "networkAccess": {
+          "type": "boolean"
+        },
+        "unrestrictedServices": {
+          "type": "boolean"
+        }
+      }
+    },
+    "createAsk": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "requester",
+        "target",
+        "title",
+        "text",
+        "requestSha256"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1,
+          "default": 1
+        },
+        "requester": {
+          "$ref": "#/$defs/wireRequesterV1"
+        },
+        "target": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string",
+          "description": "At most 4096 UTF-8 bytes."
+        },
+        "options": {
+          "$ref": "#/$defs/wireOptionsV1"
+        },
+        "hops": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "requestSha256": {
+          "type": "string",
+          "description": "SHA-256 of canonical JSON containing schemaVersion, requester (cutexSessionId, normalized name, caps.sandbox/networkAccess/unrestrictedServices), target, title, text, options.ifBusy/review/questions/notify/context, and hops. Object keys sort recursively; arrays preserve order. Digest field and unknown fields are excluded."
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "askId",
+        "revision",
+        "execution"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1,
+          "default": 1
+        },
+        "askId": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "execution": {
+          "type": "string",
+          "description": "Known values pendingReview, queued, admitted, running, answered, failed, interrupted, cancelled, rejected. Unknown strings are displayed without changing local execution."
+        },
+        "hold": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/wireHold"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "closed": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Known values completed, accepted, abandoned, stopped, cancelled, superseded."
+        },
+        "review": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Known values awaitingAcceptance, accepted, changesRequested, abandoned."
+        },
+        "answer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/wireAnswerV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "At most 65536 UTF-8 bytes."
+        },
+        "interruptReason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Known values stopped, ownerStopped, runtimeRestart, outcomeUnknown, peerRemoved, peerDisabled, peersDisabled, removedByPeer, peerStripped."
+        },
+        "lastError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "opId",
+        "op"
+      ],
+      "properties": {
+        "opId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "op": {
+          "enum": [
+            "stop",
+            "close"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "stop",
+            "accepted",
+            "abandoned",
+            null
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "events": {
+      "type": "object",
+      "required": [
+        "fromInstanceId",
+        "events"
+      ],
+      "properties": {
+        "fromInstanceId": {
+          "type": "string"
+        },
+        "events": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "required": [
+              "eventId",
+              "askId",
+              "revision",
+              "snapshot"
+            ],
+            "properties": {
+              "eventId": {
+                "type": "string"
+              },
+              "askId": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "integer"
+              },
+              "snapshot": {
+                "$ref": "#/$defs/snapshot"
+              }
+            }
+          }
+        }
+      }
+    },
+    "ack": {
+      "type": "object",
+      "required": [
+        "acked"
+      ],
+      "properties": {
+        "acked": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "changed": {
+      "type": "object",
+      "required": [
+        "peerId",
+        "reason"
+      ],
+      "properties": {
+        "peerId": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "confirm": {
+      "type": "object",
+      "required": [
+        "confirmed"
+      ],
+      "properties": {
+        "confirmed": {
+          "const": true
+        }
+      }
+    },
+    "settingsPatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable daemon peer traffic. Disabling interrupts outgoing mirrors and retains incoming result outboxes until expiry."
+        },
+        "outboxMaxAgeHours": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 720,
+          "default": 24,
+          "description": "Maximum age of unconfirmed outgoing creates and incoming result delivery, in hours."
+        },
+        "maxHops": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 3,
+          "description": "Maximum cross-host hops. Local delegations inherit ancestry hops; sending to another host increments it."
+        },
+        "refreshAgentsSecs": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 3600,
+          "default": 60,
+          "description": "Remote directory refresh interval, in seconds."
+        },
+        "connectTimeoutSecs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60,
+          "default": 5,
+          "description": "Connection timeout per peer address, in seconds."
+        },
+        "readTimeoutSecs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300,
+          "default": 30,
+          "description": "Response read timeout, in seconds. Independent of the connection timeout."
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retryable",
+        "details"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object"
+        }
+      }
+    },
+    "errorCode": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        }
+      }
+    },
+    "instanceId": {
+      "type": "string",
+      "pattern": "^ci-[a-fA-F0-9]{32}$"
+    },
+    "wireCapsV1": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "sandbox": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "networkAccess": {
+          "type": "boolean"
+        },
+        "unrestrictedServices": {
+          "type": "boolean"
+        }
+      }
+    },
+    "wireOptionsV1": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "ifBusy": {
+          "type": "string",
+          "default": "queue",
+          "description": "Known values queue, fail. Unknown strings decode but are not executable."
+        },
+        "review": {
+          "type": "boolean",
+          "default": false
+        },
+        "questions": {
+          "type": "string",
+          "default": "requester",
+          "description": "Known values requester, owner."
+        },
+        "notify": {
+          "type": "string",
+          "default": "turn",
+          "description": "Known values turn, passive."
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "description": "Known values none, brief, recent, fork. Peer creates support none and brief."
+            },
+            "turns": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "wireRequesterV1": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "cutexSessionId"
+      ],
+      "properties": {
+        "cutexSessionId": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Sanitized to one line and at most 128 UTF-8 bytes for agent-visible text."
+        },
+        "caps": {
+          "$ref": "#/$defs/wireCapsV1"
+        }
+      }
+    },
+    "wireCreateV1": {
+      "$ref": "#/$defs/createAsk"
+    },
+    "wireHold": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "reason"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "description": "Known values include targetBusy, paused, heldByRuntime, blocked, waitingForApproval, waitingForInput, profileSwitchPending, runtimeUnsupported, waitingForEvent, peerUnreachable, peerIdentityChanged, peerVersionMismatch, peerUnknown. Unknown strings remain diagnostic state."
+        },
+        "position": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by": {
+          "type": "string"
+        },
+        "native": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "missing": {
+          "type": "string"
+        },
+        "jobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "until": {
+          "type": "string"
+        },
+        "since": {
+          "type": "string"
+        },
+        "timeoutAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "raw": {
+          "type": "string"
+        }
+      }
+    },
+    "wireAnswerMetadataV1": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "durationMs": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ownerSteered": {
+          "type": "boolean"
+        },
+        "sharedTurn": {
+          "type": "boolean"
+        },
+        "compacted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "wireAnswerV1": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "answerId",
+        "askId",
+        "attempt",
+        "revision",
+        "status",
+        "bytes",
+        "createdAt"
+      ],
+      "properties": {
+        "answerId": {
+          "type": "string"
+        },
+        "askId": {
+          "type": "string"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "type": "string",
+          "description": "Known values completed, failed, interrupted; unknown strings remain diagnostic."
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "metadata": {
+          "$ref": "#/$defs/wireAnswerMetadataV1"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "description": "Portable answer metadata. Sender emits no local artifact IDs, native turn/diff IDs, model/profile, token usage, or included-note IDs. Unknown received fields are ignored."
+    },
+    "wireSnapshotV1": {
+      "$ref": "#/$defs/snapshot"
+    },
+    "inflight": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "asks"
+      ],
+      "properties": {
+        "asks": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      },
+      "description": "GET /v2/peers/{peerId}/inflight. Open outgoing mirrors and incoming asks that removal will interrupt."
+    },
+    "auditEntry": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "ts",
+        "direction",
+        "route",
+        "status",
+        "bytes",
+        "actingUser"
+      ],
+      "properties": {
+        "ts": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string"
+        },
+        "peerId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "route": {
+          "type": "string"
+        },
+        "askId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "opId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eventIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "integer"
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actingUser": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Local user bound to this peer (owner in P0.1); null before a peer is associated. Management audit only, never agent-visible."
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "entries"
+      ],
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/auditEntry"
+          }
+        }
+      },
+      "description": "GET /v2/peers/{peerId}/audit?limit=100 (maximum 1000). Newest first, current audit file only; never includes bodies or credentials."
+    }
+  }
+}

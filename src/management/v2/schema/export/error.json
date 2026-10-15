@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:error",
+  "title": "CutexErrorBody",
+  "description": "Management v2 error envelope (every non-2xx JSON response) and the SSE `cutex_management_stream_error` frame data.",
+  "$ref": "#/$defs/errorBody",
+  "$defs": {
+    "errorBody": {
+      "type": "object",
+      "required": ["contractVersion", "error"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "error": {
+          "type": "object",
+          "required": ["source", "code", "message", "retryable"],
+          "properties": {
+            "source": { "type": "string" },
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "retryable": { "type": "boolean" },
+            "diagnosticId": { "type": "string" },
+            "details": {}
+          }
+        }
+      }
+    }
+  }
+}
