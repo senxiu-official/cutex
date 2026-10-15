@@ -5,7 +5,7 @@
   "sourceCommit": null,
   "sourceCommitNote": "withheld: kept in the private export record next to the export directory",
   "license": "Apache-2.0",
-  "fileCount": 855,
+  "fileCount": 857,
   "files": [
     {
       "path": ".cargo/config.toml",
@@ -18,9 +18,19 @@
       "size": 122
     },
     {
+      "path": ".github/ci/build-cutex.sh",
+      "sha256": "35fb14000136be02b042dbef1b8071b77cf1d8fb8d5d5cedc8ab4a1cc8f7771c",
+      "size": 5900
+    },
+    {
+      "path": ".github/workflows/build-binaries.yml",
+      "sha256": "8bfbbaac73908f7cec74cb6d057a0b6d168e1cef1bee4be7b42bd32477cd84ea",
+      "size": 4232
+    },
+    {
       "path": ".github/workflows/release.yml",
-      "sha256": "6d04ce82e5c7fa83784714120f0c64e06aabc3f81e052655c896625735660214",
-      "size": 1492
+      "sha256": "34c1541d5d8ad9e3b9727be7d0380c069f7953ca369c61a2b84e3ead07a16d3c",
+      "size": 2201
     },
     {
       "path": ".gitignore",
@@ -54,13 +64,13 @@
     },
     {
       "path": "README.md",
-      "sha256": "a0deecb55e0f3857a936279ff5591864e3dfc4e4c18ee63542ad7539bff6fd88",
-      "size": 11023
+      "sha256": "767334225ca95474023a73a497034b72604c0a47c21f24c5c877bea161e52557",
+      "size": 12000
     },
     {
       "path": "README.zh-CN.md",
-      "sha256": "31c1272d896787f01d5ab3f051569b234491f52b3982fae491f9f7df7b9d67f0",
-      "size": 11175
+      "sha256": "f2f532424b006159249c12e20508ece04c7a47a7e1f264f4cf0b81ba342b8474",
+      "size": 12165
     },
     {
       "path": "assets/logo.png",

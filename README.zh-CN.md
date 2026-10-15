@@ -70,13 +70,24 @@ Profile 和用量。
 
 ## 安装
 
-目前没有预编译的二进制文件，cutex 需要从源码构建。完整的安装指南涵盖 Linux 和 Windows 上的 cutex、cute-codex、
-Claude 运行时和桌面端，人照着做或者交给编程助手执行都可以：
+可以用发布的二进制安装，也可以从源码构建。完整的安装指南两种方式都涵盖，包括 Linux 和 Windows 上的 cutex、
+cute-codex、Claude 运行时和桌面端，人照着做或者交给编程助手执行都可以：
 
 **[AGENT-INSTALL.md](https://github.com/senxiu-official/cutex-desktop/blob/release/docs/install/AGENT-INSTALL.md)**
 （在 cutex-desktop 仓库里，英文）
 
-单独构建 cutex（Rust 1.95）：
+**发布的二进制。** 每个 [GitHub Release](https://github.com/senxiu-official/cutex/releases) 都附有
+GitHub Actions 从对应标签的提交构建的 `cutex` + `cutex-mcp`（Linux x64 和 Windows x64），以及签名的 `manifest.json`。
+每个文件都用 minisign 签名（`<文件>.minisig`），用发布公钥校验；cutex 后端更新信任的也是这把公钥（`src/upgrade/keys.rs`）：
+
+```sh
+minisign -Vm <文件> -P RWRH9INhAb2gACJAg/h5EBjbudos2LXj6K+5hRBEGeVLDKaKzE+FICmS
+```
+
+指南的 B 节把它们装成托管安装，之后通过 `cutex upgrade` 或桌面端的后端更新升级。Windows 和 macOS 的桌面应用没有用付费
+证书做代码签名，第一次启动时 Windows SmartScreen 和 macOS Gatekeeper 会提示（指南写了该点哪里）；这里的命令行程序不受影响。
+
+**从源码**单独构建 cutex（Rust 1.95）：
 
 ```sh
 git clone --branch release https://github.com/senxiu-official/cutex.git
@@ -129,8 +140,8 @@ cargo build --locked --release --bin cutex --bin cutex-mcp
 - **远程访问默认在你自己的网络里。** 接口默认只监听本机回环地址。访问其他机器请通过 SSH 或你信任的私有 tailnet，
   不要把管理接口或智能体总线的端口暴露到公网。
 - **用户身份是为了方便。** 用户身份是为了和熟人共用主机，不是防陌生人的安全边界。
-- **目前只能从源码升级。** 托管安装（`cutex service install`）带有 `cutex upgrade` 命令，可以应用签名的发布版本，
-  但目前还没有发布签名版本。
+- **升级。** 托管安装（`cutex service install`）用 `cutex upgrade` 应用签名的发布版本（见 `cutex upgrade --help`）。
+  从源码构建的安装也可以继续从源码升级。
 - 在 Linux 上，智能体可以使用独立的 Job Service 运行长时间的命令；它不在这个仓库里。
 
 ### 本地数据
@@ -165,6 +176,8 @@ CUTEX_TEST_PRIVATE_HOME=~/cutex-test-home HOME=~/cutex-test-home cargo test --lo
 `cutex management serve` 请用单独的端口（`--port`），避免和已安装的后台服务冲突。
 
 Claude 适配器是一个 Python 包，测试在 `claude-adapter/` 里。
+
+欢迎在 GitHub issue 里报 bug。觉得有用的话，欢迎在 GitHub 上点个 Star，方便更多人找到它。
 
 ## 致谢
 

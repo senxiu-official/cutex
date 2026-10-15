@@ -90,14 +90,28 @@ Linux and Windows x64.
 
 ## Install
 
-There are no prebuilt binaries yet; cutex is built from source. The full guide covers cutex,
+Install from the release binaries or build from source. The full guide covers both, for cutex,
 cute-codex, the Claude runtime and the desktop on Linux and Windows. It is written so that either
 you or an AI coding agent can follow it end to end:
 
 **[AGENT-INSTALL.md](https://github.com/senxiu-official/cutex-desktop/blob/release/docs/install/AGENT-INSTALL.md)**
 (in the cutex-desktop repository)
 
-The cutex build itself, with Rust 1.95:
+**Release binaries.** Each [GitHub Release](https://github.com/senxiu-official/cutex/releases)
+carries `cutex` + `cutex-mcp` for Linux x64 and Windows x64, built by GitHub Actions from the tagged
+commit, and a signed `manifest.json`. Every file is signed with minisign (`<file>.minisig`); verify it
+with the release key, the same key cutex trusts for backend updates (`src/upgrade/keys.rs`):
+
+```sh
+minisign -Vm <file> -P RWRH9INhAb2gACJAg/h5EBjbudos2LXj6K+5hRBEGeVLDKaKzE+FICmS
+```
+
+The guide's section B installs them as a managed install, which then updates through
+`cutex upgrade` / the desktop's backend updates. The desktop apps for Windows and macOS are not
+code-signed with a paid certificate, so Windows SmartScreen and macOS Gatekeeper warn on the first
+start (the guide says what to click); the command-line binaries here are not affected.
+
+**From source**, the cutex build itself, with Rust 1.95:
 
 ```sh
 git clone --branch release https://github.com/senxiu-official/cutex.git
@@ -159,9 +173,9 @@ This is a first take. Its author uses it every day, but few others do yet.
   Agent Bus ports to the internet.
 - **Users are a convenience.** User identities make it easy to share a host with people you know;
   they are not a security boundary against strangers.
-- **Upgrades are from source for now.** A managed install (`cutex service install`) has a
-  `cutex upgrade` command that applies signed releases, but no signed releases are published
-  yet.
+- **Upgrades.** A managed install (`cutex service install`) applies signed releases with
+  `cutex upgrade` (see `cutex upgrade --help`).
+  A source build can also be updated from source.
 - On Linux, agents can use a separate Job Service for long-running commands; it is not part of
   this repository.
 
@@ -199,6 +213,9 @@ cutex then uses `~/cutex-test-home/.cutex`. Release builds refuse to run with `C
 debug `cutex management serve` on its own port (`--port`) so it never meets an installed daemon.
 
 The Claude adapter is a Python package with its own tests in `claude-adapter/`.
+
+Bug reports are welcome as GitHub issues. If cutex is useful to you, a star on GitHub helps others
+find it.
 
 ## Acknowledgements
 
