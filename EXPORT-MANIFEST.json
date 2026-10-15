@@ -64,13 +64,13 @@
     },
     {
       "path": "README.md",
-      "sha256": "767334225ca95474023a73a497034b72604c0a47c21f24c5c877bea161e52557",
-      "size": 12000
+      "sha256": "8036e1e1d53904a806f308830014f9dfd26ab584ff9d805cfc98d838a6ad3f2c",
+      "size": 12508
     },
     {
       "path": "README.zh-CN.md",
-      "sha256": "f2f532424b006159249c12e20508ece04c7a47a7e1f264f4cf0b81ba342b8474",
-      "size": 12165
+      "sha256": "c75c8beada230a536aa096ee474d6396d3bb0b24d41a09c90bd11b73d8dbcf9c",
+      "size": 12659
     },
     {
       "path": "assets/logo.png",

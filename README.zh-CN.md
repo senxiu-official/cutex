@@ -8,6 +8,12 @@
 
 **0.1.0「First Take」**：第一个公开版本。
 
+> **0.1.x 的已知缺口**（正在修，修好后删除这段）：
+> - **Claude 智能体**需要 Claude 运行时（`claude-adapter`），安装指南和发布包目前还不会安装它；基于 Codex 的智能体可以正常使用。
+> - **作业页和 NCI 远程作业**需要 Job Service，本版本还没有包含。
+> - **手机推送 / 配对手机**：还没有公开的手机应用。
+> - **外发通知（webhook）**需要 `cutex notify run`，安装程序还不会设置它。
+
 cutex 是在你自己的电脑上运行编程智能体的后台服务。智能体运行在
 [cute-codex](https://github.com/senxiu-official/cute-codex)（OpenAI Codex 的分支）或 Claude Code 上
 （通过 [`claude-adapter/`](claude-adapter/) 里的适配器）。所有状态都在 cutex 里：智能体、项目、队列、委托、
