@@ -241,6 +241,8 @@ fn cutex_and_native_method_tables_are_reviewed_snapshots() {
             "cutex/ownerNotify/reply",
             "cutex/ownerNotify/dismiss",
             "cutex/ownerNotify/delete",
+            "cutex/safetyCheck/grant",
+            "cutex/safetyCheck/dismiss",
         ]
     );
     assert_eq!(native_need("turn/start"), Need::Owner);

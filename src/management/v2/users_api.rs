@@ -39,6 +39,13 @@
 //! Listings (`GET /v2/users` items, `/v2/capabilities` `user`, `actingUser`)
 //! carry `displayName` and `avatarEtag`.
 //!
+//! Peer owner profiles (capability `peer-owner-profile`, `crate::peers::profiles`):
+//! a user bound to a paired peer owner's person key gets that owner's name /
+//! avatar unless set or cleared here directly; `GET /v2/users` items carry
+//! `profileSource` (`null` = all direct, else `{kind: "peer", peerId,
+//! fields: ["displayName"|"avatar"], updatedAt}`); host event
+//! `cutex/users/changed` `{userId, reason: "peerProfile", peerId}`.
+//!
 //! Person identity (capability `person-identity`; owner only):
 //!
 //! - `GET /v2/users` gains `personsRevision`, `tokenPersons`
@@ -240,6 +247,7 @@ pub fn listing(store: &UserStore) -> Result<Value, UserError> {
             .map(|user| {
                 let mut view = user.view();
                 user_profiles::decorate(&mut view, profiles.profile(&user.id));
+                view["profileSource"] = crate::peers::profiles::source_view(profiles.profile(&user.id));
                 view["personKeys"] = persons.keys_of(&user.id).iter().map(persons::PersonKey::view).collect();
                 view
             })

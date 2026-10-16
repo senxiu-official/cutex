@@ -30,7 +30,7 @@ When ordinals are known, every returned ID is checked against the index, so `fir
 is the ordinal of page turn `i`. A concurrent native edit that breaks this correspondence
 returns unknown ordinals, never a guessed position.
 
-`/history` pages add **no native calls** for ordinals (PERF-10, `docs/perf-sqlite-history-20261015.md`):
+`/history` pages add **no native calls** for ordinals (PERF-10):
 the newest page (no cursor) is reconciled with the cached index exactly like the bootstrap page
 (known when the page reaches the first turn or overlaps a cached index); an older page reports
 `firstOrdinal` from the cached index and `turnCount: null` (only the newest page can confirm
@@ -104,6 +104,3 @@ downgrade to a preview. A caller planning a mutation must hold its own operation
 and revalidate the binding/history version before applying changes; these read RPCs do
 not constitute a transaction. This task adds no file-revert operation or new helper HTTP API.
 
-## Validation
-
-Validation results and evidence are recorded in `docs/turn-read-validation.md`.

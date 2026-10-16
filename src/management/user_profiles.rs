@@ -17,6 +17,12 @@
 //!   size, VP8 / VP8L / VP8X header and dimensions). The ETag is the first 16
 //!   hex digits of the bytes' SHA-256.
 //! - The audit log records profile changes without image bytes.
+//! - Peer-sourced fields (capability `peer-owner-profile`, see
+//!   `crate::peers::profiles`): a paired peer whose owner is this user (by
+//!   person key) may fill `displayName` / `avatar`; [`Profile::peer`] names
+//!   the fields it supplied. A field set directly (`PATCH /v2/users/me`) is
+//!   never overwritten by a peer, and a direct clear is remembered in
+//!   [`Profile::direct_cleared`] so a peer does not refill it.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -63,11 +69,104 @@ pub struct Profile {
     pub avatar: Option<Avatar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// The fields a paired peer supplied (its owner's profile); `None` = every
+    /// set field is direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<PeerSource>,
+    /// Fields the person cleared directly (`displayName`, `avatar`): a peer
+    /// never refills them until the person sets them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_cleared: Vec<String>,
 }
+
+/// Where peer-sourced profile fields came from.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerSource {
+    pub peer_id: String,
+    #[serde(default)]
+    pub display_name: bool,
+    #[serde(default)]
+    pub avatar: bool,
+    /// When the peer last changed a field here.
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+pub const FIELD_DISPLAY_NAME: &str = "displayName";
+pub const FIELD_AVATAR: &str = "avatar";
 
 impl Profile {
     pub fn avatar_etag(&self) -> Option<&str> {
         self.avatar.as_ref().map(|avatar| avatar.etag.as_str())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.display_name.is_none() && self.avatar.is_none() && self.peer.is_none() && self.direct_cleared.is_empty()
+    }
+
+    fn peer_field(&self, field: &str) -> bool {
+        self.peer.as_ref().is_some_and(|peer| match field {
+            FIELD_DISPLAY_NAME => peer.display_name,
+            _ => peer.avatar,
+        })
+    }
+
+    /// Whether a peer may write `field`: it is empty and was not cleared
+    /// directly, or a peer supplied its current value.
+    pub fn peer_may_write(&self, field: &str) -> bool {
+        let empty = match field {
+            FIELD_DISPLAY_NAME => self.display_name.is_none(),
+            _ => self.avatar.is_none(),
+        };
+        self.peer_field(field) || (empty && !self.direct_cleared.iter().any(|f| f == field))
+    }
+
+    /// A direct write (set or clear) of `field` makes it direct.
+    fn mark_direct(&mut self, field: &str, cleared: bool) {
+        if let Some(peer) = self.peer.as_mut() {
+            match field {
+                FIELD_DISPLAY_NAME => peer.display_name = false,
+                _ => peer.avatar = false,
+            }
+            if !peer.display_name && !peer.avatar {
+                self.peer = None;
+            }
+        }
+        self.direct_cleared.retain(|f| f != field);
+        if cleared {
+            self.direct_cleared.push(field.to_string());
+        }
+    }
+
+    /// The peer-sourced fields only (what a peer may still change).
+    pub fn source_view(&self) -> Value {
+        match &self.peer {
+            None => Value::Null,
+            Some(peer) => {
+                let mut fields = Vec::new();
+                if peer.display_name {
+                    fields.push(FIELD_DISPLAY_NAME);
+                }
+                if peer.avatar {
+                    fields.push(FIELD_AVATAR);
+                }
+                json!({ "kind": "peer", "peerId": peer.peer_id, "fields": fields, "updatedAt": peer.updated_at })
+            }
+        }
+    }
+
+    /// The fields set directly on this host (what a peer serves of its owner).
+    pub fn direct_only(&self) -> Profile {
+        let mut profile = self.clone();
+        if profile.peer_field(FIELD_DISPLAY_NAME) {
+            profile.display_name = None;
+        }
+        if profile.peer_field(FIELD_AVATAR) {
+            profile.avatar = None;
+        }
+        profile.peer = None;
+        profile
     }
 }
 
@@ -102,6 +201,29 @@ pub struct ProfilePatch {
 pub struct AvatarUpload {
     pub content_type: String,
     pub bytes: Vec<u8>,
+}
+
+/// A peer's owner profile as fetched (`GET /peer/v1/owner-profile`).
+#[derive(Clone, Debug)]
+pub struct PeerProfile {
+    pub display_name: Option<String>,
+    pub avatar: PeerAvatar,
+}
+
+#[derive(Clone, Debug)]
+pub enum PeerAvatar {
+    /// The peer's owner has no avatar.
+    None,
+    /// Unchanged: the stored avatar has this ETag (no bytes were fetched).
+    Same(String),
+    /// New bytes (validated like `PATCH /v2/users/me`).
+    New(AvatarUpload),
+}
+
+enum PeerAvatarChecked {
+    None,
+    Same(String),
+    New((Avatar, Vec<u8>)),
 }
 
 #[derive(Clone, Debug)]
@@ -189,10 +311,13 @@ impl ProfileStore {
             let profile = state.profiles.entry(user.to_string()).or_default();
             let before = profile.clone();
             if let Some(name) = display_name.clone() {
+                // A direct clear is remembered so a peer does not refill it.
+                profile.mark_direct(FIELD_DISPLAY_NAME, name.is_none());
                 profile.display_name = name;
             }
             let mut replaced = None;
             if let Some(avatar) = &avatar {
+                profile.mark_direct(FIELD_AVATAR, avatar.is_none());
                 let next = avatar.as_ref().map(|(avatar, _)| Avatar { updated_at: now.clone(), ..avatar.clone() });
                 if profile.avatar.as_ref().map(|a| &a.etag) != next.as_ref().map(|a| &a.etag) {
                     replaced = profile.avatar.take();
@@ -203,7 +328,7 @@ impl ProfileStore {
                 profile.updated_at = Some(now.clone());
             }
             let profile = profile.clone();
-            if profile.display_name.is_none() && profile.avatar.is_none() {
+            if profile.is_empty() {
                 state.profiles.remove(user);
             }
             Ok((profile, replaced))
@@ -224,6 +349,113 @@ impl ProfileStore {
         }
         audit(&self.dir, "profileUpdated", details);
         Ok(profile)
+    }
+
+    /// Apply a paired peer's owner profile to `user` (peer-owner-profile).
+    /// Only fields a peer may write change ([`Profile::peer_may_write`]):
+    /// direct values and direct clears are kept. Values another peer supplied
+    /// are replaced only when `source_replaceable(thatPeerId)` says so (it no
+    /// longer vouches for this user). Returns whether anything changed.
+    pub fn apply_peer(
+        &self,
+        user: &str,
+        peer_id: &str,
+        remote: PeerProfile,
+        source_replaceable: impl FnOnce(&str) -> bool,
+    ) -> Result<bool, UserError> {
+        let display_name = remote.display_name.as_deref().map(validate_display_name).transpose()?;
+        let avatar = match remote.avatar {
+            PeerAvatar::None => PeerAvatarChecked::None,
+            PeerAvatar::Same(etag) => PeerAvatarChecked::Same(etag),
+            PeerAvatar::New(upload) => PeerAvatarChecked::New(validate_avatar(&upload)?),
+        };
+        let now = crate::management::instance::now_utc();
+        let mut written = None;
+        if let PeerAvatarChecked::New((avatar, bytes)) = &avatar {
+            let dir = self.avatars();
+            let name = avatar.file_name(user);
+            crate::management::client_tokens::ensure_private_dir(&dir)
+                .and_then(|_| crate::config::atomic::write_private_bytes_atomic(&dir.join(&name), bytes))
+                .map_err(|e| UserError::new(503, "users_unavailable", format!("write the avatar: {e:#}")))?;
+            written = Some(name);
+        }
+        let outcome = self.with(|state| {
+            let before = state.profiles.get(user).cloned().unwrap_or_default();
+            let mut profile = before.clone();
+            if let Some(source) = &profile.peer {
+                if source.peer_id != peer_id && !source_replaceable(&source.peer_id) {
+                    return Ok((false, None, profile.avatar.as_ref().map(|a| a.file_name(user))));
+                }
+            }
+            let mut flags = profile.peer.clone().unwrap_or_default();
+            if profile.peer_may_write(FIELD_DISPLAY_NAME) {
+                flags.display_name = display_name.is_some();
+                profile.display_name = display_name.clone();
+            }
+            let mut replaced = None;
+            if profile.peer_may_write(FIELD_AVATAR) {
+                match &avatar {
+                    PeerAvatarChecked::None => {
+                        replaced = profile.avatar.take();
+                        flags.avatar = false;
+                    }
+                    PeerAvatarChecked::Same(etag) => {
+                        flags.avatar = profile.avatar_etag() == Some(etag.as_str());
+                    }
+                    PeerAvatarChecked::New((next, _)) => {
+                        if profile.avatar_etag() != Some(next.etag.as_str()) {
+                            replaced = profile.avatar.take();
+                            profile.avatar = Some(Avatar { updated_at: now.clone(), ..next.clone() });
+                        }
+                        flags.avatar = true;
+                    }
+                }
+            }
+            let changed = profile.display_name != before.display_name
+                || profile.avatar_etag() != before.avatar_etag()
+                || before.peer.as_ref().map(|p| (p.peer_id.as_str(), p.display_name, p.avatar))
+                    != Some((peer_id, flags.display_name, flags.avatar)).filter(|(_, n, a)| *n || *a);
+            if changed {
+                profile.peer = (flags.display_name || flags.avatar).then(|| PeerSource {
+                    peer_id: peer_id.to_string(),
+                    display_name: flags.display_name,
+                    avatar: flags.avatar,
+                    updated_at: now.clone(),
+                });
+                profile.updated_at = Some(now.clone());
+            }
+            let current = profile.avatar.as_ref().map(|a| a.file_name(user));
+            if profile.is_empty() {
+                state.profiles.remove(user);
+            } else {
+                state.profiles.insert(user.to_string(), profile);
+            }
+            Ok((changed, replaced, current))
+        });
+        let current = outcome.as_ref().ok().and_then(|(_, _, current)| current.clone());
+        let unused = |name: &str| current.as_deref() != Some(name);
+        if let Some(name) = written.filter(|name| unused(name)) {
+            let _ = std::fs::remove_file(self.avatars().join(name));
+        }
+        let (changed, replaced, _) = outcome?;
+        if let Some(old) = replaced.map(|old| old.file_name(user)).filter(|name| unused(name)) {
+            let _ = std::fs::remove_file(self.avatars().join(old));
+        }
+        if changed {
+            let profile = self.profile(user);
+            audit(
+                &self.dir,
+                "profileUpdated",
+                json!({
+                    "userId": user,
+                    "actor": format!("peer:{peer_id}"),
+                    "source": "peer",
+                    "displayName": profile.display_name,
+                    "avatarEtag": profile.avatar_etag(),
+                }),
+            );
+        }
+        Ok(changed)
     }
 
     /// Remove a deleted user's profile and image (best effort).

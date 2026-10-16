@@ -1016,7 +1016,7 @@ mod tests {
 
     /// Rust <-> adapter handshake of the offline Claude history reader. Runs
     /// when CUTEX_TEST_CLAUDE_PYTHON names a Python with the adapter's
-    /// dependencies (e.g. `claude-adapter/.venv`); no model or login is used.
+    /// dependencies (e.g. `components/claude-runtime/.venv`); no model or login is used.
     #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn claude_history_reader_serves_the_adapter_state_read_only() {
@@ -1024,7 +1024,7 @@ mod tests {
             eprintln!("skipped: CUTEX_TEST_CLAUDE_PYTHON is not set");
             return;
         };
-        let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("claude-adapter");
+        let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("components/claude-runtime");
         let root = std::env::temp_dir().join(format!("cutex-claude-reader-{}", uuid::Uuid::new_v4()));
         let state = root.join("state");
         let session: cutex::runtime::claude::ClaudeSession = serde_json::from_value(json!({

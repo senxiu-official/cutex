@@ -76,8 +76,8 @@ the store is created on use. There is no first-enable ask-store backup.
 
 Hello exchanges integer `protocol: 1` and features. Four are required:
 `asks.v1`, `asks.snapshot.v1`, `asks.close.v1`, `agents.list.v1`. The optional
-`tells.v1` (cross-host tells, below) is advertised but never required, so
-older peers stay compatible. Only the negotiated intersection may be used. The Management view exposes
+`tells.v1` (cross-host tells, below) and `owner-profile.v1` (owner profiles,
+below) are advertised but never required, so older peers stay compatible. Only the negotiated intersection may be used. The Management view exposes
 `features:{declared,negotiated}`. Missing features produce `peer_unsupported`,
 `state:versionMismatch` and `lastError.details.missingFeatures`. Data outboxes
 pause while hello probes continue with backoff; compatible hello and directory
@@ -328,6 +328,65 @@ an older bridge cannot deliver their control record (Codex reports
 `management control ingress is not enabled`; Claude skips them), so let them
 deliver or clear them before switching back.
 
+## Owner profiles
+
+Capability `peer-owner-profile` (`peerOwnerProfile`), code `src/peers/profiles.rs`.
+Pairing exchanges the owners' person keys (`ownerPersonKeys`, stored as
+`peerPersons` in `runtime/users/persons-v1.json`). A local user that holds one
+of a peer's owner keys shows that owner's display name and avatar, pulled over
+the peer channel, so the name appears even when the person's desktop never
+connected to this host.
+
+Wire (same peer credential as every `/peer/v1/*` route, requires the
+negotiated optional feature `owner-profile.v1`):
+
+- hello gains `ownerProfile: {etag}`; `etag` = first 16 hex digits of
+  SHA-256 over `[displayName, avatarEtag]` of the owner's direct profile.
+- `GET /peer/v1/owner-profile` → `{schemaVersion: 1, etag, displayName:
+  string|null, avatar: {etag, contentType, bytes, width, height}|null}`.
+- `GET /peer/v1/owner-profile/avatar` → `{etag, contentType, data}` (`data`
+  base64); 404 `not_found` without an avatar.
+
+Only fields the serving owner set directly (`PATCH /v2/users/me`) are served,
+never values that host itself got from a peer: a profile travels one hop, and
+two hosts of the same person cannot echo stale values back and forth. Any
+authenticated, enabled peer may read them (pairing already trusts it with the
+host label and exported agents).
+
+Pulling runs in the per-peer worker: on the first round after a start or a
+pairing, after a heartbeat (directory refresh, `refreshAgentsSecs`) whose
+hello carried another `ownerProfile.etag` or when the set of linked users
+changed, and at least every 30 minutes. Avatar bytes are fetched only when the
+announced ETag differs from the stored one, then validated exactly like a
+direct upload (PNG / JPEG / WebP, square 16–512 px, at most 48 KiB) and their
+recomputed ETag must match the announced one (`peer_protocol_error`
+otherwise). Peers disabled (globally or per peer), a pending / removed peer,
+a peer without `owner-profile.v1`, or no local user holding the peer owner's
+keys: no request and no store write.
+
+Precedence, stored per user in `runtime/users/profiles-v1.json`:
+
+- `peer: {peerId, displayName: bool, avatar: bool, updatedAt}` names the
+  fields a peer supplied. A peer may write a field that is empty or that a
+  peer supplied; later peer values (including a clear) replace earlier ones.
+- `PATCH /v2/users/me` setting or clearing a field makes it direct (drops it
+  from `peer`); a direct clear is kept in `directCleared` so a peer does not
+  refill it until the person sets it again.
+- When two peers vouch for the same user, the first source keeps the fields
+  while it is still paired, enabled and vouching; then another peer takes
+  over.
+
+`GET /v2/users` items gain `profileSource`: `null` (direct or unset) or
+`{kind: "peer", peerId, fields, updatedAt}`. A change publishes the owner
+host event `cutex/users/changed` `{userId, reason: "peerProfile", peerId}`.
+The audit log (`runtime/users/audit.jsonl`) records `profileUpdated` with
+`actor: "peer:<peerId>"` and `source: "peer"`, never image bytes.
+
+Rollback: an older binary ignores `ownerProfile` in hello and answers 404 to
+the profile routes (its peers never ask: no negotiated feature); it drops the
+`peer` / `directCleared` markers on its next profile write, after which
+peer-sourced values read as direct.
+
 ## Errors and desktop API
 
 Peer errors use `{code,message,retryable,details}`; Management listener errors
@@ -516,9 +575,7 @@ federation endpoint or fallback.
 Private debug instances can use `CUTEX_PEER_TEST_MAX_AGE_SECS=1..3600` to shorten
 outbox age and `CUTEX_PEER_TEST_FEATURES=asks.v1,...` to advertise a feature subset.
 They require an isolated instance and the private-home guard; release builds
-ignore them. Commands and observed platform results are recorded separately in
-[the latest review record](CROSS-HOST-VALIDATION-R226-R3.md); older evidence is in
-[the validation archive](CROSS-HOST-VALIDATION.md).
+ignore them.
 
 Persisted `peers` settings and each peer policy layer (policy, inbound, outbound, exports, and assumed caps) tolerate future additive keys so older binaries can read the full config and peer store after rollback. Owner PATCH requests explicitly reject unknown keys at every policy layer, ambiguous export selectors, and simultaneous `asks` / `accept` aliases; existing type and range checks remain. Unauthenticated requests with no initialized peer store do not create `runtime/peers` merely for authentication or failure audit.
 

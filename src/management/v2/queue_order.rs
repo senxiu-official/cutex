@@ -402,6 +402,8 @@ mod tests {
         use super::super::admission;
         assert!(is_method(YIELD_METHOD));
         assert!(validate_cutex_request(&json!({"requestId":"bad","method":YIELD_METHOD,"params":{"x":1}})).is_err());
+        // The Agent Bus repository checks the process HOME: hold the shared HOME lock.
+        let _home = crate::config::paths::test_home_env_lock();
         let root = std::env::temp_dir().join(format!("cutex-queue-yield-{}", uuid::Uuid::new_v4()));
         let queue = UserInputRepository::open_with_asks(root.join("queue"), root.join("queue").join("asks"), true).unwrap();
         let events = EventRepository::open(root.join("events"), crate::platform::host::current_host_name()).unwrap();

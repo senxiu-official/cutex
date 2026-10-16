@@ -213,7 +213,7 @@ project-authority CAS:
 {
   "schema": "cutex/agent-management/legacy-director-ownership-import/v1",
   "action_id": "legacy-director-import-example-r2-01",
-  "project_id": "tethysune",
+  "project_id": "example-project",
   "director_cutex_session_id": "cutex.example-director-r2",
   "expected_authorized_director_session": "cutex.example-director-r2",
   "expected_authority_epoch": 1
@@ -360,13 +360,12 @@ explicit Human/Management actor marker.
 Completed legacy retained-predecessor rotations can be shown as review-only
 Operator repair candidates when their exact successor and authority epoch are
 still current. Projection is read-only: the only repair path is an explicit
-confirmed Human grant through the normal CAS and audit boundary. See
-[r36-management-ui.md](r36-management-ui.md).
+confirmed Human grant through the normal CAS and audit boundary.
 
 Persistent durable Agents, including Offline Agents, can now be explicitly
 imported through the Human/Management boundary and confirmed for Create/Add or
-guarded Detach then Move. See [durable-agent-import-design.md](durable-agent-import-design.md)
-for formal-name provenance, eligibility, nullable profile, locking and recovery.
+guarded Detach then Move (formal-name provenance, eligibility, nullable profile,
+locking and recovery are checked by the server).
 
 ## Projects without a Director
 

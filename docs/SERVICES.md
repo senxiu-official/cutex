@@ -249,8 +249,7 @@ Old cutex ignores unknown lifetime/root/settings/tombstone fields and drops them
 on its next save. However, `runtime: "static"` is an unknown enum variant to the
 old reader: **one static record makes the entire registry fail to deserialize**.
 Unknown `crashLooped` runtime snapshots are discarded by the old reader's
-existing load-state fallback. Actual r223 fixture evidence is recorded in
-`SERVICES-VALIDATION.md`.
+existing load-state fallback.
 
 ## Reproducing acceptance
 

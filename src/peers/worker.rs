@@ -731,6 +731,8 @@ pub fn send_peer(store: &Store, asks: &AskStore, id: &str) -> Result<()> {
             })?;
         }
     }
+    // Owner profiles (peer-owner-profile): first round, heartbeat or resync.
+    super::profiles::maybe_sync(store, id, refresh);
     let pending = asks.inspect(|s| {
         s.asks
             .values()

@@ -1,0 +1,195 @@
+# cutex: end-to-end check of the optional components on clean GitHub runners (Linux and Windows),
+# through the real `cutex component` CLI. Manual only (workflow_dispatch); nothing is published.
+#
+# Each job builds a DEBUG cutex from this commit (only debug builds trust the run-time test key
+# CUTEX_UPGRADE_TEST_PUBKEY) and the component archive with components/<name>/build.sh. Then
+# .github/ci/component-e2e.py signs a throwaway test release with a key generated in the job, serves it
+# on 127.0.0.1, writes a managed install base (install.json) and a private marked home
+# (CUTEX_TEST_PRIVATE_HOME) under a work dir whose path contains a space, and runs
+# install / status / list / remove / prune --dry-run, asserting states and needsUser steps.
+#
+# - claude-runtime (linux-x64, windows-x64): Python too old -> no Claude Code CLI -> no Codex runtime ->
+#   login required (stub `claude`; Windows: a stub claude.exe) -> optionally the real Claude Code CLI
+#   from npm (`claude.cmd` on Windows, in a path with a space) -> remove = deselect -> prune --dry-run.
+#   Windows: when the `py` launcher finds Python 3.11+, the venv must come from `py -3`.
+# - job-service (linux-x64): no Codex runtime -> install with a stub Codex runtime: the systemd user
+#   unit (drill name cutex-e2e-job-service, user manager via loginctl linger) starts and the socket
+#   answers -> remove stops it -> prune --dry-run.
+# No real Claude login and no secrets are used.
+name: Component e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      real_claude:
+        description: "Also install the real Claude Code CLI from npm and check it is found (login required)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: component-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  claude-runtime:
+    name: claude-runtime ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-22.04
+            leak_policy: fail
+          - platform: windows-x64
+            runner: windows-2022
+            leak_policy: warn
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep LF line endings (embedded schemas are hashed byte for byte)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Pythons from the runner's tool cache (3.12 for building and the venv; an old one for the too-old check)
+        run: bash .github/ci/component-e2e-pythons.sh
+      - name: Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal && rustc +1.95.0 --version
+      - name: Build debug cutex
+        run: cargo +1.95.0 build --locked --bin cutex --bin cutex-mcp
+      - name: Build the claude-runtime archive
+        env:
+          LEAK_POLICY: ${{ matrix.leak_policy }}
+        run: |
+          set -euo pipefail
+          version="$("$E2E_PYTHON" -c 'import json; print(json.load(open("components/claude-runtime/component.json"))["version"])' | tr -d '\r')"
+          PYTHON="$E2E_PYTHON" bash components/claude-runtime/build.sh "${{ matrix.platform }}" "$version" "$RUNNER_TEMP/archives"
+      - name: Install the real Claude Code CLI from npm (path with a space)
+        if: inputs.real_claude
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/npm claude"
+          if [ "$RUNNER_OS" = Windows ]; then prefix="$(cygpath -w "$prefix")"; fi
+          npm install --global --no-fund --no-audit --prefix "$prefix" @anthropic-ai/claude-code
+          echo "E2E_NPM_PREFIX=$prefix" >> "$GITHUB_ENV"
+      - name: Signing helper dependency
+        run: |
+          "$E2E_PYTHON" -m pip install --disable-pip-version-check --no-input "cryptography==46.0.5"
+      - name: claude-runtime e2e
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            exe=target/debug/cutex.exe
+            # Under the user profile (cutex keeps owner-private ACLs), with a space in the path.
+            work="$USERPROFILE\\cutex e2e"
+          else
+            exe=target/debug/cutex
+            work="$RUNNER_TEMP/cutex e2e"
+          fi
+          echo "E2E_WORK=$work" >> "$GITHUB_ENV"
+          args=(claude-runtime --cutex "$exe" --archives "$RUNNER_TEMP/archives" --work "$work")
+          if [ -n "${E2E_OLD_PYTHON:-}" ]; then args+=(--old-python "$E2E_OLD_PYTHON"); fi
+          if [ -n "${E2E_NPM_PREFIX:-}" ]; then args+=(--npm-claude-prefix "$E2E_NPM_PREFIX"); fi
+          "$E2E_PYTHON" .github/ci/component-e2e.py "${args[@]}"
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e-logs"
+          if [ -n "${E2E_WORK:-}" ] && [ -d "$E2E_WORK" ]; then
+            (cd "$E2E_WORK" && find . -path ./served -prune -o -path '*/venv' -prune -o -type f \( -name '*.json' -o -name '*.log' \) -print | while read -r f; do
+              mkdir -p "$RUNNER_TEMP/e2e-logs/$(dirname "$f")"; cp "$f" "$RUNNER_TEMP/e2e-logs/$f"; done)
+            # Never upload the private home's tokens.
+            find "$RUNNER_TEMP/e2e-logs" -name config.json -delete
+          fi
+      - if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: component-e2e-claude-runtime-${{ matrix.platform }}-logs
+          path: ${{ runner.temp }}/e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  job-service:
+    name: job-service linux-x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Pythons from the runner's tool cache
+        run: bash .github/ci/component-e2e-pythons.sh
+      - name: Neutral build directory (the release binary keeps the source path in one place)
+        run: |
+          sudo mkdir -p /build && sudo chown "$(id -u):$(id -g)" /build
+          echo "BUILD_ROOT=/build" >> "$GITHUB_ENV"
+      - name: Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal && rustc +1.95.0 --version
+      - name: Build debug cutex
+        run: cargo +1.95.0 build --locked --bin cutex --bin cutex-mcp
+      - name: Build the job-service archive
+        run: |
+          set -euo pipefail
+          version="$("$E2E_PYTHON" -c 'import json; print(json.load(open("components/job-service/component.json"))["version"])' | tr -d '\r')"
+          bash components/job-service/build.sh linux-x64 "$version" "$RUNNER_TEMP/archives"
+      - name: systemd user manager (linger) and a drill unit directory
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$(id -un)"
+          uid="$(id -u)"
+          for _ in $(seq 60); do [ -S "/run/user/$uid/bus" ] && break; sleep 1; done
+          [ -S "/run/user/$uid/bus" ] || { echo "::error::no user bus at /run/user/$uid/bus"; exit 1; }
+          {
+            echo "XDG_RUNTIME_DIR=/run/user/$uid"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+            echo "CUTEX_SERVICE_TEST_NAME=e2e"
+            echo "CUTEX_COMPONENT_TEST_UNIT_DIR=/run/user/$uid/systemd/user"
+          } >> "$GITHUB_ENV"
+          mkdir -p "/run/user/$uid/systemd/user"
+          XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-system-running || true
+      - name: Signing helper dependency
+        run: |
+          "$E2E_PYTHON" -m pip install --disable-pip-version-check --no-input "cryptography==46.0.5"
+      - name: job-service e2e
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/cutex e2e"
+          echo "E2E_WORK=$work" >> "$GITHUB_ENV"
+          "$E2E_PYTHON" .github/ci/component-e2e.py job-service --cutex target/debug/cutex --archives "$RUNNER_TEMP/archives" --work "$work"
+      - name: Unit journal
+        if: always()
+        run: |
+          systemctl --user --no-pager status cutex-e2e-job-service.service || true
+          journalctl --user --no-pager -u cutex-e2e-job-service.service -n 200 || true
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e-logs"
+          if [ -n "${E2E_WORK:-}" ] && [ -d "$E2E_WORK" ]; then
+            (cd "$E2E_WORK" && find . -path ./served -prune -o -type f \( -name '*.json' -o -name '*.log' -o -name '*.service' \) -print | while read -r f; do
+              mkdir -p "$RUNNER_TEMP/e2e-logs/$(dirname "$f")"; cp "$f" "$RUNNER_TEMP/e2e-logs/$f"; done)
+            find "$RUNNER_TEMP/e2e-logs" -name config.json -delete
+          fi
+          cp /run/user/"$(id -u)"/systemd/user/*.service "$RUNNER_TEMP/e2e-logs/" 2>/dev/null || true
+      - if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: component-e2e-job-service-logs
+          path: ${{ runner.temp }}/e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 7

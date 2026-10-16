@@ -30,7 +30,7 @@ nothing, so a home this binary created is never taken for an existing one on its
   a key outside the bootstrap set `agent_bus_enabled`, `agent_bus_token`, `agent_bus_port`,
   `management_api_token`, `management_port`, `management_listen`, `instance` (e.g. `new_thread_defaults`,
   `default_profile`, any other setting). A `config.json` with only bootstrap keys (what the desktop install
-  guide, `docs/install/AGENT-INSTALL.md` §5.1, writes before the first `cutex` command: the two tokens and
+  guide (cutex-desktop `docs/install/AGENT-INSTALL.md` §5.1) writes before the first `cutex` command: the two tokens and
   `agent_bus_enabled`) shows the home was prepared, not used, and is not evidence; neither is `codex-home/`.
   Each of `sandbox` / `approval` /
   `network_access` missing (or `null`) in `config.json` `new_thread_defaults.agent` is written with the old

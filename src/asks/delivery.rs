@@ -101,6 +101,24 @@ pub fn actionable(state: &AskState, delivery: &DeliveryRecord) -> bool {
         && !state.asks.get(&delivery.ask_id).is_some_and(|ask| {
             matches!(ask.closed, Some(CloseOutcome::Accepted | CloseOutcome::Abandoned | CloseOutcome::Cancelled))
         })
+        && !duplicate_answer(state, delivery)
+}
+
+/// An answer item whose attempt has a later answer record too. One attempt
+/// ends once, so this is a copy left by releases before the per-attempt
+/// guard in `observe::finalize` (two end-of-turn paths raced and each wrote
+/// an answer and a delivery): only the attempt's latest answer is shown and
+/// sent; the copy is never actionable and is settled with its ask.
+pub fn duplicate_answer(state: &AskState, delivery: &DeliveryRecord) -> bool {
+    if delivery.kind != DeliveryKind::Answer {
+        return false;
+    }
+    let Some(answer) = state.answers.get(&delivery.ref_id) else {
+        return false;
+    };
+    state.answers.values().any(|other| {
+        other.ask_id == answer.ask_id && other.attempt == answer.attempt && other.revision > answer.revision
+    })
 }
 
 /// The requester read or closed the ask: acknowledge its pending answer
@@ -157,6 +175,12 @@ pub fn claim_for_wait(
     action_id: &str,
     now: DateTime<Utc>,
 ) -> Vec<DeliveryRecord> {
+    let duplicates: std::collections::HashSet<String> = state
+        .deliveries
+        .values()
+        .filter(|delivery| delivery.requester_cutex_session_id == requester && duplicate_answer(state, delivery))
+        .map(|delivery| delivery.delivery_id.clone())
+        .collect();
     let mut claimed = Vec::new();
     for delivery in state.deliveries.values_mut() {
         if delivery.requester_cutex_session_id != requester
@@ -166,7 +190,7 @@ pub fn claim_for_wait(
         }
         let mine_before = delivery.state == DeliveryState::ClaimedByWait
             && delivery.claimed_by.as_deref() == Some(action_id);
-        if delivery.state == DeliveryState::Pending {
+        if delivery.state == DeliveryState::Pending && !duplicates.contains(&delivery.delivery_id) {
             delivery.state = DeliveryState::ClaimedByWait;
             delivery.claimed_by = Some(action_id.to_string());
             delivery.updated_at = now_rfc3339(now);

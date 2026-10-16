@@ -757,6 +757,35 @@ impl AskState {
 }
 
 /// The store on disk.
+static WHOLE_STATE_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_WHOLE_STATE_COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_whole_state_copy() {
+    WHOLE_STATE_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_WHOLE_STATE_COPIES.with(|count| count.set(count.get() + 1));
+}
+
+/// Owned whole-state copies ([`AskStore::snapshot`], [`AskStore::peek`],
+/// [`AskStore::with_state`]) made on the calling thread (tests run in
+/// parallel, so assertions use this instead of the process-wide count).
+#[cfg(test)]
+pub(crate) fn whole_state_copies_on_this_thread() -> u64 {
+    THREAD_WHOLE_STATE_COPIES.with(|count| count.get())
+}
+
+/// How many owned whole-state copies of the ask store this process made so
+/// far. A cheap diagnostic counter for performance tests: the idle scheduler
+/// pass must read the shared cached state ([`AskStore::inspect`],
+/// [`AskStore::shared`]) and leave it unchanged.
+pub fn whole_state_copy_count() -> u64 {
+    WHOLE_STATE_COPIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone)]
 pub struct AskStore {
     dir: PathBuf,
@@ -807,7 +836,9 @@ impl AskStore {
     /// store a dozen times per 1 s tick; parsing the 0.7 MB file each time
     /// read ~11 MB/s on the Linux host (2026-10-09).
     fn read_state(path: &Path) -> anyhow::Result<AskState> {
-        Ok((*Self::read_state_shared(path)?).clone())
+        let shared = Self::read_state_shared(path)?;
+        note_whole_state_copy();
+        Ok((*shared).clone())
     }
 
     fn read_state_shared(path: &Path) -> anyhow::Result<std::sync::Arc<AskState>> {
@@ -873,9 +904,29 @@ impl AskStore {
         Self::read_state(&self.state_path())
     }
 
+    /// Read-only shared snapshot (shared lock): the cached parsed state
+    /// itself, no copy. Hot read paths (the per-second scheduler pass) use
+    /// this; [`Self::snapshot`] copies the whole store (17 MB of JSON on the
+    /// Linux host, 2026-10-15) and is for callers that need an owned value.
+    pub fn shared(&self) -> anyhow::Result<std::sync::Arc<AskState>> {
+        std::fs::create_dir_all(&self.dir)?;
+        let lock = self.lock_file()?;
+        lock.lock_shared().context("ask store lock")?;
+        Self::read_state_shared(&self.state_path())
+    }
+
+    /// Like [`Self::peek`] without the copy: `None` when the store does not
+    /// exist yet.
+    pub fn peek_shared(&self) -> anyhow::Result<Option<std::sync::Arc<AskState>>> {
+        if !self.state_path().exists() {
+            return Ok(None);
+        }
+        self.shared().map(Some)
+    }
+
     /// Read a projection without cloning the complete cached state. The callback
     /// must not mutate or acquire another ask-store lock. An absent store stays absent.
-    pub(crate) fn inspect<T>(&self, read: impl FnOnce(&AskState) -> T) -> anyhow::Result<T> {
+    pub fn inspect<T>(&self, read: impl FnOnce(&AskState) -> T) -> anyhow::Result<T> {
         if !self.state_path().exists() {
             return Ok(read(&AskState::default()));
         }
@@ -910,6 +961,7 @@ impl AskStore {
         lock.lock_exclusive().context("ask store lock")?;
         let path = self.state_path();
         let before = Self::read_state_shared(&path)?;
+        note_whole_state_copy();
         let mut state = (*before).clone();
         let result = mutate(&mut state);
         super::returns::promote_next_step_leases(&mut state);

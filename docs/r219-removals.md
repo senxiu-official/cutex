@@ -222,6 +222,5 @@ Desktop (`cutex-desktop` `feat/r219-cleanup`): `dcfe2cb` (Task Service UI out, t
 - Python campaign harnesses under `tests/*.py` that exercise Task Service / seats / rotation
   (`external_delivery_cutpoints.py`, `soon_task_*`, `soon_cli_*`, `protected_management_*`,
   `external_delivery_*`, `external_recovery_history.py`, `stock_*_mcp_boundary.py`,
-  `same_id_maintenance_composition.py`, `scripts/project_recent14_inventory.py`) need adapting on
-  the Linux host before the next Linux campaign.
-- Docs in other repos (desktop `TODO.md` / `PROGRESS.md`) are updated by the lead.
+  `same_id_maintenance_composition.py`, `project_recent14_inventory.py`; not part of the public
+  tree) still need adapting.

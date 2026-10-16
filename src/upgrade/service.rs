@@ -15,6 +15,14 @@
 //! [`super::supervisor`]. The desktop may start the same command when the
 //! Management API does not answer (single instance by lock).
 //!
+//! Notifications: neither manager runs a separate `cutex notify run`. The
+//! Management API of a managed install embeds the notification worker
+//! (state collector + webhook outbox, `notify::outbound::spawn_embedded_worker`),
+//! guarded by the same worker lock as `cutex notify run`, so a host that
+//! also runs `cutex notify run` still delivers each notification once. An
+//! existing managed install gets it with the next backend update (new
+//! binary, same units / task); `status` reports its heartbeat.
+//!
 //! Safety: install refuses to overwrite a unit (or a task) it did not write
 //! (marker line), and refuses on a host with a published runtime-host, so
 //! the owner's hand-deployed hosts are never changed. With `--unit-dir`
@@ -120,7 +128,7 @@ fn args(list: &[&str]) -> Vec<String> {
 }
 
 /// systemd quoting for ExecStart / Environment values.
-fn systemd_quote(value: &str) -> String {
+pub(crate) fn systemd_quote(value: &str) -> String {
     if value.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+=:@%".contains(c)) {
         value.to_string()
     } else {
@@ -223,7 +231,7 @@ pub fn task_xml(base: &Path, user: &str) -> String {
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
+    <Priority>5</Priority>
     <RestartOnFailure>
       <Interval>PT1M</Interval>
       <Count>999</Count>
@@ -487,6 +495,8 @@ pub fn uninstall(layout: &Layout, dry_run: bool, exec: &dyn Exec) -> anyhow::Res
     if record.os == "linux" {
         let unit_dir = record.unit_dir.as_ref().map(PathBuf::from).context("install record lacks unit_dir")?;
         let default = default_unit_dir().is_some_and(|d| d == unit_dir);
+        // Component services (Job Service) first: they depend on the bus.
+        actions.extend(crate::components::job_service::uninstall_unit(exec, dry_run)?);
         if default {
             actions.push(format!("systemctl --user disable --now {management_name} {bus_name}"));
         }
@@ -541,6 +551,19 @@ pub fn status(layout: &Layout, exec: &dyn Exec) -> Value {
         "releases": layout.installed_releases(),
     });
     let Some(record) = record else { return value };
+    // The notification worker runs inside the Management API of a managed
+    // install (no unit / child of its own): report its heartbeat.
+    value["notificationWorker"] = match crate::notify::outbound::status() {
+        Ok(outbound) => json!({
+            "embeddedInManagement": true,
+            "running": outbound["running"],
+            "heartbeat": outbound["heartbeat"],
+            "webhookEnabled": outbound["config"]["enabled"],
+            "counts": outbound["counts"],
+            "lastError": outbound["lastError"],
+        }),
+        Err(error) => json!({"embeddedInManagement": true, "error": format!("{error:#}")}),
+    };
     if record.service_manager == super::service_manager::SYSTEMD {
         let names = ServiceNames::of(&record);
         let mut units = serde_json::Map::new();
@@ -716,6 +739,8 @@ mod tests {
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        // Normal priority (4-6): the default 7 runs cutex and every agent below normal.
+        assert!(xml.contains("<Priority>5</Priority>"));
         assert!(xml.contains("<Arguments>service run</Arguments>"));
         assert!(xml.contains("<Command>") && xml.contains("AppData\\Local\\cutex"));
         let bytes = utf16_with_bom(&xml);

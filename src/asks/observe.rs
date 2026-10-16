@@ -326,6 +326,11 @@ fn requeue_quota_failure(
     }
     let (_, error) = turn_outcome(turn);
     store.with_state(|state| {
+        // Another end-of-turn path already ended this attempt: nothing to
+        // requeue (and not a second `quota_requeues` count).
+        if !attempt_open(state, ask_id, attempt) {
+            return true;
+        }
         let mut requeued = false;
         state.update_ask(ask_id, now, |ask| {
             let Some(record) = ask.attempts.iter_mut().find(|item| item.n == attempt) else {
@@ -383,7 +388,21 @@ fn turn_outcome(turn: &Value) -> (AnswerStatus, Option<String>) {
     }
 }
 
-/// Capture the answer of an attempt's terminal turn.
+/// Whether `attempt` of `ask_id` may still end (checked under the store
+/// lock by every end-of-turn writer): it exists, is not terminal (answered,
+/// failed, interrupted, refused or yielded) and has no answer yet. A
+/// continuation runs as a new attempt, so its turn is not affected.
+pub(crate) fn attempt_open(state: &AskState, ask_id: &str, attempt: u32) -> bool {
+    state
+        .asks
+        .get(ask_id)
+        .and_then(|ask| ask.attempts.iter().find(|record| record.n == attempt))
+        .is_some_and(|record| !record.state.is_terminal())
+        && !state.answers.values().any(|answer| answer.ask_id == ask_id && answer.attempt == attempt)
+}
+
+/// Capture the answer of an attempt's terminal turn. Idempotent per
+/// attempt: a second call for an attempt that already ended writes nothing.
 pub fn finalize(
     store: &AskStore,
     session: &str,
@@ -447,6 +466,13 @@ pub fn finalize(
         .and_then(|(_, bytes)| super::views::preview(&String::from_utf8_lossy(&bytes)));
     let started = record.started_at.as_deref().and_then(super::parse_time);
     store.with_state(|state| {
+        // Decided under the store lock: the observer's `turn/completed` and
+        // the scheduler's reconciliation (or a re-delivered notification)
+        // may both reach here for one attempt; only the first records the
+        // answer and its requester delivery.
+        if !attempt_open(state, ask_id, attempt) {
+            return;
+        }
         let revision = state.answers.values().filter(|answer| answer.ask_id == ask_id).count() as u32 + 1;
         let answer_id = new_id("ans");
         let metadata = AnswerMetadata {
@@ -636,6 +662,116 @@ mod tests {
         assert_eq!(state.asks[&review].review, Some(ReviewState::AwaitingAcceptance));
         assert!(state.asks[&review].closed.is_none());
         assert!(state.answers[state.asks[&review].answer_id.as_ref().unwrap()].artifact_id.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    /// Two end-of-turn paths for one attempt (the observer's
+    /// `turn/completed` and the scheduler's bound-lease reconciliation, or a
+    /// re-delivered notification) record one answer and one requester
+    /// delivery (owner report 2026-10-16: two identical rows for #78).
+    #[test]
+    fn an_attempt_ends_once_whoever_reports_it() {
+        let (world, dir) = world("finalize-once");
+        let (store, store_dir) = temp_store("finalize-once");
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = Utc::now();
+        let mut review = new_ask("a", "x");
+        review.options.review = true;
+        let ask = store.with_state(|state| state.create_ask(review, now).unwrap().0.ask_id).unwrap();
+        crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap();
+        observe(&store, TARGET, "turn/started", &json!({"turn": {"id": "turn-1"}}), now).unwrap();
+        let turn = json!({"id": "turn-1", "status": "completed", "items": [{"type": "agentMessage", "text": "done"}]});
+        // Both read the attempt as running before either wrote.
+        finalize(&store, TARGET, &ask, 1, &turn, None, now).unwrap();
+        finalize(&store, TARGET, &ask, 1, &turn, Some(InterruptReason::RuntimeRestart), now + chrono::Duration::milliseconds(219)).unwrap();
+        // A late re-delivered notification is a no-op as well.
+        observe(&store, TARGET, "turn/completed", &json!({"threadId": "t", "turn": turn}), now).unwrap();
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.answers.len(), 1, "{:?}", state.answers);
+        let answer = state.answers.values().next().unwrap();
+        assert_eq!((answer.attempt, answer.revision), (1, 1));
+        assert_eq!(state.asks[&ask].answer_id.as_deref(), Some(answer.answer_id.as_str()));
+        assert_eq!(state.deliveries.values().filter(|d| d.kind == DeliveryKind::Answer).count(), 1);
+        assert_eq!(state.notices.iter().filter(|n| n.method == "cutex/ask/answered").count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    /// Copies stored by releases before the guard: of two answers of one
+    /// attempt only the latest is actionable, shown as an admission row,
+    /// claimed by a wait or coalesced into an event; accepting the ask
+    /// settles both.
+    #[test]
+    fn stored_duplicate_answers_show_once() {
+        let (world, dir) = world("dup-answers");
+        let (store, store_dir) = temp_store("dup-answers");
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = Utc::now();
+        let mut review = new_ask("a", "x");
+        review.options.review = true;
+        let ask = store.with_state(|state| state.create_ask(review, now).unwrap().0.ask_id).unwrap();
+        crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap();
+        observe(&store, TARGET, "turn/started", &json!({"turn": {"id": "turn-1"}}), now).unwrap();
+        observe(&store, TARGET, "turn/completed", &completed("turn-1", "completed"), now).unwrap();
+        // Recreate the old race's copy: a second answer of attempt 1 with
+        // its own delivery.
+        let (first, copy) = store
+            .with_state(|state| {
+                let first = state.asks[&ask].answer_id.clone().unwrap();
+                let mut copy = state.answers[&first].clone();
+                copy.answer_id = "ans-copy".into();
+                copy.revision = 2;
+                state.answers.insert(copy.answer_id.clone(), copy);
+                let updated = state.asks[&ask].clone();
+                let delivery = crate::asks::delivery::record_answer_delivery(state, &updated, "ans-copy", now).unwrap();
+                state.update_ask(&ask, now, |ask| ask.answer_id = Some("ans-copy".into()));
+                let first_delivery = state.deliveries.values().find(|d| d.ref_id == first).unwrap().delivery_id.clone();
+                (first_delivery, delivery)
+            })
+            .unwrap();
+        let state = store.snapshot().unwrap();
+        assert!(crate::asks::delivery::duplicate_answer(&state, &state.deliveries[&first]));
+        assert!(!crate::asks::delivery::actionable(&state, &state.deliveries[&first]));
+        assert!(crate::asks::delivery::actionable(&state, &state.deliveries[&copy]));
+        let rows = crate::management::v2::admission::ask_next_step(&state, REQUESTER);
+        assert_eq!(rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(), vec![copy.clone()]);
+        // An event queued before the guard carrying both: still one row.
+        store
+            .with_state(|state| {
+                for id in [&first, &copy] {
+                    let delivery = state.deliveries.get_mut(id).unwrap();
+                    delivery.state = DeliveryState::QueuedAsEvent;
+                    delivery.event_id = Some("aev-old".into());
+                }
+            })
+            .unwrap();
+        let state = store.snapshot().unwrap();
+        assert_eq!(crate::management::v2::admission::ask_next_step(&state, REQUESTER).len(), 1);
+        // Back to pending: a wait and an event take the latest only.
+        store
+            .with_state(|state| {
+                for id in [&first, &copy] {
+                    let delivery = state.deliveries.get_mut(id).unwrap();
+                    delivery.state = DeliveryState::Pending;
+                    delivery.event_id = None;
+                }
+            })
+            .unwrap();
+        let claimed = store.with_state(|state| crate::asks::delivery::claim_for_wait(state, REQUESTER, &[], "w", now)).unwrap();
+        assert_eq!(claimed.iter().map(|d| d.delivery_id.clone()).collect::<Vec<_>>(), vec![copy.clone()]);
+        store
+            .with_state(|state| {
+                let delivery = state.deliveries.get_mut(&copy).unwrap();
+                delivery.state = DeliveryState::Pending;
+                delivery.claimed_by = None;
+            })
+            .unwrap();
+        let event = store.with_state(|state| crate::asks::delivery::coalesce_into_event(state, REQUESTER, "m", now)).unwrap().unwrap();
+        assert_eq!(store.snapshot().unwrap().events[&event].delivery_ids, vec![copy.clone()]);
+        // Closing the ask settles the copy too.
+        store.with_state(|state| crate::asks::delivery::settle_for_ask(state, REQUESTER, &ask, None, "accepted", now)).unwrap();
+        assert_eq!(store.snapshot().unwrap().deliveries[&first].state, DeliveryState::Acknowledged);
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(store_dir);
     }

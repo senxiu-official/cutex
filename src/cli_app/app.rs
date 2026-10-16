@@ -160,6 +160,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         Some(CommandKind::Instance { command }) => super::instance_cli::run(command)?,
         Some(CommandKind::Upgrade { command }) => super::upgrade_cli::run_upgrade(command)?,
         Some(CommandKind::Service { command }) => super::upgrade_cli::run_service(command)?,
+        Some(CommandKind::Component { command }) => super::upgrade_cli::run_component(command)?,
         Some(CommandKind::Human { command }) => super::human::run_command(command)?,
         Some(CommandKind::Agent { command }) => agent::run_command(command)?,
         Some(CommandKind::Wizard) => launch::wizard()?,

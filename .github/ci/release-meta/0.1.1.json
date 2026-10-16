@@ -1,0 +1,9 @@
+{
+  "_comment": "upgrade-manifest.py --meta for cutex 0.1.1 (sign-and-upload.sh uses release-meta/<release>.json by itself). mode full: 0.1.1 brings no new native (same cute-codex 0.160.0-r52.2 as 0.1.0, no --native-run), so without this the manifest would be `reload` and NEW agents would keep releases/0.1.0/manifests/default.json, i.e. the 0.1.0 cutex-mcp facade. In full mode the runner (src/upgrade/swap.rs select_runtime) writes releases/0.1.1/manifests/default.json with the native files of the host's current selection and the 0.1.1 facade and selects it for new agents; the default packageRun `after` then moves idle existing agents. The upgrade e2e (ci/upgrade-e2e.py --release-meta) generates its 0.1.1 manifest from this same file.",
+  "mode": "full",
+  "packageRunRecommended": true,
+  "notes": {
+    "en": "Optional components (claude-runtime, job-service on Linux) installed and updated on demand; the notification worker runs inside the Management API of managed installs; NCI remote jobs on Linux; Claude safety checks under full access can be granted once by the owner; delegation results are delivered once. New agents start with this release's tools; idle agents move over after the update.",
+    "zh-CN": "可选组件（claude-runtime；Linux 上的 job-service）按需安装并随后端更新；托管安装自带通知 worker；Linux 主机支持 NCI 远程作业；完全访问下的 Claude 安全检查可由主人批准一次；委托结果只投递一次。新智能体使用本版本的工具，空闲的智能体会在更新后自动迁移。"
+  }
+}

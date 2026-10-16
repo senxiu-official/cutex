@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:cutex:management-v2:users",
   "title": "Users",
-  "description": "GET /v2/users → userList (owner; capability users); GET|PATCH /v2/users/me → selfProfile, PATCH body selfProfilePatch, GET /v2/users/{id}/avatar → the image bytes with an ETag (capability users-self-profile); /v2/capabilities user → capabilityUser; cutex/userInput/routeAccepted params.actingUser → actingUser. Person identity (capability person-identity): GET /v2/identity/challenge → identityChallenge, POST /v2/identity/claim body identityClaim → identityClaimResult, PUT /v2/users/{id}/person-keys body personKeysPut → personKeysResult (owner); DELETE /v2/users/token-persons/{tokenId}/previous → tokenPersonPreviousCleared (owner; capability person-identity-ack). Own devices (capability user-own-devices; owner, root or a bound user, pending: 403 user_pending): GET /v2/users/me/devices → ownDevices, DELETE /v2/users/me/devices/{tokenId} → ownDeviceRevoked (404 client_token_not_found for a token not bound to the caller). Capability user-own-token: capabilityUser.token → ownToken or null (root credential).",
+  "description": "GET /v2/users → userList (owner; capability users); GET|PATCH /v2/users/me → selfProfile, PATCH body selfProfilePatch, GET /v2/users/{id}/avatar → the image bytes with an ETag (capability users-self-profile); /v2/capabilities user → capabilityUser; cutex/userInput/routeAccepted params.actingUser → actingUser. Person identity (capability person-identity): GET /v2/identity/challenge → identityChallenge, POST /v2/identity/claim body identityClaim → identityClaimResult, PUT /v2/users/{id}/person-keys body personKeysPut → personKeysResult (owner); DELETE /v2/users/token-persons/{tokenId}/previous → tokenPersonPreviousCleared (owner; capability person-identity-ack). Own devices (capability user-own-devices; owner, root or a bound user, pending: 403 user_pending): GET /v2/users/me/devices → ownDevices, DELETE /v2/users/me/devices/{tokenId} → ownDeviceRevoked (404 client_token_not_found for a token not bound to the caller). Capability user-own-token: capabilityUser.token → ownToken or null (root credential). Capability peer-owner-profile: user.profileSource; host event cutex/users/changed {userId, reason: peerProfile, peerId} when a peer changed a user's displayName / avatar.",
   "anyOf": [
     { "$ref": "#/$defs/userList" },
     { "$ref": "#/$defs/selfProfile" },
@@ -153,7 +153,24 @@
         "updatedAt": { "type": "string" },
         "displayName": { "$ref": "#/$defs/displayName" },
         "avatarEtag": { "$ref": "#/$defs/avatarEtag" },
-        "personKeys": { "type": "array", "items": { "$ref": "#/$defs/personKey" }, "description": "Absent from hosts without person-identity." }
+        "personKeys": { "type": "array", "items": { "$ref": "#/$defs/personKey" }, "description": "Absent from hosts without person-identity." },
+        "profileSource": {
+          "description": "Capability peer-owner-profile: null = displayName / avatar are direct (PATCH /v2/users/me) or unset; otherwise the listed fields came from a paired peer whose owner holds one of this user's person keys. A direct set or clear always wins over a peer. Absent from hosts without peer-owner-profile.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "peerId", "fields", "updatedAt"],
+              "properties": {
+                "kind": { "const": "peer" },
+                "peerId": { "type": "string" },
+                "fields": { "type": "array", "items": { "enum": ["displayName", "avatar"] } },
+                "updatedAt": { "type": "string" }
+              }
+            }
+          ]
+        }
       }
     },
     "userList": {

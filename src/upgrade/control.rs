@@ -314,6 +314,7 @@ pub const RUNNER_ENV: &[&str] = &[
     crate::config::paths::FORBID_REAL_HOME_ENV,
     super::keys::TEST_PUBLIC_KEY_ENV,
     super::service::TEST_SERVICE_NAME_ENV,
+    crate::components::job_service::TEST_UNIT_DIR_ENV,
 ];
 
 /// `--setenv=K=V` for every [`RUNNER_ENV`] variable set in `vars`.

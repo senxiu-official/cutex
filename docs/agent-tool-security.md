@@ -1,8 +1,8 @@
 # Agent tool security: identity, project boundary, roles, envelopes, approvals
 
-Owner decisions of 2026-10-07 on the design review of the cutex agent-facing tools
-(cutex-desktop `docs/research/cutex-tools-review.md`, findings S1–S4, C2, C4, C7, U1).
-This document describes what is implemented on `feat/tool-security` and what is left.
+Design decisions from the review of the cutex agent-facing tools (findings S1–S4, C2, C4,
+C7, U1; the internal review notes are not part of this repository). This document
+describes what is implemented and what is left.
 
 ## 1. Trust model in one paragraph
 
@@ -103,14 +103,11 @@ can still read the app-server's `/proc/<pid>/environ`, and Claude API accounts
 (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` in the Claude Code process env) are
 inherited by Claude Code's Bash tool.
 
-Native r53 (0.162.1-r53, fork 6eec316d6) never passes the active provider's `env_key` to
-model-reachable child processes, and an env-key provider whose variable is missing falls
-back to the `OPENAI_API_KEY` in the launch-selected `--auth-file`. cutex still exports
-the key and keeps the `-c` override for every native: **r52 and older agents need the
-exported key** (no auth-file fallback) and the override, so neither may be dropped while
-any agent can run on r52 (including after an r53 -> r52 rollback). Under r53 the variable
-is absent in tools rather than empty (e2e 2026-10-14: `printenv OPENAI_API_KEY | wc -c`
-= 0 on r53, 1 on r52). See `docs/native-r53.md`.
+A future native (r53) will never pass the active provider's `env_key` to model-reachable
+child processes and can read the key from the launch-selected `--auth-file` instead.
+cutex still exports the key and keeps the `-c` override for every native: **r52 and older
+agents need the exported key** (no auth-file fallback) and the override, so neither may be
+dropped while any agent can run on r52.
 
 Debug builds only: `CUTEX_DEBUG_SHARED_AGENT_BUS_TOKEN=1` in the daemon environment makes
 every launch path hand out the root token again (for debugging old adapters). Release
@@ -219,7 +216,7 @@ legacy `cutex-director` / `cutex-release` seats (see `docs/r219-removals.md`): t
 only from the Agent Management project authority (`authorized_director_session`), and a
 `director_rotate` call answers `tool_removed`.
 
-Tool rename 2026-10-07 (`docs/research/cutex-tool-naming.md` in cutex-desktop): `send`,
+Tool rename 2026-10-07: `send`,
 `query_managed`, `cutex_agent_list` and all `cutex_task_service*` tools were removed;
 `cutex_agent_management` was split into the management tools above; `set_alarm` etc. and
 `cutex_service_*` were renamed. For one release `tools/call` still accepts the old names
@@ -387,8 +384,7 @@ Migration:
 6. Rollback hazard: profile options are parsed with `deny_unknown_fields`. A profile that
    has `native_subagents` or `agent_use_requires_approval` set makes an older cutex refuse
    the accounts store. Clear both (PATCH `null` / `false`) before rolling back. The same
-   applies to the Claude profile option `agent_turn_questions` (`agentTurnQuestions`, see
-   `claude-adapter/docs/DESKTOP_PARITY.md`).
+   applies to the Claude profile option `agent_turn_questions` (`agentTurnQuestions`).
    `agent_security` in `config.json` is safe: `CodezConfig` has no `deny_unknown_fields`,
    so an older cutex ignores it (and drops it on its next config save). The same holds for
   `agent_security.external_agents` on a cutex that knows `agent_security` but not grants
@@ -422,7 +418,7 @@ These stay proposals; `agent_ask` / `agent_wait` / `agent_start` / `agent_tell` 
 replace `send` (the Task Service tools were removed in r219, see `docs/r219-removals.md`):
 
 - U4 (naming): done 2026-10-07 — `<object>_<verb>` without the `cutex_` prefix
-  (see §5 and cutex-desktop `docs/research/cutex-tool-naming.md`), old names
+  (see §5), old names
   as aliases for one release.
 - C5 (alarms): move alarms behind a bus route (no MCP-side file writer, no file lock held
   during delivery), list only pending + recent, RFC 3339 or `in_seconds` only, show

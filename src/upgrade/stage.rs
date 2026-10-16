@@ -155,7 +155,9 @@ pub fn available_from(manifest: &ReleaseManifest, manifest_sha256: &str, install
         migrations: classification.migrations,
         below_floor: classification.below_floor,
         native_version: manifest.native.as_ref().map(|n| n.version.clone()),
-        claude_runtime: manifest.claude_runtime.as_ref().map(|c| c.name.clone()),
+        // `available.claudeRuntime` (desktop Backend updates): the claude-runtime component
+        // version, also for an older manifest's `claudeRuntime` part (mapped at parse).
+        claude_runtime: manifest.claude_runtime_version().map(str::to_string),
         capabilities_removed: manifest.cutex.capabilities.removed.clone(),
         desktop_min_commit: manifest.desktop.min_commit.clone(),
     }
@@ -356,8 +358,9 @@ pub fn stage(
     let result = (|| -> anyhow::Result<Option<String>> {
         let free = fs2::available_space(&layout.base).unwrap_or(u64::MAX);
         let native_size = parsed.native_artifact().map_or(0, |a| a.size);
+        let component_size = crate::components::stage_bytes(layout, &parsed);
         ensure!(
-            free >= artifact.size.saturating_mul(4) + native_size.saturating_mul(4) + SPARE_BYTES,
+            free >= artifact.size.saturating_mul(4) + native_size.saturating_mul(4) + component_size.saturating_mul(4) + SPARE_BYTES,
             "not enough disk space under {} ({} MiB free)",
             layout.base.display(),
             free >> 20
@@ -414,6 +417,11 @@ pub fn stage(
                 rename_into_place(&unpacked, &dir)?;
             }
             native_version = Some(native.version.clone());
+        }
+        // New versions of installed components (selected at the swap; a
+        // failure here is retried there and never fails the stage).
+        for note in crate::components::stage_installed(layout, &parsed, Some(source)) {
+            eprintln!("cutex upgrade stage: component {note}");
         }
         Ok(native_version)
     })();

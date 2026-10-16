@@ -52,6 +52,18 @@ pub struct Snapshot {
     pub online: BTreeSet<String>,
 }
 
+impl Snapshot {
+    /// The daemon runs release `label`. A source build reports no release label, only its commit:
+    /// it matches the managed install's `dev-<commit7>` label by commit prefix.
+    pub fn runs_release(&self, label: &str) -> bool {
+        match (self.release.as_deref(), label.strip_prefix("dev-"), self.commit.as_deref()) {
+            (Some(release), _, _) => release == label,
+            (None, Some(short), Some(commit)) => !short.is_empty() && commit.starts_with(short),
+            _ => false,
+        }
+    }
+}
+
 pub trait Host {
     fn busy(&self) -> anyhow::Result<Vec<Busy>>;
     fn snapshot(&self) -> anyhow::Result<Snapshot>;
@@ -78,6 +90,17 @@ pub trait Host {
     fn record(&self, run: &Run);
     fn sleep(&self, duration: Duration);
     fn now(&self) -> Instant;
+    /// Swap phase (services stopped, upgrade.lock held): select the
+    /// component versions the now-active release names for installed
+    /// components (crate::components::select_for_release). Notes for the run;
+    /// a component failure never fails the run.
+    fn select_components(&self, _run_dir: &Path) -> Vec<String> {
+        Vec::new()
+    }
+    /// Rollback: reselect the component versions selected before the swap.
+    fn restore_components(&self, _run_dir: &Path) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +193,16 @@ fn quiesce(run: &mut Run, host: &dyn Host, online: &BTreeSet<String>) -> Result<
     Ok(offlined)
 }
 
+/// Capabilities derived from a live probe of an optional component (the
+/// Job Service), not from the cutex build: a component restart or failure
+/// around the swap must not read as "capabilities lost" and roll cutex back
+/// (components contract §0.3). Excluded from the before / after diff.
+pub const HOST_DEPENDENT_CAPABILITIES: &[&str] = &["job-external", "job-source-nci"];
+
+fn host_dependent(feature: &str) -> bool {
+    HOST_DEPENDENT_CAPABILITIES.contains(&feature)
+}
+
 fn verify(plan: &Plan, before: &Snapshot, host: &dyn Host, expect_online: &BTreeSet<String>) -> Result<(), String> {
     let deadline = host.now() + online_converge(expect_online.len());
     loop {
@@ -187,11 +220,13 @@ fn verify(plan: &Plan, before: &Snapshot, host: &dyn Host, expect_online: &BTree
             problems.push("cutexBuild.commit missing".into());
         }
         let removed: BTreeSet<&String> = plan.capabilities_removed.iter().collect();
-        let lost: Vec<&String> = before.features.iter().filter(|f| !removed.contains(f) && !after.features.contains(*f)).collect();
+        let lost: Vec<&String> =
+            before.features.iter().filter(|f| !removed.contains(f) && !host_dependent(f) && !after.features.contains(*f)).collect();
         if !lost.is_empty() {
             problems.push(format!("capabilities lost: {lost:?}"));
         }
-        let missing: Vec<&String> = plan.capabilities_added.iter().filter(|f| !after.features.contains(*f)).collect();
+        let missing: Vec<&String> =
+            plan.capabilities_added.iter().filter(|f| !host_dependent(f) && !after.features.contains(*f)).collect();
         if !missing.is_empty() {
             problems.push(format!("capabilities missing: {missing:?}"));
         }
@@ -283,6 +318,7 @@ fn roll_back(
                 Err(error) => return needs_owner(run, host, format!("could not move {store} aside: {error:#}"), manual),
             }
         }
+        let _ = host.restore_components(&plan.run_dir);
     }
     if let Err(error) = host.start_services().and_then(|_| host.wait_ready(plan.ready_timeout)) {
         return needs_owner(run, host, format!("{from} did not come back: {error:#}"), manual);
@@ -291,7 +327,7 @@ fn roll_back(
         let _ = host.set_online(id);
     }
     match host.snapshot() {
-        Ok(snapshot) if !swapped || snapshot.release.as_deref() == Some(from) || from == "unknown" => {
+        Ok(snapshot) if !swapped || snapshot.runs_release(from) || from == "unknown" => {
             run.enter(Phase::RolledBack, Some(format!("back on {from}")));
             host.record(run);
         }
@@ -367,6 +403,8 @@ pub fn apply(run: &mut Run, plan: &Plan, host: &dyn Host) {
             return roll_back(run, plan, host, &from, Some(&backup), true, &offlined);
         }
     }
+    // Components follow the new release before any package run (contract §0.2).
+    let component_notes = host.select_components(&plan.run_dir);
     // start
     run.enter(Phase::Starting, None);
     host.record(run);
@@ -403,7 +441,12 @@ pub fn apply(run: &mut Run, plan: &Plan, host: &dyn Host) {
     host.record(run);
     match verify(plan, &before, host, &expect_online) {
         Ok(()) => {
-            run.enter(Phase::Committed, Some(format!("{from} → {}", plan.to_release)));
+            let mut detail = format!("{from} → {}", plan.to_release);
+            for note in &component_notes {
+                detail.push_str("; ");
+                detail.push_str(note);
+            }
+            run.enter(Phase::Committed, Some(detail));
             host.record(run);
         }
         Err(problems) => {
@@ -466,6 +509,9 @@ pub fn rollback(run: &mut Run, plan: &Plan, host: &dyn Host) {
                 run.displaced.push(store.clone());
             }
         }
+        // The versions the rollback target names (a release without a
+        // components section leaves them as they are).
+        let _ = host.select_components(&plan.run_dir);
         Ok(())
     })();
     if let Err(error) = result {
@@ -481,7 +527,7 @@ pub fn rollback(run: &mut Run, plan: &Plan, host: &dyn Host) {
     run.enter(Phase::Verifying, None);
     host.record(run);
     match host.snapshot() {
-        Ok(snapshot) if snapshot.release.as_deref() == Some(plan.to_release.as_str()) => {
+        Ok(snapshot) if snapshot.runs_release(&plan.to_release) => {
             run.enter(Phase::Committed, Some(format!("rolled back to {}", plan.to_release)));
             host.record(run);
         }
@@ -518,6 +564,8 @@ pub(crate) mod fake {
         pub new_release_commit: String,
         /// A runtime that comes back online only at this fake time.
         pub online_late: RefCell<Option<(Duration, String)>>,
+        /// Features that disappear when the new release is activated.
+        pub drop_on_swap: RefCell<Vec<String>>,
     }
 
     impl FakeHost {
@@ -538,6 +586,7 @@ pub(crate) mod fake {
                 cancel: Cell::new(false),
                 new_release_commit: "5f30a7cad4dcd8435e797592a380349df509e35d".into(),
                 online_late: RefCell::new(None),
+                drop_on_swap: RefCell::new(Vec::new()),
             }
         }
         fn step(&self, name: &'static str) -> anyhow::Result<()> {
@@ -546,6 +595,9 @@ pub(crate) mod fake {
                 anyhow::bail!("{name} failed (fake)");
             }
             Ok(())
+        }
+        pub fn fail_features_after_swap(&self, features: &[&str]) {
+            self.drop_on_swap.borrow_mut().extend(features.iter().map(|f| f.to_string()));
         }
         pub fn steps(&self) -> Vec<String> {
             self.log.borrow().clone()
@@ -614,6 +666,11 @@ pub(crate) mod fake {
         }
         fn activate(&self, release: &str) -> anyhow::Result<String> {
             self.step(if release.starts_with("r240") { "activate_new" } else { "activate_old" })?;
+            if release.starts_with("r240") {
+                for f in self.drop_on_swap.borrow().iter() {
+                    self.features.borrow_mut().remove(f);
+                }
+            }
             Ok(self.running.replace(release.to_string()))
         }
         fn select_runtime(&self, _release: &str) -> anyhow::Result<bool> {
@@ -679,6 +736,18 @@ mod tests {
         host.features.borrow_mut().insert("c".into());
         apply(&mut run, plan, host);
         run
+    }
+
+    #[test]
+    fn a_source_build_matches_its_dev_label_by_commit() {
+        let snap = |release: Option<&str>, commit: Option<&str>| Snapshot { release: release.map(Into::into), commit: commit.map(Into::into), ..Snapshot::default() };
+        assert!(snap(None, Some("656cd91aa")).runs_release("dev-656cd91"));
+        assert!(!snap(None, Some("1234567")).runs_release("dev-656cd91"));
+        assert!(!snap(None, None).runs_release("dev-656cd91"));
+        assert!(!snap(None, Some("656cd91")).runs_release("dev-"));
+        assert!(!snap(None, Some("656cd91")).runs_release("0.1.0"));
+        assert!(snap(Some("0.1.0"), Some("x")).runs_release("0.1.0"));
+        assert!(!snap(Some("0.1.1"), Some("656cd91")).runs_release("dev-656cd91"));
     }
 
     #[test]
@@ -756,6 +825,26 @@ mod tests {
         let stop = steps.iter().position(|s| s == "stop").unwrap();
         assert!(first_online < stop, "cutex.x brought back before the retry: {steps:?}");
         assert!(host.records.borrow().iter().any(|r| r.timeline.iter().any(|t| t.detail.as_deref().is_some_and(|d| d.contains("quiescing")))));
+    }
+
+    #[test]
+    fn a_job_service_down_after_the_swap_does_not_roll_back() {
+        let host = FakeHost::new("r239");
+        for f in HOST_DEPENDENT_CAPABILITIES {
+            host.features.borrow_mut().insert(f.to_string());
+        }
+        let plan = Plan { capabilities_added: vec!["c".into(), "job-external".into()], ..plan(Mode::Full, MigrationClass::RollbackSafe, PackageRun::After) };
+        let mut run = new_run(RunKind::Apply, "r239", &plan);
+        host.features.borrow_mut().insert("c".into());
+        // The swap restarts the Job Service and it does not come back.
+        host.fail_features_after_swap(HOST_DEPENDENT_CAPABILITIES);
+        apply(&mut run, &plan, &host);
+        assert_eq!(run.phase, Phase::Committed, "{:?}", run.error);
+        assert!(!host.features.borrow().contains("job-external"), "the Job Service stayed down");
+        // A cutex-built capability lost still fails.
+        let before = Snapshot { features: host.features.borrow().clone(), ..host.snapshot().unwrap() };
+        host.features.borrow_mut().remove("a");
+        assert!(verify(&plan, &before, &host, &BTreeSet::new()).unwrap_err().contains("capabilities lost"));
     }
 
     #[test]

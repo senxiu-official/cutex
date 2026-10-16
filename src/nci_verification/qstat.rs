@@ -155,7 +155,7 @@ fn command(
     target.validate()?;
     let known_hosts = safe_ssh_path(known_hosts_path)?;
     let key = safe_ssh_path(key_path)?;
-    let mut cmd = Command::new("/usr/bin/ssh");
+    let mut cmd = Command::new(ssh_program());
     cmd.args(["-F", "/dev/null", "-p", "22", "-l", &config.username])
         .arg("-i")
         .arg(key);
@@ -201,6 +201,59 @@ fn command(
         .env("PATH", "/usr/bin:/bin")
         .env("LANG", "C");
     Ok(cmd)
+}
+
+/// The system OpenSSH client. Only a debug build running in a marked private test home
+/// (`CUTEX_TEST_PRIVATE_HOME`) may substitute an absolute stub path from `CUTEX_TEST_NCI_SSH`,
+/// so the fake-Gadi end-to-end test (scripts/nci-fake-gadi-e2e.py) never opens a network
+/// connection; release builds ignore both variables.
+fn ssh_program() -> std::ffi::OsString {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CUTEX_TEST_PRIVATE_HOME").is_some() {
+        if let Some(stub) = std::env::var_os("CUTEX_TEST_NCI_SSH").filter(|p| Path::new(p).is_absolute()) {
+            return stub;
+        }
+    }
+    "/usr/bin/ssh".into()
+}
+
+/// A failed query as a code the owner can act on. stderr is only classified, never stored
+/// or shown (it may contain Gadi's banner or paths).
+fn failure_code(status: Option<i32>, stderr: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(stderr);
+    let has = |needle: &str| text.contains(needle);
+    match status {
+        // ssh's own failure (the remote command never ran).
+        Some(255) => {
+            if has("Host key verification failed")
+                || has("REMOTE HOST IDENTIFICATION HAS CHANGED")
+                || has("no matching host key type")
+            {
+                "qstat_host_key_mismatch"
+            } else if has("Permission denied") {
+                "qstat_ssh_auth_failed"
+            } else if has("Could not resolve hostname")
+                || has("Connection timed out")
+                || has("Connection refused")
+                || has("Network is unreachable")
+                || has("No route to host")
+                || has("Operation timed out")
+                || has("Connection reset")
+                || has("Connection closed")
+            {
+                "qstat_ssh_connect_failed"
+            } else {
+                "qstat_ssh_failed"
+            }
+        }
+        // The forced-command helper refused the command line.
+        _ if has("Only the fixed qstat query is permitted") => "qstat_helper_refused",
+        // `command="/usr/bin/python3 -I <path>"` names a file that is not there.
+        _ if has("can't open file") => "qstat_helper_missing",
+        // PBS has no record of the job (wrong id, or finished longer ago than the history keeps).
+        _ if has("Unknown Job Id") => "qstat_job_unknown",
+        _ => "qstat_remote_failed",
+    }
 }
 
 /// ssh expands `%` tokens in `-i` and `UserKnownHostsFile`; such paths and
@@ -257,9 +310,10 @@ fn drain(reader: &mut impl Read, output: &mut Vec<u8>, limit: usize) -> Result<b
     Ok(false)
 }
 
-/// Exit status of a child that has exited, observed without reaping it, so
-/// its pid (and the group id it leads) cannot be reused before the group kill.
-fn exited_unreaped(pid: i32) -> Result<Option<bool>, &'static str> {
+/// Exit status of a child that has exited (`Some(None)` = killed by a signal), observed
+/// without reaping it, so its pid (and the group id it leads) cannot be reused before the
+/// group kill.
+fn exited_unreaped(pid: i32) -> Result<Option<Option<i32>>, &'static str> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::waitid(
@@ -276,7 +330,7 @@ fn exited_unreaped(pid: i32) -> Result<Option<bool>, &'static str> {
         return Ok(None);
     }
     Ok(Some(
-        info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0,
+        (info.si_code == libc::CLD_EXITED).then(|| unsafe { info.si_status() }),
     ))
 }
 
@@ -287,7 +341,13 @@ fn run(mut command: Command, timeout: Duration) -> Result<Vec<u8>, &'static str>
         .stderr(Stdio::piped())
         .process_group(0);
     let start = Instant::now();
-    let mut child = command.spawn().map_err(|_| "qstat_spawn")?;
+    let mut child = command.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "qstat_ssh_missing"
+        } else {
+            "qstat_spawn"
+        }
+    })?;
     let pid = child.id() as i32;
     let result = (|| {
         let mut stdout = child.stdout.take().ok_or("qstat_io")?;
@@ -296,17 +356,22 @@ fn run(mut command: Command, timeout: Duration) -> Result<Vec<u8>, &'static str>
         nonblocking(stderr.as_raw_fd())?;
         let mut output = Vec::new();
         let mut errors = Vec::new();
+        let mut failed_at: Option<Instant> = None;
         loop {
             if start.elapsed() >= timeout {
                 return Err("qstat_timeout");
             }
             let out_done = drain(&mut stdout, &mut output, MAX_OUTPUT)?;
             let err_done = drain(&mut stderr, &mut errors, MAX_STDERR)?;
-            if let Some(success) = exited_unreaped(pid)? {
-                if !success {
-                    return Err("qstat_unavailable");
-                }
-                if out_done && err_done {
+            if let Some(status) = exited_unreaped(pid)? {
+                if status != Some(0) {
+                    // Read the rest of stderr to classify the failure, but never wait on a
+                    // descendant that keeps the pipes open.
+                    let since = *failed_at.get_or_insert_with(Instant::now);
+                    if (out_done && err_done) || since.elapsed() >= Duration::from_secs(1) {
+                        return Err(failure_code(status, &errors));
+                    }
+                } else if out_done && err_done {
                     return Ok(output);
                 }
             }
@@ -457,12 +522,12 @@ mod tests {
             remote_id: "123.gadi-pbs".into(),
             correlation_token: TOKEN.into(),
             remote_name: None,
-            project: Some("fx09".into()),
+            project: Some("zz00".into()),
             current_state: String::new(),
         }
     }
     fn response(state: &str) -> Value {
-        json!({"Jobs":{"123.gadi-pbs":{"Job_Owner":"owner@gadi", "Job_Name":format!("cx{TOKEN}"), "Account_Name":"fx09", "job_state":state, "Exit_status":0}}})
+        json!({"Jobs":{"123.gadi-pbs":{"Job_Owner":"owner@gadi", "Job_Name":format!("cx{TOKEN}"), "Account_Name":"zz00", "job_state":state, "Exit_status":0}}})
     }
     fn parse_value(v: Value) -> Result<Value, &'static str> {
         parse(&config(), &target(), &serde_json::to_vec(&v).unwrap())
@@ -696,7 +761,7 @@ mod tests {
     #[test]
     fn project_and_account_fields_must_agree() {
         let mut value = response("F");
-        value["Jobs"]["123.gadi-pbs"]["project"] = json!("fx09");
+        value["Jobs"]["123.gadi-pbs"]["project"] = json!("zz00");
         assert!(parse_value(value.clone()).is_ok());
         value["Jobs"]["123.gadi-pbs"]
             .as_object_mut()
@@ -748,7 +813,20 @@ mod tests {
     fn process_limits_and_failure() {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", "exit 1"]);
-        assert_eq!(run(cmd, Duration::from_secs(1)), Err("qstat_unavailable"));
+        assert_eq!(run(cmd, Duration::from_secs(1)), Err("qstat_remote_failed"));
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo 'user@gadi.nci.org.au: Permission denied (publickey).' >&2; exit 255"]);
+        assert_eq!(run(cmd, Duration::from_secs(2)), Err("qstat_ssh_auth_failed"));
+        // A descendant holding the pipes open does not delay the failure past the grace.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 5 & echo 'Host key verification failed.' >&2; exit 255"]);
+        let start = Instant::now();
+        assert_eq!(run(cmd, Duration::from_secs(4)), Err("qstat_host_key_mismatch"));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            run(Command::new("/nonexistent/ssh"), Duration::from_secs(1)),
+            Err("qstat_ssh_missing")
+        );
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", "sleep 5 & wait"]);
         let start = Instant::now();
@@ -775,16 +853,45 @@ mod tests {
         let pid = child.id() as i32;
         let start = Instant::now();
         let observed = loop {
-            if let Some(success) = exited_unreaped(pid).unwrap() {
-                break success;
+            if let Some(status) = exited_unreaped(pid).unwrap() {
+                break status;
             }
             assert!(start.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(5));
         };
-        assert!(!observed);
+        assert_eq!(observed, Some(3));
         // Still a zombie: the pid (and its group id) cannot have been reused.
         assert!(Path::new(&format!("/proc/{pid}")).exists());
-        assert_eq!(exited_unreaped(pid).unwrap(), Some(false));
+        assert_eq!(exited_unreaped(pid).unwrap(), Some(Some(3)));
         assert_eq!(child.wait().unwrap().code(), Some(3));
+    }
+
+    #[test]
+    fn failures_are_classified_for_the_owner() {
+        let cases: &[(Option<i32>, &str, &str)] = &[
+            (Some(255), "Host key verification failed.", "qstat_host_key_mismatch"),
+            (Some(255), "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@", "qstat_host_key_mismatch"),
+            (Some(255), "Unable to negotiate with 1.2.3.4 port 22: no matching host key type found.", "qstat_host_key_mismatch"),
+            (Some(255), "u@gadi.nci.org.au: Permission denied (publickey).", "qstat_ssh_auth_failed"),
+            (Some(255), "ssh: Could not resolve hostname gadi.nci.org.au: Name or service not known", "qstat_ssh_connect_failed"),
+            (Some(255), "ssh: connect to host gadi.nci.org.au port 22: Connection timed out", "qstat_ssh_connect_failed"),
+            (Some(255), "something else", "qstat_ssh_failed"),
+            (Some(126), "Only the fixed qstat query is permitted.", "qstat_helper_refused"),
+            (Some(2), "/usr/bin/python3: can't open file '/home/x/.cutex/nci-qstat-only.py': [Errno 2] No such file or directory", "qstat_helper_missing"),
+            (Some(153), "qstat: Unknown Job Id 123.gadi-pbs", "qstat_job_unknown"),
+            (Some(1), "", "qstat_remote_failed"),
+            (None, "", "qstat_remote_failed"),
+        ];
+        for (status, stderr, code) in cases {
+            assert_eq!(failure_code(*status, stderr.as_bytes()), *code, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn release_semantics_use_the_system_ssh_without_the_test_variable() {
+        // The lib tests never set CUTEX_TEST_NCI_SSH; the stub needs it explicitly.
+        if std::env::var_os("CUTEX_TEST_NCI_SSH").is_none() {
+            assert_eq!(ssh_program(), "/usr/bin/ssh");
+        }
     }
 }

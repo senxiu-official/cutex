@@ -93,6 +93,19 @@ case "$line" in
   *) echo "cutex --version does not name $release / ${commit:0:7}: $line" >&2; exit 1 ;;
 esac
 
+# The build's capability list (featureList of `cutex management schema export`, no daemon needed;
+# host-dependent ones such as job-external are absent here). upgrade-manifest.py diffs it against the
+# previous release's: a capability the previous release advertised must be in capabilities.removed,
+# or cutex's post-update verification rolls the update back.
+if [ "$platform" = windows-x64 ]; then py=python; else py=python3; fi
+schema_dir="$build_root/cutex-schema-$platform"
+rm -rf "${schema_dir:?}" "${build_root:?}/cutex-schema-home-$platform"
+mkdir -p "$build_root/cutex-schema-home-$platform"
+HOME="$build_root/cutex-schema-home-$platform" USERPROFILE="$(winpath "$build_root/cutex-schema-home-$platform")" \
+  "$stage/cutex$exe" management schema export --out "$(winpath "$schema_dir")" > /dev/null
+capabilities="$("$py" -c 'import json,sys; print(json.dumps(sorted(json.load(open(sys.argv[1], encoding="utf-8"))["capabilities"])))' "$(winpath "$schema_dir/index.json")")"
+[ "$capabilities" != "[]" ] || { echo "the schema export lists no capabilities" >&2; exit 1; }
+
 # Leak check: no path of the checkout, cargo's home, the toolchain or the user's home in the binaries.
 leaks=0
 for f in "$stage"/*; do
@@ -121,7 +134,8 @@ cat > "$out/BUILD-INFO-$platform.json" <<EOF
   "platform": "$platform",
   "target": "$target",
   "rustc": "$rustc_version",
-  "versionLine": "$line"
+  "versionLine": "$line",
+  "capabilities": $capabilities
 }
 EOF
 (cd "$out" && sha256sum "$name" > "SHA256SUMS-$platform")

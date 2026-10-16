@@ -1,7 +1,6 @@
 # Notification levels
 
-Capability `notification-levels` (Management v2). Design and owner decisions: cutex-desktop
-`docs/research/notification-levels.md`. Code: `src/notification_levels/` (registry, presets, evaluator),
+Capability `notification-levels` (Management v2). Code: `src/notification_levels/` (registry, presets, evaluator),
 `src/config/notification_levels.rs` (settings), `src/management/v2/notification_levels.rs` (routes).
 
 The owner configures two tables, each a preset plus changed cells:
@@ -33,7 +32,7 @@ Fixed cells (never stored, ignored in a PATCH): `urgent.needsYou = true`, `needs
 
 | id | meaning |
 |---|---|
-| `default` | "Recommended": notification-levels.md §2.1 (only the owner's own work can need the owner) |
+| `default` | "Recommended" (only the owner's own work can need the owner) |
 
 ### Method presets
 
@@ -63,6 +62,7 @@ tables (after the desktop freeze). `requires`: what cutex still lacks to decide 
 | `ownerNotify.needsReply` (combined with the level event) | cutex | needsYou |
 | `ownerNotify.rateLimited` (replaces the level events) | cutex | record |
 | `system.quarantine` / `system.deliveryFailed` / `system.idleDelegation` / `system.other` | cutex | record |
+| `system.safetyBlock` (a Claude Code safety check declined a command under full access; [SAFETY-GRANTS.md](SAFETY-GRANTS.md)) | cutex | needsYou |
 | `native.approval` (command / file / permissions) | cutex + client | needsYou |
 | `native.question` (requestUserInput / elicitation) | cutex + client | needsYou |
 | `ownerApproval.pending` | cutex + client | needsYou |
@@ -93,7 +93,7 @@ tables (after the desktop freeze). `requires`: what cutex still lacks to decide 
 - **summary** (`/v2/summary`, management process, every tick): native requests, owner approvals, delegations
   and owner_notify records → `needs[]` only when the decision includes `needsYou`; each need gains `level`;
   `asksChanged.count` uses the same rule. `messageToOwner` follows `to_phone()`.
-- **webhook** (`cutex notify run`): `agent.message_to_owner` follows the record's channels as before; turn /
+- **webhook** (the notification worker: inside `management serve` on managed installs, else `cutex notify run`): `agent.message_to_owner` follows the record's channels as before; turn /
   attention / job webhook events keep the per-session level (`notify/session.rs`) for now. The levels
   `task.reviewReady` / `task.closed` / `system.preActivationSkipped` and the webhook events
   `task.review_ready` / `task.closed` were removed in r219 (see [r219-removals.md](r219-removals.md));
@@ -152,7 +152,7 @@ unknown or `legacy` preset reads as `default`.
 An event is data:
 
 ```json
-{"id": "waveline.reminderDue", "module": "waveline", "appliedBy": ["client"],
+{"id": "reminders.due", "module": "reminders", "appliedBy": ["client"],
  "title": {"en": "Reminder due", "zh-CN": "提醒到期"}, "description": {"en": "…"},
  "levels": {"default": "inform"}}
 ```
@@ -160,7 +160,7 @@ An event is data:
 - `id`: dotted ascii (`module.event[.variant]`), unique. `levels.default` is required; other keys must be event
   preset ids. A `legacy` key (a contribution written for an older cutex) is dropped on registration.
 - In code: `cutex::notification_levels::register_event(spec)` at process start (management and / or Agent Bus
-  process: each has its own registry), then `Evaluator::current().decide(&["waveline.reminderDue"], scope)`.
+  process: each has its own registry), then `Evaluator::current().decide(&["reminders.due"], scope)`.
 - As data: drop `*.json` (one event, or `{"events": [...]}`) into `<cutex config dir>/notification-events/`;
   both processes load them on first use. Bad files / duplicates are skipped and logged.
 - Owner settings for an event id that is not registered (module removed or not loaded yet) are kept and apply

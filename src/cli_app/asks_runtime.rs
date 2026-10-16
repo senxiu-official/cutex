@@ -695,6 +695,7 @@ pub(crate) fn on_runtime_event(cutex_session_id: &str, runtime_generation: u64, 
 }
 
 /// One session's presence inputs observed outside the ask-store lock.
+#[derive(Clone)]
 struct ObservedPresence {
     entry: cutex::asks::store::Presence,
     runtime_generation: u64,
@@ -784,14 +785,22 @@ fn refresh_presence(store: &AskStore) -> anyhow::Result<()> {
         .iter()
         .map(|record| (record.cutex_session_id.clone(), observe_presence(record, users)))
         .collect();
-    store.with_state(|state| {
+    let merged = |state: &cutex::asks::store::AskState| {
         let mut presence = std::collections::BTreeMap::new();
-        for (session, observed) in observed {
-            let paused = state.pauses.contains_key(&session);
-            let entry = merge_presence(observed, state.presence.get(&session), None, paused);
-            presence.insert(session, entry);
+        for (session, observed) in &observed {
+            let paused = state.pauses.contains_key(session);
+            let entry = merge_presence(observed.clone(), state.presence.get(session), None, paused);
+            presence.insert(session.clone(), entry);
         }
-        state.presence = presence;
+        presence
+    };
+    // Usually nothing changed: compare on the shared cached state and skip
+    // the locked read-modify-write (a whole-store copy every 5 s).
+    if store.inspect(|state| merged(state) == state.presence)? {
+        return Ok(());
+    }
+    store.with_state(|state| {
+        state.presence = merged(state);
     })
 }
 

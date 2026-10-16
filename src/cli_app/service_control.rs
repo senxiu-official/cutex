@@ -15,6 +15,19 @@ impl Service {
     fn unit(self) -> &'static str {
         match self { Self::Bus => "cutex-agent-bus.service", Self::Management => "cutex-management-api.service" }
     }
+    /// The unit a managed install recorded (`install.json`; drill names in
+    /// debug end-to-end tests), else the standard name.
+    #[cfg(target_os = "linux")]
+    fn managed_unit(self) -> String {
+        let names = supervisor::managed_layout()
+            .and_then(|layout| layout.read_install().ok())
+            .map(|record| cutex::upgrade::service::ServiceNames::of(&record));
+        match (self, names) {
+            (Self::Bus, Some(names)) => names.bus_unit,
+            (Self::Management, Some(names)) => names.management_unit,
+            _ => self.unit().to_string(),
+        }
+    }
 }
 
 pub(super) fn run(service: Service, action: Action) -> anyhow::Result<String> {
@@ -34,7 +47,7 @@ fn run_inner(service: Service, action: Action) -> anyhow::Result<String> {
     {
         let verb = match action { Action::Status => "show", Action::Start => "start", Action::Stop => "stop", Action::Restart => "restart" };
         let mut command = Command::new("systemctl");
-        command.args(["--user", verb, service.unit()]);
+        command.args(["--user", verb, &service.managed_unit()]);
         if action == Action::Status {
             command.args(["--property=LoadState,ActiveState,SubState,MainPID", "--no-pager"]);
         }
@@ -57,10 +70,17 @@ fn run_inner(service: Service, action: Action) -> anyhow::Result<String> {
                 return runtime_host::run(&endpoint, service, action, timeout);
             }
         }
-        let executable = configured.context(
-            r"runtime-host is not running: start it with the command in HKCU\Software\Microsoft\Windows\CurrentVersion\Run (RuntimeHost)")?;
-        let logs = cutex::config::paths::runtime_dir()?.join("services");
-        controller::run(executable, &logs, service, action, timeout)
+        if let Some(executable) = configured {
+            let logs = cutex::config::paths::runtime_dir()?.join("services");
+            return controller::run(executable, &logs, service, action, timeout);
+        }
+        // A managed install (`cutex service install`): its supervisor task.
+        if let Some(layout) = supervisor::managed_layout() {
+            return supervisor::run(&layout, service, action, timeout);
+        }
+        anyhow::bail!(
+            "No Windows service manager found: run `cutex service install` (managed install), or start the runtime-host of a hand-deployed host"
+        )
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     anyhow::bail!("Service controls currently support Linux and Windows")
@@ -70,6 +90,10 @@ fn run_inner(service: Service, action: Action) -> anyhow::Result<String> {
 #[cfg(any(windows, test))]
 #[path = "service_controller.rs"]
 mod controller;
+
+#[cfg(any(windows, target_os = "linux", test))]
+#[path = "service_supervisor.rs"]
+mod supervisor;
 
 #[cfg(any(windows, test))]
 #[path = "runtime_host_controller.rs"]

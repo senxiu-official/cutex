@@ -66,6 +66,7 @@ pub fn refresh(store: &Store, peer: &Peer) -> Result<Value> {
 }
 fn refresh_inner(store: &Store, peer: &Peer) -> Result<Value> {
     let hello = super::client::call(store, peer, "GET", "/peer/v1/hello", None)?;
+    super::profiles::note_hello(&peer.peer_id, &hello);
     store.with(|s| {
         if let Some(p) = s.peers.get_mut(&peer.peer_id) {
             p.features = super::pair::declared_features(&hello);
@@ -174,6 +175,9 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
                 Ok(json!({"removed":true}))
             }
             ("GET", "/peer/v1/agents") => exported(&peer),
+            ("GET", super::profiles::ROUTE | super::profiles::AVATAR_ROUTE) => {
+                super::profiles::handle(path)
+            }
             ("POST", super::tells::ROUTE) => {
                 super::tells::receive(&store, &peer, data, &super::tells::bus_delivery)
             }
@@ -341,6 +345,7 @@ pub fn handle_v2(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow:
                             Some(&json!({})),
                         );
                         store.remove(id)?;
+                        super::profiles::forget(id);
                         super::worker::removed(&crate::asks::store::AskStore::open_default()?, id)?;
                         changed(id, "removed");
                         Ok(json!({"removed":true}))

@@ -1,0 +1,227 @@
+# cutex: end-to-end check of the backend updater on clean GitHub runners (Linux and Windows): an existing
+# cutex 0.1.0 managed install upgrades to 0.1.1 through `cutex upgrade check / stage / apply`, and a broken
+# later release rolls back by itself. Manual only (workflow_dispatch); nothing is published, no secret is used.
+#
+# Each job builds DEBUG cutex binaries of `from_ref` (default: the public 0.1.0 tree, tag cutex-0.1.0 of
+# senxiu-official/cutex) and `to_ref` (default: the dispatched ref), with the release identity baked in
+# (CUTEX_RELEASE / CUTEX_COMMIT / CUTEX_CHANNEL=release, as build-cutex.sh does for release builds). Only
+# debug builds trust the run-time test key CUTEX_UPGRADE_TEST_PUBKEY, and only debug builds honour the
+# drill service names (CUTEX_SERVICE_TEST_NAME) and the private test home (CUTEX_TEST_PRIVATE_HOME).
+# It also builds the component archives of `to_ref` (components/<name>/build.sh). Then
+# .github/ci/upgrade-e2e.py signs a throwaway test release with a key generated in the job (0.1.0 manifest
+# with sequence 1; 0.1.1 and the broken release with .github/ci/upgrade-manifest.py, the generator the
+# owner uses), serves it on 127.0.0.1 and drives the installed binaries (see the helper's docstring):
+#
+# - install: `cutex service install --channel release` of 0.1.0 on the real service manager (Linux:
+#   systemd user units under linger, drill names cutex-e2e-*; Windows: the per-user scheduled task
+#   \Cutex-e2e\cutex-supervisor and its supervisor);
+# - 0.1.0 -> 0.1.1: check, stage (preflight), apply -> committed; `cutex --version`, GET /v2/upgrade,
+#   capabilities only gained (incl. `components`), GET /v2/components, services up;
+# - components from the 0.1.1 manifest: claude-runtime -> needsUser claude_cli_missing; Linux: job-service
+#   -> ready (systemd drill unit);
+# - rollback leg: a release whose daemon exits -> the apply ends rolled-back on 0.1.1 (not needs-owner).
+#
+# The 0.1.1 manifest is generated with the REAL release's generator arguments: the committed release
+# metadata .github/ci/release-meta/<to_release>.json (--meta; 0.1.1: mode full) and
+# capabilities-<from_release>.json (--previous-capabilities), no native (0.1.1 ships none). 0.1.0 is
+# installed with its native selected for new agents (as AGENT-INSTALL.md B.3 does); after the apply NEW
+# agents must use releases/0.1.1/manifests/default.json (0.1.0's native + the 0.1.1 cutex-mcp facade).
+# The native runtime is a stub (never executed: cutex only hashes and selects it).
+name: Upgrade e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_repo:
+        description: "Repository of the installed release's source"
+        required: false
+        default: senxiu-official/cutex
+        type: string
+      from_ref:
+        description: "Tag / commit of the installed release (0.1.0 = tag cutex-0.1.0 of senxiu-official/cutex)"
+        required: false
+        default: cutex-0.1.0
+        type: string
+      from_release:
+        description: "Release label of the installed build"
+        required: false
+        default: "0.1.0"
+        type: string
+      to_ref:
+        description: "Ref of the new release in this repository (empty = the dispatched ref)"
+        required: false
+        default: ""
+        type: string
+      to_release:
+        description: "Release label of the new build"
+        required: false
+        default: "0.1.1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upgrade-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  upgrade:
+    name: upgrade ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-22.04
+            leak_policy: fail
+          - platform: windows-x64
+            runner: windows-2022
+            leak_policy: warn
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep LF line endings (embedded schemas are hashed byte for byte)
+        run: git config --global core.autocrlf false
+      - name: Helpers of this workflow's ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: ci
+          sparse-checkout: .github
+          persist-credentials: false
+      - name: New release source (to_ref)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: to
+          ref: ${{ inputs.to_ref }}
+          persist-credentials: false
+      - name: Installed release source (from_ref)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: from
+          repository: ${{ inputs.from_repo }}
+          ref: ${{ inputs.from_ref }}
+          persist-credentials: false
+      - name: Release labels and commits
+        env:
+          FROM_RELEASE: ${{ inputs.from_release }}
+          TO_RELEASE: ${{ inputs.to_release }}
+        run: |
+          set -euo pipefail
+          for label in "$FROM_RELEASE" "$TO_RELEASE"; do
+            [[ "$label" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "::error::invalid release label '$label'"; exit 1; }
+          done
+          [ "$FROM_RELEASE" != "$TO_RELEASE" ] || { echo "::error::from_release and to_release are the same"; exit 1; }
+          {
+            echo "FROM_RELEASE=$FROM_RELEASE"
+            echo "TO_RELEASE=$TO_RELEASE"
+            echo "FROM_COMMIT=$(git -C from rev-parse HEAD)"
+            echo "TO_COMMIT=$(git -C to rev-parse HEAD)"
+          } >> "$GITHUB_ENV"
+          echo "from $FROM_RELEASE $(git -C from rev-parse HEAD); to $TO_RELEASE $(git -C to rev-parse HEAD)"
+      - name: Pythons from the runner's tool cache
+        run: bash ci/.github/ci/component-e2e-pythons.sh
+      - name: Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal && rustc +1.95.0 --version
+      - name: Build debug cutex of both releases (release identity baked in)
+        run: |
+          set -euo pipefail
+          # One target dir: the dependencies are built once. No debug info keeps both builds small.
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target" CARGO_PROFILE_DEV_DEBUG=0 CUTEX_CHANNEL=release
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; tmp="$(cygpath -u "$RUNNER_TEMP")"; else exe=; tmp="$RUNNER_TEMP"; fi
+          for side in from to; do
+            if [ "$side" = from ]; then label="$FROM_RELEASE"; else label="$TO_RELEASE"; fi
+            (
+              cd "$side"
+              export CUTEX_RELEASE="$label" CUTEX_COMMIT="$(git rev-parse HEAD)" CUTEX_BUILD_TIME="$(git log -1 --format=%cI)"
+              cargo +1.95.0 build --locked --bin cutex --bin cutex-mcp
+            )
+            mkdir -p "$tmp/bins/$side"
+            cp "$tmp/target/debug/cutex$exe" "$tmp/target/debug/cutex-mcp$exe" "$tmp/bins/$side/"
+            "$tmp/bins/$side/cutex$exe" --version
+          done
+          rm -rf "$tmp/target/debug/incremental"
+      - name: Neutral build directory for the component builds
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then d=/c/build; mkdir -p "$d"; else d=/build; sudo mkdir -p "$d"; sudo chown "$(id -u):$(id -g)" "$d"; fi
+          echo "BUILD_ROOT=$d" >> "$GITHUB_ENV"
+      - name: Build the new release's component archives
+        env:
+          LEAK_POLICY: ${{ matrix.leak_policy }}
+        run: |
+          set -euo pipefail
+          for json in to/components/*/component.json; do
+            read -r name version platforms < <("$E2E_PYTHON" -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c["name"], c["version"], ",".join(c["platforms"]))' "$json" | tr -d '\r')
+            case ",$platforms," in *",${{ matrix.platform }},"*) ;; *) echo "skip $name (not for ${{ matrix.platform }})"; continue ;; esac
+            echo "== $name $version"
+            PYTHON="$E2E_PYTHON" bash "to/components/$name/build.sh" "${{ matrix.platform }}" "$version" "$RUNNER_TEMP/archives"
+          done
+          if [ "$RUNNER_OS" = Windows ]; then ls -la "$(cygpath -u "$RUNNER_TEMP")/archives"; else ls -la "$RUNNER_TEMP/archives"; fi
+      - name: systemd user manager (linger)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$(id -un)"
+          uid="$(id -u)"
+          for _ in $(seq 60); do [ -S "/run/user/$uid/bus" ] && break; sleep 1; done
+          [ -S "/run/user/$uid/bus" ] || { echo "::error::no user bus at /run/user/$uid/bus"; exit 1; }
+          {
+            echo "XDG_RUNTIME_DIR=/run/user/$uid"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+          } >> "$GITHUB_ENV"
+          XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-system-running || true
+      - name: Signing helper dependency
+        run: |
+          "$E2E_PYTHON" -m pip install --disable-pip-version-check --no-input "cryptography==46.0.5"
+      - name: Upgrade e2e
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Under the user profile (cutex keeps owner-private ACLs), with a space in the path.
+            work="$USERPROFILE\\cutex upgrade e2e"
+            bins="$(cygpath -w "$RUNNER_TEMP/bins")"
+            archives="$(cygpath -w "$RUNNER_TEMP/archives")"
+            sep='\'
+          else
+            work="$RUNNER_TEMP/cutex upgrade e2e"
+            bins="$RUNNER_TEMP/bins"
+            archives="$RUNNER_TEMP/archives"
+            sep=/
+          fi
+          echo "E2E_WORK=$work" >> "$GITHUB_ENV"
+          "$E2E_PYTHON" ci/.github/ci/upgrade-e2e.py \
+            --from-cutex "$bins${sep}from" --from-commit "$FROM_COMMIT" \
+            --to-cutex "$bins${sep}to" --to-commit "$TO_COMMIT" \
+            --components "$archives" --work "$work" --service-name e2e --claude-python "$E2E_PYTHON" \
+            --release-meta ci/.github/ci/release-meta
+      - name: Unit journal
+        if: always() && runner.os == 'Linux'
+        run: |
+          for unit in cutex-e2e-agent-bus.service cutex-e2e-management-api.service cutex-e2e-job-service.service; do
+            journalctl --user --no-pager -o short-iso -u "$unit" -n 100 || true
+          done
+          journalctl --user --no-pager -o short-iso -u 'cutex-upgrade-*' -n 100 || true
+      - name: Collect logs
+        if: failure()
+        run: |
+          tmp="$RUNNER_TEMP"; work="${E2E_WORK:-}"
+          if [ "$RUNNER_OS" = Windows ]; then tmp="$(cygpath -u "$tmp")"; [ -z "$work" ] || work="$(cygpath -u "$work")"; fi
+          mkdir -p "$tmp/e2e-logs"
+          if [ -n "$work" ] && [ -d "$work/logs" ]; then
+            cp -R "$work/logs/." "$tmp/e2e-logs/"
+          fi
+          # The helper never copies config.json / accounts.json and scrubs the tokens; belt and braces.
+          find "$tmp/e2e-logs" \( -name config.json -o -name accounts.json -o -name 'auth*.json' \) -delete
+      - if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: upgrade-e2e-${{ matrix.platform }}-logs
+          path: ${{ runner.temp }}/e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 7

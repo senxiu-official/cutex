@@ -488,6 +488,11 @@ pub fn yield_attempt(store: &AskStore, session: &str, ask_id: &str, attempt: u32
         .and_then(|artifact| store.read_artifact(artifact, None).ok().flatten())
         .and_then(|(_, bytes)| super::views::preview(&String::from_utf8_lossy(&bytes)));
     store.with_state(|state| {
+        // Already ended by another end-of-turn path (observer vs.
+        // reconciliation): one stage, one waiting delivery.
+        if !super::observe::attempt_open(state, ask_id, attempt) {
+            return;
+        }
         state.update_ask(ask_id, now, |ask| {
             if let Some(record) = ask.attempts.iter_mut().find(|item| item.n == attempt) {
                 record.state = AttemptState::Yielded;
@@ -1024,6 +1029,55 @@ mod flow {
         let state = store.snapshot().unwrap();
         assert_eq!(state.asks[&ask_id].review, Some(ReviewState::AwaitingAcceptance));
         assert_eq!(state.answers.values().map(|answer| answer.revision).max(), Some(2));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    /// The per-attempt guard never blocks a continuation: a stage reported
+    /// twice yields once, and the continuation's later turn (a new attempt)
+    /// still records its answer, once.
+    #[test]
+    fn duplicate_turn_ends_keep_one_stage_and_the_continuation_answer() {
+        let (world, dir) = world("await-dup-ends");
+        let (store, store_dir) = temp_store("await-dup-ends");
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = Utc::now();
+        let ask_id = store.with_state(|state| state.create_ask(new_ask("a", "build"), now).unwrap().0.ask_id).unwrap();
+        assert_eq!(tick(&world, &runtime, &store, now).unwrap().admitted, vec![ask_id.clone()]);
+        let turn = leased_turn(&store);
+        observe(&store, TARGET, "turn/started", &started(&turn), now).unwrap();
+        observe(&store, TARGET, "item/completed", &item(&turn, submit("job-1")), now).unwrap();
+        assert_eq!(call(&world, &store, TARGET, "delegation_await", json!({"note": "building"}), "w1")["waiting"], true);
+        let stage = completed(&turn, "Waiting for the build.")["turn"].clone();
+        // Observer and reconciliation both end attempt 1.
+        crate::asks::observe::finalize(&store, TARGET, &ask_id, 1, &stage, None, now).unwrap();
+        crate::asks::observe::finalize(&store, TARGET, &ask_id, 1, &stage, Some(InterruptReason::RuntimeRestart), now).unwrap();
+        yield_attempt(&store, TARGET, &ask_id, 1, &stage, now).unwrap();
+        runtime.set(TARGET, |status| status.active_turn_id = None);
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.asks[&ask_id].attempts[0].state, AttemptState::Yielded);
+        assert!(state.answers.is_empty(), "a stage is not an answer");
+
+        assert!(complete(&store, "job-1", exit(0), now));
+        assert_eq!(tick(&world, &runtime, &store, now).unwrap().admitted, vec![ask_id.clone()]);
+        let turn = leased_turn(&store);
+        observe(&store, TARGET, "turn/started", &started(&turn), now).unwrap();
+        let answer = completed(&turn, "Build green.")["turn"].clone();
+        crate::asks::observe::finalize(&store, TARGET, &ask_id, 2, &answer, None, now).unwrap();
+        crate::asks::observe::finalize(&store, TARGET, &ask_id, 2, &answer, None, now).unwrap();
+        // Attempt 1 already ended: a late report for it changes nothing.
+        crate::asks::observe::finalize(&store, TARGET, &ask_id, 1, &stage, None, now).unwrap();
+        let state = store.snapshot().unwrap();
+        let ask = &state.asks[&ask_id];
+        assert_eq!(ask.execution, ExecutionState::Answered);
+        assert_eq!(
+            ask.attempts.iter().map(|record| record.state).collect::<Vec<_>>(),
+            vec![AttemptState::Yielded, AttemptState::Answered]
+        );
+        assert_eq!(state.answers.len(), 1);
+        let recorded = state.answers.values().next().unwrap();
+        assert_eq!((recorded.attempt, recorded.revision), (2, 1));
+        assert_eq!(state.deliveries.values().filter(|d| d.kind == DeliveryKind::Answer).count(), 1);
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(store_dir);
     }

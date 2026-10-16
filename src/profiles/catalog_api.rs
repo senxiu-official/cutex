@@ -273,14 +273,7 @@ fn claude_default_effort(model: &Value, configured: Option<&str>) -> Value {
 
 /// Claude default model: the profile's new-session default, else its own default.
 fn claude_selected_model(account: &StoredAccount) -> Option<String> {
-    let config = load_codez_config();
-    let defaults = config
-        .new_session_defaults
-        .get(&account.name)
-        .or_else(|| config.new_session_defaults.get(&account.id))
-        .and_then(|defaults| defaults.model.clone());
-    defaults
-        .or_else(|| Some(account.options.claude.model.clone()))
+    crate::profiles::settings_api::claude_effective_model(&load_codez_config(), account)
         .filter(|model| !model.trim().is_empty())
 }
 

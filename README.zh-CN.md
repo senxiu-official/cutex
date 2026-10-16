@@ -6,17 +6,17 @@
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
-**0.1.0「First Take」**：第一个公开版本。
+**0.1.1**：可选组件（Job Service、Claude 运行时）由 cutex 安装和更新；托管安装自己运行通知 worker（0.1.0「First Take」是第一个公开版本）。更新内容见 [CHANGELOG.md](CHANGELOG.md)。
 
 > **0.1.x 的已知缺口**（正在修，修好后删除这段）：
-> - **Claude 智能体**需要 Claude 运行时（`claude-adapter`），安装指南和发布包目前还不会安装它；基于 Codex 的智能体可以正常使用。
-> - **作业页和 NCI 远程作业**需要 Job Service，本版本还没有包含。
+> - **NCI 远程作业**在公开版本里还不能用。
 > - **手机推送 / 配对手机**：还没有公开的手机应用。
-> - **外发通知（webhook）**需要 `cutex notify run`，安装程序还不会设置它。
+>
+> Claude 智能体需要可选组件 `claude-runtime`，长时间作业（Linux）需要 `job-service`：在托管安装上运行 `cutex component install <名字>`，或点桌面端的「安装」按钮（[components/README.md](components/README.md)）。
 
 cutex 是在你自己的电脑上运行编程智能体的后台服务。智能体运行在
 [cute-codex](https://github.com/senxiu-official/cute-codex)（OpenAI Codex 的分支）或 Claude Code 上
-（通过 [`claude-adapter/`](claude-adapter/) 里的适配器）。所有状态都在 cutex 里：智能体、项目、队列、委托、
+（通过 [`components/claude-runtime/`](components/claude-runtime/) 里的适配器）。所有状态都在 cutex 里：智能体、项目、队列、委托、
 Profile 和用量。
 
 客户端通过 Management v2 HTTP / SSE 接口和它通信。主要的客户端是
@@ -37,7 +37,7 @@ Profile 和用量。
 - 项目记忆会在启动时加进每个成员的指令里。
 - 闹钟：智能体可以给自己或别的智能体定一条稍后送达的消息。你可以查看和取消。
 - 通知：智能体可以给你发消息（`owner_notify`），也可以要求你回复。通知级别决定哪些事件、以什么方式通知你；
-  `cutex notify run` 可以把通知转发到 webhook。
+  通知 worker 把通知转发到 webhook（用 `cutex service install` 安装时它运行在管理服务里；其他情况把 `cutex notify run` 作为单独的服务运行）。
 - 审批：超出智能体自身权限的操作（比如使用标记为“需要审批”的 Profile）要等你批准或拒绝。
 - 工作流：一个经过批准的脚本启动一次性的步骤智能体，并汇总它们的结果。
 - 笔记和侧聊：只属于你自己的笔记（智能体看不到），以及在 Codex 智能体旁边开的临时侧聊。
@@ -70,14 +70,14 @@ Profile 和用量。
 **主机**
 - 能力发现（`GET /v2/capabilities`）和接口的 JSON Schema（`cutex management schema export`）。
 - 主机健康检查（`GET /v2/health`）。
-- `cutex service install` 把后台服务安装为用户服务（Linux 上是 systemd 用户单元，Windows 上是登录任务）。
+- `cutex service install` 把后台服务安装为用户服务（Linux 上是 systemd 用户单元，Windows 上是登录任务）：智能体总线和管理服务，管理服务同时运行通知 worker（webhook、通知状态）。
+- 可选组件，按需安装、更新和移除（`cutex component`、`/v2/components`）：`claude-runtime`（Claude 智能体，Linux 和 Windows）和 `job-service`（智能体的长时间作业，Linux）。见 [components/README.md](components/README.md)。
 - 用不同的目录运行相互独立的实例（`CUTEX_HOME`）。
-- 每个 Profile 可以使用 Docker 运行时。
 
 ## 安装
 
 可以用发布的二进制安装，也可以从源码构建。完整的安装指南两种方式都涵盖，包括 Linux 和 Windows 上的 cutex、
-cute-codex、Claude 运行时和桌面端，人照着做或者交给编程助手执行都可以：
+cute-codex、可选组件和桌面端，人照着做或者交给编程助手执行都可以：
 
 **[AGENT-INSTALL.md](https://github.com/senxiu-official/cutex-desktop/blob/release/docs/install/AGENT-INSTALL.md)**
 （在 cutex-desktop 仓库里，英文）
@@ -110,7 +110,7 @@ cargo build --locked --release --bin cutex --bin cutex-mcp
 | 组件 | 作用 |
 |---|---|
 | cute-codex | Codex 智能体：原生 app-server、模型调用和工具 |
-| `claude-adapter/` | Claude 智能体：基于 Claude Agent SDK 和 Claude Code 的 app-server 适配器 |
+| `components/claude-runtime/` | Claude 智能体：基于 Claude Agent SDK 和 Claude Code 的 app-server 适配器 |
 | Profile | 一个服务商账号的凭据和设置，各 Profile 相互隔离 |
 | 会话存储 | 智能体的持久身份、原生线程 ID、工作目录、项目、Profile 和生命周期 |
 | 托管运行时 | 一个智能体的常驻原生进程；没有客户端连接时也继续运行 |
@@ -135,7 +135,12 @@ cargo build --locked --release --bin cutex --bin cutex-mcp
 - [docs/profile-model-configurations.md](docs/profile-model-configurations.md)：模型的命名配置
 - [docs/FILES-REVERT.md](docs/FILES-REVERT.md)：撤销某一轮改动的文件
 - [docs/health-check.md](docs/health-check.md)：主机健康检查
-- [docs/docker-image-notes.md](docs/docker-image-notes.md)：Docker 运行时
+- [docs/backend-upgrade.md](docs/backend-upgrade.md)：托管安装、`cutex service install` 和签名的后端更新（`cutex upgrade`）
+- [components/README.md](components/README.md)：可选组件（`cutex component`）
+- [docs/INSTANCES.md](docs/INSTANCES.md)：相互独立的实例（`CUTEX_HOME`）
+- [docs/agent-bus-operations.md](docs/agent-bus-operations.md)：智能体总线的令牌、审计日志和卡住的消息
+- [docs/PROFILE-SEARCH-TOOL.md](docs/PROFILE-SEARCH-TOOL.md)：`web_search` 工具
+- [docs/SESSION-FAST-MODE.md](docs/SESSION-FAST-MODE.md)：按会话的快速模式
 
 以上文档均为英文。
 
@@ -146,9 +151,10 @@ cargo build --locked --release --bin cutex --bin cutex-mcp
 - **远程访问默认在你自己的网络里。** 接口默认只监听本机回环地址。访问其他机器请通过 SSH 或你信任的私有 tailnet，
   不要把管理接口或智能体总线的端口暴露到公网。
 - **用户身份是为了方便。** 用户身份是为了和熟人共用主机，不是防陌生人的安全边界。
-- **升级。** 托管安装（`cutex service install`）用 `cutex upgrade` 应用签名的发布版本（见 `cutex upgrade --help`）。
+- **升级。** 托管安装（`cutex service install`）用 `cutex upgrade` 或桌面端的后端更新应用签名的发布版本
+  （见 [docs/backend-upgrade.md](docs/backend-upgrade.md)）。
   从源码构建的安装也可以继续从源码升级。
-- 在 Linux 上，智能体可以使用独立的 Job Service 运行长时间的命令；它不在这个仓库里。
+- 在 Linux 上，智能体可以用 Job Service 运行长时间的命令，它是一个可选组件（[components/job-service/](components/job-service/)）。
 
 ### 本地数据
 
@@ -181,7 +187,7 @@ CUTEX_TEST_PRIVATE_HOME=~/cutex-test-home HOME=~/cutex-test-home cargo test --lo
 这样 cutex 会使用 `~/cutex-test-home/.cutex`。设置了 `CUTEX_TEST_PRIVATE_HOME` 时，发布版本会拒绝运行。调试版的
 `cutex management serve` 请用单独的端口（`--port`），避免和已安装的后台服务冲突。
 
-Claude 适配器是一个 Python 包，测试在 `claude-adapter/` 里。
+Claude 适配器是一个 Python 包，测试在 `components/claude-runtime/` 里。
 
 欢迎在 GitHub issue 里报 bug。觉得有用的话，欢迎在 GitHub 上点个 Star，方便更多人找到它。
 
@@ -194,5 +200,5 @@ cutex 原样使用了 Codex 0.154.0 的默认模型指令，见 [NOTICE](NOTICE)
 
 ## 许可证
 
-Apache License 2.0：见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。`claude-adapter/` 使用 MIT 许可证
-（[claude-adapter/LICENSE](claude-adapter/LICENSE)）。
+Apache License 2.0：见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。`components/claude-runtime/` 使用 MIT 许可证
+（[components/claude-runtime/LICENSE](components/claude-runtime/LICENSE)）。

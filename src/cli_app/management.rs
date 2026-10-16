@@ -492,6 +492,18 @@ pub(crate) fn cmd_management_serve(
     cutex::inbound_mail::start_worker();
     #[cfg(all(target_os = "linux", feature = "nci-qstat"))]
     cutex::nci_verification::start_worker();
+    // Notification worker (state collector + webhook outbox): embedded for a
+    // managed install, whose services start no separate `cutex notify run`.
+    // The worker lock keeps a concurrently running `cutex notify run` and
+    // this one from both delivering.
+    if cutex::notify::outbound::embedded_worker_wanted(
+        std::env::var(cutex::notify::outbound::EMBEDDED_WORKER_ENV).ok().as_deref(),
+        cutex::upgrade::layout::Layout::detect().is_some(),
+    ) {
+        if let Err(error) = cutex::notify::outbound::spawn_embedded_worker() {
+            eprintln!("notification worker warning: {error:#}");
+        }
+    }
     cutex::management::v2::profile_quota_native::start_refresher();
     cutex::management::v2::usage::catalog::start_refresher();
     cutex::management::v2::usage::external::start_scanner();

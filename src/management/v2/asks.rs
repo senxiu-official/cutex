@@ -256,6 +256,16 @@ fn owner_need_for_delivery_failure(params: &Value) {
 }
 
 pub fn publish_pending_notices(store: &AskStore) {
+    // Called every scheduler pass: look before taking the write lock (which
+    // copies the whole store).
+    match store.inspect(|state| state.notices.is_empty()) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("asks: could not read notices: {error:#}");
+            return;
+        }
+    }
     let notices = match store.with_state(|state| std::mem::take(&mut state.notices)) {
         Ok(notices) => notices,
         Err(error) => {

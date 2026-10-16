@@ -141,7 +141,7 @@ pub fn level_of_snapshot(snapshot: &Value) -> (RevisionLevel, Option<String>) {
 
 /// Scheduler pass: raise revisions below `inContext` from the bus records.
 pub fn reconcile(world: &dyn SchedulerWorld, store: &AskStore, now: DateTime<Utc>) -> anyhow::Result<()> {
-    let Some(state) = store.peek()? else {
+    let Some(state) = store.peek_shared()? else {
         return Ok(());
     };
     let pending: Vec<(String, String, String)> = state

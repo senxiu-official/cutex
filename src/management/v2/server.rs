@@ -197,6 +197,14 @@ pub fn handle_v2_request(
         }
         return super::runtimes_api::handle(stream, request);
     }
+    if super::components_api::is_path(path) {
+        // Optional components (install / remove backend services): root only.
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for components", false, json!({}));
+        }
+        return super::components_api::handle(stream, request);
+    }
     if super::upgrade_api::is_path(path) {
         // Backend upgrade (stop / swap / restart this daemon): root only.
         if !authenticated_root_request(request, agent_management_admin_token) {
@@ -290,6 +298,14 @@ pub fn handle_v2_request(
                 "the Management root credential is required for the harness preview", false, json!({}));
         }
         return super::agent_harness::handle(stream, request);
+    }
+    if super::safety_checks::is_path(path) {
+        // Safety blocks (owner decisions): root (incl. device / client tokens).
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for safety checks", false, json!({}));
+        }
+        return super::safety_checks::handle(stream, request);
     }
     if super::owner_notify::is_path(path) {
         // Agent → owner messages are the owner's view: root (incl. device /
@@ -2376,6 +2392,19 @@ fn handle_cutex_request(
     if cutex_request.method == "cutex/userInput/submit" {
         trace.enable(&cutex_request.request_id, cutex_session_id);
     }
+    // Safety grants are the owner's: refused before any state is read.
+    if super::safety_checks::is_command(&cutex_request.method) && owner.is_none() {
+        return write_v2_request_error(
+            stream,
+            403,
+            "Forbidden",
+            Some(&cutex_request.request_id),
+            "cutex_method_denied",
+            "safety check decisions are the owner's (Management root credential)",
+            false,
+            json!({ "cutexSessionId": cutex_session_id }),
+        );
+    }
     let registry = (context.load_registry)()?;
     let session = if matches!(
         cutex_request.method.as_str(),
@@ -2579,6 +2608,15 @@ fn handle_cutex_request(
                     &cutex_request,
                 )
             })
+    } else if super::safety_checks::is_command(&cutex_request.method) {
+        super::safety_checks::dispatch(
+            event_repository,
+            context,
+            owner.copied(),
+            cutex_session_id,
+            &session,
+            &cutex_request,
+        )
     } else if super::owner_notify::is_command(&cutex_request.method) {
         super::owner_notify::dispatch(
             event_repository,
@@ -4539,7 +4577,9 @@ pub(super) fn cutex_operation_error_status(code: &str, outcome_unknown: bool) ->
         | "notification_closed"
         | "notification_not_replyable" => 409,
         "ask_not_found" | "question_not_found" | "recipient_not_found" | "revision_not_found" => 404,
-        "notification_not_found" => 404,
+        "notification_not_found" | "safety_block_not_found" => 404,
+        // Safety grants.
+        "safety_block_closed" | "safety_grants_unsupported" | "runtime_refused" => 409,
         "owner_notify_unavailable" => 503,
         "recipient_outside_boundary" | "recipient_archived" => 403,
         "invalid_arguments" | "unsupported_context" => 400,

@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use cutex::cli::args::{ServiceCommand, UpgradeCommand};
+use cutex::cli::args::{ComponentCommand, ServiceCommand, UpgradeCommand};
 use cutex::upgrade::control::{self, ApplyRequest, RollbackRequest};
 use cutex::upgrade::layout::Layout;
 use cutex::upgrade::manifest::Mode;
@@ -310,5 +310,55 @@ pub(super) fn run_service(command: ServiceCommand) -> anyhow::Result<()> {
             print(&service::status(&layout, &RealExec))
         }
         ServiceCommand::Run => cutex::upgrade::supervisor::run(&layout()?),
+    }
+}
+
+pub(super) fn run_component(command: ComponentCommand) -> anyhow::Result<()> {
+    use cutex::components::{self, InstallRequest, Lock};
+    let keys = cutex::upgrade::keys::trusted_keys();
+    let layout = Layout::detect();
+    let layout = layout.as_ref();
+    match command {
+        ComponentCommand::List { json } => {
+            let view = components::list(layout, &keys, None);
+            if json {
+                return print(&view);
+            }
+            if view["managed"] != true {
+                println!("unmanaged: this cutex was deployed by hand; components are set up by hand on this host");
+            }
+            for c in view["components"].as_array().into_iter().flatten() {
+                let text = |key: &str| c[key].as_str().unwrap_or("-").to_string();
+                println!("{:<16} {:<15} selected {:<14} available {}", text("name"), text("state"), text("selected"), text("available"));
+                if let Some(error) = c["error"].as_str() {
+                    println!("{:<16} last error: {error}", "");
+                }
+            }
+            Ok(())
+        }
+        ComponentCommand::Status { name } => {
+            let view = components::list(layout, &keys, None);
+            match name {
+                None => print(&view),
+                Some(name) => {
+                    components::handler(&name).map_err(explain)?;
+                    let one = view["components"].as_array().into_iter().flatten().find(|c| c["name"] == name.as_str()).cloned();
+                    print(&one.unwrap_or_default())
+                }
+            }
+        }
+        ComponentCommand::Install { name, from_source, dry_run } => {
+            let request = InstallRequest { from_source, dry_run };
+            let out = components::install(layout, &keys, &name, &request, &RealExec, Lock::Acquire).map_err(explain)?;
+            print(&out)
+        }
+        ComponentCommand::Remove { name, force, dry_run } => {
+            let out = components::remove(layout, &keys, &name, force, dry_run, &RealExec, Lock::Acquire).map_err(explain)?;
+            print(&out)
+        }
+        ComponentCommand::Prune { name, dry_run } => {
+            let removed = components::prune(layout, &keys, &name, dry_run).map_err(explain)?;
+            print(&serde_json::json!({ "removed": removed, "dryRun": dry_run }))
+        }
     }
 }

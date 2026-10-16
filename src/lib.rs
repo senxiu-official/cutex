@@ -15,6 +15,7 @@ pub mod artifacts;
 /// Asks (委托): call/return between persistent agents.
 pub mod asks;
 pub mod catalog;
+pub mod components;
 pub mod cli;
 pub mod compat;
 pub mod config;

@@ -11,6 +11,7 @@ mod http_tests;
 pub mod model;
 pub mod pair;
 pub mod policy;
+pub mod profiles;
 pub mod routes;
 pub mod store;
 pub mod strip;

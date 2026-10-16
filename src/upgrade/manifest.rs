@@ -22,6 +22,8 @@ use super::layout::{ensure_label, valid_label};
 pub const CHANNEL_SCHEMA: &str = "cutex/channel/v1";
 pub const MANIFEST_SCHEMA: &str = "cutex/release-manifest/v1";
 pub const MAX_DOCUMENT_BYTES: usize = 1 << 20;
+/// `components.<name>` of the Claude runtime (was the `claudeRuntime` part).
+pub const CLAUDE_RUNTIME_COMPONENT: &str = "claude-runtime";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,6 +169,10 @@ pub struct NativePart {
     pub artifacts: BTreeMap<String, Artifact>,
 }
 
+/// The legacy `claudeRuntime` part (manifests before components). Since
+/// 0.1.1 the generator writes `components.claude-runtime` instead and omits
+/// this; [`ReleaseManifest::parse`] maps an old one onto that component, so
+/// everything reads the Claude runtime from `components` only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeRuntimePart {
@@ -176,6 +182,19 @@ pub struct ClaudeRuntimePart {
     pub adapter_version: Option<String>,
     #[serde(default)]
     pub sdk: Option<String>,
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, Artifact>,
+}
+
+/// An optional component shipped as its own archive in the same release
+/// (`components.<name>`, e.g. `job-service`): installed only on hosts that
+/// ask for it, refreshed by backend updates only where installed. Older
+/// manifests have none; older readers ignore the section.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentPart {
+    pub version: String,
+    /// Platform key -> archive.
     #[serde(default)]
     pub artifacts: BTreeMap<String, Artifact>,
 }
@@ -222,6 +241,9 @@ pub struct ReleaseManifest {
     pub native: Option<NativePart>,
     #[serde(default)]
     pub claude_runtime: Option<ClaudeRuntimePart>,
+    /// Optional components by name (`job-service`, …).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub components: BTreeMap<String, ComponentPart>,
     #[serde(default)]
     pub desktop: DesktopPart,
     pub mode: Mode,
@@ -246,8 +268,25 @@ pub fn platform_key() -> String {
 impl ReleaseManifest {
     pub fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         ensure!(bytes.len() <= MAX_DOCUMENT_BYTES, "release manifest too large");
-        let manifest: Self = serde_json::from_slice(bytes).context("invalid release manifest")?;
+        let mut manifest: Self = serde_json::from_slice(bytes).context("invalid release manifest")?;
+        manifest.map_legacy_claude_runtime();
         Ok(manifest)
+    }
+
+    /// An old `claudeRuntime` part is the `claude-runtime` component (one
+    /// source of truth). `components.claude-runtime` wins when both exist.
+    fn map_legacy_claude_runtime(&mut self) {
+        if let Some(legacy) = &self.claude_runtime {
+            self.components.entry(CLAUDE_RUNTIME_COMPONENT.to_string()).or_insert_with(|| ComponentPart {
+                version: legacy.name.clone(),
+                artifacts: legacy.artifacts.clone(),
+            });
+        }
+    }
+
+    /// The Claude runtime version this release names (`claude-rN`).
+    pub fn claude_runtime_version(&self) -> Option<&str> {
+        self.components.get(CLAUDE_RUNTIME_COMPONENT).map(|c| c.version.as_str())
     }
 
     pub fn tag(&self) -> String {
@@ -291,7 +330,20 @@ impl ReleaseManifest {
                 artifact.validate()?;
             }
         }
+        for (name, component) in &self.components {
+            ensure_label(name, "component name")?;
+            ensure_label(&component.version, "component version")?;
+            for artifact in component.artifacts.values() {
+                artifact.validate()?;
+            }
+        }
         Ok(())
+    }
+
+    /// Component `name`'s archive for this platform.
+    pub fn component_artifact(&self, name: &str) -> Option<(&ComponentPart, &Artifact)> {
+        let component = self.components.get(name)?;
+        Some((component, component.artifacts.get(&platform_key())?))
     }
 
     /// The cutex archive for this platform.
@@ -446,6 +498,7 @@ pub(crate) mod fixtures {
             },
             native: None,
             claude_runtime: None,
+            components: BTreeMap::new(),
             desktop: DesktopPart::default(),
             mode: Mode::Reload,
             package_run_recommended: false,
@@ -521,6 +574,61 @@ mod tests {
         for (path, ok) in [("runtime/users", true), ("a", true), ("/abs", false), ("a/../b", false), ("a\\b", false), ("c:x", false), ("", false)] {
             assert_eq!(safe_relative(path), ok, "{path}");
         }
+    }
+
+    #[test]
+    fn components_are_optional_and_validated() {
+        // A 0.1.0 manifest (no `components`) stays valid and round-trips without one.
+        let plain = manifest("0.1.0", 1);
+        let text = serde_json::to_string(&plain).unwrap();
+        assert!(!text.contains("components"));
+        assert!(ReleaseManifest::parse(text.as_bytes()).unwrap().components.is_empty());
+        let mut m = manifest("0.1.1", 2);
+        let raw = serde_json::json!({"job-service": {"version": "0.1.1", "artifacts": {platform_key(): {
+            "name": format!("cutex-job-service-0.1.1-{}.tar.gz", platform_key()), "sha256": "a".repeat(64), "size": 10}}}});
+        m.components = serde_json::from_value(raw).unwrap();
+        m.validate("release").unwrap();
+        let (component, artifact) = m.component_artifact("job-service").unwrap();
+        assert_eq!(component.version, "0.1.1");
+        assert!(artifact.name.starts_with("cutex-job-service-"));
+        assert!(m.component_artifact("claude-runtime").is_none());
+        m.components.get_mut("job-service").unwrap().version = "../x".into();
+        assert!(m.validate("release").is_err());
+    }
+
+    #[test]
+    fn claude_runtime_is_the_component_and_an_old_part_maps_onto_it() {
+        let artifact = |name: &str| serde_json::json!({"name": name, "sha256": "b".repeat(64), "size": 7});
+        // 0.1.1+: only `components.claude-runtime`, no `claudeRuntime` (a 0.1.0 reader sees the
+        // Option as absent and does not validate anything of it).
+        let mut value = serde_json::to_value(manifest("0.1.1", 2)).unwrap();
+        assert!(value.get("claudeRuntime").is_none() || value["claudeRuntime"].is_null());
+        value.as_object_mut().unwrap().remove("claudeRuntime");
+        value["components"] = serde_json::json!({"claude-runtime": {"version": "claude-r13", "artifacts": {
+            platform_key(): artifact(&format!("component-claude-runtime-claude-r13-{}.tar.gz", platform_key()))}}});
+        let m = ReleaseManifest::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        m.validate("release").unwrap();
+        assert!(m.claude_runtime.is_none());
+        assert_eq!(m.claude_runtime_version(), Some("claude-r13"));
+        assert!(m.component_artifact(CLAUDE_RUNTIME_COMPONENT).is_some());
+
+        // An older manifest's `claudeRuntime` is read as the same component.
+        let mut old = serde_json::to_value(manifest("r240", 41)).unwrap();
+        old["claudeRuntime"] = serde_json::json!({"name": "claude-r12", "adapterVersion": "0.7.1",
+            "artifacts": {platform_key(): artifact("claude-r12.tar.gz")}});
+        let m = ReleaseManifest::parse(&serde_json::to_vec(&old).unwrap()).unwrap();
+        m.validate("release").unwrap();
+        assert_eq!(m.claude_runtime_version(), Some("claude-r12"));
+        assert_eq!(m.component_artifact(CLAUDE_RUNTIME_COMPONENT).unwrap().1.name, "claude-r12.tar.gz");
+
+        // Both: the component wins.
+        old["components"] = value["components"].clone();
+        let m = ReleaseManifest::parse(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(m.claude_runtime_version(), Some("claude-r13"));
+
+        // A manifest with neither names no Claude runtime.
+        let m = ReleaseManifest::parse(&serde_json::to_vec(&manifest("r240", 41)).unwrap()).unwrap();
+        assert_eq!(m.claude_runtime_version(), None);
     }
 
     #[test]

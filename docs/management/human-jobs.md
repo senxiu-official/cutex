@@ -1,7 +1,7 @@
 # Human Jobs API (Management v2)
 
 Root-only bridge from Management v2 to the local Job Service
-(`review-sources/job-service`, Linux-only, private Unix socket
+(`components/job-service`, Linux-only, private Unix socket
 `~/.cutex/runtime/job-service/v1/job-service.sock`). Cutex authenticates
 with the service's root `api.token`; no caller grants are involved — these
 routes act for the human owner (desktop / `cutex` CLI), never for agents.
@@ -50,5 +50,5 @@ unchanged. Output paging: request again with `offset = nextOffset` until `eof`;
 
 The human operations (`humanCancel`, `humanReadOutput`, `humanOperations` in
 capabilities, `command` on list rows) need a Job Service built from
-`review-sources/job-service` at or after the commit that added them; an older
+`components/job-service` at or after the commit that added them; an older
 service yields 501 for cancel/output and list rows without `command`.

@@ -150,6 +150,16 @@ fn handle_claude_event(
             }
         }
     }
+    if let cutex::app_server::client::AppServerEvent::Notification(notification) = event {
+        // A declined Claude Code safety check (full access) becomes an owner
+        // notice; a later block state (granted, used) updates it.
+        if notification.method.starts_with("thread/safetyCheck/") {
+            if let Some(params) = notification.params.as_ref() {
+                cutex::management::v2::safety_checks::on_runtime_notification(
+                    &context.cutex_session_id, &context.thread_id, &notification.method, params);
+            }
+        }
+    }
     if let Err(error) = record_agent_message_item(&context.cutex_session_id, context.runtime_generation, event) {
         eprintln!("Claude agent message receipt for {} not recorded: {error:#}", context.cutex_session_id);
     }
@@ -202,7 +212,7 @@ pub(super) fn observe(id: &str) -> anyhow::Result<()> {
         registration_class: record.registration_class,
     };
     let mut options =
-        cutex::app_server::bus_bridge::AppServerAgentBusBridgeOptions::new(registration, thread)
+        cutex::app_server::bus_bridge::AppServerAgentBusBridgeOptions::new(registration, thread.clone())
             .with_cutex_session_id(id);
     // Registration and heartbeat only until Claude's different ingress receipt
     // semantics are mapped explicitly. Never invoke Codex's insertion methods.
@@ -217,6 +227,8 @@ pub(super) fn observe(id: &str) -> anyhow::Result<()> {
         manager().disconnect(id)?;
         return Err(error);
     }
+    // Safety blocks the adapter reported while nobody observed it.
+    cutex::management::v2::safety_checks::reconcile(id, &thread);
     // Like a Codex connect: input queued while no observer was connected
     // (offline submit, daemon restart) goes out once the thread is idle.
     if let Err(error) = super::app_server_user_input::flush_queued_if_idle(id) {

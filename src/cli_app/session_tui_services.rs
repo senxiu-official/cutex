@@ -23,8 +23,8 @@ pub(super) fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, events: &mu
                     Style::new().fg(if index == selected { theme::focus() } else { theme::text() }))).collect();
             frame.render_widget(Paragraph::new(rows).block(Block::bordered().title(" Local services ")), panes[0]);
             let text = if let Some(action) = confirmation {
-                format!("{action:?} {}?\n\nMessages and management requests may be briefly unavailable. Agent runtimes and Job Service are not stopped.\nOn Windows, restarting Agent Bus also restarts Management API; stopping it stops both.\nSaved settings apply on startup.\n\nEnter confirms · Esc cancels", services[selected].name())
-            } else { format!("{status}\n\nOpening this page never starts a service.\nLinux uses installed user systemd units.\nWindows uses the shared Cutex controller and runtime host. The TethysUNE desktop is optional.\n\nJob Service is managed separately.") };
+                format!("{action:?} {}?\n\nMessages and management requests may be briefly unavailable. Agent runtimes and Job Service are not stopped.\nOn Windows, restarting Agent Bus also restarts Management API; stopping it stops both. Under the cutex supervisor (managed installs) Stop and Restart always act on both.\nSaved settings apply on startup.\n\nEnter confirms · Esc cancels", services[selected].name())
+            } else { format!("{status}\n\nOpening this page never starts a service.\nLinux uses the installed user systemd units.\nWindows uses the cutex supervisor task of `cutex service install`, or the runtime host on hand-deployed hosts.\n\nJob Service is managed separately.") };
             frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }).block(Block::bordered().title(" Details ")), panes[1]);
             frame.render_widget(Paragraph::new(if busy { "Working… · Esc returns (requested action continues)" } else { "↑/↓ select · S start · X stop · T restart · R status · Esc back" }).style(Style::new().fg(theme::focus())).wrap(Wrap { trim: false }), areas[1]);
         })?;

@@ -1,6 +1,6 @@
 [package]
 name = "cutex"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [[bin]]
@@ -8,9 +8,13 @@ name = "cutex"
 path = "src/main.rs"
 
 [features]
-# Optional private NCI integration; excluded from ordinary builds.
-# Key generation uses ring (a regular dependency: person identity verifies
-# Ed25519 signatures with it; already in the tree through rustls).
+# NCI Gadi scheduler verification (Linux only; src/nci_verification). On in every
+# build: runtime-disabled until the owner configures it, so an unconfigured host
+# makes no SSH connection and starts exactly as before. `--no-default-features`
+# drops it (capabilities nci-verification / nci-host-keygen / job-source-nci are
+# then never advertised). Key generation uses ring (a regular dependency: person
+# identity verifies Ed25519 signatures with it; already in the tree through rustls).
+default = ["nci-qstat"]
 nci-qstat = []
 archive-agent-bus-roster-test-fixture = []
 archive-conflict-test-hook = []

@@ -12,9 +12,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -351,67 +350,45 @@ fn map_owner_message(e: &EventEnvelope, name: &str) -> Option<Option<Value>> {
     })))
 }
 
-// curl is the platform HTTP/TLS client. Credentials and payload travel through stdin,
-// never shell interpolation or process arguments. No redirects or response-body storage.
+/// POST one payload with the HTTP client cutex links (ureq + rustls; no
+/// `curl` on PATH needed). No redirects, no response-body storage; the token
+/// travels only in the Authorization header. Proxies follow the usual
+/// `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` environment, as before.
 fn post(c: &Config, payload: &str) -> anyhow::Result<()> {
     validate(c)?;
-    let quote = |s: &str| {
-        format!(
-            "\"{}\"",
-            s.replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-        )
-    };
-    let mut input = format!(
-        "url = {}\nheader = \"Content-Type: application/json\"\ndata-binary = {}\n",
-        quote(c.url.as_deref().context("webhook URL missing")?),
-        quote(payload)
-    );
+    let url = c.url.as_deref().context("webhook URL missing")?;
+    let agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(2)))
+        .timeout_global(Some(Duration::from_secs(5)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut request = agent
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", concat!("cutex-notify/", env!("CARGO_PKG_VERSION")));
     if let Some(token) = &c.token {
-        input.push_str(&format!(
-            "header = {}\n",
-            quote(&format!("Authorization: Bearer {token}"))
-        ));
+        request = request.header("Authorization", format!("Bearer {token}"));
     }
-    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let mut child = Command::new("curl")
-        .args([
-            "--disable",
-            "--silent",
-            "--connect-timeout",
-            "2",
-            "--max-time",
-            "5",
-            "--proto",
-            "=http,https",
-            "--output",
-            null,
-            "--write-out",
-            "%{http_code}",
-            "--config",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("curl is required for notification HTTP(S)")?;
-    child
-        .stdin
-        .take()
-        .context("curl stdin unavailable")?
-        .write_all(input.as_bytes())?;
-    let output = child.wait_with_output()?;
-    ensure!(
-        output.status.success(),
-        "webhook transport failed (curl exit {:?})",
-        output.status.code()
-    );
-    let code = std::str::from_utf8(&output.stdout)?.trim().parse::<u16>()?;
+    // The error text never includes the URL's query or the token.
+    let response = request
+        .send(payload.as_bytes())
+        .map_err(|error| anyhow::anyhow!("webhook transport failed: {}", transport_error_kind(&error)))?;
+    let code = response.status().as_u16();
     ensure!((200..300).contains(&code), "webhook HTTP {code}");
     Ok(())
+}
+fn transport_error_kind(error: &ureq::Error) -> &'static str {
+    match error {
+        ureq::Error::Timeout(_) => "timeout",
+        ureq::Error::Io(_) => "connection failed",
+        ureq::Error::HostNotFound => "host not found",
+        ureq::Error::ConnectionFailed => "connection failed",
+        ureq::Error::Tls(_) | ureq::Error::Rustls(_) => "TLS error",
+        ureq::Error::TooManyRedirects | ureq::Error::RedirectFailed => "redirect refused",
+        _ => "request failed",
+    }
 }
 fn deliver_one(store: &Store, c: &Config) -> anyhow::Result<bool> {
     if !c.enabled {
@@ -513,19 +490,85 @@ pub fn test_notification() -> anyhow::Result<Value> {
     );
     Ok(json!({"eventId":id,"state":"pending"}))
 }
-pub fn run() -> anyhow::Result<()> {
+/// The worker lock (`notifications/outbound.lock`). Whoever holds it is the
+/// one notification worker of this home: `cutex notify run` (a separate
+/// service on hand-deployed hosts) or the worker embedded in `management
+/// serve` on a managed install ([`spawn_embedded_worker`]). Never both, so a
+/// notification is delivered once.
+fn try_worker_lock(root: &Path) -> anyhow::Result<Option<fs::File>> {
     use fs2::FileExt;
-    let root = root()?;
-    let mut store = Store::open(&root)?;
+    fs::create_dir_all(root)?;
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(root.join("outbound.lock"))?;
-    lock.try_lock_exclusive()
-        .context("notification worker already running")?;
+    Ok(lock.try_lock_exclusive().is_ok().then_some(lock))
+}
+
+/// `cutex notify run`: the notification worker in the foreground.
+pub fn run() -> anyhow::Result<()> {
+    let root = root()?;
+    Store::open(&root)?;
+    let _lock = try_worker_lock(&root)?.context(
+        "notification worker already running (`cutex notify run`, or the Management API of a managed install)",
+    )?;
     crate::platform::heap::start_daemon_heap_maintenance();
+    spawn_side_threads(&root)?;
+    ingest_loop(&root)
+}
+
+/// Where the worker runs: `management serve` embeds it only for a managed
+/// install (`cutex service install`), whose units / supervisor start no
+/// separate `cutex notify run`. Hand-deployed hosts keep their own
+/// `cutex notify run` service and are unchanged.
+pub const EMBEDDED_WORKER_ENV: &str = "CUTEX_NOTIFY_WORKER";
+
+/// `CUTEX_NOTIFY_WORKER`: `embedded` = always, `off` = never, unset / other
+/// = only in a managed install.
+pub fn embedded_worker_wanted(env: Option<&str>, managed_install: bool) -> bool {
+    match env.map(str::trim) {
+        Some("embedded") => true,
+        Some("off") => false,
+        _ => managed_install,
+    }
+}
+
+/// Run the notification worker (state collector + webhook outbox) inside
+/// this process when nobody else holds the worker lock; keeps trying every
+/// 30 s, so it takes over when a separate `cutex notify run` stops. The lock
+/// is held for the life of the process once taken.
+pub fn spawn_embedded_worker() -> anyhow::Result<()> {
+    let root = root()?;
+    std::thread::Builder::new()
+        .name("cutex-notification-worker".into())
+        .spawn(move || {
+            let lock = loop {
+                match try_worker_lock(&root) {
+                    Ok(Some(lock)) => break lock,
+                    Ok(None) => {}
+                    Err(error) => eprintln!("notification worker: {error:#}"),
+                }
+                std::thread::sleep(Duration::from_secs(30));
+            };
+            let _lock = lock;
+            if let Err(error) = spawn_side_threads(&root) {
+                eprintln!("notification worker: {error:#}");
+                return;
+            }
+            loop {
+                if let Err(error) = ingest_loop(&root) {
+                    eprintln!("notification worker: {error:#}");
+                }
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        })?;
+    Ok(())
+}
+
+/// The state collector (`/v2/notifications/states`) and the delivery thread.
+fn spawn_side_threads(root: &Path) -> anyhow::Result<()> {
     std::thread::Builder::new().name("cutex-notification-state".into()).spawn(|| {
         loop {
             match super::state::tick() {
@@ -538,8 +581,8 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
     })?;
-    let delivery_root = root.clone();
-    std::thread::spawn(move || {
+    let delivery_root = root.to_path_buf();
+    std::thread::Builder::new().name("cutex-notification-delivery".into()).spawn(move || {
         let Ok(store) = Store::open(&delivery_root) else {
             return;
         };
@@ -560,7 +603,14 @@ pub fn run() -> anyhow::Result<()> {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
-    });
+    })?;
+    Ok(())
+}
+
+/// Event journal -> outbox. Returns only on a store / repository error.
+fn ingest_loop(root: &Path) -> anyhow::Result<()> {
+    let root = root.to_path_buf();
+    let mut store = Store::open(&root)?;
     let repo = management_v2_repository()?;
     let mut heartbeat = 0;
     loop {
@@ -714,6 +764,7 @@ pub fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use crate::management::v2::model::{EventCorrelation, EventSource, NativeMessage};
     struct Temp(PathBuf);
     impl Temp {
@@ -1030,6 +1081,46 @@ mod tests {
             store.list(None).unwrap()["deliveries"][0]["state"],
             "failed"
         );
+    }
+    #[test]
+    fn one_worker_per_home_and_embedded_only_where_wanted() {
+        let temp = Temp::new();
+        let first = try_worker_lock(&temp.0).unwrap();
+        assert!(first.is_some());
+        // `cutex notify run` and the embedded worker share this lock.
+        assert!(try_worker_lock(&temp.0).unwrap().is_none());
+        drop(first);
+        assert!(try_worker_lock(&temp.0).unwrap().is_some());
+        assert!(embedded_worker_wanted(None, true));
+        assert!(!embedded_worker_wanted(None, false));
+        assert!(embedded_worker_wanted(Some("embedded"), false));
+        assert!(!embedded_worker_wanted(Some("off"), true));
+        assert!(embedded_worker_wanted(Some("other"), true));
+    }
+    #[test]
+    fn webhook_sends_bearer_token_and_refuses_redirects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hook?k=v", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut auth = Vec::new();
+            for response in [
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = crate::http::server::read_simple_http_request(&mut stream).unwrap();
+                assert_eq!(request.method, "POST");
+                auth.push(request.headers.get("authorization").cloned());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            auth
+        });
+        let c = Config { enabled: true, url: Some(url), token: Some("tok".into()), ..Default::default() };
+        post(&c, "{}").unwrap();
+        let error = post(&c, "{}").unwrap_err().to_string();
+        assert!(!error.contains("tok"), "{error}");
+        let auth = handle.join().unwrap();
+        assert_eq!(auth, vec![Some("Bearer tok".to_string()); 2]);
     }
     /// r218 wrote its default event set, incl. the Task Service events removed
     /// in r219: the config still loads (retired names dropped) and the next

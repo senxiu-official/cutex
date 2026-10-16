@@ -64,6 +64,8 @@ pub fn record(
                 | "/peer/v1/agents"
                 | "/peer/v1/events"
                 | "/peer/v1/tells"
+                | "/peer/v1/owner-profile"
+                | "/peer/v1/owner-profile/avatar"
         ) || ask_id.is_some_and(|id| {
             route == format!("/peer/v1/asks/{id}") || route == format!("/peer/v1/asks/{id}/ops")
         }) {

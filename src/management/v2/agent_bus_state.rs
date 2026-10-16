@@ -828,7 +828,12 @@ impl AgentBusMessageRepository {
             &AgentBusMessage,
         ) -> anyhow::Result<crate::app_server::external_input::Envelope>,
     ) -> anyhow::Result<crate::app_server::external_input::Envelope> {
-        self.mutate_checked(|store| {
+        // Every delivery sweep of a retained-pending message (a passive one
+        // waits natively for the recipient's next turn) calls this again: an
+        // already frozen envelope changes nothing, so the whole store is not
+        // serialized just to learn that (47 MB per call on the Linux host,
+        // r240 idle CPU, 2026-10-15).
+        self.update_inner(true, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -839,7 +844,7 @@ impl AgentBusMessageRepository {
             );
             if let Some(envelope) = &stored.snapshot.external_input {
                 envelope.validate()?;
-                return Ok(envelope.clone());
+                return Ok((envelope.clone(), false));
             }
             anyhow::ensure!(
                 stored.snapshot.state == "pending"
@@ -868,7 +873,7 @@ impl AgentBusMessageRepository {
             } else {
                 3
             });
-            Ok(envelope)
+            Ok((envelope, true))
         })
     }
 
@@ -1137,7 +1142,9 @@ impl AgentBusMessageRepository {
         frozen: &crate::app_server::external_input::Envelope,
         observed: &crate::app_server::external_input::Status,
     ) -> anyhow::Result<()> {
-        self.mutate_checked(|store| {
+        // Repeated sweeps usually observe the same native status: no change,
+        // no whole-store serialization.
+        self.update_inner(true, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -1148,8 +1155,11 @@ impl AgentBusMessageRepository {
                     && observed.semantic_sha256 == frozen.semantic_sha256,
                 "native observation CAS conflict"
             );
+            if stored.snapshot.external_input_last_observed.as_ref() == Some(observed) {
+                return Ok(((), false));
+            }
             stored.snapshot.external_input_last_observed = Some(observed.clone());
-            Ok(())
+            Ok(((), true))
         })
     }
 
@@ -2125,6 +2135,7 @@ impl AgentBusMessageRepository {
                 unchanged(&mut cache, store, digest);
                 return Ok(result);
             }
+            note_whole_state_serialization();
             let data = serde_json::to_vec_pretty(&store).with_context(|| {
                 format!("Failed to serialize management v2 agent-bus state: {}", path.display())
             })?;
@@ -4542,6 +4553,73 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// r240 idle CPU: a passive message the native holds for the recipient's
+    /// next turn stays pending, and every bridge sweep (5 s) freezes and
+    /// observes it again. Those repeats change nothing and must not serialize
+    /// the whole store (47 MB, ~50 ms each on the Linux host); only a real
+    /// change does.
+    #[test]
+    fn repeated_freeze_and_same_observation_do_not_serialize_the_store() {
+        use crate::app_server::external_input as ei;
+        let root = std::env::temp_dir().join(format!("cutex-sweep-serialize-{}", uuid::Uuid::new_v4()));
+        let repository = AgentBusMessageRepository::open(&root).unwrap();
+        let queued = system_queued_message("passive note");
+        let owner = queued.owner_cutex_session_id.clone();
+        repository.record_queued_isolated(queued).unwrap();
+        let make = |message: &AgentBusMessage| {
+            let mut envelope = ei::Envelope {
+                version: 1,
+                owner_id: owner.clone(),
+                thread_id: "11111111-1111-4111-8111-111111111111".into(),
+                runtime_generation: 1,
+                message: ei::Message {
+                    id: message.id.clone(),
+                    source: ei::Source { kind: ei::SourceKind::Service, id: "cutex-alarm".into() },
+                    event_type: "alarm".into(),
+                    delivery: ei::Delivery::Passive,
+                    text: message.content.clone(),
+                },
+                view: None,
+                semantic_sha256: String::new(),
+            };
+            envelope.semantic_sha256 = envelope.digest();
+            Ok(envelope)
+        };
+        let before = whole_state_serializations_on_this_thread();
+        let frozen = repository.freeze_external_input(&owner, "jsc_stable", make).unwrap();
+        assert_eq!(whole_state_serializations_on_this_thread() - before, 1, "the first freeze writes");
+        let pending = ei::Status {
+            message_id: frozen.message.id.clone(),
+            semantic_sha256: frozen.semantic_sha256.clone(),
+            delivery_state: ei::DeliveryState::Pending,
+            receipt: None,
+            processing: ei::ProcessingStatus { state: ei::ProcessingState::None, attempt_id: None, reason: None },
+        };
+        repository.observe_external_input("jsc_stable", &frozen, &pending).unwrap();
+        repository.record_external_input_error("jsc_stable", "native pending: Pending/None/None").unwrap();
+        let settled = whole_state_serializations_on_this_thread();
+        for _ in 0..3 {
+            // One bridge sweep of the retained-pending message.
+            let again = repository.freeze_external_input(&owner, "jsc_stable", |_| panic!("already frozen")).unwrap();
+            assert_eq!(again, frozen);
+            repository.observe_external_input("jsc_stable", &frozen, &pending).unwrap();
+            repository.record_external_input_error("jsc_stable", "native pending: Pending/None/None").unwrap();
+        }
+        assert_eq!(whole_state_serializations_on_this_thread(), settled, "an unchanged sweep serializes nothing");
+        // A changed observation is still recorded.
+        let claimed = ei::Status {
+            processing: ei::ProcessingStatus { state: ei::ProcessingState::Claimed, attempt_id: Some("a1".into()), reason: None },
+            ..pending.clone()
+        };
+        repository.observe_external_input("jsc_stable", &frozen, &claimed).unwrap();
+        assert_eq!(whole_state_serializations_on_this_thread(), settled + 1);
+        assert_eq!(
+            repository.snapshot_by_message_id("jsc_stable").unwrap().unwrap().external_input_last_observed,
+            Some(claimed)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn process_global_repository_guard_rejects_ambient_or_mismatched_home() {
         assert!(validate_private_test_home("/home/user", "").is_err());
@@ -4549,6 +4627,33 @@ mod tests {
         assert!(validate_private_test_home("/", "/").is_err());
         assert!(validate_private_test_home("/tmp/private", "/tmp/private").is_ok());
     }
+}
+
+static WHOLE_STATE_SERIALIZATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_WHOLE_STATE_SERIALIZATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_whole_state_serialization() {
+    WHOLE_STATE_SERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_WHOLE_STATE_SERIALIZATIONS.with(|count| count.set(count.get() + 1));
+}
+
+/// Whole agent-bus state serializations on the calling thread (tests run in
+/// parallel, so assertions use this instead of the process-wide count).
+#[cfg(test)]
+pub(crate) fn whole_state_serializations_on_this_thread() -> u64 {
+    THREAD_WHOLE_STATE_SERIALIZATIONS.with(|count| count.get())
+}
+
+/// How many times this process serialized the whole agent-bus state (to
+/// write it, or to learn a write changed nothing). A cheap diagnostic counter
+/// for performance tests: a repeated delivery sweep must not serialize.
+pub fn whole_state_serialization_count() -> u64 {
+    WHOLE_STATE_SERIALIZATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A finished agent bus message past retention (archive input).

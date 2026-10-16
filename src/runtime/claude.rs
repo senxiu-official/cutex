@@ -518,6 +518,13 @@ pub(super) fn record(id: &str) -> anyhow::Result<CutexSessionRecord> {
 }
 
 pub(super) fn connect(session: &ClaudeSession) -> anyhow::Result<(AppServerClient, Ready)> {
+    connect_with(session, false)
+}
+
+/// `interactive`: the connection relays the owner's decisions
+/// (`claudeInteractiveApprovals`); it subscribes to no thread, so it never
+/// receives approval requests itself.
+fn connect_with(session: &ClaudeSession, interactive: bool) -> anyhow::Result<(AppServerClient, Ready)> {
     let ready: Ready =
         serde_json::from_slice(&std::fs::read(session.state_dir.join("server.json"))?)?;
     let token = std::fs::read_to_string(session.state_dir.join("rpc-token"))?;
@@ -525,6 +532,9 @@ pub(super) fn connect(session: &ClaudeSession) -> anyhow::Result<(AppServerClien
         url: ready.endpoint.clone(),
         bearer_token: Some(token.trim().into()),
     });
+    if interactive {
+        options.extra_capabilities.insert("claudeInteractiveApprovals".to_string(), Value::Bool(true));
+    }
     options.connect_timeout = Duration::from_millis(300);
     options.request_timeout = Duration::from_secs(60);
     let client = AppServerClient::connect(options)?;
@@ -538,6 +548,60 @@ pub(super) fn connect(session: &ClaudeSession) -> anyhow::Result<(AppServerClien
         "Claude adapter identity/capabilities mismatch"
     );
     Ok((client, ready))
+}
+
+/// Why a safety-check decision could not be handed to the Claude runtime.
+#[derive(Debug)]
+pub enum SafetyDecisionError {
+    /// No adapter runs for this agent.
+    Offline,
+    /// The agent's adapter predates safety grants (feature `safetyGrants`).
+    Unsupported,
+    /// The adapter refused (`data.code`, e.g. `safety_block_closed`).
+    Refused { code: String, message: String, data: Value },
+    Failed(anyhow::Error),
+}
+
+/// Forward the owner's decision on a safety block
+/// (`thread/safetyCheck/grant|dismiss`, docs/safety-grants.md) to the
+/// agent's running adapter. Management calls this only from its owner-only
+/// route; the adapter accepts it only from an interactive connection.
+pub fn safety_check_decision(id: &str, method: &str, params: Value) -> Result<Value, SafetyDecisionError> {
+    let record = record(id).map_err(SafetyDecisionError::Failed)?;
+    let session = record.claude_session.as_ref().ok_or(SafetyDecisionError::Unsupported)?;
+    if adapter_features(&session.deployment.adapter_source)["safetyGrants"] != true {
+        return Err(SafetyDecisionError::Unsupported);
+    }
+    if record.runtime_pid.is_none() {
+        return Err(SafetyDecisionError::Offline);
+    }
+    let (client, _) = connect_with(session, true).map_err(|_| SafetyDecisionError::Offline)?;
+    match client.handle().request(method, params) {
+        Ok(result) => Ok(result),
+        Err(crate::app_server::client::AppServerClientError::Rpc(error)) => {
+            let data = error.data.unwrap_or(Value::Null);
+            let code = data.get("code").and_then(Value::as_str).unwrap_or("runtime_refused").to_string();
+            Err(SafetyDecisionError::Refused { code, message: error.message, data })
+        }
+        Err(error) => Err(SafetyDecisionError::Failed(anyhow::Error::new(error))),
+    }
+}
+
+/// The adapter's recent safety blocks of this agent's thread
+/// (`thread/safetyCheck/list`), newest first; empty when the adapter does
+/// not run or predates `safetyGrants`. Observers use it to catch blocks
+/// reported while nobody was connected.
+pub fn safety_blocks(id: &str) -> anyhow::Result<Vec<Value>> {
+    let record = record(id)?;
+    let Some(session) = record.claude_session.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if record.runtime_pid.is_none() || adapter_features(&session.deployment.adapter_source)["safetyGrants"] != true {
+        return Ok(Vec::new());
+    }
+    let (client, _) = connect(session)?;
+    let listed = client.handle().request("thread/safetyCheck/list", json!({"threadId": session.thread_id}))?;
+    Ok(listed["data"].as_array().cloned().unwrap_or_default())
 }
 
 /// Optional per-profile native Claude settings. These are environment overrides,
@@ -1490,7 +1554,7 @@ mod tests {
             assert!(file_checkpointing_args(&older, true).is_empty());
         }
         let shipped: Value = serde_json::from_str(include_str!(
-            "../../claude-adapter/src/cute_claude/features.json"
+            "../../components/claude-runtime/src/cute_claude/features.json"
         )).unwrap();
         assert_eq!(shipped["features"]["fileCheckpointing"], true);
     }
@@ -1510,7 +1574,7 @@ mod tests {
             assert!(agent_turn_questions_args(&older, AgentTurnQuestions::Wait).is_empty());
         }
         let shipped: Value = serde_json::from_str(include_str!(
-            "../../claude-adapter/src/cute_claude/features.json"
+            "../../components/claude-runtime/src/cute_claude/features.json"
         ))
         .unwrap();
         assert_eq!(shipped["features"]["agentTurnQuestions"], true);
@@ -1559,7 +1623,7 @@ mod tests {
         assert!(text.starts_with("# Cutex\n") && text.contains("- Name: Appender (id cutex.append-test)"));
         assert!(text.contains("# File references"));
         let shipped: Value = serde_json::from_str(include_str!(
-            "../../claude-adapter/src/cute_claude/features.json"
+            "../../components/claude-runtime/src/cute_claude/features.json"
         ))
         .unwrap();
         assert_eq!(shipped["features"]["systemAppend"], true);

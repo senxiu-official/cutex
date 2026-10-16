@@ -39,6 +39,8 @@ fn source(root: &Path) -> CutexSessionRecord {
 
 #[test]
 fn fork_projection_preserves_account_but_never_copies_runtime_ownership() {
+    // runtime_dir() is read here and again inside fork_record: HOME must not move in between.
+    let _home = crate::config::paths::test_home_env_lock();
     let id = format!("cutex.{}", uuid::Uuid::new_v4());
     let target = crate::config::paths::runtime_dir()
         .unwrap()

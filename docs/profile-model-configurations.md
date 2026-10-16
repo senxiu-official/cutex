@@ -194,3 +194,38 @@ Per-entry context: an entry's `contextWindow` / `autoCompactTokenLimit` live
 in its catalog row (`PATCH .../models/{id}`), for single entries the same as
 for named configurations. A profile-level `modelContextWindow` /
 `modelAutoCompactTokenLimit` still takes precedence over every entry.
+
+## Claude profile default model (`claude-profile-default-model`)
+
+A Claude profile's default model and effort live in its store options
+(`accounts.json` `options.claude.model` / `effort`; built-in default
+`sonnet`, effort unset = the model's own default). `PATCH /v2/profiles/{p}`
+sets them with the same fields as a Codex profile's config:
+
+- `model`: a Claude model id or alias as the adapter takes it (1–200
+  characters, no whitespace / control characters; e.g. `claude-opus-5-5`,
+  `opus`, `claude-opus-5-5[1m]`). `null` restores `sonnet`.
+- `modelReasoningEffort`: `low` | `medium` | `high` | `xhigh` | `max`;
+  `null` (or `default`) = the model's own default.
+
+Any other Codex config field on a Claude profile is still refused (400
+`Codex model settings are unavailable for a Claude profile`). Before this
+capability `model` was refused too.
+
+**Precedence for new sessions** (owner-created agents, quick chats,
+`cutex` Claude launches, profile switches to a Claude profile, the models
+list's `isDefault` / `selectedModel`): an explicit request model, then
+`config.json` `new_session_defaults[<profile name>].model` (`/v2/settings`
+`newSessionDefaults`, the more specific per-profile override), then the
+profile's own default. The Claude profile item `model` shows that
+effective value; `detail.claudeProfileModel` is the profile's own,
+`detail.claudeNewSessionModel` the override (null when unset),
+`detail.claudeBuiltinDefaultModel` = `sonnet`, and
+`detail.editable.claudeDefaultModel` is true on Claude profiles.
+
+A `PATCH` that sets or clears `model` on a Claude profile also drops that
+profile's `newSessionDefaults` model when it differs (its `reasoning` stays;
+an entry left empty goes), so the value written is what new sessions get.
+Existing sessions keep their own model (a Claude session copies it at
+creation); pinned older adapters (claude-r5 …) pass the string to the SDK
+unchanged, ids and aliases alike.

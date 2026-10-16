@@ -786,7 +786,7 @@ fn collect_need_sources(sessions: &[Value], meta: &HashMap<String, AgentMeta>) -
         })
         .unwrap_or_default();
     let asks = crate::asks::store::AskStore::open_default()
-        .and_then(|store| store.snapshot())
+        .and_then(|store| store.shared())
         .map(|state| {
             state
                 .asks

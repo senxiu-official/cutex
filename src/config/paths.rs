@@ -30,10 +30,16 @@ pub const FORBID_REAL_HOME_ENV: &str = "CUTEX_TEST_FORBID_REAL_HOME";
 
 /// One lock for every library test that changes `HOME`: test homes with
 /// separate locks raced each other ("Profile not found" in parallel runs).
+/// (The bin-only `cli_app::test_home` runs in a separate test process with its own lock.)
+#[cfg(test)]
+pub(crate) fn test_home_env_mutex() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 #[cfg(test)]
 pub(crate) fn test_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    test_home_env_mutex().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

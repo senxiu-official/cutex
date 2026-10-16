@@ -31,6 +31,8 @@ const MAX_NOTICES: usize = 2000;
 pub const MAX_TEXT_CHARS: usize = 4000;
 pub const MAX_REPLY_CHARS: usize = 20_000;
 pub const MAX_REF_CHARS: usize = 128;
+/// `systemKind` (and event `system.safetyBlock`) of a safety block notice.
+pub const SAFETY_BLOCK_KIND: &str = "safetyBlock";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,10 +137,63 @@ pub struct OwnerNotification {
     /// `deliveryFailed`, `idleDelegation` (r217 – r218 also wrote `preActivationSkipped`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_kind: Option<String>,
+    /// A runtime safety check the agent's runtime declined under full
+    /// access (`systemKind: safetyBlock`, capability
+    /// `claude-safety-grants`, docs/safety-grants.md). Its `state` decides
+    /// whether the record still needs the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_block: Option<SafetyBlock>,
+}
+
+/// One declined runtime safety check (Claude Code under full access) and
+/// the owner's decision on it. Field values come from the runtime
+/// (`thread/safetyCheck/blocked|updated`); `state` is `blocked` until the
+/// owner decides, then `granted` (one exact retry within `grantSeconds`),
+/// `used`, `dismissed` or `expired`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SafetyBlock {
+    pub block_id: String,
+    /// `claude` (the only runtime with such checks so far).
+    pub runtime: String,
+    pub thread_id: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// The declined tool call (timeline item id).
+    #[serde(default)]
+    pub item_id: Option<String>,
+    pub tool_name: String,
+    /// The exact tool input the runtime declined.
+    pub tool_input: Value,
+    /// Display form (the shell command for `Bash`).
+    pub command: String,
+    /// The runtime's reason (Claude Code's own text).
+    pub reason: String,
+    pub state: String,
+    pub blocked_at: String,
+    #[serde(default)]
+    pub decided_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub used_at: Option<String>,
+    pub grant_seconds: u64,
+}
+
+impl SafetyBlock {
+    pub const BLOCKED: &'static str = "blocked";
+
+    /// Still waiting for the owner.
+    pub fn is_open(&self) -> bool {
+        self.state == Self::BLOCKED
+    }
 }
 
 impl OwnerNotification {
     pub fn is_final(&self) -> bool {
+        if let Some(block) = &self.safety_block {
+            return !block.is_open();
+        }
         match self.state {
             State::Answered | State::Dismissed => true,
             State::Acknowledged => !self.needs_reply,
@@ -152,6 +207,11 @@ impl OwnerNotification {
     /// notification levels) keep the r216 rule: open with a channel, never a
     /// cutex notice (`origin: system`).
     pub fn pending(&self) -> bool {
+        // A safety block needs the owner until decided, also after the
+        // owner read the agent (`mark_agent_read` only acknowledges it).
+        if let Some(block) = &self.safety_block {
+            return block.is_open() && self.actions.as_ref().is_some_and(|actions| actions.iter().any(|a| a == "needsYou"));
+        }
         if self.needs_reply && self.origin == Origin::Agent {
             return matches!(self.state, State::Open | State::Acknowledged);
         }
@@ -446,6 +506,7 @@ impl OwnerNotifyState {
             notification_event: Some(decision.event.clone()),
             actions: Some(decision.actions.clone()),
             system_kind: if origin == Origin::System { system_kind.map(str::to_string) } else { None },
+            safety_block: None,
         };
         self.notifications.insert(record.notification_id.clone(), record.clone());
         self.notice(super::CREATED_EVENT, &record);
@@ -529,6 +590,87 @@ impl OwnerNotifyState {
         let record = record.clone();
         self.notice(super::UPDATED_EVENT, &record);
         Ok(record)
+    }
+
+    /// Record a runtime safety block as a cutex notice (`systemKind:
+    /// safetyBlock`). Idempotent by block id (several processes may observe
+    /// the same runtime event): returns (record, created).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_safety_block(
+        &mut self,
+        agent_id: &str,
+        agent_name: Option<String>,
+        block: SafetyBlock,
+        settings: &OwnerNotifySettings,
+        evaluator: &Evaluator,
+        project: Option<Option<&str>>,
+        now: DateTime<Utc>,
+    ) -> (OwnerNotification, bool) {
+        if let Some(existing) = self.safety_record(agent_id, &block.block_id) {
+            return (existing.clone(), false);
+        }
+        let text = crate::asks::truncate_chars(
+            &format!("Claude Code 安全检查拦下了一条命令：{}\n原因：{}", block.command, block.reason),
+            MAX_TEXT_CHARS,
+        );
+        let new = NewNotification {
+            agent_id: agent_id.to_string(),
+            agent_name,
+            text,
+            level: Level::Attention,
+            needs_reply: false,
+            delegation: None,
+            job: None,
+            turn_id: block.turn_id.clone(),
+        };
+        let mut record = self.create_decided(new, Origin::System, Some(SAFETY_BLOCK_KIND), settings, evaluator, project, now);
+        // create_decided queued `created` without the block: replace it.
+        self.notices.pop();
+        record.safety_block = Some(block);
+        self.notifications.insert(record.notification_id.clone(), record.clone());
+        self.notice(super::CREATED_EVENT, &record);
+        (record, true)
+    }
+
+    /// The record of a safety block of this agent.
+    pub fn safety_record(&self, agent_id: &str, block_id: &str) -> Option<&OwnerNotification> {
+        self.notifications.values().find(|record| {
+            record.agent_id == agent_id && record.safety_block.as_ref().is_some_and(|block| block.block_id == block_id)
+        })
+    }
+
+    /// Apply a newer block state (the runtime's, or the owner's decision as
+    /// the runtime confirmed it). A decided block closes the record.
+    pub fn update_safety_block(
+        &mut self,
+        agent_id: &str,
+        block: SafetyBlock,
+        now: DateTime<Utc>,
+    ) -> Result<(OwnerNotification, bool), OwnerError> {
+        let id = self
+            .safety_record(agent_id, &block.block_id)
+            .map(|record| record.notification_id.clone())
+            .ok_or_else(|| OwnerError {
+                status: 404,
+                code: "safety_block_not_found",
+                message: format!("no safety block {} for this agent", block.block_id),
+            })?;
+        let record = self.get_for(agent_id, &id)?;
+        if record.safety_block.as_ref() == Some(&block) {
+            return Ok((record.clone(), false));
+        }
+        let at = now_rfc3339(now);
+        if !block.is_open() {
+            record.acknowledged_at.get_or_insert_with(|| at.clone());
+            if record.state == State::Open {
+                record.state = State::Acknowledged;
+            }
+            record.closed_at.get_or_insert(at);
+        }
+        record.safety_block = Some(block);
+        let record = record.clone();
+        self.notice(super::UPDATED_EVENT, &record);
+        Ok((record, true))
     }
 
     /// The owner deleted the record (any state): it is removed, so lists,

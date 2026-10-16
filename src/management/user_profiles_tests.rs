@@ -100,11 +100,15 @@ fn profiles_update_replace_clear_and_remove() {
     assert_eq!(bad.unwrap_err().code, "invalid_request");
     assert_eq!(store.profile("owner").display_name.as_deref(), Some("J"));
 
-    // Clearing both empties the record.
+    // Clearing both empties the fields; the record only remembers the direct
+    // clears (a paired peer must not refill them, peer-owner-profile).
     store
         .update("owner", ProfilePatch { display_name: Some(None), avatar: Some(None) }, "root")
         .unwrap();
-    assert!(store.snapshot().unwrap().profiles.is_empty());
+    let cleared = store.profile("owner");
+    assert_eq!((cleared.display_name.as_deref(), cleared.avatar_etag()), (None, None));
+    assert_eq!(cleared.direct_cleared, vec!["displayName".to_string(), "avatar".to_string()]);
+    assert_eq!(view_fields(Some(&cleared)), json!({"displayName": null, "avatarEtag": null}));
     assert!(store.avatar("owner").is_none());
 
     store

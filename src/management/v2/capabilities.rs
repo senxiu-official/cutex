@@ -622,6 +622,14 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // previousPublicKey: null, personsRevision}; audit
     // tokenPersonChangeAcknowledged.
     ("person-identity-ack", "personIdentityAck"),
+    // Peers sync the owner's profile (crate::peers::profiles): a local user
+    // bound to a paired peer owner's person key gets that owner's directly-
+    // set displayName / avatar (GET /peer/v1/owner-profile[/avatar], hello
+    // feature owner-profile.v1, ownerProfile.etag in hello). Values set or
+    // cleared here via PATCH /v2/users/me always win. GET /v2/users items
+    // gain profileSource; host event cutex/users/changed {userId, reason
+    // peerProfile, peerId}. Peers disabled: nothing is fetched or written.
+    ("peer-owner-profile", "peerOwnerProfile"),
     // r236 P2 access for non-owner users (cutex-desktop
     // docs/research/user-isolation-p2-access-20261015.md): read-only
     // {scope}/fs/dir|file|search|watch and {scope}/git/status|diff for a
@@ -660,6 +668,17 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // update); runtimeDefaults shows the effective values. One-time
     // migration claude-tool-defaults cleared the stored profile values.
     ("claude-tool-defaults", "claudeToolDefaults"),
+    // PATCH /v2/profiles/{p} `model` / `modelReasoningEffort` on a Claude
+    // profile set the profile's Claude default model / effort (`model` any
+    // id or alias without spaces, null = built-in `sonnet`; effort
+    // low..max, null = model default) instead of answering 400. The Claude
+    // profile item `model` is the effective new-session default
+    // (newSessionDefaults[profile].model, else the profile's own); detail
+    // gains claudeProfileModel / claudeNewSessionModel /
+    // claudeBuiltinDefaultModel and editable.claudeDefaultModel. A PATCH
+    // `model` drops a disagreeing newSessionDefaults model of that profile,
+    // so the written value is what new sessions get.
+    ("claude-profile-default-model", "claudeProfileDefaultModel"),
     // The legacy IM exposure flag (session `exposed_to_backend`, agent_create
     // `expose_to_im`) no longer hides persistent agents: GET /v2/sessions,
     // exact-ID routes, summary and Users P2 scopes include every active
@@ -754,6 +773,12 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // answer 409 upgrade_blocked {reason: unmanaged_install} unless the
     // daemon runs from a managed install (install.json).
     ("backend-upgrade", "backendUpgrade"),
+    // Optional components (components/README.md, components_api.rs):
+    // owner-only GET /v2/components, POST /v2/components/{name}/install|remove
+    // (empty body, 202 {operation}); host event cutex/components/updated;
+    // backend updates keep installed components in step. Static per build:
+    // component state is only in GET /v2/components.
+    ("components", "components"),
     // create_project {create_workspace_root: true} (project-mutations): a
     // missing workspace_root is created (missing tail only, no `.` / `..`,
     // as the daemon user) instead of refused with workspace_root_not_found;
@@ -839,6 +864,16 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // `task_mode: "message"` keeps the plain start message (`first_message`).
     // Human-reviewed bootstrap intents keep their reviewed start message.
     ("agent-create-task-delegation", "agentCreateTaskDelegation"),
+    // 2026-10-16 (owner decision): Claude Code safety checks under full
+    // access (docs/safety-grants.md, safety_checks.rs). The adapter declines
+    // them at once and reports a safety block; cutex keeps it as an owner
+    // notice (origin system, systemKind safetyBlock, field safetyBlock;
+    // event system.safetyBlock, needsYou by default). Root-only session
+    // methods cutex/safetyCheck/grant {blockId} (one exact retry, used once,
+    // 30 minutes; the agent gets the owner input 主人已批准一次：…) and
+    // cutex/safetyCheck/dismiss {blockId}; GET /v2/safety-checks
+    // ?state=open|all&agentId=&limit=. Live via cutex/ownerNotify/created|updated.
+    ("claude-safety-grants", "claudeSafetyGrants"),
     #[cfg(target_os = "linux")]
     ("job-service", "jobService"),
 ];
@@ -1038,6 +1073,7 @@ mod tests {
             "userOwnToken",
             "userOwnDevices",
             "usageSourceZcode",
+            "peerOwnerProfile",
         ] {
             assert_eq!(value["features"][key], true, "{key}");
         }

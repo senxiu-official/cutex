@@ -28,7 +28,7 @@ A client retry normally uses a **new** `requestId` with the same `clientUserMess
 does not help. Cutex used to dedupe only by scanning the native history for a `userMessage` with that
 `clientId`. Right after native accepts `turn/start` / `turn/steer`, `thread/read` can already list the
 turn but not yet the `userMessage`. A retry in that window was sent again. Concurrent retries
-returned `started, steered, steered` and left three copies of the input in native (Kutex C-010).
+returned `started, steered, steered` and left three copies of the input in native (finding C-010).
 
 Each `clientUserMessageId` identity (`runtime/management-v2/user-input-state.json`, per session) now
 records its native **delivery**. Every native user-input request (submit and queue flush) goes

@@ -390,6 +390,9 @@ pub(crate) fn ask_next_step(state: &AskState, session: &str) -> Vec<AdmissionNex
         delivery.requester_cutex_session_id == session && !delivery.passive
             && (crate::asks::delivery::actionable(state, delivery)
                 || delivery.state == DeliveryState::QueuedAsEvent)
+            // A stored copy of an attempt's answer (an event queued before
+            // the finalize guard may carry both): one row per answer.
+            && !crate::asks::delivery::duplicate_answer(state, delivery)
     }).map(|delivery| {
         let sent_next_step = (delivery.state == DeliveryState::QueuedAsEvent)
             .then(|| delivery.event_id.as_ref().and_then(|id| state.events.get(id)))

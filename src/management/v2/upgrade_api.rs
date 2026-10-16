@@ -479,6 +479,7 @@ pub fn start_watcher() -> anyhow::Result<()> {
     std::thread::Builder::new().name("cutex-upgrade-watch".into()).spawn(|| {
         let mut stamp: Option<SystemTime> = None;
         let mut last_schedule = Instant::now() - Duration::from_secs(3600);
+        let mut last_settle = Instant::now();
         // A run this daemon restarted for: announce its state once.
         let mut first = true;
         loop {
@@ -496,10 +497,18 @@ pub fn start_watcher() -> anyhow::Result<()> {
                     publish(event_params(&State::load(&layout), if first { "startup" } else { "state" }));
                 }
             }
+            if first {
+                super::components_api::announce_startup(&layout);
+            }
             first = false;
             if last_schedule.elapsed() >= Duration::from_secs(300) {
                 last_schedule = Instant::now();
                 scheduled(&layout);
+            }
+            // Deferred component restarts (Job Service): once no job runs.
+            if last_settle.elapsed() >= Duration::from_secs(60) {
+                last_settle = Instant::now();
+                super::components_api::settle(&layout);
             }
             std::thread::sleep(WATCH_INTERVAL);
         }

@@ -541,12 +541,13 @@ impl State {
     }
 }
 
-/// Persist a run: `state.json` `run`, `runs/<id>/run.json`, and (once
-/// terminal) a `history.jsonl` line.
+/// Persist a run: `state.json` `run`, (once terminal) a `history.jsonl`
+/// line, and `runs/<id>/run.json` last: `cutex upgrade apply` follows
+/// `run.json`, so when it sees a phase the API (state + history) already
+/// shows it too.
 pub fn record_run(layout: &Layout, run: &Run) -> anyhow::Result<()> {
     let dir = layout.run_dir(&run.run_id);
     std::fs::create_dir_all(&dir)?;
-    crate::config::atomic::write_private_pretty_json_atomic(&dir.join("run.json"), run, "upgrade run")?;
     State::update(layout, |state| state.run = Some(run.clone()))?;
     if run.phase.terminal() {
         let marker = dir.join(".in-history");
@@ -558,6 +559,7 @@ pub fn record_run(layout: &Layout, run: &Run) -> anyhow::Result<()> {
             std::fs::write(marker, b"")?;
         }
     }
+    crate::config::atomic::write_private_pretty_json_atomic(&dir.join("run.json"), run, "upgrade run")?;
     Ok(())
 }
 

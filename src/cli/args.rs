@@ -296,6 +296,12 @@ pub enum CommandKind {
         command: UpgradeCommand,
     },
 
+    /// Optional backend components of a managed install (components/README.md)
+    Component {
+        #[command(subcommand)]
+        command: ComponentCommand,
+    },
+
     /// User services of a managed install (systemd --user units on Linux,
     /// the cutex supervisor logon task on Windows)
     Service {
@@ -2010,6 +2016,41 @@ pub enum InstanceCommand {
         /// Native version registry to copy (display metadata)
         #[arg(long)]
         registry: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ComponentCommand {
+    /// Every component: state, selected / available version
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// One component (or all) in detail (JSON)
+    Status { name: Option<String> },
+    /// Install or update to the version the running cutex release names
+    Install {
+        name: String,
+        /// Build / take the files from a checkout instead (origin: source)
+        #[arg(long = "from-source", value_name = "DIR")]
+        from_source: Option<std::path::PathBuf>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Stop and unselect it for new agents (files and data stay; see prune)
+    Remove {
+        name: String,
+        /// Even while jobs run or agents were launched with it
+        #[arg(long)]
+        force: bool,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Delete versions nothing selects, pins or names
+    Prune {
+        name: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 

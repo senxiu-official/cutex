@@ -17,7 +17,7 @@ pub const FEATURES: [&str; 4] = [
 
 /// Advertised and negotiated like [`FEATURES`], but never required by
 /// [`validate_hello`]: older peers keep working without them.
-pub const OPTIONAL_FEATURES: [&str; 1] = [super::tells::FEATURE];
+pub const OPTIONAL_FEATURES: [&str; 2] = [super::tells::FEATURE, super::profiles::FEATURE];
 
 pub fn features() -> Vec<String> {
     let all = FEATURES.iter().chain(OPTIONAL_FEATURES.iter());
@@ -86,7 +86,11 @@ fn callback_url(destination: &str) -> Result<String> {
         .ok_or_else(|| Error::new("peer_callback_unavailable", 409))
 }
 pub fn hello() -> Value {
-    json!({"instanceId":super::instance_id(),"hostId":host(),"label":label(),"platform":std::env::consts::OS,"protocol":1,"features":features(),"cutexBuild":crate::build_info::build_json()})
+    let mut hello = json!({"instanceId":super::instance_id(),"hostId":host(),"label":label(),"platform":std::env::consts::OS,"protocol":1,"features":features(),"cutexBuild":crate::build_info::build_json()});
+    if let Some(profile) = super::profiles::hello_field() {
+        hello["ownerProfile"] = profile;
+    }
+    hello
 }
 pub fn invite(body: &Value) -> Result<Value> {
     requested_owner_user(body, "targetUserId")?;

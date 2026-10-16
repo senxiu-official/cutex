@@ -540,7 +540,7 @@ pub fn admit_events(
     report: &mut TickReport,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let state = store.snapshot()?;
+    let state = store.shared()?;
     if !state.leases.values().any(|lease| matches!(lease.holder, LeaseHolder::Event { .. }))
         && state.next_step_leases.is_empty()
         && super::delivery::requesters_with_pending(&state).is_empty()
@@ -672,7 +672,7 @@ pub fn admit_events(
             }
         }
     }
-    let state = store.snapshot()?;
+    let state = store.shared()?;
     for requester in super::delivery::requesters_with_pending(&state) {
         // `held_turn`: the running turn whose lease the results go beside.
         let Some(held_turn) = results_admissible(&state, &requester) else {

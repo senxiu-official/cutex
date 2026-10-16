@@ -255,6 +255,19 @@ impl Host for RealHost {
         super::swap::activate(&self.layout, release)
     }
 
+    fn select_components(&self, run_dir: &Path) -> Vec<String> {
+        crate::components::select_for_release(
+            &self.layout,
+            &super::keys::trusted_keys(),
+            &super::service::RealExec,
+            &run_dir.join("components-state.before.json"),
+        )
+    }
+
+    fn restore_components(&self, run_dir: &Path) -> Vec<String> {
+        crate::components::restore_after_rollback(&self.layout, &super::service::RealExec, &run_dir.join("components-state.before.json"))
+    }
+
     fn select_runtime(&self, release: &str) -> anyhow::Result<bool> {
         let keys = super::keys::trusted_keys();
         let manifest = super::stage::staged_manifest(&self.layout, &keys, release)?;

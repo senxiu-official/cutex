@@ -6,18 +6,21 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.1.0 "First Take"**: the first public release.
+**0.1.1**: optional components (Job Service, Claude runtime) installed and updated by cutex; managed
+installs run the notification worker themselves (0.1.0 "First Take" was the first public release).
+See [CHANGELOG.md](CHANGELOG.md).
 
 > **Known gaps in 0.1.x** (being fixed; this note goes away when they are):
-> - **Claude agents** need the Claude runtime (`claude-adapter`), which the install guide and the
->   release packages don't install yet. Codex-based agents work.
-> - **Jobs page and NCI remote jobs** need the Job Service, which this release doesn't ship.
+> - **NCI remote jobs** are not usable in the public release yet.
 > - **Phone push / pairing a phone**: there is no public phone app yet.
-> - **Outbound notifications (webhooks)** need `cutex notify run`, which the installer doesn't set up.
+>
+> Claude agents need the optional `claude-runtime` component and long-running jobs (Linux) the
+> `job-service` component: `cutex component install <name>` on a managed install, or the desktop's
+> **Install** button ([components/README.md](components/README.md)).
 
 cutex is a daemon that runs coding agents on your own machines. Agents run on
 [cute-codex](https://github.com/senxiu-official/cute-codex) (a fork of OpenAI Codex) or on Claude Code
-(through the adapter in [`claude-adapter/`](claude-adapter/)). cutex holds all the state: agents,
+(through the adapter in [`components/claude-runtime/`](components/claude-runtime/)). cutex holds all the state: agents,
 projects, queues, delegations, Profiles and usage.
 
 Clients talk to it through the Management v2 HTTP / SSE API. The main client is the
@@ -43,8 +46,9 @@ Linux and Windows x64.
 - Alarms: an agent schedules a message to itself or another agent for later. The owner can list
   and cancel them.
 - Owner notifications: an agent can message the owner (`owner_notify`) and ask for a reply.
-  Notification levels decide which events reach you and how; `cutex notify run` forwards them to a
-  webhook.
+  Notification levels decide which events reach you and how; the notification worker forwards them
+  to a webhook (it runs inside the Management API of a `cutex service install` install; elsewhere run
+  `cutex notify run` as its own service).
 - Owner approvals: actions beyond an agent's own permissions, such as using a Profile marked
   "needs approval", wait until the owner approves or denies them.
 - Workflows: an approved script starts one-shot step agents and collects their results.
@@ -91,14 +95,17 @@ Linux and Windows x64.
   (`cutex management schema export`).
 - Health check of the host (`GET /v2/health`).
 - `cutex service install` installs the daemon as user services (systemd user units on Linux, a
-  logon task on Windows).
+  logon task on Windows): the Agent Bus and the Management API, which also runs the notification
+  worker (webhooks, notification states).
+- Optional components, installed, updated and removed on demand (`cutex component`,
+  `/v2/components`): `claude-runtime` (Claude agents, Linux and Windows) and `job-service`
+  (long-running agent jobs, Linux). See [components/README.md](components/README.md).
 - Independent instances in separate homes (`CUTEX_HOME`).
-- Docker runtimes per Profile.
 
 ## Install
 
 Install from the release binaries or build from source. The full guide covers both, for cutex,
-cute-codex, the Claude runtime and the desktop on Linux and Windows. It is written so that either
+cute-codex, the optional components and the desktop on Linux and Windows. It is written so that either
 you or an AI coding agent can follow it end to end:
 
 **[AGENT-INSTALL.md](https://github.com/senxiu-official/cutex-desktop/blob/release/docs/install/AGENT-INSTALL.md)**
@@ -136,7 +143,7 @@ run on.
 | Component | Role |
 |---|---|
 | cute-codex | Codex agents: the native app-server, model calls and tools |
-| `claude-adapter/` | Claude agents: an app-server adapter over the Claude Agent SDK and Claude Code |
+| `components/claude-runtime/` | Claude agents: an app-server adapter over the Claude Agent SDK and Claude Code |
 | Profiles | Credentials and settings of one provider account, kept apart per Profile |
 | Session store | Durable agent identity, native thread id, cwd, project, Profile and lifecycle |
 | Managed runtime | The long-lived native process of one agent; it keeps running when no client is attached |
@@ -169,7 +176,14 @@ not stop it. Archiving a session keeps its native history.
   configurations
 - [docs/FILES-REVERT.md](docs/FILES-REVERT.md): reverting the files of a turn
 - [docs/health-check.md](docs/health-check.md): host health check
-- [docs/docker-image-notes.md](docs/docker-image-notes.md): Docker runtimes
+- [docs/backend-upgrade.md](docs/backend-upgrade.md): managed installs, `cutex service install`
+  and signed backend updates (`cutex upgrade`)
+- [components/README.md](components/README.md): optional components (`cutex component`)
+- [docs/INSTANCES.md](docs/INSTANCES.md): independent instances (`CUTEX_HOME`)
+- [docs/agent-bus-operations.md](docs/agent-bus-operations.md): Agent Bus token, audit log and
+  stuck messages
+- [docs/PROFILE-SEARCH-TOOL.md](docs/PROFILE-SEARCH-TOOL.md): the `web_search` tool
+- [docs/SESSION-FAST-MODE.md](docs/SESSION-FAST-MODE.md): fast mode per session
 
 ## Status
 
@@ -181,10 +195,11 @@ This is a first take. Its author uses it every day, but few others do yet.
 - **Users are a convenience.** User identities make it easy to share a host with people you know;
   they are not a security boundary against strangers.
 - **Upgrades.** A managed install (`cutex service install`) applies signed releases with
-  `cutex upgrade` (see `cutex upgrade --help`).
+  `cutex upgrade` or the desktop's backend updates (see
+  [docs/backend-upgrade.md](docs/backend-upgrade.md)).
   A source build can also be updated from source.
-- On Linux, agents can use a separate Job Service for long-running commands; it is not part of
-  this repository.
+- On Linux, agents can use the Job Service for long-running commands, an optional component
+  ([components/job-service/](components/job-service/)).
 
 ### Local data
 
@@ -219,7 +234,7 @@ CUTEX_TEST_PRIVATE_HOME=~/cutex-test-home HOME=~/cutex-test-home cargo test --lo
 cutex then uses `~/cutex-test-home/.cutex`. Release builds refuse to run with `CUTEX_TEST_PRIVATE_HOME` set. Run a
 debug `cutex management serve` on its own port (`--port`) so it never meets an installed daemon.
 
-The Claude adapter is a Python package with its own tests in `claude-adapter/`.
+The Claude adapter is a Python package with its own tests in `components/claude-runtime/`.
 
 Bug reports are welcome as GitHub issues. If cutex is useful to you, a star on GitHub helps others
 find it.
@@ -235,5 +250,5 @@ Codex agents run on cute-codex, a fork of [OpenAI Codex](https://github.com/open
 
 ## License
 
-Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE). `claude-adapter/` is under the MIT
-License ([claude-adapter/LICENSE](claude-adapter/LICENSE)).
+Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE). `components/claude-runtime/` is under the MIT
+License ([components/claude-runtime/LICENSE](components/claude-runtime/LICENSE)).

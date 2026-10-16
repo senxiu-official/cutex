@@ -269,7 +269,7 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
             snapshot.model_reasoning_effort.clone(),
         ),
         None => (
-            Some(account.options.claude.model.clone()),
+            claude_effective_model(config, account),
             None,
             None,
             account.options.claude.effort.map(|effort| effort.as_str().to_string()),
@@ -421,6 +421,14 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
         item["detail"]["claudeAllowWriteDefault"] = json!(default);
         item["detail"]["claudeAllowExecExplicit"] = json!(account.options.claude.allow_exec);
         item["detail"]["claudeAllowExecDefault"] = json!(default);
+        // claude-profile-default-model: `model` above is the effective
+        // default of new Claude sessions; these are its two sources
+        // (newSessionDefaults wins; a PATCH `model` clears it).
+        item["detail"]["editable"]["claudeDefaultModel"] = json!(!codex);
+        item["detail"]["claudeProfileModel"] = json!((!codex).then(|| account.options.claude.model.clone()));
+        item["detail"]["claudeNewSessionModel"] =
+            json!((!codex).then(|| new_session_model_override(config, account)).flatten());
+        item["detail"]["claudeBuiltinDefaultModel"] = json!((!codex).then(claude_builtin_default_model));
     }
     item
 }
@@ -700,8 +708,16 @@ pub fn update_profile(profile: &str, patch: &ProfileApiPatch) -> anyhow::Result<
 
     // Store-level options.
     apply_store_options(&mut account, patch)?;
-    let account_changed = store_fields_changed(&account, &original);
     let codex = account.cli_kind == CliKind::Codex;
+    // claude-profile-default-model: on a Claude profile `model` /
+    // `modelReasoningEffort` are the profile's Claude defaults (store
+    // options), every other Codex config field stays refused below.
+    let codex_config = if codex {
+        patch.codex_config.clone()
+    } else {
+        apply_claude_defaults(&mut account, &patch.codex_config)?
+    };
+    let account_changed = store_fields_changed(&account, &original);
 
     if patch.api_key.is_some() {
         ensure!(
@@ -718,12 +734,12 @@ pub fn update_profile(profile: &str, patch: &ProfileApiPatch) -> anyhow::Result<
         .map(extract_profile_config_toml)
         .transpose()?
         .flatten();
-    let (next_profile_config, config_changed) = if patch.codex_config.is_empty() {
+    let (next_profile_config, config_changed) = if codex_config.is_empty() {
         (current_profile_config, false)
     } else {
         ensure!(codex, "Codex model settings are unavailable for a Claude profile");
         let (next, changed) =
-            apply_codex_profile_config_patch(current_profile_config.as_deref(), &patch.codex_config)?;
+            apply_codex_profile_config_patch(current_profile_config.as_deref(), &codex_config)?;
         let snapshot = inspect_codex_profile_config(next.as_deref())?;
         if let (Some(window), Some(limit)) =
             (snapshot.model_context_window, snapshot.model_auto_compact_token_limit)
@@ -746,7 +762,16 @@ pub fn update_profile(profile: &str, patch: &ProfileApiPatch) -> anyhow::Result<
         .as_ref()
         .is_some_and(|next| current_auth.as_ref() != Some(next));
 
-    if !(account_changed || config_changed || auth_changed) {
+    // A Claude default-model write must be the model new sessions get: drop
+    // this profile's per-profile new-session model (`newSessionDefaults`,
+    // which otherwise takes precedence) when it disagrees.
+    let shadowing_default = (!codex
+        && matches!(patch.codex_config.model, ConfigValueUpdate::Set(_) | ConfigValueUpdate::Clear))
+    .then(|| new_session_model_override(&load_codez_config(), &account))
+    .flatten()
+    .filter(|model| *model != account.options.claude.model);
+
+    if !(account_changed || config_changed || auth_changed || shadowing_default.is_some()) {
         return Ok((account, false));
     }
 
@@ -809,7 +834,101 @@ pub fn update_profile(profile: &str, patch: &ProfileApiPatch) -> anyhow::Result<
             return Err(error);
         }
     }
+    if shadowing_default.is_some() {
+        clear_new_session_model(&account).context(
+            "the profile default model was saved, but this profile's newSessionDefaults model still overrides it",
+        )?;
+    }
     Ok((account, true))
+}
+
+/// Default Claude model when nothing is set (`ClaudeDefaults::default`).
+pub fn claude_builtin_default_model() -> String {
+    crate::profiles::appearance::ClaudeDefaults::default().model
+}
+
+/// A Claude model id / alias as the adapter takes it: 1-200 characters, no
+/// whitespace or control characters (`sonnet`, `claude-opus-5-5`,
+/// `claude-opus-5-5[1m]`, ...).
+pub fn validate_claude_model(model: &str) -> anyhow::Result<()> {
+    ensure!(
+        !model.is_empty()
+            && model.len() <= 200
+            && !model.chars().any(|c| c.is_whitespace() || c.is_control()),
+        "model: a Claude model id or alias (1-200 characters, no spaces)"
+    );
+    Ok(())
+}
+
+/// Apply `model` / `modelReasoningEffort` of a Claude profile patch to the
+/// profile's Claude defaults; returns the Codex fields left (refused by the
+/// caller when not empty). `model: null` restores the built-in default
+/// (`sonnet`), `modelReasoningEffort: null` the model's own default.
+fn apply_claude_defaults(
+    account: &mut StoredAccount,
+    patch: &CodexProfileConfigPatch,
+) -> anyhow::Result<CodexProfileConfigPatch> {
+    match &patch.model {
+        ConfigValueUpdate::Unchanged => {}
+        ConfigValueUpdate::Set(model) => {
+            let model = model.trim();
+            validate_claude_model(model)?;
+            account.options.claude.model = model.to_string();
+        }
+        ConfigValueUpdate::Clear => account.options.claude.model = claude_builtin_default_model(),
+    }
+    match &patch.model_reasoning_effort {
+        ConfigValueUpdate::Unchanged => {}
+        ConfigValueUpdate::Set(effort) => {
+            account.options.claude.effort = crate::profiles::appearance::ClaudeEffort::parse(effort.trim())
+                .map_err(|error| anyhow::anyhow!("modelReasoningEffort: {error}"))?;
+        }
+        ConfigValueUpdate::Clear => account.options.claude.effort = None,
+    }
+    Ok(CodexProfileConfigPatch {
+        model: ConfigValueUpdate::Unchanged,
+        model_reasoning_effort: ConfigValueUpdate::Unchanged,
+        ..patch.clone()
+    })
+}
+
+/// This profile's `newSessionDefaults` model (keyed by profile name, as
+/// every reader looks it up; an id key is honoured by the models list).
+pub fn new_session_model_override(config: &CodezConfig, account: &StoredAccount) -> Option<String> {
+    config
+        .new_session_defaults
+        .get(&account.name)
+        .or_else(|| config.new_session_defaults.get(&account.id))
+        .and_then(|defaults| defaults.model.clone())
+        .filter(|model| !model.trim().is_empty())
+}
+
+/// Effective default model of new Claude sessions on this profile: the
+/// per-profile new-session model (more specific), else the profile's own
+/// Claude default. Codex profiles: `None`.
+pub fn claude_effective_model(config: &CodezConfig, account: &StoredAccount) -> Option<String> {
+    (account.cli_kind == CliKind::Claude).then(|| {
+        new_session_model_override(config, account).unwrap_or_else(|| account.options.claude.model.clone())
+    })
+}
+
+/// Remove the profile's `newSessionDefaults` model (name and id keys); an
+/// entry left without model or reasoning goes.
+fn clear_new_session_model(account: &StoredAccount) -> anyhow::Result<()> {
+    let mut config = crate::config::store::load_codez_config_checked()?;
+    let mut changed = false;
+    for key in [&account.name, &account.id] {
+        if let Some(defaults) = config.new_session_defaults.get_mut(key.as_str()) {
+            changed |= defaults.model.take().is_some();
+            if defaults.reasoning.is_none() {
+                config.new_session_defaults.remove(key.as_str());
+            }
+        }
+    }
+    if changed {
+        crate::config::store::save_codez_config(&config)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1331,6 +1450,101 @@ mod tests {
         assert_eq!(item["detail"]["planLabelManual"], "plus");
         let item = profile_item(&cleared, &CodezConfig::default(), false);
         assert_eq!((item["planLabel"].clone(), item["planLabelSource"].clone()), (Value::Null, Value::Null));
+    }
+
+    #[test]
+    fn claude_profile_default_model_is_patchable_and_wins_over_a_stale_new_session_default() {
+        use crate::profiles::lifecycle::{create_profile, NewProfile, NewProfileKind};
+        use crate::profiles::model::NewSessionDefaults;
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let created = create_profile(&NewProfile {
+            name: "claude-main".into(),
+            kind: NewProfileKind::Claude,
+            preset: None,
+            base_url: None,
+            model: None,
+            api_key: None,
+        })
+        .expect("claude profile");
+        assert_eq!(created.options.claude.model, "sonnet");
+        let item = profile_item(&created, &CodezConfig::default(), true);
+        assert_eq!(item["model"], "sonnet");
+        assert_eq!(item["detail"]["editable"]["claudeDefaultModel"], true);
+        assert_eq!(item["detail"]["editable"]["model"], false);
+        assert_eq!(item["detail"]["claudeBuiltinDefaultModel"], "sonnet");
+        assert_eq!(item["detail"]["claudeNewSessionModel"], Value::Null);
+
+        let model_patch = |model: ConfigValueUpdate<String>, effort: ConfigValueUpdate<String>| ProfileApiPatch {
+            codex_config: CodexProfileConfigPatch {
+                model,
+                model_reasoning_effort: effort,
+                ..CodexProfileConfigPatch::default()
+            },
+            ..ProfileApiPatch::default()
+        };
+        let (opus, changed) = update_profile(
+            &created.id,
+            &model_patch(ConfigValueUpdate::Set("claude-opus-5-5".into()), ConfigValueUpdate::Set("high".into())),
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(opus.options.claude.model, "claude-opus-5-5");
+        assert_eq!(opus.options.claude.effort.map(|e| e.as_str()), Some("high"));
+        let item = profile_item(&opus, &CodezConfig::default(), true);
+        assert_eq!((item["model"].clone(), item["modelReasoningEffort"].clone()), (json!("claude-opus-5-5"), json!("high")));
+        // Same value again: no change.
+        let (_, changed) =
+            update_profile(&created.id, &model_patch(ConfigValueUpdate::Set("claude-opus-5-5".into()), ConfigValueUpdate::Unchanged))
+                .unwrap();
+        assert!(!changed);
+
+        // Invalid values and other Codex fields are refused; nothing changes.
+        for bad in ["", "claude opus", "a\u{7}"] {
+            assert!(update_profile(&created.id, &model_patch(ConfigValueUpdate::Set(bad.into()), ConfigValueUpdate::Unchanged)).is_err(), "{bad:?}");
+        }
+        assert!(update_profile(&created.id, &model_patch(ConfigValueUpdate::Unchanged, ConfigValueUpdate::Set("extreme".into()))).is_err());
+        let codex_only = ProfileApiPatch {
+            codex_config: CodexProfileConfigPatch {
+                model: ConfigValueUpdate::Set("claude-sonnet-5-5".into()),
+                model_context_window: ConfigValueUpdate::Set(100_000),
+                ..CodexProfileConfigPatch::default()
+            },
+            ..ProfileApiPatch::default()
+        };
+        let error = update_profile(&created.id, &codex_only).unwrap_err().to_string();
+        assert!(error.contains("unavailable for a Claude profile"), "{error}");
+        assert_eq!(load_store().unwrap().accounts[0].options.claude.model, "claude-opus-5-5");
+
+        // newSessionDefaults is the more specific source: the item (and the
+        // models list) show it ...
+        let mut config = crate::config::store::load_codez_config_checked().unwrap();
+        config.new_session_defaults.insert(
+            "claude-main".into(),
+            NewSessionDefaults { model: Some("claude-haiku-4-5".into()), reasoning: Some("low".into()) },
+        );
+        crate::config::store::save_codez_config(&config).unwrap();
+        let config = crate::config::store::load_codez_config_checked().unwrap();
+        let item = profile_item(&opus, &config, true);
+        assert_eq!(item["model"], "claude-haiku-4-5");
+        assert_eq!(item["detail"]["claudeProfileModel"], "claude-opus-5-5");
+        assert_eq!(item["detail"]["claudeNewSessionModel"], "claude-haiku-4-5");
+        assert_eq!(crate::profiles::catalog_api::models_resource(&opus).unwrap()["selectedModel"], "claude-haiku-4-5");
+        // ... until a PATCH `model` (even an unchanged one) drops it; the
+        // entry's reasoning stays.
+        let (_, changed) =
+            update_profile(&created.id, &model_patch(ConfigValueUpdate::Set("claude-opus-5-5".into()), ConfigValueUpdate::Unchanged))
+                .unwrap();
+        assert!(changed);
+        let config = crate::config::store::load_codez_config_checked().unwrap();
+        assert_eq!(config.new_session_defaults["claude-main"], NewSessionDefaults { model: None, reasoning: Some("low".into()) });
+        let account = load_store().unwrap().accounts[0].clone();
+        assert_eq!(profile_item(&account, &config, false)["model"], "claude-opus-5-5");
+        assert_eq!(crate::profiles::catalog_api::models_resource(&account).unwrap()["selectedModel"], "claude-opus-5-5");
+
+        // null restores the built-in default / the model's own effort.
+        let (cleared, _) =
+            update_profile(&created.id, &model_patch(ConfigValueUpdate::Clear, ConfigValueUpdate::Clear)).unwrap();
+        assert_eq!((cleared.options.claude.model.as_str(), cleared.options.claude.effort), ("sonnet", None));
     }
 
     #[test]

@@ -5,6 +5,12 @@
 # (docs/backend-upgrade.md: tag cutex-<release>, channel-release).
 #
 # Release label: the `release` input, else the tag name without its leading `v` (v0.2.0 -> 0.2.0).
+#
+# Optional components (components/README.md): every components/<name>/component.json adds one build per
+# listed platform (`components/<name>/build.sh <platform> <version> <out>`), uploaded as the artifact
+# component-<name>-<platform>. Their files all start with `component-` (archives, SHA256SUMS-component-*,
+# BUILD-INFO-component-*), so the cutex-* globs of the release scripts never pick them up. The owner
+# publishes each component version once under the tag component-<name>-<version>.
 name: Build binaries
 
 on:
@@ -77,27 +83,109 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  component-matrix:
+    name: Component matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      any: ${{ steps.m.outputs.any }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - id: m
+        name: Read components/*/component.json
+        run: |
+          set -euo pipefail
+          matrix="$(python3 .github/ci/components.py matrix)"
+          echo "$matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          if [ "$(printf '%s' "$matrix" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["include"]))')" = 0 ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  component:
+    name: component ${{ matrix.name }} ${{ matrix.platform }}
+    needs: component-matrix
+    if: needs.component-matrix.outputs.any == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.component-matrix.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Neutral build directory (the binaries keep the source path in one place)
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then d=/c/build; mkdir -p "$d"; else d=/build; sudo mkdir -p "$d"; sudo chown "$(id -u):$(id -g)" "$d"; fi
+          echo "BUILD_ROOT=$d" >> "$GITHUB_ENV"
+      - name: Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal && rustc +1.95.0 --version
+      - name: Python 3.12 from the runner's tool cache (the system Python 3.10 cannot build the pinned wheels)
+        run: bash .github/ci/component-e2e-pythons.sh
+      - name: Build and pack
+        env:
+          LEAK_POLICY: ${{ matrix.leak_policy }}
+          NAME: ${{ matrix.name }}
+          VERSION: ${{ matrix.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: PYTHON="$E2E_PYTHON" bash "components/$NAME/build.sh" "$PLATFORM" "$VERSION" "$RUNNER_TEMP/out"
+      - name: Check the output
+        env:
+          NAME: ${{ matrix.name }}
+          VERSION: ${{ matrix.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          # GitHub's Windows images have `python`, not `python3`.
+          if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
+          "$py" .github/ci/components.py check "$NAME" "$VERSION" "$PLATFORM" "$RUNNER_TEMP/out" --commit "$(git rev-parse HEAD)"
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: component-${{ matrix.name }}-${{ matrix.platform }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
+
   sums:
     name: SHA256SUMS
-    needs: build
+    needs: [build, component-matrix, component]
+    # Runs when the cutex builds passed and the component builds passed or there were none.
+    if: >-
+      always() && needs.build.result == 'success' && needs.component-matrix.result == 'success' &&
+      (needs.component.result == 'success' || (needs.component.result == 'skipped' && needs.component-matrix.outputs.any == 'false'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           pattern: cutex-*
+      - if: needs.component-matrix.outputs.any == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: component-*
       - name: Check and combine the per-platform sums
         run: |
           set -euo pipefail
+          shopt -s nullglob
           mkdir out
-          for d in artifacts/cutex-*; do
+          for d in artifacts/cutex-* artifacts/component-*; do
             (cd "$d" && sha256sum --check SHA256SUMS-*)
             cat "$d"/SHA256SUMS-* >> out/SHA256SUMS
           done
           sort -k2 -o out/SHA256SUMS out/SHA256SUMS
           cat out/SHA256SUMS
           {
-            echo '### cutex release archives'
+            echo '### cutex release archives and component archives'
             echo '```'
             cat out/SHA256SUMS
             echo '```'

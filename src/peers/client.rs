@@ -252,6 +252,7 @@ pub fn call(
             Some("asks.close.v1")
         }
         ("GET", path) if path.starts_with("/peer/v1/asks/") => Some("asks.snapshot.v1"),
+        (_, path) if path.starts_with(super::profiles::ROUTE) => Some(super::profiles::FEATURE),
         (_, path) if path.starts_with("/peer/v1/asks/") => Some("asks.v1"),
         _ => None,
     };

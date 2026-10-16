@@ -92,6 +92,8 @@ pub const CUTEX_METHOD_REGISTRY_METHODS: &[&str] = &[
     "cutex/ownerNotify/reply",
     "cutex/ownerNotify/dismiss",
     "cutex/ownerNotify/delete",
+    "cutex/safetyCheck/grant",
+    "cutex/safetyCheck/dismiss",
 ];
 
 #[cfg(test)]
@@ -2024,9 +2026,9 @@ mod tests {
 
     #[test]
     fn profile_projection_distinguishes_durable_intent_global_fallback_and_unavailable_launch() {
-        let previous_home = std::env::var_os("HOME");
         let isolated_home = IsolatedTestHome::new("cutex-profile-projection-test")
             .expect("create isolated test HOME");
+        let isolated_root = isolated_home.root().to_path_buf();
         let mut record = CutexSessionRecord::from_codex_session_id("thread-profile-projection")
             .expect("durable test session");
         record.cutex_session_id = "cutex-profile-projection".to_string();
@@ -2071,9 +2073,11 @@ mod tests {
             "the test config must stay inside the isolated HOME"
         );
         drop(isolated_home);
-        assert_eq!(
-            std::env::var_os("HOME"),
-            previous_home,
+        // HOME is read after the guard is gone, so another test may already hold it; it must
+        // not still be this test's home.
+        assert_ne!(
+            std::env::var_os("HOME").map(std::path::PathBuf::from),
+            Some(isolated_root),
             "the isolated HOME guard must restore the process environment"
         );
     }

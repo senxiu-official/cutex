@@ -26,7 +26,7 @@
 //! root token and keep working until they are relaunched.
 //!
 //! One non-MCP caller also holds the runtime's credential: the Job Service
-//! MCP adapter (`review-sources/job-service`, `cutex_job` server), which
+//! MCP adapter (`components/job-service`, `cutex_job` server), which
 //! inherits `CUTEX_AGENT_BUS_TOKEN` and resolves its caller with
 //! `GET /api/agents?agent_id=<runtime>&all_hosts=false` and no
 //! `x-cutex-agent-id` header. Its binary is pinned by digest in the reviewed

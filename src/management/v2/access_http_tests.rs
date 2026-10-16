@@ -970,3 +970,55 @@ fn p2_users_read_workspaces_send_own_images_and_act_on_visible_asks() {
     let state = asks.snapshot().unwrap();
     assert!(state.asks[&hidden_ask.ask_id].closed.is_none(), "the refused ask is untouched");
 }
+
+/// Safety grants (capability `claude-safety-grants`): only the owner decides.
+/// Non-owner users (read or send grant) are refused by the gate, a caller
+/// without the root credential (an agent, any other process) by the route.
+#[test]
+fn safety_check_decisions_and_list_are_the_owners_only() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let mut store = crate::session::model::CutexSessionStore::default();
+    let mut record = crate::session::model::CutexSessionRecord::new(
+        "cutex.solo".to_string(), None, "test-host".to_string(), "/tmp".to_string(), None,
+    )
+    .unwrap();
+    record.exposed_to_backend = true;
+    store.sessions.insert("cutex.solo".to_string(), record);
+    crate::session::store::save_cutex_session_store(&store).unwrap();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let grant = Grant { standalone_agents: vec!["cutex.solo".into()], send: true, ..Grant::default() };
+    let sender = users.create_user("Sender", None, grant.clone(), "root").unwrap();
+    let reader = users.create_user("Reader", None, Grant { send: false, ..grant }, "root").unwrap();
+    let send_token = tokens.issue("sender").unwrap();
+    let read_token = tokens.issue("reader").unwrap();
+    users.bind_token(&send_token.token_id, Some(&sender.id), "root").unwrap();
+    users.bind_token(&read_token.token_id, Some(&reader.id), "root").unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+
+    let path = "/v2/sessions/cutex.solo/cutex/requests";
+    for method in ["cutex/safetyCheck/grant", "cutex/safetyCheck/dismiss"] {
+        let body = json!({"requestId": "r-1", "method": method, "params": {"blockId": "sb-1"}});
+        for token in [send_token.token.as_str(), read_token.token.as_str()] {
+            let (status, value) = exchange("POST", path, Some(token), &body);
+            assert_eq!((status, code(&value)), (403, "owner_required"), "{method}");
+        }
+        // No root credential (what an agent or a bridge caller has): refused
+        // before any state is read.
+        for bearer in [None, Some("agent-bus-token-is-not-a-management-credential")] {
+            let (status, value) = exchange("POST", path, bearer, &body);
+            assert_eq!((status, code(&value)), (403, "cutex_method_denied"), "{method} {bearer:?}");
+        }
+    }
+    for token in [send_token.token.as_str(), read_token.token.as_str()] {
+        let (status, value) = exchange("GET", "/v2/safety-checks", Some(token), &Value::Null);
+        assert_eq!((status, code(&value)), (403, "owner_required"));
+    }
+    for bearer in [None, Some("agent-bus-token-is-not-a-management-credential")] {
+        let (status, _) = exchange("GET", "/v2/safety-checks", bearer, &Value::Null);
+        assert_eq!(status, 401, "{bearer:?}");
+    }
+    let (status, value) = exchange("GET", "/v2/safety-checks?state=all", Some(ROOT), &Value::Null);
+    assert_eq!((status, &value["blocks"]), (200, &json!([])), "{value}");
+}

@@ -178,6 +178,11 @@ pub fn claim_owner_role() {
     OWNER_ROLE.store(true, Ordering::Release);
 }
 
+/// This process is Management serve (it publishes live events).
+pub fn owner_role() -> bool {
+    OWNER_ROLE.load(Ordering::Acquire)
+}
+
 /// This process's ledger, or `None` when the runtime directory is unusable
 /// (then every connection writes, as before).
 pub fn process_ledger() -> Option<Arc<Ledger>> {
