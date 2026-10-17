@@ -251,6 +251,9 @@ fn cutex_and_native_method_tables_are_reviewed_snapshots() {
     assert_eq!(native_need("model/list"), Need::Owner);
     assert_eq!(native_need("thread/read"), Need::Read);
     assert_eq!(native_need("turn/interrupt"), Need::Send);
+    // Windows sandbox readiness / unelevated setup: the owner's only.
+    assert_eq!(native_need("windowsSandbox/readiness"), Need::Owner);
+    assert_eq!(native_need("windowsSandbox/setupStart"), Need::Owner);
     assert_eq!(native_need(""), Need::Owner);
     // Native r53 additions stay the owner's (and the gateway denies them).
     for method in crate::management::v2::native_requests::NATIVE_R53_UNFORWARDED_METHODS {

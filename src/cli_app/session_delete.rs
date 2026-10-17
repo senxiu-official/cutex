@@ -152,12 +152,12 @@ fn references(key: &str) -> Result<Value, UserInputExecutionError> {
 }
 
 fn referenced_error(details: Value) -> UserInputExecutionError {
-    error(
-        "session_referenced",
-        "this session is still referenced (Director, Operator or owned services); resolve those first",
-        false,
-        details,
-    )
+    let message = if details["nativeForkReferences"] == true {
+        "a fork of this session on the same runtime home still reads its history; delete that fork first"
+    } else {
+        "this session is still referenced (Director, Operator or owned services); resolve those first"
+    };
+    error("session_referenced", message, false, details)
 }
 
 fn busy_error(message: &str, details: Value) -> UserInputExecutionError {
@@ -237,6 +237,183 @@ fn is_thread_not_found(error: &CatalogError) -> bool {
     matches!(error, CatalogError::Rpc { error, .. } if error.message.contains("thread not found"))
 }
 
+/// The left-behind copy of fork `candidate` in `home` (canonical), if it is
+/// one: a fork made from storage (`cutex/session/fork`) is created in the
+/// source's native home and then adopted into a home of its own,
+/// `runtime/light/agents/<thread>`, whose `adoption.json` records that source
+/// home as `history_home`. The copy left in the source home is no session's
+/// history, yet its `history_base` still references the source's rollouts, so
+/// native `thread/delete` of the source refused ("forked history still
+/// references it") even after the fork itself was deleted. `None` when the
+/// thread is not such a copy or a session record still uses it in `home`.
+fn fork_leftover_copy(
+    agents: &Path,
+    home: &Path,
+    store: &cutex::session::model::CutexSessionStore,
+    candidate: &str,
+) -> Option<PathBuf> {
+    let adoption: Value =
+        serde_json::from_slice(&std::fs::read(agents.join(candidate).join("adoption.json")).ok()?).ok()?;
+    if adoption.get("native_id").and_then(Value::as_str) != Some(candidate) {
+        return None;
+    }
+    let history_home = Path::new(adoption.get("history_home")?.as_str()?).canonicalize().ok()?;
+    if history_home != home || agents.join(candidate).canonicalize().ok()? == home {
+        return None;
+    }
+    let used_here = store.sessions.values().any(|record| {
+        record.codex_session_id.as_deref() == Some(candidate)
+            && super::session_history::native_home_for(Some(record))
+                .ok()
+                .and_then(|own| own.canonicalize().ok())
+                .is_some_and(|own| own == home)
+    });
+    if used_here {
+        return None;
+    }
+    cutex::launch::native_history::current(home, candidate).ok()
+}
+
+/// Left-behind fork copies in `home` (see [`fork_leftover_copy`]) whose
+/// inherited history includes a rollout of `thread`.
+fn fork_leftovers_referencing(
+    home: &Path,
+    thread: &str,
+    store: &cutex::session::model::CutexSessionStore,
+) -> Vec<(String, PathBuf)> {
+    let (Ok(home), Ok(agents)) = (
+        home.canonicalize(),
+        cutex::config::paths::runtime_dir().map(|runtime| runtime.join("light").join("agents")),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&agents) else {
+        return Vec::new();
+    };
+    let mut found = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| name != thread && uuid::Uuid::parse_str(name).is_ok_and(|uuid| uuid.to_string() == *name))
+        .filter_map(|candidate| {
+            let rollout = fork_leftover_copy(&agents, &home, store, &candidate)?;
+            let chain = cutex::launch::native_history::recovery_sources(&home, &rollout).ok()?;
+            chain
+                .iter()
+                .skip(1)
+                .any(|inherited| {
+                    cutex::launch::native_history::metadata(inherited)
+                        .is_ok_and(|meta| meta.get("id").and_then(Value::as_str) == Some(thread))
+                })
+                .then_some((candidate, rollout))
+        })
+        .collect::<Vec<_>>();
+    found.sort();
+    found
+}
+
+/// Native `thread/delete` of left-behind fork copies, each first copied to
+/// `<backup>/fork-copies/` when given. A copy another copy inherits from is
+/// retried after that one is gone. Returns how many are gone.
+fn delete_fork_copies(
+    endpoint: &mut dyn CatalogEndpoint,
+    copies: &[(String, PathBuf)],
+    backup: Option<&Path>,
+) -> usize {
+    let mut pending = Vec::new();
+    for (thread, rollout) in copies {
+        if let Some(backup) = backup {
+            let target = backup.join("fork-copies");
+            let saved = std::fs::create_dir_all(&target).and_then(|_| {
+                std::fs::copy(rollout, target.join(rollout.file_name().unwrap_or_default())).map(|_| ())
+            });
+            if let Err(error) = saved {
+                eprintln!("session delete: fork copy {thread} kept, no backup: {error}");
+                continue;
+            }
+        }
+        pending.push(thread.as_str());
+    }
+    let mut released = 0;
+    loop {
+        let before = released;
+        pending.retain(|thread| match endpoint.request("thread/delete", json!({ "threadId": thread })) {
+            Ok(_) => {
+                released += 1;
+                false
+            }
+            Err(native) if is_thread_not_found(&native) => {
+                released += 1;
+                false
+            }
+            Err(native) if is_fork_reference(&native) => true,
+            Err(native) => {
+                eprintln!("session delete: fork copy {thread} not deleted: {native}");
+                false
+            }
+        });
+        if pending.is_empty() || released == before {
+            break;
+        }
+    }
+    released
+}
+
+/// After `cutex/session/fork` adopted `thread` into a home of its own: delete
+/// the copy native `thread/fork` left in the source's home (`home`), so it no
+/// longer keeps the source's history referenced. Best effort: a later delete
+/// of the source releases a copy still left here.
+pub(crate) fn release_fork_copy(source: &CutexSessionRecord, home: &Path, thread: &str) {
+    let copy = (|| {
+        let home = home.canonicalize().ok()?;
+        let agents = cutex::config::paths::runtime_dir().ok()?.join("light").join("agents");
+        let store = cutex::session::store::load_cutex_session_store().ok()?;
+        fork_leftover_copy(&agents, &home, &store, thread)
+    })();
+    let Some(rollout) = copy else {
+        return;
+    };
+    match isolated_endpoint(source) {
+        Ok(mut endpoint) => {
+            delete_fork_copies(&mut endpoint, &[(thread.to_string(), rollout)], None);
+        }
+        Err(error) => eprintln!("session fork: source-home copy of {thread} kept ({error:#})"),
+    }
+}
+
+/// Native `thread/delete` of `thread` in `home`. A fork-reference refusal
+/// caused only by copies earlier forks left in this home (also in homes
+/// written before forks released them, see [`release_fork_copy`]) deletes
+/// those copies (backed up under `directory`) and retries; a fork that still
+/// lives on this home's history keeps the refusal.
+fn delete_thread(
+    endpoint: &mut dyn CatalogEndpoint,
+    home: &Path,
+    thread: &str,
+    directory: &Path,
+) -> Result<NativeOutcome, UserInputExecutionError> {
+    let mut refusal = match endpoint.request("thread/delete", json!({ "threadId": thread })) {
+        Ok(_) => return Ok(NativeOutcome::Deleted),
+        Err(native) if is_fork_reference(&native) => native,
+        Err(native) if is_thread_not_found(&native) => return Ok(NativeOutcome::Nothing),
+        Err(native) => return Err(failed("deleting the native thread", native)),
+    };
+    let copies = cutex::session::store::load_cutex_session_store()
+        .map(|store| fork_leftovers_referencing(home, thread, &store))
+        .unwrap_or_default();
+    if !copies.is_empty() && delete_fork_copies(endpoint, &copies, Some(directory)) > 0 {
+        match endpoint.request("thread/delete", json!({ "threadId": thread })) {
+            Ok(_) => return Ok(NativeOutcome::Deleted),
+            Err(native) if is_thread_not_found(&native) => return Ok(NativeOutcome::Nothing),
+            Err(native) if is_fork_reference(&native) => refusal = native,
+            Err(native) => return Err(failed("deleting the native thread", native)),
+        }
+    }
+    Err(referenced_error(json!({
+        "nativeForkReferences": true,
+        "message": refusal.to_string(),
+    })))
+}
+
 fn delete_native(record: &CutexSessionRecord, directory: &Path) -> Result<NativeOutcome, UserInputExecutionError> {
     let Some(thread) = record.codex_session_id.as_deref() else {
         return Ok(NativeOutcome::Nothing);
@@ -246,15 +423,7 @@ fn delete_native(record: &CutexSessionRecord, directory: &Path) -> Result<Native
     let rollout = backup_rollouts(&home, thread, directory)
         .map_err(|error| failed("saving the recovery copy", error))?;
     match isolated_endpoint(record) {
-        Ok(mut endpoint) => match endpoint.request("thread/delete", json!({ "threadId": thread })) {
-            Ok(_) => Ok(NativeOutcome::Deleted),
-            Err(native) if is_fork_reference(&native) => Err(referenced_error(json!({
-                "nativeForkReferences": true,
-                "message": native.to_string(),
-            }))),
-            Err(native) if is_thread_not_found(&native) => Ok(NativeOutcome::Nothing),
-            Err(native) => Err(failed("deleting the native thread", native)),
-        },
+        Ok(mut endpoint) => delete_thread(&mut endpoint, &home, thread, directory),
         Err(spawn) => {
             // No native available: move this thread's own rollout into the
             // recovery directory (state DB rows stay; native lists skip a
@@ -432,6 +601,201 @@ pub(crate) fn delete_for_management(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ORIGINAL: &str = "018a0000-0000-7000-8000-00000000000a";
+    const FORK: &str = "018a0000-0000-7000-8000-00000000000b";
+    const FORK_OF_FORK: &str = "018a0000-0000-7000-8000-00000000000c";
+    const IN_HOME_FORK: &str = "018a0000-0000-7000-8000-00000000000d";
+
+    /// Native `thread/delete` over rollout files: refuses a thread another
+    /// rollout's `history_base` names, like the native reference index.
+    struct FakeNative {
+        home: PathBuf,
+        deleted: Vec<String>,
+    }
+
+    impl CatalogEndpoint for FakeNative {
+        fn request(&mut self, method: &str, params: Value) -> Result<Value, CatalogError> {
+            assert_eq!(method, "thread/delete");
+            let thread = params["threadId"].as_str().unwrap().to_string();
+            let rpc = |message: String| CatalogError::Rpc {
+                method: method.into(),
+                error: cutex::app_server::protocol::RpcError { code: -32600, message, data: None },
+            };
+            let Ok(rollout) = cutex::launch::native_history::current(&self.home, &thread) else {
+                return Err(rpc(format!("thread not found: {thread}")));
+            };
+            let referenced = walk(&self.home.join("sessions")).iter().any(|other| {
+                cutex::launch::native_history::metadata(other)
+                    .is_ok_and(|meta| meta["history_base"]["thread_id"] == thread.as_str())
+            });
+            if referenced {
+                return Err(rpc(format!(
+                    "invalid thread-store request: cannot delete thread {thread}: forked history still references it"
+                )));
+            }
+            std::fs::remove_file(rollout).unwrap();
+            self.deleted.push(thread);
+            Ok(json!({}))
+        }
+
+        fn notify(&mut self, _: &str, _: Option<Value>) -> Result<(), CatalogError> {
+            Ok(())
+        }
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.path().is_dir() {
+                found.extend(walk(&entry.path()));
+            } else {
+                found.push(entry.path());
+            }
+        }
+        found
+    }
+
+    /// A rollout of `id` in `home`, inheriting from `base` when given.
+    fn rollout(home: &Path, id: &str, base: Option<&str>) {
+        let dir = home.join("sessions/2026/10/16");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut meta = json!({ "id": id, "cwd": "/work" });
+        if let Some(base) = base {
+            meta["history_base"] = json!({ "thread_id": base, "end_byte_offset": 10 });
+        }
+        let line = json!({ "timestamp": "t", "type": "session_meta", "payload": meta });
+        std::fs::write(dir.join(format!("rollout-2026-10-16T00-00-00-{id}.jsonl")), format!("{line}\n")).unwrap();
+    }
+
+    /// `runtime/light/agents/<id>/adoption.json` of a fork adopted from `history_home`.
+    fn adopted_fork(id: &str, history_home: &Path) -> PathBuf {
+        let home = cutex::config::paths::runtime_dir().unwrap().join("light/agents").join(id);
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        let provenance = json!({ "native_id": id, "source_history": "/elsewhere", "sha256": "00", "history_home": history_home });
+        std::fs::write(home.join("adoption.json"), provenance.to_string()).unwrap();
+        home
+    }
+
+    fn shared_home(test: &crate::cli_app::test_home::IsolatedTestHome) -> PathBuf {
+        let home = test.root().join("shared-native-home");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        home
+    }
+
+    /// Owner's sequence: fork an agent (the fork is adopted into its own home,
+    /// native leaves a copy in the source's home), delete the fork, then delete
+    /// the original. The left-behind copy is no dependant: the delete goes on.
+    #[test]
+    fn deleting_the_original_after_its_fork_releases_the_left_behind_copy() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-fork-copy").unwrap();
+        let source = shared_home(&test);
+        rollout(&source, ORIGINAL, None);
+        rollout(&source, FORK, Some(ORIGINAL));
+        let fork_home = adopted_fork(FORK, &source);
+        // The fork's own copy was already deleted with the fork.
+        assert!(walk(&fork_home.join("sessions")).is_empty());
+
+        let recovery = test.root().join("recovery");
+        std::fs::create_dir_all(&recovery).unwrap();
+        let mut native = FakeNative { home: source.clone(), deleted: Vec::new() };
+        let outcome = delete_thread(&mut native, &source, ORIGINAL, &recovery).unwrap();
+        assert!(matches!(outcome, NativeOutcome::Deleted));
+        assert_eq!(native.deleted, vec![FORK.to_string(), ORIGINAL.to_string()]);
+        assert_eq!(walk(&recovery.join("fork-copies")).len(), 1, "the copy is backed up first");
+        assert!(walk(&source.join("sessions")).is_empty());
+    }
+
+    /// Reverse order: the original is deleted while its fork lives on in its
+    /// own home (it holds its own copy of the inherited history).
+    #[test]
+    fn deleting_the_original_while_its_adopted_fork_lives_keeps_the_fork() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-fork-live").unwrap();
+        let source = shared_home(&test);
+        rollout(&source, ORIGINAL, None);
+        rollout(&source, FORK, Some(ORIGINAL));
+        let fork_home = adopted_fork(FORK, &source);
+        rollout(&fork_home, ORIGINAL, None);
+        rollout(&fork_home, FORK, Some(ORIGINAL));
+
+        let mut native = FakeNative { home: source.clone(), deleted: Vec::new() };
+        let outcome = delete_thread(&mut native, &source, ORIGINAL, &test.root().join("recovery")).unwrap();
+        assert!(matches!(outcome, NativeOutcome::Deleted));
+        assert_eq!(walk(&fork_home.join("sessions")).len(), 2, "the fork's own home is untouched");
+        // Then the fork itself, in its own home.
+        let mut native = FakeNative { home: fork_home.clone(), deleted: Vec::new() };
+        assert!(matches!(
+            delete_thread(&mut native, &fork_home, FORK, &test.root().join("recovery-2")).unwrap(),
+            NativeOutcome::Deleted
+        ));
+    }
+
+    /// A fork of a fork is made in the first fork's home: deleting the first
+    /// fork releases the copy its own fork left there, also when that copy is
+    /// in turn inherited by another left-behind copy.
+    #[test]
+    fn fork_of_a_fork_copies_are_released_in_dependency_order() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-fork-chain").unwrap();
+        let fork_home = adopted_fork(FORK, &test.root().join("unused"));
+        rollout(&fork_home, ORIGINAL, None);
+        rollout(&fork_home, FORK, Some(ORIGINAL));
+        rollout(&fork_home, FORK_OF_FORK, Some(FORK));
+        rollout(&fork_home, IN_HOME_FORK, Some(FORK_OF_FORK));
+        adopted_fork(FORK_OF_FORK, &fork_home);
+        adopted_fork(IN_HOME_FORK, &fork_home);
+
+        let mut native = FakeNative { home: fork_home.clone(), deleted: Vec::new() };
+        let outcome = delete_thread(&mut native, &fork_home, FORK, &test.root().join("recovery")).unwrap();
+        assert!(matches!(outcome, NativeOutcome::Deleted));
+        assert_eq!(native.deleted, vec![IN_HOME_FORK.to_string(), FORK_OF_FORK.to_string(), FORK.to_string()]);
+    }
+
+    /// A fork that still lives on this home's history (no home of its own) is
+    /// a real dependant: the refusal stays, with fork wording.
+    #[test]
+    fn a_fork_living_on_the_same_home_still_blocks_the_delete() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-fork-inhome").unwrap();
+        let source = shared_home(&test);
+        rollout(&source, ORIGINAL, None);
+        rollout(&source, FORK, Some(ORIGINAL));
+        adopted_fork(FORK, &source);
+        rollout(&source, IN_HOME_FORK, Some(ORIGINAL));
+        // Adopted from another home: not a copy left in this one.
+        adopted_fork(FORK_OF_FORK, &test.root().join("other-home"));
+        rollout(&source, FORK_OF_FORK, Some(ORIGINAL));
+
+        let mut native = FakeNative { home: source.clone(), deleted: Vec::new() };
+        let refusal = delete_thread(&mut native, &source, ORIGINAL, &test.root().join("recovery"))
+            .err()
+            .unwrap();
+        assert_eq!(refusal.code, "session_referenced");
+        assert_eq!(refusal.details["nativeForkReferences"], true);
+        assert!(refusal.message.contains("fork"), "{}", refusal.message);
+        assert_eq!(native.deleted, vec![FORK.to_string()], "only the left-behind copy went");
+        assert_eq!(walk(&source.join("sessions")).len(), 3);
+    }
+
+    #[test]
+    fn a_left_behind_copy_needs_matching_provenance() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-fork-provenance").unwrap();
+        let source = shared_home(&test);
+        rollout(&source, FORK, None);
+        let agents = cutex::config::paths::runtime_dir().unwrap().join("light/agents");
+        let canonical = source.canonicalize().unwrap();
+        let store = cutex::session::model::CutexSessionStore::default();
+        assert_eq!(fork_leftover_copy(&agents, &canonical, &store, FORK), None, "no adoption record");
+        adopted_fork(FORK, &test.root().join("other-home"));
+        std::fs::create_dir_all(test.root().join("other-home")).unwrap();
+        assert_eq!(fork_leftover_copy(&agents, &canonical, &store, FORK), None, "adopted from another home");
+        adopted_fork(FORK, &source);
+        assert!(fork_leftover_copy(&agents, &canonical, &store, FORK).is_some());
+        std::fs::write(
+            agents.join(FORK).join("adoption.json"),
+            json!({ "native_id": ORIGINAL, "history_home": source }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(fork_leftover_copy(&agents, &canonical, &store, FORK), None, "provenance of another thread");
+    }
 
     fn rpc(message: &str) -> CatalogError {
         CatalogError::Rpc {

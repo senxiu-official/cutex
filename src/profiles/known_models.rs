@@ -56,6 +56,11 @@ pub enum VendorTemplate {
     /// `truncation_policy {bytes, 10000}`, `shell_type shell_command`,
     /// `apply_patch freeform`, `default_reasoning_summary none`.
     Glm,
+    /// Kimi Code official Codex `models.json`: `support_verbosity:false`,
+    /// `truncation_policy {bytes, 10000}`, `shell_type shell_command`,
+    /// `supports_reasoning_summaries:true`, `default_reasoning_summary none`
+    /// (no `apply_patch_tool_type`: native's default stays).
+    KimiCode,
 }
 
 const LOW_HIGH_MAX: &[&str] = &["low", "high", "max"];
@@ -128,6 +133,28 @@ pub const KNOWN_MODELS: &[KnownModel] = &[
     KnownModel { context_window: Some(262_144), image: true,
         ..model("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed") },
     KnownModel { context_window: Some(262_144), image: true, ..model("kimi-k2.6", "Kimi K2.6") },
+    // --- Kimi Code membership plan (kimi.com/code/docs models + Codex page,
+    // fetched 2026-10-16; the vendor Codex template) ------------------------
+    // kimi-for-coding (stable ID, currently K2.8 Preview): 1,048,576, image,
+    // low/high/max → max.
+    KnownModel { context_window: Some(ONE_M), max_context_window: Some(ONE_M), image: true,
+        efforts: LOW_HIGH_MAX, default_effort: Some("max"), supports_parallel_tool_calls: Some(true),
+        template: VendorTemplate::KimiCode, ..model("kimi-for-coding", "Kimi for Coding") },
+    // k3-256k: 262,144 only, image, low/high/max → high.
+    KnownModel { context_window: Some(262_144), max_context_window: Some(262_144), image: true,
+        efforts: LOW_HIGH_MAX, default_effort: Some("high"), supports_parallel_tool_calls: Some(true),
+        template: VendorTemplate::KimiCode, ..model("k3-256k", "K3 256K") },
+    // k3: 1M only for Pro / Allegretto and above, 262,144 on Plus /
+    // Moderato (the server refuses more), so the default window is 256K and
+    // 1M the maximum (the vendor's sample catalog writes 1M for both).
+    KnownModel { context_window: Some(262_144), max_context_window: Some(ONE_M), image: true,
+        efforts: LOW_HIGH_MAX, default_effort: Some("high"), supports_parallel_tool_calls: Some(true),
+        template: VendorTemplate::KimiCode, ..model("k3", "K3") },
+    // kimi-for-coding-highspeed (K2.7 Code HighSpeed, Pro / Allegretto and
+    // above): 262,144, image, thinking always on (no effort is sent).
+    KnownModel { context_window: Some(262_144), max_context_window: Some(262_144), image: true,
+        supports_parallel_tool_calls: Some(true), template: VendorTemplate::KimiCode,
+        ..model("kimi-for-coding-highspeed", "Kimi for Coding HighSpeed") },
     // --- MiniMax (platform.minimax.io Token Plan Codex guide) ----------------
     // 524,288 recommended (1M option), image, low…max → max, never `none`;
     // supports_image_detail_original false; parallel calls supported.
@@ -266,6 +293,14 @@ pub fn catalog_row(model: &KnownModel, priority: i64) -> Value {
         row["apply_patch_tool_type"] = json!("freeform");
         row["default_reasoning_summary"] = json!("none");
     }
+    if model.template == VendorTemplate::KimiCode {
+        row["support_verbosity"] = json!(false);
+        row["default_verbosity"] = Value::Null;
+        row["truncation_policy"] = json!({ "mode": "bytes", "limit": 10000 });
+        row["shell_type"] = json!("shell_command");
+        row["supports_reasoning_summaries"] = json!(true);
+        row["default_reasoning_summary"] = json!("none");
+    }
     row
 }
 
@@ -376,6 +411,27 @@ pub(crate) mod tests {
             let mut other = json!({"slug": unknown, "context_window": null});
             assert!(!apply_overlay(&mut other), "{unknown}");
         }
+    }
+
+    #[test]
+    fn kimi_code_catalog_rows_follow_the_vendor_template() {
+        let catalog: Value = serde_json::from_str(&catalog_json(&["kimi-for-coding", "k3-256k", "k3", "kimi-for-coding-highspeed"])).unwrap();
+        assert_native_model_rows(&catalog);
+        let rows = catalog["models"].as_array().unwrap();
+        for row in rows {
+            assert_eq!(row["truncation_policy"], json!({"mode": "bytes", "limit": 10000}));
+            assert_eq!(row["shell_type"], "shell_command");
+            assert_eq!(row["support_verbosity"], false);
+            assert_eq!(row["supports_reasoning_summaries"], true);
+            assert_eq!(row["default_reasoning_summary"], "none");
+            assert_eq!(row["input_modalities"], json!(["text", "image"]));
+        }
+        let by = |slug: &str| rows.iter().find(|row| row["slug"] == slug).unwrap();
+        assert_eq!((by("kimi-for-coding")["context_window"].as_i64(), by("kimi-for-coding")["default_reasoning_level"].as_str()), (Some(ONE_M), Some("max")));
+        assert_eq!((by("k3")["context_window"].as_i64(), by("k3")["max_context_window"].as_i64()), (Some(262_144), Some(ONE_M)));
+        assert_eq!(by("k3-256k")["default_reasoning_level"], "high");
+        assert_eq!(by("kimi-for-coding-highspeed")["supported_reasoning_levels"], json!([]));
+        assert_eq!(by("kimi-for-coding-highspeed")["default_reasoning_level"], Value::Null);
     }
 
     #[test]

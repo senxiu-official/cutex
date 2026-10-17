@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """End-to-end check of the backend updater (.github/workflows/upgrade-e2e.yml, docs/backend-upgrade.md):
 an existing cutex 0.1.0 managed install upgrades to 0.1.1 through `cutex upgrade check / stage / apply`,
-on the platform's real service manager, and a broken later release rolls back by itself.
+on the platform's real service manager, and a broken later release rolls back by itself. The steps below
+say 0.1.0 / 0.1.1 for the installed / new release; the same run checks 0.1.1 -> 0.1.2 (the workflow's
+default since the 0.1.2 release; 0.1.1 already advertises `components`).
 
     python .github/ci/upgrade-e2e.py --from-cutex DIR --from-commit SHA --to-cutex DIR --to-commit SHA
         --components DIR --work DIR [--release-meta DIR] [--service-name LABEL] [--unit-dir DIR]
@@ -781,7 +783,8 @@ def install_010(host: Host, args: argparse.Namespace, from_label: str, dl: Path)
     status, caps = host.get("/v2/capabilities")
     before = features(caps)
     check(status == 200 and len(before) > 0, f"{from_label} capabilities read ({len(before)})")
-    check("components" not in before, f"{from_label} does not advertise `components` yet")
+    # 0.1.0 predates components; 0.1.1 on (the default since the 0.1.2 release) already has them.
+    log(f"  {from_label} {'advertises' if 'components' in before else 'does not advertise'} `components`")
     install_native_010(host, from_label)
     return before
 
@@ -846,7 +849,7 @@ def upgrade_to_011(host: Host, url: str, to_label: str, to_commit: str, from_lab
     after = features(caps)
     lost = sorted(before - after - HOST_DEPENDENT)
     check(status == 200 and not lost, f"capabilities only gained (lost: {lost})")
-    check("components" in after, "`components` capability gained")
+    check("components" in after, "`components` capability after the update")
     log(f"  gained: {sorted(after - before)}")
     status, comps = host.get("/v2/components")
     names = sorted(c.get("name") for c in (comps or {}).get("components") or [])
@@ -895,7 +898,7 @@ def components(host: Host, args: argparse.Namespace, versions: dict[str, str]) -
     check(ce.needs_code(comp) == "claude_cli_missing", f"claude-runtime: needsUser claude_cli_missing (got {ce.needs_code(comp)})")
     version = versions["claude-runtime"]
     check((host.base / "components" / "claude-runtime" / version / "receipt.json").is_file(),
-          f"claude-runtime {version} unpacked from the 0.1.1 manifest with a receipt")
+          f"claude-runtime {version} unpacked from the new release's manifest with a receipt")
 
     if not WINDOWS:
         _, out, _ = host.cli("component", "install", "job-service", show=True)

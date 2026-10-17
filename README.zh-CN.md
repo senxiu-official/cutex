@@ -6,10 +6,9 @@
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
-**0.1.1**：可选组件（Job Service、Claude 运行时）由 cutex 安装和更新；托管安装自己运行通知 worker（0.1.0「First Take」是第一个公开版本）。更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+**0.1.2**：新线程使用 Codex 自动审批员；Windows 沙箱就绪检查；Profile 可在主机之间复制；修复 Windows API-key Profile 和分叉智能体的问题（0.1.0「First Take」是第一个公开版本）。更新内容见 [CHANGELOG.md](CHANGELOG.md)。
 
 > **0.1.x 的已知缺口**（正在修，修好后删除这段）：
-> - **NCI 远程作业**在公开版本里还不能用。
 > - **手机推送 / 配对手机**：还没有公开的手机应用。
 >
 > Claude 智能体需要可选组件 `claude-runtime`，长时间作业（Linux）需要 `job-service`：在托管安装上运行 `cutex component install <名字>`，或点桌面端的「安装」按钮（[components/README.md](components/README.md)）。

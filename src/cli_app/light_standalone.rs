@@ -118,6 +118,7 @@ pub(super) fn command(
         "model_provider",
         projection.provider_id(),
     )?;
+    launch = launch.args(cutex::profiles::reviewer_catalog::launch_args(&projection, &model, &bundle, &deployment.native_home));
     launch = super::stock_lifecycle::option(launch, "model", model)?;
     if let Some(reasoning) = reasoning {
         launch = super::stock_lifecycle::option(launch, "model_reasoning_effort", reasoning)?;

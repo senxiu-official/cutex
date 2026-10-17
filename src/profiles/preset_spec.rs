@@ -121,6 +121,24 @@ pub const SPECS: &[PresetSpec] = &[
         forced_login_api: false,
         catalog: PresetCatalog::Known(&["kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"]),
     },
+    // Kimi Code membership plan (kimi.com/code/docs "Using Kimi in Codex" and
+    // "Model Configuration", fetched 2026-10-16): Responses API on
+    // `/coding/v1` (overseas api.kimi.ai, China api.kimi.com, shared by the
+    // `kimi-code` / `kimi-code-cn` presets), official template
+    // `web_search = "live"`. Default `kimi-for-coding`: the stable ID every
+    // coding tier has (legacy Andante has no K3). Each model has its own
+    // default effort, so no root effort is written.
+    PresetSpec {
+        provider_id: crate::profiles::providers::KIMI_CODE_PROVIDER_ID,
+        provider_name: "Kimi Code",
+        default_base_url: Some("https://api.kimi.ai/coding/v1"),
+        default_model: Some("kimi-for-coding"),
+        reasoning_effort: None,
+        web_search: Some("live"),
+        tool_schema_compat: None,
+        forced_login_api: false,
+        catalog: PresetCatalog::Known(&["kimi-for-coding", "k3-256k", "k3", "kimi-for-coding-highspeed"]),
+    },
     // MiniMax Token Plan Codex guide (global; `minimax-cn` shares the ID with
     // api.minimaxi.com). Web search supported.
     PresetSpec {

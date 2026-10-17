@@ -368,8 +368,45 @@ pub struct Run {
     /// Displaced (moved aside, never deleted) store paths of a rollback.
     #[serde(default)]
     pub displaced: Vec<String>,
+    /// The cute-codex native version the target release carries (apply: the
+    /// staged manifest's `native.version`; rollback: the target release's
+    /// installed manifest), recorded when the run is prepared. None: the
+    /// release carries no native, or a record from before this field.
+    #[serde(default)]
+    pub native_version: Option<String>,
+    /// The native selected for new agents on this host when the run was
+    /// prepared (apply), or the running release's native (rollback).
+    #[serde(default)]
+    pub previous_native_version: Option<String>,
+    /// What the run does to the runtime for new agents. None: a record from
+    /// before this field.
+    #[serde(default)]
+    pub runtime_change: Option<RuntimeChange>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// [`Run::runtime_change`]: what a run does to the runtime new agents get.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeChange {
+    /// `full` mode and a different native version: a new native runtime.
+    Native,
+    /// `full` mode, same native: only the runtime package for new agents
+    /// (bundle / facade / Claude runtime selection) changes.
+    Package,
+    /// `reload` mode: the runtime selection is not touched.
+    None,
+}
+
+impl RuntimeChange {
+    pub fn of(mode: Mode, native_version: Option<&str>, previous_native_version: Option<&str>) -> Self {
+        match mode {
+            Mode::Reload => Self::None,
+            Mode::Full if native_version.is_some() && native_version != previous_native_version => Self::Native,
+            Mode::Full => Self::Package,
+        }
+    }
 }
 
 impl Run {
@@ -399,8 +436,18 @@ impl Run {
             needs_owner: None,
             runner_pid: None,
             displaced: Vec::new(),
+            native_version: None,
+            previous_native_version: None,
+            runtime_change: None,
             extra: Map::new(),
         }
+    }
+
+    /// Record the native / runtime detail (at prepare time, from `mode`).
+    pub fn set_runtime(&mut self, native_version: Option<String>, previous_native_version: Option<String>) {
+        self.runtime_change = Some(RuntimeChange::of(self.mode, native_version.as_deref(), previous_native_version.as_deref()));
+        self.native_version = native_version;
+        self.previous_native_version = previous_native_version;
     }
 
     pub fn enter(&mut self, phase: Phase, detail: Option<String>) {
@@ -674,6 +721,31 @@ mod tests {
         let text = serde_json::to_string(&run).unwrap();
         assert!(text.contains("\"phase\":\"committed\"") && text.contains("\"mode\":\"reload\""), "{text}");
         std::fs::remove_dir_all(&layout.base).unwrap();
+    }
+
+    #[test]
+    fn runtime_change_detail_and_old_records() {
+        let full = |native: Option<&str>, previous: Option<&str>| RuntimeChange::of(Mode::Full, native, previous);
+        assert_eq!(full(Some("0.162.1-r53"), Some("0.160.0-r51")), RuntimeChange::Native);
+        assert_eq!(full(Some("0.162.1-r53"), None), RuntimeChange::Native);
+        assert_eq!(full(Some("0.162.1-r53"), Some("0.162.1-r53")), RuntimeChange::Package);
+        assert_eq!(full(None, Some("0.160.0-r51")), RuntimeChange::Package);
+        assert_eq!(RuntimeChange::of(Mode::Reload, Some("0.162.1-r53"), None), RuntimeChange::None);
+        let mut run = Run::new(RunKind::Apply, "r239", "r240", Mode::Full, MigrationClass::ReloadSafe, 60, PackageRun::After);
+        run.set_runtime(Some("0.162.1-r53".into()), Some("0.160.0-r51".into()));
+        let value = serde_json::to_value(&run).unwrap();
+        assert_eq!((&value["nativeVersion"], &value["previousNativeVersion"], &value["runtimeChange"]),
+            (&serde_json::json!("0.162.1-r53"), &serde_json::json!("0.160.0-r51"), &serde_json::json!("native")));
+        // A record written before these fields reads them as null (and writes them as null).
+        let mut old = value.as_object().unwrap().clone();
+        for key in ["nativeVersion", "previousNativeVersion", "runtimeChange"] {
+            old.remove(key);
+        }
+        let old: Run = serde_json::from_value(Value::Object(old)).unwrap();
+        assert_eq!((&old.native_version, &old.previous_native_version, old.runtime_change), (&None, &None, None));
+        assert!(old.extra.is_empty());
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value["nativeVersion"].is_null() && value["runtimeChange"].is_null() && value.get("runtimeChange").is_some());
     }
 
     fn finished(kind: RunKind, from: &str, to: &str, by: &str, phase: Phase, code: Option<&str>) -> Run {

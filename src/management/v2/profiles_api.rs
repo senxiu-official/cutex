@@ -1,6 +1,8 @@
 //! Root-only profile settings routes:
 //! `GET|POST /v2/profiles`, `GET|PATCH|DELETE /v2/profiles/{profile}`,
-//! `POST /v2/profiles/{profile}/duplicate`, `GET /v2/profile-presets`.
+//! `POST /v2/profiles/{profile}/duplicate`, `GET /v2/profile-presets`,
+//! `POST /v2/profiles/{profile}/export`, `POST /v2/profiles/import`
+//! (`profile-transfer`; the export may carry an API key, loopback only).
 //! `{profile}` is a profile ID or exact name (percent-encoded). Responses are
 //! camelCase and secret-free; `apiKey` is write-only.
 //!
@@ -19,6 +21,7 @@ use crate::profiles::appearance::AgentTurnQuestions;
 use crate::profiles::codex_profile::{CodexProfileConfigPatch, MODEL_REASONING_SUMMARY_VALUES, TOOL_SCHEMA_COMPAT_VALUES, WEB_SEARCH_VALUES};
 use crate::profiles::lifecycle::{self, LifecycleError, NewProfile, NewProfileKind};
 use crate::profiles::settings_api::{self, ApiKey, ProfileApiPatch, MAX_API_KEY_BYTES};
+use crate::profiles::transfer;
 
 pub const PRESETS_PATH: &str = "/v2/profile-presets";
 
@@ -45,11 +48,21 @@ pub fn parse_duplicate_path(path: &str) -> Option<String> {
     decode_profile_segment(path.strip_prefix("/v2/profiles/")?.strip_suffix("/duplicate")?)
 }
 
+/// `{profile}` for `/v2/profiles/{profile}/export` (`profile-transfer`).
+pub fn parse_export_path(path: &str) -> Option<String> {
+    decode_profile_segment(path.strip_prefix("/v2/profiles/")?.strip_suffix("/export")?)
+}
+
+/// `POST /v2/profiles/import` (`profile-transfer`). The same path with
+/// another method still addresses a profile named `import`.
+pub const IMPORT_PATH: &str = "/v2/profiles/import";
+
 pub fn is_profiles_path(path: &str) -> bool {
     is_list_path(path)
         || path == PRESETS_PATH
         || parse_item_path(path).is_some()
         || parse_duplicate_path(path).is_some()
+        || parse_export_path(path).is_some()
 }
 
 fn profile_body(account: &crate::profiles::model::StoredAccount) -> Value {
@@ -190,6 +203,15 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: 
             _ => method_not_allowed(stream, "use GET or POST for /v2/profiles"),
         };
     }
+    if let Some(profile) = parse_export_path(path) {
+        if request.method != "POST" {
+            return method_not_allowed(stream, "use POST for /v2/profiles/{profile}/export");
+        }
+        return handle_export(stream, &request.body, &profile);
+    }
+    if path == IMPORT_PATH && request.method == "POST" {
+        return handle_import(stream, &request.body);
+    }
     if let Some(profile) = parse_duplicate_path(path) {
         if request.method != "POST" {
             return method_not_allowed(stream, "use POST for /v2/profiles/{profile}/duplicate");
@@ -317,7 +339,159 @@ fn archived_references(path: &str) -> Result<lifecycle::ArchivedReferences, Stri
     Ok(archived)
 }
 
-const CREATE_FIELDS: &[&str] = &["name", "kind", "preset", "baseUrl", "model", "apiKey", "claudeAccount"];
+fn transfer_error(stream: &mut TcpStream, profile: &str, failure: transfer::TransferError) -> anyhow::Result<()> {
+    use transfer::TransferError;
+    // Messages are fixed texts or file diagnostics: never bundle values.
+    let message = failure.to_string();
+    let (status, reason, code, retryable, details) = match failure {
+        TransferError::NotFound => return not_found(stream, profile),
+        TransferError::Invalid(_) => (400, "Bad Request", "invalid_request", false, json!({})),
+        TransferError::Unsupported(_) => (
+            400,
+            "Bad Request",
+            "unsupported_bundle",
+            false,
+            json!({ "schemaVersion": transfer::BUNDLE_SCHEMA_VERSION }),
+        ),
+        TransferError::NameConflict(name) => {
+            (409, "Conflict", "profile_name_conflict", false, json!({ "name": name }))
+        }
+        TransferError::Store(error) => (
+            503,
+            "Service Unavailable",
+            "profile_store_unavailable",
+            true,
+            json!({ "diagnostic": format!("{error:#}") }),
+        ),
+    };
+    super::server::write_v2_error(stream, status, reason, code, &message, retryable, details)
+}
+
+/// `POST /v2/profiles/{p}/export {includeCredentials?: bool}`. Credentials
+/// only over a loopback connection (an SSH tunnel arrives on loopback; a
+/// tailnet / LAN listener is refused with 403 `credentials_loopback_only`).
+/// Audited without values. POST only: the bundle must not be cached.
+fn handle_export(stream: &mut TcpStream, body: &[u8], profile: &str) -> anyhow::Result<()> {
+    let include_credentials = match parse_export_body(body) {
+        Ok(include) => include,
+        Err(message) => return bad_request(stream, &message),
+    };
+    let loopback = crate::management::listeners::current_request_is_loopback();
+    if include_credentials && !loopback {
+        transfer::audit(
+            "profileExportRefused",
+            json!({
+                "profile": profile,
+                "includeCredentials": true,
+                "reason": "credentials_loopback_only",
+                "actor": crate::management::users::current_actor(),
+            }),
+        );
+        return super::server::write_v2_error(
+            stream,
+            403,
+            "Forbidden",
+            "credentials_loopback_only",
+            "credentials can only be exported over a loopback connection (this machine or an SSH tunnel); export without credentials or connect through SSH",
+            false,
+            json!({ "profile": profile }),
+        );
+    }
+    match transfer::export_profile(profile, include_credentials) {
+        Ok(export) => {
+            transfer::audit(
+                "profileExport",
+                json!({
+                    "profileId": export.profile_id,
+                    "profileName": export.profile_name,
+                    "includeCredentials": include_credentials,
+                    "credentialsIncluded": export.credentials_included,
+                    "credentialKind": export.credential_kind.as_str(),
+                    "loopback": loopback,
+                    "actor": crate::management::users::current_actor(),
+                }),
+            );
+            write_json_response(
+                stream,
+                200,
+                "OK",
+                &json!({
+                    "contractVersion": 2,
+                    "credentialsIncluded": export.credentials_included,
+                    "credentialKind": export.credential_kind.as_str(),
+                    "bundle": export.bundle,
+                }),
+            )
+        }
+        Err(failure) => transfer_error(stream, profile, failure),
+    }
+}
+
+/// `POST /v2/profiles/import {bundle, name, onConflict?: "fail"}` (201).
+fn handle_import(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()> {
+    let (bundle, name) = match parse_import_body(body) {
+        Ok(parsed) => parsed,
+        Err(message) => return bad_request(stream, &message),
+    };
+    match transfer::import_profile(&bundle, &name) {
+        Ok(outcome) => {
+            transfer::audit(
+                "profileImport",
+                json!({
+                    "profileId": outcome.account.id,
+                    "profileName": outcome.account.name,
+                    "sourceProfileName": outcome.source_name,
+                    "credentialsCopied": outcome.credentials_copied,
+                    "credentialKind": outcome.credential_kind.as_str(),
+                    "loopback": crate::management::listeners::current_request_is_loopback(),
+                    "actor": crate::management::users::current_actor(),
+                }),
+            );
+            let mut response = profile_body(&outcome.account);
+            response["imported"] = json!(true);
+            response["credentialKind"] = json!(outcome.credential_kind.as_str());
+            response["credentialsCopied"] = json!(outcome.credentials_copied);
+            response["warnings"] = json!(outcome.warnings);
+            write_json_response(stream, 201, "Created", &response)
+        }
+        Err(failure) => transfer_error(stream, &name, failure),
+    }
+}
+
+pub(super) fn parse_export_body(body: &[u8]) -> Result<bool, String> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(false);
+    }
+    let body = object_body(body)?;
+    if let Some(unknown) = body.keys().find(|key| key.as_str() != "includeCredentials") {
+        return Err(format!("unsupported field: {unknown}"));
+    }
+    Ok(optional_bool(&body, "includeCredentials")?.unwrap_or(false))
+}
+
+pub(super) fn parse_import_body(body: &[u8]) -> Result<(Value, String), String> {
+    // No serde text: a malformed body may hold an API key.
+    let value: Value = serde_json::from_slice(body).map_err(|_| "JSON object body required".to_string())?;
+    let Value::Object(mut body) = value else {
+        return Err("JSON object body required".into());
+    };
+    if let Some(unknown) = body.keys().find(|key| !["bundle", "name", "onConflict"].contains(&key.as_str())) {
+        return Err(format!("unsupported field: {unknown}"));
+    }
+    match body.get("onConflict") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(mode)) if mode == "fail" => {}
+        Some(_) => return Err("onConflict: only \"fail\" is supported (imports never overwrite)".into()),
+    }
+    let name = name_value(&body)?.ok_or_else(|| "name: required string".to_string())?;
+    let bundle = match body.remove("bundle") {
+        Some(bundle @ Value::Object(_)) => bundle,
+        _ => return Err("bundle: required object (from POST /v2/profiles/{profile}/export)".into()),
+    };
+    Ok((bundle, name))
+}
+
+const CREATE_FIELDS: &[&str] =&["name", "kind", "preset", "baseUrl", "model", "apiKey", "claudeAccount"];
 
 fn object_body(body: &[u8]) -> Result<Map<String, Value>, String> {
     let value: Value =
@@ -1116,5 +1290,132 @@ mod tests {
         assert!(!format!("{patch:?}").contains("sk-very-secret"));
         let error = parse_patch(br#"{"apiKey":"sk-very secret"}"#).unwrap_err();
         assert!(!error.contains("sk-very"));
+    }
+
+    /// One request through `handle` on a real socket; `remote` = accepted on
+    /// a non-loopback listener. Returns (status line + headers + body).
+    fn call(method: &str, path: &str, body: &str, remote: bool) -> (u16, Value) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            let mut text = String::new();
+            stream.read_to_string(&mut text).unwrap();
+            text
+        });
+        let (mut stream, peer) = listener.accept().unwrap();
+        crate::management::listeners::set_current_connection(Some(
+            crate::management::listeners::ConnectionInfo { remote, peer },
+        ));
+        let request = SimpleHttpRequest {
+            method: method.into(),
+            path: path.into(),
+            headers: Default::default(),
+            body: body.as_bytes().to_vec(),
+        };
+        handle(&mut stream, &request, path).unwrap();
+        crate::management::listeners::set_current_connection(None);
+        drop(stream);
+        let response = client.join().unwrap();
+        let status = response[9..12].parse().unwrap();
+        let json = response.split_once("\r\n\r\n").map(|(_, body)| body).unwrap_or_default();
+        (status, serde_json::from_str(json).unwrap_or(Value::Null))
+    }
+
+    fn audit_text() -> String {
+        let path = crate::config::paths::runtime_dir().unwrap().join(transfer::AUDIT_DIR).join("audit.jsonl");
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[test]
+    fn transfer_routes_loopback_gate_round_trip_and_audit_without_values() {
+        const KEY: &str = "route-test-placeholder-key";
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let created = call(
+            "POST",
+            "/v2/profiles",
+            &json!({ "name": "GLM", "kind": "apiKey", "preset": "glm", "apiKey": KEY }).to_string(),
+            false,
+        );
+        assert_eq!(created.0, 201, "{created:?}");
+
+        // Credentials over a remote (tailnet / LAN) listener: refused.
+        let (status, body) = call("POST", "/v2/profiles/GLM/export", r#"{"includeCredentials":true}"#, true);
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(body["error"]["code"], "credentials_loopback_only", "{body}");
+        // Settings only over the same listener: allowed, no key.
+        let (status, remote) = call("POST", "/v2/profiles/GLM/export", "", true);
+        assert_eq!(status, 200, "{remote}");
+        assert_eq!(remote["credentialsIncluded"], false);
+        assert!(!remote.to_string().contains(KEY));
+        // GET is not a thing (the bundle must not be cached or logged).
+        assert_eq!(call("GET", "/v2/profiles/GLM/export", "", false).0, 405);
+
+        // Loopback (this machine / SSH tunnel): the key travels.
+        let (status, local) = call("POST", "/v2/profiles/GLM/export", r#"{"includeCredentials":true}"#, false);
+        assert_eq!(status, 200, "{local}");
+        assert_eq!(local["credentialsIncluded"], true);
+        assert_eq!(local["bundle"]["credentials"]["apiKey"], KEY);
+
+        // Import: clash refused, new name created with warnings.
+        let import = |name: &str, bundle: &Value| {
+            call("POST", IMPORT_PATH, &json!({ "bundle": bundle, "name": name }).to_string(), false)
+        };
+        let (status, clash) = import("GLM", &local["bundle"]);
+        assert_eq!(status, 409, "{clash}");
+        assert_eq!(clash["error"]["code"], "profile_name_conflict");
+        assert!(!clash.to_string().contains(KEY));
+        let (status, copied) = import("GLM (other host)", &local["bundle"]);
+        assert_eq!(status, 201, "{copied}");
+        assert_eq!((copied["imported"].as_bool(), copied["credentialsCopied"].as_bool()), (Some(true), Some(true)));
+        assert_eq!(copied["warnings"], json!([]));
+        assert_eq!(copied["profile"]["name"], "GLM (other host)");
+        assert!(!copied.to_string().contains(KEY), "import response is secret-free");
+        let (status, plain) = import("GLM 3", &remote["bundle"]);
+        assert_eq!(status, 201);
+        assert_eq!(plain["warnings"][0]["code"], "needsLogin");
+        let mut newer = local["bundle"].clone();
+        newer["schemaVersion"] = json!(9);
+        let (status, refused) = import("GLM 4", &newer);
+        assert_eq!((status, refused["error"]["code"].as_str()), (400, Some("unsupported_bundle")));
+        assert!(!refused.to_string().contains(KEY));
+        // A profile literally named "import" stays addressable by GET.
+        assert_eq!(call("GET", IMPORT_PATH, "", false).0, 404);
+
+        let audit = audit_text();
+        assert!(!audit.contains(KEY), "audit holds no values: {audit}");
+        assert_eq!(audit.matches("\"profileExport\"").count(), 2, "{audit}");
+        assert_eq!(audit.matches("\"profileExportRefused\"").count(), 1, "{audit}");
+        assert_eq!(audit.matches("\"profileImport\"").count(), 2, "{audit}");
+        assert!(audit.contains("\"credentialsIncluded\":true"), "{audit}");
+        // Nor the diagnostic error log.
+        let errors = crate::config::paths::runtime_dir().unwrap().join("service-logs/management-errors.jsonl");
+        assert!(!std::fs::read_to_string(errors).unwrap_or_default().contains(KEY));
+    }
+
+    #[test]
+    fn transfer_bodies_are_strict() {
+        assert!(!parse_export_body(b"").unwrap());
+        assert!(!parse_export_body(b"{}").unwrap());
+        assert!(parse_export_body(br#"{"includeCredentials":true}"#).unwrap());
+        assert!(parse_export_body(br#"{"includeCredentials":"yes"}"#).is_err());
+        assert!(parse_export_body(br#"{"other":1}"#).is_err());
+        assert_eq!(parse_export_path("/v2/profiles/my%20glm/export"), Some("my glm".into()));
+        assert!(is_profiles_path("/v2/profiles/GLM/export") && is_profiles_path(IMPORT_PATH));
+
+        let (_, name) = parse_import_body(br#"{"bundle":{},"name":" new ","onConflict":"fail"}"#).unwrap();
+        assert_eq!(name, "new");
+        for bad in [
+            r#"{"bundle":{}}"#,
+            r#"{"name":"x"}"#,
+            r#"{"bundle":[],"name":"x"}"#,
+            r#"{"bundle":{},"name":"x","onConflict":"overwrite"}"#,
+            r#"{"bundle":{},"name":"x","extra":1}"#,
+        ] {
+            assert!(parse_import_body(bad.as_bytes()).is_err(), "{bad}");
+        }
+        let error = parse_import_body(br#"{"bundle":{"credentials":{"apiKey":"sk-leak"}},"name":"x",}"#).unwrap_err();
+        assert!(!error.contains("sk-leak"), "{error}");
     }
 }

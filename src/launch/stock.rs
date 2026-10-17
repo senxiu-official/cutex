@@ -779,6 +779,11 @@ pub struct StockConfiguration {
     pub provider: DummyProvider,
     pub sandbox: String,
     pub approval: String,
+    /// Native `approvals_reviewer` for owner launches (`user` | `auto_review`);
+    /// None leaves the profile config / native default. Launch receipts
+    /// written before the field read as None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
     /// workspace-write only: outbound network for sandboxed commands.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network_access: bool,
@@ -887,6 +892,7 @@ impl StockConfiguration {
         validate_selected_permissions(Some(&permissions.sandbox), &permissions.sandbox, &permissions.approval)?;
         self.sandbox = permissions.sandbox.clone();
         self.approval = permissions.approval.clone();
+        self.approvals_reviewer = permissions.approvals_reviewer.clone();
         self.network_access = permissions.network_access;
         self.writable_roots = permissions.writable_roots.clone();
         Ok(self)
@@ -1016,6 +1022,7 @@ fn configuration_for_record(
         record.reasoning_defaults.as_ref(),
         migration,
     )?;
+    configuration.approvals_reviewer = record.approvals_reviewer.clone();
     configuration.network_access = record.sandbox_network_access.unwrap_or(false);
     configuration.writable_roots = record.sandbox_writable_roots.clone();
     if !record.agent_enabled
@@ -1277,6 +1284,7 @@ fn configuration_for_selection(
             provider,
             sandbox,
             approval,
+            approvals_reviewer: None,
             network_access: false,
             writable_roots: Vec::new(),
         });
@@ -1408,6 +1416,7 @@ fn configuration_for_selection(
         provider,
         sandbox,
         approval,
+        approvals_reviewer: None,
         network_access: false,
         writable_roots: Vec::new(),
     })
@@ -1854,6 +1863,7 @@ mod tests {
             },
             sandbox: "read-only".into(),
             approval: "never".into(),
+            approvals_reviewer: None,
             network_access: false,
             writable_roots: Vec::new(),
         };
@@ -2059,6 +2069,7 @@ mod permission_profile_tests {
             },
             sandbox: sandbox.into(),
             approval: "on-request".into(),
+            approvals_reviewer: None,
             network_access: network,
             writable_roots: roots.iter().map(|r| r.to_string()).collect(),
         }
@@ -2107,7 +2118,7 @@ mod permission_profile_tests {
         let back: StockConfiguration = serde_json::from_value(serde_json::to_value(&extras).unwrap()).unwrap();
         assert_eq!(back, extras);
         let permissions = crate::config::new_thread::LaunchPermissions {
-            sandbox: "workspace-write".into(), approval: "never".into(),
+            sandbox: "workspace-write".into(), approval: "never".into(), approvals_reviewer: None,
             network_access: true, writable_roots: vec![std::env::temp_dir().display().to_string()],
         };
         let applied = plain.with_permissions(&permissions).unwrap();

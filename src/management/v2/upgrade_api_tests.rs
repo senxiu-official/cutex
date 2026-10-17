@@ -113,6 +113,11 @@ fn runs_and_events_match_the_schema() {
     run.needs_owner = Some(crate::upgrade::state::NeedsOwner { reason: "x".into(), commands: vec!["cutex upgrade status".into()] });
     run.extra.insert("selectionBackup".into(), json!("/b"));
     assert_valid("upgradeRunList", &json!({ "runs": [run.clone()] }));
+    run.set_runtime(Some("0.162.1-r53".into()), Some("0.160.0-r51".into()));
+    assert_valid("upgradeRunResponse", &json!({ "run": run }));
+    let mut invalid = serde_json::to_value(&run).unwrap();
+    invalid["runtimeChange"] = json!("other");
+    assert!(super::super::schema_export::validator("upgrade", "upgradeRun").unwrap().iter_errors(&invalid).next().is_some());
     let mut state = State::default();
     state.run = Some(run);
     state.extra.insert(STAGING_KEY.into(), json!({ "release": "r241", "state": "failed", "error": { "code": "signature_invalid", "message": "m" } }));

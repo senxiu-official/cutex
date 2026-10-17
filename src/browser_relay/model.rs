@@ -67,6 +67,14 @@ impl RelayError {
             "busy" => "busy",
             "idempotency_capacity_exceeded" => "idempotency_capacity_exceeded",
             "external_pages_unavailable" => "external_pages_unavailable",
+            // browser-refusal-reasons: the desktop's precise refusal reasons (it
+            // sends them only to a host advertising the capability).
+            "external_pages_off" => "external_pages_off",
+            "external_proxy_unavailable" => "external_proxy_unavailable",
+            "private_address_blocked" => "private_address_blocked",
+            "reserved_address" => "reserved_address",
+            "protected_endpoint" => "protected_endpoint",
+            "remote_loopback" => "remote_loopback",
             "service_proxy_required" => "service_proxy_required",
             "navigation_failed" => "navigation_failed",
             "service_unavailable" => "service_unavailable",
@@ -143,6 +151,13 @@ pub enum GrantSource {
     AgentOpen {
         #[serde(rename = "requestId")]
         request_id: String,
+    },
+    /// browser-popup-grant: a tab the leased agent's own click opened. Valid only
+    /// while the opener lease is active for the same agent on this device
+    /// connection; the new lease inherits the opener's origin.
+    Popup {
+        #[serde(rename = "openerLeaseId")]
+        opener_lease_id: String,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

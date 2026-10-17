@@ -300,6 +300,97 @@ pub fn login_runtime_root() -> anyhow::Result<PathBuf> {
     Ok(runtime_dir()?.join("login"))
 }
 
+/// Name of the private temporary directory under [`runtime_dir`] that
+/// spawned natives get as `TMPDIR` (Windows: also `TEMP` / `TMP`).
+pub const RUNTIME_TMP_DIR_NAME: &str = "stock-tmp";
+
+/// This home's `runtime/stock-tmp`, created owner-private on demand.
+pub fn runtime_tmp_dir() -> anyhow::Result<PathBuf> {
+    let path = runtime_dir()?.join(RUNTIME_TMP_DIR_NAME);
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&path)
+        .context("failed to create runtime temporary directory")?;
+    let metadata = fs::symlink_metadata(&path)?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "runtime temporary path must be a directory"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
+            "runtime temporary directory must be private and owned"
+        );
+    }
+    Ok(path)
+}
+
+/// True when `path` lies in some cutex home's `runtime/stock-tmp` other than
+/// this one's. Every native agent shell inherits its home's stock-tmp as
+/// `TMPDIR` / `TEMP` / `TMP`, so a cutex started from such a shell (an
+/// independent instance, a private test home, a desktop launched by an agent)
+/// would otherwise hand its own natives the other home's temporary directory
+/// (and with it a writable root outside its home).
+pub fn is_foreign_runtime_tmp(path: &Path) -> bool {
+    let own = runtime_dir().ok().map(|dir| dir.join(RUNTIME_TMP_DIR_NAME));
+    is_foreign_runtime_tmp_of(path, own.as_deref())
+}
+
+fn is_foreign_runtime_tmp_of(path: &Path, own: Option<&Path>) -> bool {
+    fn same_name(component: Option<&std::ffi::OsStr>, name: &str) -> bool {
+        component.and_then(|value| value.to_str()).is_some_and(|value| {
+            if cfg!(windows) {
+                value.eq_ignore_ascii_case(name)
+            } else {
+                value == name
+            }
+        })
+    }
+    fn same_path(left: &Path, right: &Path) -> bool {
+        if let (Ok(left), Ok(right)) = (left.canonicalize(), right.canonicalize()) {
+            return left == right;
+        }
+        let normalize = |path: &Path| {
+            let text = path.to_string_lossy().replace('\\', "/");
+            let text = text.strip_prefix("//?/").unwrap_or(&text).trim_end_matches('/').to_string();
+            if cfg!(windows) {
+                text.to_ascii_lowercase()
+            } else {
+                text
+            }
+        };
+        normalize(left) == normalize(right)
+    }
+    let Some(stock_tmp) = path.ancestors().find(|ancestor| {
+        same_name(ancestor.file_name(), RUNTIME_TMP_DIR_NAME)
+            && same_name(ancestor.parent().and_then(Path::file_name), "runtime")
+    }) else {
+        return false;
+    };
+    own.is_none_or(|own| !same_path(stock_tmp, own))
+}
+
+/// The temporary directory for a spawned native: an explicit `TMPDIR`
+/// (`configured`) stays supported unless it is another home's stock-tmp
+/// ([`is_foreign_runtime_tmp`]); otherwise this home's [`runtime_tmp_dir`].
+pub fn launch_tmp_dir(configured: Option<&str>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = configured
+        .filter(|path| !path.is_empty())
+        .filter(|path| !is_foreign_runtime_tmp(Path::new(path)))
+    {
+        return Ok(path.into());
+    }
+    runtime_tmp_dir()
+}
+
 pub fn migrate_legacy_runtime_layout() -> anyhow::Result<()> {
     if crate::config::instance::is_isolated() {
         return Ok(());
@@ -376,6 +467,24 @@ mod guard_tests {
         }
         let other = std::env::temp_dir().join("cutex-guard-explicit-home");
         assert_eq!(guarded_test_home(Some(other.clone())), other);
+    }
+
+    #[test]
+    fn foreign_runtime_tmp_is_another_homes_stock_tmp_only() {
+        let own = std::path::Path::new("/h/a/.cutex/runtime/stock-tmp");
+        let check = |path: &str| is_foreign_runtime_tmp_of(std::path::Path::new(path), Some(own));
+        assert!(check("/h/b/.cutex/runtime/stock-tmp"));
+        assert!(check("/h/b/.cutex/runtime/stock-tmp/cb-1"));
+        assert!(check("/h/b/instance/runtime/stock-tmp/"));
+        assert!(!check("/h/a/.cutex/runtime/stock-tmp"));
+        assert!(!check("/h/a/.cutex/runtime/stock-tmp/cn-1"));
+        assert!(!check("/tmp"));
+        assert!(!check("/h/b/stock-tmp"));
+        assert!(!check("/h/b/runtime/other"));
+        assert!(is_foreign_runtime_tmp_of(
+            std::path::Path::new("/h/b/.cutex/runtime/stock-tmp"),
+            None
+        ));
     }
 
     #[test]

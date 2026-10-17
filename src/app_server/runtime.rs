@@ -291,6 +291,7 @@ pub fn thread_resume_params_for_session_with_model_provider(
         service_tier: session_service_tier(record),
         cwd: Some(cwd),
         approval_policy: approval_policy.map(serde_json::Value::String),
+        approvals_reviewer: nonempty(record.approvals_reviewer.as_deref()).map(str::to_string),
         sandbox: sandbox_mode,
         permissions,
         config: (!config.is_empty()).then_some(config),
@@ -334,6 +335,7 @@ pub fn thread_start_params_for_session(
         service_tier: session_service_tier(record),
         cwd: Some(cwd),
         approval_policy: approval_policy.map(serde_json::Value::String),
+        approvals_reviewer: nonempty(record.approvals_reviewer.as_deref()).map(str::to_string),
         sandbox: sandbox_mode,
         permissions,
         config: (!config.is_empty()).then_some(config),
@@ -752,6 +754,30 @@ mod tests {
         record.service_tier = Some("default".to_string());
         let start = thread_start_params_for_session(&record, None).expect("start params");
         assert_eq!(start.service_tier, Some(Some("default".to_string())));
+    }
+
+    #[test]
+    fn approvals_reviewer_is_sent_on_resume_and_start_only_when_set() {
+        let mut record = CutexSessionRecord::new_at(
+            "cutex-1".to_string(),
+            Some("018f0000-0000-7000-8000-000000000001".to_string()),
+            "host".to_string(),
+            std::env::temp_dir().display().to_string(),
+            None,
+            "2026-10-16T00:00:00Z".to_string(),
+        )
+        .expect("session record");
+        record.permission_defaults = Some("workspace-write".to_string());
+        record.approval_policy = Some("on-request".to_string());
+        let resume = thread_resume_params_for_session(&record).expect("resume params");
+        assert!(serde_json::to_value(&resume).unwrap().get("approvalsReviewer").is_none());
+
+        record.approvals_reviewer = Some("auto_review".to_string());
+        let resume = thread_resume_params_for_session(&record).expect("resume params");
+        assert_eq!(serde_json::to_value(&resume).unwrap()["approvalsReviewer"], "auto_review");
+        record.codex_session_id = None;
+        let start = thread_start_params_for_session(&record, None).expect("start params");
+        assert_eq!(serde_json::to_value(&start).unwrap()["approvalsReviewer"], "auto_review");
     }
 
     #[test]

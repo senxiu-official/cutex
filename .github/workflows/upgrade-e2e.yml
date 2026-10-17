@@ -1,8 +1,9 @@
 # cutex: end-to-end check of the backend updater on clean GitHub runners (Linux and Windows): an existing
-# cutex 0.1.0 managed install upgrades to 0.1.1 through `cutex upgrade check / stage / apply`, and a broken
-# later release rolls back by itself. Manual only (workflow_dispatch); nothing is published, no secret is used.
+# cutex managed install (default 0.1.1; written for 0.1.0 -> 0.1.1, the labels below say "0.1.0" / "0.1.1"
+# for from / to) upgrades through `cutex upgrade check / stage / apply`, and a broken later release rolls
+# back by itself. Manual only (workflow_dispatch); nothing is published, no secret is used.
 #
-# Each job builds DEBUG cutex binaries of `from_ref` (default: the public 0.1.0 tree, tag cutex-0.1.0 of
+# Each job builds DEBUG cutex binaries of `from_ref` (default: the public 0.1.1 tree, tag cutex-0.1.1 of
 # senxiu-official/cutex) and `to_ref` (default: the dispatched ref), with the release identity baked in
 # (CUTEX_RELEASE / CUTEX_COMMIT / CUTEX_CHANNEL=release, as build-cutex.sh does for release builds). Only
 # debug builds trust the run-time test key CUTEX_UPGRADE_TEST_PUBKEY, and only debug builds honour the
@@ -38,14 +39,14 @@ on:
         default: senxiu-official/cutex
         type: string
       from_ref:
-        description: "Tag / commit of the installed release (0.1.0 = tag cutex-0.1.0 of senxiu-official/cutex)"
+        description: "Tag / commit of the installed release (0.1.1 = tag cutex-0.1.1 of senxiu-official/cutex)"
         required: false
-        default: cutex-0.1.0
+        default: cutex-0.1.1
         type: string
       from_release:
         description: "Release label of the installed build"
         required: false
-        default: "0.1.0"
+        default: "0.1.1"
         type: string
       to_ref:
         description: "Ref of the new release in this repository (empty = the dispatched ref)"
@@ -55,7 +56,7 @@ on:
       to_release:
         description: "Release label of the new build"
         required: false
-        default: "0.1.1"
+        default: "0.1.2"
         type: string
 
 permissions:

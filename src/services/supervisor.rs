@@ -984,7 +984,10 @@ impl Supervisor {
             return Err(ServicesError::new(
                 409,
                 "not_supervised",
-                format!("`{slug}` is an external service; cutex does not run it"),
+                format!(
+                    "`{slug}` is a {} service; cutex does not run a process for it (delete it to remove it)",
+                    record.runtime.label()
+                ),
             ));
         }
         Ok(record)
@@ -1361,7 +1364,20 @@ mod tests {
         ServiceStore::new(dir, "testhost")
     }
 
+    /// `Supervisor::new` captures `home_dir()` as the default process cwd. A
+    /// parallel test's `TestHome` points `HOME` at a temp dir it deletes on
+    /// drop, so a supervisor built inside that window spawned its services in
+    /// a missing cwd (`failed to start: No such file or directory`). Build it
+    /// under the same `HOME` lock.
     fn recording_supervisor(
+        store: ServiceStore,
+    ) -> (Arc<Supervisor>, Arc<Mutex<Vec<ServiceEvent>>>) {
+        let _home_lock = crate::config::paths::test_home_env_lock();
+        recording_supervisor_unlocked(store)
+    }
+
+    /// For tests that already hold the `HOME` lock through `TestHome`.
+    fn recording_supervisor_unlocked(
         store: ServiceStore,
     ) -> (Arc<Supervisor>, Arc<Mutex<Vec<ServiceEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1371,6 +1387,22 @@ mod tests {
             Box::new(move |event| sink_events.lock().unwrap().push(event)),
         );
         (supervisor, events)
+    }
+
+    /// Stop accepting on `listener` for good. A plain `drop` is not enough
+    /// while parallel tests spawn processes: a child between fork and exec
+    /// holds a copy of every fd (CLOEXEC closes it only at exec), so the
+    /// socket kept listening and a probe right after `drop` still connected.
+    /// `shutdown` acts on the socket itself, i.e. on every copy.
+    fn stop_listening(listener: TcpListener) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: a valid, owned socket fd; dropped right below.
+            unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) };
+        }
+        // Windows: std sockets are not inheritable, so the drop closes it.
+        drop(listener);
     }
 
     fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
@@ -1415,7 +1447,7 @@ mod tests {
 
         // Empty registry: no session-store copy (the old pass copied it every tick).
         let empty = temp_store();
-        let (supervisor, _) = recording_supervisor(empty);
+        let (supervisor, _) = recording_supervisor_unlocked(empty);
         let before = whole_store_copies_on_this_thread();
         for _ in 0..5 {
             supervisor.tick();
@@ -1446,7 +1478,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (supervisor, _) = recording_supervisor(store.clone());
+        let (supervisor, _) = recording_supervisor_unlocked(store.clone());
         let before = whole_store_copies_on_this_thread();
         supervisor.tick();
         assert_eq!(whole_store_copies_on_this_thread(), before);
@@ -1604,7 +1636,7 @@ mod tests {
             ServiceHealth::Reachable
         );
         assert!(supervisor.snapshots()["ext"].last_seen_at.is_some());
-        drop(listener);
+        stop_listening(listener);
         supervisor.probe_all();
         assert_eq!(
             supervisor.snapshots()["ext"].health,

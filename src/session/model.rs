@@ -385,6 +385,11 @@ pub struct CutexSessionRecord {
     pub permission_defaults: Option<String>,
     #[serde(default)]
     pub approval_policy: Option<String>,
+    /// Native `approvals_reviewer` (`user` | `auto_review`) chosen at creation
+    /// and mirrored from `thread/settings/updated`; sent on every thread start /
+    /// resume. None follows the profile config / native default (`user`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
     #[serde(default)]
     pub sandbox_mode: Option<String>,
     /// workspace-write only: allow outbound network from sandboxed commands.
@@ -504,6 +509,7 @@ impl CutexSessionRecord {
             default_cli_args: Vec::new(),
             permission_defaults: None,
             approval_policy: None,
+            approvals_reviewer: None,
             sandbox_mode: None,
             sandbox_network_access: None,
             sandbox_writable_roots: Vec::new(),

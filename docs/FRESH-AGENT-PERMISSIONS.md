@@ -54,3 +54,43 @@ nothing, so a home this binary created is never taken for an existing one on its
 - Moving forward again: the record exists, nothing is re-decided.
 - To give an existing home the new default on purpose: Settings → 新建默认 → 自动, or `PATCH /v2/settings
   {newThreadDefaults: {agent: null}}`.
+
+## Automatic reviewer (`launch-approvals-reviewer`, 2026-10-16)
+
+Owner decision: 「自动」 is `workspace-write` + `on-request` + the native automatic reviewer
+(`approvals_reviewer = "auto_review"`), so escalations (writes outside the workspace, network when it is off,
+`require_escalated` commands) are decided by Codex's reviewer subagent instead of being sent to the owner.
+
+- Built-in `approvalsReviewer` of both kinds (`LaunchPermissions::builtin`) is `auto_review`; it only matters
+  with `on-request` (the native routes to the reviewer only for interactive policies).
+  `config.json` `new_thread_defaults.<kind>.approvals_reviewer` overrides it (`/v2/settings`
+  `newThreadDefaults.<kind>.approvalsReviewer`, `user` | `auto_review`, null = built-in). The one-time
+  fresh-agent migration does not write it, so existing homes also get `auto_review` for new on-request threads.
+- Create routes accept `launch.approvalsReviewer` (`user` | `auto_review`; the legacy alias
+  `guardian_subagent` is stored as `auto_review`). Claude profiles refuse it like the other permission fields.
+- The session record stores `approvals_reviewer` (absent = the profile config / native default `user`). It is
+  sent as `approvalsReviewer` on the bootstrap `thread/start` and on every app-server start / resume, and as
+  `-c approvals_reviewer=…` for owner launches. Agents created by agents (`agent_create`) keep None.
+- `thread/settings/updated` `approvalsReviewer` is mirrored into the record, so a running change (desktop
+  「自动」 on an older thread) survives the next relaunch.
+- Likewise a workspace-write `sandboxPolicy` without a named permission profile (what a running
+  `thread/settings/update` with a `sandboxPolicy` produces) mirrors `networkAccess` and `writableRoots` (unique,
+  without the cwd) into `sandbox_network_access` / `sandbox_writable_roots`, which every start / resume
+  (`apply_workspace_extras`) and stock launch (`[permissions.cutex-workspace]`) rebuild from. Absent keys keep the
+  stored values; other sandbox types and named permission profiles leave them alone.
+- Reviewer model on providers a profile defines itself (`src/profiles/reviewer_catalog.rs`): the native picks the
+  reviewer from the active catalog (the parent row's `auto_review_model_override`, else the provider's preferred
+  OpenAI review model when the catalog lists it, else the agent's model). Without `model_catalog_json` the native
+  uses its bundled catalog, which lists the OpenAI review model; a third-party endpoint answers 404 and every
+  escalation is denied. So a launch of an API-key profile without a catalog whose provider is not the native's
+  built-in OpenAI provider gets `-c model_catalog_json=<profile dir>/reviewer-models-<sha256>.json`: the same
+  native's bundled rows (`debug models --bundled`, metadata unchanged), each with `auto_review_model_override` =
+  its own slug, plus a row for the launched model when the bundled list has none (the native's prefix match, else
+  cutex's template row with the native fallback's 272k context window). The reviewer then uses the agent's own
+  model. Profiles with a catalog and the built-in OpenAI provider are unchanged. Best effort (a CLI that cannot
+  list its bundled models leaves the launch as before). Limits: a running model switch to a model that is neither
+  bundled nor the launched one falls back to the bundled review model again; the native refuses a mid-turn model
+  switch between rows with different reviewer overrides (it applies at the next turn).
+- Rollback: an older binary ignores the record field and the `approvals_reviewer` config key, but launch
+  receipts written with a reviewer (`StockConfiguration.approvals_reviewer`) are unreadable for binaries with
+  `deny_unknown_fields` there; the thread itself keeps its persisted native settings.

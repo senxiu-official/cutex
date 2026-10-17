@@ -628,6 +628,86 @@ pub fn open_private_file_path(
     Ok(file)
 }
 
+/// Create `path` (which must not exist) with a protected owner-only DACL
+/// before any byte is written. A plain create inherits the parent's ACEs
+/// without `SE_DACL_PROTECTED`, which [`validate_private_file`] refuses even
+/// when the parent is owner-private; `MoveFileExW` keeps this DACL, so a
+/// temp file created here can be renamed over a private target.
+pub fn create_new_private_file(path: &Path) -> Result<File, PrivateFsError> {
+    let file = open_path(
+        path,
+        GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+        CREATE_NEW,
+        false,
+        true,
+    )?;
+    validate_type(&file, false)?;
+    secure_owned_handle(&file, false)?;
+    validate_private_acl(&file, false)?;
+    Ok(file)
+}
+
+/// Recover a file Cutex wrote before its writers set a protected DACL (or
+/// that a native wrote): when every ACE already grants only to this account
+/// (typically one ACE inherited from an owner-private directory) and the
+/// owner is accepted, the effective access is already owner-only, so the
+/// DACL is replaced by the protected owner-only one. Returns whether it
+/// changed anything. Any other ACE (another account, a deny ACE, ...) is
+/// left alone and still refused.
+pub fn repair_inherited_owner_only_file(path: &Path) -> Result<bool, PrivateFsError> {
+    let file = open_path(
+        path,
+        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+        OPEN_EXISTING,
+        false,
+        true,
+    )?;
+    validate_type(&file, false)?;
+    if validate_private_acl(&file, false).is_ok() {
+        return Ok(false);
+    }
+    if !grants_only_current_user(&file)? {
+        return Err(PrivateFsError::DaclNotPrivate);
+    }
+    secure_owned_handle(&file, false)?;
+    validate_private_acl(&file, false)?;
+    Ok(true)
+}
+
+fn grants_only_current_user(file: &File) -> Result<bool, PrivateFsError> {
+    let sid = current_user_sid()?;
+    let (owner, dacl, _descriptor) = security_info(file)?;
+    validate_token_owner(owner)?;
+    if dacl.is_null() {
+        return Ok(false);
+    }
+    let mut size: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+    let ok = unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    if ok == 0 || size.AceCount == 0 {
+        return Ok(false);
+    }
+    for index in 0..size.AceCount {
+        let mut ace = null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+            return Ok(false);
+        }
+        let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+        let header = unsafe { (*ace).Header };
+        let ace_sid = unsafe { (&mut (*ace).SidStart as *mut u32).cast() };
+        if header.AceType != 0 || unsafe { EqualSid(ace_sid, sid.as_ptr() as PSID) } == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub fn secure_tree(path: &Path) -> Result<(), PrivateFsError> {
     let (_, root_identity) = secure_directory(path)?;
     for entry in std::fs::read_dir(path)? {

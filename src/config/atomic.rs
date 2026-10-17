@@ -51,7 +51,7 @@ fn write_bytes_atomic_with_privacy(
     data: &[u8],
     owner_only: bool,
 ) -> anyhow::Result<()> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = owner_only;
     let parent = path
         .parent()
@@ -78,8 +78,20 @@ fn write_bytes_atomic_with_privacy(
 
             options.mode(0o600);
         }
-        let mut file = options
-            .open(&tmp_path)
+        // Windows: a plain create inherits the parent's ACEs without a
+        // protected DACL, which Cutex's own private-file check refuses (e.g.
+        // a profile auth.json written by an API-key edit). Create the temp
+        // file owner-private instead; the rename keeps its DACL.
+        #[cfg(windows)]
+        let created = if owner_only {
+            crate::platform::private_fs::create_new_private_file(&tmp_path)
+                .map_err(|error| anyhow!("{error}"))
+        } else {
+            options.open(&tmp_path).map_err(anyhow::Error::from)
+        };
+        #[cfg(not(windows))]
+        let created = options.open(&tmp_path).map_err(anyhow::Error::from);
+        let mut file = created
             .with_context(|| format!("Failed to create temp file: {}", tmp_path.display()))?;
         file.write_all(data)
             .with_context(|| format!("Failed to write temp file: {}", tmp_path.display()))?;

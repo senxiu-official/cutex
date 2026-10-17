@@ -13,6 +13,16 @@ fn read(path: &Path, route: &Route) -> anyhow::Result<(AuthCustody, Option<ApiKe
     let path = parent.join(path.file_name().context("auth filename missing")?);
     let (_directory, parent_id) = private_fs::open_validated_directory(&parent)
         .with_context(|| format!("Validate profile credential directory {}", parent.display()))?;
+    // Earlier releases replaced auth.json on an API-key edit with a file that
+    // only inherits the private directory's owner ACE (no protected DACL), and
+    // a native token refresh can do the same: re-protect such a file instead
+    // of refusing the profile. A file with any other ACE is still refused below.
+    if let Ok(true) = private_fs::repair_inherited_owner_only_file(&path) {
+        eprintln!(
+            "cutex: re-protected the inherited owner-only DACL of {}",
+            path.display()
+        );
+    }
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(0x0020_0000)
@@ -136,6 +146,56 @@ mod tests {
             &serde_json::json!({"OPENAI_API_KEY":"test-key-two"}),
         );
         assert_ne!(review_auth(&path, &Route::GlmApiKey).unwrap(), before);
+    }
+    #[test]
+    fn windows_private_atomic_write_passes_the_credential_check() {
+        let root = fixture();
+        let path = root.0.join("auth.json");
+        crate::config::atomic::write_private_pretty_json_atomic(
+            &path,
+            &serde_json::json!({"OPENAI_API_KEY":"test-key-atomic"}),
+            "test auth",
+        )
+        .unwrap();
+        assert_eq!(read_api_key(&path).unwrap().0, "test-key-atomic");
+        // Replacing an existing private file keeps it private.
+        crate::config::atomic::write_private_pretty_json_atomic(
+            &path,
+            &serde_json::json!({"OPENAI_API_KEY":"test-key-atomic-2"}),
+            "test auth",
+        )
+        .unwrap();
+        assert_eq!(read_api_key(&path).unwrap().0, "test-key-atomic-2");
+    }
+    #[test]
+    fn windows_inherited_owner_only_auth_is_reprotected() {
+        let root = fixture();
+        let path = root.0.join("auth.json");
+        // A plain create inherits the private directory's owner ACE only.
+        std::fs::write(&path, br#"{"OPENAI_API_KEY":"test-key-inherited"}"#).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert!(private_fs::validate_private_file(&file).is_err());
+        drop(file);
+        assert_eq!(read_api_key(&path).unwrap().0, "test-key-inherited");
+        let file = std::fs::File::open(&path).unwrap();
+        private_fs::validate_private_file(&file).unwrap();
+        drop(file);
+        assert!(!private_fs::repair_inherited_owner_only_file(&path).unwrap());
+    }
+    #[test]
+    fn windows_auth_shared_with_another_account_is_still_refused() {
+        let root = fixture();
+        let path = root.0.join("auth.json");
+        std::fs::write(&path, br#"{"OPENAI_API_KEY":"test-key-shared"}"#).unwrap();
+        // *S-1-1-0 = Everyone.
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "*S-1-1-0:(R)"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "icacls failed: {output:?}");
+        assert!(private_fs::repair_inherited_owner_only_file(&path).is_err());
+        assert!(read_api_key(&path).is_err());
     }
     #[test]
     fn windows_chatgpt_refresh_preserves_account_identity() {

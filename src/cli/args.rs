@@ -1410,7 +1410,9 @@ pub enum ProfileCommand {
         target: String,
     },
 
-    /// Copy one profile into a new profile, optionally changing provider settings
+    /// Copy one profile's settings into a new profile, optionally changing
+    /// provider settings. Credentials are not copied: log the copy in or set
+    /// its API key afterwards (a ChatGPT login is never copied)
     Copy {
         /// Source profile name or id
         source: String,
@@ -1423,6 +1425,9 @@ pub enum ProfileCommand {
         /// Optional base_url override for the copied provider
         #[arg(long = "provider-base-url")]
         provider_base_url: Option<String>,
+        /// Also copy the source's API key (API-key profiles only)
+        #[arg(long = "with-api-key")]
+        with_api_key: bool,
     },
 
     /// Copy one profile's status_line to every profile
@@ -2103,6 +2108,9 @@ pub enum UpgradeCommand {
     History {
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Print `{runs}` (the full run records, as `GET /v2/upgrade/runs` shows them)
+        #[arg(long)]
+        json: bool,
     },
     /// Show or change upgrade settings
     Config {

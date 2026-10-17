@@ -420,6 +420,25 @@ impl Relay {
             GrantSource::Claim { approval_id } => Some(approval_id.clone()),
             _ => None,
         };
+        // A popup inherits an ACTIVE opener lease of the same agent on this exact
+        // device connection (never a pending, other-agent or other-generation one).
+        let inherited = match &request.source {
+            GrantSource::Popup { opener_lease_id } => {
+                let opener = state
+                    .leases
+                    .get(opener_lease_id)
+                    .filter(|lease| {
+                        lease.view.state == "active"
+                            && lease.generation == binding.generation
+                            && lease.view.target.device_id == request.device_id
+                            && lease.view.cutex_session_id == request.cutex_session_id
+                            && lease.view.target.guest_id.as_deref() != Some(request.guest_id.as_str())
+                    })
+                    .ok_or(RelayError::new("permission_denied"))?;
+                Some(opener.view.origin.clone())
+            }
+            _ => None,
+        };
         let view = LeaseView {
             lease_id: format!("bl-{}", uuid::Uuid::new_v4().simple()),
             cutex_session_id: request.cutex_session_id,
@@ -431,12 +450,14 @@ impl Relay {
             state: "pending".into(),
             title: request.title,
             url: safe_url(&request.url),
-            origin: if matches!(request.source, GrantSource::AgentOpen { .. }) {
-                "agent"
-            } else {
-                "owner"
-            }
-            .into(),
+            origin: inherited.unwrap_or_else(|| {
+                if matches!(request.source, GrantSource::AgentOpen { .. }) {
+                    "agent"
+                } else {
+                    "owner"
+                }
+                .into()
+            }),
             agent_name,
         };
         if let Some(guest) = &view.target.guest_id {
@@ -811,6 +832,41 @@ mod tests {
         assert_eq!(r.activate(&b, &lease.lease_id).unwrap().state, "active");
         drop(s);
         assert!(r.state.lock().unwrap().leases.is_empty());
+    }
+    #[test]
+    fn a_popup_inherits_only_an_active_opener_lease_of_the_same_agent() {
+        let r = Arc::new(Relay::new());
+        let i = identity();
+        let v = r.register(i.clone(), reg("d"), 10000, 30000).unwrap();
+        let b = binding(&i, &v);
+        let s = r.attach(&b, None).unwrap();
+        s.receiver.recv().unwrap();
+        let request = |guest: &str, session: &str, source: GrantSource| GrantRequest {
+            device_id: "d".into(),
+            guest_id: guest.into(),
+            cutex_session_id: session.into(),
+            title: "page".into(),
+            url: "http://localhost/".into(),
+            source,
+        };
+        let opener = r
+            .grant_checked(&b, request("g1", "cutex.s", GrantSource::AgentOpen { request_id: "r1".into() }), "Agent".into())
+            .unwrap();
+        let popup = |guest: &str, session: &str, lease: &str| request(guest, session, GrantSource::Popup { opener_lease_id: lease.into() });
+        // A pending opener is not a proof yet.
+        assert_eq!(r.grant_checked(&b, popup("g2", "cutex.s", &opener.lease_id), "Agent".into()).unwrap_err().code, "permission_denied");
+        r.activate(&b, &opener.lease_id).unwrap();
+        // Another agent, an unknown lease, or the opener's own tab cannot use it.
+        assert_eq!(r.grant_checked(&b, popup("g2", "cutex.other", &opener.lease_id), "Other".into()).unwrap_err().code, "permission_denied");
+        assert_eq!(r.grant_checked(&b, popup("g2", "cutex.s", "bl-missing"), "Agent".into()).unwrap_err().code, "permission_denied");
+        assert!(r.grant_checked(&b, popup("g1", "cutex.s", &opener.lease_id), "Agent".into()).is_err());
+        let child = r.grant_checked(&b, popup("g2", "cutex.s", &opener.lease_id), "Agent".into()).unwrap();
+        assert_eq!(child.origin, "agent");
+        assert_eq!(child.state, "pending");
+        assert_eq!(child.cutex_session_id, "cutex.s");
+        // Wire shape: kebab-case kind with camelCase opener id, unknown fields refused.
+        assert!(parse::<GrantSource>(br#"{"kind":"popup","openerLeaseId":"bl-1"}"#).is_ok());
+        assert!(parse::<GrantSource>(br#"{"kind":"popup","openerLeaseId":"bl-1","owner":true}"#).is_err());
     }
     #[test]
     fn leases_ended_by_a_desktop_restart_say_so_to_the_agent() {

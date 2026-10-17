@@ -134,6 +134,7 @@ pub fn category_for_url(url: &str) -> Option<ProviderCategory> {
         ("moonshot.cn", ProviderCategory::Kimi),
         ("moonshot.ai", ProviderCategory::Kimi),
         ("kimi.com", ProviderCategory::Kimi),
+        ("kimi.ai", ProviderCategory::Kimi),
         ("deepseek.com", ProviderCategory::Deepseek),
         ("anthropic.com", ProviderCategory::Claude),
         ("openai.com", ProviderCategory::Codex),
@@ -150,7 +151,7 @@ pub fn category_for_provider_name(name: &str) -> Option<ProviderCategory> {
     Some(match name.trim().to_ascii_lowercase().as_str() {
         "glm" | "zhipu" | "zhipuai" | "bigmodel" => ProviderCategory::Glm,
         "zai" | "z.ai" | "z-ai" => ProviderCategory::Zai,
-        "kimi" | "moonshot" | "moonshotai" => ProviderCategory::Kimi,
+        "kimi" | "moonshot" | "moonshotai" | "kimi-code" => ProviderCategory::Kimi,
         "deepseek" => ProviderCategory::Deepseek,
         "claude" | "anthropic" => ProviderCategory::Claude,
         "openai" | "chatgpt" | "codex" => ProviderCategory::Codex,
@@ -212,6 +213,7 @@ mod tests {
         assert_eq!(url("https://api.moonshot.cn/v1"), Kimi);
         assert_eq!(url("https://api.moonshot.ai/v1"), Kimi);
         assert_eq!(url("https://api.kimi.com/coding/v1"), Kimi);
+        assert_eq!(url("https://api.kimi.ai/coding/v1"), Kimi);
         assert_eq!(url("https://api.deepseek.com"), Deepseek);
         assert_eq!(url("https://api.anthropic.com/v1"), Claude);
         assert_eq!(url("https://api.openai.com/v1"), Codex);

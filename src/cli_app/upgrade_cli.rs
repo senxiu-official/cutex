@@ -183,18 +183,26 @@ pub(super) fn run_upgrade(command: UpgradeCommand) -> anyhow::Result<()> {
             }
             follow(&layout, &run.run_id)
         }
-        UpgradeCommand::History { limit } => {
+        UpgradeCommand::History { limit, json } => {
             let layout = layout()?;
+            if json {
+                return print(&serde_json::json!({ "runs": state::history(&layout, limit) }));
+            }
             for run in state::history(&layout, limit) {
                 println!(
-                    "{}  {}  {:8}  {} → {}  {}{}",
+                    "{}  {}  {:8}  {} → {}  {}{}{}",
                     run.created_at,
                     run.run_id,
                     serde_json::to_value(run.kind)?.as_str().unwrap_or(""),
                     run.from_release,
                     run.to_release,
                     run.phase.as_str(),
-                    run.error.as_ref().map(|e| format!("  ({})", e.code)).unwrap_or_default()
+                    run.error.as_ref().map(|e| format!("  ({})", e.code)).unwrap_or_default(),
+                    match (run.runtime_change, &run.native_version) {
+                        (Some(state::RuntimeChange::Native), Some(native)) => format!("  [native {native}]"),
+                        (Some(state::RuntimeChange::Package), _) => "  [runtime package]".to_string(),
+                        _ => String::new(),
+                    }
                 );
             }
             Ok(())

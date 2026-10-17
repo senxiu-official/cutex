@@ -155,8 +155,17 @@ pub fn prepare_apply(layout: &Layout, keys: &[PublicKey], request: &ApplyRequest
     );
     run.confirm_one_way = request.confirm_one_way.clone();
     run.requested_by = request.requested_by.clone();
+    run.set_runtime(target.native.as_ref().map(|n| n.version.clone()), local.native.clone());
     state::record_run(layout, &run)?;
     Ok(run)
+}
+
+/// The native version in `releases/<release>/manifest.json`, if any.
+fn release_native_version(layout: &Layout, release: &str) -> Option<String> {
+    std::fs::read(layout.release_dir(release).join(MANIFEST_FILE))
+        .ok()
+        .and_then(|bytes| ReleaseManifest::parse(&bytes).ok())
+        .and_then(|m| m.native.map(|n| n.version))
 }
 
 /// The sequence in `releases/<release>/manifest.json`; 0 without one (a
@@ -269,6 +278,8 @@ pub fn prepare_rollback(layout: &Layout, request: &RollbackRequest) -> anyhow::R
     let mode = if selection.is_some() { Mode::Full } else { Mode::Reload };
     let mut run = Run::new(RunKind::Rollback, &from, &to, mode, class, max_wait(request.max_wait_secs, &settings)?, PackageRun::None);
     run.requested_by = request.requested_by.clone();
+    // Only a `full` rollback (selection backup restored) changes the runtime for new agents.
+    run.set_runtime(release_native_version(layout, &to), release_native_version(layout, &from));
     if let Some(selection) = &selection {
         run.extra.insert(SELECTION_BACKUP_KEY.into(), json!(selection.display().to_string()));
     }
@@ -714,6 +725,43 @@ mod tests {
     }
 
     #[test]
+    fn runs_record_the_native_they_bring() {
+        // No native in the release, reload-safe: nothing changes for new agents.
+        let (layout, keys, root) = staged_setup(MigrationClass::ReloadSafe);
+        let run = prepare_apply(&layout, &keys, &ApplyRequest::default()).unwrap();
+        assert_eq!((run.mode, run.native_version.as_deref(), run.runtime_change), (Mode::Reload, None, Some(state::RuntimeChange::None)));
+        assert_eq!(cancel(&layout).unwrap().phase, Phase::Cancelled);
+        // Same release forced to full: only the runtime package changes.
+        let run = prepare_apply(&layout, &keys, &ApplyRequest { mode: Some(Mode::Full), ..Default::default() }).unwrap();
+        assert_eq!((run.mode, run.runtime_change), (Mode::Full, Some(state::RuntimeChange::Package)));
+        cancel(&layout).unwrap();
+        std::fs::remove_dir_all(&layout.base).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // A release with a native this host has not selected: a new native runtime.
+        let key = TestKey::new(7);
+        let keys = vec![PublicKey::parse(&key.public_text()).unwrap()];
+        let layout = installed_layout("r239", 40);
+        let root = temp("control-native");
+        publish(&root, &key, "r240", 41, Some("0.162.1-r53"), |_| {});
+        let source = super::super::source::Source::parse(&root.display().to_string()).unwrap();
+        stage::stage(&layout, &source, &keys, "release", "r240", &LocalRuntimes::default()).unwrap();
+        let run = prepare_apply(&layout, &keys, &ApplyRequest::default()).unwrap();
+        assert_ne!(run.previous_native_version.as_deref(), Some("0.162.1-r53"));
+        assert_eq!((run.mode, run.native_version.as_deref(), run.runtime_change), (Mode::Full, Some("0.162.1-r53"), Some(state::RuntimeChange::Native)));
+        // Kept through the run record, the state and the history (the status view's `run`).
+        assert_eq!(state::read_run(&layout, &run.run_id).unwrap().native_version.as_deref(), Some("0.162.1-r53"));
+        let view = status_view(&layout);
+        assert_eq!((&view["run"]["nativeVersion"], &view["run"]["runtimeChange"]), (&json!("0.162.1-r53"), &json!("native")));
+        cancel(&layout).unwrap();
+        let history = state::history(&layout, 5);
+        assert_eq!(history[0].runtime_change, Some(state::RuntimeChange::Native));
+        assert_eq!(history[0].native_version.as_deref(), Some("0.162.1-r53"));
+        std::fs::remove_dir_all(&layout.base).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn lost_runner_is_reconciled() {
         let (layout, keys, root) = staged_setup(MigrationClass::RollbackSafe);
         let mut run = prepare_apply(&layout, &keys, &ApplyRequest::default()).unwrap();
@@ -867,6 +915,7 @@ mod tests {
         let (run, _) = prepare_rollback(&layout, &RollbackRequest::default()).unwrap();
         let run = run.unwrap();
         assert_eq!((run.kind, run.mode), (RunKind::Rollback, Mode::Reload));
+        assert_eq!(run.runtime_change, Some(state::RuntimeChange::None), "no selection backup: the runtime selection stays");
         assert_eq!(runner_executable(&layout, &run), layout.release_executable("r240"));
         std::fs::remove_dir_all(&layout.base).unwrap();
         std::fs::remove_dir_all(&root).unwrap();

@@ -530,8 +530,8 @@ pub fn scan_project(host: &dyn ArtifactHost, store: &ArtifactStore, project: &st
         }
         let new = NewVersion {
             scope: scope.clone(),
-            default_kind: paths::default_kind(&name).to_string(),
-            media_type: paths::media_type(&name, &sample),
+            default_kind: paths::default_kind_of(&name, &real.display().to_string()).to_string(),
+            media_type: paths::media_type(&real.display().to_string(), &name, &sample),
             name: name.clone(),
             kind: None,
             content,

@@ -284,6 +284,8 @@ pub fn clamp_or_refuse(
     Ok(LaunchPermissions {
         sandbox: sandbox.as_str().to_string(),
         approval: approval.as_str().to_string(),
+        // Agent-created agents keep the native / profile default reviewer.
+        approvals_reviewer: None,
         network_access,
         writable_roots: if sandbox == SandboxLevel::WorkspaceWrite {
             writable_roots
@@ -481,6 +483,7 @@ mod tests {
         LaunchPermissions {
             sandbox: "workspace-write".into(),
             approval: "on-request".into(),
+            approvals_reviewer: None,
             network_access: true,
             writable_roots: vec![abs("/work/shared")],
         }

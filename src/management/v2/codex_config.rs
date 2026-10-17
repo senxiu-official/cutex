@@ -70,7 +70,21 @@ pub const CODEX_CONFIG_METHODS: &[&str] = &[
     "marketplace/add",
     "marketplace/remove",
     "marketplace/upgrade",
+    // Capability `windows-sandbox-readiness`: the shared home's Windows
+    // sandbox readiness (what newly adopted agents get) and its unelevated
+    // setup (fenced like the session route:
+    // `native_requests::windows_sandbox_setup_fence`). The setup answers
+    // once native's `windowsSandbox/setupCompleted` arrived (`result.completed`,
+    // null when it did not arrive in time) and then stops the warm process so
+    // the next readiness reads the new config.toml.
+    "windowsSandbox/readiness",
+    "windowsSandbox/setupStart",
 ];
+
+pub const WINDOWS_SANDBOX_SETUP_METHOD: &str = "windowsSandbox/setupStart";
+const WINDOWS_SANDBOX_SETUP_COMPLETED: &str = "windowsSandbox/setupCompleted";
+/// How long the host route waits for the unelevated setup to report back.
+const WINDOWS_SANDBOX_SETUP_WAIT: Duration = Duration::from_secs(90);
 
 /// Allowlisted methods newer than the pinned 0.144.1 schema (experimental in
 /// the selected runtime). Only the envelope and an object `params` are
@@ -146,9 +160,9 @@ pub fn validate_codex_request(body: &[u8]) -> Result<ValidatedCodexRequest, Code
         return Err(CodexRequestError::MethodDenied(method));
     }
     let params = object.get("params").cloned().unwrap_or(Value::Null);
-    let params = if method == "config/mcpServer/reload" {
+    let params = if matches!(method.as_str(), "config/mcpServer/reload" | "windowsSandbox/readiness") {
         if !params.is_null() {
-            return Err(invalid("config/mcpServer/reload takes no params"));
+            return Err(CodexRequestError::Invalid(format!("{method} takes no params")));
         }
         Value::Null
     } else {
@@ -205,6 +219,9 @@ fn apply_fences(method: &str, params: &Value) -> Result<(), CodexRequestError> {
         return Err(CodexRequestError::Invalid(
             "threadId is not allowed: global config requests are not bound to a thread".to_string(),
         ));
+    }
+    if method == WINDOWS_SANDBOX_SETUP_METHOD {
+        super::native_requests::windows_sandbox_setup_fence(params).map_err(CodexRequestError::Invalid)?;
     }
     if PLUGIN_CWDS_METHODS.contains(&method) && field_is_set("cwds") {
         return Err(CodexRequestError::Invalid(
@@ -422,6 +439,7 @@ struct WarmEndpoint {
 pub struct CodexConfigHost {
     factory: Box<dyn CodexEndpointFactory>,
     keep_warm: Duration,
+    setup_wait: Duration,
     state: Mutex<HostState>,
 }
 
@@ -442,8 +460,15 @@ impl CodexConfigHost {
         Self {
             factory,
             keep_warm,
+            setup_wait: WINDOWS_SANDBOX_SETUP_WAIT,
             state: Mutex::new(HostState::default()),
         }
+    }
+
+    #[cfg(test)]
+    fn with_setup_wait(mut self, wait: Duration) -> Self {
+        self.setup_wait = wait;
+        self
     }
 
     /// Forward one request. Returns `Err` only when no app-server could be
@@ -476,8 +501,20 @@ impl CodexConfigHost {
                 .unwrap_or(OAUTH_DEFAULT_KEEP)
                 .min(OAUTH_MAX_KEEP)
         });
-        let result = warm.spawned.endpoint.request(method, params);
+        let mut result = warm.spawned.endpoint.request(method, params);
         let codex_home = warm.spawned.codex_home.clone();
+        if method == WINDOWS_SANDBOX_SETUP_METHOD {
+            if let Ok(response) = &mut result {
+                let completed = wait_for_setup_completed(warm.spawned.endpoint.as_mut(), self.setup_wait);
+                if let Some(object) = response.as_object_mut() {
+                    object.insert("completed".to_string(), completed);
+                }
+            }
+            // The setup may have rewritten config.toml; native keeps the
+            // config it started with, so the next request starts afresh.
+            state.warm = None;
+            return Ok((CodexCallOutcome { codex_home, result }, started));
+        }
         match &result {
             Ok(_) | Err(CatalogError::Rpc { .. }) => {
                 let now = Instant::now();
@@ -529,6 +566,26 @@ impl CodexConfigHost {
     }
 }
 
+/// Wait for native's `windowsSandbox/setupCompleted` (`{mode, success,
+/// error}`); `Value::Null` when it does not arrive within `wait` or the
+/// transport fails (the outcome is then unknown; readiness tells).
+fn wait_for_setup_completed(endpoint: &mut dyn CatalogEndpoint, wait: Duration) -> Value {
+    let deadline = Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Value::Null;
+        }
+        match endpoint.next_notification(remaining) {
+            Ok(Some((method, params))) if method == WINDOWS_SANDBOX_SETUP_COMPLETED => {
+                return params.unwrap_or(Value::Null);
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return Value::Null,
+        }
+    }
+}
+
 pub fn spawn_reaper(host: Arc<CodexConfigHost>, generation: u64) {
     std::thread::spawn(move || loop {
         std::thread::sleep(REAPER_INTERVAL);
@@ -572,9 +629,22 @@ pub(crate) fn resolve_runtime() -> anyhow::Result<(PathBuf, Vec<String>, PathBuf
         Ok((
             PathBuf::from(crate::launch::program::codex_program()),
             vec!["app-server".to_string(), "--stdio".to_string()],
-            crate::config::paths::host_codex_home_dir()?,
+            ensure_host_codex_home()?,
         ))
     }
+}
+
+/// This home's shared native home (`<home>/codex-home`), created owner-private
+/// when missing. A fresh home has none until a runtime is installed or a
+/// Profile is launched; the Codex settings / Windows sandbox readiness reads
+/// must not fail with "shared CODEX_HOME does not exist" there (a selected
+/// deployment's `native_home` is never created here: it must already exist).
+pub fn ensure_host_codex_home() -> anyhow::Result<PathBuf> {
+    let home = crate::config::paths::host_codex_home_dir()?;
+    if !home.is_dir() {
+        crate::profiles::materialize::create_private_dir_all(&home)?;
+    }
+    Ok(home)
 }
 
 /// OS context only: no Cutex credentials, profile auth or overrides.
@@ -620,6 +690,18 @@ pub(crate) fn base_command(program: &std::path::Path, codex_home: &std::path::Pa
             command.env(key, value);
         }
     }
+    // A temporary directory inherited from another cutex home's agent shell
+    // (`<home>/runtime/stock-tmp`) is replaced by this home's own.
+    for key in ["TMPDIR", "TEMP", "TMP"] {
+        let foreign = std::env::var_os(key)
+            .is_some_and(|value| crate::config::paths::is_foreign_runtime_tmp(std::path::Path::new(&value)));
+        if foreign {
+            match crate::config::paths::runtime_tmp_dir() {
+                Ok(own) => command.env(key, own),
+                Err(_) => command.env_remove(key),
+            };
+        }
+    }
     command
 }
 
@@ -641,6 +723,8 @@ impl CodexEndpointFactory for RuntimeEndpointFactory {
         command.args(&args);
         let mut options = StdioAppServerOptions::new(program.into_os_string(), codex_home.clone());
         options.request_timeout = REQUEST_TIMEOUT;
+        // Keeps `windowsSandbox/setupCompleted` for the setup request.
+        options.notification_buffer = 16;
         options.shutdown_timeout = Duration::from_secs(2);
         let mut endpoint = OwnedStdioEndpoint::spawn_command(options, command)?;
         let initialized = endpoint.request(
@@ -894,7 +978,8 @@ mod tests {
         let minimal = |method: &str| match method {
             "config/value/write" => json!({ "keyPath": "a", "value": 1, "mergeStrategy": "replace" }),
             "config/batchWrite" => json!({ "edits": [] }),
-            "config/mcpServer/reload" => Value::Null,
+            "config/mcpServer/reload" | "windowsSandbox/readiness" => Value::Null,
+            "windowsSandbox/setupStart" => json!({ "mode": "unelevated" }),
             "mcpServer/oauth/login" => json!({ "name": "x" }),
             "skills/config/write" => json!({ "enabled": true, "name": "x" }),
             "skills/extraRoots/set" => json!({ "extraRoots": [] }),
@@ -1289,6 +1374,7 @@ command = \"g\"
     struct FakeEndpoint {
         log: Arc<Mutex<Vec<(String, Value)>>>,
         replies: Arc<Mutex<VecDeque<Result<Value, CatalogError>>>>,
+        notifications: Arc<Mutex<VecDeque<(String, Option<Value>)>>>,
     }
 
     impl CatalogEndpoint for FakeEndpoint {
@@ -1303,6 +1389,12 @@ command = \"g\"
         fn notify(&mut self, _method: &str, _params: Option<Value>) -> Result<(), CatalogError> {
             Ok(())
         }
+        fn next_notification(
+            &mut self,
+            _timeout: Duration,
+        ) -> Result<Option<(String, Option<Value>)>, CatalogError> {
+            Ok(self.notifications.lock().unwrap().pop_front())
+        }
     }
 
     #[derive(Clone, Default)]
@@ -1311,6 +1403,7 @@ command = \"g\"
         fail: bool,
         log: Arc<Mutex<Vec<(String, Value)>>>,
         replies: Arc<Mutex<VecDeque<Result<Value, CatalogError>>>>,
+        notifications: Arc<Mutex<VecDeque<(String, Option<Value>)>>>,
     }
 
     impl CodexEndpointFactory for FakeFactory {
@@ -1323,6 +1416,7 @@ command = \"g\"
                 endpoint: Box::new(FakeEndpoint {
                     log: Arc::clone(&self.log),
                     replies: Arc::clone(&self.replies),
+                    notifications: Arc::clone(&self.notifications),
                 }),
                 codex_home: PathBuf::from("/fake/codex-home"),
             })
@@ -1378,6 +1472,84 @@ command = \"g\"
         assert_eq!(log[0], ("config/read".to_string(), json!({})));
         assert_eq!(log[1].0, "config/value/write");
         assert_eq!(log[2], ("config/mcpServer/reload".to_string(), Value::Null));
+    }
+
+    #[test]
+    fn windows_sandbox_methods_are_fenced_on_the_host_route() {
+        let readiness = validated(json!({ "requestId": "r", "method": "windowsSandbox/readiness" }));
+        assert_eq!(readiness.params, Value::Null);
+        assert!(validate_codex_request(&body(json!({ "requestId": "r", "method": "windowsSandbox/readiness",
+            "params": null }))).is_ok());
+        assert!(matches!(
+            validate_codex_request(&body(json!({ "requestId": "r", "method": "windowsSandbox/readiness",
+                "params": {} }))),
+            Err(CodexRequestError::Invalid(_))
+        ));
+        validated(json!({ "requestId": "r", "method": "windowsSandbox/setupStart",
+            "params": { "mode": "unelevated" } }));
+        for params in [
+            json!({ "mode": "elevated" }),
+            json!({ "mode": "unelevated", "cwd": "/repo" }),
+            json!({}),
+        ] {
+            assert!(
+                matches!(
+                    validate_codex_request(&body(json!({ "requestId": "r",
+                        "method": "windowsSandbox/setupStart", "params": params.clone() }))),
+                    Err(CodexRequestError::Invalid(_))
+                ),
+                "{params}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_sandbox_setup_waits_for_completion_and_restarts_the_process() {
+        let factory = FakeFactory::default();
+        factory.replies.lock().unwrap().extend([
+            Ok(json!({ "status": "notConfigured" })),
+            Ok(json!({ "started": true })),
+            Ok(json!({ "status": "ready" })),
+        ]);
+        factory.notifications.lock().unwrap().extend([
+            ("account/updated".to_string(), Some(json!({}))),
+            (
+                "windowsSandbox/setupCompleted".to_string(),
+                Some(json!({ "mode": "unelevated", "success": true, "error": null })),
+            ),
+        ]);
+        let host = Arc::new(
+            CodexConfigHost::new(Box::new(factory.clone()), Duration::from_secs(60))
+                .with_setup_wait(Duration::from_millis(50)),
+        );
+        let readiness = validated(json!({ "requestId": "a", "method": "windowsSandbox/readiness" }));
+        let (status, _, body, _) = respond(&host, &readiness);
+        assert_eq!((status, body["result"]["status"].as_str()), (200, Some("notConfigured")));
+        let (status, _, body, _) = respond(
+            &host,
+            &validated(json!({ "requestId": "b", "method": "windowsSandbox/setupStart",
+                "params": { "mode": "unelevated" } })),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["result"]["started"], true);
+        assert_eq!(body["result"]["completed"]["success"], true);
+        assert!(!host.is_warm(), "setup drops the warm process");
+        let (_, _, body, _) = respond(&host, &readiness);
+        assert_eq!(body["result"]["status"], "ready");
+        assert_eq!(factory.spawns.load(Ordering::SeqCst), 2);
+        let log = factory.log.lock().unwrap().clone();
+        assert_eq!(log[0], ("windowsSandbox/readiness".to_string(), Value::Null));
+        assert_eq!(log[1], ("windowsSandbox/setupStart".to_string(), json!({ "mode": "unelevated" })));
+
+        // No completion in time: `completed` is null, the process still restarts.
+        factory.replies.lock().unwrap().push_back(Ok(json!({ "started": true })));
+        let (_, _, body, _) = respond(
+            &host,
+            &validated(json!({ "requestId": "c", "method": "windowsSandbox/setupStart",
+                "params": { "mode": "unelevated", "cwd": null } })),
+        );
+        assert_eq!(body["result"]["completed"], Value::Null);
+        assert!(!host.is_warm());
     }
 
     #[test]

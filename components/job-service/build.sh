@@ -10,7 +10,8 @@
 # <version> must equal component.json and Cargo.toml.
 # Same rules as the cutex archive (.github/ci/build-cutex.sh): builds an LF `git archive` export of
 # HEAD's components/job-service under BUILD_ROOT, no build paths in the binary (remap + leak check),
-# stripped, ustar with fixed owner and mtime, `gzip -n`. Linux only (the Job Service is Linux-only).
+# stripped, ustar with fixed owner and mtime (last commit of the binary's sources), `gzip -n`. Linux
+# only (the Job Service is Linux-only).
 # Environment (optional): BUILD_ROOT (default <checkout>/../build-root), CARGO_HOME, RUST_TOOLCHAIN
 # (default 1.95.0), LEAK_POLICY fail (default) | warn.
 set -euo pipefail
@@ -50,7 +51,17 @@ src="$build_root/job-service"
 rm -rf "${src:?}"
 mkdir -p "$src"
 git -c core.autocrlf=false archive --format=tar HEAD components/job-service | tar -x -C "$src" --strip-components=2
-mtime="$(git log -1 --format=%ct)"
+# The archive mtime is the time of the last commit that changed the binary's inputs (src/, Cargo.toml,
+# Cargo.lock), not HEAD's: a later release that leaves them unchanged (README, tests or this script may
+# change) reproduces the already-published archive byte for byte (sign-and-upload.sh refuses a
+# published component version whose bytes changed). Needs the history of those paths: a shallow clone
+# falls back to HEAD's time with a warning (fine for e2e builds, never for a release build).
+if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+  echo "::warning::shallow clone: the archive mtime is HEAD's commit time (not reproducible across releases)"
+  mtime="$(git log -1 --format=%ct)"
+else
+  mtime="$(git log -1 --format=%ct -- components/job-service/src components/job-service/Cargo.toml components/job-service/Cargo.lock)"
+fi
 commit="$(git rev-parse HEAD)"
 
 sysroot="$(rustc "+$toolchain" --print sysroot)"

@@ -329,6 +329,8 @@ pub struct ApiProviderCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions_field: Option<bool>,
 }
+/// Base URL of the native's built-in `openai` provider.
+pub const BUILTIN_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 fn file_storage() -> String { "file".into() }
 fn responses_protocol() -> String { "responses".into() }
 
@@ -402,7 +404,7 @@ impl Config {
             let provider = match self.model_providers.get(&provider_id) {
                 Some(provider) => provider.clone(),
                 None if provider_id == "openai" => ApiProvider {
-                    name: "OpenAI".into(), base_url: "https://api.openai.com/v1".into(),
+                    name: "OpenAI".into(), base_url: BUILTIN_OPENAI_BASE_URL.into(),
                     wire_api: "responses".into(), requires_openai_auth: false, env_key: "OPENAI_API_KEY".into(),
                     capabilities: None,
                 },
@@ -863,6 +865,13 @@ fn read_api_key(path: &Path) -> anyhow::Result<ApiKey> {
     Ok(ApiKey(key.into()))
 }
 impl Projection {
+    /// The API route uses the native's built-in OpenAI provider (no provider
+    /// definition of the profile's own).
+    pub fn uses_builtin_openai_provider(&self) -> bool {
+        self.api.as_ref().is_some_and(|api| {
+            api.provider_id == "openai" && api.provider.base_url.trim_end_matches('/') == BUILTIN_OPENAI_BASE_URL
+        })
+    }
     pub fn provider_id(&self) -> &str {
         self.api.as_ref().map(|api| api.provider_id.as_str())
             .unwrap_or(if self.route == Route::GlmApiKey { "GLM" } else { "openai" })

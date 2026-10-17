@@ -4902,25 +4902,25 @@ base_url = "https://old.example/v1"
         fs::write(&source_files.model_catalog_path, r#"{"models":[]}"#)
             .expect("source model catalog should be written");
 
-        cmd_profile_copy("source", "copied", None, None).expect("copy should succeed");
+        // A login is not an API key: --with-api-key refuses, nothing written.
+        let refused = cmd_profile_copy("source", "copied", None, None, true).unwrap_err();
+        assert!(refused.to_string().contains("never copied"), "{refused}");
+        assert_eq!(load_store().unwrap().accounts.len(), 1);
+
+        cmd_profile_copy("source", "copied", None, None, false).expect("copy should succeed");
 
         let reloaded = load_store().expect("store should reload");
         assert_eq!(reloaded.accounts.len(), 2);
         assert_eq!(reloaded.accounts[1].name, "copied");
-        assert_eq!(
-            reloaded.accounts[1].email.as_deref(),
-            Some("source@example.test")
-        );
-        assert_eq!(reloaded.accounts[1].plan_type.as_deref(), Some("pro"));
+        // Account identity belongs to the login, which is not copied.
+        assert_eq!(reloaded.accounts[1].email, None);
+        assert_eq!(reloaded.accounts[1].plan_type, None);
         assert_eq!(reloaded.accounts[1].runtime, source.runtime);
         assert_eq!(reloaded.accounts[1].proxy, source.proxy);
 
         let copied_files =
             materialized_account_files(&reloaded.accounts[1]).expect("copied files should resolve");
-        assert_eq!(
-            fs::read_to_string(&copied_files.auth_path).expect("copied auth should be readable"),
-            fs::read_to_string(&source_files.auth_path).expect("source auth should be readable")
-        );
+        assert!(!copied_files.auth_path.exists(), "credentials are not copied");
         assert_eq!(
             fs::read_to_string(&copied_files.config_path)
                 .expect("copied config should be readable"),
@@ -4933,6 +4933,19 @@ base_url = "https://old.example/v1"
             fs::read_to_string(&source_files.model_catalog_path)
                 .expect("source model catalog should be readable")
         );
+
+        // An API key travels only on request.
+        let key_auth = "{\"OPENAI_API_KEY\":\"copy-test-placeholder-key\",\"tokens\":null}\n";
+        fs::write(&source_files.auth_path, key_auth).unwrap();
+        cmd_profile_copy("source", "with key", None, None, true).expect("copy with key");
+        let reloaded = load_store().unwrap();
+        let with_key = reloaded.accounts.iter().find(|a| a.name == "with key").unwrap();
+        let with_key_files = materialized_account_files(with_key).unwrap();
+        assert_eq!(fs::read_to_string(&with_key_files.auth_path).unwrap(), key_auth);
+        cmd_profile_copy("source", "no key", None, None, false).expect("copy without key");
+        let reloaded = load_store().unwrap();
+        let no_key = reloaded.accounts.iter().find(|a| a.name == "no key").unwrap();
+        assert!(!materialized_account_files(no_key).unwrap().auth_path.exists());
 
         match old_home {
             Some(value) => unsafe { std::env::set_var("HOME", value) },
@@ -4970,6 +4983,7 @@ base_url = "https://old.example/v1"
             "copied",
             None,
             Some("https://new.example/v1".to_string()),
+            false,
         )
         .expect("copy should succeed");
 

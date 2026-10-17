@@ -104,6 +104,33 @@ pub const API_KEY_PRESETS: &[ApiKeyPreset] = &[
         quota_reader: Some(crate::profiles::quota::Reader::MoonshotCnBalance),
     },
     ApiKeyPreset {
+        // Kimi Code membership plan, overseas endpoint (kimi.com/code docs
+        // "Using Kimi in Codex": Responses API on /coding/v1). Keys come
+        // from the Kimi Code Console, not the Open Platform.
+        id: "kimi-code",
+        aliases: &["kimi-for-coding"],
+        label: "Kimi Code (membership plan)",
+        provider_id: KIMI_CODE_PROVIDER_ID,
+        provider_name: "Kimi Code",
+        base_url: Some("https://api.kimi.ai/coding/v1"),
+        default_model: Some("kimi-for-coding"),
+        family: Some(FAMILY_KIMI_CODE),
+        quota_reader: Some(crate::profiles::quota::Reader::KimiCodePlan),
+    },
+    ApiKeyPreset {
+        // Kimi Code, China endpoint (same API on api.kimi.com, which the
+        // official Kimi CLI uses by default).
+        id: "kimi-code-cn",
+        aliases: &[],
+        label: "Kimi Code (membership plan, China)",
+        provider_id: KIMI_CODE_PROVIDER_ID,
+        provider_name: "Kimi Code",
+        base_url: Some("https://api.kimi.com/coding/v1"),
+        default_model: Some("kimi-for-coding"),
+        family: Some(FAMILY_KIMI_CODE),
+        quota_reader: Some(crate::profiles::quota::Reader::KimiCodePlan),
+    },
+    ApiKeyPreset {
         id: "minimax",
         aliases: &[],
         label: "MiniMax",
@@ -286,6 +313,11 @@ pub const FAMILY_MOONSHOT: &str = "moonshot";
 pub const FAMILY_OPENROUTER: &str = "openrouter";
 pub const FAMILY_MINIMAX: &str = "minimax";
 pub const FAMILY_XAI: &str = "xai";
+/// Kimi Code membership API (api.kimi.com / api.kimi.ai `/coding/v1`): own
+/// keys and model IDs, so not the Open Platform's `moonshot` family.
+pub const FAMILY_KIMI_CODE: &str = "kimi-code";
+/// `model_provider` ID the Kimi Code presets write.
+pub const KIMI_CODE_PROVIDER_ID: &str = "kimi-code";
 /// Custom families are `custom:<host[:port]>` (or `custom:<provider id>`
 /// without a base URL, `custom` with neither).
 pub const FAMILY_CUSTOM_PREFIX: &str = "custom";
@@ -309,6 +341,8 @@ fn family_for_host(host: &str) -> Option<&'static str> {
         ("minimax.io", FAMILY_MINIMAX),
         ("minimaxi.com", FAMILY_MINIMAX),
         ("x.ai", FAMILY_XAI),
+        ("kimi.com", FAMILY_KIMI_CODE),
+        ("kimi.ai", FAMILY_KIMI_CODE),
     ];
     HOSTS
         .iter()
@@ -326,6 +360,7 @@ fn family_for_provider_id(provider: &str) -> Option<&'static str> {
         "openrouter" => FAMILY_OPENROUTER,
         "minimax" => FAMILY_MINIMAX,
         "xai" | "grok" => FAMILY_XAI,
+        "kimi-code" => FAMILY_KIMI_CODE,
         _ => return None,
     })
 }
@@ -379,6 +414,7 @@ pub fn family_label(id: &str) -> String {
         FAMILY_OPENROUTER => "OpenRouter".to_string(),
         FAMILY_MINIMAX => "MiniMax".to_string(),
         FAMILY_XAI => "xAI (Grok)".to_string(),
+        FAMILY_KIMI_CODE => "Kimi Code".to_string(),
         FAMILY_CUSTOM_PREFIX => "Custom".to_string(),
         other => match other.strip_prefix("custom:") {
             Some(key) => format!("Custom ({key})"),
@@ -417,6 +453,10 @@ mod tests {
         assert_eq!(family(Some("x"), Some("https://openrouter.ai/api/v1")), "openrouter");
         assert_eq!(family(Some("x"), Some("https://api.minimaxi.com/v1")), "minimax");
         assert_eq!(family(Some("x"), Some("https://api.x.ai/v1")), "xai");
+        assert_eq!(family(Some("kimi"), Some("https://api.kimi.com/coding/v1")), "kimi-code");
+        assert_eq!(family(Some("x"), Some("https://api.kimi.ai/coding/v1")), "kimi-code");
+        assert_eq!(family(Some("kimi-code"), None), "kimi-code");
+        assert_eq!(family_label("kimi-code"), "Kimi Code");
         assert_eq!(family(Some("zai"), Some("https://api.z.ai/api/v1")), "zhipu");
         assert_eq!(family(Some("openai"), Some("https://chatgpt.com/backend-api/codex")), "openai-chatgpt");
         assert_eq!(family(Some("openai"), Some("https://api.openai.com/v1")), "openai-api");
@@ -471,7 +511,7 @@ mod tests {
         // Every preset with a spec catalog writes it; OpenAI / OpenRouter /
         // custom have no default model.
         let by_id = |id: &str| presets.as_array().unwrap().iter().find(|preset| preset["id"] == id).unwrap().clone();
-        for id in ["deepseek", "zai", "zhipu", "moonshot", "moonshot-cn", "minimax", "minimax-cn", "xai"] {
+        for id in ["deepseek", "zai", "zhipu", "moonshot", "moonshot-cn", "kimi-code", "kimi-code-cn", "minimax", "minimax-cn", "xai"] {
             assert_eq!(by_id(id)["modelCatalog"], true, "{id}");
             let preset = find_preset(id).unwrap();
             let root = api_key_profile_config(preset.provider_id, preset.provider_name, preset.base_url).unwrap();
@@ -509,6 +549,18 @@ mod tests {
         for id in ["deepseek", "xai"] {
             assert_eq!(api_key_profile_config(id, id, None).unwrap()["web_search"].as_str(), Some("disabled"), "{id}");
         }
+        // Kimi Code: the official Codex template turns live web search on;
+        // both regions share the provider ID and the catalog.
+        let kimi_cn = find_preset("kimi-code-cn").unwrap();
+        let root = api_key_profile_config(kimi_cn.provider_id, kimi_cn.provider_name, kimi_cn.base_url).unwrap();
+        assert_eq!(root["web_search"].as_str(), Some("live"));
+        assert_eq!(root["model"].as_str(), Some("kimi-for-coding"));
+        assert_eq!(root["model_providers"]["kimi-code"]["base_url"].as_str(), Some("https://api.kimi.com/coding/v1"));
+        assert_eq!(root["model_providers"]["kimi-code"]["wire_api"].as_str(), Some("responses"));
+        assert!(root.get("model_reasoning_effort").is_none());
+        assert_eq!(by_id("kimi-code")["quotaReader"], "kimi_code_plan");
+        assert_eq!(by_id("kimi-code")["providerFamilyLabel"], "Kimi Code");
+        assert_eq!(find_preset("kimi-for-coding").unwrap().id, "kimi-code");
         for (id, name) in [("custom", "custom"), ("zai", "Z.ai"), ("moonshot", "Moonshot"), ("minimax", "MiniMax"), ("openrouter", "OpenRouter")] {
             assert!(api_key_profile_config(id, name, Some("https://x.example/v1")).unwrap().get("web_search").is_none(), "{id}");
         }
@@ -526,6 +578,8 @@ mod tests {
                 ("zhipu", true),
                 ("moonshot", true),
                 ("moonshot-cn", true),
+                ("kimi-code", true),
+                ("kimi-code-cn", true),
                 ("minimax", false),
                 ("minimax-cn", false),
                 ("xai", false),

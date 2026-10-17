@@ -1964,10 +1964,29 @@ fn load_or_create_job_service_completion_token(path: &Path) -> anyhow::Result<St
     Ok(token)
 }
 
+/// The held agent bus host lock; released when dropped.
+///
+/// The file is opened close-on-exec, so no child of the bus keeps it after
+/// `exec`. Between `fork` and `exec`, though, a child spawned by another
+/// thread holds a copy of the descriptor, and a flock lives until the last
+/// copy of its open file description closes: a plain close could leave the
+/// lock held for that window (a restart in the same process, e.g. the
+/// tests, saw EAGAIN). `Drop` therefore unlocks explicitly first; `LOCK_UN`
+/// acts on the shared open file description, i.e. on every copy.
+struct AgentBusHostLock {
+    file: File,
+}
+
+impl Drop for AgentBusHostLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
 /// Takes the exclusive single-instance lock `<service_root>/agent-bus-host.lock`
-/// (r218 kept the same lock inside the Task Service root). The returned file
+/// (r218 kept the same lock inside the Task Service root). The returned guard
 /// holds the lock until it is dropped.
-fn acquire_agent_bus_host_lock(service_root: &Path) -> anyhow::Result<File> {
+fn acquire_agent_bus_host_lock(service_root: &Path) -> anyhow::Result<AgentBusHostLock> {
     if let Ok(metadata) = fs::symlink_metadata(service_root) {
         if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
             anyhow::bail!(
@@ -1990,7 +2009,7 @@ fn acquire_agent_bus_host_lock(service_root: &Path) -> anyhow::Result<File> {
             service_root.display()
         )
     })?;
-    Ok(lock)
+    Ok(AgentBusHostLock { file: lock })
 }
 
 fn open_agent_bus_host_lock(path: &Path) -> anyhow::Result<File> {

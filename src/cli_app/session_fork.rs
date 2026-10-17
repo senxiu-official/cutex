@@ -26,7 +26,10 @@
 //!    visible, name it and add it to the source's project. Its history is
 //!    taken from the home it was forked in (the source's native home, not the
 //!    selected deployment's), the inherited source history only up to the
-//!    byte prefix the fork references, so a live source may keep writing.
+//!    byte prefix the fork references, so a live source may keep writing;
+//! 5. when adoption gave the fork a home of its own, delete the copy native
+//!    left in the source's home: it is no session's history, but it kept the
+//!    source's rollouts referenced, so deleting the source was refused.
 use cutex::catalog::{CatalogEndpoint, CatalogError};
 use cutex::management::control_plane::HumanManagementPrincipal;
 use cutex::management::v2::session_fork::{default_fork_name, SessionForkRequest};
@@ -197,6 +200,7 @@ fn launch_permissions(record: &CutexSessionRecord) -> Option<cutex::config::new_
     Some(cutex::config::new_thread::LaunchPermissions {
         sandbox,
         approval: record.approval_policy.clone()?,
+        approvals_reviewer: record.approvals_reviewer.clone(),
         network_access: record.sandbox_network_access.unwrap_or(false),
         writable_roots: record.sandbox_writable_roots.clone(),
     })
@@ -460,6 +464,8 @@ pub(crate) fn fork_for_management(
     if let Some(message) = &adopted.error {
         return Err(partial("roster import", message.clone(), Some(&new_id)));
     }
+    // Adopted into a home of its own (step 5): drop the source-home copy.
+    super::session_delete::release_fork_copy(&source, &forked.home, &thread);
     follow_up(&new_id, "cutex/session/visibility/show", json!({}))
         .map_err(|message| partial("visibility", message, Some(&new_id)))?;
     if !agent {

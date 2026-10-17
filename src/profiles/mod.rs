@@ -19,6 +19,7 @@ pub mod plan_label;
 pub mod profile_config;
 pub mod providers;
 pub mod lifecycle;
+pub mod transfer;
 pub mod references;
 pub mod store;
 
@@ -37,6 +38,7 @@ pub mod settings_api;
 pub mod catalog_api;
 pub mod catalog_overlay;
 pub mod native_models;
+pub mod reviewer_catalog;
 pub mod reasoning;
 pub mod claude_models;
 pub mod claude_tool_defaults;

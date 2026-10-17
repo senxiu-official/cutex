@@ -1,0 +1,9 @@
+{
+  "_comment": "upgrade-manifest.py --meta for cutex 0.1.2 (sign-and-upload.sh uses release-meta/<release>.json by itself). mode full, no native: like 0.1.1, cutex 0.1.2 by default ships no new cute-codex (the host keeps 0.160.0-r52.2; no --native-run), so without this the manifest would be `reload` and NEW agents would keep releases/0.1.1/manifests/default.json, i.e. the 0.1.1 cutex-mcp facade (no browser-refusal-reasons / browser-popup-grant hints). In full mode the runner (src/upgrade/swap.rs select_runtime) writes releases/0.1.2/manifests/default.json with the native files of the host's current selection and the 0.1.2 facade and selects it for new agents; the default packageRun `after` then moves idle existing agents. The previous capability list is the published cutex-0.1.1/capabilities.json (capabilities-0.1.1.json here is a copy for the upgrade e2e); 0.1.2 only adds capabilities. If 0.1.2 ships native 0.160.0-r52.3 (--native-run), mode stays full and the notes change: docs/release/RUNBOOK-0.1.3.md, section 'Variant: with native r52.3'. The upgrade e2e (ci/upgrade-e2e.py --release-meta) generates its 0.1.2 manifest from this same file.",
+  "mode": "full",
+  "packageRunRecommended": true,
+  "notes": {
+    "en": "The desktop's Auto mode uses Codex's automatic reviewer for escalations; Windows sandbox readiness and a one-click setup without administrator rights; copy a Profile to another host; precise in-app browser refusal reasons for agents; fixes: Windows API-key Profiles that could not start agents (repaired automatically), deleting agents that had been forked, previews of artifacts published under a label name. New agents start with this release's tools; idle agents move over after the update.",
+    "zh-CN": "桌面端的「自动」模式由 Codex 自动审批员处理越界操作；Windows 沙箱就绪检查与免管理员一键设置；Profile 可复制到其他主机；智能体能得到内置浏览器的具体拒绝原因；修复：Windows 上无法创建智能体的 API-key Profile（自动修复）、删除被分叉过的智能体、以名称发布的成果无法预览。新智能体使用本版本的工具，空闲的智能体会在更新后自动迁移。"
+  }
+}

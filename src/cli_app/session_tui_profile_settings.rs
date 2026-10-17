@@ -470,6 +470,7 @@ impl ProfileSettingsSnapshot {
                 ("Kimi balance (api.moonshot.cn)", "moonshot_cn_balance"),
                 ("Zhipu Coding Plan quota", "zhipu_coding_plan"),
                 ("OpenRouter key credits", "openrouter_key"),
+                ("Kimi Code plan quota (<base URL>/usages)", "kimi_code_plan"),
             ],
             ProfileSettingsField::DeepSeekPreset => &[
                 ("Keep current model/provider config", "current"),

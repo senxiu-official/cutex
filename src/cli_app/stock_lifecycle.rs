@@ -381,35 +381,11 @@ impl Drop for StockExecutor {
     }
 }
 
-fn launch_tmpdir(configured: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
-    if let Some(path) = configured.filter(|path| !path.is_empty()) {
-        return Ok(path.into());
-    }
-    let path = cutex::config::paths::runtime_dir()?.join("stock-tmp");
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(&path)
-        .context("failed to create runtime temporary directory")?;
-    let metadata = std::fs::symlink_metadata(&path)?;
-    ensure!(
-        metadata.is_dir(),
-        "runtime temporary path must be a directory"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        ensure!(
-            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
-            "runtime temporary directory must be private and owned"
-        );
-    }
-    Ok(path)
+/// `TMPDIR` for a spawned native: an explicit one stays supported unless it
+/// is another cutex home's stock-tmp (inherited from an agent shell), else
+/// this home's private `runtime/stock-tmp`.
+pub(super) fn launch_tmpdir(configured: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    cutex::config::paths::launch_tmp_dir(configured)
 }
 
 pub(super) fn clean_launch(
@@ -581,6 +557,9 @@ pub(super) fn configured(
         } else {
             projection.native_args(owner)?
         });
+        // A catalog-less API-key profile on its own provider: the automatic
+        // reviewer reviews with the agent's model (`reviewer_catalog`).
+        launch = launch.args(cutex::profiles::reviewer_catalog::launch_args(projection, &profile.model, bundle, native_home));
     } else if profile.private_chatgpt_auth.is_some() {
         launch = option(launch, "cli_auth_credentials_store", "file")?;
     } else {
@@ -595,6 +574,10 @@ pub(super) fn configured(
     if owner {
         launch = option(launch, "approval_policy", &profile.approval)?;
         launch = option(launch, "sandbox_mode", &profile.sandbox)?;
+        // Explicit reviewer only: None keeps the profile's own setting.
+        if let Some(reviewer) = &profile.approvals_reviewer {
+            launch = option(launch, "approvals_reviewer", reviewer)?;
+        }
         // Honoured only when no named permission profile is selected (older
         // bundles); `permission_profile` below covers profile-mode launches.
         if let Some(table) = profile.legacy_workspace_write_table() {
@@ -1796,6 +1779,18 @@ mod ingress_guard_tests {
             super::launch_tmpdir(Some("/custom/tmp")).unwrap(),
             std::path::PathBuf::from("/custom/tmp")
         );
+        // An agent shell of another cutex home exports that home's stock-tmp.
+        assert_eq!(
+            super::launch_tmpdir(Some("/other/home/.cutex/runtime/stock-tmp")).unwrap(),
+            tmp
+        );
+        assert_eq!(
+            super::launch_tmpdir(Some("/other/home/.cutex/runtime/stock-tmp/cb-1234")).unwrap(),
+            tmp
+        );
+        // This home's own stock-tmp (e.g. a nested `cutex` call) is kept.
+        let own = tmp.join("nested");
+        assert_eq!(super::launch_tmpdir(own.to_str()).unwrap(), own);
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(tmp).unwrap().permissions().mode() & 0o777,

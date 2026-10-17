@@ -121,8 +121,11 @@ jobs:
     steps:
       - name: Keep LF line endings
         run: git config --global core.autocrlf false
+      # Full history: job-service's archive mtime is the last commit of its sources (components/
+      # job-service/build.sh), so an unchanged component version rebuilds byte for byte in a later release.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Neutral build directory (the binaries keep the source path in one place)
         run: |

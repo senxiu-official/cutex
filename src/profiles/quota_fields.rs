@@ -53,6 +53,7 @@ impl Field {
                 ("1 - used / limit", "used_and_limit"),
                 ("Remaining percent", "remaining_percent"),
                 ("100 - used percent", "used_percent"),
+                ("1 - used ratio (0..1)", "used_ratio"),
             ],
             Self::ResetFormat => vec![
                 ("RFC3339 / ISO timestamp", "rfc3339"),
@@ -82,6 +83,7 @@ impl Field {
                 Mode::UsedAndLimit => "used_and_limit",
                 Mode::RemainingPercent => "remaining_percent",
                 Mode::UsedPercent => "used_percent",
+                Mode::UsedRatio => "used_ratio",
                 Mode::Balance => "balance",
             }
             .into(),

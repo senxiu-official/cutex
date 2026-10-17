@@ -19,6 +19,22 @@ pub const SANDBOX_MODES: &[&str] = &["read-only", "workspace-write", "danger-ful
 /// Approval policies cutex can launch with. `untrusted` is rejected by the
 /// native config loader and `on-failure` is a deprecated alias of `on-request`.
 pub const APPROVAL_POLICIES: &[&str] = &["never", "on-request"];
+/// Who reviews on-request escalations (native `approvals_reviewer`): the owner
+/// (`user`) or the native automatic reviewer (`auto_review`). The native also
+/// accepts the legacy alias `guardian_subagent`; cutex stores the canonical name.
+pub const APPROVALS_REVIEWERS: &[&str] = &["user", "auto_review"];
+/// The reviewer of the desktop's 「自动」 mode and the built-in default of
+/// both thread kinds (owner decision 2026-10-16).
+pub const AUTO_REVIEW: &str = "auto_review";
+
+/// Canonical reviewer name, or None for an unknown value.
+pub fn canonical_approvals_reviewer(value: &str) -> Option<&'static str> {
+    match value {
+        "user" => Some("user"),
+        "auto_review" | "guardian_subagent" => Some(AUTO_REVIEW),
+        _ => None,
+    }
+}
 pub const MAX_WRITABLE_ROOTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +53,8 @@ pub struct ThreadLaunchDefaults {
     pub sandbox: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_access: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,6 +108,9 @@ impl NewThreadDefaults {
         if let Some(approval) = &configured.approval {
             resolved.approval = approval.clone();
         }
+        if let Some(reviewer) = &configured.approvals_reviewer {
+            resolved.approvals_reviewer = Some(reviewer.clone());
+        }
         if let Some(network) = configured.network_access {
             resolved.network_access = network;
         }
@@ -117,6 +138,11 @@ impl NewThreadDefaults {
 pub struct LaunchPermissions {
     pub sandbox: String,
     pub approval: String,
+    /// Native `approvals_reviewer` (`user` | `auto_review`); None leaves it to
+    /// the profile config / native default (`user`). Only consulted with
+    /// `on-request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network_access: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -129,18 +155,22 @@ impl LaunchPermissions {
     /// never). Homes that existed before keep full access through the
     /// one-time migration `fresh-agent-permissions`, which stores the old
     /// values explicitly. Quick chats are confined to their own directory
-    /// (workspace-write, no network) and ask before escalating (on-request).
+    /// (workspace-write, no network). Escalations of both kinds go to the
+    /// native automatic reviewer (`auto_review`; owner decision 2026-10-16:
+    /// 「自动」 is workspace-write + on-request + auto_review), not the owner.
     pub fn builtin(kind: ThreadKind) -> Self {
         match kind {
             ThreadKind::Agent => Self {
                 sandbox: "workspace-write".into(),
                 approval: "on-request".into(),
+                approvals_reviewer: Some(AUTO_REVIEW.into()),
                 network_access: true,
                 writable_roots: Vec::new(),
             },
             ThreadKind::QuickChat => Self {
                 sandbox: "workspace-write".into(),
                 approval: "on-request".into(),
+                approvals_reviewer: Some(AUTO_REVIEW.into()),
                 network_access: false,
                 writable_roots: Vec::new(),
             },
@@ -163,6 +193,13 @@ impl LaunchPermissions {
             APPROVAL_POLICIES.contains(&self.approval.as_str()),
             "approvalPolicy must be one of {}",
             APPROVAL_POLICIES.join(", ")
+        );
+        ensure!(
+            self.approvals_reviewer
+                .as_deref()
+                .is_none_or(|reviewer| APPROVALS_REVIEWERS.contains(&reviewer)),
+            "approvalsReviewer must be one of {}",
+            APPROVALS_REVIEWERS.join(", ")
         );
         validate_writable_roots(&self.writable_roots)
     }
@@ -191,6 +228,7 @@ impl LaunchPermissions {
         record.sandbox_mode = Some(self.sandbox.clone());
         record.permission_defaults = Some(self.sandbox.clone());
         record.approval_policy = Some(self.approval.clone());
+        record.approvals_reviewer = self.approvals_reviewer.clone();
         record.sandbox_network_access = self.network_access.then_some(true);
         record.sandbox_writable_roots = self.writable_roots.clone();
     }
@@ -223,6 +261,10 @@ pub struct LaunchOverrides {
     pub sandbox: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<String>,
+    /// `user` | `auto_review` (alias `guardian_subagent`), capability
+    /// `launch-approvals-reviewer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_access: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,6 +283,7 @@ impl LaunchOverrides {
     pub fn has_permission_overrides(&self) -> bool {
         self.sandbox.is_some()
             || self.approval_policy.is_some()
+            || self.approvals_reviewer.is_some()
             || self.network_access.is_some()
             || self.writable_roots.is_some()
     }
@@ -266,6 +309,14 @@ impl LaunchOverrides {
                 ));
             }
         }
+        if let Some(reviewer) = &self.approvals_reviewer {
+            if canonical_approvals_reviewer(reviewer).is_none() {
+                return Err(format!(
+                    "launch.approvalsReviewer must be one of {}",
+                    APPROVALS_REVIEWERS.join(", ")
+                ));
+            }
+        }
         if let Some(roots) = &self.writable_roots {
             validate_writable_roots(roots).map_err(|error| format!("launch.{error}"))?;
         }
@@ -286,6 +337,10 @@ impl LaunchOverrides {
         }
         if let Some(approval) = &self.approval_policy {
             permissions.approval = approval.clone();
+        }
+        if let Some(reviewer) = self.approvals_reviewer.as_deref() {
+            permissions.approvals_reviewer =
+                Some(canonical_approvals_reviewer(reviewer).unwrap_or(reviewer).to_string());
         }
         if let Some(network) = self.network_access {
             permissions.network_access = network;
@@ -321,10 +376,12 @@ mod tests {
         let agent = defaults.resolve(ThreadKind::Agent);
         assert_eq!((agent.sandbox.as_str(), agent.approval.as_str()), ("workspace-write", "on-request"));
         assert!(agent.network_access && agent.writable_roots.is_empty());
+        assert_eq!(agent.approvals_reviewer.as_deref(), Some("auto_review"));
         let chat = defaults.resolve(ThreadKind::QuickChat);
         assert_eq!((chat.sandbox.as_str(), chat.approval.as_str()), ("workspace-write", "on-request"));
         assert!(!chat.network_access && chat.writable_roots.is_empty());
         assert!(!chat.has_workspace_extras());
+        assert_eq!(chat.approvals_reviewer.as_deref(), Some("auto_review"));
     }
 
     #[test]
@@ -363,11 +420,14 @@ mod tests {
         assert_eq!(permissions.sandbox, "read-only");
         assert!(!permissions.has_workspace_extras());
         assert!(serde_json::from_value::<LaunchOverrides>(serde_json::json!({"sandboxMode": "x"})).is_err());
+        assert_eq!(permissions.approvals_reviewer.as_deref(), Some("auto_review"), "absent reviewer keeps the default");
         for bad in [
             serde_json::json!({"sandbox": "full"}),
             serde_json::json!({"approvalPolicy": "untrusted"}),
             serde_json::json!({"approvalPolicy": "on-failure"}),
             serde_json::json!({"writableRoots": ["relative"]}),
+            serde_json::json!({"approvalsReviewer": "owner"}),
+            serde_json::json!({"approvalsReviewer": ""}),
             serde_json::json!({"model": " x"}),
             serde_json::json!({"reasoningEffort": "hi gh"}),
         ] {
@@ -377,11 +437,47 @@ mod tests {
     }
 
     #[test]
+    fn approvals_reviewer_override_and_defaults() {
+        // The launch override selects the reviewer; the legacy alias is stored canonically.
+        for (given, stored) in [("user", "user"), ("auto_review", "auto_review"), ("guardian_subagent", "auto_review")] {
+            let launch: LaunchOverrides =
+                serde_json::from_value(serde_json::json!({"approvalsReviewer": given})).unwrap();
+            launch.validate().unwrap();
+            assert!(launch.has_permission_overrides());
+            let mut permissions = LaunchPermissions::builtin(ThreadKind::Agent);
+            launch.apply_permissions(&mut permissions);
+            assert_eq!(permissions.approvals_reviewer.as_deref(), Some(stored));
+            permissions.validate_shape().unwrap();
+            let mut record = crate::session::model::CutexSessionRecord::new(
+                "cutex.019e-reviewer".into(), None, "devbox".into(), "/w".into(), None,
+            )
+            .unwrap();
+            permissions.apply_to_record(&mut record);
+            assert_eq!(record.approvals_reviewer.as_deref(), Some(stored));
+        }
+        // Configured defaults: a stored `user` reviewer wins over the built-in.
+        let defaults: NewThreadDefaults =
+            serde_json::from_value(serde_json::json!({"quick_chat": {"approvals_reviewer": "user"}})).unwrap();
+        assert_eq!(defaults.resolve(ThreadKind::QuickChat).approvals_reviewer.as_deref(), Some("user"));
+        assert_eq!(defaults.resolve(ThreadKind::Agent).approvals_reviewer.as_deref(), Some("auto_review"));
+        defaults.validate().unwrap();
+        let bad: NewThreadDefaults =
+            serde_json::from_value(serde_json::json!({"agent": {"approvals_reviewer": "owner"}})).unwrap();
+        assert!(bad.validate().is_err());
+        // Persisted permissions written before the field still read (reviewer unknown = None).
+        let old: LaunchPermissions =
+            serde_json::from_value(serde_json::json!({"sandbox": "workspace-write", "approval": "on-request"})).unwrap();
+        assert_eq!(old.approvals_reviewer, None);
+        assert!(serde_json::to_value(&old).unwrap().get("approvals_reviewer").is_none());
+    }
+
+    #[test]
     fn launch_validation_canonicalizes_and_dedupes_roots() {
         let dir = std::env::temp_dir();
         let mut permissions = LaunchPermissions {
             sandbox: "workspace-write".into(),
             approval: "on-request".into(),
+            approvals_reviewer: None,
             network_access: false,
             writable_roots: vec![dir.display().to_string(), dir.display().to_string()],
         };

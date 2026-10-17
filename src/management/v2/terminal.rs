@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpStream;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -31,6 +33,21 @@ pub const SCROLLBACK_BYTES: usize = 256 * 1024;
 const SUBSCRIBER_CAPACITY: usize = 512;
 const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
+/// `DELETE` hangs the shell up first (SIGHUP, so it can pass the hangup on to
+/// its jobs); a shell still running after this grace is killed with its
+/// process group (Unix: an interactive shell can miss a SIGHUP that arrives
+/// while it starts up, or a script may ignore it).
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_millis(1500);
+/// After the shell exited, output still arriving is drained until the pty is
+/// quiet for one poll interval, at most this long. Unix: other processes may
+/// hold the pty slave open (a background job, or a process spawned elsewhere
+/// in the daemon while `openpty` had not yet marked the slave close-on-exec),
+/// so EOF on the master can be arbitrarily late.
+#[cfg(unix)]
+const EXIT_DRAIN_MAX: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const READER_POLL_MS: i32 = 100;
 
 #[derive(Clone)]
 enum TerminalEvent {
@@ -61,6 +78,10 @@ struct Terminal {
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    /// Held by the waiter while it records the shell's exit and reaps it, and
+    /// by the kill escalation while it signals: the escalation never signals a
+    /// reaped (possibly reused) pid.
+    child_exited: Mutex<bool>,
     state: Mutex<TerminalState>,
 }
 
@@ -307,6 +328,10 @@ pub fn create(root: &ResolvedRoot, body: &[u8]) -> WorkspaceResult<Value> {
         .map_err(|error| WorkspaceError::new(503, "pty_unavailable", format!("{error:#}")))?;
     let killer = child.clone_killer();
     let pid = child.process_id();
+    #[cfg(unix)]
+    let poll_fd = pair.master.as_raw_fd();
+    #[cfg(not(unix))]
+    let poll_fd: Option<i32> = None;
     let id = format!("term-{}", uuid::Uuid::new_v4().simple());
     let terminal = Arc::new(Terminal {
         id: id.clone(),
@@ -319,6 +344,7 @@ pub fn create(root: &ResolvedRoot, body: &[u8]) -> WorkspaceResult<Value> {
         writer: Mutex::new(writer),
         master: Mutex::new(Some(pair.master)),
         killer: Mutex::new(killer),
+        child_exited: Mutex::new(false),
         state: Mutex::new(TerminalState {
             scrollback: VecDeque::new(),
             end_offset: 0,
@@ -335,31 +361,125 @@ pub fn create(root: &ResolvedRoot, body: &[u8]) -> WorkspaceResult<Value> {
         .insert(id.clone(), terminal.clone());
 
     let reader_terminal = terminal.clone();
+    let stop_reading = Arc::new(AtomicBool::new(false));
+    let reader_stop = stop_reading.clone();
     let reader_thread = std::thread::Builder::new()
         .name(format!("cutex-pty-read-{id}"))
-        .spawn(move || read_loop(reader, reader_terminal))
+        .spawn(move || read_loop(reader, reader_terminal, poll_fd, reader_stop))
         .map_err(WorkspaceError::internal)?;
     let waiter_terminal = terminal.clone();
     std::thread::Builder::new()
         .name(format!("cutex-pty-wait-{id}"))
         .spawn(move || {
-            let code = child.wait().ok().map(|status| status.exit_code());
-            // ConPTY keeps the output pipe open until the pseudoconsole is
-            // closed; give the reader a moment to drain, then close it.
+            // Wait without reaping, then reap under the lock (see child_exited).
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                wait_exited_no_reap(pid);
+            }
+            let code = {
+                let mut exited = waiter_terminal
+                    .child_exited
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let code = child.wait().ok().map(|status| status.exit_code());
+                *exited = true;
+                code
+            };
+            // Give the reader a moment to drain what the shell wrote last.
             std::thread::sleep(Duration::from_millis(150));
+            stop_reading.store(true, Ordering::SeqCst);
+            // ConPTY keeps the output pipe open until the pseudoconsole is
+            // closed: close it first there. Unix: the reader polls the master
+            // fd, so the master stays open until the reader is done.
+            if poll_fd.is_none() {
+                if let Ok(mut master) = waiter_terminal.master.lock() {
+                    master.take();
+                }
+            }
+            let _ = reader_thread.join();
             if let Ok(mut master) = waiter_terminal.master.lock() {
                 master.take();
             }
-            let _ = reader_thread.join();
             waiter_terminal.mark_exited(code);
         })
         .map_err(WorkspaceError::internal)?;
     Ok(terminal.summary())
 }
 
-fn read_loop(mut reader: Box<dyn Read + Send>, terminal: Arc<Terminal>) {
-    let mut buffer = vec![0_u8; 16 * 1024];
+/// Block until `pid` has exited, leaving it unreaped (`WNOWAIT`).
+#[cfg(unix)]
+fn wait_exited_no_reap(pid: u32) {
     loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        {
+            return;
+        }
+    }
+}
+
+/// Unix: `Some(true)` when the pty has data (or hung up), `Some(false)` on a
+/// quiet poll interval, `None` when polling failed.
+#[cfg(unix)]
+fn poll_readable(fd: i32) -> Option<bool> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut pollfd, 1, READER_POLL_MS) };
+        if result > 0 {
+            return Some(true);
+        }
+        if result == 0 {
+            return Some(false);
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
+}
+
+/// Copies pty output into the terminal until EOF. Unix (`poll_fd` = the
+/// master fd, open until this returns): once `stop` is set (the shell has
+/// exited) it also ends when the pty is quiet or after [`EXIT_DRAIN_MAX`], so
+/// a process still holding the slave cannot keep the terminal from exiting.
+fn read_loop(
+    mut reader: Box<dyn Read + Send>,
+    terminal: Arc<Terminal>,
+    poll_fd: Option<i32>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut buffer = vec![0_u8; 16 * 1024];
+    #[cfg(unix)]
+    let mut stopped_at: Option<std::time::Instant> = None;
+    #[cfg(not(unix))]
+    let _ = (&poll_fd, &stop);
+    loop {
+        #[cfg(unix)]
+        if let Some(fd) = poll_fd {
+            if stop.load(Ordering::SeqCst) {
+                let since = *stopped_at.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= EXIT_DRAIN_MAX {
+                    break;
+                }
+            }
+            match poll_readable(fd) {
+                Some(true) => {}
+                Some(false) if stop.load(Ordering::SeqCst) => break,
+                Some(false) => continue,
+                None => break,
+            }
+        }
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => terminal.push_output(&buffer[..count]),
@@ -450,11 +570,45 @@ pub fn kill(id: &str) -> WorkspaceResult<Value> {
         if let Ok(mut killer) = terminal.killer.lock() {
             let _ = killer.kill();
         }
+        #[cfg(unix)]
+        if let Some(pid) = terminal.pid {
+            let terminal = terminal.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("cutex-pty-kill-{id}"))
+                .spawn(move || escalate_kill(&terminal, pid));
+        }
     }
     if let Ok(mut registry) = registry().lock() {
         registry.remove(id);
     }
     Ok(json!({ "terminalId": id, "killed": was_running }))
+}
+
+/// The shell is still running [`KILL_GRACE`] after the hangup: SIGKILL its
+/// process group (the shell leads its own session and group) and the shell.
+#[cfg(unix)]
+fn escalate_kill(terminal: &Terminal, pid: u32) {
+    let deadline = std::time::Instant::now() + KILL_GRACE;
+    loop {
+        {
+            let exited = terminal
+                .child_exited
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *exited {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Not reaped while this lock is held, so the pid is still ours.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Snapshot for (re)attachment: bytes after `since` when that offset is still
@@ -686,6 +840,109 @@ mod tests {
             terminal.state.lock().unwrap().exited,
             "terminal exits after kill"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    fn session_root(tag: &str) -> (std::path::PathBuf, ResolvedRoot) {
+        let dir = std::env::temp_dir().join(format!(
+            "cutex-term-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = ResolvedRoot::from_dir(
+            Scope {
+                kind: ScopeKind::Session,
+                id: format!("s-{tag}"),
+            },
+            &dir,
+        )
+        .unwrap();
+        (dir, root)
+    }
+
+    #[cfg(unix)]
+    fn wait_exited(terminal: &Terminal, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if terminal.state.lock().unwrap().exited {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        terminal.state.lock().unwrap().exited
+    }
+
+    /// A shell that survives the hangup (here: ignores it; an interactive
+    /// shell can also miss one during startup) is killed with its group.
+    #[cfg(unix)]
+    #[test]
+    fn kill_escalates_when_the_shell_survives_the_hangup() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, root) = session_root("hup");
+        let script = dir.join("ignore-hup.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ntrap '' HUP\necho cutexready\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let body = json!({ "cols": 80, "rows": 24, "shell": script.to_string_lossy() }).to_string();
+        let created = create(&root, body.as_bytes()).unwrap();
+        let id = created["terminalId"].as_str().unwrap().to_string();
+        let terminal = get(&id).unwrap();
+        let pid = terminal.pid.unwrap() as libc::pid_t;
+        assert!(collect_output(
+            &terminal,
+            "cutexready",
+            Duration::from_secs(20)
+        ));
+        let started = Instant::now();
+        assert_eq!(kill(&id).unwrap()["killed"], true);
+        assert!(
+            wait_exited(&terminal, Duration::from_secs(10)),
+            "terminal exits after kill"
+        );
+        assert!(
+            started.elapsed() >= KILL_GRACE,
+            "the hangup was ignored, so the kill came after the grace"
+        );
+        // Reaped and gone, its `sleep` children (same process group) with it.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(unsafe { libc::killpg(pid, 0) }, -1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Another process holding the pty slave (a leaked fd) cannot keep a
+    /// killed terminal from exiting.
+    #[cfg(unix)]
+    #[test]
+    fn exits_while_another_holder_keeps_the_pty_slave_open() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let (dir, root) = session_root("slave");
+        let created = create(&root, br#"{"cols":80,"rows":24,"shell":"/bin/sh"}"#).unwrap();
+        let id = created["terminalId"].as_str().unwrap().to_string();
+        let terminal = get(&id).unwrap();
+        input(&id, br#"{"data":"echo cutex$((40+2))ok\r"}"#).unwrap();
+        assert!(collect_output(
+            &terminal,
+            "cutex42ok",
+            Duration::from_secs(20)
+        ));
+        let pid = terminal.pid.unwrap();
+        let pts = std::fs::read_link(format!("/proc/{pid}/fd/0")).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&pts)
+            .unwrap();
+        assert_eq!(kill(&id).unwrap()["killed"], true);
+        assert!(
+            wait_exited(&terminal, Duration::from_secs(10)),
+            "terminal exits although {pts:?} is still open elsewhere"
+        );
+        drop(holder);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

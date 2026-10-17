@@ -199,6 +199,12 @@ pub fn grant(
         GrantSource::AgentOpen { request_id } => {
             open_proof(relay, binding, request_id, &agent.session, None)?;
         }
+        // The opener lease is checked atomically in grant_checked.
+        GrantSource::Popup { opener_lease_id } => {
+            if !identifier(opener_lease_id) {
+                return Err(RelayError::new("invalid_request"));
+            }
+        }
     }
     let open_id = match &request.source {
         GrantSource::AgentOpen { request_id } => Some(request_id.clone()),

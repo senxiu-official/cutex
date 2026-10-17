@@ -256,14 +256,15 @@ pub fn prepare(request: &PublishRequest, settings: &ArtifactSettings, git: &mut 
     let resolved = paths::resolve(&request.path, request.base.as_deref(), &request.roots)?;
     let name = name.unwrap_or_else(|| paths::default_name(&resolved.path, &request.name_bases));
     let (content, sample) = read_content(&resolved, settings, true)?;
+    let source_path = resolved.display();
     Ok(NewVersion {
         scope: request.scope.clone(),
-        default_kind: paths::default_kind(&name).to_string(),
-        media_type: paths::media_type(&name, &sample),
+        default_kind: paths::default_kind_of(&name, &source_path).to_string(),
+        media_type: paths::media_type(&source_path, &name, &sample),
         name,
         kind: request.kind.clone(),
         content,
-        source_path: resolved.display(),
+        source_path,
         source_mtime_ms: resolved.mtime_ms,
         note: super::clean_note(request.note.as_deref()),
         git: git.info(&resolved.path),
@@ -352,6 +353,29 @@ mod tests {
         }
     }
 
+    /// The desktop's 「从工作区发布…」 sends an owner label as the name; the
+    /// media type and default kind still follow the published file.
+    #[test]
+    fn a_label_name_keeps_the_files_media_type_and_kind() {
+        let host = TestHost::new("publish-label");
+        let workspace = host.workspace("ws");
+        std::fs::create_dir_all(workspace.join("out")).unwrap();
+        std::fs::write(workspace.join("out/page.html"), "<!DOCTYPE html>\n<html><body><h1>Hi</h1></body></html>\n").unwrap();
+        std::fs::write(workspace.join("out/paper.pdf"), b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n").unwrap();
+        std::fs::write(workspace.join("out/photo.JPG"), [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00]).unwrap();
+        let now = Utc::now();
+        for (path, label, media, kind) in [
+            ("out/page.html", "round2-html-artifact", "text/html", "report"),
+            ("out/paper.pdf", "round2-pdf-artifact", "application/pdf", "report"),
+            ("out/photo.JPG", "Holiday photo", "image/jpeg", "figure"),
+        ] {
+            let mut named = request(&host, &workspace, path);
+            named.name = Some(label.into());
+            let published = publish(&host, &named, now).unwrap();
+            assert_eq!((published.version.media_type.as_str(), published.artifact.kind.as_str()), (media, kind), "{path}");
+        }
+    }
+
     #[test]
     fn publishes_blobs_externals_and_emits_events() {
         let host = TestHost::new("publish");
@@ -389,6 +413,7 @@ mod tests {
         named.kind = Some("plan".into());
         let named = publish(&host, &named, now).unwrap();
         assert_eq!((named.artifact.name.as_str(), named.artifact.kind.as_str()), ("Regression", "plan"));
+        assert_eq!(named.version.media_type, "text/markdown");
         let mut bad = request(&host, &workspace, "reports/r.md");
         bad.kind = Some("poem".into());
         assert!(matches!(publish(&host, &bad, now), Err(PublishError::Invalid(_))));

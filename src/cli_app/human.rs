@@ -237,9 +237,12 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
             let prior = LocalDeployment::selected()?;
             let deployment = LocalDeployment {
                 bundle_manifest: bundle_manifest.canonicalize()?,
-                native_home: source_home
-                    .unwrap_or(cutex::config::paths::host_codex_home_dir()?)
-                    .canonicalize()?,
+                native_home: match source_home {
+                    Some(home) => home,
+                    // The default shared home of a fresh cutex home does not exist yet.
+                    None => cutex::management::v2::codex_config::ensure_host_codex_home()?,
+                }
+                .canonicalize()?,
                 job_mcp: match job_descriptor {
                     Some(path) => Some(serde_json::from_slice(&std::fs::read(path)?)?),
                     None => prior.and_then(|p| p.job_mcp),

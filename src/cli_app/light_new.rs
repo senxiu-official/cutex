@@ -114,6 +114,17 @@ pub(super) fn human_configuration(
     Ok(configuration)
 }
 
+/// `thread/start` of the bootstrap native: the reviewer travels with the
+/// approval policy so the persisted thread starts with it (the record keeps
+/// it for every later start / resume).
+fn thread_start_body(cwd: &std::path::Path, configuration: &cutex::launch::stock::StockConfiguration) -> serde_json::Value {
+    let mut body = serde_json::json!({"cwd":cwd,"approvalPolicy":configuration.approval,"ephemeral":false,"historyMode":"paginated"});
+    if let Some(reviewer) = &configuration.approvals_reviewer {
+        body["approvalsReviewer"] = serde_json::Value::String(reviewer.clone());
+    }
+    body
+}
+
 /// Resolved permissions a configuration launches with (persisted on the record).
 pub(super) fn launch_permissions(
     configuration: &cutex::launch::stock::StockConfiguration,
@@ -121,6 +132,7 @@ pub(super) fn launch_permissions(
     cutex::config::new_thread::LaunchPermissions {
         sandbox: configuration.sandbox.clone(),
         approval: configuration.approval.clone(),
+        approvals_reviewer: configuration.approvals_reviewer.clone(),
         network_access: configuration.network_access,
         writable_roots: configuration.writable_roots.clone(),
     }
@@ -195,7 +207,8 @@ pub(super) fn create_native(
     )?;
     configuration.validate_auth_home(&deployment.native_home)?;
     timing.phase("bundle+auth checks");
-    let directory = std::env::temp_dir().join(format!(
+    // Not `std::env::temp_dir()`: an inherited TEMP may be another home's stock-tmp.
+    let directory = super::stock_lifecycle::launch_tmpdir(std::env::var("TMPDIR").ok().as_deref())?.join(format!(
         "cn-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     ));
@@ -284,7 +297,7 @@ pub(super) fn create_native(
     let client = AppServerClient::connect(AppServerClientOptions::new(endpoint))?;
     let handle = client.handle();
     timing.phase("connect");
-    let response = handle.request("thread/start", serde_json::json!({"cwd":cwd,"approvalPolicy":configuration.approval,"ephemeral":false,"historyMode":"paginated"})).context("Native creation response unconfirmed; inspect Recent before creating another agent")?;
+    let response = handle.request("thread/start", thread_start_body(cwd, &configuration)).context("Native creation response unconfirmed; inspect Recent before creating another agent")?;
     let native = response["thread"]["id"]
         .as_str()
         .context("native thread ID missing")?

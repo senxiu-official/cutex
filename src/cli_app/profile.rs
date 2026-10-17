@@ -212,11 +212,16 @@ fn switch_to_account(account: &StoredAccount) -> anyhow::Result<()> {
     sync_active_codex_home_files(account, &files)
 }
 
+/// `cutex profile copy`: settings only, like the Management duplicate. A
+/// ChatGPT login is never copied (two profiles sharing one rotating refresh
+/// token log each other out); an API key only with `--with-api-key`. The
+/// copy's account identity (email, ChatGPT plan) is cleared.
 pub(crate) fn cmd_profile_copy(
     source: &str,
     name: &str,
     provider: Option<String>,
     provider_base_url: Option<String>,
+    with_api_key: bool,
 ) -> anyhow::Result<()> {
     if name.trim().is_empty() {
         anyhow::bail!("Profile name cannot be empty");
@@ -236,16 +241,26 @@ pub(crate) fn cmd_profile_copy(
     copied_account.id = Uuid::new_v4().to_string();
     copied_account.name = name.to_string();
     copied_account.last_used_at = None;
+    copied_account.email = None;
+    if copied_account.source.as_deref() != Some("api-key") {
+        copied_account.plan_type = None;
+        copied_account.plan_label = None;
+    }
 
-    copy_profile_account_files(
+    let key_copied = copy_profile_account_files(
         &source_account,
         &copied_account,
         provider,
         provider_base_url,
+        with_api_key,
     )?;
 
+    // Without auth.json the files may say nothing ("custom"): keep the
+    // source's label then.
     if let Some(source_label) = detect_source_label_for_account_files(&copied_account) {
-        copied_account.source = Some(source_label);
+        if key_copied || source_label != "custom" {
+            copied_account.source = Some(source_label);
+        }
     }
 
     let copied_name = copied_account.name.clone();
@@ -256,27 +271,58 @@ pub(crate) fn cmd_profile_copy(
         "{GREEN}Copied{RESET} profile {BOLD}{}{RESET} -> {BOLD}{}{RESET}",
         source_account.name, copied_name
     );
+    if key_copied {
+        println!("API key copied (--with-api-key).");
+    } else {
+        println!(
+            "{YELLOW}No credentials copied:{RESET} log the copy in (desktop: Settings → Profiles) \
+             or set its API key (`cutex profile edit {copied_name}`); `--with-api-key` copies an \
+             API key, a ChatGPT login is never copied."
+        );
+    }
     cmd_profile_show(Some(copied_name.as_str()))
 }
 
+/// The API-key `auth.json` of a source profile (no ChatGPT tokens).
+fn api_key_auth(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw).is_ok_and(|auth| {
+        auth.get("tokens").is_none_or(serde_json::Value::is_null)
+            && auth
+                .get("OPENAI_API_KEY")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|key| !key.trim().is_empty())
+    })
+}
+
+/// Returns whether an API key was copied.
 fn copy_profile_account_files(
     source_account: &StoredAccount,
     target_account: &StoredAccount,
     provider: Option<String>,
     provider_base_url: Option<String>,
-) -> anyhow::Result<()> {
-    let source_files = ensure_materialized_account_files(source_account)?;
+    with_api_key: bool,
+) -> anyhow::Result<bool> {
+    let source_files = cutex::profiles::materialize::refresh_materialized_account_config(source_account)?;
     let target_files = materialized_account_files(target_account)?;
-    ensure_materialized_account_dir(&target_files)?;
 
-    let auth_contents = read_optional_text(&source_files.auth_path)?.ok_or_else(|| {
-        anyhow!(
-            "Source profile '{}' is missing auth.json at {}",
-            source_account.name,
-            source_files.auth_path.display()
-        )
-    })?;
-    write_optional_text_if_changed(&target_files.auth_path, Some(&auth_contents))?;
+    let auth_contents = read_optional_text(&source_files.auth_path)?;
+    let api_key = if with_api_key {
+        match auth_contents {
+            Some(raw) if api_key_auth(&raw) => Some(raw),
+            Some(_) => anyhow::bail!(
+                "Source profile '{}' uses a ChatGPT login, which is never copied (two profiles sharing \
+                 one refresh token log each other out); copy without --with-api-key and log the copy in",
+                source_account.name
+            ),
+            None => anyhow::bail!("Source profile '{}' has no API key to copy", source_account.name),
+        }
+    } else {
+        None
+    };
+    ensure_materialized_account_dir(&target_files)?;
+    if let Some(raw) = &api_key {
+        write_optional_text_if_changed(&target_files.auth_path, Some(raw))?;
+    }
 
     let source_config_contents = read_optional_text(&source_files.config_path)?;
     let copied_config = build_copied_profile_config(
@@ -335,7 +381,7 @@ fn copy_profile_account_files(
         custom_status_items_json.as_deref(),
     )?;
     set_materialized_file_permissions(&target_files)?;
-    Ok(())
+    Ok(api_key.is_some())
 }
 
 pub(crate) fn cmd_profile_pin(target: &str, to_top: bool) -> anyhow::Result<()> {
@@ -1488,7 +1534,8 @@ pub(crate) fn run_command(command: ProfileCommand) -> anyhow::Result<()> {
             name,
             provider,
             provider_base_url,
-        } => cmd_profile_copy(&source, &name, provider, provider_base_url),
+            with_api_key,
+        } => cmd_profile_copy(&source, &name, provider, provider_base_url, with_api_key),
         ProfileCommand::CloneStatusLine { from } => cmd_profile_clone_status_line(from.as_deref()),
         ProfileCommand::PinTop { target } => cmd_profile_pin(&target, true),
         ProfileCommand::PinBottom { target } => cmd_profile_pin(&target, false),

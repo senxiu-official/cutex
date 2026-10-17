@@ -279,7 +279,7 @@ mod tests {
             session_only: false,
             creation_defaults: Some(HumanCreationDefaults { profile: "selected-profile".into(), model: "selected-model".into(), reasoning: Some("high".into()),
                 permissions: Some(crate::config::new_thread::LaunchPermissions {
-                    sandbox: "workspace-write".into(), approval: "on-request".into(),
+                    sandbox: "workspace-write".into(), approval: "on-request".into(), approvals_reviewer: None,
                     network_access: true, writable_roots: vec![root.to_string_lossy().into_owned()],
                 }) }),
             action_id: AgentActionId::new("partial-adopt").unwrap(),

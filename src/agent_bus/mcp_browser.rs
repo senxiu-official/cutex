@@ -117,7 +117,7 @@ pub fn definitions() -> Vec<Value> {
             "browser_navigate" => "Navigate this leased tab through its allowed network policy.",
             "browser_screenshot" => "Return an inline image of the visible viewport or optional element ref.",
             "browser_release" => "Relinquish control without closing the owner's page.",
-            "browser_open" => "Open a page for you to inspect in the separate agent login pool: only loopback and cutex:service/<slug>/ URLs open. Configured owner approval is mechanical. To show the owner a result, publish it with artifact_publish show: true instead.",
+            "browser_open" => "Open a page for you to inspect in the separate agent login pool: loopback and cutex:service/<slug>/ URLs, and public websites while the owner allows websites in the desktop; LAN / tailnet addresses never (only the owner opens those). Configured owner approval is mechanical. To show the owner a result, publish it with artifact_publish show: true instead.",
             _ => "Ask the owner to hand you one of their tabs; it shares that tab's login state. The desktop may hand over a local page by itself within a few seconds: the result then has claimed: true and the guestId. Otherwise it answers approval_required; after the owner approves, use browser_list.",
         };
         json!({"name":name,"description":format!("{purpose} {DISCIPLINE}"),"inputSchema":object(properties,&optional),
@@ -196,8 +196,29 @@ pub fn filter_listing(list: &mut Value, enabled: bool) {
 /// A fixed, mechanical next step for refusals an agent can act on.
 pub fn hint(code: &str) -> Option<&'static str> {
     match code {
-        "external_pages_unavailable" | "service_proxy_required" => Some(
-            "Only loopback and cutex:service/<slug>/ URLs open in the agent browser. To show the owner a page, chart or picture, publish it with artifact_publish show: true.",
+        "external_pages_unavailable" => Some(
+            "The desktop refused this address (websites turned off, its website proxy not ready, or a LAN / local / reserved address). Loopback and cutex:service/<slug>/ pages open; public websites open only while the owner allows websites. To show the owner a page, chart or picture, publish it with artifact_publish show: true.",
+        ),
+        "service_proxy_required" => Some(
+            "This host's services need the cutex service proxy; open them as cutex:service/<slug>/ URLs. To show the owner a page, chart or picture, publish it with artifact_publish show: true.",
+        ),
+        "external_pages_off" => Some(
+            "The owner turned websites off in the desktop (Settings -> Browser). Loopback and cutex:service/<slug>/ pages still open; ask the owner if you need a website, or publish your result with artifact_publish show: true.",
+        ),
+        "external_proxy_unavailable" => Some(
+            "The desktop's website proxy is not ready yet; retry once shortly. Do not retry in a loop.",
+        ),
+        "private_address_blocked" => Some(
+            "LAN, tailnet and local addresses open only in a tab where the owner typed them, and only from that page itself; agents cannot open them. Serve your own pages as cutex:service/<slug>/ URLs.",
+        ),
+        "reserved_address" => Some(
+            "Link-local, cloud metadata and reserved addresses never open in the browser.",
+        ),
+        "protected_endpoint" => Some(
+            "cutex management, message-bus and browser-proxy ports and /__cutex paths are never browser targets.",
+        ),
+        "remote_loopback" => Some(
+            "This host is reached over SSH: localhost in the browser is the desktop computer, not this host. Run the page as a cutex service and open cutex:service/<slug>/.",
         ),
         "lease_ended_desktop_restarted" => {
             Some("The desktop app restarted and this tab's lease ended; call browser_claim or browser_open again.")
@@ -439,12 +460,20 @@ mod tests {
     #[test]
     fn browser_refusals_an_agent_can_act_on_carry_a_fixed_hint() {
         let text = |value: Value| -> Value { serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap() };
-        for code in ["external_pages_unavailable", "service_proxy_required"] {
+        for code in ["external_pages_unavailable", "service_proxy_required", "external_pages_off"] {
             let error = text(http_failure(&json!({"error":{"code":code,"details":{"url":"private"}}})))["error"].clone();
             assert_eq!(error["code"], code);
             let hint = error["hint"].as_str().unwrap();
             assert!(hint.contains("cutex:service/<slug>/") && hint.contains("artifact_publish show: true"), "{hint}");
             assert!(!error.to_string().contains("private"));
+        }
+        // Each precise desktop refusal has its own fixed, mechanical next step.
+        for (code, needle) in [("external_proxy_unavailable", "retry once"), ("private_address_blocked", "owner typed"), ("reserved_address", "metadata"),
+            ("protected_endpoint", "/__cutex"), ("remote_loopback", "over SSH")] {
+            let error = text(http_failure(&json!({"error":{"code":code}})))["error"].clone();
+            assert_eq!(error["code"], code);
+            assert!(error["hint"].as_str().unwrap().contains(needle), "{code}");
+            assert_eq!(crate::browser_relay::model::RelayError::provider(code).code, code);
         }
         let restarted = text(failure("lease_ended_desktop_restarted"))["error"].clone();
         assert!(restarted["hint"].as_str().unwrap().contains("browser_claim or browser_open"));

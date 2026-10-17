@@ -158,6 +158,18 @@ fn apply_durable_notification(
                 changed |=
                     replace_if_changed(&mut record.approval_policy, Some(policy.to_string()));
             }
+            // The reviewer the owner picks on a running thread (desktop 「自动」)
+            // must survive the next start / resume, which sends the record's.
+            if let Some(reviewer) = settings
+                .get("approvalsReviewer")
+                .and_then(Value::as_str)
+                .and_then(cutex::config::new_thread::canonical_approvals_reviewer)
+            {
+                changed |= replace_if_changed(
+                    &mut record.approvals_reviewer,
+                    Some(reviewer.to_string()),
+                );
+            }
             if let Some(profile_id) = settings
                 .pointer("/activePermissionProfile/id")
                 .and_then(Value::as_str)
@@ -185,6 +197,15 @@ fn apply_durable_notification(
                     &mut record.sandbox_mode,
                     Some(camel_to_kebab(sandbox_type)),
                 );
+                // A running workspace-write policy carries its extras; the
+                // next start / resume rebuilds them from the record
+                // (`apply_workspace_extras`, stock launches), so keep them in
+                // step. Other policies leave them (they only apply to
+                // workspace-write); a named permission profile (branch above)
+                // defines its own.
+                if sandbox_type == "workspaceWrite" {
+                    changed |= sync_workspace_extras(record, &settings["sandboxPolicy"]);
+                }
                 // The preset alias must follow, or the next launch sees an
                 // alias for the old sandbox next to the new explicit one.
                 changed |= cutex::runtime::args::reconcile_permission_fields(
@@ -201,6 +222,37 @@ fn apply_durable_notification(
         record.updated_at = timestamp.to_string();
     }
     Ok(changed)
+}
+
+/// `networkAccess` / `writableRoots` of a workspace-write `sandboxPolicy` into
+/// the record (absent keys keep the stored value). Roots: non-empty, unique,
+/// without the thread cwd (always writable).
+fn sync_workspace_extras(
+    record: &mut cutex::session::model::CutexSessionRecord,
+    policy: &Value,
+) -> bool {
+    let mut changed = false;
+    if let Some(network) = policy.get("networkAccess").and_then(Value::as_bool) {
+        changed |= replace_if_changed(&mut record.sandbox_network_access, Some(network));
+    }
+    if let Some(roots) = policy.get("writableRoots").and_then(Value::as_array) {
+        let cwd = record
+            .managed_cwd
+            .as_deref()
+            .map(cutex::session::metadata::normalize_session_cwd);
+        let mut kept: Vec<String> = Vec::new();
+        for root in roots.iter().filter_map(Value::as_str).map(str::trim) {
+            if root.is_empty()
+                || cwd.as_deref() == Some(cutex::session::metadata::normalize_session_cwd(root).as_str())
+                || kept.iter().any(|existing| existing == root)
+            {
+                continue;
+            }
+            kept.push(root.to_string());
+        }
+        changed |= replace_if_changed(&mut record.sandbox_writable_roots, kept);
+    }
+    changed
 }
 
 fn replace_if_changed<T: PartialEq>(slot: &mut T, value: T) -> bool {
@@ -316,6 +368,25 @@ mod tests {
     }
 
     #[test]
+    fn approvals_reviewer_follows_thread_settings() {
+        let settings = |value: serde_json::Value| RpcNotification {
+            method: "thread/settings/updated".to_string(),
+            params: Some(serde_json::json!({ "threadSettings": value })),
+            raw: serde_json::json!({}),
+        };
+        let mut record = record();
+        assert!(apply_durable_notification(&mut record, 7, &settings(serde_json::json!({ "approvalsReviewer": "auto_review" })), "t").unwrap());
+        assert_eq!(record.approvals_reviewer.as_deref(), Some("auto_review"));
+        // Absent (older native) or unknown values keep the stored reviewer.
+        assert!(!apply_durable_notification(&mut record, 7, &settings(serde_json::json!({ "model": null })), "t").unwrap());
+        assert!(!apply_durable_notification(&mut record, 7, &settings(serde_json::json!({ "approvalsReviewer": "someone" })), "t").unwrap());
+        // The legacy alias is stored canonically.
+        assert!(!apply_durable_notification(&mut record, 7, &settings(serde_json::json!({ "approvalsReviewer": "guardian_subagent" })), "t").unwrap());
+        assert!(apply_durable_notification(&mut record, 7, &settings(serde_json::json!({ "approvalsReviewer": "user" })), "t").unwrap());
+        assert_eq!(record.approvals_reviewer.as_deref(), Some("user"));
+    }
+
+    #[test]
     fn cutex_workspace_profile_syncs_as_the_workspace_alias() {
         let mut record = record();
         record.sandbox_mode = Some("workspace-write".into());
@@ -370,6 +441,145 @@ mod tests {
         assert!(apply_durable_notification(&mut record, 7, &notification, "t").unwrap());
         assert_eq!(record.sandbox_mode.as_deref(), Some("workspace-write"));
         assert_eq!(record.permission_defaults.as_deref(), Some("workspace-write"));
+    }
+
+    fn settings_updated(value: serde_json::Value) -> RpcNotification {
+        RpcNotification {
+            method: "thread/settings/updated".to_string(),
+            params: Some(serde_json::json!({ "threadSettings": value })),
+            raw: serde_json::json!({}),
+        }
+    }
+
+    /// The desktop's 「自动」 on a running thread: legacy sandbox policy, no
+    /// named permission profile (the native reports it as null).
+    fn auto_switch(network: bool, roots: serde_json::Value) -> RpcNotification {
+        settings_updated(serde_json::json!({
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+            "activePermissionProfile": null,
+            "sandboxPolicy": { "type": "workspaceWrite", "networkAccess": network, "writableRoots": roots,
+                "excludeTmpdirEnvVar": false, "excludeSlashTmp": false }
+        }))
+    }
+
+    fn resume_extras(record: &cutex::session::model::CutexSessionRecord) -> (Option<String>, Option<String>, Option<serde_json::Value>, Option<String>) {
+        let mut record = record.clone();
+        record.codex_session_id.get_or_insert_with(|| "018f0000-0000-7000-8000-000000000001".to_string());
+        let params = cutex::app_server::runtime::thread_resume_params_for_session(&record).unwrap();
+        (
+            params.permissions,
+            params.sandbox,
+            params.config.and_then(|config| config.get("sandbox_workspace_write").cloned()),
+            params.approvals_reviewer,
+        )
+    }
+
+    #[test]
+    fn running_auto_switch_persists_network_roots_and_reviewer_for_resume_old_home() {
+        // Old home: agents started with full access and no network
+        // (fresh-agent migration kept the old defaults).
+        let mut record = record();
+        record.managed_cwd = Some("/tmp/state-sync".into());
+        record.permission_defaults = Some("danger-full-access".into());
+        record.approval_policy = Some("never".into());
+        let switch = auto_switch(true, serde_json::json!(["/tmp/state-sync", "/extra/a", "/extra/a", "", "/extra/b"]));
+        assert!(apply_durable_notification(&mut record, 7, &switch, "t").unwrap());
+        assert_eq!(record.sandbox_network_access, Some(true));
+        assert_eq!(record.sandbox_writable_roots, vec!["/extra/a".to_string(), "/extra/b".to_string()]);
+        assert_eq!(record.approvals_reviewer.as_deref(), Some("auto_review"));
+        assert_eq!(record.permission_defaults.as_deref(), Some("workspace-write"));
+        let (permissions, sandbox, extras, reviewer) = resume_extras(&record);
+        assert_eq!(permissions, None);
+        assert_eq!(sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(extras, Some(serde_json::json!({"network_access": true, "writable_roots": ["/extra/a", "/extra/b"]})));
+        assert_eq!(reviewer.as_deref(), Some("auto_review"));
+        // The same notification again is no durable change.
+        assert!(!apply_durable_notification(&mut record, 7, &switch, "t").unwrap());
+        // A thread start (fresh native thread for the record) uses the same values.
+        let mut fresh = record.clone();
+        fresh.codex_session_id = None;
+        let start = cutex::app_server::runtime::thread_start_params_for_session(&fresh, None).unwrap();
+        assert_eq!(start.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(start.config.unwrap()["sandbox_workspace_write"]["network_access"], true);
+    }
+
+    #[test]
+    fn running_switch_turning_extras_off_survives_resume_new_home() {
+        // New home: workspace-write with network on by default.
+        let mut record = record();
+        record.permission_defaults = Some("workspace-write".into());
+        record.approval_policy = Some("on-request".into());
+        record.sandbox_network_access = Some(true);
+        record.sandbox_writable_roots = vec!["/old".into()];
+        assert_eq!(resume_extras(&record).2.unwrap()["network_access"], true);
+        assert!(apply_durable_notification(&mut record, 7, &auto_switch(false, serde_json::json!([])), "t").unwrap());
+        assert_eq!(record.sandbox_network_access, Some(false));
+        assert!(record.sandbox_writable_roots.is_empty());
+        let (permissions, sandbox, extras, _) = resume_extras(&record);
+        assert_eq!(permissions.as_deref(), Some(":workspace"));
+        assert_eq!(sandbox, None);
+        assert_eq!(extras, None);
+        // A policy without the keys (older native) keeps what the record has.
+        record.sandbox_writable_roots = vec!["/kept".into()];
+        let partial = settings_updated(serde_json::json!({ "sandboxPolicy": { "type": "workspaceWrite" } }));
+        apply_durable_notification(&mut record, 7, &partial, "t").unwrap();
+        assert_eq!(record.sandbox_writable_roots, vec!["/kept".to_string()]);
+        assert_eq!(record.sandbox_network_access, Some(false));
+    }
+
+    #[test]
+    fn quick_chat_records_sync_extras_like_agents() {
+        let mut record = record();
+        record.explicit_launch = Some(
+            serde_json::from_value(serde_json::json!({
+                "version": 4, "native_id": "0189aaaa-0000-7000-8000-000000000001",
+                "native_home": "/tmp/native", "bundle_manifest": "/tmp/manifest.json",
+                "bundle_sha256": "e".repeat(64),
+            }))
+            .unwrap(),
+        );
+        assert!(record.is_owned_session());
+        record.permission_defaults = Some("read-only".into());
+        record.approval_policy = Some("on-request".into());
+        assert!(apply_durable_notification(&mut record, 7, &auto_switch(true, serde_json::json!(["/notes"])), "t").unwrap());
+        let (_, sandbox, extras, reviewer) = resume_extras(&record);
+        assert_eq!(sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(extras, Some(serde_json::json!({"network_access": true, "writable_roots": ["/notes"]})));
+        assert_eq!(reviewer.as_deref(), Some("auto_review"));
+    }
+
+    #[test]
+    fn named_permission_profile_keeps_the_record_extras() {
+        // cutex's own extras profile (or any named profile) defines network /
+        // roots itself; the legacy projection next to it is not copied back.
+        for id in [cutex::launch::stock::CUTEX_WORKSPACE_PERMISSION_PROFILE, "team-profile"] {
+            let mut record = record();
+            record.permission_defaults = Some("workspace-write".into());
+            record.sandbox_network_access = Some(true);
+            record.sandbox_writable_roots = vec!["/extra".into()];
+            let notification = settings_updated(serde_json::json!({
+                "activePermissionProfile": { "id": id },
+                "sandboxPolicy": { "type": "workspaceWrite", "networkAccess": false, "writableRoots": [] }
+            }));
+            apply_durable_notification(&mut record, 7, &notification, "t").unwrap();
+            assert_eq!(record.sandbox_network_access, Some(true), "{id}");
+            assert_eq!(record.sandbox_writable_roots, vec!["/extra".to_string()], "{id}");
+        }
+    }
+
+    #[test]
+    fn non_workspace_policies_leave_the_extras() {
+        let mut record = record();
+        record.sandbox_network_access = Some(true);
+        record.sandbox_writable_roots = vec!["/extra".into()];
+        let full = settings_updated(serde_json::json!({ "approvalPolicy": "never", "activePermissionProfile": null,
+            "sandboxPolicy": { "type": "dangerFullAccess" } }));
+        assert!(apply_durable_notification(&mut record, 7, &full, "t").unwrap());
+        let read_only = settings_updated(serde_json::json!({ "sandboxPolicy": { "type": "readOnly", "networkAccess": false } }));
+        apply_durable_notification(&mut record, 7, &read_only, "t").unwrap();
+        assert_eq!(record.sandbox_network_access, Some(true));
+        assert_eq!(record.sandbox_writable_roots, vec!["/extra".to_string()]);
     }
 
     #[test]

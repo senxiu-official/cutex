@@ -773,6 +773,12 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // answer 409 upgrade_blocked {reason: unmanaged_install} unless the
     // daemon runs from a managed install (install.json).
     ("backend-upgrade", "backendUpgrade"),
+    // Backend upgrade run records (`$defs/upgradeRun`, GET /v2/upgrade `run`,
+    // GET /v2/upgrade/runs[/{id}], `cutex upgrade history --json`) carry
+    // `nativeVersion` (the native the target release carries),
+    // `previousNativeVersion` and `runtimeChange` (`native` | `package` |
+    // `none`), recorded when the run is prepared; null on older records.
+    ("upgrade-run-native", "upgradeRunNative"),
     // Optional components (components/README.md, components_api.rs):
     // owner-only GET /v2/components, POST /v2/components/{name}/install|remove
     // (empty body, 202 {operation}); host event cutex/components/updated;
@@ -874,6 +880,66 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // cutex/safetyCheck/dismiss {blockId}; GET /v2/safety-checks
     // ?state=open|all&agentId=&limit=. Live via cutex/ownerNotify/created|updated.
     ("claude-safety-grants", "claudeSafetyGrants"),
+    // 2026-10-16: Windows sandbox readiness. Native `windowsSandbox/readiness`
+    // (no params; `{status: ready|notConfigured|updateRequired}`) on a
+    // session (POST /v2/sessions/{id}/app-server/requests: that runtime's native
+    // home) and on POST /v2/codex/requests (the shared home new agents adopt),
+    // plus `windowsSandbox/setupStart` with exactly `{mode: "unelevated"}`
+    // (no cwd; elevated setup = UAC, local sandbox users, firewall rules:
+    // refused, 400). Owner only. The host route answers after native's
+    // `windowsSandbox/setupCompleted` (`result.completed {mode, success,
+    // error}`, null on timeout); the session route answers `{started}` and the
+    // completion arrives as that session's native event. Running threads keep
+    // the sandbox level they started with: the agent needs a relaunch.
+    ("windows-sandbox-readiness", "windowsSandboxReadiness"),
+    // 2026-10-16 (owner decision): the desktop's 「自动」 mode is
+    // workspace-write + on-request + the native automatic reviewer. POST
+    // /v2/human/agents and /v2/human/sessions `launch.approvalsReviewer`
+    // ("user" | "auto_review"; legacy "guardian_subagent" = auto_review) is
+    // stored on the session record, sent as native `approvalsReviewer` on
+    // thread/start and every start / resume (`-c approvals_reviewer` for owner
+    // launches), and mirrored from thread/settings/updated so a running
+    // change survives relaunch. /v2/settings newThreadDefaults.<kind> gains
+    // `approvalsReviewer` (built-in `auto_review` for both kinds; null =
+    // built-in). Without this feature `launch` refuses the field (unknown
+    // field) and new threads keep the profile's reviewer (native `user`).
+    ("launch-approvals-reviewer", "launchApprovalsReviewer"),
+    // Browser relay (desktop 0.1.3): the desktop may report its precise
+    // refusal reasons — external_pages_off, external_proxy_unavailable,
+    // private_address_blocked, reserved_address, protected_endpoint,
+    // remote_loopback — instead of external_pages_unavailable (each with a
+    // fixed agent hint).
+    ("browser-refusal-reasons", "browserRefusalReasons"),
+    // Browser relay grant source {kind:"popup", openerLeaseId}: a tab the
+    // leased agent's own click opened is granted to the same agent without a
+    // new owner approval, only while the opener lease is active for that agent
+    // on the same device connection; it inherits the opener lease's origin.
+    ("browser-popup-grant", "browserPopupGrant"),
+    // 2026-10-16: Kimi Code membership plan. Quota reader `kimi_code_plan`
+    // (quota-config `presetOptions`): GET <profile base URL>/usages on the
+    // Kimi Code API (api.kimi.com / api.kimi.ai `/coding/v1`, Bearer key),
+    // 5 h window `limits[0]`; quota mode `used_ratio` (used share 0..1) and
+    // reader config `optional` (a window never read is not reported).
+    // API-key presets `kimi-code` (api.kimi.ai) / `kimi-code-cn`
+    // (api.kimi.com): family `kimi-code`, Kimi Code catalog (k3, k3-256k,
+    // kimi-for-coding, kimi-for-coding-highspeed), web_search live; a new
+    // profile starts with the reader plus optional `week` (legacy plans) and
+    // `month` (monthly total) extras.
+    ("kimi-code-plan", "kimiCodePlan"),
+    // 2026-10-16: copy a profile to another host (owner only, POST only).
+    // POST /v2/profiles/{p}/export {includeCredentials?: bool} -> {bundle,
+    // credentialsIncluded, credentialKind}: bundle schemaVersion 1 (settings,
+    // config.toml profile part, effective model catalog + overlay). With
+    // includeCredentials (loopback connection only, else 403
+    // `credentials_loopback_only`) an API-key profile's key and settings
+    // secrets are included; a ChatGPT login or Claude account credential never
+    // is. Each export / import is audited without values.
+    // POST /v2/profiles/import {bundle, name} -> 201 profile detail +
+    // credentialsCopied + warnings [{code: needsLogin | claudeAccountRebound |
+    // privateAuthReset | runtimeDockerImage | proxyCleared | proxyCopied |
+    // secretFieldsCleared, ...}]; never overwrites (409 profile_name_conflict);
+    // 400 unsupported_bundle for a bundle this cutex does not read.
+    ("profile-transfer", "profileTransfer"),
     #[cfg(target_os = "linux")]
     ("job-service", "jobService"),
 ];
@@ -1073,6 +1139,7 @@ mod tests {
             "userOwnToken",
             "userOwnDevices",
             "usageSourceZcode",
+            "windowsSandboxReadiness",
             "peerOwnerProfile",
         ] {
             assert_eq!(value["features"][key], true, "{key}");

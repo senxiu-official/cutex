@@ -22,6 +22,12 @@ pub struct Config {
     /// Display-only window caption (e.g. "5h", "week"), at most 8 characters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_label: Option<String>,
+    /// A window the provider may leave out of its response (e.g. the Kimi
+    /// Code weekly window, gone on the new plans): an optional gauge that
+    /// has never read a value is not reported instead of showing an empty
+    /// stale gauge. Absent = false (older binaries keep it in `extra`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
     /// Fields a newer cutex wrote (kept on save; persistence is not
     /// `deny_unknown_fields`, RFC backend-auto-update §6.2).
     #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
@@ -70,16 +76,22 @@ pub enum Reader {
     ZhipuCodingPlan,
     /// OpenRouter key credits.
     OpenrouterKey,
+    /// Kimi Code membership plan (`GET <base URL>/usages` on the Kimi Code
+    /// API, api.kimi.com / api.kimi.ai `/coding/v1`): 5 h rate window; a
+    /// profile created from the preset adds the weekly (legacy plans) and
+    /// monthly total windows.
+    KimiCodePlan,
 }
 
 impl Reader {
-    pub const ALL: [Reader; 6] = [
+    pub const ALL: [Reader; 7] = [
         Reader::UsageEndpoint,
         Reader::DeepseekBalance,
         Reader::MoonshotBalance,
         Reader::MoonshotCnBalance,
         Reader::ZhipuCodingPlan,
         Reader::OpenrouterKey,
+        Reader::KimiCodePlan,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -90,6 +102,7 @@ impl Reader {
             Reader::MoonshotCnBalance => "moonshot_cn_balance",
             Reader::ZhipuCodingPlan => "zhipu_coding_plan",
             Reader::OpenrouterKey => "openrouter_key",
+            Reader::KimiCodePlan => "kimi_code_plan",
         }
     }
 
@@ -99,7 +112,7 @@ impl Reader {
 
     /// Whether the reader derives its URL from the profile's base URL.
     pub fn needs_base_url(self) -> bool {
-        matches!(self, Reader::UsageEndpoint | Reader::ZhipuCodingPlan)
+        matches!(self, Reader::UsageEndpoint | Reader::ZhipuCodingPlan | Reader::KimiCodePlan)
     }
 }
 
@@ -188,6 +201,8 @@ pub enum Mode {
     UsedAndLimit,
     RemainingPercent,
     UsedPercent,
+    /// Used share as a fraction 0..1 (e.g. Kimi Code `used_ratio`).
+    UsedRatio,
     Balance,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +226,7 @@ impl Default for Config {
             reset_pointer: "/rate_limits/0/reset_at".into(),
             reset_format: ResetFormat::Rfc3339,
             window_label: None,
+            optional: false,
             extra: Default::default(),
         }
     }
@@ -315,6 +331,20 @@ impl Config {
                     next.window_label = Some("5h".into());
                 }
             }
+            Reader::KimiCodePlan => {
+                next.url = kimi_code_usages_url(base()?)?;
+                next.mode = Mode::UsedAndLimit;
+                next.value_pointer = format!("{KIMI_FIVE_HOUR}/used");
+                next.limit_pointer = format!("{KIMI_FIVE_HOUR}/limit");
+                next.reset_pointer = format!("{KIMI_FIVE_HOUR}/resetTime");
+                next.reset_format = ResetFormat::Rfc3339;
+                if next.label == "Q" {
+                    next.label = "Kimi".into();
+                }
+                if next.window_label.is_none() {
+                    next.window_label = Some("5h".into());
+                }
+            }
             Reader::UsageEndpoint => {
                 next.url = format!("{}/usage", base()?.trim_end_matches('/'));
                 next.mode = Mode::RemainingAndLimit;
@@ -347,10 +377,41 @@ impl Config {
         Ok(next)
     }
 
-    /// Extra gauges a new profile with `reader` starts with: the Zhipu Coding
-    /// Plan weekly window (same response as the primary 5 h window; an empty
-    /// URL inherits the primary endpoint and auth).
+    /// Extra gauges a new profile with `reader` starts with (same response
+    /// as the primary window; an empty URL inherits the primary endpoint and
+    /// auth): the Zhipu Coding Plan weekly window; the Kimi Code weekly
+    /// window (legacy plans only, optional) and monthly total (optional).
     pub fn extras_for_new_profile(reader: Reader) -> Vec<Config> {
+        if reader == Reader::KimiCodePlan {
+            return vec![
+                Config {
+                    enabled: true,
+                    url: String::new(),
+                    label: "Kimi".into(),
+                    mode: Mode::UsedAndLimit,
+                    value_pointer: format!("{KIMI_WEEK}/used"),
+                    limit_pointer: format!("{KIMI_WEEK}/limit"),
+                    reset_pointer: format!("{KIMI_WEEK}/resetTime"),
+                    reset_format: ResetFormat::Rfc3339,
+                    window_label: Some("week".into()),
+                    optional: true,
+                    ..Config::default()
+                },
+                Config {
+                    enabled: true,
+                    url: String::new(),
+                    label: "Kimi".into(),
+                    mode: Mode::UsedRatio,
+                    value_pointer: format!("{KIMI_MONTH}/used_ratio"),
+                    limit_pointer: String::new(),
+                    reset_pointer: format!("{KIMI_MONTH}/reset_time"),
+                    reset_format: ResetFormat::Rfc3339,
+                    window_label: Some("month".into()),
+                    optional: true,
+                    ..Config::default()
+                },
+            ];
+        }
         if reader != Reader::ZhipuCodingPlan {
             return Vec::new();
         }
@@ -439,6 +500,43 @@ pub fn enable_preset_reader(
 const ZHIPU_QUOTA_PATH: &str = "/api/monitor/usage/quota/limit";
 const ZHIPU_FIVE_HOUR: &str = "/data/limits/[unit=3,number=5]";
 const ZHIPU_WEEK: &str = "/data/limits/[unit=6]";
+
+/// Kimi Code membership usage (`GET https://api.kimi.com/coding/v1/usages`,
+/// overseas `api.kimi.ai`; `Authorization: Bearer <Kimi Code API key>`).
+/// Not in Kimi's public docs; the shape is the one the official Kimi CLI
+/// reads for `/usage` (MoonshotAI/kimi-cli `src/kimi_cli/ui/shell/usage.py`)
+/// and CodexBar's Kimi provider fixtures (steipete/CodexBar
+/// `KimiModels.swift`, tests from captured responses):
+///
+/// - `limits[]`: `{window: {duration: 300, timeUnit: "TIME_UNIT_MINUTE"},
+///   detail: {limit, used, remaining, resetTime}}`, counts as strings or
+///   numbers: the rolling 5 h rate window (every plan);
+/// - `usage`: `{limit, used, remaining, resetTime}`: the weekly quota
+///   (legacy plans only; new plans have no weekly window);
+/// - `usages`: ratio pools `{used_ratio: 0..1, reset_time}` keyed
+///   `limit_5h`, `limit_7d`, `limit_month_total` (the membership's monthly
+///   total shared with Kimi web), `limit_month_code`.
+///
+/// Reset times are RFC 3339 with up to nanoseconds.
+const KIMI_FIVE_HOUR: &str = "/limits/0/detail";
+const KIMI_WEEK: &str = "/usage";
+const KIMI_MONTH: &str = "/usages/limit_month_total";
+
+/// `<base>/usages` for a Kimi Code API base URL: `…/coding/v1` as given,
+/// `…/coding` (the Anthropic-compatible base) gains `/v1`, any other path
+/// is replaced by `/coding/v1` on the same origin.
+fn kimi_code_usages_url(base: &str) -> anyhow::Result<String> {
+    let url = url::Url::parse(base.trim()).context("Invalid base URL")?;
+    let path = url.path().trim_end_matches('/');
+    let origin = url.origin().ascii_serialization();
+    Ok(if path.ends_with("/coding/v1") {
+        format!("{origin}{path}/usages")
+    } else if path.ends_with("/coding") {
+        format!("{origin}{path}/v1/usages")
+    } else {
+        format!("{origin}/coding/v1/usages")
+    })
+}
 
 /// Pointers stored by earlier releases (the weekly extra in `options.quotas`)
 /// still select `type=TOKENS_LIMIT`; on the Zhipu endpoint they match by
@@ -611,6 +709,7 @@ pub fn parse(c: &Config, v: &Value, now: i64) -> anyhow::Result<Display> {
         }
         Mode::RemainingPercent => n,
         Mode::UsedPercent => 100.0 - n,
+        Mode::UsedRatio => 100.0 * (1.0 - n),
         Mode::Balance => anyhow::bail!("Balance mode has no percentage"),
     };
     ensure!(percent.is_finite(), "Quota percentage is not finite");
@@ -1001,6 +1100,13 @@ fn gauges_in(
         match resolved {
             Ok(c) => {
                 let read = read_resolved_cached(a, &c, Some(()), force, dir, &fetch);
+                // An optional window that has never been read (the response
+                // does not carry it) is left out; one read before keeps its
+                // last value as a stale gauge like any other.
+                let never_read = |d: &Display| d.observed_at.is_none() && d.remaining_percent.is_none() && d.balance.is_none();
+                if c.optional && read.as_ref().is_ok_and(never_read) {
+                    continue;
+                }
                 out.push(gauge(id, &c, read));
             }
             Err(error) => out.push(gauge(id, &a.options.quotas[index], Err(error))),
@@ -1645,5 +1751,220 @@ mod tests {
                 .remaining_percent,
             Some(42.0)
         );
+        c.mode = Mode::UsedRatio;
+        assert_eq!(parse(&c, &serde_json::json!({"used":0.25}), 1).unwrap().remaining_percent, Some(75.0));
+        assert_eq!(parse(&c, &serde_json::json!({"used":"1.05"}), 1).unwrap().remaining_percent, Some(0.0));
+        assert!(parse(&c, &serde_json::json!({"used":-0.5}), 1).is_err());
+    }
+
+    // ---- Kimi Code membership plan -----------------------------------------
+
+    /// Legacy-plan `/usages` response: weekly `usage`, 5 h `limits[0]` and
+    /// the ratio pools (shape of the official Kimi CLI / CodexBar fixtures;
+    /// counts are strings, reset times carry nanoseconds).
+    fn kimi_legacy_usages() -> Value {
+        serde_json::json!({
+            "user": {"membership": {"level": "LEVEL_BASIC"}},
+            "usage": {"limit": "2048", "used": "512", "remaining": "1536",
+                      "resetTime": "2026-10-20T15:23:13.373329235Z"},
+            "limits": [{
+                "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                "detail": {"limit": "200", "used": "50", "remaining": "150",
+                           "resetTime": "2026-10-16T15:05:24.374187075Z"}
+            }],
+            "usages": {
+                "limit_5h": {"used_ratio": 0.25, "reset_time": "2026-10-16T15:05:24Z"},
+                "limit_7d": {"used_ratio": 0.25, "reset_time": "2026-10-20T15:23:13Z"},
+                "limit_month_total": {"used_ratio": 0.375,"reset_time": "2026-11-01T00:00:00Z"},
+                "limit_month_code": {"used_ratio": 0.1, "reset_time": "2026-11-01T00:00:00Z"}
+            }
+        })
+    }
+
+    /// New-plan response: no weekly window (`usage` / `limit_7d` absent).
+    fn kimi_new_plan_usages() -> Value {
+        serde_json::json!({
+            "limits": [{
+                "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                "detail": {"limit": 100, "used": 10, "remaining": 90, "resetTime": "2026-10-16T20:15:44Z"}
+            }],
+            "usages": {
+                "limit_5h": {"used_ratio": 0.1, "reset_time": "2026-10-16T20:15:44Z"},
+                "limit_month_total": {"used_ratio": 0.0056, "reset_time": "2026-10-17T00:00:00Z"}
+            }
+        })
+    }
+
+    /// A loopback HTTP server answering one request per `(status, body)`;
+    /// returns its base URL and the request heads it saw (lowercased).
+    fn fake_server(replies: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status, body) in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                seen.push(String::from_utf8(request).unwrap().to_lowercase());
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            seen
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    /// A profile as `enable_preset_reader` leaves it for a Kimi Code base
+    /// URL, but with the reader's resolved endpoint stored as custom (the
+    /// test has no materialized profile config to read the base URL from).
+    fn kimi_account(base: &str) -> StoredAccount {
+        let mut a: StoredAccount = serde_json::from_value(
+            serde_json::json!({"id": uuid::Uuid::new_v4().to_string(), "name": "kimi"}),
+        )
+        .unwrap();
+        enable_preset_reader(&mut a, Some(Reader::KimiCodePlan), Some(base), None);
+        assert_eq!(a.quota_reader, Some(Reader::KimiCodePlan));
+        assert!(a.options.quota.enabled);
+        a.quota_reader = None;
+        a
+    }
+
+    const KIMI_AUTH: &[u8] = br#"{"OPENAI_API_KEY":"sk-kimi-fixture"}"#;
+
+    #[test]
+    fn kimi_code_reader_derives_usages_from_the_base_url() {
+        let resolve = |base: Option<&str>| Config::default().resolve(Choice::Reader(Reader::KimiCodePlan), base);
+        for (base, url) in [
+            ("https://api.kimi.com/coding/v1", "https://api.kimi.com/coding/v1/usages"),
+            ("https://api.kimi.com/coding/v1/", "https://api.kimi.com/coding/v1/usages"),
+            ("https://api.kimi.ai/coding/v1", "https://api.kimi.ai/coding/v1/usages"),
+            // Anthropic-compatible base (Claude Code setup) and a bare origin.
+            ("https://api.kimi.com/coding/", "https://api.kimi.com/coding/v1/usages"),
+            ("https://api.kimi.com", "https://api.kimi.com/coding/v1/usages"),
+            ("http://127.0.0.1:9/coding/v1", "http://127.0.0.1:9/coding/v1/usages"),
+        ] {
+            let resolved = resolve(Some(base)).unwrap();
+            assert_eq!(resolved.url, url, "{base}");
+            assert_eq!(resolved.auth, Auth::ProfileApiKey);
+            assert_eq!(resolved.mode, Mode::UsedAndLimit);
+            assert_eq!(resolved.label, "Kimi");
+            assert_eq!(resolved.window_label.as_deref(), Some("5h"));
+            assert!(!resolved.optional);
+        }
+        assert!(resolve(None).unwrap_err().to_string().contains("needs the profile's base URL"));
+        assert!(Reader::KimiCodePlan.needs_base_url());
+        assert_eq!(Choice::parse_settable("kimi_code_plan"), Ok(Choice::Reader(Reader::KimiCodePlan)));
+        assert!(Choice::settable_values().contains(&"kimi_code_plan"));
+
+        let extras = Config::extras_for_new_profile(Reader::KimiCodePlan);
+        let windows: Vec<_> = extras.iter().map(|c| (c.window_label.as_deref(), c.mode, c.optional, c.url.as_str())).collect();
+        assert_eq!(windows, [(Some("week"), Mode::UsedAndLimit, true, ""), (Some("month"), Mode::UsedRatio, true, "")]);
+        // New fields serialize only when set; `used_ratio` is the wire name.
+        let month = serde_json::to_value(&extras[1]).unwrap();
+        assert_eq!((month["mode"].as_str(), month["optional"].as_bool()), (Some("used_ratio"), Some(true)));
+        assert!(serde_json::to_value(Config::default()).unwrap().get("optional").is_none());
+        let round: Config = serde_json::from_value(month).unwrap();
+        assert_eq!(round, extras[1]);
+    }
+
+    #[test]
+    fn kimi_code_plan_reads_5h_week_and_month_from_a_fake_server() {
+        let dir = std::env::temp_dir().join(format!("cutex-quota-kimi-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let (base, server) = fake_server(vec![
+            (200, kimi_legacy_usages().to_string()),
+            (200, kimi_new_plan_usages().to_string()),
+        ]);
+        let a = kimi_account(&format!("{base}/coding/v1"));
+        let fetch = |c: &Config, _: &[u8]| fetch_json(c, KIMI_AUTH);
+
+        let gauges = gauges_in(&a, true, &dir, fetch).unwrap();
+        let summary: Vec<_> = gauges.iter().map(|g| (g.id.as_str(), g.window_label.as_deref(), g.remaining_percent)).collect();
+        assert_eq!(
+            summary,
+            [("primary", Some("5h"), Some(75.0)), ("extra-0", Some("week"), Some(75.0)), ("extra-1", Some("month"), Some(62.5))]
+        );
+        assert!(gauges.iter().all(|g| g.label == "Kimi" && g.kind == "window" && !g.stale && g.error.is_none()));
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        assert_eq!(gauges[0].reset_at, Some(at("2026-10-16T15:05:24Z")));
+        assert_eq!(gauges[1].reset_at, Some(at("2026-10-20T15:23:13Z")));
+        assert_eq!(gauges[2].reset_at, Some(at("2026-11-01T00:00:00Z")));
+
+        // New plan in a fresh cache: the weekly window was never read, so it
+        // is not reported; the 5 h and month windows are.
+        let fresh = dir.join("fresh");
+        let gauges = gauges_in(&a, true, &fresh, fetch).unwrap();
+        let summary: Vec<_> = gauges.iter().map(|g| (g.id.as_str(), g.window_label.as_deref(), g.remaining_percent)).collect();
+        assert_eq!(summary.len(), 2, "{summary:?}");
+        assert_eq!(summary[0], ("primary", Some("5h"), Some(90.0)));
+        assert_eq!(summary[1].0, "extra-1");
+        assert!((summary[1].2.unwrap() - 99.44).abs() < 1e-9);
+
+        // One request per read (the three gauges share it), with the key as
+        // a Bearer token on the Kimi Code path.
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 2);
+        for request in &seen {
+            assert!(request.starts_with("get /coding/v1/usages "), "{request}");
+            assert!(request.contains("authorization: bearer sk-kimi-fixture\r\n"), "{request}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn kimi_code_plan_errors_leave_stale_gauges_and_name_the_failure() {
+        let dir = std::env::temp_dir().join(format!("cutex-quota-kimi-err-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let (base, server) = fake_server(vec![
+            (401, r#"{"error":{"message":"Invalid Authentication","type":"invalid_authentication_error"}}"#.into()),
+            (429, r#"{"error":{"type":"rate_limit_reached_error"}}"#.into()),
+            (200, "{not json".into()),
+            (200, r#"{"limits":[{"detail":{"limit":"100","remaining":"99"}}]}"#.into()),
+            (200, kimi_legacy_usages().to_string()),
+            (401, "{}".into()),
+        ]);
+        let a = kimi_account(&format!("{base}/coding/v1"));
+        let primary = a.options.quota.clone();
+        let error = |expected: &str| {
+            let err = fetch_json(&primary, KIMI_AUTH).map(|_| ()).unwrap_err().to_string();
+            assert!(err.contains(expected), "{err}");
+        };
+        error("HTTP 401");
+        error("HTTP 429");
+        error("Invalid or oversized quota JSON");
+        // A detail without `used` is a missing field, not a full window.
+        let partial = fetch_json(&primary, KIMI_AUTH).unwrap();
+        assert!(parse(&primary, &partial, 1).unwrap_err().to_string().contains("missing"));
+
+        // Through the gauge reader: a success, then a refused refresh keeps
+        // the last values marked stale (optional windows included).
+        let fetch = |c: &Config, _: &[u8]| fetch_json(c, KIMI_AUTH);
+        let ok = gauges_in(&a, true, &dir, fetch).unwrap();
+        assert_eq!(ok.len(), 3);
+        let refused = gauges_in(&a, true, &dir, fetch).unwrap();
+        assert_eq!(refused.len(), 3);
+        for (before, after) in ok.iter().zip(&refused) {
+            assert!(after.stale && after.error.is_none(), "{after:?}");
+            assert_eq!(after.remaining_percent, before.remaining_percent);
+        }
+        assert_eq!(server.join().unwrap().len(), 6);
+
+        // A first read that fails: the primary shows an empty stale gauge,
+        // the optional windows are not reported.
+        let empty = gauges_in(&a, true, &dir.join("never"), |_, _| anyhow::bail!("Quota endpoint returned HTTP 401")).unwrap();
+        assert_eq!(empty.len(), 1);
+        assert_eq!((empty[0].id.as_str(), empty[0].remaining_percent, empty[0].stale), ("primary", None, true));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

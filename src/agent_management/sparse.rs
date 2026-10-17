@@ -1029,6 +1029,7 @@ mod tests {
         crate::config::new_thread::LaunchPermissions {
             sandbox: "workspace-write".into(),
             approval: "on-request".into(),
+            approvals_reviewer: None,
             network_access: false,
             writable_roots: Vec::new(),
         }
@@ -1137,6 +1138,7 @@ mod tests {
                 },
                 sandbox: "workspace-write".into(),
                 approval: "on-request".into(),
+                approvals_reviewer: None,
                 network_access: false,
                 writable_roots: Vec::new(),
             },

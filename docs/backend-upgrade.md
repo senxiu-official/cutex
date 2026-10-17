@@ -210,7 +210,7 @@ cutex upgrade apply [RELEASE] [--mode reload|full] [--max-wait SECS] [--confirm-
                     [--package-run after|during|none] [--no-follow]
 cutex upgrade cancel
 cutex upgrade rollback [--to RELEASE] [--dry-run] [--max-wait SECS] [--no-follow]
-cutex upgrade history [--limit N]
+cutex upgrade history [--limit N] [--json]
 cutex upgrade config [--channel release|main] [--source URL|DIR] [--clear-source] [--check-interval-hours N]
                      [--auto-stage BOOL] [--auto-apply BOOL] [--package-run …] [--package-run-batch N] [--max-wait SECS]
 cutex upgrade selftest [--json]          (read-only; preflight runs it with the new binary)
@@ -252,7 +252,15 @@ Run object (`$defs/upgradeRun`): `runId` (`upg-<12 hex>`), `kind`
 `requestedBy`, `waitingFor[{reason, cutexSessionId, name, detail}]`,
 `cancelRequested`, `timeline[{phase, at, detail?}]`, `downtimeMs`,
 `backupDir`, `packageRunId`, `error{code, message}`,
-`needsOwner{reason, commands[]}`, `runnerPid`, `displaced[]`.
+`needsOwner{reason, commands[]}`, `runnerPid`, `displaced[]`, and
+(capability `upgrade-run-native`, recorded when the run is prepared, null on
+older records) `nativeVersion` (the cute-codex native the target release
+carries: apply = the staged manifest's `native.version`, rollback = the
+target release's installed manifest), `previousNativeVersion` (apply: the
+native selected for new agents then; rollback: the running release's) and
+`runtimeChange`: `native` (full mode, a different native: a new native
+runtime for new agents), `package` (full mode, same native: only the runtime
+package for new agents changes), `none` (reload mode: selection untouched).
 Terminal phases: `committed`, `rolled-back`, `needs-owner`, `deferred`,
 `cancelled`, `failed`.
 

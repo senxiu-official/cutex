@@ -99,6 +99,7 @@ pub const READ_ONLY_METHODS: &[&str] = &[
     "permissionProfile/list",
     "collaborationMode/list",
     "account/rateLimits/read",
+    "windowsSandbox/readiness",
     // cutex reads
     "cutex/session/get",
     "cutex/session/groups/get",

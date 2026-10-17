@@ -376,6 +376,7 @@ fn launch_view(permissions: &LaunchPermissions) -> Value {
     json!({
         "sandbox": permissions.sandbox,
         "approvalPolicy": permissions.approval,
+        "approvalsReviewer": permissions.approvals_reviewer,
         "networkAccess": permissions.network_access,
         "writableRoots": permissions.writable_roots,
     })
@@ -412,7 +413,8 @@ fn parse_new_thread_defaults(value: &Value) -> Result<NewThreadDefaultsPatch, St
             Value::Null => patch.kinds.push((kind, None)),
             Value::Object(fields) => {
                 if let Some(field) = fields.keys().find(|k| {
-                    !["sandbox", "approvalPolicy", "networkAccess", "writableRoots"].contains(&k.as_str())
+                    !["sandbox", "approvalPolicy", "approvalsReviewer", "networkAccess", "writableRoots"]
+                        .contains(&k.as_str())
                 }) {
                     return Err(format!("newThreadDefaults.{key}: unsupported field {field}"));
                 }
@@ -452,6 +454,18 @@ fn apply_new_thread_defaults(
             match field.as_str() {
                 "sandbox" => target.sandbox = text(field, value)?,
                 "approvalPolicy" => target.approval = text(field, value)?,
+                "approvalsReviewer" => {
+                    target.approvals_reviewer = text(field, value)?
+                        .map(|reviewer| {
+                            crate::config::new_thread::canonical_approvals_reviewer(&reviewer)
+                                .map(str::to_string)
+                                .ok_or(format!(
+                                    "newThreadDefaults.{name}.approvalsReviewer: must be one of {}",
+                                    crate::config::new_thread::APPROVALS_REVIEWERS.join(", ")
+                                ))
+                        })
+                        .transpose()?
+                }
                 "networkAccess" => {
                     target.network_access = match value {
                         Value::Null => None,
@@ -1721,7 +1735,19 @@ mod tests {
         assert_eq!(view["newThreadDefaults"]["quickChat"]["sandbox"], "workspace-write");
         assert_eq!(view["newThreadDefaults"]["quickChat"]["approvalPolicy"], "on-request");
         assert_eq!(view["newThreadDefaults"]["quickChat"]["networkAccess"], false);
+        assert_eq!(view["newThreadDefaults"]["agent"]["approvalsReviewer"], "auto_review");
+        assert_eq!(view["newThreadDefaults"]["quickChat"]["approvalsReviewer"], "auto_review");
         assert_eq!(view["newThreadDefaultsBuiltin"], view["newThreadDefaults"]);
+        // The reviewer is a patchable field; the legacy alias is stored canonically.
+        let reviewer = parse_patch(br#"{"newThreadDefaults":{"quickChat":{"approvalsReviewer":"user"},"agent":{"approvalsReviewer":"guardian_subagent"}}}"#).unwrap();
+        let with_reviewer = apply_new_thread_defaults(&NewThreadDefaults::default(), reviewer.new_thread_defaults.as_ref().unwrap()).unwrap();
+        assert_eq!(with_reviewer.quick_chat.approvals_reviewer.as_deref(), Some("user"));
+        assert_eq!(with_reviewer.agent.approvals_reviewer.as_deref(), Some("auto_review"));
+        let view = settings_view(&CodezConfig { new_thread_defaults: with_reviewer.clone(), ..CodezConfig::default() });
+        assert_eq!(view["newThreadDefaults"]["quickChat"]["approvalsReviewer"], "user");
+        let reset = parse_patch(br#"{"newThreadDefaults":{"quickChat":{"approvalsReviewer":null}}}"#).unwrap();
+        let after = apply_new_thread_defaults(&with_reviewer, reset.new_thread_defaults.as_ref().unwrap()).unwrap();
+        assert_eq!(after.quick_chat.approvals_reviewer, None);
 
         let parsed = parse_patch(
             br#"{"newThreadDefaults":{"quickChat":{"networkAccess":true,"approvalPolicy":"never"}}}"#,
@@ -1755,6 +1781,8 @@ mod tests {
             r#"{"newThreadDefaults":{"worker":{}}}"#,
             r#"{"newThreadDefaults":{"agent":{"sandbox":"full"}}}"#,
             r#"{"newThreadDefaults":{"agent":{"approvalPolicy":"untrusted"}}}"#,
+            r#"{"newThreadDefaults":{"agent":{"approvalsReviewer":"owner"}}}"#,
+            r#"{"newThreadDefaults":{"agent":{"approvalsReviewer":true}}}"#,
             r#"{"newThreadDefaults":{"agent":{"networkAccess":"yes"}}}"#,
             r#"{"newThreadDefaults":{"agent":{"writableRoots":["relative"]}}}"#,
             r#"{"newThreadDefaults":{"agent":{"model":"x"}}}"#,

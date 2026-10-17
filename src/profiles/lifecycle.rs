@@ -44,7 +44,7 @@ const SESSION_STORE_RETRIES: usize = 6;
 /// Serializes Management profile lifecycle writes within the daemon.
 static LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 
-fn lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
     LIFECYCLE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -150,7 +150,7 @@ pub fn validate_profile_name(name: &str) -> Result<String, String> {
 }
 
 /// The name must not equal another profile's name or ID (lookups accept both).
-fn ensure_available(store: &AccountsStore, name: &str, ignore_id: Option<&str>) -> Result<(), LifecycleError> {
+pub(crate) fn ensure_available(store: &AccountsStore, name: &str, ignore_id: Option<&str>) -> Result<(), LifecycleError> {
     let taken = store
         .accounts
         .iter()
@@ -163,7 +163,7 @@ fn ensure_available(store: &AccountsStore, name: &str, ignore_id: Option<&str>) 
     }
 }
 
-fn base_account(name: &str, cli_kind: CliKind, source: &str) -> StoredAccount {
+pub(crate) fn base_account(name: &str, cli_kind: CliKind, source: &str) -> StoredAccount {
     StoredAccount {
         options: Default::default(),
         browser_tools: false,
@@ -197,11 +197,11 @@ pub fn new_claude_account(name: &str) -> StoredAccount {
     account
 }
 
-fn profile_dir(account: &StoredAccount) -> anyhow::Result<PathBuf> {
+pub(crate) fn profile_dir(account: &StoredAccount) -> anyhow::Result<PathBuf> {
     Ok(materialized_profiles_dir()?.join(&account.id))
 }
 
-fn remove_profile_dir(account: &StoredAccount) {
+pub(crate) fn remove_profile_dir(account: &StoredAccount) {
     if let Ok(dir) = profile_dir(account) {
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -913,6 +913,20 @@ pub(crate) mod tests {
             let profile = create_profile(&api_key(name, preset, None)).unwrap();
             assert!(profile.quota_reader.is_some(), "{preset}");
             assert_eq!(config_view(&profile)["resolvedPrimary"]["url"], url, "{preset}");
+        }
+        // Kimi Code membership plan (both regions): the /usages reader on the
+        // profile's own base URL, plus the optional week and month windows.
+        for (name, preset, url) in [
+            ("kc", "kimi-code", "https://api.kimi.ai/coding/v1/usages"),
+            ("kc cn", "kimi-code-cn", "https://api.kimi.com/coding/v1/usages"),
+        ] {
+            let profile = create_profile(&api_key(name, preset, None)).unwrap();
+            assert_eq!(profile.quota_reader, Some(Reader::KimiCodePlan), "{preset}");
+            let view = config_view(&profile);
+            assert_eq!(view["resolvedPrimary"]["url"], url, "{preset}");
+            assert_eq!(view["resolvedPrimary"]["window_label"], "5h", "{preset}");
+            let windows: Vec<_> = profile.options.quotas.iter().map(|c| (c.window_label.clone().unwrap(), c.optional)).collect();
+            assert_eq!(windows, [("week".to_string(), true), ("month".to_string(), true)], "{preset}");
         }
         // Other APIs: no reader, left off.
         for (name, preset) in [("oa", "openai"), ("mm", "minimax"), ("x", "xai")] {

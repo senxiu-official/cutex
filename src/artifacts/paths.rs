@@ -263,10 +263,66 @@ pub fn default_kind(name: &str) -> &'static str {
     }
 }
 
-/// Media type from the extension; unknown extensions are `text/plain` when
-/// `sample` is UTF-8 without NUL, else `application/octet-stream`.
-pub fn media_type(name: &str, sample: &[u8]) -> String {
-    let known = match extension(name).as_str() {
+/// Default kind of a version: from the name, else (a name without a known
+/// extension, e.g. an owner-chosen label) from the source file's name.
+pub fn default_kind_of(name: &str, source: &str) -> &'static str {
+    match default_kind(name) {
+        "other" => default_kind(file_part(source)),
+        kind => kind,
+    }
+}
+
+/// Last segment of a `/` or `\` separated path (both on every platform: a
+/// Windows source path reads the same on a Linux host and vice versa).
+fn file_part(path: &str) -> &str {
+    path.rsplit(['/', '\\']).find(|segment| !segment.is_empty()).unwrap_or(path)
+}
+
+/// Media type of a version, independent of the platform: the source file's
+/// extension first (the file that was read), then the artifact name's
+/// extension (a name may be a label without one), then the content's magic
+/// bytes; otherwise `text/plain` when `sample` is UTF-8 without NUL, else
+/// `application/octet-stream`.
+pub fn media_type(source: &str, name: &str, sample: &[u8]) -> String {
+    if let Some(known) = media_type_by_extension(&extension(file_part(source))).or_else(|| media_type_by_extension(&extension(name))) {
+        return known.to_string();
+    }
+    if let Some(sniffed) = sniff(sample) {
+        return sniffed.to_string();
+    }
+    if looks_like_text(sample) {
+        "text/plain".into()
+    } else {
+        "application/octet-stream".into()
+    }
+}
+
+/// Media type of well-known file signatures (and an HTML document start).
+fn sniff(sample: &[u8]) -> Option<&'static str> {
+    const SIGNATURES: &[(&[u8], &str)] = &[
+        (b"%PDF-", "application/pdf"),
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"\xff\xd8\xff", "image/jpeg"),
+        (b"GIF87a", "image/gif"),
+        (b"GIF89a", "image/gif"),
+    ];
+    if let Some((_, media)) = SIGNATURES.iter().find(|(magic, _)| sample.starts_with(magic)) {
+        return Some(media);
+    }
+    if sample.len() >= 12 && &sample[..4] == b"RIFF" && &sample[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    let text = sample.strip_prefix(b"\xef\xbb\xbf").unwrap_or(sample);
+    let start = text.iter().position(|byte| !byte.is_ascii_whitespace()).unwrap_or(text.len());
+    let head: Vec<u8> = text[start..].iter().take(15).map(u8::to_ascii_lowercase).collect();
+    if head.starts_with(b"<!doctype html") || head.starts_with(b"<html") {
+        return Some("text/html");
+    }
+    None
+}
+
+fn media_type_by_extension(extension: &str) -> Option<&'static str> {
+    let known = match extension {
         "md" | "markdown" => "text/markdown",
         "txt" | "log" | "text" => "text/plain",
         "csv" => "text/csv",
@@ -299,16 +355,9 @@ pub fn media_type(name: &str, sample: &[u8]) -> String {
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "parquet" => "application/vnd.apache.parquet",
-        _ => "",
+        _ => return None,
     };
-    if !known.is_empty() {
-        return known.to_string();
-    }
-    if looks_like_text(sample) {
-        "text/plain".into()
-    } else {
-        "application/octet-stream".into()
-    }
+    Some(known)
 }
 
 /// UTF-8 (a sample may end inside a character) without NUL.
@@ -446,9 +495,40 @@ pub(crate) mod tests {
         assert_eq!(default_kind("handoff/next.md"), "handoff");
         assert_eq!(default_kind("plan.md"), "plan");
         assert_eq!(default_kind("weird.xyz"), "other");
-        assert_eq!(media_type("a.md", b""), "text/markdown");
-        assert_eq!(media_type("a.unknown", b"hello"), "text/plain");
-        assert_eq!(media_type("a.unknown", &[0, 1, 2]), "application/octet-stream");
+        assert_eq!(media_type("", "a.md", b""), "text/markdown");
+        assert_eq!(media_type("", "a.unknown", b"hello"), "text/plain");
+        assert_eq!(media_type("", "a.unknown", &[0, 1, 2]), "application/octet-stream");
+    }
+
+    /// A name chosen by the owner (a label without an extension) must not
+    /// turn an HTML / PDF / JPEG source into text or octet-stream; Windows
+    /// and POSIX source paths read the same on every platform.
+    #[test]
+    fn media_type_prefers_the_source_extension_on_any_platform() {
+        let html = b"<!DOCTYPE html>\n<html><body>hi</body></html>";
+        for source in [r"C:\Users\someone\work\out\report.HTML", "/home/someone/work/out/report.html", r"\\?\D:\w\report.htm", "out/report.html"] {
+            assert_eq!(media_type(source, "round2-html-artifact", html), "text/html", "{source}");
+        }
+        assert_eq!(media_type(r"D:\w\paper.pdf", "round2-pdf-artifact", b"%PDF-1.7\n%\xe2\xe3"), "application/pdf");
+        assert_eq!(media_type(r"D:\w\photo.JPG", "Holiday photo", &[0xff, 0xd8, 0xff, 0xe0, 0, 0x10]), "image/jpeg");
+        assert_eq!(media_type(r"D:\w\photo.jpeg", "photo", &[0xff, 0xd8, 0xff]), "image/jpeg");
+        // The name's extension still counts when the source has none.
+        assert_eq!(media_type(r"D:\w\README", "notes.md", b"# hi"), "text/markdown");
+        // The source wins over a misleading name.
+        assert_eq!(media_type("/w/fig.png", "fig.txt", b"\x89PNG\r\n\x1a\n"), "image/png");
+        // Neither has a known extension: the content's signature decides.
+        assert_eq!(media_type(r"D:\w\blob", "Blob", b"%PDF-1.4"), "application/pdf");
+        assert_eq!(media_type("/w/blob", "Blob", b"\x89PNG\r\n\x1a\n\0\0"), "image/png");
+        assert_eq!(media_type("/w/blob", "Blob", &[0xff, 0xd8, 0xff, 0xdb]), "image/jpeg");
+        assert_eq!(media_type("/w/blob", "Blob", b"GIF89a\x01\0"), "image/gif");
+        assert_eq!(media_type("/w/blob", "Blob", b"RIFF\x10\0\0\0WEBPVP8 "), "image/webp");
+        assert_eq!(media_type("/w/page", "Page", b"\xef\xbb\xbf\r\n  <!doctype HTML><html>"), "text/html");
+        assert_eq!(media_type("/w/page", "Page", b"<html lang=\"en\">"), "text/html");
+        assert_eq!(media_type("/w/notes", "Notes", b"plain words"), "text/plain");
+        assert_eq!(default_kind_of("round2-html-artifact", r"C:\w\out\report.html"), "report");
+        assert_eq!(default_kind_of("Holiday photo", "/w/photo.jpg"), "figure");
+        assert_eq!(default_kind_of("results/table.csv", r"C:\w\x.png"), "table");
+        assert_eq!(default_kind_of("Label", "/w/blob"), "other");
         assert!(looks_like_text("héllo".as_bytes()));
         assert!(looks_like_text(&"é".as_bytes()[..1]), "cut inside a character");
         assert!(!looks_like_text(&[0xff, 0xfe, 0x41]));

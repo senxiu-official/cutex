@@ -30,6 +30,7 @@ pub fn native_request_allow_rules_sha256() -> String {
     let rules = serde_json::json!({
         "sessionThread": SESSION_THREAD_METHODS,
         "ownerGlobalRead": OWNER_GLOBAL_READ_METHODS,
+        "ownerGlobalFenced": OWNER_GLOBAL_FENCED_METHODS,
     });
     format!("{:x}", Sha256::digest(rules.to_string().as_bytes()))
 }
@@ -62,7 +63,59 @@ const OWNER_GLOBAL_READ_METHODS: &[&str] = &[
     "collaborationMode/list",
     // ChatGPT-account profiles: native rate-limit windows for quota gauges.
     "account/rateLimits/read",
+    // Capability `windows-sandbox-readiness`: whether this runtime's native
+    // home has a Windows sandbox backend (`ready` | `notConfigured` |
+    // `updateRequired`). With none, native asks before every command under
+    // a managed filesystem policy (exec_policy: Windows sandbox level
+    // Disabled), so the desktop explains frequent approvals with it.
+    "windowsSandbox/readiness",
 ];
+
+/// Owner-only native methods that change the runtime's native home, each
+/// behind a Cutex fence ([`windows_sandbox_setup_fence`]). Access stays the
+/// owner's (`access.rs` classifies every unlisted native method so).
+const OWNER_GLOBAL_FENCED_METHODS: &[&str] = &[
+    // Capability `windows-sandbox-readiness`: `{mode: "unelevated"}` only.
+    "windowsSandbox/setupStart",
+];
+
+/// Cutex fence for native `windowsSandbox/setupStart` (session and host
+/// routes). Only the unelevated (restricted-token) mode passes, without
+/// `cwd`:
+/// - unelevated setup needs no administrator rights: native validates the
+///   managed `windows_sandbox_mode` requirement, runs the legacy preflight
+///   (capability-SID ACLs on the setup's writable roots; with no `cwd` there
+///   are no workspace roots) and persists `[windows] sandbox =
+///   "unelevated"` in that native home's `config.toml` (clearing the legacy
+///   `features.experimental_windows_sandbox` keys);
+/// - elevated setup launches the setup helper through UAC (`runas`) and
+///   creates the local `CodexSandboxOffline` / `CodexSandboxOnline` users,
+///   a sandbox group and firewall rules: a system change on the host that a
+///   remote client cannot see or answer, so it stays a manual step on that
+///   host (cute-codex TUI `/setup-default-sandbox`);
+/// - `cwd` would grant sandbox write ACLs on an arbitrary directory.
+pub(crate) fn windows_sandbox_setup_fence(params: &Value) -> Result<(), String> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| "windowsSandbox/setupStart params must be an object".to_string())?;
+    if let Some(key) = object.keys().find(|key| !matches!(key.as_str(), "mode" | "cwd")) {
+        return Err(format!("windowsSandbox/setupStart does not accept {key}"));
+    }
+    if object.get("cwd").is_some_and(|cwd| !cwd.is_null()) {
+        return Err(
+            "windowsSandbox/setupStart cwd is not allowed: setup grants no workspace ACLs through Cutex"
+                .to_string(),
+        );
+    }
+    match object.get("mode").and_then(Value::as_str) {
+        Some("unelevated") => Ok(()),
+        Some("elevated") => Err(
+            "elevated Windows sandbox setup changes the host (UAC, local sandbox users, firewall rules) and is not available through Cutex; run it on that host (cute-codex /setup-default-sandbox)"
+                .to_string(),
+        ),
+        _ => Err("windowsSandbox/setupStart requires mode \"unelevated\"".to_string()),
+    }
+}
 
 /// Methods added by native r53 (upstream 0.162.1) that the native request
 /// gateway deliberately does not forward for any principal: they answer
@@ -179,6 +232,9 @@ pub fn validate_native_request(
             }
             descendant_thread_id = Some(thread_id.to_string());
         }
+    } else if OWNER_GLOBAL_FENCED_METHODS.contains(&method.as_str()) {
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        windows_sandbox_setup_fence(&params).map_err(NativeRequestValidationError::Invalid)?;
     } else if !OWNER_GLOBAL_READ_METHODS.contains(&method.as_str()) {
         return Err(NativeRequestValidationError::MethodDenied(method));
     }
@@ -405,10 +461,62 @@ mod tests {
     }
 
     #[test]
+    fn windows_sandbox_readiness_and_unelevated_setup_are_forwarded() {
+        let body = |method: &str, params: Option<Value>| {
+            let mut message = json!({ "id": 7, "method": method });
+            if let Some(params) = params {
+                message["params"] = params;
+            }
+            serde_json::to_vec(&json!({ "requestId": "r", "native": { "message": message } })).unwrap()
+        };
+        let readiness = validate_native_request(&body("windowsSandbox/readiness", None), "root")
+            .expect("readiness takes no params and no threadId");
+        assert_eq!(readiness.method, "windowsSandbox/readiness");
+        assert_eq!(readiness.descendant_thread_id, None);
+        // The pinned schema: readiness params must be null / absent.
+        assert!(matches!(
+            validate_native_request(&body("windowsSandbox/readiness", Some(json!({ "x": 1 }))), "root"),
+            Err(NativeRequestValidationError::Invalid(_))
+        ));
+        assert!(validate_native_request(
+            &body("windowsSandbox/setupStart", Some(json!({ "mode": "unelevated" }))),
+            "root"
+        )
+        .is_ok());
+        assert!(validate_native_request(
+            &body("windowsSandbox/setupStart", Some(json!({ "mode": "unelevated", "cwd": null }))),
+            "root"
+        )
+        .is_ok());
+        for params in [
+            json!({ "mode": "elevated" }),
+            json!({ "mode": "unelevated", "cwd": "C:\\work" }),
+            json!({ "mode": "unelevated", "threadId": "root" }),
+            json!({}),
+            json!("unelevated"),
+        ] {
+            assert!(
+                matches!(
+                    validate_native_request(&body("windowsSandbox/setupStart", Some(params.clone())), "root"),
+                    Err(NativeRequestValidationError::Invalid(_))
+                ),
+                "{params}"
+            );
+        }
+        assert!(matches!(
+            validate_native_request(&body("windowsSandbox/setupStart", None), "root"),
+            Err(NativeRequestValidationError::Invalid(_))
+        ));
+        let elevated = windows_sandbox_setup_fence(&json!({ "mode": "elevated" })).unwrap_err();
+        assert!(elevated.contains("/setup-default-sandbox"), "{elevated}");
+    }
+
+    #[test]
     fn native_r53_additions_are_not_forwarded() {
         for method in NATIVE_R53_UNFORWARDED_METHODS {
             assert!(!SESSION_THREAD_METHODS.contains(method), "{method}");
             assert!(!OWNER_GLOBAL_READ_METHODS.contains(method), "{method}");
+            assert!(!OWNER_GLOBAL_FENCED_METHODS.contains(method), "{method}");
             assert!(!SUBAGENT_READ_METHODS.contains(method), "{method}");
             let body = serde_json::to_vec(&json!({
                 "requestId": "request-1",

@@ -151,7 +151,13 @@
         },
         "runnerPid": { "type": ["integer", "null"] },
         "displaced": { "type": "array", "items": { "type": "string" } },
-        "selectionBackup": { "type": "string" }
+        "selectionBackup": { "type": "string" },
+        "nativeVersion": { "$ref": "#/$defs/nullableString", "description": "Capability upgrade-run-native: the cute-codex native version the target release carries (apply: the staged manifest; rollback: the target release's installed manifest), recorded when the run is prepared; null when it carries none or for a run recorded before this field." },
+        "previousNativeVersion": { "$ref": "#/$defs/nullableString", "description": "Capability upgrade-run-native: apply = the native selected for new agents on this host when the run was prepared; rollback = the running release's native. null when unknown." },
+        "runtimeChange": {
+          "anyOf": [{ "enum": ["native", "package", "none"] }, { "type": "null" }],
+          "description": "Capability upgrade-run-native: native = full mode with a different native version (new native runtime for new agents); package = full mode, same native (only the runtime package for new agents changes); none = reload mode (runtime selection untouched); null = a run recorded before this field."
+        }
       }
     },
     "followUp": {

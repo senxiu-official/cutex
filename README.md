@@ -6,12 +6,11 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.1.1**: optional components (Job Service, Claude runtime) installed and updated by cutex; managed
-installs run the notification worker themselves (0.1.0 "First Take" was the first public release).
-See [CHANGELOG.md](CHANGELOG.md).
+**0.1.2**: Codex's automatic reviewer for new threads, Windows sandbox readiness, Profile transfer
+between hosts, and fixes for Windows API-key Profiles and forked agents (0.1.0 "First Take" was the
+first public release). See [CHANGELOG.md](CHANGELOG.md).
 
 > **Known gaps in 0.1.x** (being fixed; this note goes away when they are):
-> - **NCI remote jobs** are not usable in the public release yet.
 > - **Phone push / pairing a phone**: there is no public phone app yet.
 >
 > Claude agents need the optional `claude-runtime` component and long-running jobs (Linux) the
