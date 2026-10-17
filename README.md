@@ -6,9 +6,10 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.1.2**: Codex's automatic reviewer for new threads, Windows sandbox readiness, Profile transfer
-between hosts, and fixes for Windows API-key Profiles and forked agents (0.1.0 "First Take" was the
-first public release). See [CHANGELOG.md](CHANGELOG.md).
+**0.1.3**: new cute-codex native 0.160.0-r52.3 (Windows: Store PowerShell works under the sandbox
+without administrator rights), network access and extra writable folders changeable on a running
+session, agent browser tools in independent instances, usage fixes (0.1.0 "First Take" was the first
+public release). See [CHANGELOG.md](CHANGELOG.md).
 
 > **Known gaps in 0.1.x** (being fixed; this note goes away when they are):
 > - **Phone push / pairing a phone**: there is no public phone app yet.

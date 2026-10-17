@@ -655,3 +655,57 @@ fn reset_windows_follow_a_rename_by_id() {
     assert_eq!(boundaries.len(), 1, "{boundaries:#?}");
     assert_eq!(boundaries[0].profile_id.as_deref(), Some(p1));
 }
+
+#[test]
+fn model_rows_and_unpriced_models_ignore_the_model_ids_case() {
+    // The Claude runtime reports `GLM-5.3`, Codex `glm-5.3`: one model, one row.
+    let root = TestRoot::new("model-case");
+    let sessions = [
+        ("cutex.a", "GLM-5.3"),
+        ("cutex.b", "glm-5.3"),
+        ("cutex.c", "GLM-5.3-Flash"),
+        ("cutex.d", "glm-5.3-flash"),
+    ];
+    for (session, model) in sessions {
+        record_usage_event_at(root.path(), &settings_event(session, 1, "2026-10-04T01:00:00Z", model), Some("glm")).unwrap();
+        record_usage_event_at(
+            root.path(),
+            &token_event(session, &format!("x-{session}"), 2, "2026-10-04T02:00:00Z", "t1", usage(100, 0, 10, 0), usage(100, 0, 10, 0)),
+            Some("glm"),
+        )
+        .unwrap();
+    }
+    let stored = fs::read_to_string(root.path().join("usage-ledger").join("2026-10.jsonl")).unwrap();
+    assert!(stored.contains("\"GLM-5.3\"") && stored.contains("\"glm-5.3\""), "samples keep their spelling: {stored}");
+
+    let ledger = store::load_usage_ledger_at(root.path()).unwrap();
+    let query = UsageQuery { from: d("2026-10-01"), to: d("2026-10-31"), group_by: vec![UsageGroupKey::Model] };
+    let mut settings = crate::config::usage_pricing::UsageSettings::default().effective();
+    settings.price_source = crate::config::usage_pricing::PriceSource::Manual;
+    let context = super::estimate::PriceContext::new(
+        &settings,
+        Some(UsagePriceTable::default()),
+        None,
+        crate::config::usage_pricing::ExchangeRates::default(),
+    );
+    let result = aggregate_usage(&ledger, &query, &UsageLabels::default(), Some(&context), &aedt);
+    let rows: Vec<_> = result
+        .rows
+        .iter()
+        .map(|row| (row.key.model.clone().flatten(), row.amounts.requests, row.amounts.input))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(Some("glm-5.3".to_string()), 2, 200), (Some("glm-5.3-flash".to_string()), 2, 200)]
+    );
+    let unpriced: Vec<_> = result
+        .unpriced_models
+        .unwrap()
+        .into_iter()
+        .map(|m| (m.model, m.requests, m.tokens))
+        .collect();
+    assert_eq!(
+        unpriced,
+        vec![(Some("glm-5.3".to_string()), 2, 220), (Some("glm-5.3-flash".to_string()), 2, 220)]
+    );
+}

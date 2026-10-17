@@ -122,6 +122,7 @@ pub fn managed_mcp_resource(job_configured: bool, facade: Option<String>) -> Val
                 "codeModeDirectOnly": true,
                 "command": facade,
                 "envVars": ["CUTEX_AGENT_ID", "CUTEX_RUNTIME_GENERATION", "CUTEX_AGENT_BUS_URL", "CUTEX_AGENT_BUS_TOKEN"],
+                "env": ["CUTEX_MANAGEMENT_URL"],
                 "toolsSource": "daemon",
                 "tools": tools,
             },

@@ -2,12 +2,14 @@
 """End-to-end check of the backend updater (.github/workflows/upgrade-e2e.yml, docs/backend-upgrade.md):
 an existing cutex 0.1.0 managed install upgrades to 0.1.1 through `cutex upgrade check / stage / apply`,
 on the platform's real service manager, and a broken later release rolls back by itself. The steps below
-say 0.1.0 / 0.1.1 for the installed / new release; the same run checks 0.1.1 -> 0.1.2 (the workflow's
-default since the 0.1.2 release; 0.1.1 already advertises `components`).
+say 0.1.0 / 0.1.1 for the installed / new release; the same run checks 0.1.1 -> 0.1.2 and 0.1.2 -> 0.1.3
+(the workflow's default since the 0.1.3 prep; 0.1.1 on already advertise `components`). With --new-native the
+new release also brings a new cute-codex native, as `sign-and-upload.sh cutex --native-run` builds it (0.1.3
+ships native 0.160.0-r52.3): the updater stages, preflights and selects it.
 
     python .github/ci/upgrade-e2e.py --from-cutex DIR --from-commit SHA --to-cutex DIR --to-commit SHA
-        --components DIR --work DIR [--release-meta DIR] [--service-name LABEL] [--unit-dir DIR]
-        [--claude-python PATH] [--rustc RUSTC] [--generator upgrade-manifest.py] [--no-cleanup]
+        --components DIR --work DIR [--release-meta DIR] [--new-native none|stub|DIR] [--service-name LABEL]
+        [--unit-dir DIR] [--claude-python PATH] [--rustc RUSTC] [--generator upgrade-manifest.py] [--no-cleanup]
 
 --from-cutex / --to-cutex: directories with DEBUG `cutex` + `cutex-mcp` builds of the two versions (only
 debug builds trust the run-time key CUTEX_UPGRADE_TEST_PUBKEY; a release build trusts only the embedded
@@ -18,6 +20,12 @@ BUILD-INFO). --release-meta: the release metadata the owner signs the real relea
 (.github/ci/release-meta = the desktop repo's scripts/public-export/projects/cutex/release-meta, which
 sign-and-upload.sh reads): `<to release>.json` is the generator's --meta, `capabilities-<from release>.json`
 its --previous-capabilities (first checked against the FROM build's own list on this platform).
+--new-native: the native the new release brings (the generator's --native-dir, as --native-run gives it):
+`none` (default: like 0.1.1 / 0.1.2), `stub` (a second stub native, version 0.0.1-e2e-stub), or a directory
+with a real `native-<version>-<platform>.tar.gz` of this platform (a cute-codex run's natives-<platform>
+artifact, or the archive downloaded from a published cute-codex release; without a BUILD-INFO-<platform>.json
+next to it, the archive's own cute-codex-build.json is used). Nothing executes the native: cutex stages,
+checks the files of, hashes and selects it.
 
 What it does (nothing here touches a real cutex home, the real service names or the real signing key):
 
@@ -27,7 +35,7 @@ What it does (nothing here touches a real cutex home, the real service names or 
    cutex only hashes and selects them) and a broken release (below). Manifests: 0.1.0 with sequence 1
    in the published 0.1.0 shape, native included (the generator refuses sequence 1); 0.1.1 and the
    broken release with the real generator and the REAL release's arguments, as sign-and-upload.sh runs
-   it: no --native-dir (0.1.1 brings no new native: no --native-run), --meta release-meta/<to>.json,
+   it: --native-dir only with --new-native (0.1.1 / 0.1.2 brought none: no --native-run), --meta release-meta/<to>.json,
    --previous-capabilities release-meta/capabilities-<from>.json (else the FROM build's list); top-level
    `components`, sequence 2 / 3. All signed; served on http://127.0.0.1:<random>.
 2. A private marked home (CUTEX_TEST_PRIVATE_HOME + HOME) and the install base under --work (a path
@@ -50,10 +58,12 @@ What it does (nothing here touches a real cutex home, the real service names or 
    that native + 0.1.0's cutex-mcp facade) selected with `cutex human install-runtime`.
 3. Upgrade 0.1.0 -> 0.1.1 with the INSTALLED 0.1.0 binary: check offers 0.1.1 in the mode the real
    manifest has (0.1.1: `full`, from its meta), stage (preflight: the new binary's --version and
-   selftest, ...; no native to stage), apply (the 0.1.1 binary runs the run). Asserts committed in that
+   selftest, ...; with --new-native also the staged native: `nativeVersion` offered, natives/<new> unpacked,
+   preflight check `native`), apply (the 0.1.1 binary runs the run). Asserts committed in that
    mode, `cutex --version`, GET /v2/upgrade, capabilities only gained (incl. `components`),
    GET /v2/components, the services up, and what NEW agents get: full -> runtime/light/deployment.json
-   selects releases/0.1.1/manifests/default.json = 0.1.0's native files + the 0.1.1 cutex-mcp facade;
+   selects releases/0.1.1/manifests/default.json = 0.1.0's native files (with --new-native: natives/<new>)
+   + the 0.1.1 cutex-mcp facade;
    reload -> they keep releases/0.1.0/manifests/default.json (asserted and reported as a warning).
 4. Components from the 0.1.1 manifest: claude-runtime -> needsUser claude_cli_missing (no `claude` on
    PATH); Linux: job-service -> ready (a systemd drill unit, socket answers; its Codex runtime is the
@@ -103,6 +113,7 @@ PLATFORM = "windows-x64" if WINDOWS else "linux-x64"
 EXE = ".exe" if WINDOWS else ""
 MARKER = ".cutex-test-private-home"
 NATIVE_VERSION = "0.0.0-e2e-stub"
+NEW_NATIVE_STUB = "0.0.1-e2e-stub"
 BROKEN_LABEL = "0.1.2-e2e-broken"
 # Capabilities that follow a live component (cutex runner.rs HOST_DEPENDENT_CAPABILITIES).
 HOST_DEPENDENT = {"job-external", "job-source-nci"}
@@ -190,23 +201,63 @@ def cutex_build(out: Path, label: str, commit: str, line: str, caps: list[str], 
     return archive
 
 
-def native_build(out: Path) -> Path:
+def native_build(out: Path, version: str = NATIVE_VERSION) -> Path:
     """A stub native: the updater stages, hashes and selects these files; nothing executes them here."""
     stubs = out / "files"
     stubs.mkdir(parents=True)
     files = {}
     for name in (f"codex-app-server{EXE}", f"codex-code-mode-host{EXE}", f"codex{EXE}"):
-        (stubs / name).write_text(f"#!/bin/sh\n# cutex upgrade e2e stub {name}: never run\nexit 1\n", encoding="utf-8")
+        (stubs / name).write_text(f"#!/bin/sh\n# cutex upgrade e2e stub {name} {version}: never run\nexit 1\n", encoding="utf-8")
         files[name] = stubs / name
     schema = stubs / "codex_app_server_protocol.schemas.json"
     schema.write_text("{}\n", encoding="utf-8")
     files[schema.name] = schema
-    archive = out / f"native-{NATIVE_VERSION}-{PLATFORM}.tar.gz"
+    archive = out / f"native-{version}-{PLATFORM}.tar.gz"
     pack(archive, files)
-    info = {"version": NATIVE_VERSION, "commit": "0" * 40, "platform": PLATFORM}
+    commit = "0" * 40 if version == NATIVE_VERSION else "1" * 40
+    info = {"version": version, "commit": commit, "platform": PLATFORM}
     (out / f"BUILD-INFO-{PLATFORM}.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
     write_sums(out, archive, f"SHA256SUMS-{PLATFORM}")
     return archive
+
+
+def new_native_build(spec: str, out: Path) -> tuple[Path, str] | None:
+    """The native the new release brings (--new-native), as a `natives-<platform>` build dir for the
+    generator's --native-dir: None, a second stub, or a real archive of this platform."""
+    if spec == "none":
+        return None
+    if spec == "stub":
+        return native_build(out, NEW_NATIVE_STUB), NEW_NATIVE_STUB
+    given = Path(spec)
+    archives = sorted(given.glob(f"native-*-{PLATFORM}.tar.gz"))
+    if len(archives) != 1:
+        raise SystemExit(f"--new-native {given}: expected one native-*-{PLATFORM}.tar.gz, found {len(archives)}")
+    info_path = given / f"BUILD-INFO-{PLATFORM}.json"
+    if info_path.is_file():
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+    else:
+        with tarfile.open(archives[0]) as tar:
+            member = tar.extractfile("cute-codex-build.json")
+            if member is None:
+                raise SystemExit(f"{archives[0]}: no cute-codex-build.json and no {info_path.name}")
+            info = json.loads(member.read().decode("utf-8"))
+    version = str(info.get("version", ""))
+    if info.get("platform") != PLATFORM or archives[0].name != f"native-{version}-{PLATFORM}.tar.gz":
+        raise SystemExit(f"{archives[0]}: build record says {version} / {info.get('platform')}")
+    if version in (NATIVE_VERSION, NEW_NATIVE_STUB):
+        raise SystemExit(f"--new-native: {version} is a stub version")
+    with tarfile.open(archives[0]) as tar:
+        names = set(tar.getnames())
+    missing = sorted({f"codex-app-server{EXE}", f"codex-code-mode-host{EXE}", "codex_app_server_protocol.schemas.json"} - names)
+    if missing:
+        raise SystemExit(f"{archives[0]}: missing {missing}")
+    out.mkdir(parents=True, exist_ok=True)
+    archive = out / archives[0].name
+    shutil.copyfile(archives[0], archive)
+    (out / f"BUILD-INFO-{PLATFORM}.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    write_sums(out, archive, f"SHA256SUMS-{PLATFORM}")
+    log(f"  new native {version} ({str(info.get('commit', ''))[:12]}) from {archives[0]}")
+    return archive, version
 
 
 BROKEN_RS = r"""
@@ -810,24 +861,40 @@ def install_native_010(host: Host, from_label: str) -> None:
     host.native_home_before = selected.get("native_home")
 
 
-def upgrade_to_011(host: Host, url: str, to_label: str, to_commit: str, from_label: str, before: set[str], mode: str) -> None:
-    phase(f"upgrade {from_label} -> {to_label} ({mode}) with the installed {from_label} binary")
+def upgrade_to_011(host: Host, url: str, to_label: str, to_commit: str, from_label: str, before: set[str], mode: str,
+                   new_native: str | None = None) -> None:
+    phase(f"upgrade {from_label} -> {to_label} ({mode}{', native ' + new_native if new_native else ''}) "
+          f"with the installed {from_label} binary")
     host.cli("upgrade", "config", "--source", url)
     _, available, _ = host.cli("upgrade", "check", show=True)
     available = available or {}
     check(available.get("release") == to_label, f"check offers {to_label} (got {available.get('release')})")
     check(available.get("sequence") == 2, f"{to_label} has sequence 2")
     check(available.get("mode") == mode, f"{from_label} classifies {to_label} as {mode} (got {available.get('mode')})")
-    check(available.get("nativeVersion") is None, f"no native to stage (got {available.get('nativeVersion')})")
+    if new_native:
+        check(available.get("nativeVersion") == new_native, f"native {new_native} to stage (got {available.get('nativeVersion')})")
+    else:
+        check(available.get("nativeVersion") is None, f"no native to stage (got {available.get('nativeVersion')})")
     _, staged, _ = host.cli("upgrade", "stage", show=True)
     staged = staged or {}
     checks = {c.get("name"): c.get("ok") for c in staged.get("preflight") or []}
     check(staged.get("preflightOk", staged.get("preflight_ok")) is True, f"preflight ok ({checks})")
     for name in ("integrity", "version", "selftest", "rollbackTarget"):
         check(checks.get(name) is True, f"preflight check {name} passed")
-    check("native" not in checks, "no native preflight (the manifest brings no native)")
     natives = sorted(p.name for p in (host.base / "natives").iterdir())
-    check(natives == [NATIVE_VERSION], f"natives/ holds only {from_label}'s {NATIVE_VERSION} (got {natives})")
+    if new_native:
+        check(checks.get("native") is True, f"preflight check native passed (natives/{new_native} complete)")
+        check(natives == sorted([NATIVE_VERSION, new_native]),
+              f"natives/ holds {from_label}'s {NATIVE_VERSION} and the staged {new_native} (got {natives})")
+        staged_dir = host.base / "natives" / new_native
+        for name in (f"codex-app-server{EXE}", f"codex-code-mode-host{EXE}", "codex_app_server_protocol.schemas.json"):
+            check((staged_dir / name).is_file(), f"natives/{new_native}/{name} unpacked")
+        selected = host.selected_runtime()
+        check(same_path(selected.get("bundle_manifest"), host.base / "releases" / from_label / "manifests" / "default.json"),
+              f"staging selects nothing yet: new agents still use releases/{from_label}/manifests/default.json")
+    else:
+        check("native" not in checks, "no native preflight (the manifest brings no native)")
+        check(natives == [NATIVE_VERSION], f"natives/ holds only {from_label}'s {NATIVE_VERSION} (got {natives})")
     t0 = time.time()
     code, _, out = host.cli("upgrade", "apply", "--max-wait", "600", show=True, ok=False)
     log(f"  apply took {time.time() - t0:.0f} s")
@@ -855,10 +922,10 @@ def upgrade_to_011(host: Host, url: str, to_label: str, to_commit: str, from_lab
     names = sorted(c.get("name") for c in (comps or {}).get("components") or [])
     check(status == 200, f"GET /v2/components answers (status {status}; {names})")
     host.services_up(to_label)
-    new_agents(host, from_label, to_label, mode)
+    new_agents(host, from_label, to_label, mode, new_native)
 
 
-def new_agents(host: Host, from_label: str, to_label: str, mode: str) -> None:
+def new_agents(host: Host, from_label: str, to_label: str, mode: str, new_native: str | None = None) -> None:
     """What NEW agents start with after the apply (runtime/light/deployment.json and its bundle)."""
     selected = host.selected_runtime()
     log(f"  deployment.json: {json.dumps(selected)}")
@@ -878,11 +945,13 @@ def new_agents(host: Host, from_label: str, to_label: str, mode: str) -> None:
     pinned = bundle.get("facade") or {}
     check(same_path(pinned.get("path"), facade) and pinned.get("sha256") == ce.sha256(facade),
           f"its facade is {to_label}'s cutex-mcp (got {pinned.get('path')})")
-    native = host.base / "natives" / NATIVE_VERSION
+    version = new_native or NATIVE_VERSION
+    whose = f"the staged {to_label}" if new_native else f"{from_label}'s"
+    native = host.base / "natives" / version
     for key, name in (("executable", f"codex-app-server{EXE}"), ("code_mode_host", f"codex-code-mode-host{EXE}"),
                       ("schema", "codex_app_server_protocol.schemas.json")):
         got = (bundle.get(key) or {}).get("path")
-        check(same_path(got, native / name), f"its {key} is {from_label}'s natives/{NATIVE_VERSION}/{name} (got {got})")
+        check(same_path(got, native / name), f"its {key} is {whose} natives/{version}/{name} (got {got})")
 
 
 def components(host: Host, args: argparse.Namespace, versions: dict[str, str]) -> None:
@@ -999,6 +1068,9 @@ def build_release(args: argparse.Namespace, work: Path, key, generator: Path) ->
     from_archive = cutex_build(rel / "b-from", from_label, args.from_commit, from_line, from_caps, pair(args.from_cutex))
     cutex_build(rel / "b-to", to_label, args.to_commit, to_line, to_caps, pair(args.to_cutex))
     native = native_build(rel / "b-native")
+    brought = new_native_build(args.new_native, rel / "b-new-native")
+    new_native = brought[1] if brought else None
+    native_args = ["--native-dir", str(rel / "b-new-native")] if brought else []
     broken_line = f"cutex 0.0.0 ({BROKEN_LABEL}, {args.to_commit[:7]})"
     stub = broken_stub(rel / "b-stub", broken_line, args.rustc)
     cutex_build(rel / "b-broken", BROKEN_LABEL, args.to_commit, broken_line, to_caps,
@@ -1009,10 +1081,10 @@ def build_release(args: argparse.Namespace, work: Path, key, generator: Path) ->
     m010.mkdir(parents=True)
     (m010 / "manifest.json").write_text(json.dumps(manifest_010(from_label, args.from_commit, from_archive, native), indent=2) + "\n",
                                         encoding="utf-8")
-    # As `sign-and-upload.sh cutex --run <to> --sequence next` (no --native-run) builds it.
+    # As `sign-and-upload.sh cutex --run <to> --sequence next [--native-run <cute-codex run>]` builds it.
     generate(generator, "manifest", "--cutex-dir", str(rel / "b-to"), "--component-dir", str(args.components),
              "--sequence", "next", "--previous", str(m010 / "manifest.json"), "--previous-capabilities", str(prev_caps),
-             *meta_args, "--out", str(rel / "m-to"))
+             *native_args, *meta_args, "--out", str(rel / "m-to"))
     generate(generator, "manifest", "--cutex-dir", str(rel / "b-broken"), "--component-dir", str(args.components),
              "--sequence", "next", "--previous", str(rel / "m-to" / "manifest.json"), *meta_args,
              "--notes-en", "upgrade e2e: a release whose daemon exits", "--out", str(rel / "m-broken"))
@@ -1022,10 +1094,17 @@ def build_release(args: argparse.Namespace, work: Path, key, generator: Path) ->
     for d, label in ((rel / "b-from", from_label), (rel / "b-to", to_label), (rel / "b-broken", BROKEN_LABEL)):
         release.put(f"cutex-{label}", d / f"cutex-{label}-{PLATFORM}.tar.gz")
     release.put(f"native-{NATIVE_VERSION}", native)
+    if brought:
+        release.put(f"native-{new_native}", brought[0])
+        expected_mode = meta.get("mode") or "full"
     to_doc = docs["m-to"]
     check(to_doc["sequence"] == 2, f"{to_label} manifest: sequence 2 (got {to_doc['sequence']})")
     check(to_doc["mode"] == expected_mode, f"{to_label} manifest: mode {expected_mode} like the real release (got {to_doc['mode']})")
-    check("native" not in to_doc, f"{to_label} manifest: no native part (the host keeps {from_label}'s {NATIVE_VERSION})")
+    if new_native:
+        check((to_doc.get("native") or {}).get("version") == new_native,
+              f"{to_label} manifest: native {new_native} (got {(to_doc.get('native') or {}).get('version')})")
+    else:
+        check("native" not in to_doc, f"{to_label} manifest: no native part (the host keeps {from_label}'s {NATIVE_VERSION})")
     check("components" in to_doc and "claudeRuntime" not in to_doc, f"{to_label} manifest: top-level components, no claudeRuntime")
     if to_doc["mode"] == "reload":
         warn(f"the {to_label} manifest is `reload`: NEW agents will keep {from_label}'s runtime bundle and cutex-mcp facade")
@@ -1033,7 +1112,7 @@ def build_release(args: argparse.Namespace, work: Path, key, generator: Path) ->
         for a in comp["artifacts"].values():
             release.put(a["tag"], next(args.components.rglob(a["name"])))
     release.channel(generator, rel / "m-to", rel / "ch-to")
-    return release, {"from": (from_label, from_line), "to": (to_label, to_line), "mode": to_doc["mode"],
+    return release, {"from": (from_label, from_line), "to": (to_label, to_line), "mode": to_doc["mode"], "native": new_native,
                      "components": {n: c["version"] for n, c in to_doc.get("components", {}).items()}}
 
 
@@ -1050,6 +1129,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--work", required=True, type=Path, help="empty or missing work dir (use one with a space)")
     ap.add_argument("--release-meta", type=Path,
                     help="the real release's metadata: <to>.json (--meta), capabilities-<from>.json (--previous-capabilities)")
+    ap.add_argument("--new-native", default="none",
+                    help="the native the new release brings: none, stub, or a dir with a real native-<v>-<platform>.tar.gz")
     ap.add_argument("--service-name", default="e2e", help="drill label for CUTEX_SERVICE_TEST_NAME")
     ap.add_argument("--unit-dir", help="Linux: the user unit dir the drill units go to (default $XDG_RUNTIME_DIR/systemd/user)")
     ap.add_argument("--claude-python", default=sys.executable, help="Python >= 3.11 for the Claude runtime venv")
@@ -1062,6 +1143,10 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("from_cutex", "to_cutex", "components", "release_meta"):
         if getattr(args, name) is not None:
             setattr(args, name, getattr(args, name).resolve())
+    if args.new_native not in ("none", "stub"):
+        if not Path(args.new_native).is_dir():
+            raise SystemExit(f"--new-native {args.new_native}: none, stub or a directory")
+        args.new_native = str(Path(args.new_native).resolve())
     if args.release_meta is not None and not args.release_meta.is_dir():
         raise SystemExit(f"--release-meta {args.release_meta} is not a directory")
     if not re.fullmatch(r"[0-9a-f]{40}", args.from_commit) or not re.fullmatch(r"[0-9a-f]{40}", args.to_commit):
@@ -1090,7 +1175,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         before = install_010(host, args, from_label, dl)
         if not failures:
-            upgrade_to_011(host, url, to_label, args.to_commit, from_label, before, info["mode"])
+            upgrade_to_011(host, url, to_label, args.to_commit, from_label, before, info["mode"], info["native"])
         if not failures:
             components(host, args, info["components"])
         if not failures:

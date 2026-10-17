@@ -940,6 +940,19 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // secretFieldsCleared, ...}]; never overwrites (409 profile_name_conflict);
     // 400 unsupported_bundle for a bundle this cutex does not read.
     ("profile-transfer", "profileTransfer"),
+    // 2026-10-17: network access and extra writable roots of a running
+    // workspace-write Codex session (sandbox_extras.rs). Owner only.
+    // GET /v2/sessions/{id}/sandbox-extras -> {cutexSessionId, sandbox,
+    // networkAccess, writableRoots, editable, reason}; PATCH with
+    // {networkAccess?, writableRoots?} stores them on the session record
+    // (kept across runtime restart, relaunch and daemon restart) and sends
+    // native thread/settings/update when the runtime is connected; the answer
+    // adds `changed` and `live {status: applied | offline | failed,
+    // diagnostic?}` (applied = from the next turn). Refusals: 409
+    // sandbox_not_workspace_write | unsupported_runtime (Claude) |
+    // session_retired; 400 invalid_writable_root (relative, missing, not a
+    // directory, > 32) | writable_root_in_cutex_home.
+    ("session-sandbox-extras", "sessionSandboxExtras"),
     #[cfg(target_os = "linux")]
     ("job-service", "jobService"),
 ];
@@ -1141,6 +1154,7 @@ mod tests {
             "usageSourceZcode",
             "windowsSandboxReadiness",
             "peerOwnerProfile",
+            "sessionSandboxExtras",
         ] {
             assert_eq!(value["features"][key], true, "{key}");
         }

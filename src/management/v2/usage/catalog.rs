@@ -381,7 +381,8 @@ pub fn provider_prefixes(provider: Option<&str>, category: Option<ProviderCatego
 
 impl CatalogCache {
     /// Library price of a model: `<prefix>/<candidate>` for each provider
-    /// prefix, then the bare candidate. Returns the matched key.
+    /// prefix, then the bare candidate, then the prefixes of the family the
+    /// model name itself belongs to. Returns the matched key.
     pub fn lookup(
         &self,
         provider: Option<&str>,
@@ -389,16 +390,50 @@ impl CatalogCache {
         model: &str,
     ) -> Option<(&str, &LibraryPrice)> {
         let prefixes = provider_prefixes(provider, category);
-        for candidate in model_candidates(model) {
+        let candidates = model_candidates(model);
+        for candidate in &candidates {
             for prefix in &prefixes {
                 if let Some((key, price)) = self.models.get_key_value(&format!("{prefix}/{candidate}")) {
                     return Some((key.as_str(), price));
                 }
             }
-            if let Some((key, price)) = self.models.get_key_value(&candidate) {
+            if let Some((key, price)) = self.models.get_key_value(candidate) {
                 return Some((key.as_str(), price));
             }
         }
+        // A provider the library has no name for (a Claude account, a custom
+        // provider id): the model's own family names the library prefix.
+        let family = candidates.iter().find_map(|candidate| category_for_model_name(candidate))?;
+        for candidate in &candidates {
+            for prefix in category_prefixes(family) {
+                if prefixes.iter().any(|tried| tried == prefix) {
+                    continue;
+                }
+                if let Some((key, price)) = self.models.get_key_value(&format!("{prefix}/{candidate}")) {
+                    return Some((key.as_str(), price));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Provider family a model name belongs to (`glm-5.3`, `kimi-k2`,
+/// `deepseek-chat`, …); `None` for names that do not say.
+pub fn category_for_model_name(model: &str) -> Option<ProviderCategory> {
+    let model = model.trim().to_ascii_lowercase();
+    let starts = |prefixes: &[&str]| prefixes.iter().any(|prefix| model.starts_with(prefix));
+    if starts(&["glm-", "chatglm"]) {
+        Some(ProviderCategory::Glm)
+    } else if starts(&["kimi-", "moonshot-"]) {
+        Some(ProviderCategory::Kimi)
+    } else if starts(&["deepseek-"]) {
+        Some(ProviderCategory::Deepseek)
+    } else if starts(&["claude-"]) {
+        Some(ProviderCategory::Claude)
+    } else if starts(&["gpt-", "codex-"]) {
+        Some(ProviderCategory::Codex)
+    } else {
         None
     }
 }

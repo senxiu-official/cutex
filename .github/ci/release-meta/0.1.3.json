@@ -1,0 +1,9 @@
+{
+  "_comment": "upgrade-manifest.py --meta for cutex 0.1.3 (sign-and-upload.sh uses release-meta/<release>.json by itself). cutex 0.1.3 ships the new cute-codex native 0.160.0-r52.3 (cute-codex release/native-r52.3: the restricted-token Windows sandbox falls back from Store PowerShell). The native part of the manifest comes from `--native-run <cute-codex build binaries run>` (the artifacts natives-<platform>), never from this file, as for 0.1.0; with a native the generator would choose full anyway, `mode` is explicit so a run without --native-run still gives full (the runner then selects releases/0.1.3/manifests/default.json with the host's current native and the 0.1.3 cutex-mcp facade, like 0.1.2). packageRunRecommended: idle agents move to the new bundle (new native + facade) after the update. The previous capability list is the published cutex-0.1.2/capabilities.json (capabilities-0.1.2.json here is a copy for the upgrade e2e); 0.1.3 only adds (session-sandbox-extras). Owner commands: docs/release/RUNBOOK-cutex-0.1.3.md. The upgrade e2e (ci/upgrade-e2e.py --release-meta, --new-native) generates its 0.1.3 manifest from this same file.",
+  "mode": "full",
+  "packageRunRecommended": true,
+  "notes": {
+    "en": "New native runtime cute-codex 0.160.0-r52.3: under the Windows sandbox without administrator rights, commands work when PowerShell is the Microsoft Store version. Agent browser tools work in independent instances (non-default cutex homes); usage cost for models priced by their family (e.g. GLM-5.3 through a Claude account or a custom provider). New agents start with the new native and this release's tools; idle agents move over after the update.",
+    "zh-CN": "新的原生运行时 cute-codex 0.160.0-r52.3：Windows 免管理员沙箱下，商店版 PowerShell 也能正常运行命令。独立实例（非默认 cutex home）里的智能体可以使用浏览器工具；按模型系列估算用量费用（如通过 Claude 账号或自定义提供方使用的 GLM-5.3）。新智能体使用新的原生运行时和本版本的工具，空闲的智能体会在更新后自动迁移。"
+  }
+}

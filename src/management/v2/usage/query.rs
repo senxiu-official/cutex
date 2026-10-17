@@ -336,11 +336,12 @@ pub fn aggregate_usage(
         let (cost, priced_as) = pricing.map(|context| context.price_mapped(sample)).unwrap_or((None, None));
         if pricing.is_some() && cost.is_none() {
             let attribution = &sample.attribution;
+            let model = model_key(attribution.model.as_deref());
             let entry = unpriced
-                .entry((attribution.provider.clone(), attribution.model.clone()))
+                .entry((attribution.provider.clone(), model.clone()))
                 .or_insert_with(|| UnpricedModel {
                     provider: attribution.provider.clone(),
-                    model: attribution.model.clone(),
+                    model,
                     priced_as: priced_as.map(str::to_string),
                     ..UnpricedModel::default()
                 });
@@ -383,6 +384,14 @@ pub fn aggregate_usage(
     }
 }
 
+/// A model's report key: its id lowercased (ASCII), so one model reported in
+/// two spellings (the Claude runtime's `GLM-5.3`, Codex's `glm-5.3`) is one
+/// row / unpriced entry, as pricing already matches it. Stored samples keep
+/// their spelling.
+fn model_key(model: Option<&str>) -> Option<String> {
+    model.map(str::to_ascii_lowercase)
+}
+
 fn row_key(
     group_by: &[UsageGroupKey],
     sample: &UsageSample,
@@ -413,8 +422,9 @@ fn row_key(
                 });
             }
             UsageGroupKey::Model => {
-                identity.push(sample.attribution.model.clone());
-                key.model = Some(sample.attribution.model.clone());
+                let model = model_key(sample.attribution.model.as_deref());
+                identity.push(model.clone());
+                key.model = Some(model);
             }
             UsageGroupKey::Agent => {
                 let id = sample.cutex_session_id.clone();

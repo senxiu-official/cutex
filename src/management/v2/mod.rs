@@ -38,6 +38,7 @@ pub mod side_chats;
 pub mod notification_levels;
 pub mod owner_notify;
 pub mod safety_checks;
+pub mod sandbox_extras;
 pub mod owner_rotation;
 pub mod owner_rotation_api;
 pub mod request_idempotency;

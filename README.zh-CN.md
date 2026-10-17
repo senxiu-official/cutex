@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
-**0.1.2**：新线程使用 Codex 自动审批员；Windows 沙箱就绪检查；Profile 可在主机之间复制；修复 Windows API-key Profile 和分叉智能体的问题（0.1.0「First Take」是第一个公开版本）。更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+**0.1.3**：新的 cute-codex 原生运行时 0.160.0-r52.3（Windows 免管理员沙箱下商店版 PowerShell 可用）；运行中会话的联网与额外可写目录可以修改；独立实例里的智能体浏览器工具可用；用量估价修复（0.1.0「First Take」是第一个公开版本）。更新内容见 [CHANGELOG.md](CHANGELOG.md)。
 
 > **0.1.x 的已知缺口**（正在修，修好后删除这段）：
 > - **手机推送 / 配对手机**：还没有公开的手机应用。

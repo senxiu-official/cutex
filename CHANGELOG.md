@@ -1,6 +1,51 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 (2026-10-17)
+
+New cute-codex native 0.160.0-r52.3 (Windows: Store PowerShell works under the sandbox without
+administrator rights), network access and extra writable folders changeable on a running session, agent
+browser tools in independent instances, and usage fixes. 新的 cute-codex 原生运行时 0.160.0-r52.3（Windows
+免管理员沙箱下商店版 PowerShell 可用）；运行中会话的联网与额外可写目录可以修改；独立实例里的智能体浏览器工具可用；
+用量估价与按模型统计修复。
+
+**Native runtime**
+
+- New native cute-codex 0.160.0-r52.3: Windows sandbox falls back from Store PowerShell. Under the
+  sandbox without administrator rights (restricted token), the Microsoft Store PowerShell cannot start
+  (commands failed with exit -1); native now falls back to an installed `pwsh` or Windows PowerShell,
+  as the elevated sandbox already did. The backend update stages the native; new agents use it, idle
+  agents move over after the update. 新原生运行时 0.160.0-r52.3：Windows 免管理员沙箱下不再启动商店版
+  PowerShell（之前命令以 exit -1 失败），改用已安装的 pwsh 或 Windows PowerShell。
+
+**Permissions**
+
+- Network access and extra writable roots of a running session (capability `session-sandbox-extras`,
+  owner only): `GET|PATCH /v2/sessions/{id}/sandbox-extras` with `{networkAccess?, writableRoots?}`.
+  The values are stored on the session record — every start / resume / relaunch builds the
+  workspace-write sandbox from it, so they survive runtime restart, relaunch and daemon restart — and
+  pushed to a connected runtime with native `thread/settings/update` (applies from the next turn;
+  answer `live.status` = `applied` | `offline` | `failed`). Workspace-write Codex sessions only (409
+  `sandbox_not_workspace_write` / `unsupported_runtime`); roots must be existing absolute directories
+  on the host, at most 32, never the cutex home or inside it (400 `invalid_writable_root` /
+  `writable_root_in_cutex_home`). 运行中会话的联网与额外可写目录可以修改并保存在会话上，重启后保留。
+
+**Browser**
+
+- Agent browser tools in an independent instance (`CUTEX_HOME`) or any non-default home: the cutex MCP
+  tool server now gets its own daemon's Management URL at launch. Before, it used the default
+  `~/.cutex` daemon's port, so every `browser_*` call was refused with `permission_denied` (and went to
+  the wrong daemon). Existing agents pick it up at their next runtime restart. 独立实例里智能体的浏览器
+  工具可以用了（之前连到默认 home 的 daemon，全部被拒）。
+
+**Usage**
+
+- Usage cost: models whose provider the price library has no name for (a Claude account routed to
+  Z.ai, a custom provider id) are priced by the model's own family, e.g. `GLM-5.3` / `GLM-5.3-Flash`
+  via `zai/…`. Before they showed as unpriced. 用量估价：Claude 账号走 Z.ai、自定义提供方名时，按模型名
+  所属系列查价（GLM-5.3 等不再显示无价格）。
+- Usage by model: one model reported in two spellings (the Claude runtime's `GLM-5.3`, Codex's
+  `glm-5.3`) is one row in `GET /v2/usage?groupBy=model` and one `unpricedModels` entry, keyed by the
+  lowercase id. Stored samples keep their spelling. 用量按模型：大小写不同的同一模型合并为一行（显示小写 id）。
 
 ## 0.1.2 (2026-10-17)
 

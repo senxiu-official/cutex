@@ -299,6 +299,18 @@ pub fn handle_v2_request(
         }
         return super::agent_harness::handle(stream, request);
     }
+    if super::sandbox_extras::is_path(path) {
+        // Network / extra writable roots of one session (capability
+        // session-sandbox-extras): the owner only (root, or an owner-bound
+        // token; the access gate classifies /v2/sessions owner-only too).
+        if !authenticated_root_request(request, agent_management_admin_token)
+            || crate::management::users::current_principal().is_some_and(|p| !p.is_owner())
+        {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for session sandbox settings", false, json!({}));
+        }
+        return super::sandbox_extras::handle(stream, request, context);
+    }
     if super::safety_checks::is_path(path) {
         // Safety blocks (owner decisions): root (incl. device / client tokens).
         if !authenticated_root_request(request, agent_management_admin_token) {

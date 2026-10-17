@@ -1084,7 +1084,9 @@ impl StockRuntimeExecutor for StockExecutor {
         launch = option(
             launch,
             "mcp_servers.cutex",
-            serde_json::json!({"command":bundle.facade.path,"env_vars":mcp_env,"default_tools_approval_mode":"approve","enabled":cutex::agent_bus::tool_policy::cutex_mcp_enabled(record)}),
+            serde_json::json!({"command":bundle.facade.path,"env_vars":mcp_env,
+                "env":facade_config_env(cutex::management::service::management_port(&config)),
+                "default_tools_approval_mode":"approve","enabled":cutex::agent_bus::tool_policy::cutex_mcp_enabled(record)}),
         )?;
         launch = option(
             launch,
@@ -1700,6 +1702,39 @@ pub(super) fn foreground_status(
         })
         .unwrap_or_default();
     Ok((status, diagnostic))
+}
+
+/// Literal (non-secret) environment of the `cutex` MCP façade, written into
+/// `mcp_servers.cutex.env` so only the façade gets it: the native process and
+/// its shells do not (an agent shell's `cutex` CLI still reads its own home and
+/// token, so it must not be pointed at another daemon's port).
+///
+/// The façade's browser tools call this daemon's Management API. Without
+/// `CUTEX_MANAGEMENT_URL` the façade resolved the port from the OS user's
+/// default `~/.cutex` (it sees neither `CUTEX_HOME` nor a test private home),
+/// so an independent instance or a private dev home sent
+/// `/v2/browser/commands` to another daemon, which refused every call with
+/// `permission_denied`.
+fn facade_config_env(management_port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "CUTEX_MANAGEMENT_URL": cutex::management::service::management_base_url(management_port),
+    })
+}
+
+#[cfg(test)]
+mod facade_env_tests {
+    #[test]
+    fn facade_gets_this_daemons_management_endpoint_only_via_mcp_config() {
+        let env = super::facade_config_env(25070);
+        let object = env.as_object().unwrap();
+        assert_eq!(object.len(), 1, "only the endpoint; secrets stay in env_vars");
+        let raw = object["CUTEX_MANAGEMENT_URL"].as_str().unwrap();
+        // Exactly the shape the façade's browser transport accepts.
+        let url = url::Url::parse(raw).unwrap();
+        assert!(url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.path() == "/");
+        assert!(url.query().is_none() && url.username().is_empty() && url.password().is_none());
+        assert_eq!(url.port(), Some(25070));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

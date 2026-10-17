@@ -1,11 +1,11 @@
 {
   "project": "cutex",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "exportDate": "2026-10-17",
   "sourceCommit": null,
   "sourceCommitNote": "withheld: kept in the private export record next to the export directory",
   "license": "Apache-2.0",
-  "fileCount": 918,
+  "fileCount": 921,
   "files": [
     {
       "path": ".cargo/config.toml",
@@ -48,6 +48,11 @@
       "size": 2220
     },
     {
+      "path": ".github/ci/release-meta/0.1.3.json",
+      "sha256": "b648103e7a1ada9e912c25eccaf8c901dea87ca9fc31e24afbf2d95f05b9b2be",
+      "size": 2133
+    },
+    {
       "path": ".github/ci/release-meta/capabilities-0.1.0.json",
       "sha256": "f83570231bb57bb445e8b1c3bf790f3133ab809871fd7af6aa2311bc78f73396",
       "size": 8902
@@ -58,9 +63,14 @@
       "size": 9165
     },
     {
+      "path": ".github/ci/release-meta/capabilities-0.1.2.json",
+      "sha256": "04a4c341409498d3b9af99c9e81c0a000d9e5d9bf4a8ca177a2fed5f0cd99cd2",
+      "size": 9557
+    },
+    {
       "path": ".github/ci/upgrade-e2e.py",
-      "sha256": "de0c959c08a179c7c8cef336e75018c305d4b8c1360c93c00d1e0c585802d3ee",
-      "size": 61361
+      "sha256": "55695e5d05ade4734fac885ac856b150ae99defc9d33cd36de31782551c1696a",
+      "size": 66923
     },
     {
       "path": ".github/ci/upgrade-manifest.py",
@@ -84,8 +94,8 @@
     },
     {
       "path": ".github/workflows/upgrade-e2e.yml",
-      "sha256": "3aa74dabd62deaed28e4060117b4999689a93346310841ade268e5fe9571a93e",
-      "size": 11297
+      "sha256": "19bcfade1475d69ab7c30ee82ab150c3e8348d3c6de9e3f87f7de1587139dce9",
+      "size": 13752
     },
     {
       "path": ".gitignore",
@@ -94,17 +104,17 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "c62d1c18ecb928517358a392f54e3b066482619438382e747476f1f0c04c6694",
-      "size": 14018
+      "sha256": "9721c5203137c1765a618035b189e9e2e7a7dc47314efb18583e3e18b647ba3d",
+      "size": 17389
     },
     {
       "path": "Cargo.lock",
-      "sha256": "53b5e0122a04bbbe7c8934c69a93ece3f40ca0bded01d57ce58f793bbd876533",
+      "sha256": "a5b8f274c40f65f9528ec9aa14ac8cfd3aa2b3fd38f021ed75bccac4563754fe",
       "size": 96557
     },
     {
       "path": "Cargo.toml",
-      "sha256": "bda0408f429420b1f647b1e8cd3be269faaf471d9cc178952c235f4b3254adea",
+      "sha256": "be00b67026ad94a628e2e72bbae1b606fa809c575eba1a65080b74642e90463e",
       "size": 2772
     },
     {
@@ -119,13 +129,13 @@
     },
     {
       "path": "README.md",
-      "sha256": "2763bd2a30035f423fbea4f4181ca64752f9e96fecfb7afe1e6515b497a5fb1e",
-      "size": 13785
+      "sha256": "5b1d11ba97d58faba5fc4724e74a52ca5f7427e529b8df333e78e1ea7718043b",
+      "size": 13876
     },
     {
       "path": "README.zh-CN.md",
-      "sha256": "5bba29527b13e2bdfd3c45837cadae1e3c71f986ccb1c8da3c5a3329ffb1440a",
-      "size": 13923
+      "sha256": "5ee1e083df383589c2454b39b0cb120651efcf3fc098c16ed345202d5e02d598",
+      "size": 14002
     },
     {
       "path": "assets/logo.png",
@@ -2259,8 +2269,8 @@
     },
     {
       "path": "src/cli_app/stock_lifecycle.rs",
-      "sha256": "f4d922a0c196f7d826ed6a8c4ad9d08387cf37877b1b74af55f8c0222dfc73a4",
-      "size": 82251
+      "sha256": "443718f3becfa2dbff8ac37c80a235f84217c9b50d01e06752d3f942af6593c2",
+      "size": 84002
     },
     {
       "path": "src/cli_app/stock_publication.rs",
@@ -2849,8 +2859,8 @@
     },
     {
       "path": "src/management/v2/capabilities.rs",
-      "sha256": "81310d9a08bd6c80ff75d45135c605b2c6dd68f322711f3d68eb0ec734edc708",
-      "size": 74399
+      "sha256": "84aa49606dcd6e0995e3e77d90dd64e1225aae8108654ce2423115ed8972447f",
+      "size": 75337
     },
     {
       "path": "src/management/v2/claude_accounts_api.rs",
@@ -2974,8 +2984,8 @@
     },
     {
       "path": "src/management/v2/mod.rs",
-      "sha256": "935dfeeee40cf80e4b956fc0e27d130b49a8af589ea8ff2c105b07485de7e9be",
-      "size": 2143
+      "sha256": "e5e7d5e6a090387ee0398b0489f0acfe79771976676d72e6ac8dd4085af337f4",
+      "size": 2167
     },
     {
       "path": "src/management/v2/model.rs",
@@ -3143,6 +3153,11 @@
       "size": 11681
     },
     {
+      "path": "src/management/v2/sandbox_extras.rs",
+      "sha256": "fb55409411fb6682aa9ffbd43b53e5a7a1d3ec7315efacf054c65e948d069144",
+      "size": 21539
+    },
+    {
       "path": "src/management/v2/schema/client-request-0.144.1-experimental.json",
       "sha256": "1ba93c7adaa753e7c2e489f0f23e67844e004eece0bc2b0fb3b056d800ae9eb5",
       "size": 221796
@@ -3289,13 +3304,13 @@
     },
     {
       "path": "src/management/v2/scoped_mcp.rs",
-      "sha256": "4e05b93b9799e5a0128f0bd3c5ffb7dcea7abe27f502e3aa9c2177784926d286",
-      "size": 17307
+      "sha256": "49a2a9387ab5ff98bbd341f6808fd56aa883439e6507f9e29bffb7b08df42ce8",
+      "size": 17356
     },
     {
       "path": "src/management/v2/server.rs",
-      "sha256": "158c6a4b3e38b836b89db96717f7c97208ac783047565fc1a9126bbadf383b1a",
-      "size": 285498
+      "sha256": "870d89c6c3c730d23291c82a74bbac9f1e347b4bed2100e73f025217547664a1",
+      "size": 286221
     },
     {
       "path": "src/management/v2/server_requests.rs",
@@ -3379,13 +3394,13 @@
     },
     {
       "path": "src/management/v2/usage/catalog.rs",
-      "sha256": "efc15d14c6c3131004a8be075aad76d7a5eab2f98f3aa66c1941dccd2da5afc0",
-      "size": 27231
+      "sha256": "b18f3667cc3665182b9af6a00fef37da57cc24aeff238576b7f4b68a074fe8ef",
+      "size": 28782
     },
     {
       "path": "src/management/v2/usage/catalog_tests.rs",
-      "sha256": "7a1fdda8ff07669a63e952ab12c894bac0933e00e3a0a5e40ed322aa778749e7",
-      "size": 23844
+      "sha256": "cf188be9f35b2367b81a3d02aa6d234807de231c85ff02c7359ee6fa16f8810b",
+      "size": 25114
     },
     {
       "path": "src/management/v2/usage/estimate.rs",
@@ -3409,8 +3424,8 @@
     },
     {
       "path": "src/management/v2/usage/ledger_query_tests.rs",
-      "sha256": "11c94d4f0a37c4147dedcb298420c6a4b0c559d7b9987f3719a1025018734345",
-      "size": 23064
+      "sha256": "366c9cb0914a767a4a04bbe4cd61cba4d83a36a1b2e8da743149d20fb5ec6998",
+      "size": 25339
     },
     {
       "path": "src/management/v2/usage/mod.rs",
@@ -3434,8 +3449,8 @@
     },
     {
       "path": "src/management/v2/usage/query.rs",
-      "sha256": "58cdf1f912fdcea14343a076e9ada58d96caee6a5e4ac3e81f5aaee0af52a9a6",
-      "size": 18956
+      "sha256": "513cdc46c27b14952aa6a67439eedfbaaf0dd80d112eb424f816c852c239d200",
+      "size": 19360
     },
     {
       "path": "src/management/v2/usage/quota_history.rs",

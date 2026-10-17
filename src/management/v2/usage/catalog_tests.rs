@@ -112,6 +112,26 @@ fn model_names_are_normalized_for_lookup() {
     assert_eq!(key(None, None, "nope"), None);
 }
 
+#[test]
+fn a_provider_the_library_does_not_name_falls_back_to_the_model_family() {
+    // LiteLLM has no bare `glm-5.3`, only vendor keys.
+    let mut models = parse_models_dev(&models_dev_fixture()).unwrap();
+    models.remove("glm-5.3");
+    let cache = CatalogCache { models, ..Default::default() };
+    let key = |provider: Option<&str>, model: &str| cache.lookup(provider, None, model).map(|(key, _)| key.to_string());
+    // A Claude account routed to Z.ai, a custom provider id: the model name says GLM.
+    assert_eq!(key(Some("account:zai-individual-coding-plan"), "GLM-5.3").as_deref(), Some("zhipuai/glm-5.3"));
+    assert_eq!(key(Some("zai-standard-api"), "glm-5.3").as_deref(), Some("zhipuai/glm-5.3"));
+    assert_eq!(key(None, "glm-5.3").as_deref(), Some("zhipuai/glm-5.3"));
+    // The provider's own prefix still wins when the library has it.
+    assert_eq!(key(Some("zai"), "glm-5.3").as_deref(), Some("zai/glm-5.3"));
+    // A name with no family stays unpriced.
+    assert_eq!(key(Some("account:x"), "mystery-1"), None);
+    assert_eq!(category_for_model_name("GLM-5.3-Flash"), Some(ProviderCategory::Glm));
+    assert_eq!(category_for_model_name("kimi-k3"), Some(ProviderCategory::Kimi));
+    assert_eq!(category_for_model_name("sonnet"), None);
+}
+
 struct FakeFetcher {
     responses: RefCell<Vec<anyhow::Result<FetchResponse>>>,
     seen: RefCell<Vec<(String, Option<String>, Option<String>)>>,

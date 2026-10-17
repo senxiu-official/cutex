@@ -1,9 +1,9 @@
 # cutex: end-to-end check of the backend updater on clean GitHub runners (Linux and Windows): an existing
-# cutex managed install (default 0.1.1; written for 0.1.0 -> 0.1.1, the labels below say "0.1.0" / "0.1.1"
+# cutex managed install (default 0.1.2; written for 0.1.0 -> 0.1.1, the labels below say "0.1.0" / "0.1.1"
 # for from / to) upgrades through `cutex upgrade check / stage / apply`, and a broken later release rolls
 # back by itself. Manual only (workflow_dispatch); nothing is published, no secret is used.
 #
-# Each job builds DEBUG cutex binaries of `from_ref` (default: the public 0.1.1 tree, tag cutex-0.1.1 of
+# Each job builds DEBUG cutex binaries of `from_ref` (default: the public 0.1.2 tree, tag cutex-0.1.2 of
 # senxiu-official/cutex) and `to_ref` (default: the dispatched ref), with the release identity baked in
 # (CUTEX_RELEASE / CUTEX_COMMIT / CUTEX_CHANNEL=release, as build-cutex.sh does for release builds). Only
 # debug builds trust the run-time test key CUTEX_UPGRADE_TEST_PUBKEY, and only debug builds honour the
@@ -24,10 +24,16 @@
 #
 # The 0.1.1 manifest is generated with the REAL release's generator arguments: the committed release
 # metadata .github/ci/release-meta/<to_release>.json (--meta; 0.1.1: mode full) and
-# capabilities-<from_release>.json (--previous-capabilities), no native (0.1.1 ships none). 0.1.0 is
+# capabilities-<from_release>.json (--previous-capabilities) and, per `new_native`, the generator's --native-dir
+# (0.1.1 / 0.1.2 shipped none; 0.1.3 ships cute-codex 0.160.0-r52.3 through --native-run): `stub` = a second
+# stub native (default: covers staging, the `native` preflight and selecting natives/<new> for new agents),
+# `none`, or a published cute-codex release tag (e.g. cute-codex-v0.160.0-r52.3 of senxiu-official/cute-codex,
+# after the cute-codex step of the release) whose real native archive of the platform is downloaded and
+# checked against that release's SHA256SUMS. 0.1.0 is
 # installed with its native selected for new agents (as AGENT-INSTALL.md B.3 does); after the apply NEW
-# agents must use releases/0.1.1/manifests/default.json (0.1.0's native + the 0.1.1 cutex-mcp facade).
-# The native runtime is a stub (never executed: cutex only hashes and selects it).
+# agents must use releases/0.1.1/manifests/default.json (0.1.0's native, or the new native, + the 0.1.1
+# cutex-mcp facade). The installed native is a stub; no native is ever executed (cutex stages, hashes and
+# selects it).
 name: Upgrade e2e
 
 on:
@@ -39,14 +45,14 @@ on:
         default: senxiu-official/cutex
         type: string
       from_ref:
-        description: "Tag / commit of the installed release (0.1.1 = tag cutex-0.1.1 of senxiu-official/cutex)"
+        description: "Tag / commit of the installed release (0.1.2 = tag cutex-0.1.2 of senxiu-official/cutex)"
         required: false
-        default: cutex-0.1.1
+        default: cutex-0.1.2
         type: string
       from_release:
         description: "Release label of the installed build"
         required: false
-        default: "0.1.1"
+        default: "0.1.2"
         type: string
       to_ref:
         description: "Ref of the new release in this repository (empty = the dispatched ref)"
@@ -56,7 +62,12 @@ on:
       to_release:
         description: "Release label of the new build"
         required: false
-        default: "0.1.2"
+        default: "0.1.3"
+        type: string
+      new_native:
+        description: "Native the new release brings: stub, none, or a published cute-codex release tag (cute-codex-v<version> of senxiu-official/cute-codex)"
+        required: false
+        default: stub
         type: string
 
 permissions:
@@ -164,6 +175,36 @@ jobs:
             PYTHON="$E2E_PYTHON" bash "to/components/$name/build.sh" "${{ matrix.platform }}" "$version" "$RUNNER_TEMP/archives"
           done
           if [ "$RUNNER_OS" = Windows ]; then ls -la "$(cygpath -u "$RUNNER_TEMP")/archives"; else ls -la "$RUNNER_TEMP/archives"; fi
+      - name: New native of the new release
+        env:
+          NEW_NATIVE: ${{ inputs.new_native }}
+          NATIVE_REPO: senxiu-official/cute-codex
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          case "$NEW_NATIVE" in
+            stub | none) arg="$NEW_NATIVE" ;;
+            cute-codex-v*)
+              [[ "$NEW_NATIVE" =~ ^cute-codex-v[0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "::error::invalid cute-codex tag '$NEW_NATIVE'"; exit 1; }
+              version="${NEW_NATIVE#cute-codex-v}"
+              name="native-$version-$PLATFORM.tar.gz"
+              d="$RUNNER_TEMP/new-native"
+              if [ "$RUNNER_OS" = Windows ]; then d="$(cygpath -u "$RUNNER_TEMP")/new-native"; fi
+              mkdir -p "$d"
+              base="https://github.com/$NATIVE_REPO/releases/download/$NEW_NATIVE"
+              curl -fsSL --retry 3 -o "$d/$name" "$base/$name"
+              curl -fsSL --retry 3 -o "$d/SHA256SUMS" "$base/SHA256SUMS"
+              want="$(awk -v n="$name" '$2 == n || $2 == "*" n { print $1 }' "$d/SHA256SUMS")"
+              got="$(sha256sum "$d/$name" | awk '{ print $1 }')"
+              [ -n "$want" ] && [ "$want" = "$got" ] || { echo "::error::$name does not match $NEW_NATIVE's SHA256SUMS"; exit 1; }
+              rm "$d/SHA256SUMS"
+              echo "$name $got"
+              arg="$d"
+              if [ "$RUNNER_OS" = Windows ]; then arg="$(cygpath -w "$d")"; fi
+              ;;
+            *) echo "::error::new_native must be stub, none or cute-codex-v<version> (got '$NEW_NATIVE')"; exit 1 ;;
+          esac
+          echo "NEW_NATIVE_ARG=$arg" >> "$GITHUB_ENV"
       - name: systemd user manager (linger)
         if: runner.os == 'Linux'
         run: |
@@ -200,7 +241,7 @@ jobs:
             --from-cutex "$bins${sep}from" --from-commit "$FROM_COMMIT" \
             --to-cutex "$bins${sep}to" --to-commit "$TO_COMMIT" \
             --components "$archives" --work "$work" --service-name e2e --claude-python "$E2E_PYTHON" \
-            --release-meta ci/.github/ci/release-meta
+            --release-meta ci/.github/ci/release-meta --new-native "$NEW_NATIVE_ARG"
       - name: Unit journal
         if: always() && runner.os == 'Linux'
         run: |
