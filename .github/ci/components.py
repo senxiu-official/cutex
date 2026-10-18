@@ -34,6 +34,9 @@ PLATFORMS = {
     "linux-x64": ("ubuntu-22.04", "fail"),
     "windows-x64": ("windows-2022", "warn"),
 }
+# Platforms a component may declare that the release does not build yet (no cutex release build for
+# them: macOS is an MVP backend host). Accepted in component.json, left out of the build matrix.
+UNRELEASED_PLATFORMS = {"darwin-arm64"}
 NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 VERSION = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 CLAUDE_VERSION = re.compile(r"^claude-r[0-9]+$")
@@ -79,8 +82,8 @@ def load_component(path: Path) -> dict:
     if not isinstance(platforms, list) or not platforms or len(set(platforms)) != len(platforms):
         raise ComponentError(f"{path}: platforms must be a non-empty list without duplicates")
     for p in platforms:
-        if p not in PLATFORMS:
-            raise ComponentError(f"{path}: unknown platform `{p}` (allowed: {', '.join(PLATFORMS)})")
+        if p not in PLATFORMS and p not in UNRELEASED_PLATFORMS:
+            raise ComponentError(f"{path}: unknown platform `{p}` (allowed: {', '.join([*PLATFORMS, *sorted(UNRELEASED_PLATFORMS)])})")
     for f in ("build.sh", "README.md"):
         if not (path.parent / f).is_file():
             raise ComponentError(f"{path.parent}: missing {f}")
@@ -92,6 +95,8 @@ def matrix(root: Path) -> dict:
     for path in sorted((root / "components").glob("*/component.json")):
         c = load_component(path)
         for p in c["platforms"]:
+            if p not in PLATFORMS:
+                continue
             runner, leak = PLATFORMS[p]
             include.append({"name": c["name"], "version": c["version"], "platform": p,
                             "runner": runner, "leak_policy": leak})

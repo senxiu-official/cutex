@@ -515,6 +515,14 @@ fn claude_launch_defaults(
             CLAUDE_CODEX_ONLY_LAUNCH_OPTIONS,
         ));
     }
+    if let Some(mode) = launch.and_then(|launch| launch.claude_permission_mode.as_deref()) {
+        if !cutex::runtime::claude::launch_permission_modes().iter().any(|offered| offered == mode) {
+            return Err(human_agent_validation(
+                "unsupported_launch_option",
+                format!("the installed Claude runtime does not offer the permission mode `{mode}`; update the claude-runtime component"),
+            ));
+        }
+    }
     let mut defaults = account.options.claude.clone();
     if let Some(model) = config.new_session_defaults.get(&account.name).and_then(|d| d.model.clone()) {
         defaults.model = model;
@@ -532,6 +540,19 @@ fn claude_launch_defaults(
 }
 
 const CLAUDE_CODEX_ONLY_LAUNCH_OPTIONS: &str = "Claude profiles use their own write/exec permissions; sandbox, approvalPolicy, networkAccess and writableRoots are Codex-only";
+
+/// `launch.claudePermissionMode` on a Codex profile.
+fn refuse_claude_mode_for_codex(
+    launch: Option<&cutex::config::new_thread::LaunchOverrides>,
+) -> Result<(), cutex::management::v2::user_input::UserInputExecutionError> {
+    if launch.is_some_and(|launch| launch.claude_permission_mode.is_some()) {
+        return Err(human_agent_validation(
+            "unsupported_launch_option",
+            "claudePermissionMode applies to Claude profiles only",
+        ));
+    }
+    Ok(())
+}
 
 /// Root-only `POST /v2/human/agents`: `cutex human new` (Codex profiles) or
 /// the Claude creator + roster import (Claude profiles, `human-agent-claude`)
@@ -630,6 +651,9 @@ fn create_human_agent(
         .as_ref()
         .map(|account| claude_launch_defaults(account, &config, request.launch.as_ref()))
         .transpose()?;
+    if claude.is_none() {
+        refuse_claude_mode_for_codex(request.launch.as_ref())?;
+    }
     let configuration = match &claude {
         Some(_) => None,
         None => Some(
@@ -670,6 +694,15 @@ fn create_human_agent(
                 .and_then(|cwd| super::claude_profile::create(account, &request.name, &cwd, true, defaults, (None, None)))
                 .map_err(creation_failed)?;
             let id = record.cutex_session_id.clone();
+            if let Some(mode) = request.launch.as_ref().and_then(|launch| launch.claude_permission_mode.as_deref()) {
+                cutex::runtime::claude::set_initial_permission_mode(&id, mode).map_err(|error| {
+                    human_agent_error(
+                        "agent_setup_incomplete",
+                        format!("agent {id} was created but its permission mode failed: {error:#}"),
+                        serde_json::json!({ "cutexSessionId": id, "step": "permission mode" }),
+                    )
+                })?;
+            }
             let incomplete = |step: &str, message: String| {
                 human_agent_error(
                     "agent_setup_incomplete",
@@ -840,6 +873,9 @@ fn create_human_session(
         .as_ref()
         .map(|account| claude_launch_defaults(account, &config, request.launch.as_ref()))
         .transpose()?;
+    if claude.is_none() {
+        refuse_claude_mode_for_codex(request.launch.as_ref())?;
+    }
     let configuration = match &claude {
         Some(_) => None,
         None => Some(
@@ -874,7 +910,12 @@ fn create_human_session(
             let defaults = claude_defaults.clone().expect("Claude defaults resolved above");
             let cwd = super::light_new::canonical_cwd(&cwd)?;
             let name = format!("Session {}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-            Ok(super::claude_profile::create(account, &name, &cwd, false, defaults, (None, None))?.cutex_session_id)
+            let id = super::claude_profile::create(account, &name, &cwd, false, defaults, (None, None))?.cutex_session_id;
+            if let Some(mode) = request.launch.as_ref().and_then(|launch| launch.claude_permission_mode.as_deref()) {
+                cutex::runtime::claude::set_initial_permission_mode(&id, mode)
+                    .map_err(|error| anyhow::anyhow!("session {id} was created but its permission mode failed: {error:#}"))?;
+            }
+            Ok(id)
         })(),
         (None, None) => unreachable!("Codex configuration resolved above"),
     };
@@ -2897,6 +2938,25 @@ pub(crate) fn load_app_server_runtime_status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_permission_mode_needs_a_claude_profile_and_an_offering_runtime() {
+        let _home = super::super::test_home::IsolatedTestHome::new("claude-launch-mode").unwrap();
+        let launch: cutex::config::new_thread::LaunchOverrides =
+            serde_json::from_value(serde_json::json!({"claudePermissionMode": "plan"})).unwrap();
+        let codex = super::refuse_claude_mode_for_codex(Some(&launch)).unwrap_err();
+        assert_eq!(codex.code, "unsupported_launch_option");
+        assert!(super::refuse_claude_mode_for_codex(None).is_ok());
+        // No Claude runtime installed in the test home: no mode is offered.
+        let account = cutex::profiles::lifecycle::new_claude_account("Claude main");
+        let config = cutex::profiles::model::CodezConfig::default();
+        let refused = super::claude_launch_defaults(&account, &config, Some(&launch)).unwrap_err();
+        assert_eq!(refused.code, "unsupported_launch_option");
+        assert!(refused.message.contains("does not offer"));
+        let model_only: cutex::config::new_thread::LaunchOverrides =
+            serde_json::from_value(serde_json::json!({"model": "sonnet"})).unwrap();
+        assert!(super::claude_launch_defaults(&account, &config, Some(&model_only)).is_ok());
+    }
+
     /// r208 C: an explicit-launch agent's online request without an owner
     /// (asks auto-wake) reconnects to a live exact binding; with no binding,
     /// a launch claim or a dead process it needs the owner.
@@ -3129,6 +3189,7 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: format!("{name}-id"),
             name: name.to_string(),
             email: None,

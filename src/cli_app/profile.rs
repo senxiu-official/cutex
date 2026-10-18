@@ -39,7 +39,7 @@ use cutex::profiles::store::save_store;
 use cutex::session::model::CutexSessionStore;
 use cutex::session::service::persist_cutex_session_store_and_im_record;
 use cutex::session::store::load_cutex_session_store;
-use cutex::ui::format::{bool_label, proxy_config_label};
+use cutex::ui::format::proxy_config_label;
 use toml::value::Table;
 use uuid::Uuid;
 
@@ -524,7 +524,6 @@ pub(crate) fn cmd_profile_set(
     docker_user_name: Option<String>,
     proxy_url: Option<String>,
     proxy_no_proxy: Option<String>,
-    proxy_force_http_transport: Option<bool>,
     proxy_disable: bool,
     proxy_inherit: bool,
     session_enable: bool,
@@ -533,9 +532,6 @@ pub(crate) fn cmd_profile_set(
 ) -> anyhow::Result<()> {
     if proxy_no_proxy.is_some() && proxy_url.is_none() {
         anyhow::bail!("--proxy-no-proxy requires --proxy-url");
-    }
-    if proxy_force_http_transport.is_some() && proxy_url.is_none() {
-        anyhow::bail!("--proxy-force-http requires --proxy-url");
     }
 
     let metadata_requested = source.is_some()
@@ -583,13 +579,12 @@ pub(crate) fn cmd_profile_set(
         proxy: if proxy_inherit {
             ConfigValueUpdate::Clear
         } else if proxy_disable {
-            ConfigValueUpdate::Set(proxy_config_from_parts(false, None, None, true)?)
+            ConfigValueUpdate::Set(proxy_config_from_parts(false, None, None)?)
         } else if let Some(url) = proxy_url {
             ConfigValueUpdate::Set(proxy_config_from_parts(
                 true,
                 Some(url),
                 proxy_no_proxy,
-                proxy_force_http_transport.unwrap_or(true),
             )?)
         } else {
             ConfigValueUpdate::Unchanged
@@ -1029,21 +1024,6 @@ pub(crate) fn cmd_profile_edit(target: Option<&str>) -> anyhow::Result<()> {
             )
         );
         println!(
-            " 14. {} proxy force_http                       {}",
-            checkbox(
-                account
-                    .proxy
-                    .as_ref()
-                    .is_some_and(|proxy| proxy.force_http_transport)
-            ),
-            account
-                .proxy
-                .as_ref()
-                .map(|proxy| bool_label(proxy.force_http_transport))
-                .map(wizard_value)
-                .unwrap_or_else(|| wizard_value("-"))
-        );
-        println!(
             " 15. {} session inherit global                 {}",
             checkbox(session_inherit),
             wizard_value(session_override_label(account.session.as_ref()))
@@ -1154,9 +1134,7 @@ pub(crate) fn cmd_profile_edit(target: Option<&str>) -> anyhow::Result<()> {
                 store.accounts[account_index].proxy = None;
             }
             10 => {
-                store.accounts[account_index].proxy = Some(proxy_config_from_parts(
-                    false, None, None, /*force_http_transport*/ true,
-                )?);
+                store.accounts[account_index].proxy = Some(proxy_config_from_parts(false, None, None)?);
             }
             11 => {
                 let url = store.accounts[account_index]
@@ -1171,11 +1149,6 @@ pub(crate) fn cmd_profile_edit(target: Option<&str>) -> anyhow::Result<()> {
                         .proxy
                         .as_ref()
                         .and_then(|proxy| proxy.no_proxy.clone()),
-                    store.accounts[account_index]
-                        .proxy
-                        .as_ref()
-                        .map(|proxy| proxy.force_http_transport)
-                        .unwrap_or(true),
                 )?);
             }
             12 => {
@@ -1193,11 +1166,6 @@ pub(crate) fn cmd_profile_edit(target: Option<&str>) -> anyhow::Result<()> {
                                 .proxy
                                 .as_ref()
                                 .and_then(|proxy| proxy.no_proxy.clone()),
-                            store.accounts[account_index]
-                                .proxy
-                                .as_ref()
-                                .map(|proxy| proxy.force_http_transport)
-                                .unwrap_or(true),
                         )
                     })
                     .transpose()?;
@@ -1209,13 +1177,6 @@ pub(crate) fn cmd_profile_edit(target: Option<&str>) -> anyhow::Result<()> {
                 };
                 proxy.no_proxy =
                     prompt_optional_string("Profile proxy NO_PROXY", proxy.no_proxy.as_deref())?;
-            }
-            14 => {
-                let Some(proxy) = store.accounts[account_index].proxy.as_mut() else {
-                    println!("{YELLOW}Enable profile proxy first.{RESET}");
-                    continue;
-                };
-                proxy.force_http_transport = !proxy.force_http_transport;
             }
             15 => {
                 store.accounts[account_index].session = None;
@@ -1557,7 +1518,6 @@ pub(crate) fn run_command(command: ProfileCommand) -> anyhow::Result<()> {
             docker_user_name,
             proxy_url,
             proxy_no_proxy,
-            proxy_force_http_transport,
             proxy_disable,
             proxy_inherit,
             session_enable,
@@ -1581,7 +1541,6 @@ pub(crate) fn run_command(command: ProfileCommand) -> anyhow::Result<()> {
             docker_user_name,
             proxy_url,
             proxy_no_proxy,
-            proxy_force_http_transport,
             proxy_disable,
             proxy_inherit,
             session_enable,
@@ -1611,11 +1570,8 @@ fn cmd_profile_models(target: &str, refresh: bool, apply: bool) -> anyhow::Resul
             .map_err(|_| anyhow!("Invalid profile credential file"))?;
         let key = auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str)
             .filter(|key| !key.is_empty()).context("API model discovery requires an API-key profile; subscriptions use native model discovery")?;
-        let global = load_codez_config();
-        let proxy = effective_proxy_config(account, &global)
-            .map(|proxy| if proxy.enabled { proxy.url.as_deref() } else { None });
-        let no_proxy = effective_proxy_config(account, &global).and_then(|proxy| proxy.no_proxy.as_deref());
-        let catalog = model_discovery::fetch(base, key, proxy, no_proxy)?;
+        let proxy = cutex::config::proxy_outbound::OutboundProxy::for_profile(account, &load_codez_config());
+        let catalog = model_discovery::fetch(base, key, &proxy)?;
         write_private_pretty_json_atomic(&cached_path, &catalog, "discovered models")?;
         catalog
     } else { cached.unwrap() };

@@ -132,9 +132,38 @@ pub fn installed(layout: &Layout) -> Installed {
             sequence: m.sequence,
             commit: Some(m.cutex.commit),
             manifest_sha256: Some(manifest::sha256_hex(&bytes)),
+            notes: Some(m.notes),
+            published_at: m.published_at,
         },
-        None => Installed { release, sequence: 0, commit: crate::build_info::COMMIT.map(str::to_string), manifest_sha256: None },
+        None => Installed {
+            release,
+            sequence: 0,
+            commit: crate::build_info::COMMIT.map(str::to_string),
+            manifest_sha256: None,
+            notes: None,
+            published_at: None,
+        },
     }
+}
+
+/// `installed` with `notes` / `publishedAt` read from the release's
+/// committed manifest (`releases/<release>/manifest.json`) when the record
+/// lacks them (a `state.json` written before these fields). Only a manifest
+/// whose sha256 matches the record's `manifestSha256` is used.
+pub fn with_manifest_details(layout: &Layout, mut installed: Installed) -> Installed {
+    if installed.notes.is_some() || installed.manifest_sha256.is_none() || !super::layout::valid_label(&installed.release) {
+        return installed;
+    }
+    let path = layout.release_dir(&installed.release).join(MANIFEST_FILE);
+    let Ok(bytes) = std::fs::read(&path) else { return installed };
+    if installed.manifest_sha256.as_deref() != Some(manifest::sha256_hex(&bytes).as_str()) {
+        return installed;
+    }
+    if let Ok(m) = ReleaseManifest::parse(&bytes) {
+        installed.notes = Some(m.notes);
+        installed.published_at = m.published_at;
+    }
+    installed
 }
 
 pub fn runtime_changes(manifest: &ReleaseManifest, local: &LocalRuntimes) -> bool {
@@ -494,9 +523,14 @@ pub(crate) mod fixtures {
         std::fs::create_dir_all(&dir).unwrap();
         let mut m = manifest::fixtures::manifest(release, sequence);
         let exe = fake_cutex(release, &m.cutex.commit, true);
+        // The license files the release builds put next to the executables (build-cutex.sh,
+        // build-natives.sh): extra regular files at the archive root, unpacked and otherwise ignored.
         let archive = tar_gz(&[
             Item::File { path: CUTEX_EXE, data: &exe, mode: 0o755 },
             Item::File { path: FACADE_EXE, data: b"facade", mode: 0o755 },
+            Item::File { path: "LICENSE", data: b"license", mode: 0o644 },
+            Item::File { path: "NOTICE", data: b"notice", mode: 0o644 },
+            Item::File { path: "THIRD_PARTY_NOTICES.md", data: b"# Third-party notices\n", mode: 0o644 },
         ]);
         std::fs::write(dir.join(&m.cutex_artifact().unwrap().name.clone()), &archive).unwrap();
         let artifact = m.cutex.artifacts.get_mut(&manifest::platform_key()).unwrap();
@@ -509,6 +543,8 @@ pub(crate) mod fixtures {
                 Item::File { path: NATIVE_CLI, data: b"cli", mode: 0o755 },
                 Item::File { path: NATIVE_CODE_MODE_HOST, data: b"host", mode: 0o755 },
                 Item::File { path: NATIVE_SCHEMA, data: b"{}", mode: 0o644 },
+                Item::File { path: "LICENSE", data: b"license", mode: 0o644 },
+                Item::File { path: "THIRD_PARTY_NOTICES.md", data: b"# Third-party notices\n", mode: 0o644 },
             ]);
             let native_tag = format!("native-{version}");
             std::fs::create_dir_all(root.join(&native_tag)).unwrap();
@@ -603,6 +639,29 @@ mod tests {
     use crate::upgrade::minisign::test_key::TestKey;
 
     #[test]
+    fn installed_carries_the_manifest_notes() {
+        let layout = installed_layout("r239", 40);
+        let fresh = installed(&layout);
+        assert_eq!(fresh.notes, Some(std::collections::BTreeMap::from([("en".to_string(), "r239 notes".to_string())])));
+        assert_eq!(fresh.published_at.as_deref(), Some("2026-10-20T03:00:00Z"));
+        // A record from before these fields gets them from the matching manifest.
+        let old = Installed { notes: None, published_at: None, ..fresh.clone() };
+        assert_eq!(with_manifest_details(&layout, old.clone()), fresh);
+        // A manifest that does not match the record is not used.
+        let other = Installed { manifest_sha256: Some("0".repeat(64)), ..old.clone() };
+        assert_eq!(with_manifest_details(&layout, other.clone()), other);
+        // The serialized record: null when unknown.
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value["notes"].is_null() && value["publishedAt"].is_null());
+        std::fs::remove_dir_all(&layout.base).unwrap();
+        // A release without a committed manifest (older layouts): unknown.
+        let bare = installed_layout("r100", 0);
+        let none = installed(&bare);
+        assert_eq!((none.notes, none.published_at), (None, None));
+        std::fs::remove_dir_all(&bare.base).unwrap();
+    }
+
+    #[test]
     fn check_finds_a_newer_signed_release_and_records_it() {
         let key = TestKey::new(1);
         let root = temp("source");
@@ -666,6 +725,9 @@ mod tests {
         assert!(layout.release_executable("r240").is_file());
         assert!(layout.release_dir("r240").join("manifest.json.minisig").is_file());
         assert!(layout.native_dir("0.162.1-r53").join(NATIVE_APP_SERVER).is_file());
+        // License files of the archives land next to the executables.
+        assert!(layout.release_dir("r240").join("THIRD_PARTY_NOTICES.md").is_file());
+        assert!(layout.native_dir("0.162.1-r53").join("LICENSE").is_file());
         assert_eq!(layout.active_release().unwrap(), "r239", "staging never switches");
         assert_eq!(State::load(&layout).staged.unwrap().release, "r240");
         assert_eq!(staged_manifest(&layout, &[key.public()], "r240").unwrap().sequence, 41);

@@ -662,6 +662,8 @@ mod tests {
             std::fs::remove_dir(path).unwrap();
         }
 
+        // APFS refuses non-UTF-8 names (EILSEQ), so the fixture cannot exist there.
+        #[cfg_attr(target_os = "macos", ignore = "APFS rejects non-UTF-8 file names")]
         #[test]
         fn browser_private_store_enumeration_rejects_non_utf8_names() {
             let path = path();

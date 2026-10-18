@@ -161,7 +161,7 @@ pub fn read_serve_token_file(path: &std::path::Path) -> anyhow::Result<(String, 
 }
 
 pub fn validate_agent_bus_port(port: u16) -> anyhow::Result<()> {
-    if crate::config::instance::is_isolated() {
+    if crate::config::instance::uses_isolated_ports() {
         return crate::config::instance::validate_isolated_port(port, "Agent bus port");
     }
     if !(24000..=24999).contains(&port) {
@@ -172,7 +172,14 @@ pub fn validate_agent_bus_port(port: u16) -> anyhow::Result<()> {
 
 pub fn agent_bus_port(config: &CodezConfig) -> u16 {
     // An instance never falls back to the default bus (0 fails closed; the
-    // instance preflight requires the port).
+    // instance preflight requires the port). A test process never resolves a
+    // default-instance port, not even a stored one.
+    if crate::config::instance::default_ports_forbidden() {
+        return config
+            .agent_bus_port
+            .filter(|port| !crate::config::instance::RESERVED_DEFAULT_PORTS.contains(port))
+            .unwrap_or(0);
+    }
     config.agent_bus_port.unwrap_or(if crate::config::instance::is_isolated() {
         0
     } else {

@@ -84,6 +84,7 @@ pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
     // Web services (registry; managed runtimes may need owner approval).
     rule("service_register", Audience::Everyone),
     rule("service_update", Audience::Everyone),
+    rule("service_restart", Audience::Everyone),
     rule("service_unregister", Audience::Everyone),
     rule("service_list", Audience::Everyone),
     // Search-only provider request; also subject to the profile's

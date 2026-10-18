@@ -181,7 +181,6 @@ fn normalize_proxy_update(
             proxy.enabled,
             proxy.url.clone(),
             proxy.no_proxy.clone(),
-            proxy.force_http_transport,
         )?)),
     }
 }
@@ -232,6 +231,7 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: "profile-id".to_string(),
             name: "alpha".to_string(),
             email: Some("alpha@example.com".to_string()),
@@ -265,7 +265,6 @@ mod tests {
                 enabled: true,
                 url: Some("http://127.0.0.1:8080".to_string()),
                 no_proxy: Some("localhost".to_string()),
-                force_http_transport: false,
             }),
             session: ConfigValueUpdate::Set(SessionConfig { enabled: true }),
             default_cli_args: Some(vec!["--model".to_string(), "gpt-5".to_string()]),
@@ -346,7 +345,6 @@ mod tests {
                 enabled: true,
                 url: None,
                 no_proxy: None,
-                force_http_transport: true,
             }),
             ..ProfileSettingsPatch::default()
         };

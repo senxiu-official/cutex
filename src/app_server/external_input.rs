@@ -574,12 +574,12 @@ fn occurrence_in(
         runtime.schema_sha256 == bundle.schema.sha256.as_str(),
         "ingress runtime schema mismatch"
     );
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         // Exact recorded owned PID only; no discovery or process-argument scan.
         ensure!(
             runtime.pid > 1
-                && std::fs::read_link(format!("/proc/{}/exe", runtime.pid))?
+                && crate::platform::process::process_executable(runtime.pid)?
                     == bundle.executable.path,
             "ingress native owner absent/changed"
         );

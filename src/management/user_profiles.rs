@@ -502,14 +502,20 @@ fn invalid_avatar(message: impl Into<String>) -> UserError {
 
 /// Decode `{contentType, data}` (base64) from a request body.
 pub fn parse_upload(value: &Value) -> Result<AvatarUpload, UserError> {
+    parse_upload_limited(value, MAX_AVATAR_BYTES)
+}
+
+/// [`parse_upload`] for images of at most `max_bytes` (profile intro
+/// portraits).
+pub fn parse_upload_limited(value: &Value, max_bytes: usize) -> Result<AvatarUpload, UserError> {
     let object = value.as_object().ok_or_else(|| invalid_avatar("avatar must be {contentType, data} or null"))?;
     if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "contentType" | "data")) {
         return Err(invalid_avatar(format!("avatar: unsupported field {key}")));
     }
     let content_type = object.get("contentType").and_then(Value::as_str).ok_or_else(|| invalid_avatar("avatar.contentType is required"))?;
     let data = object.get("data").and_then(Value::as_str).ok_or_else(|| invalid_avatar("avatar.data (base64) is required"))?;
-    if data.len() > MAX_AVATAR_BYTES.div_ceil(3) * 4 + 4 {
-        return Err(UserError::new(413, "avatar_too_large", format!("the avatar may be at most {MAX_AVATAR_BYTES} bytes")));
+    if data.len() > max_bytes.div_ceil(3) * 4 + 4 {
+        return Err(UserError::new(413, "avatar_too_large", format!("the image may be at most {max_bytes} bytes")));
     }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.trim())
@@ -517,15 +523,35 @@ pub fn parse_upload(value: &Value) -> Result<AvatarUpload, UserError> {
     Ok(AvatarUpload { content_type: content_type.to_string(), bytes })
 }
 
+/// Size and shape rules of an uploaded image.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageRules {
+    pub max_bytes: usize,
+    pub min_side: u32,
+    pub max_side: u32,
+    pub square: bool,
+}
+
+/// User and Profile avatars: square, [`MIN_AVATAR_SIDE`]..=[`MAX_AVATAR_SIDE`]
+/// px, at most [`MAX_AVATAR_BYTES`].
+pub const AVATAR_RULES: ImageRules =
+    ImageRules { max_bytes: MAX_AVATAR_BYTES, min_side: MIN_AVATAR_SIDE, max_side: MAX_AVATAR_SIDE, square: true };
+
 /// Check type (declared and sniffed), size and dimensions; returns the record
 /// to store and the bytes.
 pub fn validate_avatar(upload: &AvatarUpload) -> Result<(Avatar, Vec<u8>), UserError> {
+    validate_image(upload, AVATAR_RULES)
+}
+
+/// [`validate_avatar`] with other size / shape rules.
+pub fn validate_image(upload: &AvatarUpload, rules: ImageRules) -> Result<(Avatar, Vec<u8>), UserError> {
+    let ImageRules { max_bytes, min_side, max_side, square } = rules;
     let bytes = &upload.bytes;
     if bytes.is_empty() {
-        return Err(invalid_avatar("the avatar is empty"));
+        return Err(invalid_avatar("the image is empty"));
     }
-    if bytes.len() > MAX_AVATAR_BYTES {
-        return Err(UserError::new(413, "avatar_too_large", format!("the avatar may be at most {MAX_AVATAR_BYTES} bytes")));
+    if bytes.len() > max_bytes {
+        return Err(UserError::new(413, "avatar_too_large", format!("the image may be at most {max_bytes} bytes")));
     }
     let sniffed = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         "image/png"
@@ -545,17 +571,19 @@ pub fn validate_avatar(upload: &AvatarUpload) -> Result<(Avatar, Vec<u8>), UserE
             let format = if sniffed == "image/png" { image::ImageFormat::Png } else { image::ImageFormat::Jpeg };
             let mut reader = image::ImageReader::with_format(Cursor::new(bytes.as_slice()), format);
             let mut limits = image::Limits::default();
-            limits.max_image_width = Some(MAX_AVATAR_SIDE);
-            limits.max_image_height = Some(MAX_AVATAR_SIDE);
-            limits.max_alloc = Some(8 * 1024 * 1024);
+            limits.max_image_width = Some(max_side);
+            limits.max_image_height = Some(max_side);
+            limits.max_alloc = Some((u64::from(max_side) * u64::from(max_side) * 8).max(8 * 1024 * 1024));
             reader.limits(limits);
             let decoded = reader.decode().map_err(|_| invalid_avatar("the avatar image could not be decoded"))?;
             (decoded.width(), decoded.height())
         }
     };
-    if width != height || !(MIN_AVATAR_SIDE..=MAX_AVATAR_SIDE).contains(&width) {
+    let sides_ok = (min_side..=max_side).contains(&width) && (min_side..=max_side).contains(&height);
+    if (square && width != height) || !sides_ok {
+        let shape = if square { "square, " } else { "" };
         return Err(invalid_avatar(format!(
-            "the avatar must be square, {MIN_AVATAR_SIDE}..={MAX_AVATAR_SIDE} px (got {width}×{height})"
+            "the image must be {shape}{min_side}..={max_side} px (got {width}×{height})"
         )));
     }
     let digest = Sha256::digest(bytes);

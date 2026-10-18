@@ -352,16 +352,20 @@ fn map_owner_message(e: &EventEnvelope, name: &str) -> Option<Option<Value>> {
 
 /// POST one payload with the HTTP client cutex links (ureq + rustls; no
 /// `curl` on PATH needed). No redirects, no response-body storage; the token
-/// travels only in the Authorization header. Proxies follow the usual
-/// `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` environment, as before.
+/// travels only in the Authorization header. Proxy: the host proxy setting
+/// (follow system = the usual `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`
+/// environment, then the Windows system proxy).
 fn post(c: &Config, payload: &str) -> anyhow::Result<()> {
     validate(c)?;
     let url = c.url.as_deref().context("webhook URL missing")?;
-    let agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(2)))
-        .timeout_global(Some(Duration::from_secs(5)))
-        .max_redirects(0)
-        .http_status_as_error(false)
+    let agent = crate::config::proxy_outbound::OutboundProxy::host()
+        .apply(
+            ureq::Agent::config_builder()
+                .timeout_connect(Some(Duration::from_secs(2)))
+                .timeout_global(Some(Duration::from_secs(5)))
+                .max_redirects(0)
+                .http_status_as_error(false),
+        )?
         .build()
         .new_agent();
     let mut request = agent

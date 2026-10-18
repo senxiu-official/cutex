@@ -82,11 +82,16 @@ impl Source {
             }
             Self::Http { .. } => {
                 let url = self.url(tag, name);
-                let agent = ureq::Agent::config_builder()
-                    .timeout_connect(Some(Duration::from_secs(20)))
-                    .timeout_recv_body(Some(Duration::from_secs(60 * 30)))
-                    .max_redirects(5)
-                    .http_status_as_error(false)
+                // The host proxy (`/v2/settings.proxy`: system / none / manual).
+                let agent = crate::config::proxy_outbound::OutboundProxy::host()
+                    .apply(
+                        ureq::Agent::config_builder()
+                            .timeout_connect(Some(Duration::from_secs(20)))
+                            .timeout_recv_body(Some(Duration::from_secs(60 * 30)))
+                            .max_redirects(5)
+                            .http_status_as_error(false),
+                    )
+                    .context("host proxy setting")?
                     .build()
                     .new_agent();
                 let response = agent
@@ -94,8 +99,12 @@ impl Source {
                     .header("User-Agent", concat!("cutex-upgrade/", env!("CARGO_PKG_VERSION")))
                     .header("Accept", "application/octet-stream")
                     .call()
-                    .with_context(|| format!("cannot reach {url}"))?;
+                    .map_err(|error| match crate::config::proxy_outbound::proxy_error_message(&error) {
+                        Some(message) => anyhow::anyhow!("cannot reach {url}: {message}"),
+                        None => anyhow::Error::new(error).context(format!("cannot reach {url}")),
+                    })?;
                 let status = response.status().as_u16();
+                ensure!(status != 407, "{url}: {}", crate::config::proxy_outbound::PROXY_AUTH_MESSAGE);
                 ensure!(status == 200, "{url}: HTTP {status}");
                 Ok(Box::new(response.into_body().into_with_config().limit(limit).reader()))
             }

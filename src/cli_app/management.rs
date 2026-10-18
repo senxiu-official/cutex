@@ -480,6 +480,11 @@ pub(crate) fn cmd_management_serve(
     if let Err(error) = cutex::management::v2::alarms_api::start_watcher() {
         eprintln!("alarms watcher warning: {error:#}");
     }
+    // Approvals requested in the Agent Bus process (services, agent
+    // profiles) as live host events.
+    if let Err(error) = cutex::management::v2::approvals::start_watcher() {
+        eprintln!("approvals watcher warning: {error:#}");
+    }
     // Session / project writes of other processes (agent_create runs in the
     // Agent Bus service) as a live host event.
     if let Err(error) = cutex::management::v2::sessions_watch::start_watcher() {
@@ -550,7 +555,8 @@ fn run_management_server(
 }
 
 fn register_management_handoff(bind_addr: IpAddr, port: u16) {
-    if cutex::config::instance::is_isolated() {
+    // Never from an instance or a test process (test port guard).
+    if cutex::config::instance::uses_isolated_ports() {
         return;
     }
     if !command_exists_in_path("bridgeboard") {

@@ -127,7 +127,7 @@ pub(crate) fn native_home_for(
 
 /// A private, initialized stdio app-server on `home` for an offline session.
 /// No thread is resumed: callers that only read stay read-only.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) fn isolated_endpoint(
     record: Option<&cutex::session::model::CutexSessionRecord>,
     home: &Path,
@@ -190,12 +190,12 @@ pub(crate) fn isolated_endpoint(
 pub(crate) fn open_offline_history_endpoint(
     cutex_session_id: &str,
 ) -> anyhow::Result<(Box<dyn cutex::catalog::CatalogEndpoint>, PathBuf)> {
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = cutex_session_id;
         anyhow::bail!("offline history requires a local Linux or Windows runtime")
     }
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         let store = cutex::session::store::load_cutex_session_store()?;
         let key = cutex::session::service::cutex_session_key_for_user_id_including_retired(
@@ -279,7 +279,7 @@ fn derive_from_native_rollout(
 /// A stopped Claude agent's history: the deployed adapter's read-only
 /// `cute_claude.history_reader` on the agent's private state directory. It
 /// never takes the adapter's writer lease and serves only history reads.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn claude_history_reader(
     session: &cutex::runtime::claude::ClaudeSession,
 ) -> anyhow::Result<OwnedStdioEndpoint> {
@@ -319,12 +319,12 @@ pub(super) struct Editor {
     home: PathBuf,
 }
 impl Editor {
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub(super) fn open(_id: &str) -> anyhow::Result<Self> {
         anyhow::bail!("History revert currently requires a local Linux runtime")
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     pub(super) fn open(id: &str) -> anyhow::Result<Self> {
         let (record, thread, home) = resolve(id)?;
         let record = record.as_ref();
@@ -645,13 +645,22 @@ pub(crate) fn backup_history(home: &Path, source: &Path) -> anyhow::Result<Histo
 pub(crate) fn revert_for_management(
     cutex_session_id: &str,
     before_turn_id: &str,
+    rewind_files: bool,
 ) -> Result<Value, UserInputExecutionError> {
     let store = cutex::session::store::load_cutex_session_store().map_err(revert_error)?;
     let record = store.sessions.get(cutex_session_id).ok_or_else(|| {
         revert_error(failure("session_not_found", "the agent does not exist on this host", false))
     })?;
     if record.claude_session.is_some() {
-        return super::claude_structure::revert(record, before_turn_id);
+        return super::claude_structure::revert(record, before_turn_id, rewind_files);
+    }
+    if rewind_files {
+        // Codex agents revert files through cutex/session/files/revert.
+        return Err(revert_error(failure(
+            "rewind_files_unsupported",
+            "rewindFiles applies to Claude agents only; use cutex/session/files/revert for Codex agents",
+            false,
+        )));
     }
     let (runtime_pid, runtime_generation) = (record.runtime_pid, record.runtime_generation);
     let handle = super::app_server_runtime::runtime_manager()
@@ -822,7 +831,14 @@ fn has_writer(path: &Path, own_pid: u32) -> anyhow::Result<bool> {
     }
     Ok(false)
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn has_writer(path: &Path, own_pid: u32) -> anyhow::Result<bool> {
+    let expected = path.canonicalize()?;
+    Ok(cutex::platform::macos_proc::open_writers(&expected)?
+        .into_iter()
+        .any(|pid| pid != own_pid))
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn has_writer(_: &Path, _: u32) -> anyhow::Result<bool> {
     anyhow::bail!("Bring this session online before reverting history on this platform; isolated writer detection is unavailable")
 }
@@ -1017,7 +1033,7 @@ mod tests {
     /// Rust <-> adapter handshake of the offline Claude history reader. Runs
     /// when CUTEX_TEST_CLAUDE_PYTHON names a Python with the adapter's
     /// dependencies (e.g. `components/claude-runtime/.venv`); no model or login is used.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn claude_history_reader_serves_the_adapter_state_read_only() {
         let Some(python) = std::env::var_os("CUTEX_TEST_CLAUDE_PYTHON").map(PathBuf::from) else {

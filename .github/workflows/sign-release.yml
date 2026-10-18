@@ -1,0 +1,203 @@
+# Signs one "Build binaries" run of cutex with the release minisign key and publishes it: the human
+# release (--tag), cutex-<label> (manifest.json, capabilities.json), native-<version> (with native_run),
+# every new component-<name>-<version>, and channel-release LAST. It runs .github/ci/sign-and-upload.sh,
+# the same script and checks as an interactive signing run: SHA256SUMS of the run, the sequence must be
+# higher than the published channel.json's (verified with the committed key first), capabilities the
+# previous release advertised must be listed as removed in the release metadata, an already published
+# component version must be byte-identical or the run stops, every signature verified with
+# .github/ci/cutex-release.pub before anything is uploaded, every release re-downloaded and checked
+# before it is published, channel-release uploaded last and verified.
+#
+# Order across repositories: cute-codex (when a release ships a new native), then cutex-desktop, then
+# this one. desktop_tag makes this run check first that the cutex-desktop release is public and its
+# SHA256SUMS signature verifies.
+#
+# Secrets (the `release` environment's or the repository's): MINISIGN_SECRET_KEY = the minisign secret
+# key file, MINISIGN_PASSWORD = its passphrase; NATIVE_ARTIFACTS_TOKEN (optional) = a token with Actions
+# read on cute-codex, only if GITHUB_TOKEN cannot download the native_run's artifacts.
+#
+# dry_run (default): download, check and sign, print the gh commands instead of uploading.
+name: Sign release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID of the Build binaries run to sign"
+        required: true
+        type: string
+      tag:
+        description: "Human release tag (its draft release must exist), e.g. v0.1.4"
+        required: true
+        type: string
+      sequence:
+        description: "channel.json sequence: a number, or next (= published sequence + 1)"
+        required: false
+        default: next
+        type: string
+      native_run:
+        description: "Optional: ID of the cute-codex build binaries run whose natives this release ships"
+        required: false
+        default: ""
+        type: string
+      meta:
+        description: "Optional: release metadata file in .github/ci/release-meta (default: <release>.json there)"
+        required: false
+        default: ""
+        type: string
+      release:
+        description: "Optional: release label (default: from the run's BUILD-INFO)"
+        required: false
+        default: ""
+        type: string
+      previous_capabilities:
+        description: "Optional: previous capability list file in .github/ci/release-meta"
+        required: false
+        default: ""
+        type: string
+      desktop_tag:
+        description: "Optional: cutex-desktop release that must already be public and signed, e.g. v0.1.4"
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Dry run: sign and check, print the upload commands, upload nothing"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: sign-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sign:
+    # Only the default branch's workflow (and so its script and public key) may use the key.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install minisign and check stdin passphrases
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q minisign
+          minisign -v
+          # A throwaway key with a password: this minisign must read the passphrase from stdin.
+          t="$RUNNER_TEMP/minisign-selftest"
+          mkdir -p "$t"
+          pw="selftest-$RANDOM$RANDOM$RANDOM"
+          printf '%s\n%s\n' "$pw" "$pw" | minisign -G -p "$t/t.pub" -s "$t/t.key" > /dev/null
+          echo selftest > "$t/f"
+          printf '%s\n' "$pw" | minisign -S -s "$t/t.key" -m "$t/f" > /dev/null
+          minisign -V -q -p "$t/t.pub" -m "$t/f"
+          rm -rf "$t"
+      - name: Check inputs
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          TAG: ${{ inputs.tag }}
+          SEQUENCE: ${{ inputs.sequence }}
+          NATIVE_RUN: ${{ inputs.native_run }}
+          META: ${{ inputs.meta }}
+          RELEASE: ${{ inputs.release }}
+          PREVIOUS_CAPABILITIES: ${{ inputs.previous_capabilities }}
+          DESKTOP_TAG: ${{ inputs.desktop_tag }}
+        run: |
+          set -euo pipefail
+          [ "${GITHUB_REPOSITORY#*/}" = cutex ] || { echo "::error::this workflow signs cutex, not $GITHUB_REPOSITORY"; exit 1; }
+          [ -f .github/ci/sign-and-upload.sh ] && [ -f .github/ci/cutex-release.pub ] || { echo "::error::missing .github/ci/sign-and-upload.sh or cutex-release.pub"; exit 1; }
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a number"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || { echo "::error::bad tag"; exit 1; }
+          [[ "$SEQUENCE" =~ ^([0-9]+|next)$ ]] || { echo "::error::sequence must be a number or next"; exit 1; }
+          [[ "$NATIVE_RUN" =~ ^[0-9]*$ ]] || { echo "::error::native_run must be a number"; exit 1; }
+          [[ "$RELEASE" =~ ^[A-Za-z0-9._-]*$ ]] || { echo "::error::bad release label"; exit 1; }
+          [[ "$DESKTOP_TAG" =~ ^(v[0-9][A-Za-z0-9._-]*)?$ ]] || { echo "::error::bad desktop_tag"; exit 1; }
+          for f in "$META" "$PREVIOUS_CAPABILITIES"; do
+            [ -z "$f" ] && continue
+            [[ "$f" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.json$ ]] || { echo "::error::$f: a file name in .github/ci/release-meta"; exit 1; }
+            [ -f ".github/ci/release-meta/$f" ] || { echo "::error::no .github/ci/release-meta/$f"; exit 1; }
+          done
+      - name: Check that the cutex-desktop release is public and signed
+        if: inputs.desktop_tag != ''
+        env:
+          DESKTOP_TAG: ${{ inputs.desktop_tag }}
+        run: |
+          set -euo pipefail
+          # Anonymous download: a draft release's assets are not public.
+          base="https://github.com/${GITHUB_REPOSITORY%%/*}/cutex-desktop/releases/download/$DESKTOP_TAG"
+          d="$RUNNER_TEMP/desktop-check"
+          mkdir -p "$d"
+          curl -fsSL -o "$d/SHA256SUMS" "$base/SHA256SUMS"
+          curl -fsSL -o "$d/SHA256SUMS.minisig" "$base/SHA256SUMS.minisig"
+          minisign -V -q -P "$(sed -n 2p .github/ci/cutex-release.pub)" -m "$d/SHA256SUMS"
+          echo "cutex-desktop $DESKTOP_TAG is public; SHA256SUMS ($(wc -l < "$d/SHA256SUMS") files) verifies"
+      - name: Write the signing key
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$MINISIGN_SECRET_KEY" ] || { echo "::error::secret MINISIGN_SECRET_KEY is not set"; exit 1; }
+          umask 077
+          key="$RUNNER_TEMP/minisign-release.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          line=$(sed -n 2p "$key")
+          [ -n "$line" ] && echo "::add-mask::$line"
+          head -n 1 "$key" | grep -q '^untrusted comment: ' || { echo "::error::MINISIGN_SECRET_KEY is not a minisign key file"; exit 1; }
+      - name: Sign and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          CUTEX_NATIVE_GH_TOKEN: ${{ secrets.NATIVE_ARTIFACTS_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+          TAG: ${{ inputs.tag }}
+          SEQUENCE: ${{ inputs.sequence }}
+          NATIVE_RUN: ${{ inputs.native_run }}
+          META: ${{ inputs.meta }}
+          RELEASE: ${{ inputs.release }}
+          PREVIOUS_CAPABILITIES: ${{ inputs.previous_capabilities }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(cutex --run "$RUN_ID" --tag "$TAG" --sequence "$SEQUENCE" --key "$RUNNER_TEMP/minisign-release.key"
+            --password-env MINISIGN_PASSWORD --owner "${GITHUB_REPOSITORY%%/*}" --dir "$RUNNER_TEMP/sign")
+          [ -z "$NATIVE_RUN" ] || args+=(--native-run "$NATIVE_RUN")
+          [ -z "$META" ] || args+=(--meta ".github/ci/release-meta/$META")
+          [ -z "$RELEASE" ] || args+=(--release "$RELEASE")
+          [ -z "$PREVIOUS_CAPABILITIES" ] || args+=(--previous-capabilities ".github/ci/release-meta/$PREVIOUS_CAPABILITIES")
+          [ "$DRY_RUN" = true ] || args+=(--upload)
+          bash .github/ci/sign-and-upload.sh "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/sign.log"
+          {
+            if [ "$DRY_RUN" = true ]; then echo "### Dry run: nothing uploaded"; else echo "### Signed and uploaded"; fi
+            echo '```'
+            tail -n 80 "$RUNNER_TEMP/sign.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the release documents
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: sign-release-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/sign.log
+            ${{ runner.temp }}/sign/release/manifest.json
+            ${{ runner.temp }}/sign/release/SHA256SUMS
+            ${{ runner.temp }}/sign/channel/channel.json
+            ${{ runner.temp }}/sign/capabilities/capabilities.json
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Delete the signing key
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/minisign-release.key"

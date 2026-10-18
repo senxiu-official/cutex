@@ -23,7 +23,6 @@ use serde_json::{json, Map, Value};
 
 use crate::config::atomic::write_private_pretty_json_atomic;
 use crate::config::global_settings::ConfigValueUpdate;
-use crate::config::proxy::effective_proxy_config;
 use crate::config::store::load_codez_config;
 use crate::profiles::catalog_overlay as overlay;
 use crate::profiles::codex_profile::{CodexProfileConfigPatch, CodexProfileConfigSnapshot};
@@ -218,6 +217,7 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
             model["isDefault"] = json!(model["id"].as_str() == selected_model.as_deref());
             model["defaultReasoningEffort"] = claude_default_effort(
                 model, account.options.claude.effort.map(|effort| effort.as_str()));
+            claude_effective_limits(model);
         }
     }
     // profile-model-display-names: this profile's own name for each entry
@@ -251,6 +251,9 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
         "selectedModel": selected_model,
         "modelsSource": models_source,
         "modelsUnavailableReason": models_unavailable,
+        // claude-model-context: Claude Code decides auto-compaction itself (its
+        // server-tuned window, settings, env); no per-model limit to report.
+        "autoCompactApplies": account.cli_kind != CliKind::Claude,
         "profileOverrides": {
             "modelContextWindow": state.snapshot.model_context_window,
             "modelAutoCompactTokenLimit": state.snapshot.model_auto_compact_token_limit,
@@ -264,6 +267,19 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
         "unsupportedModelFields": UNSUPPORTED_MODEL_FIELDS,
         "precedence": "profile modelContextWindow replaces catalog contextWindow (clamped to maxContextWindow); profile modelAutoCompactTokenLimit replaces catalog autoCompactTokenLimit; effective auto-compact = min(limit, 90% of resolved context window)",
     }))
+}
+
+/// Claude rows: the context window is the adapter's reference value (the
+/// runtime reports the real one per turn); there is no auto-compact limit.
+fn claude_effective_limits(model: &mut Value) {
+    let window = model["contextWindow"].as_i64();
+    model["autoCompactTokenLimit"] = Value::Null;
+    model["effective"] = json!({
+        "contextWindow": window,
+        "contextWindowSource": if window.is_some() { "reference" } else { "unknown" },
+        "autoCompactTokenLimit": null,
+        "autoCompactTokenLimitSource": "notApplicable",
+    });
 }
 
 fn claude_default_effort(model: &Value, configured: Option<&str>) -> Value {
@@ -337,14 +353,8 @@ pub fn discover(account: &StoredAccount, apply: bool) -> anyhow::Result<()> {
     ensure!(discovery_supported(account), "model discovery requires an API-key custom profile");
     let base = account_model_api_base(account).context("profile has no API base URL")?;
     let key = api_key(account)?;
-    let global = load_codez_config();
-    let proxy = effective_proxy_config(account, &global);
-    let catalog = model_discovery::fetch(
-        &base,
-        &key,
-        proxy.map(|p| if p.enabled { p.url.as_deref() } else { None }),
-        proxy.and_then(|p| p.no_proxy.as_deref()),
-    )?;
+    let proxy = crate::config::proxy_outbound::OutboundProxy::for_profile(account, &load_codez_config());
+    let catalog = model_discovery::fetch(&base, &key, &proxy)?;
     crate::profiles::materialize::ensure_materialized_account_dir(&materialized_account_files(account)?)?;
     write_private_pretty_json_atomic(&discovered_path(account)?, &catalog, "discovered models")?;
     if apply {
@@ -645,6 +655,22 @@ mod tests {
             assert_eq!(view[key], row[key], "{key}");
         }
         assert_eq!(view["supportedReasoningEfforts"], json!([]));
+    }
+
+    #[test]
+    fn claude_rows_report_the_reference_window_and_no_auto_compact() {
+        let snapshot = CodexProfileConfigSnapshot::default();
+        let mut pinned = model_view(&json!({"slug": "claude-x", "context_window": 1_000_000}), &snapshot, &[]);
+        // The Codex rule would invent a 90 % auto-compact limit here.
+        assert_eq!(pinned["effective"]["autoCompactTokenLimit"], 900_000);
+        claude_effective_limits(&mut pinned);
+        assert_eq!(pinned["effective"], json!({"contextWindow": 1_000_000, "contextWindowSource": "reference",
+            "autoCompactTokenLimit": null, "autoCompactTokenLimitSource": "notApplicable"}));
+        let mut alias = model_view(&json!({"slug": "opus", "context_window": null}), &snapshot, &[]);
+        claude_effective_limits(&mut alias);
+        assert_eq!(alias["effective"]["contextWindow"], Value::Null);
+        assert_eq!(alias["effective"]["contextWindowSource"], "unknown");
+        assert_eq!(alias["autoCompactTokenLimit"], Value::Null);
     }
 
     #[test]

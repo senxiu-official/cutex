@@ -10,7 +10,7 @@
       "required": ["approvalId", "kind", "reason", "requesterCutexSessionId", "summary", "requestSha256", "state", "createdAt"],
       "properties": {
         "approvalId": { "type": "string" },
-        "kind": { "enum": ["managed_service", "service_lifetime", "agent_profile", "ask_delivery", "browser_claim", "browser_open", "workflow_run"] },
+        "kind": { "enum": ["managed_service", "service_lifetime", "agent_profile", "ask_delivery", "browser_claim", "browser_open", "workflow_run", "static_root"] },
         "reason": { "type": "string" },
         "requesterCutexSessionId": { "type": "string" },
         "requesterName": { "type": "string" },
@@ -22,7 +22,44 @@
         "createdAt": { "type": "string" },
         "decidedAt": { "type": "string" },
         "note": { "type": "string" },
-        "consumedAt": { "type": "string" }
+        "decidedBy": { "$ref": "#/$defs/approvalDecider" },
+        "consumedAt": { "type": "string" },
+        "wait": { "$ref": "#/$defs/approvalWait" }
+      }
+    },
+    "approvalDecider": {
+      "description": "approval-decided-by: who decided. `by` = owner (root credential) or auto:<reason>; `client` = the client's own unverified facts.",
+      "type": "object",
+      "required": ["by"],
+      "properties": {
+        "by": { "type": "string" },
+        "connection": { "enum": ["loopback", "remote"] },
+        "peer": { "type": "string" },
+        "client": {
+          "type": "object",
+          "properties": {
+            "app": { "type": "string" },
+            "version": { "type": "string" },
+            "device": { "type": "string" },
+            "surface": { "type": "string" },
+            "input": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "approvalWait": {
+      "description": "approval-wait: the requesting tool call holds for the owner's decision until `until`; `end` once the hold ended.",
+      "type": "object",
+      "required": ["id", "startedAt", "until"],
+      "properties": {
+        "id": { "type": "string" },
+        "startedAt": { "type": "string" },
+        "until": { "type": "string" },
+        "threadId": { "type": "string" },
+        "turnId": { "type": "string" },
+        "endedAt": { "type": "string" },
+        "end": { "enum": ["approved", "denied", "timeout", "disconnected", "turn_ended", "runtime_changed"] }
       }
     },
     "approvalList": {

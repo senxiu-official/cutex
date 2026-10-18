@@ -52,6 +52,7 @@ fn claude_record(home: &Path) -> CutexSessionRecord {
         allow_exec: false, write_explicit: false, exec_explicit: false,
         native_session_id: None,
         connection_id: None,
+        initial_permission_mode: None,
     });
     record
 }

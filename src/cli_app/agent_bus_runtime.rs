@@ -25,6 +25,7 @@ pub(crate) fn ensure_agent_bus_running(
 ) -> anyhow::Result<()> {
     let port = agent_bus_port(config);
     validate_agent_bus_port(port)?;
+    cutex::config::instance::ensure_port_allowed(port)?;
     if agent_bus_healthy(port, config.agent_bus_token.as_deref()) {
         if register_handoff_if_healthy {
             register_agent_bus_handoff(port);
@@ -114,7 +115,9 @@ pub(crate) fn maybe_patch_live_agent_groups(
 }
 
 pub(crate) fn register_agent_bus_handoff(port: u16) {
-    if cutex::config::instance::is_isolated() {
+    // Bridgeboard handoffs are machine-wide: never from an instance or a
+    // test process (test port guard).
+    if cutex::config::instance::uses_isolated_ports() {
         return;
     }
     if !command_exists_in_path("bridgeboard") {

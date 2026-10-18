@@ -763,7 +763,6 @@ mod tests {
             enabled: true,
             url: Some("http://user:proxy-secret@127.0.0.1:7890".into()),
             no_proxy: None,
-            force_http_transport: true,
         });
         save_store(&store).unwrap();
         let mut raw = std::fs::read_to_string(&files.config_path).unwrap();

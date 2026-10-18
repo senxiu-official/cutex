@@ -708,6 +708,7 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: "00000000-0000-4000-8000-0000000000a1".into(),
             name: "orchid".into(),
             email: None,

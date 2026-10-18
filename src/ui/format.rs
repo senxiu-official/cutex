@@ -77,12 +77,13 @@ pub fn proxy_config_label(proxy: Option<&ProxyConfig>) -> String {
     match proxy {
         Some(proxy) if !proxy.enabled => "disabled".to_string(),
         Some(proxy) => {
-            let url = proxy.url.as_deref().unwrap_or("<missing-url>");
+            let url = proxy
+                .url
+                .as_deref()
+                .map(|url| crate::config::proxy_outbound::redacted_proxy_url(url).0)
+                .unwrap_or_else(|| "<missing-url>".to_string());
             let no_proxy = proxy.no_proxy.as_deref().unwrap_or("-");
-            format!(
-                "enabled url={url} no_proxy={no_proxy} force_http={}",
-                bool_label(proxy.force_http_transport)
-            )
+            format!("enabled url={url} no_proxy={no_proxy}")
         }
         None => "inherit/none".to_string(),
     }

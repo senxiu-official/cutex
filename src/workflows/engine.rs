@@ -517,7 +517,7 @@ impl WorkflowService {
                         self.save_run(run);
                         self.start_driver(run.clone(), false);
                     }
-                    Ok(GateOutcome::Denied(_)) => self.end_unstarted(run.clone(), RunState::Rejected),
+                    Ok(GateOutcome::Denied(_) | GateOutcome::DeniedEarlier(_)) => self.end_unstarted(run.clone(), RunState::Rejected),
                     _ => {}
                 }
             }
@@ -919,7 +919,7 @@ pub fn submit_run(
                 run.approval_id = Some(record.approval_id);
                 run.state = RunState::Running;
             }
-            GateOutcome::Denied(record) => {
+            GateOutcome::Denied(record) | GateOutcome::DeniedEarlier(record) => {
                 run.approval_id = Some(record.approval_id);
                 run.state = RunState::Rejected;
                 run.ended_at = Some(now.clone());

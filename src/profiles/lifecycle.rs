@@ -170,6 +170,8 @@ pub(crate) fn base_account(name: &str, cli_kind: CliKind, source: &str) -> Store
         search_tool: false,
         quota_reader: None,
         private_chatgpt_auth_file: false,
+        // New Claude profiles read the workspace's Claude Code project settings.
+        claude_code: crate::profiles::claude_code::ClaudeCodeOptions::for_new_profile(&cli_kind),
         id: uuid::Uuid::new_v4().to_string(),
         name: name.to_string(),
         email: None,
@@ -490,6 +492,8 @@ pub fn delete_profile_with(target: &str, archived: ArchivedReferences) -> Result
     if references.quick_state_changed {
         save_quick_state(&state)?;
     }
+    // profile-avatar: the picture / intro portrait go with the profile.
+    crate::profiles::avatar::remove_default(&account.id);
     let (backup_path, backup_error) = match move_to_deleted(&account) {
         Ok(path) => (Some(path), None),
         Err(error) => (None, Some(format!("{error:#}"))),

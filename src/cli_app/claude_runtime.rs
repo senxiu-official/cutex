@@ -111,8 +111,20 @@ fn handle_claude_event(
     if synchronize_before_publish {
         super::app_server_state_sync::handle_runtime_event(context, event)?;
     }
-    if let NativeEventDisposition::Publish(pending) = pending_event_from_app_server(&native, event)? {
+    let disposition = pending_event_from_app_server(&native, event)?;
+    if let NativeEventDisposition::OtherThread { thread_id, pending } = disposition {
+        // A subagent transcript frame: stream-only, nothing else observes it.
+        for frame in subagent_frames(context, &native, event, Some((&thread_id, pending)))? {
+            management_v2_repository()?.append(frame)?;
+        }
+        return Ok(());
+    }
+    if let NativeEventDisposition::Publish(pending) = disposition {
         let envelope = management_v2_repository()?.append(pending)?;
+        // A subAgentActivity `started` names a subagent transcript as a verified descendant.
+        for frame in subagent_frames(context, &native, event, None)? {
+            management_v2_repository()?.append(frame)?;
+        }
         cutex::management::v2::activity::record_activity_event(&envelope)?;
         // Token usage goes into the usage ledger under the session's
         // profile, as for Codex runtimes: GET /v2/usage and the quota
@@ -170,6 +182,52 @@ fn handle_claude_event(
         eprintln!("Claude queued input for {} was not flushed: {error:#}", context.cutex_session_id);
     }
     Ok(())
+}
+
+/// Capability `claude-subagent-transcripts`: a foreground subagent's
+/// transcript frames (`params.threadId` = `claude:<session>:task:<id>`, adapter
+/// `features.subagentTranscripts`) are published stream-only, with the native
+/// thread id intact, once that thread is a verified descendant of the bound
+/// thread (taught by the parent's `subAgentActivity` `started` item, or by a
+/// `thread/read` lineage check). They never touch the session record,
+/// activity, usage, asks or the queue. Unverified frames wait briefly
+/// (bounded, `subagent_lineage`); unrelated ones are dropped.
+///
+/// `other` is an event for another thread; None = a bound-thread event that
+/// may teach an edge. Returns the subagent frames to publish, in order.
+fn subagent_frames(
+    context: &AppServerRuntimeEventContext,
+    native: &NativeEventContext,
+    event: &cutex::app_server::client::AppServerEvent,
+    other: Option<(&str, cutex::management::v2::model::PendingEvent)>,
+) -> anyhow::Result<Vec<cutex::management::v2::model::PendingEvent>> {
+    use cutex::app_server::client::AppServerEvent;
+    use cutex::management::v2::subagent_lineage::{self, ForeignThreadRoute};
+    let (session, root) = (context.cutex_session_id.as_str(), context.thread_id.as_str());
+    let mut frames = Vec::new();
+    match (other, event) {
+        (Some((thread_id, pending)), AppServerEvent::Notification(_)) => {
+            if subagent_lineage::route_foreign_event(session, root, thread_id, event) == ForeignThreadRoute::Descendant {
+                frames.push(pending);
+            }
+        }
+        (None, AppServerEvent::Notification(notification)) => {
+            subagent_lineage::learn_from_notification(session, root, &notification.raw);
+        }
+        _ => {}
+    }
+    loop {
+        let (ready, _) = subagent_lineage::take_ready_events(session, root);
+        if ready.is_empty() {
+            break;
+        }
+        for buffered in &ready {
+            if let NativeEventDisposition::OtherThread { pending, .. } = pending_event_from_app_server(native, buffered)? {
+                frames.push(pending);
+            }
+        }
+    }
+    Ok(frames)
 }
 
 pub(super) fn observe(id: &str) -> anyhow::Result<()> {
@@ -631,6 +689,59 @@ fn reconcile_native_message(id: &str, generation: u64, envelope: &cutex::app_ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claude_native(context: &AppServerRuntimeEventContext) -> NativeEventContext {
+        NativeEventContext {
+            cutex_session_id: context.cutex_session_id.clone(), thread_id: context.thread_id.clone(),
+            host_id: "host".into(), runtime_generation: 1, runtime_backend: "claude_subscription".into(),
+            schema: AppServerSchema {
+                protocol: "claude-app-server-subset".into(), major_version: 1, version: "0.3.0+cutex".into(),
+                sha256: "a".repeat(64), channel: AppServerSchemaChannel::Experimental,
+                capabilities: serde_json::json!({}), extensions: vec![],
+            },
+        }
+    }
+
+    fn claude_event(method: &str, params: serde_json::Value) -> cutex::app_server::client::AppServerEvent {
+        let raw = serde_json::json!({"method": method, "params": params});
+        cutex::app_server::client::AppServerEvent::Notification(cutex::app_server::protocol::RpcNotification {
+            method: method.into(), params: raw.get("params").cloned(), raw,
+        })
+    }
+
+    fn frames_for(context: &AppServerRuntimeEventContext, event: &cutex::app_server::client::AppServerEvent) -> Vec<Option<String>> {
+        let native = claude_native(context);
+        let other = match pending_event_from_app_server(&native, event).unwrap() {
+            NativeEventDisposition::OtherThread { thread_id, pending } => Some((thread_id, pending)),
+            NativeEventDisposition::Publish(_) => None,
+        };
+        subagent_frames(context, &native, event, other.as_ref().map(|(t, p)| (t.as_str(), p.clone())))
+            .unwrap().into_iter().map(|frame| frame.correlation.thread_id).collect()
+    }
+
+    /// claude-subagent-transcripts: transcript frames wait for the parent's
+    /// activity item, then publish with their own thread id; others never do.
+    #[test]
+    fn subagent_transcript_frames_publish_after_the_parent_names_them() {
+        let context = AppServerRuntimeEventContext {
+            cutex_session_id: format!("cutex-claude-sub-{}", uuid::Uuid::new_v4()),
+            thread_id: "root".into(), runtime_generation: 1, runtime_backend: "claude_subscription".into(),
+            launched_profile: None, launched_profile_id: None, usage: Default::default(),
+            schema: cutex::app_server::journal::AppServerSchemaIdentity { version: "0.3.0+cutex".into(), sha256: "a".repeat(64) },
+        };
+        let child = "claude:sid:task:task-a";
+        let frame = claude_event("turn/started", serde_json::json!({"threadId": child, "turn": {"id": "subagent:c", "items": [], "status": "inProgress"}}));
+        assert!(frames_for(&context, &frame).is_empty(), "buffered until the parent names it");
+        let activity = claude_event("item/completed", serde_json::json!({"threadId": "root", "turnId": "t", "item": {
+            "type": "subAgentActivity", "id": "a1", "kind": "started", "agentThreadId": child, "agentPath": "/claude/task-a"}}));
+        assert_eq!(frames_for(&context, &activity), vec![Some(child.to_string())]);
+        let item = claude_event("item/completed", serde_json::json!({"threadId": child, "turnId": "subagent:c", "item": {"type": "agentMessage", "id": "m", "text": "hi"}}));
+        assert_eq!(frames_for(&context, &item), vec![Some(child.to_string())]);
+        let stranger = claude_event("item/completed", serde_json::json!({"threadId": "claude:sid:task:other", "turnId": "x", "item": {"type": "agentMessage", "id": "m2", "text": "no"}}));
+        assert!(frames_for(&context, &stranger).is_empty());
+        // A bound-thread event that teaches nothing publishes no subagent frame.
+        assert!(frames_for(&context, &claude_event("turn/started", serde_json::json!({"threadId": "root", "turn": {"id": "t"}}))).is_empty());
+    }
 
     /// PERF-03: one observer pass over several online Claude runtimes with an
     /// empty bus makes no whole-store copy (before: one per runtime per pass).

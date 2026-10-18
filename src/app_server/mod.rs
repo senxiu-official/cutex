@@ -12,6 +12,7 @@ pub mod external_input;
 pub mod external_recovery;
 pub mod journal;
 pub mod late_adoption;
+pub mod live_settings;
 pub mod manager;
 pub mod participants;
 pub mod presentation;

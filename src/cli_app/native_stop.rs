@@ -54,7 +54,7 @@ pub(super) fn stop_processes(
             detail: "native_owner_previous_boot".into(),
         });
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         stop_linux(record, binding, force)
     }
@@ -84,14 +84,14 @@ pub(super) fn stop_processes(
             receipt.publication.as_ref().context("runtime publication evidence missing")?, process.as_ref())?;
         Ok(ProcessTerminateOutcome { stopped: true, forced: force, detail: "owned_runtime_job_stopped".into() })
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (binding, force);
         anyhow::bail!("native process stop requires supported process identity")
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Member {
     pid: u32,
@@ -121,6 +121,27 @@ fn member(pid: u32) -> anyhow::Result<Option<Member>> {
         state: parts[0].into(),
     }))
 }
+/// macOS: libproc identity (docs/macos/PROBE.md). `ticks` is the start time
+/// in microseconds: fixed for a process's life, different after PID reuse.
+#[cfg(target_os = "macos")]
+fn member_of(stat: cutex::platform::macos_proc::ProcStat) -> Member {
+    Member {
+        pid: stat.pid,
+        parent: stat.ppid,
+        group: stat.pgid,
+        session: stat.sid,
+        ticks: stat.start_ticks,
+        state: if stat.zombie { "Z" } else { "S" }.into(),
+    }
+}
+#[cfg(target_os = "macos")]
+fn member(pid: u32) -> anyhow::Result<Option<Member>> {
+    Ok(cutex::platform::macos_proc::stat(pid)?.map(member_of))
+}
+#[cfg(target_os = "macos")]
+fn process_snapshot() -> anyhow::Result<Vec<Member>> {
+    Ok(cutex::platform::macos_proc::snapshot()?.into_iter().map(member_of).collect())
+}
 #[cfg(target_os = "linux")]
 fn process_snapshot() -> anyhow::Result<Vec<Member>> {
     let mut found = Vec::new();
@@ -135,7 +156,7 @@ fn process_snapshot() -> anyhow::Result<Vec<Member>> {
     }
     Ok(found)
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn members(group: u32) -> anyhow::Result<Vec<Member>> {
     Ok(process_snapshot()?
         .into_iter()
@@ -144,7 +165,7 @@ fn members(group: u32) -> anyhow::Result<Vec<Member>> {
         })
         .collect())
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StopScope {
     version: u32,
@@ -154,11 +175,11 @@ struct StopScope {
     binding: cutex::session::model::CutexAppServerRuntimeBinding,
     members: Vec<Member>,
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scope_path(binding: &cutex::session::model::CutexAppServerRuntimeBinding) -> std::path::PathBuf {
     std::path::Path::new(&binding.runtime_dir).join("stop-scope.json")
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn load_scope(
     record: &CutexSessionRecord,
     binding: &cutex::session::model::CutexAppServerRuntimeBinding,
@@ -179,7 +200,7 @@ fn load_scope(
     );
     Ok(Some(scope))
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn live_scope(scope: &mut StopScope, snapshot: &[Member]) -> Vec<Member> {
     // Birth ticks, not current PID alone, carry ownership across reparenting and
     // setsid(). Only a currently proven member can authorize session expansion.
@@ -224,7 +245,7 @@ fn live_scope(scope: &mut StopScope, snapshot: &[Member]) -> Vec<Member> {
         .filter(|m| !matches!(m.state.as_str(), "Z" | "X"))
         .collect()
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scope_lock(
     binding: &cutex::session::model::CutexAppServerRuntimeBinding,
 ) -> anyhow::Result<std::fs::File> {
@@ -247,6 +268,26 @@ fn scope_lock(
         .open(dir.join("stop-scope.lock"))?;
     fs2::FileExt::lock_exclusive(&lock)?;
     Ok(lock)
+}
+/// macOS has no pidfd: re-read the identity, then signal the PID. The window
+/// between the check and kill(2) is the PID-reuse race pidfd closes on Linux;
+/// macOS assigns PIDs sequentially up to 99999, so reuse inside that window
+/// needs the whole PID space to wrap in microseconds.
+#[cfg(target_os = "macos")]
+fn signal_exact(m: &Member, signal: i32) -> anyhow::Result<()> {
+    let Some(now) = member(m.pid)? else {
+        return Ok(());
+    };
+    if now.ticks != m.ticks || now.group != m.group || now.session != m.session {
+        return Ok(());
+    }
+    if unsafe { libc::kill(m.pid as libc::pid_t, signal) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ESRCH) {
+            return Err(e.into());
+        }
+    }
+    Ok(())
 }
 #[cfg(target_os = "linux")]
 fn signal_exact(m: &Member, signal: i32) -> anyhow::Result<()> {
@@ -283,7 +324,7 @@ fn signal_exact(m: &Member, signal: i32) -> anyhow::Result<()> {
     }
     Ok(())
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stop_linux(
     record: &CutexSessionRecord,
     binding: &cutex::session::model::CutexAppServerRuntimeBinding,
@@ -350,7 +391,7 @@ fn stop_linux(
     }
     stop_captured_scope(scope.as_mut().unwrap(), force)
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn refresh_and_persist_scope(
     scope: &mut StopScope,
     persisted: &mut Option<usize>,
@@ -366,7 +407,7 @@ fn refresh_and_persist_scope(
     }
     Ok(live)
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stop_captured_scope(
     scope: &mut StopScope,
     force: bool,
@@ -408,7 +449,7 @@ fn stop_captured_scope(
     })
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
@@ -588,7 +629,7 @@ mod tests {
 /// Kernel observation after stop; never emits a signal.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn verify_stopped(record: &CutexSessionRecord) -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(binding) = &record.app_server_runtime {
         let _lock = if scope_path(binding).exists() {
             Some(scope_lock(binding)?)

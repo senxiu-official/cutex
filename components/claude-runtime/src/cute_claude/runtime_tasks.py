@@ -56,7 +56,17 @@ class RuntimeTasks:
         await self.engine.emit(self.tid, 'item/completed', {
             'threadId': self.tid, 'turnId': row['turnId'], 'item': item})
 
+    async def _transcript_seen(self, agent_id, turn_id, call_id=None):
+        subagents = getattr(self.engine, 'subagents', None)
+        if subagents is not None and turn_id:
+            await subagents.agent_seen(self.tid, self.sid, turn_id, agent_id, call_id)
+
     async def child_started(self, agent_id, turn_id):
+        await self._child_started(agent_id, turn_id)
+        # After the activity item: it names the transcript reference first.
+        await self._transcript_seen(agent_id, turn_id)
+
+    async def _child_started(self, agent_id, turn_id):
         if agent_id not in self.rows:
             self.rows[agent_id] = {'taskId': agent_id, 'turnId': turn_id,
                                   'taskType': 'local_agent', 'status': 'running'}
@@ -128,6 +138,8 @@ class RuntimeTasks:
                             if key in {'total_tokens', 'tool_uses', 'duration_ms'} and type(value) is int and value >= 0}
         if subtype == 'task_started' and first:
             await self.activity(row, 'started')
+        if subtype == 'task_started' and row.get('toolUseId') and row.get('taskType') in {'local_agent', 'agent', 'subagent'}:
+            await self._transcript_seen(task_id, row.get('turnId'), row['toolUseId'])
         elif row['status'] in TERMINAL and (previous not in TERMINAL or corrected_failure):
             await self.activity(row, 'completed' if row['status'] == 'completed' else 'interrupted')
         elif subtype == 'task_progress' and previous not in TERMINAL:

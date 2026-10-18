@@ -59,6 +59,9 @@ pub fn python_steps(venv_module_missing: bool) -> Vec<String> {
     let mut steps = Vec::new();
     if cfg!(windows) {
         steps.push("Install Python 3.11 or newer: `winget install Python.Python.3.13` (or the python.org installer).".into());
+    } else if cfg!(target_os = "macos") {
+        // /usr/bin/python3 of the Command Line Tools is 3.9: too old.
+        steps.push("Install Python 3.11 or newer: the python.org macOS installer, `brew install python@3.13` or `uv python install 3.13`.".into());
     } else if venv_module_missing {
         steps.push("Install Python's venv module: `sudo apt install python3-venv` (Debian / Ubuntu; other distributions: their python3 venv package).".into());
     } else {
@@ -263,6 +266,13 @@ impl Handler for ClaudeRuntime {
 
     fn external(&self, _layout: &Layout) -> bool {
         false
+    }
+
+    /// A hand-deployed host selects its Claude runtime in
+    /// `runtime/claude/deployment.json` (the deployment kits' stage script):
+    /// usable when that deployment validates.
+    fn configured_by_hand(&self) -> bool {
+        ClaudeDeployment::selected().and_then(|deployment| deployment.validate()).is_ok()
     }
 
     fn prepare(&self, ctx: &Context) -> anyhow::Result<Value> {

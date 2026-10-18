@@ -76,8 +76,7 @@ fn target(base: &str) -> SearchTarget {
         wire_model: "gemini-3.8-flash-tiered".into(),
         model: "gemini-3.8-flash-tiered".into(),
         provider: Some("gemini".into()),
-        proxy: Some(None),
-        no_proxy: None,
+        proxy: crate::config::proxy_outbound::OutboundProxy::Direct,
     }
 }
 
@@ -241,7 +240,7 @@ fn the_mock_refuses_mixed_tools_like_gemini() {
     // Guard for the e2e mock's contract: a request mixing the built-in web
     // search with function tools gets the Gemini 400.
     let (base, provider) = mock_provider(|_| (200, cited_answer().to_string(), "application/json"));
-    let agent = crate::profiles::model_discovery::provider_agent(Duration::from_secs(10), Some(None), None).unwrap();
+    let agent = crate::profiles::model_discovery::provider_agent(Duration::from_secs(10), &crate::config::proxy_outbound::OutboundProxy::Direct).unwrap();
     let mut response = agent
         .post(responses_url(&base).unwrap().as_str())
         .send_json(json!({"model": "m", "input": "q", "tools": [{"type": "web_search"}, {"type": "function", "name": "shell", "parameters": {}}]}))

@@ -28,8 +28,10 @@ pub mod model_discovery;
 pub mod list_preferences;
 
 pub mod appearance;
+pub mod avatar;
 pub mod provider_category;
 
+pub mod claude_code;
 pub mod claude_usage;
 pub mod generic_switches;
 pub mod quota;

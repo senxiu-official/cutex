@@ -1520,8 +1520,9 @@ impl AgentManagementProvider {
                             unresolved_reservation_detail(blocking, spec),
                         ));
                     }
-                    // Every collider is a same-project Create that was
-                    // rejected by the pure preflight: release it.
+                    // Every collider is a same-project Create rejected by
+                    // the pure preflight, or a Replace stopped before its
+                    // successor existed: release it.
                     for stale in &colliding {
                         released_events.push(release_pre_effect_reservation(
                             &mut state,
@@ -3765,6 +3766,9 @@ fn pre_effect_preflight_reservation(
     state: &AgentManagementSnapshot,
     action: &AgentActionRecord,
 ) -> bool {
+    if action.operation == AgentOperationKind::Replace {
+        return pre_successor_replace_reservation(state, action);
+    }
     if action.operation != AgentOperationKind::Create
         || action.reserved_agent_name.is_none()
         || action.known_native_session_id.is_some()
@@ -3829,6 +3833,44 @@ fn recorded_failure<'a>(
     }
 }
 
+/// A Replace that stopped (owner action required) before its successor
+/// existed: it never got past closing its predecessor (r244: the
+/// predecessor check failed with `managed Agent observation mismatch: cwd`),
+/// so no native thread, durable session or ownership record of the reserved
+/// successor name can exist. Its reservation is released like a pre-effect
+/// Create; the predecessor stays an ordinary Agent (an active one still holds
+/// its name through the roster collision check).
+fn pre_successor_replace_reservation(
+    state: &AgentManagementSnapshot,
+    action: &AgentActionRecord,
+) -> bool {
+    if action.reserved_agent_name.is_none()
+        || action.phase != AgentActionPhase::OwnerActionRequired
+        || action.known_native_session_id.is_some()
+        || action.known_successor_cutex_session.is_some()
+        || action.native_bootstrap_retryable
+        || action.historical_runtime_occurrence_fence.is_some()
+        || state.bootstrap_intents.contains_key(&action.action_id)
+        || recorded_failure(state, action).is_none_or(|failure| failure.action_id != action.action_id)
+    {
+        return false;
+    }
+    let phases = state
+        .phase_events
+        .values()
+        .filter(|event| event.action_id == action.action_id)
+        .collect::<Vec<_>>();
+    !phases.is_empty()
+        && phases.iter().all(|event| {
+            matches!(
+                event.phase,
+                AgentActionPhase::Prepared
+                    | AgentActionPhase::PredecessorClosing
+                    | AgentActionPhase::OwnerActionRequired
+            )
+        })
+}
+
 /// A Create whose native bootstrap failed definitely before anything was
 /// spawned (see [`PRE_SPAWN_BOOTSTRAP_FAILURE_CODES`]): parked retryable in
 /// `native_bootstrap_pending` without SID or adoption, and only the
@@ -3890,8 +3932,13 @@ fn release_pre_effect_reservation(
         &stale.action_id,
         "reservation_released_pre_effect",
         &format!(
-            "released by {}: the create preflight rejected this action before any native effect ({original})",
-            released_by.as_str()
+            "released by {}: {} ({original})",
+            released_by.as_str(),
+            if stale.operation == AgentOperationKind::Replace {
+                "this replace stopped before creating its successor"
+            } else {
+                "the create preflight rejected this action before any native effect"
+            }
         ),
     );
     let target = state
@@ -4345,8 +4392,11 @@ fn validate_recovery_spec(
     observation: &AgentRuntimeObservation,
 ) -> Result<(), AgentManagementError> {
     let spec = &agent.spec;
-    let groups_match = observation.groups == spec.groups
-        || observation.groups == expected_runtime_groups(&spec.cwd, &spec.groups);
+    let groups_match = observed_groups_match(
+        agent,
+        observation,
+        &expected_runtime_groups(&spec.cwd, &spec.groups),
+    );
     if !observation.active {
         return Err(managed_observation_mismatch("runtime recovery", "active"));
     }
@@ -4372,8 +4422,7 @@ fn validate_managed_observation_groups(
     observation: &AgentRuntimeObservation,
     expected_groups: &[String],
 ) -> Result<(), AgentManagementError> {
-    let groups_match =
-        observation.groups == agent.spec.groups || observation.groups == expected_groups;
+    let groups_match = observed_groups_match(agent, observation, expected_groups);
     if let Some(field) = managed_spec_mismatch(agent, observation, groups_match) {
         return Err(managed_observation_mismatch(
             "managed Agent observation",
@@ -4410,8 +4459,7 @@ fn validate_ready_with_groups(
     }
     // Native observations retain desired explicit groups; legacy adapters may
     // include the deterministic cwd group. Both represent the same membership.
-    let groups_match =
-        observation.groups == agent.spec.groups || observation.groups == expected_groups;
+    let groups_match = observed_groups_match(agent, observation, expected_groups);
     if let Some(field) = managed_spec_mismatch(agent, observation, groups_match) {
         return Err(managed_observation_mismatch("Agent readiness", field));
     }
@@ -4448,6 +4496,23 @@ fn validate_ready_with_groups(
     Ok(())
 }
 
+/// The observed groups are the desired ones, or those plus the system-owned
+/// cwd group. That group is derived from the cwd text, so a runtime started
+/// on a Windows verbatim spelling of the spec cwd (`\\?\F:\x`, Claude
+/// records before r245) carries the group of that spelling: the same
+/// directory, accepted as well.
+fn observed_groups_match(
+    agent: &ManagedAgentRecord,
+    observation: &AgentRuntimeObservation,
+    expected_groups: &[String],
+) -> bool {
+    observation.groups == agent.spec.groups
+        || observation.groups == expected_groups
+        || (observation.cwd != agent.spec.cwd
+            && crate::session::metadata::same_session_cwd(&observation.cwd, &agent.spec.cwd)
+            && observation.groups == expected_runtime_groups(&observation.cwd, &agent.spec.groups))
+}
+
 fn managed_spec_mismatch(
     agent: &ManagedAgentRecord,
     observation: &AgentRuntimeObservation,
@@ -4460,7 +4525,9 @@ fn managed_spec_mismatch(
         Some("cutex_session_id")
     } else if observation.native_session_id != agent.native_session_id {
         Some("native_session_id")
-    } else if observation.cwd != spec.cwd {
+    } else if !crate::session::metadata::same_session_cwd(&observation.cwd, &spec.cwd) {
+        // A Windows verbatim spelling (`\\?\F:\x`) of the same directory is
+        // the same cwd (r244: Claude records stored canonicalize() output).
         Some("cwd")
     } else if observation.runtime_backend != spec.runtime_backend {
         Some("runtime_backend")
@@ -5059,7 +5126,7 @@ mod tests {
             let recovery = state.recovery;
             let agent = state.agents.get_mut(cutex_session_id).unwrap();
             if agent.native_session_id != native_session_id
-                || agent.cwd != spec.cwd
+                || !crate::session::metadata::same_session_cwd(&agent.cwd, &spec.cwd)
                 || agent.runtime_backend != spec.runtime_backend
                 || agent.model != spec.model
                 || agent.reasoning != spec.reasoning
@@ -5316,8 +5383,8 @@ mod tests {
 
     fn root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "cutex-agent-management-{label}-{}",
-            uuid::Uuid::new_v4()
+            "cutex-am-{label}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
         ))
     }
 
@@ -8538,6 +8605,133 @@ mod tests {
             &lifecycle,
         ));
         assert!(matches!(receipt.result, AgentManagementResult::Replaced { .. }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// On Windows a Claude member's durable cwd was the Windows
+    /// verbatim spelling `\\?\F:\cutex-test\r244` of its spec cwd
+    /// `F:\cutex-test\r244`; `member_runtime restart` failed with `runtime
+    /// recovery mismatch: cwd` and `member_replace` with `managed Agent
+    /// observation mismatch: cwd`.
+    #[test]
+    fn restart_and_replace_accept_a_verbatim_spelling_of_the_spec_cwd() {
+        let root = root("verbatim-cwd");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        let created = created_agent(&completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request("create", "worker", AgentStartMode::BootstrapOnly),
+            &lifecycle,
+        )));
+        let verbatim = format!(r"\\?\{}", created.spec.cwd);
+        {
+            // The durable record (configured with the spec groups) carries
+            // the verbatim cwd; the runtime adds the cwd group of that text.
+            let mut state = lifecycle.state.lock().unwrap();
+            let observed = state.agents.get_mut(&created.cutex_session_id).unwrap();
+            observed.cwd = verbatim.clone();
+            observed.groups = created.spec.groups.clone();
+        }
+        let restart = AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action("restart"),
+            project_id: Some(project()),
+            operation: AgentOperation::Restart {
+                cutex_session_id: created.cutex_session_id.clone(),
+            },
+        };
+        completed(provider.execute(&invocation("cutex.director"), &restart, &lifecycle));
+        let replace = AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action("replace"),
+            project_id: Some(project()),
+            operation: AgentOperation::Replace {
+                bootstrap_intent: None,
+                predecessor_cutex_session_id: created.cutex_session_id.clone(),
+                policy: AgentReplacePolicy::CloseBeforeCreate,
+                successor: spec("worker"),
+                start_mode: AgentStartMode::BootstrapOnly,
+                frozen_message: None,
+            },
+        };
+        let receipt = completed(provider.execute(&invocation("cutex.director"), &replace, &lifecycle));
+        assert!(matches!(receipt.result, AgentManagementResult::Replaced { .. }));
+        // A different directory is still a mismatch.
+        let mut other = ready_observation(&created);
+        other.cwd = format!(r"\\?\{}", test_agent_cwd("elsewhere"));
+        assert!(validate_ready(&created, &other)
+            .unwrap_err()
+            .to_string()
+            .contains("mismatch: cwd"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// r244: a `member_replace` stopped while checking its predecessor kept
+    /// the successor name reserved, so the next `agent_create` of that name
+    /// failed with `unresolved_agent_reservation` and the owner had no
+    /// allowlisted way to clear it. Nothing of the successor exists yet: a
+    /// new request for the name releases the reservation.
+    #[test]
+    fn replace_stopped_before_its_successor_releases_the_name() {
+        let root = root("replace-release");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        let predecessor = created_agent(&completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request("create-old", "worker", AgentStartMode::BootstrapOnly),
+            &lifecycle,
+        )));
+        // The predecessor no longer matches its ownership record.
+        lifecycle
+            .state
+            .lock()
+            .unwrap()
+            .agents
+            .get_mut(&predecessor.cutex_session_id)
+            .unwrap()
+            .model = "drifted-model".to_string();
+        let replace = AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action("replace-stuck"),
+            project_id: Some(project()),
+            operation: AgentOperation::Replace {
+                bootstrap_intent: None,
+                predecessor_cutex_session_id: predecessor.cutex_session_id.clone(),
+                policy: AgentReplacePolicy::CloseBeforeCreate,
+                successor: spec("worker-next"),
+                start_mode: AgentStartMode::BootstrapOnly,
+                frozen_message: None,
+            },
+        };
+        match provider.execute(&invocation("cutex.director"), &replace, &lifecycle).outcome {
+            AgentManagementOutcome::OwnerActionRequired { failure } => {
+                assert!(failure.detail.contains("mismatch: model"), "{}", failure.detail)
+            }
+            other => panic!("unexpected replace outcome: {other:?}"),
+        }
+        let stuck = provider.store().snapshot().unwrap().actions[&replace.action_id].clone();
+        assert_eq!(stuck.phase, AgentActionPhase::OwnerActionRequired);
+        assert_eq!(stuck.reserved_agent_name.as_deref(), Some("worker-next"));
+
+        completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request("create-next", "worker-next", AgentStartMode::BootstrapOnly),
+            &lifecycle,
+        ));
+        let released = provider.store().snapshot().unwrap().actions[&replace.action_id].clone();
+        assert_eq!(released.phase, AgentActionPhase::NoWrite);
+        assert!(matches!(
+            released.response.map(|response| response.outcome),
+            Some(AgentManagementOutcome::NoWrite { ref code, ref detail })
+                if code == "reservation_released_pre_effect"
+                    && detail.contains("before creating its successor")
+        ));
+        // The predecessor itself is untouched.
+        assert!(provider.store().snapshot().unwrap().agents[&predecessor.cutex_session_id]
+            .retired_at
+            .is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 

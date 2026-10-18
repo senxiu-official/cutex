@@ -96,9 +96,12 @@ impl NativeVersionRegistry {
         self.runtime_version(digest.as_str()).map(str::to_string)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn runtime_version_for_pid(&self, pid: u32) -> Option<String> {
+        #[cfg(target_os = "linux")]
         let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        #[cfg(target_os = "macos")]
+        let executable = crate::platform::macos_proc::exe(pid).ok()??;
         if let Some(record) = executable
             .to_str()
             .and_then(|path| self.runtime_paths.get(path))
@@ -276,7 +279,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn runtime_version_uses_exact_executable_bytes() {
         let root =
@@ -308,7 +311,7 @@ mod tests {
             registry.runtime_version_for_executable(&executable),
             Some("0.156.1-r35".into())
         );
-        let test_executable = std::fs::read_link("/proc/self/exe").unwrap();
+        let test_executable = crate::platform::process::process_executable(std::process::id()).unwrap();
         registry.runtime_paths.insert(
             test_executable.to_string_lossy().into_owned(),
             NativeVersionRecord {

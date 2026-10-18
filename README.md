@@ -6,10 +6,10 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.1.3**: new cute-codex native 0.160.0-r52.3 (Windows: Store PowerShell works under the sandbox
-without administrator rights), network access and extra writable folders changeable on a running
-session, agent browser tools in independent instances, usage fixes (0.1.0 "First Take" was the first
-public release). See [CHANGELOG.md](CHANGELOG.md).
+**0.1.4**: Claude agents grow up (launch permission modes, the claude-r19 runtime, context windows
+and effort levels, repin, skills import, subagent transcripts, file rewind, permission rules),
+Profile looks on the host, clearer approvals, proxy modes and a safer rollback
+(0.1.x is "First Take"; 0.1.0 was the first public release). See [CHANGELOG.md](CHANGELOG.md).
 
 > **Known gaps in 0.1.x** (being fixed; this note goes away when they are):
 > - **Phone push / pairing a phone**: there is no public phone app yet.
@@ -233,6 +233,8 @@ CUTEX_TEST_PRIVATE_HOME=~/cutex-test-home HOME=~/cutex-test-home cargo test --lo
 
 cutex then uses `~/cutex-test-home/.cutex`. Release builds refuse to run with `CUTEX_TEST_PRIVATE_HOME` set. Run a
 debug `cutex management serve` on its own port (`--port`) so it never meets an installed daemon.
+The same processes also refuse the default ports (24270, 24260, 24670, 24660, 24250): a test home
+without a bus port of its own gets a free one, kept in its `config.json`.
 
 The Claude adapter is a Python package with its own tests in `components/claude-runtime/`.
 

@@ -346,7 +346,6 @@ mod tests {
             enabled: true,
             url: Some("socks5h://127.0.0.1:7890".to_string()),
             no_proxy: Some("localhost".to_string()),
-            force_http_transport: true,
         };
         let patch = GlobalConfigPatch {
             docker_use_sudo: Some(true),
@@ -421,7 +420,6 @@ mod tests {
             enabled: true,
             url: Some("http://127.0.0.1:7890".to_string()),
             no_proxy: None,
-            force_http_transport: false,
         });
         let patch = GlobalConfigPatch {
             proxy: ConfigValueUpdate::Clear,
@@ -510,11 +508,15 @@ mod tests {
             Some(24251)
         );
         assert!(parse_desktop_notify_port("8080").is_err());
-        assert_eq!(
-            parse_agent_bus_port("24261").expect("Agent Bus port"),
-            Some(24261)
-        );
-        assert!(parse_agent_bus_port("59996").is_err());
+        // Default-instance rules (a test process otherwise uses instance rules).
+        crate::config::instance::with_default_ports_for_test(|| {
+            assert_eq!(
+                parse_agent_bus_port("24261").expect("Agent Bus port"),
+                Some(24261)
+            );
+            assert!(parse_agent_bus_port("59996").is_err());
+        });
+        assert!(parse_agent_bus_port("24260").is_err());
     }
 
     #[test]
@@ -554,7 +556,8 @@ mod tests {
             agent_bus_port: ConfigValueUpdate::Set(59996),
             ..GlobalConfigPatch::default()
         };
-        assert!(apply_global_config_patch(&mut unchanged, &invalid).is_err());
+        // 59996 is invalid under the default-instance rules only.
+        assert!(crate::config::instance::with_default_ports_for_test(|| apply_global_config_patch(&mut unchanged, &invalid)).is_err());
         assert!(!unchanged.docker_use_sudo);
         assert_eq!(unchanged.agent_bus_port, None);
     }

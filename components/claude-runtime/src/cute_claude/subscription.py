@@ -32,7 +32,10 @@ from .inputs import sdk_user_message
 from .model_config import ModelConfig
 from .model_observations import ModelObservations
 
-from .native_tools import EDIT_TOOLS, NativeTools, PlanState, exclusions, interrupted_item
+from .subagent_transcripts import SubagentTranscripts
+from .native_tools import EDIT_TOOLS, OWNER_DECLINED, OWNER_STOPPED, UNANSWERED_PERMISSION, NativeTools, PlanState, exclusions, external_mcp_tool, interrupted_item
+from . import permission_rules
+from .approvals import is_allowed
 
 SDK_TARGET = '0.2.166'
 SERVER_NAME = 'cutex'
@@ -45,6 +48,23 @@ def field(obj: Any, key: str, default: Any = None) -> Any:
 
 def message_type(obj: Any) -> str:
     return obj.get('type', '') if isinstance(obj, dict) else type(obj).__name__
+
+
+# Claude Code's own placeholder reply (model "<synthetic>"), written to the
+# native transcript after "[Request interrupted by user]" when a session is
+# resumed whose last message is the user's (r243 acceptance, claude-r17).
+# Not something Claude said: never an agent message.
+SYNTHETIC_PLACEHOLDERS = frozenset({'No response requested.'})
+
+
+def synthetic_placeholder(message: Any) -> bool:
+    if field(message, 'model') != '<synthetic>':
+        return False
+    blocks = field(message, 'content', None) or []
+    if not isinstance(blocks, list) or not blocks:
+        return False
+    return all(message_type(block) in {'TextBlock', 'text'}
+               and str(field(block, 'text', '')).strip() in SYNTHETIC_PLACEHOLDERS for block in blocks)
 
 
 def api_error_subject(account: ApiAccount) -> str:
@@ -61,6 +81,33 @@ def api_error_subject(account: ApiAccount) -> str:
 
 # Official CLI text (headless and interactive variants) when the OAuth refresh lock is held.
 REFRESH_LOCK_TEXT = re.compile(r'another Claude Code process is refreshing', re.I)
+
+# Waits before re-sending an input whose turn failed on the OAuth refresh lock
+# before Claude produced anything (the lock is released, or goes stale after
+# about 60 s). `CUTE_CLAUDE_REFRESH_RETRY_DELAYS` overrides them: comma-separated
+# seconds, empty = never retry.
+REFRESH_RETRY_DELAYS = (20.0, 45.0)
+
+
+def permission_mode(engine: Any, tid: str) -> str | None:
+    """The thread's Claude permission mode (not plan) for the prompt, if known."""
+    permissions = getattr(engine, 'permissions', None)
+    mode = getattr(permissions, 'mode', None)
+    try:
+        return mode(tid) if callable(mode) else None
+    except Exception:
+        return None
+
+
+def refresh_retry_delays() -> tuple[float, ...]:
+    raw = os.environ.get('CUTE_CLAUDE_REFRESH_RETRY_DELAYS')
+    if raw is None:
+        return REFRESH_RETRY_DELAYS
+    try:
+        delays = tuple(float(part) for part in raw.split(',') if part.strip())
+    except ValueError:
+        return REFRESH_RETRY_DELAYS
+    return tuple(d for d in delays if 0 <= d <= 600)[:5]
 
 
 class SdkResponseError(ProviderError):
@@ -197,6 +244,20 @@ class OfficialSdkDriver:
             rules = [rule(tool_name=name)]
         return [update(type='addRules', rules=rules, behavior='allow', destination='session')]
 
+    def project_rules(self, rules: list[str]):
+        """"Always allow in this project": the chosen rules take effect in the
+        live native session at once (destination session); cutex persists them
+        per workspace and passes them as flag settings on every start."""
+        update = getattr(self.sdk, 'PermissionUpdate', None)
+        rule = getattr(self.sdk, 'PermissionRuleValue', None)
+        if update is None or rule is None:
+            return None
+        values = []
+        for text in rules:
+            name, paren, rest = text.partition('(')
+            values.append(rule(tool_name=name, rule_content=rest[:-1] if paren else None))
+        return [update(type='addRules', rules=values, behavior='allow', destination='session')]
+
     async def make_client(self, engine, tid: str, session_id: str, resume: bool):
         # No pre-start `claude auth status` (subscription or API accounts). For a
         # subscription login that check is a second official CLI process on the
@@ -251,12 +312,15 @@ class OfficialSdkDriver:
                 if answers is not None:
                     return self.sdk.PermissionResultAllow(updated_input={**args, 'answers': answers})
                 return self.sdk.PermissionResultDeny(message='No user answer received. Do not invent an answer or repeat the question automatically.')
-            if not name.startswith('mcp__'):
+            # Claude Code's own tools and host-selected external MCP servers /
+            # connectors: the frontend decides, like any native permission request.
+            if not name.startswith('mcp__') or external_mcp_tool(engine.settings, name):
                 decision = await bridge.native.approve(name, args, context)
                 if decision['allow']:
-                    rules = self.session_rules(name, args) if decision['session'] else None
+                    rules = (self.project_rules(decision['rules']) if decision.get('rules')
+                             else self.session_rules(name, args) if decision['session'] else None)
                     return self.sdk.PermissionResultAllow(updated_input=args, updated_permissions=rules)
-                return self.sdk.PermissionResultDeny(message=decision.get('message') or 'The user did not approve this tool call.',
+                return self.sdk.PermissionResultDeny(message=decision.get('message') or UNANSWERED_PERMISSION,
                                                      interrupt=decision['interrupt'])
             grant = bridge.grants.get(args.get(CALL_FIELD, '')) if isinstance(args,dict) else None
             if not grant or not bridge.accepting or grant[0] != bridge.binding:
@@ -270,9 +334,15 @@ class OfficialSdkDriver:
                 approved = await task
             finally:
                 bridge.host_tasks.discard(task)
-            if approved:
-                return self.sdk.PermissionResultAllow(updated_input=args)
-            return self.sdk.PermissionResultDeny(message='Not approved; do not retry without new user instruction.')
+            if is_allowed(approved):
+                # "This session" keeps the tool allowed in the live native session
+                # (never cutex's own exec: each command is reviewed).
+                rules = (self.session_rules(name, args) if approved == 'acceptForSession'
+                         and call['name'] not in {'exec', 'Bash'} else None)
+                return self.sdk.PermissionResultAllow(updated_input=args, updated_permissions=rules)
+            return self.sdk.PermissionResultDeny(
+                message=(OWNER_STOPPED if approved == 'cancel' else OWNER_DECLINED if approved == 'decline'
+                         else UNANSWERED_PERMISSION), interrupt=approved == 'cancel')
         async def post_tool(data, tool_use_id, context):
             binding = bridge.binding
             call_id = tool_use_id or data.get('tool_use_id')
@@ -309,38 +379,49 @@ class OfficialSdkDriver:
                 engine.busy_delivery.offered(tid, binding[0])
             return {'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': notes}}
         thread = engine.store.thread(tid)
+        connectors = engine.settings.claude_ai_connectors and self.api_account is None
         options = self.sdk.ClaudeAgentOptions(
             cli_path=str(self.cli), cwd=str(engine.settings.workspace), model=thread['model'],
             effort=engine.thread_effort(tid), thinking=ModelConfig(engine.settings).thinking(),
-            tools={'type':'preset','preset':'claude_code'}, disallowed_tools=exclusions(engine.settings), allowed_tools=[f'mcp__{SERVER_NAME}__{name}' for name in ('read_file', 'list_directory') if name in engine.tools.tools],
+            tools={'type':'preset','preset':'claude_code'}, disallowed_tools=exclusions(engine.settings), allowed_tools=[f'mcp__{SERVER_NAME}__{tool.name}' for tool in engine.tools.tools.values() if tool.read_only],
             permission_mode=engine.permissions.effective_mode(tid),
             extra_args={'allow-dangerously-skip-permissions': None, 'replay-user-messages': None},
-            mcp_servers={SERVER_NAME: server}, strict_mcp_config=True,
+            # Host-selected external servers (cutex's MCP layers) next to the in-process cutex server.
+            # --strict-mcp-config keeps every other MCP source out; claude.ai connectors (subscription
+            # logins only) are fetched by Claude Code only without it.
+            mcp_servers={**engine.settings.mcp_servers, SERVER_NAME: server}, strict_mcp_config=not connectors,
             # The SDK warns that can_use_tool is never invoked under bypassPermissions; Claude Code still
             # calls it for AskUserQuestion and for its safety checks (NativeTools.approve declines those).
-            setting_sources=[], plugins=[], can_use_tool=permission_request,
+            # Settings sources are the profile's opt-in (project / user = the account home); plugins stay off.
+            setting_sources=list(engine.settings.setting_sources), plugins=[], can_use_tool=permission_request,
             hooks={'PreToolUse': [self.sdk.HookMatcher(hooks=[bridge.pre_tool])],
                    'PostToolUse': [self.sdk.HookMatcher(hooks=[post_tool])],
                    'PostToolUseFailure': [self.sdk.HookMatcher(hooks=[bridge.native.post])],
                    'SubagentStart': [self.sdk.HookMatcher(hooks=[bridge.subagent_start])],
                    'SubagentStop': [self.sdk.HookMatcher(hooks=[bridge.subagent_stop])]},
             # Claude Code's own prompt (environment, date, tool guidance) plus
-            # the host's text; settings / CLAUDE.md stay off (setting_sources).
+            # the host's text; CLAUDE.md / settings only with setting_sources.
             system_prompt={'type': 'preset', 'preset': 'claude_code',
-                           'append': engine.settings.preset_append(thread['instructions'])},
+                           'append': engine.settings.preset_append(thread['instructions'], permission_mode(engine, tid))},
             include_partial_messages=True, max_turns=None,
-            enable_file_checkpointing=engine.settings.file_checkpointing, forward_subagent_text=False,
+            enable_file_checkpointing=engine.settings.file_checkpointing,
+            # Subagent text and thinking reach subagent_transcripts (never the parent's reply).
+            forward_subagent_text=True,
             session_id=None if resume else session_id, resume=session_id if resume else None,
             continue_conversation=False,
             # API accounts: the key comes from the apiKeyHelper flag setting, never
             # the env, which Bash / hooks / MCP stdio servers inherit.
-            settings=json.dumps(self.api_account.cli_settings()) if self.api_account else None,
+            settings=engine.flag_settings(tid) if hasattr(engine, 'flag_settings') else (
+                json.dumps(self.api_account.cli_settings()) if self.api_account else None),
             env={**(self.api_account.environment() if self.api_account else {}),
                  'CLAUDE_CONFIG_DIR': str(self.config_dir), 'CLAUDE_CODE_MAX_RETRIES': '3' if self.api_account else '0',
                  'API_TIMEOUT_MS': str(int(engine.settings.api_timeout * 1000)),
                  # Cross-session messaging off (ListAgents / SendMessage / SendFile and the
                  # inbound peer socket); otherwise a server flag that defaults to on decides.
-                 'CLAUDE_CODE_HARBOR_KITE': '0'},
+                 'CLAUDE_CODE_HARBOR_KITE': '0',
+                 # Memory is cutex's (project memory in the append): Claude Code's own,
+                 # account-local auto memory stays off for every Claude agent.
+                 'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'},
             stderr=lambda line: None,  # Do not inherit raw CLI diagnostics on public stderr.
 
         )
@@ -393,6 +474,8 @@ class SdkToolBridge:
         self.host_tasks.difference_update(tasks)
 
     async def end_turn(self) -> None:
+        if self.binding is not None and getattr(self.engine, 'subagents', None) is not None:
+            await self.engine.subagents.turn_ended(self.tid, self.binding[0])
         self.revoke()
         if self.host_tasks:
             await self.cancel_tools()
@@ -459,6 +542,8 @@ class SdkToolBridge:
         if call_id in self.call_agents and self.call_agents[call_id] != agent_id:
             return self.denied('Native tool-call identity belongs to another agent')
         self.call_agents[call_id] = agent_id
+        if agent_id and getattr(self.engine, 'subagents', None) is not None:
+            await self.engine.subagents.child_tool(agent_id, call_id)
         if full_name in {'Agent', 'Task'}:
             arguments = data.get('tool_input', {})
             if not isinstance(arguments, dict):
@@ -479,8 +564,13 @@ class SdkToolBridge:
             self.native_questions[call_id] = (binding, deepcopy(args))
             return {}  # Native requires-user-interaction dispatches can_use_tool even in bypass.
 
-        if not full_name.startswith('mcp__'):
-            return await self.native.start(full_name, data.get('tool_input', {}), tool_use_id or data.get('tool_use_id'))
+        if not full_name.startswith('mcp__') or external_mcp_tool(self.engine.settings, full_name):
+            # Native tools and host-selected external MCP tools: observed, never run here.
+            decision = await self.native.start(full_name, data.get('tool_input', {}), tool_use_id or data.get('tool_use_id'))
+            if (full_name in {'Agent', 'Task'} and not agent_id and decision == {}
+                    and getattr(self.engine, 'subagents', None) is not None):
+                await self.engine.subagents.start(self.tid, self.sid, binding[0], call_id, data.get('tool_input', {}))
+            return decision
 
         prefix = f'mcp__{SERVER_NAME}__'
         name = full_name[len(prefix):] if full_name.startswith(prefix) else ''
@@ -620,12 +710,15 @@ class SubscriptionEngine(Engine):
         self.reset_launch_model = os.environ.get('CUTEX_CLAUDE_RESET_LAUNCH_MODEL') == '1'
         self.launch_models_applied: set[str] = set()
         self.model_observations = ModelObservations(store)
+        self.subagents = SubagentTranscripts(self)
         store.db.execute('''CREATE TABLE IF NOT EXISTS sdk_sessions(
             thread_id TEXT PRIMARY KEY REFERENCES threads(id), session_id TEXT NOT NULL UNIQUE,
             attempted INTEGER NOT NULL DEFAULT 0, last_status TEXT NOT NULL DEFAULT 'allocated')''')
         store.db.execute('''CREATE TABLE IF NOT EXISTS thread_efforts(
             thread_id TEXT PRIMARY KEY REFERENCES threads(id), effort TEXT)''')
         store.db.execute('CREATE TABLE IF NOT EXISTS thread_launch_models(thread_id TEXT PRIMARY KEY REFERENCES threads(id), model TEXT NOT NULL)')
+        # Claude Code fast mode per thread (a `fastMode` flag setting at connect).
+        store.db.execute('CREATE TABLE IF NOT EXISTS thread_fast_mode(thread_id TEXT PRIMARY KEY REFERENCES threads(id), enabled INTEGER NOT NULL)')
 
     def ensure_launch_thread(self, tid: str, model: str, cwd: str, instructions: str) -> bool:
         """Apply changed host launch defaults only while the native owner is offline.
@@ -652,24 +745,59 @@ class SubscriptionEngine(Engine):
         self.launch_models_applied.add(tid)
         return False
 
-    def save_model_effort(self, tid: str, model: str, effort) -> None:
+    def save_model_effort(self, tid: str, model: str, effort, fast: bool | None = None) -> None:
         with self.store.transaction():
             self.store.db.execute('INSERT OR IGNORE INTO thread_launch_models SELECT id,model FROM threads WHERE id=?', (tid,))
             self.store.db.execute('UPDATE threads SET model=? WHERE id=?', (model, tid))
             self.store.db.execute('INSERT OR REPLACE INTO thread_efforts VALUES(?,?)', (tid, effort))
+            if fast is not None:
+                self.store.db.execute('INSERT OR REPLACE INTO thread_fast_mode VALUES(?,?)', (tid, int(fast)))
+
+    def thread_fast(self, tid: str) -> bool:
+        row = self.store.db.execute('SELECT enabled FROM thread_fast_mode WHERE thread_id=?', (tid,)).fetchone()
+        return bool(row[0]) if row else False
+
+    def flag_settings(self, tid: str) -> str | None:
+        """`--settings` JSON for the SDK child: an API account's settings plus
+        fast mode (Claude Code requires the flag-settings opt-in in SDK mode)
+        plus cutex's persisted allow rules (``permissions.allow``) plus
+        ``disableAllHooks`` while the profile's command execution is off."""
+        settings = self.flag_settings_dict(tid)
+        return json.dumps(settings) if settings else None
+
+    def flag_settings_dict(self, tid: str, *, explicit_rules: bool = False) -> dict:
+        settings = dict(self.driver.api_account.cli_settings()) if getattr(self.driver, 'api_account', None) else {}
+        if self.thread_fast(tid):
+            settings['fastMode'] = True
+        if not self.settings.allow_exec:
+            # Exec off: no settings hooks (project / user / local settings, skill and agent
+            # frontmatter, plugins) and no statusLine run commands. Flag settings outrank those
+            # sources. The adapter's SDK callback hooks (`hooks=`, registered by `initialize`)
+            # still run: Claude Code (checked in 2.1.289) only drops configured hooks for it.
+            settings['disableAllHooks'] = True
+        return permission_rules.with_rules(settings, permission_rules.load(self.settings.state_dir), explicit=explicit_rules)
 
     def thread_effort(self, tid: str):
         row = self.store.db.execute('SELECT effort FROM thread_efforts WHERE thread_id=?', (tid,)).fetchone()
         return row[0] if row else self.settings.effort
 
-    async def set_model_effort(self, tid: str, model: str, effort) -> None:
-        if effort == self.thread_effort(tid):
+    async def set_model_effort(self, tid: str, model: str, effort, fast: bool | None = None) -> None:
+        if fast is not None and fast == self.thread_fast(tid):
+            fast = None
+        if effort == self.thread_effort(tid) and fast is None:
             await self.set_model(tid, model)
             return
         owner = self.driver.owners.get(tid) if getattr(self.driver, 'persistent', False) else None
-        if owner is None:
+        if owner is None or owner.task.done():
+            if effort == self.thread_effort(tid) and model == self.store.thread(tid)['model']:
+                # Fast mode alone, runtime offline: the next connect applies it.
+                self.save_model_effort(tid, model, effort, fast)
+                return
             raise RpcError(-32009, 'Start the Claude runtime before changing effort')
-        await owner.set_model_effort(model, effort)
+        if fast is None:
+            await owner.set_model_effort(model, effort)
+        else:
+            await owner.set_model_effort(model, effort, fast)
 
     async def start_runtime(self, tid: str) -> dict:
         self.store.thread(tid)
@@ -728,11 +856,30 @@ class SubscriptionEngine(Engine):
             raise RpcError(-32009, 'Start the Claude runtime before changing model')
         await owner.set_model(model)
 
+    async def _interrupt_before_close(self, tid: str) -> None:
+        """Stop or restart while a turn runs: interrupt it first, as cutex does
+        for a Codex runtime before stopping it, so the turn ends `interrupted`
+        with its open tools closed. Only a confirmed interrupt claims that: if
+        the native runtime does not drain it in time, Close ends the turn as
+        before (failed, outcome uncertain)."""
+        if tid not in self.driver.owners:
+            return
+        row = self.store.db.execute("SELECT id FROM turns WHERE thread_id=? AND reverted=0 AND state='inProgress'", (tid,)).fetchone()
+        if not row:
+            return
+        limit = getattr(self.driver, 'interrupt_timeout', 15) + getattr(self.driver, 'control_timeout', 10) + 1
+        try:
+            async with asyncio.timeout(limit):
+                await self.interrupt(tid, row[0])
+        except (Exception, TimeoutError):
+            pass  # Close below settles the turn either way.
+
     async def close_runtime(self, tid: str) -> dict:
         self.store.thread(tid)
         self.offline_threads.add(tid)
         if not getattr(self.driver, 'persistent', False):
             raise RpcError(-32601, 'This driver does not implement persistent runtime lifecycle')
+        await self._interrupt_before_close(tid)
         worker = self.workers.get(tid)
         # A worker not yet scheduled cannot own an SDK client. Cancelling that
         # waiter does not violate SDK task ownership.
@@ -769,7 +916,19 @@ class SubscriptionEngine(Engine):
         row = self.store.db.execute("SELECT id FROM turns WHERE thread_id=? AND reverted=0 AND state='inProgress'", (tid,)).fetchone()
         if not row or row[0] != turn_id:
             raise RpcError(-32009, 'turnId does not name the active turn')
-        if not await self.driver.interrupt(tid, turn_id):
+        # The owner stops this turn: its unread steers are dropped now, not at the
+        # terminal result. The client resends them (desktop interrupt & send), so
+        # neither a PostToolUse before the abort lands nor a turn that completes
+        # anyway (FIFO fallback) may deliver them a second time.
+        with self.store.transaction():
+            dropped = self.store.drop_unread_steers(tid)
+        try:
+            stopping = await self.driver.interrupt(tid, turn_id)
+        except BaseException:
+            with self.store.transaction():
+                self.store.restore_steers(tid, dropped)
+            raise
+        if not stopping:
             return await super().interrupt(tid, turn_id)
         worker = self.workers.get(tid)
         if worker: await asyncio.shield(worker)
@@ -778,6 +937,7 @@ class SubscriptionEngine(Engine):
         if not getattr(self.driver, 'persistent', False):
             return await super().close()
         self.closing = True
+        await asyncio.gather(*(self._interrupt_before_close(tid) for tid in list(self.driver.owners)))
         # No raw owner cancellation: let official disconnect flush and reap.
         await self.driver.close()
         tasks = list(self.workers.values())
@@ -927,6 +1087,8 @@ class SubscriptionEngine(Engine):
                 if field(message, 'error'):
                     terminal_failure = SdkResponseError(message, getattr(self.driver, 'api_account', None))
                     return
+                if synthetic_placeholder(message):
+                    return
                 await self.observe_model(tid, turn_id, message)
                 usage = field(message, 'usage')
                 if isinstance(usage, dict):
@@ -981,10 +1143,13 @@ class SubscriptionEngine(Engine):
                     reason = f"subtype={safe_reason(subtype)}, terminal={safe_reason(terminal)}"
                     terminal_failure = terminal_failure or f'Official runtime ended unsuccessfully ({reason}). You may submit a new instruction; the failed input is not automatically retried.'
                     return
-                if last_item and last_item['type'] == 'agentMessage':
+                if last_item and last_item['type'] == 'agentMessage' and last_item.get('phase') != 'final_answer':
+                    # Only the terminal result tells which text was the last one: it completed as
+                    # commentary; live subscribers (desktop, delegation answers, activity) get the
+                    # same item again as the final answer, like a reload of the saved snapshot.
                     last_item['phase'] = 'final_answer'
                     self.store.put_item(turn_id, last_item)
-                    # Saved snapshot is authoritative on reconnect; don't duplicate item/completed.
+                    await self.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': last_item})
                 await self.busy_delivery.acknowledge(tid, turn_id)
                 await self.emit(tid, 'claude/input/contextPersisted', {
                     'threadId': tid, 'turnId': turn_id, 'messageId': record['message_id']})
@@ -1010,9 +1175,34 @@ class SubscriptionEngine(Engine):
             # a leading "/" is literal; only thread/compact/start runs /compact.
             verbatim = payload['source']['kind'] != 'user' or (not compact and prompt.lstrip().startswith('/'))
             message = sdk_user_message(prompt, payload.get('attachments') or [], verbatim=verbatim)
-            await self.driver.run(engine=self, tid=tid, turn_id=turn_id,
-                session_id=session['session_id'], resume=bool(session['attempted']),
-                prompt=prompt, message=message, on_message=on_message)
+            delays, attempt = refresh_retry_delays(), 0
+            while True:
+                await self.driver.run(engine=self, tid=tid, turn_id=turn_id,
+                    session_id=session['session_id'], resume=bool(session['attempted']),
+                    prompt=prompt, message=message, on_message=on_message)
+                silent = last_item is None and not pending and not reasoning and not self.open_tools.get(turn_id)
+                if not (isinstance(terminal_failure, SdkResponseError) and terminal_failure.transient_refresh
+                        and silent and attempt < len(delays)):
+                    break
+                # The OAuth refresh lock was held (another Claude Code process on this
+                # login was refreshing an expired token). Claude produced nothing, so
+                # the same input is sent again in this turn once the lock is free. The
+                # native transcript keeps the failed copy of the message.
+                delay = delays[attempt]
+                attempt += 1
+                await self.emit(tid, 'error', {'threadId': tid, 'turnId': turn_id, 'willRetry': True, 'error': {
+                    'message': f'Claude is waiting for its login token refresh (another Claude Code process holds it); '
+                               f'retrying in {delay:g} s ({attempt}/{len(delays)}).',
+                    'codexErrorInfo': 'other', 'additionalDetails': None}}, durable=False)
+                await asyncio.sleep(delay)
+                terminal_failure, got_result = None, False
+                usage_calls.append({'kind': 'sdk-turn', 'outcome': 'requested', 'usage': None, 'retry': attempt})
+                self._usage(turn_id, usage_calls)
+            if attempt and isinstance(terminal_failure, SdkResponseError) and terminal_failure.transient_refresh:
+                terminal_failure.args = (
+                    f'Official Claude could not refresh its login token: another Claude Code process using this account '
+                    f'kept the refresh lock. The input was sent again {attempt} time(s) without success; send it again '
+                    f'later or check the login (cutex human claude account status).',)
             await self.metrics.refresh_context(tid)
             if terminal_failure:
                 raise terminal_failure if isinstance(terminal_failure, SdkResponseError) else ProviderError(terminal_failure)

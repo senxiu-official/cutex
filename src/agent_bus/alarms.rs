@@ -261,6 +261,44 @@ fn create(
 pub fn set(owner: &str, args: SetArgs) -> anyhow::Result<Value> {
     locked(&path()?, |d| Ok(json!(create(d, owner, args, Utc::now())?)))
 }
+/// A cutex system notice to one agent through the alarm scheduler (durable,
+/// delivered `after_turn` by the Agent Bus like any alarm, a few seconds from
+/// now). `owner` is a reserved non-session owner (e.g.
+/// [`APPROVAL_NOTICE_OWNER`]); `notice_id` makes a repeat idempotent. The
+/// store lock is contended briefly by the scheduler, so this retries a few
+/// times.
+pub fn set_system_notice(owner: &str, notice_id: &str, to: &str, message: &str) -> anyhow::Result<Alarm> {
+    set_system_notice_at(&path()?, owner, notice_id, to, message, Utc::now())
+}
+
+/// Owner of the owner-approval decision notices (cutex `approval-decision-notice`).
+pub const APPROVAL_NOTICE_OWNER: &str = "cutex.approvals";
+
+fn set_system_notice_at(
+    path: &Path,
+    owner: &str,
+    notice_id: &str,
+    to: &str,
+    message: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Alarm> {
+    ensure!(!owner.trim().is_empty() && !crate::agent_bus::routing::is_full_durable_cutex_session_id(owner), "system notice owner must be a reserved name");
+    let at = (now + chrono::Duration::seconds(1)).to_rfc3339();
+    let mut last = None;
+    for attempt in 0..20 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let args = SetArgs { alarm_id: notice_id.into(), to: to.into(), message: message.into(), at: Some(at.clone()), delay_seconds: None };
+        match locked(path, |data| create(data, owner, args, now)) {
+            Ok(alarm) => return Ok(alarm),
+            Err(error) if format!("{error:#}").contains("Alarm store busy") => last = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("alarm store busy")))
+}
+
 pub fn list(owner: Option<&str>) -> anyhow::Result<Value> {
     let mut rows: Vec<_> = read_all_at(&path()?)?
         .into_iter()
@@ -415,6 +453,22 @@ mod tests {
             delay_seconds: Some(60),
         }
     }
+    #[test]
+    fn system_notice_is_scheduled_once_for_a_reserved_owner() {
+        let dir = std::env::temp_dir().join(format!("alarm-notice-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("alarms.json");
+        let now = Utc::now();
+        let to = "cutex.00000000-0000-0000-0000-000000000001";
+        let first = set_system_notice_at(&path, APPROVAL_NOTICE_OWNER, "apr-1:approved", to, "retry now", now).unwrap();
+        assert_eq!((first.owner.as_str(), first.state.as_str()), (APPROVAL_NOTICE_OWNER, "scheduled"));
+        assert!(first.next_attempt <= now.timestamp() + 1);
+        let again = set_system_notice_at(&path, APPROVAL_NOTICE_OWNER, "apr-1:approved", to, "retry now", now).unwrap();
+        assert_eq!(again.message_id, first.message_id, "idempotent");
+        assert_eq!(read_all_at(&path).unwrap().len(), 1);
+        assert!(set_system_notice_at(&path, to, "x", to, "m", now).is_err(), "a session id is not a system owner");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn queued_alarm_authentication_is_exact_and_fail_closed() {
         let dir = std::env::temp_dir().join(format!("alarm-auth-{}", uuid::Uuid::new_v4()));

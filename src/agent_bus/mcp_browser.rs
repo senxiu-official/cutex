@@ -410,6 +410,7 @@ pub fn invoke(
             "Browser requires per-agent credential"
         );
         let port = endpoint_port()?;
+        crate::config::instance::ensure_port_allowed(port)?;
         let thread = crate::session::identity::normalize_codex_session_id(&fence.thread_id)?;
         let body = serde_json::to_vec(&json!({"requestId":request,"tool":tool,"arguments":args}))?;
         let deadline = Instant::now() + Duration::from_secs(30);

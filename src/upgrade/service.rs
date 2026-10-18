@@ -361,14 +361,24 @@ pub fn install(options: &InstallOptions, exec: &dyn Exec) -> anyhow::Result<Vec<
     }
     let linux = cfg!(target_os = "linux");
     let windows = cfg!(windows);
-    ensure!(linux || windows, "cutex service install supports Linux and Windows");
+    let macos = cfg!(target_os = "macos");
+    ensure!(linux || windows || macos, "cutex service install supports Linux, macOS and Windows");
     let names = &options.names;
     let (bus_name, management_name, task_name) = (&names.bus_unit, &names.management_unit, &names.task_name);
     let default_units = options.unit_dir.is_none();
     let unit_dir = match &options.unit_dir {
         Some(dir) => dir.clone(),
+        None if macos => super::launchd::default_agents_dir().context("no home directory for launchd agents")?,
         None => default_unit_dir().context("no home directory for systemd user units")?,
     };
+    // macOS: launchd agents named after the units (`super::launchd`).
+    let (bus_label, management_label) =
+        (super::launchd::label_for_unit(bus_name), super::launchd::label_for_unit(management_name));
+    let (bus_plist, management_plist) = (
+        unit_dir.join(super::launchd::plist_file_name(&bus_label)),
+        unit_dir.join(super::launchd::plist_file_name(&management_label)),
+    );
+    let uid = super::launchd::current_uid();
     if linux {
         for unit in [bus_name, management_name] {
             let path = unit_dir.join(unit);
@@ -381,6 +391,19 @@ pub fn install(options: &InstallOptions, exec: &dyn Exec) -> anyhow::Result<Vec<
         if default_units && !options.no_start {
             actions.push("systemctl --user daemon-reload".into());
             actions.push(format!("systemctl --user enable --now {bus_name} {management_name}"));
+        }
+    }
+    if macos {
+        for path in [&bus_plist, &management_plist] {
+            if super::launchd::existing_foreign(path) && !options.force {
+                bail!("{} exists and was not written by `cutex service install`; refusing (use --force to replace it)", path.display());
+            }
+        }
+        actions.push(format!("point {} at releases/{}", layout.current_link().display(), options.release));
+        actions.push(format!("write {} and {}", bus_plist.display(), management_plist.display()));
+        if default_units && !options.no_start {
+            actions.push(format!("launchctl bootout {}/{management_label} and {}/{bus_label} (if loaded)", super::launchd::domain(uid), super::launchd::domain(uid)));
+            actions.push(format!("launchctl bootstrap {} {} {}", super::launchd::domain(uid), bus_plist.display(), management_plist.display()));
         }
     }
     if windows {
@@ -433,6 +456,11 @@ pub fn install(options: &InstallOptions, exec: &dyn Exec) -> anyhow::Result<Vec<
             management_unit_with(&options.base, bus_name, home.as_deref()).as_bytes(),
         )?;
     }
+    if macos {
+        #[cfg(unix)]
+        super::layout::point_current(&layout, &options.release)?;
+        super::launchd::write_agents(&unit_dir, &options.base, names, instance_home().as_deref(), options.force)?;
+    }
     if windows {
         super::layout::copy_file_atomic(&release_dir.join(CUTEX_EXE), &layout.bin_dir().join(CUTEX_EXE))?;
         super::layout::copy_file_atomic(&release_dir.join(FACADE_EXE), &layout.bin_dir().join(FACADE_EXE))?;
@@ -440,16 +468,23 @@ pub fn install(options: &InstallOptions, exec: &dyn Exec) -> anyhow::Result<Vec<
     let record = InstallRecord {
         schema: INSTALL_SCHEMA.into(),
         os: std::env::consts::OS.into(),
-        service_manager: if linux { super::service_manager::SYSTEMD } else { super::service_manager::SUPERVISOR }.into(),
+        service_manager: if linux {
+            super::service_manager::SYSTEMD
+        } else if macos {
+            super::service_manager::LAUNCHD
+        } else {
+            super::service_manager::SUPERVISOR
+        }
+        .into(),
         channel: channel.into(),
         created_at: previous.as_ref().map(|p| p.created_at.clone()).unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
         active_release: options.release.clone(),
         previous_release: previous.as_ref().map(|p| p.active_release.clone()).filter(|r| r != &options.release),
-        unit_dir: linux.then(|| unit_dir.display().to_string()),
+        unit_dir: (linux || macos).then(|| unit_dir.display().to_string()),
         task_name: windows.then(|| task_name.clone()),
         extra: {
             let mut extra = previous.map(|p| p.extra).unwrap_or_default();
-            if linux {
+            if linux || macos {
                 extra.insert("busUnit".into(), json!(bus_name));
                 extra.insert("managementUnit".into(), json!(management_name));
             }
@@ -460,6 +495,11 @@ pub fn install(options: &InstallOptions, exec: &dyn Exec) -> anyhow::Result<Vec<
     if linux && default_units && !options.no_start {
         exec.run("systemctl", &args(&["--user", "daemon-reload"]))?;
         exec.run("systemctl", &args(&["--user", "enable", "--now", bus_name, management_name]))?;
+    }
+    if macos && default_units && !options.no_start {
+        let control = super::launchd::LaunchdControl { exec, names: names.clone(), agents_dir: unit_dir.clone(), uid };
+        control.stop_all()?;
+        control.start_all()?;
     }
     if windows {
         let xml = layout.supervisor_dir().join("cutex-supervisor.xml");
@@ -521,6 +561,36 @@ pub fn uninstall(layout: &Layout, dry_run: bool, exec: &dyn Exec) -> anyhow::Res
                 exec.run("systemctl", &args(&["--user", "daemon-reload"]))?;
             }
         }
+    } else if record.os == "macos" {
+        let agents_dir = record.unit_dir.as_ref().map(PathBuf::from).context("install record lacks unit_dir")?;
+        let default = super::launchd::default_agents_dir().is_some_and(|d| d == agents_dir);
+        let uid = super::launchd::current_uid();
+        let plists: Vec<PathBuf> = [management_name, bus_name]
+            .iter()
+            .map(|unit| agents_dir.join(super::launchd::plist_file_name(&super::launchd::label_for_unit(unit))))
+            .collect();
+        if default {
+            actions.push(format!(
+                "launchctl bootout {0}/{1} and {0}/{2}",
+                super::launchd::domain(uid),
+                super::launchd::label_for_unit(management_name),
+                super::launchd::label_for_unit(bus_name)
+            ));
+        }
+        for path in &plists {
+            if path.exists() {
+                ensure!(!super::launchd::existing_foreign(path), "{} was not written by `cutex service install`; leaving it", path.display());
+                actions.push(format!("remove {}", path.display()));
+            }
+        }
+        if !dry_run {
+            if default {
+                super::launchd::LaunchdControl { exec, names: names.clone(), agents_dir: agents_dir.clone(), uid }.stop_all()?;
+            }
+            for path in &plists {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     } else {
         actions.push("ask the supervisor to stop the services and exit".into());
         actions.push(format!("schtasks /Delete /TN {task_name} /F"));
@@ -580,6 +650,19 @@ pub fn status(layout: &Layout, exec: &dyn Exec) -> Value {
             units.insert(unit.clone(), Value::Object(fields));
         }
         value["units"] = Value::Object(units);
+    } else if record.service_manager == super::service_manager::LAUNCHD {
+        let names = ServiceNames::of(&record);
+        let uid = super::launchd::current_uid();
+        let mut agents = serde_json::Map::new();
+        for unit in [&names.bus_unit, &names.management_unit] {
+            let label = super::launchd::label_for_unit(unit);
+            let fields = match exec.run("launchctl", &super::launchd::print_args(uid, &label)) {
+                Ok(text) => super::launchd::parse_print(&text),
+                Err(_) => serde_json::Map::from_iter([("state".to_string(), json!("not loaded"))]),
+            };
+            agents.insert(label, Value::Object(fields));
+        }
+        value["launchdAgents"] = Value::Object(agents);
     } else {
         value["supervisor"] = json!({
             "running": super::supervisor::running(layout),
@@ -862,5 +945,104 @@ mod tests {
             ]
         );
         assert_eq!(linger_hint(&exec).is_some(), std::env::var("USER").is_ok());
+    }
+}
+
+/// macOS (launchd). With `--unit-dir` nothing is bootstrapped and launchctl
+/// is never called; the default-dir plan is checked as a dry run only.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::fake::FakeExec;
+    use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cutex-service-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn build_dir() -> PathBuf {
+        let dir = temp("build");
+        std::fs::write(dir.join(CUTEX_EXE), b"#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join(FACADE_EXE), b"facade").unwrap();
+        dir
+    }
+
+    fn options(base: &Path, unit_dir: Option<PathBuf>, source: &Path) -> InstallOptions {
+        InstallOptions {
+            base: base.to_path_buf(),
+            unit_dir,
+            channel: "release".into(),
+            no_start: false,
+            dry_run: false,
+            force: false,
+            source_dir: source.to_path_buf(),
+            release: "r240".into(),
+            names: ServiceNames::default(),
+        }
+    }
+
+    #[test]
+    fn install_into_a_temp_agents_dir_writes_plists_and_never_calls_launchctl() {
+        let base = temp("base");
+        let agents = temp("agents");
+        let source = build_dir();
+        let exec = FakeExec::default();
+        let dry = install(&InstallOptions { dry_run: true, ..options(&base, Some(agents.clone()), &source) }, &exec).unwrap();
+        assert!(dry.iter().any(|a| a.contains("write") && a.contains("dev.cutex.agent-bus.plist")), "{dry:?}");
+        assert!(!dry.iter().any(|a| a.contains("launchctl")));
+        assert!(!Layout::at(&base).is_managed());
+        install(&options(&base, Some(agents.clone()), &source), &exec).unwrap();
+        assert!(exec.calls.lock().unwrap().is_empty(), "{:?}", exec.calls.lock().unwrap());
+        let layout = Layout::at(&base);
+        let record = layout.read_install().unwrap();
+        assert_eq!(record.service_manager, "launchd");
+        assert_eq!(record.os, "macos");
+        assert_eq!(record.unit_dir.as_deref(), Some(agents.display().to_string().as_str()));
+        assert_eq!(layout.active_release().unwrap(), "r240");
+        let plist = std::fs::read_to_string(agents.join("dev.cutex.management-api.plist")).unwrap();
+        assert!(plist.contains(&format!("<string>{}/current/cutex</string>", base.display())));
+        assert!(agents.join("dev.cutex.agent-bus.plist").is_file());
+        // Status asks launchctl print (fake).
+        let status = status(&layout, &exec);
+        assert!(status["launchdAgents"]["dev.cutex.agent-bus"].is_object(), "{status}");
+        // Uninstall of a non-default agents dir removes only our plists, no bootout.
+        exec.calls.lock().unwrap().clear();
+        uninstall(&layout, false, &exec).unwrap();
+        assert!(exec.calls.lock().unwrap().is_empty());
+        assert!(!agents.join("dev.cutex.agent-bus.plist").exists());
+        assert!(!layout.is_managed());
+        for dir in [base, agents, source] {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn default_agents_dir_plan_bootstraps_in_the_gui_domain() {
+        let base = temp("base");
+        let source = build_dir();
+        let exec = FakeExec::default();
+        let plan = install(&InstallOptions { dry_run: true, ..options(&base, None, &source) }, &exec).unwrap();
+        let uid = unsafe { libc::getuid() };
+        assert!(plan.iter().any(|a| a.starts_with(&format!("launchctl bootstrap gui/{uid} ")) && a.contains("Library/LaunchAgents/dev.cutex.agent-bus.plist")), "{plan:?}");
+        assert!(exec.calls.lock().unwrap().is_empty());
+        assert!(!Layout::at(&base).is_managed());
+        for dir in [base, source] {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn install_refuses_foreign_plists() {
+        let base = temp("base");
+        let agents = temp("agents");
+        let source = build_dir();
+        std::fs::write(agents.join("dev.cutex.management-api.plist"), "<?xml version=\"1.0\"?>\n<plist version=\"1.0\"><dict/></plist>\n").unwrap();
+        let error = install(&options(&base, Some(agents.clone()), &source), &FakeExec::default()).unwrap_err();
+        assert!(error.to_string().contains("not written by"), "{error}");
+        assert!(!Layout::at(&base).is_managed());
+        for dir in [base, agents, source] {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

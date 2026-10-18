@@ -147,7 +147,7 @@ pub struct CutexPart {
     /// Lowest release that may upgrade straight to this one.
     #[serde(default)]
     pub upgrade_floor: Option<String>,
-    /// Platform key (`linux-x64`, `windows-x64`) -> archive with
+    /// Platform key (`linux-x64`, `windows-x64`, `darwin-arm64`) -> archive with
     /// `cutex[.exe]` and `cutex-mcp[.exe]` at its root.
     pub artifacts: BTreeMap<String, Artifact>,
 }
@@ -255,14 +255,24 @@ pub fn is_sha256(text: &str) -> bool {
     text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// `linux-x64`, `windows-x64`, `linux-arm64`, … for this binary.
+/// `linux-x64`, `windows-x64`, `darwin-arm64`, `linux-arm64`, … for this
+/// binary. macOS is `darwin` (the release artifact names of cutex and
+/// cute-codex), not Rust's `macos`.
 pub fn platform_key() -> String {
-    let arch = match std::env::consts::ARCH {
+    platform_key_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn platform_key_for(os: &str, arch: &str) -> String {
+    let arch = match arch {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         other => other,
     };
-    format!("{}-{arch}", std::env::consts::OS)
+    let os = match os {
+        "macos" => "darwin",
+        other => other,
+    };
+    format!("{os}-{arch}")
 }
 
 impl ReleaseManifest {
@@ -514,6 +524,18 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    #[test]
+    fn platform_keys_name_macos_darwin() {
+        assert_eq!(platform_key_for("linux", "x86_64"), "linux-x64");
+        assert_eq!(platform_key_for("windows", "x86_64"), "windows-x64");
+        assert_eq!(platform_key_for("macos", "aarch64"), "darwin-arm64");
+        assert_eq!(platform_key_for("macos", "x86_64"), "darwin-x64");
+        assert_eq!(platform_key_for("linux", "aarch64"), "linux-arm64");
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(platform_key(), "darwin-arm64");
+        }
+    }
 
     #[test]
     fn release_ordering_is_numeric() {

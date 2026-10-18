@@ -33,6 +33,7 @@ fn source(root: &Path) -> CutexSessionRecord {
         allow_exec: false, write_explicit: false, exec_explicit: false,
         native_session_id: Some(uuid::Uuid::new_v4().to_string()),
         connection_id: Some("source-connection".into()),
+        initial_permission_mode: None,
     });
     record
 }
@@ -92,13 +93,31 @@ fn managed_skill_catalog_is_project_and_account_scoped() {
         std::fs::create_dir_all(root.join(child)).unwrap();
     }
     let record = source(&root);
-    let roots = managed_skill_roots(&record).unwrap();
+    let roots = managed_skill_roots_with(&record, None).unwrap();
     assert_eq!(
         roots,
         [".agents/skills", ".claude/skills", "account/cutex-skills"]
             .map(|p| PathBuf::from(crate::agent_management::strip_verbatim_prefix(
                 root.join(p).canonicalize().unwrap().to_str().unwrap())))
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn user_level_skill_root_follows_the_account_catalog() {
+    let root = std::env::temp_dir().join(format!("claude-skills-user-{}", uuid::Uuid::new_v4()));
+    for child in [".agents/skills", "account/cutex-skills", "user-skills"] {
+        std::fs::create_dir_all(root.join(child)).unwrap();
+    }
+    let record = source(&root);
+    let public = |p: &str| PathBuf::from(crate::agent_management::strip_verbatim_prefix(
+        root.join(p).canonicalize().unwrap().to_str().unwrap()));
+    let roots = managed_skill_roots_with(&record, Some(&root.join("user-skills"))).unwrap();
+    assert_eq!(roots, [".agents/skills", "account/cutex-skills", "user-skills"].map(public));
+    // Missing user directory: skipped, not an error.
+    let roots = managed_skill_roots_with(&record, Some(&root.join("missing"))).unwrap();
+    assert_eq!(roots, [".agents/skills", "account/cutex-skills"].map(public));
+    assert!(user_skills_root().unwrap().ends_with(USER_SKILLS_DIR));
     std::fs::remove_dir_all(root).unwrap();
 }
 

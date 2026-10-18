@@ -46,6 +46,7 @@ fn restart_report(runtime: &Value) -> (bool, Vec<Value>) {
 pub(super) fn revert(
     record: &CutexSessionRecord,
     before: &str,
+    rewind_files: bool,
 ) -> Result<Value, UserInputExecutionError> {
     let run = || -> anyhow::Result<Value> {
         let id = &record.cutex_session_id;
@@ -56,7 +57,7 @@ pub(super) fn revert(
         let result = cutex::runtime::claude::structure::request(
             id,
             "claude/thread/revert",
-            json!({"beforeTurnId": before}),
+            revert_params(before, rewind_files),
         )?;
         drop(guard);
         refresh_observer(record, &result["runtime"])?;
@@ -69,6 +70,17 @@ pub(super) fn revert(
         Ok(revert_response(record, before, generation, result))
     };
     run().map_err(|e| failure("history_revert_failed", e))
+}
+
+/// `claude/thread/revert` params: `rewindFiles` (the adapter restores the
+/// files from Claude Code's checkpoint of the first removed turn) is sent only
+/// when requested, so adapters before claude-r8's file rewind never see it.
+fn revert_params(before: &str, rewind_files: bool) -> Value {
+    if rewind_files {
+        json!({"beforeTurnId": before, "rewindFiles": true})
+    } else {
+        json!({"beforeTurnId": before})
+    }
 }
 
 /// `cutex/session/history/revert` result (`sessionHistoryRevertResult`,
@@ -199,6 +211,12 @@ mod tests {
     }
 
     #[test]
+    fn revert_params_carry_rewind_files_only_when_requested() {
+        assert_eq!(revert_params("turn-2", false), json!({"beforeTurnId": "turn-2"}));
+        assert_eq!(revert_params("turn-2", true), json!({"beforeTurnId": "turn-2", "rewindFiles": true}));
+    }
+
+    #[test]
     fn committed_history_with_failed_restart_returns_a_warning() {
         let (restarted, warnings) = restart_report(&json!({"state": "failed", "restartError": "ProviderError"}));
         assert!(!restarted);
@@ -232,6 +250,7 @@ mod tests {
             allow_exec: false, write_explicit: false, exec_explicit: false,
             native_session_id: Some("018a0000-0000-7000-8000-0000000000aa".into()),
             connection_id: Some("c1".into()),
+            initial_permission_mode: None,
         });
         record
     }

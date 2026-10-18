@@ -44,9 +44,10 @@ pub type ManagementUserInputQueueFlusher = fn(&str, usize, bool) -> anyhow::Resu
 /// (None: no turn was running). Interrupts and waits for the turn to stop.
 pub type ManagementTurnInterruptHandler =
     fn(&str, &str) -> Result<Option<String>, UserInputExecutionError>;
-/// `cutex/session/history/revert` backend: (cutexSessionId, beforeTurnId) -> result.
+/// `cutex/session/history/revert` backend: (cutexSessionId, beforeTurnId,
+/// rewindFiles) -> result.
 pub type ManagementHistoryRevertHandler =
-    fn(&str, &str) -> Result<serde_json::Value, UserInputExecutionError>;
+    fn(&str, &str, bool) -> Result<serde_json::Value, UserInputExecutionError>;
 /// `cutex/session/delete` backend (also the delete-empty step of
 /// `cutex/session/retire`): (cutexSessionId, request) -> delete receipt.
 pub type ManagementSessionDeleteHandler = fn(

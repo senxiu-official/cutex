@@ -28,6 +28,7 @@ pub struct RealHost {
     token: String,
     service_manager: String,
     names: ServiceNames,
+    unit_dir: Option<PathBuf>,
     cancel_marker: PathBuf,
 }
 
@@ -45,6 +46,7 @@ impl RealHost {
             base_url: crate::management::service::management_base_url(port),
             token,
             names: ServiceNames::of(&record),
+            unit_dir: record.unit_dir.as_ref().map(PathBuf::from),
             service_manager: record.service_manager,
             cancel_marker,
         })
@@ -70,6 +72,13 @@ impl RealHost {
     fn control(&self) -> Box<dyn ServiceControl + '_> {
         if self.service_manager == super::service_manager::SUPERVISOR {
             Box::new(SupervisorControl { layout: &self.layout, timeout: SERVICE_TIMEOUT, task_name: self.names.task_name.clone() })
+        } else if self.service_manager == super::service_manager::LAUNCHD {
+            Box::new(super::launchd::LaunchdControl {
+                exec: &RealExec,
+                names: self.names.clone(),
+                agents_dir: self.unit_dir.clone().or_else(super::launchd::default_agents_dir).unwrap_or_default(),
+                uid: super::launchd::current_uid(),
+            })
         } else {
             Box::new(SystemdControl { exec: &RealExec, names: self.names.clone() })
         }
@@ -280,6 +289,10 @@ impl Host for RealHost {
 
     fn move_aside(&self, store: &str, displaced: &Path) -> anyhow::Result<bool> {
         super::backup::move_aside(&self.home, store, displaced)
+    }
+
+    fn prepare_older_stores(&self, displaced: &Path) -> anyhow::Result<Vec<String>> {
+        super::older_stores::prepare(&self.home, displaced)
     }
 
     fn rollback_prep(&self, migrations: &[Migration]) -> anyhow::Result<Vec<String>> {

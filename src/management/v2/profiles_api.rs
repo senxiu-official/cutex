@@ -6,6 +6,26 @@
 //! `{profile}` is a profile ID or exact name (percent-encoded). Responses are
 //! camelCase and secret-free; `apiKey` is write-only.
 //!
+//! Profile looks (capability `profile-avatar`, `crate::profiles::avatar`):
+//!
+//! - `GET    /v2/profiles/{profile}/avatar` → the picture (ETag,
+//!   `If-None-Match` → 304; 404 `avatar_not_found`)
+//! - `PUT    /v2/profiles/{profile}/avatar` `{contentType, data}` (base64 of
+//!   a square PNG / JPEG / WebP ≤ 48 KiB, 16..=512 px) → `{contractVersion,
+//!   profileId, avatarEtag}`; 400 `invalid_avatar`, 413 `avatar_too_large`
+//! - `DELETE /v2/profiles/{profile}/avatar` → the same with `avatarEtag: null`
+//! - `GET|PUT|DELETE /v2/profiles/{profile}/intro-portrait`: the same for the
+//!   intro portrait (≤ 2 MiB, any aspect, each side ≤ 1024 px; result field
+//!   `introPortraitEtag`)
+//! - items (list / detail / write results) carry `avatarEtag` and
+//!   `introPortraitEtag` (null = none); `appearance` carries `avatarThemes`
+//!   (theme ids or null = default) and `introGreeting` (string or null),
+//!   both PATCHable (null clears; `avatarThemes` must be a non-empty list of
+//!   unique known ids, `detail.avatarThemeOptions`).
+//!
+//! Images are keyed by the profile id (a rename keeps them) and removed with
+//! the profile.
+//!
 //! Create / duplicate / delete / rename go through
 //! `crate::profiles::lifecycle` (the CLI's profile layout).
 
@@ -18,6 +38,7 @@ use crate::config::store::load_codez_config;
 use crate::http::server::write_json_response;
 use crate::http::server::SimpleHttpRequest;
 use crate::profiles::appearance::AgentTurnQuestions;
+use crate::profiles::avatar::{self as profile_avatar, Kind as ImageKind};
 use crate::profiles::codex_profile::{CodexProfileConfigPatch, MODEL_REASONING_SUMMARY_VALUES, TOOL_SCHEMA_COMPAT_VALUES, WEB_SEARCH_VALUES};
 use crate::profiles::lifecycle::{self, LifecycleError, NewProfile, NewProfileKind};
 use crate::profiles::settings_api::{self, ApiKey, ProfileApiPatch, MAX_API_KEY_BYTES};
@@ -53,6 +74,17 @@ pub fn parse_export_path(path: &str) -> Option<String> {
     decode_profile_segment(path.strip_prefix("/v2/profiles/")?.strip_suffix("/export")?)
 }
 
+/// `{profile}` and the image of `/v2/profiles/{profile}/avatar` and
+/// `/v2/profiles/{profile}/intro-portrait` (`profile-avatar`).
+pub fn parse_image_path(path: &str) -> Option<(String, ImageKind)> {
+    let rest = path.strip_prefix("/v2/profiles/")?;
+    if let Some(profile) = rest.strip_suffix("/avatar") {
+        return decode_profile_segment(profile).map(|profile| (profile, ImageKind::Avatar));
+    }
+    let profile = rest.strip_suffix("/intro-portrait")?;
+    decode_profile_segment(profile).map(|profile| (profile, ImageKind::IntroPortrait))
+}
+
 /// `POST /v2/profiles/import` (`profile-transfer`). The same path with
 /// another method still addresses a profile named `import`.
 pub const IMPORT_PATH: &str = "/v2/profiles/import";
@@ -63,12 +95,28 @@ pub fn is_profiles_path(path: &str) -> bool {
         || parse_item_path(path).is_some()
         || parse_duplicate_path(path).is_some()
         || parse_export_path(path).is_some()
+        || parse_image_path(path).is_some()
+}
+
+/// `avatarEtag` / `introPortraitEtag` of a profile item (profile-avatar).
+fn with_images(mut item: Value, profile_id: &str, images: &profile_avatar::State) -> Value {
+    item["avatarEtag"] = json!(images.etag(ImageKind::Avatar, profile_id));
+    item["introPortraitEtag"] = json!(images.etag(ImageKind::IntroPortrait, profile_id));
+    item
+}
+
+fn detail_item(account: &crate::profiles::model::StoredAccount) -> Value {
+    with_images(
+        settings_api::profile_item(account, &load_codez_config(), true),
+        &account.id,
+        &profile_avatar::default_snapshot(),
+    )
 }
 
 fn profile_body(account: &crate::profiles::model::StoredAccount) -> Value {
     json!({
         "contractVersion": 2,
-        "profile": settings_api::profile_item(account, &load_codez_config(), true),
+        "profile": detail_item(account),
     })
 }
 
@@ -128,13 +176,14 @@ fn store_unavailable(stream: &mut TcpStream, error: &anyhow::Error) -> anyhow::R
 pub fn list_resource() -> anyhow::Result<Value> {
     let store = settings_api::load_store()?;
     let config = load_codez_config();
+    let images = profile_avatar::default_snapshot();
     Ok(json!({
         "contractVersion": 2,
         "defaultProfile": config.default_profile,
         "profiles": store
             .accounts
             .iter()
-            .map(|account| settings_api::profile_item(account, &config, false))
+            .map(|account| with_images(settings_api::profile_item(account, &config, false), &account.id, &images))
             .collect::<Vec<_>>(),
     }))
 }
@@ -212,6 +261,9 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: 
     if path == IMPORT_PATH && request.method == "POST" {
         return handle_import(stream, &request.body);
     }
+    if let Some((profile, kind)) = parse_image_path(path) {
+        return handle_image(stream, request, &profile, kind);
+    }
     if let Some(profile) = parse_duplicate_path(path) {
         if request.method != "POST" {
             return method_not_allowed(stream, "use POST for /v2/profiles/{profile}/duplicate");
@@ -241,7 +293,7 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: 
             let Some(account) = settings_api::find(&store, &profile) else {
                 return not_found(stream, &profile);
             };
-            let item = settings_api::profile_item(account, &load_codez_config(), true);
+            let item = detail_item(account);
             write_json_response(stream, 200, "OK", &json!({ "contractVersion": 2, "profile": item }))
         }
         "PATCH" => {
@@ -251,6 +303,9 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: 
                 Ok(parsed) => parsed,
                 Err(message) => return bad_request(stream, &message),
             };
+            if patch.proxy.is_some() && !super::settings_api::proxy_editable() {
+                return super::settings_api::proxy_owner_required(stream);
+            }
             let account_id = match settings_api::load_store() {
                 Ok(store) => match settings_api::find(&store, &profile) {
                     Some(account) => account.id.clone(),
@@ -267,7 +322,7 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: 
             };
             match settings_api::update_profile(&account_id, &patch) {
                 Ok((account, changed)) => {
-                    let item = settings_api::profile_item(&account, &load_codez_config(), true);
+                    let item = detail_item(&account);
                     write_json_response(
                         stream,
                         200,
@@ -298,7 +353,8 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: 
                 Err(message) => return bad_request(stream, &message),
             };
             match lifecycle::delete_profile_with(&profile, archived) {
-            Ok(outcome) => write_json_response(
+            Ok(outcome) => {
+                write_json_response(
                 stream,
                 200,
                 "OK",
@@ -313,12 +369,113 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: 
                     },
                     "detachedSessions": outcome.detached_sessions,
                 }),
-            ),
+            )
+            }
             Err(failure) => lifecycle_error(stream, &profile, failure),
             }
         }
         _ => method_not_allowed(stream, "use GET, PATCH or DELETE for /v2/profiles/{profile}"),
     }
+}
+
+/// `GET|PUT|DELETE /v2/profiles/{p}/avatar|intro-portrait` (profile-avatar).
+fn handle_image(stream: &mut TcpStream, request: &SimpleHttpRequest, profile: &str, kind: ImageKind) -> anyhow::Result<()> {
+    let store = match settings_api::load_store() {
+        Ok(store) => store,
+        Err(error) => return store_unavailable(stream, &error),
+    };
+    let Some(profile_id) = settings_api::find(&store, profile).map(|account| account.id.clone()) else {
+        return not_found(stream, profile);
+    };
+    let images = match profile_avatar::ProfileAvatarStore::open_default() {
+        Ok(images) => images,
+        Err(error) => return store_unavailable(stream, &error),
+    };
+    let field = match kind {
+        ImageKind::Avatar => "avatarEtag",
+        ImageKind::IntroPortrait => "introPortraitEtag",
+    };
+    let upload = match request.method.as_str() {
+        "GET" => return write_image(stream, request, &images, kind, &profile_id),
+        "PUT" => {
+            let value: Value = match serde_json::from_slice(&request.body) {
+                Ok(value) => value,
+                Err(_) => return bad_request(stream, "JSON object body {contentType, data} required"),
+            };
+            match crate::management::user_profiles::parse_upload_limited(&value, kind.rules().max_bytes) {
+                Ok(upload) => Some(upload),
+                Err(failure) => return image_error(stream, failure),
+            }
+        }
+        "DELETE" => None,
+        _ => return method_not_allowed(stream, "use GET, PUT or DELETE for this profile image"),
+    };
+    match images.set(kind, &profile_id, upload.as_ref(), &crate::management::users::current_actor()) {
+        Ok(stored) => write_json_response(
+            stream,
+            200,
+            "OK",
+            &json!({
+                "contractVersion": 2,
+                "profileId": profile_id,
+                field: stored.map(|avatar| avatar.etag),
+            }),
+        ),
+        Err(failure) => image_error(stream, failure),
+    }
+}
+
+fn image_error(stream: &mut TcpStream, failure: crate::management::users::UserError) -> anyhow::Result<()> {
+    let reason = match failure.status {
+        400 => "Bad Request",
+        413 => "Payload Too Large",
+        _ => "Service Unavailable",
+    };
+    super::server::write_v2_error(
+        stream,
+        failure.status,
+        reason,
+        failure.code,
+        &failure.message,
+        failure.status >= 500,
+        failure.details,
+    )
+}
+
+fn write_image(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+    images: &profile_avatar::ProfileAvatarStore,
+    kind: ImageKind,
+    profile_id: &str,
+) -> anyhow::Result<()> {
+    let Some((image, bytes)) = images.image(kind, profile_id) else {
+        return super::server::write_v2_error(
+            stream,
+            404,
+            "Not Found",
+            "avatar_not_found",
+            &format!("this profile has no {}", kind.label()),
+            false,
+            json!({ "profileId": profile_id }),
+        );
+    };
+    let etag = format!("\"{}\"", image.etag);
+    let matches = request
+        .headers
+        .get("if-none-match")
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim().trim_start_matches("W/") == etag));
+    let previous = crate::http::server::extra_response_headers();
+    crate::http::server::set_extra_response_headers(format!(
+        "{previous}ETag: {etag}\r\nCache-Control: private, no-cache\r\nX-Content-Type-Options: nosniff\r\n"
+    ));
+    let result = if matches {
+        crate::http::server::write_http_response(stream, 304, "Not Modified", &image.content_type, &[])
+    } else {
+        crate::http::server::write_http_response(stream, 200, "OK", &image.content_type, &bytes)
+    };
+    crate::http::server::set_extra_response_headers(previous);
+    result
 }
 
 /// `DELETE /v2/profiles/{p}?archived=detach|refuse` (default refuse; see
@@ -658,15 +815,20 @@ const PATCH_FIELDS: &[&str] = &[
     "providerInstructionsField",
     "color",
     "providerCategory",
+    "avatarThemes",
+    "introGreeting",
     "allowSessionSwitch",
     "nativeSubagents",
     "delegationWait",
     "browserTools",
+    "proxy",
     "searchTool",
     "privateChatgptAuthFile",
     "agentUseRequiresApproval",
     "agentTurnQuestions",
     "claudeFileCheckpointing",
+    "claudeSettingSources",
+    "claudeAiConnectors",
     "claudeAllowWrite",
     "claudeAllowExec",
     "planLabel",
@@ -806,6 +968,20 @@ fn plan_label(value: &Value) -> Result<String, String> {
     crate::profiles::plan_label::normalize_manual_plan_label(text)
 }
 
+/// claude-code-sources: a list of `project` / `user` (empty = none).
+fn setting_sources(value: &Value) -> Result<Vec<crate::profiles::claude_code::SettingSource>, String> {
+    let items = value.as_array().ok_or("must be a list of project / user, or null")?;
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .and_then(crate::profiles::claude_code::SettingSource::parse)
+                .ok_or_else(|| format!("unknown source {item}; known: project, user"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(crate::profiles::claude_code::normalize)
+}
+
 fn boolean(value: &Value) -> Result<bool, String> {
     value.as_bool().ok_or_else(|| "must be a boolean or null".to_string())
 }
@@ -835,6 +1011,23 @@ fn provider_category(value: &Value) -> Result<crate::profiles::provider_category
         .as_str()
         .and_then(crate::profiles::provider_category::ProviderCategory::parse)
         .ok_or_else(|| "must be kimi, glm, zai, claude, deepseek, codex, other or null".to_string())
+}
+
+/// profile-avatar: a non-empty list of unique known theme ids (canonical
+/// order on return).
+fn avatar_themes(value: &Value) -> Result<Vec<String>, String> {
+    let items = value.as_array().ok_or("must be a list of theme ids or null")?;
+    let ids = items
+        .iter()
+        .map(|item| item.as_str().map(str::to_string).ok_or_else(|| "must be a list of theme ids or null".to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    profile_avatar::normalize_avatar_themes(&ids)
+}
+
+/// profile-avatar: the greeting text ("" = clear on apply).
+fn intro_greeting(value: &Value) -> Result<String, String> {
+    let text = value.as_str().ok_or("must be a string or null")?;
+    profile_avatar::normalize_intro_greeting(text).map(|text| text.unwrap_or_default())
 }
 
 fn color(value: &Value) -> Result<String, String> {
@@ -901,6 +1094,8 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
         },
         color: tri_state(body, "color", color)?,
         provider_category: tri_state(body, "providerCategory", provider_category)?,
+        avatar_themes: tri_state(body, "avatarThemes", avatar_themes)?,
+        intro_greeting: tri_state(body, "introGreeting", intro_greeting)?,
         allow_session_switch: tri_state(body, "allowSessionSwitch", boolean)?,
         native_subagents: tri_state(body, "nativeSubagents", boolean)?,
         delegation_wait: tri_state(body, "delegationWait", boolean)?,
@@ -908,6 +1103,12 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
             None => None,
             Some(Value::Bool(value)) => Some(*value),
             Some(_) => return Err("browserTools: must be a boolean".into()),
+        },
+        proxy: match body.get("proxy") {
+            None => None,
+            Some(Value::Null) => Some(crate::config::proxy::ProxyUpdate(Map::from_iter([("mode".to_string(), json!("inherit"))]))),
+            Some(Value::Object(update)) => Some(crate::config::proxy::ProxyUpdate(update.clone())),
+            Some(_) => return Err("proxy: must be an object or null".into()),
         },
         search_tool: match body.get("searchTool") {
             None => None,
@@ -926,6 +1127,12 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
         },
         agent_turn_questions: tri_state(body, "agentTurnQuestions", agent_turn_questions)?,
         claude_file_checkpointing: tri_state(body, "claudeFileCheckpointing", boolean)?,
+        claude_setting_sources: tri_state(body, "claudeSettingSources", setting_sources)?,
+        claude_ai_connectors: match body.get("claudeAiConnectors") {
+            None => None,
+            Some(Value::Bool(value)) => Some(*value),
+            Some(_) => return Err("claudeAiConnectors: must be a boolean".into()),
+        },
         claude_allow_write: tri_state(body, "claudeAllowWrite", boolean)?,
         claude_allow_exec: tri_state(body, "claudeAllowExec", boolean)?,
         plan_label: tri_state(body, "planLabel", plan_label)?,
@@ -941,12 +1148,33 @@ mod tests {
 
     #[test]
     fn browser_profile_patch_is_boolean_and_default_off() {
+        assert!(parse_patch(br#"{"proxy":{"mode":"none"}}"#).unwrap().proxy.is_some());
+        assert_eq!(parse_patch(br#"{"proxy":null}"#).unwrap().proxy.unwrap().0["mode"], "inherit");
+        assert!(parse_patch(br#"{"proxy":"http://x"}"#).is_err());
         assert_eq!(parse_patch(br#"{"browserTools":true}"#).unwrap().browser_tools,Some(true));
         assert_eq!(parse_patch(br#"{"browserTools":false}"#).unwrap().browser_tools,Some(false));
         assert_eq!(parse_patch(br#"{}"#).unwrap().browser_tools,None);
         for bad in [br#"{"browserTools":null}"#.as_slice(),br#"{"browserTools":"true"}"#,br#"{"browserTools":1}"#] {
             assert!(parse_patch(bad).is_err());
         }
+    }
+
+    #[test]
+    fn claude_code_sources_patch() {
+        use crate::profiles::claude_code::SettingSource::*;
+        assert_eq!(parse_patch(br#"{}"#).unwrap().claude_setting_sources, ConfigValueUpdate::Unchanged);
+        assert_eq!(parse_patch(br#"{"claudeSettingSources":null}"#).unwrap().claude_setting_sources, ConfigValueUpdate::Clear);
+        assert_eq!(parse_patch(br#"{"claudeSettingSources":[]}"#).unwrap().claude_setting_sources, ConfigValueUpdate::Set(vec![]));
+        assert_eq!(
+            parse_patch(br#"{"claudeSettingSources":["user","project","user"]}"#).unwrap().claude_setting_sources,
+            ConfigValueUpdate::Set(vec![Project, User])
+        );
+        for bad in [br#"{"claudeSettingSources":["local"]}"#.as_slice(), br#"{"claudeSettingSources":"project"}"#] {
+            assert!(parse_patch(bad).unwrap_err().starts_with("claudeSettingSources: "));
+        }
+        assert_eq!(parse_patch(br#"{"claudeAiConnectors":true}"#).unwrap().claude_ai_connectors, Some(true));
+        assert_eq!(parse_patch(br#"{}"#).unwrap().claude_ai_connectors, None);
+        assert!(parse_patch(br#"{"claudeAiConnectors":null}"#).unwrap_err().starts_with("claudeAiConnectors: "));
     }
 
     #[test]
@@ -1300,9 +1528,10 @@ mod tests {
         let client = std::thread::spawn(move || {
             use std::io::Read;
             let mut stream = std::net::TcpStream::connect(address).unwrap();
-            let mut text = String::new();
-            stream.read_to_string(&mut text).unwrap();
-            text
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).unwrap();
+            // Image bodies are binary.
+            String::from_utf8_lossy(&bytes).into_owned()
         });
         let (mut stream, peer) = listener.accept().unwrap();
         crate::management::listeners::set_current_connection(Some(
@@ -1392,6 +1621,96 @@ mod tests {
         // Nor the diagnostic error log.
         let errors = crate::config::paths::runtime_dir().unwrap().join("service-logs/management-errors.jsonl");
         assert!(!std::fs::read_to_string(errors).unwrap_or_default().contains(KEY));
+    }
+
+    fn png_data(width: u32, height: u32) -> String {
+        use base64::Engine;
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(width, height).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+    }
+
+    #[test]
+    fn profile_avatar_routes_round_trip_rename_and_delete() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let created = call(
+            "POST",
+            "/v2/profiles",
+            &json!({ "name": "Pic", "kind": "apiKey", "preset": "glm", "apiKey": "placeholder" }).to_string(),
+            false,
+        );
+        assert_eq!(created.0, 201, "{created:?}");
+        let id = created.1["profile"]["id"].as_str().unwrap().to_string();
+        assert_eq!(created.1["profile"]["avatarEtag"], Value::Null);
+        assert_eq!(created.1["profile"]["introPortraitEtag"], Value::Null);
+        assert_eq!(created.1["profile"]["appearance"]["avatarThemes"], Value::Null);
+        assert_eq!(created.1["profile"]["detail"]["avatarThemeOptions"][0], "animals");
+
+        assert_eq!(call("GET", "/v2/profiles/Pic/avatar", "", false).0, 404);
+        let avatar = json!({ "contentType": "image/png", "data": png_data(64, 64) }).to_string();
+        let (status, put) = call("PUT", "/v2/profiles/Pic/avatar", &avatar, false);
+        assert_eq!(status, 200, "{put}");
+        assert_eq!(put["profileId"], id.as_str());
+        let etag = put["avatarEtag"].as_str().unwrap().to_string();
+        // Refusals: not square, wrong type, not JSON, unknown profile.
+        let (status, bad) = call("PUT", "/v2/profiles/Pic/avatar", &json!({ "contentType": "image/png", "data": png_data(64, 32) }).to_string(), false);
+        assert_eq!((status, bad["error"]["code"].as_str()), (400, Some("invalid_avatar")), "{bad}");
+        let (status, bad) = call("PUT", "/v2/profiles/Pic/avatar", &json!({ "contentType": "image/gif", "data": png_data(64, 64) }).to_string(), false);
+        assert_eq!((status, bad["error"]["code"].as_str()), (400, Some("invalid_avatar")), "{bad}");
+        assert_eq!(call("PUT", "/v2/profiles/Pic/avatar", "nope", false).0, 400);
+        assert_eq!(call("PUT", "/v2/profiles/Nobody/avatar", &avatar, false).0, 404);
+        assert_eq!(call("POST", "/v2/profiles/Pic/avatar", &avatar, false).0, 405);
+
+        // The intro portrait: any aspect, its own ETag.
+        let portrait = json!({ "contentType": "image/png", "data": png_data(300, 500) }).to_string();
+        let (status, put) = call("PUT", "/v2/profiles/Pic/intro-portrait", &portrait, false);
+        assert_eq!(status, 200, "{put}");
+        let portrait_etag = put["introPortraitEtag"].as_str().unwrap().to_string();
+        assert_eq!(call("GET", &format!("/v2/profiles/{id}/intro-portrait"), "", false).0, 200);
+
+        // Themes + greeting.
+        let (status, patched) = call("PATCH", "/v2/profiles/Pic", r#"{"avatarThemes":["cats","sea"],"introGreeting":"  Hi {{owner}} "}"#, false);
+        assert_eq!(status, 200, "{patched}");
+        assert_eq!(patched["profile"]["appearance"]["avatarThemes"], json!(["sea", "cats"]));
+        assert_eq!(patched["profile"]["appearance"]["introGreeting"], "Hi {{owner}}");
+        for bad in [r#"{"avatarThemes":[]}"#, r#"{"avatarThemes":["all"]}"#, r#"{"avatarThemes":["sea","sea"]}"#, r#"{"avatarThemes":"sea"}"#] {
+            assert_eq!(call("PATCH", "/v2/profiles/Pic", bad, false).0, 400, "{bad}");
+        }
+
+        // Rename keeps everything (keyed by id).
+        let (status, renamed) = call("PATCH", "/v2/profiles/Pic", r#"{"name":"Picture"}"#, false);
+        assert_eq!(status, 200, "{renamed}");
+        assert_eq!(renamed["profile"]["avatarEtag"], etag.as_str());
+        assert_eq!(renamed["profile"]["introPortraitEtag"], portrait_etag.as_str());
+        let (status, list) = call("GET", "/v2/profiles", "", false);
+        assert_eq!(status, 200);
+        let row = list["profiles"].as_array().unwrap().iter().find(|p| p["id"] == id.as_str()).unwrap().clone();
+        assert_eq!(row["avatarEtag"], etag.as_str());
+        assert_eq!(row["appearance"]["avatarThemes"], json!(["sea", "cats"]));
+        assert_eq!(call("GET", "/v2/profiles/Picture/avatar", "", false).0, 200);
+
+        // Clears.
+        let (status, cleared) = call("PATCH", "/v2/profiles/Picture", r#"{"avatarThemes":null,"introGreeting":""}"#, false);
+        assert_eq!(status, 200, "{cleared}");
+        assert_eq!(cleared["profile"]["appearance"]["avatarThemes"], Value::Null);
+        assert_eq!(cleared["profile"]["appearance"]["introGreeting"], Value::Null);
+        let (status, deleted) = call("DELETE", "/v2/profiles/Picture/avatar", "", false);
+        assert_eq!((status, &deleted["avatarEtag"]), (200, &Value::Null), "{deleted}");
+        assert_eq!(call("GET", "/v2/profiles/Picture/avatar", "", false).0, 404);
+
+        // Profile delete removes the intro portrait too.
+        assert_eq!(call("DELETE", "/v2/profiles/Picture", "", false).0, 200);
+        let images = profile_avatar::ProfileAvatarStore::open_default().unwrap().snapshot().unwrap();
+        assert!(images.avatars.is_empty() && images.intro_portraits.is_empty());
+    }
+
+    #[test]
+    fn image_paths_parse() {
+        assert_eq!(parse_image_path("/v2/profiles/a%20b/avatar"), Some(("a b".into(), ImageKind::Avatar)));
+        assert_eq!(parse_image_path("/v2/profiles/x/intro-portrait"), Some(("x".into(), ImageKind::IntroPortrait)));
+        assert_eq!(parse_image_path("/v2/profiles/avatar"), None);
+        assert_eq!(parse_image_path("/v2/profiles/a/b/avatar"), None);
+        assert!(is_profiles_path("/v2/profiles/x/avatar"));
     }
 
     #[test]

@@ -163,6 +163,7 @@ pub const SCHEMAS: &[ExportedSchema] = &[
     super::skills_archive::EXPORTED_SCHEMA,
     super::runtime_restore_api::EXPORTED_SCHEMA,
     super::quota_continue::EXPORTED_SCHEMA,
+    super::claude_runtime_api::EXPORTED_SCHEMA,
     ExportedSchema {
         name: "services",
         title: "Services, viewing tickets and leases",
@@ -460,7 +461,22 @@ mod tests {
             created_at: "2026-10-08T00:00:00Z".into(),
             decided_at: None,
             note: None,
+            decided_by: Some(crate::approvals::ApprovalDecider {
+                by: "owner".into(),
+                connection: Some("loopback".into()),
+                peer: None,
+                client: [("app".to_string(), "cutex-desktop".to_string()), ("input".to_string(), "pointer".to_string())].into(),
+            }),
             consumed_at: None,
+            wait: Some(crate::approvals::ApprovalWait {
+                id: "w".into(),
+                started_at: "2026-10-08T00:00:00Z".into(),
+                until: "2026-10-08T00:02:00Z".into(),
+                thread_id: Some("t".into()),
+                turn_id: None,
+                ended_at: None,
+                end: None,
+            }),
         };
         assert_valid(
             "approvals",

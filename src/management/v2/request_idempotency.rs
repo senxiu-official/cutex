@@ -93,6 +93,7 @@ pub const READ_ONLY_METHODS: &[&str] = &[
     "thread/items/list",
     "thread/backgroundTerminals/list",
     "thread/goal/get",
+    "thread/searchOccurrences",
     "model/list",
     "claude/models/catalog",
     "claude/model/status",

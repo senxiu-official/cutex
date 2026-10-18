@@ -250,7 +250,7 @@ impl ServicesContext {
         }
         let record = self.store.get(slug)?;
         let mut view = service_view(&record, self.store.load_state().get(slug));
-        let traffic = crate::services::traffic::snapshot(slug);
+        let traffic = crate::services::traffic::snapshot_for(&record);
         crate::services::lifecycle::for_store(&self.store).augment_view(
             &record,
             &self.store.load()?.settings,
@@ -348,7 +348,7 @@ pub fn route_json(
                     .as_str()
                     .and_then(|slug| registry.services.get(slug))
                 {
-                    let traffic = crate::services::traffic::snapshot(&record.slug);
+                    let traffic = crate::services::traffic::snapshot_for(record);
                     life.augment_view(
                         record,
                         &registry.settings,

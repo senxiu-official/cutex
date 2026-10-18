@@ -1,6 +1,6 @@
 //! One gated child, not a supervisor. No native exec before durable publication.
 //! An inherited flock proves that an unpublished child cannot outlive its lease.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod linux {
     use anyhow::{ensure, Context};
     use cutex::agent_management::StockPublication;
@@ -137,6 +137,21 @@ mod linux {
         }
     }
 
+    /// Close every descriptor from `first` up (child side, after fork).
+    #[cfg(target_os = "linux")]
+    unsafe fn close_from_impl(first: u32, _limit: libc::c_int) -> libc::c_long {
+        unsafe { libc::syscall(libc::SYS_close_range, first, u32::MAX, 0u32) }
+    }
+    #[cfg(target_os = "macos")]
+    unsafe fn close_from_impl(first: u32, limit: libc::c_int) -> libc::c_long {
+        let mut fd = first as libc::c_int;
+        while fd < limit {
+            unsafe { libc::close(fd) };
+            fd += 1;
+        }
+        0
+    }
+
     pub fn spawn(
         launch: &LaunchCommand,
         cwd: &str,
@@ -192,6 +207,20 @@ mod linux {
         let lease_fd = duplicate(lease.as_raw_fd())?;
         let log_fd = duplicate(log.as_raw_fd())?;
         let null_fd = duplicate(null.as_raw_fd())?;
+        // macOS has no close_range(2): the child closes 5..fd_limit one by
+        // one (close is async-signal-safe). The limit is read before fork.
+        #[cfg(target_os = "linux")]
+        let fd_limit: libc::c_int = 0;
+        #[cfg(target_os = "macos")]
+        let fd_limit: libc::c_int = {
+            let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+            let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+                limit.rlim_cur
+            } else {
+                1024
+            };
+            soft.clamp(256, 65_536) as libc::c_int
+        };
         let pid = unsafe { libc::fork() };
         ensure!(pid >= 0, "stock gated fork failed");
         if pid == 0 {
@@ -206,7 +235,7 @@ mod linux {
                     || libc::dup2(lease_fd.as_raw_fd(), 4) < 0
                     || libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) < 0
                     || libc::fcntl(4, libc::F_SETFD, libc::FD_CLOEXEC) < 0
-                    || libc::syscall(libc::SYS_close_range, 5u32, u32::MAX, 0u32) != 0
+                    || close_from_impl(5, fd_limit) != 0
                 {
                     libc::_exit(126);
                 }
@@ -241,10 +270,10 @@ mod linux {
         Ok(owned)
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) use linux::*;
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported {
     use cutex::agent_management::StockPublication;
     pub struct GatedChild;
@@ -289,10 +318,10 @@ mod unsupported {
         anyhow::bail!("stock publication requires Linux")
     }
 }
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(super) use unsupported::*;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use cutex::launch::command::LaunchCommand;

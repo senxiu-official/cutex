@@ -343,6 +343,7 @@ mod tests {
             env: [("GREETING".to_string(), "hi-{port}".to_string())].into(),
             login_link_command: None,
             stopped: false,
+            restart_requested_at: None,
             port_allocated: false,
             ceiling: None,
             provenance: None,

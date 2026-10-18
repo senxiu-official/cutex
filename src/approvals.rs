@@ -59,7 +59,10 @@ pub enum ApprovalKind {
     /// An agent-started workflow run plan (cutex `workflows`): name, phases,
     /// step profiles, limits and the script digest. Approving starts the run;
     /// owner only, never the project reviewer (it multiplies spend).
-    WorkflowRun,
+    WorkflowRun,    /// A static service root outside the agent's cwd / project workspace
+    /// (bound to the canonical root). Combined into `ServiceLifetime` when the
+    /// same request also asks for a persistent lifetime.
+    StaticRoot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,8 +101,144 @@ pub struct ApprovalRecord {
     pub decided_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Who decided (`approval-decided-by`, 2026-10-18); absent on records
+    /// decided before it and on undecided ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<ApprovalDecider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumed_at: Option<String>,
+    /// The requesting tool call is holding for the owner's decision
+    /// (approval-wait). Kept after the hold ended (`end`), so clients can
+    /// tell a call that already gave up from one still waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<ApprovalWait>,
+}
+
+/// Who made an approval decision (`approval-decided-by`), so an unexpected
+/// decision can be traced to a client (r243 acceptance: a denial nobody
+/// remembered making).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalDecider {
+    /// `owner` (a client holding the Management root credential); a decision
+    /// cutex makes itself would be `auto:<reason>` (none today).
+    pub by: String,
+    /// `loopback` (this host, SSH tunnels included) or `remote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
+    /// The remote peer address (`remote` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// What the client said about itself (`app`, `version`, `device`,
+    /// `surface`, `input`); unverified, for diagnosis only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub client: BTreeMap<String, String>,
+}
+
+/// One tool call holding for the owner's decision (approval-wait,
+/// [`ApprovalStore::begin_wait`] / [`ApprovalStore::finish_wait`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalWait {
+    /// Distinguishes holds of the same record (a later identical call takes
+    /// the slot over; the earlier one then ends without touching it).
+    pub id: String,
+    pub started_at: String,
+    /// When the call gives up and answers `approval_required`.
+    pub until: String,
+    /// The caller's native thread and turn (when known): Management ends the
+    /// hold when that turn ends, so an approval never runs into a turn the
+    /// agent no longer sees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    /// Why the hold ended: `approved` (the call proceeded), `denied` (the
+    /// call answered denied), `timeout`, `disconnected` (the caller went
+    /// away), `turn_ended` (Management saw the caller's turn end),
+    /// `runtime_changed` (the caller's runtime was replaced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+}
+
+impl ApprovalWait {
+    /// Still holding at `now`.
+    pub fn active(&self, now: DateTime<Utc>) -> bool {
+        self.end.is_none() && timestamp(&self.until).is_some_and(|until| until > now)
+    }
+}
+
+/// How long an agent's tool call holds for the owner's decision before it
+/// answers `approval_required` (owner decision 2026-10-17, approval-wait).
+pub const APPROVAL_WAIT_SECS: u64 = 120;
+/// Façade → Agent Bus: the call may hold up to this many seconds.
+pub const APPROVAL_WAIT_HEADER: &str = "x-cutex-approval-wait";
+/// Façade → Agent Bus: the caller's native turn (when known).
+pub const TURN_HEADER: &str = "x-cutex-mcp-turn-id";
+/// cutex → façade: opt in to holding (set by cutex for Codex façades and for
+/// Claude adapters declaring `features.approvalWait`; absent = answer at once).
+pub const APPROVAL_WAIT_ENV: &str = "CUTEX_MCP_APPROVAL_WAIT_SECS";
+/// Claude adapter → façade (one process per call): the calling turn.
+pub const TURN_ENV: &str = "CUTEX_MCP_TURN_ID";
+
+/// The hold a façade asks for in seconds: `1..=APPROVAL_WAIT_SECS`, else none.
+pub fn parse_wait_secs(value: Option<&str>) -> Option<u64> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(|secs| secs.min(APPROVAL_WAIT_SECS))
+}
+
+/// A tool call that may hold for the owner's decision (Agent Bus side).
+pub struct Waiter {
+    pub duration: std::time::Duration,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    /// Cheap, checked every poll: the caller still waits for the answer
+    /// (its connection is open).
+    pub connected: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Checked once, right before an approval is used: the caller's runtime
+    /// is still the one that asked (same generation and thread).
+    pub current: Box<dyn Fn() -> bool + Send + Sync>,
+    pub poll: std::time::Duration,
+}
+
+impl Waiter {
+    /// A waiter for the exact caller; `connected` / `current` as above.
+    pub fn new(
+        secs: u64,
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        connected: impl Fn() -> bool + Send + Sync + 'static,
+        current: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            duration: std::time::Duration::from_secs(secs.min(APPROVAL_WAIT_SECS)),
+            thread_id,
+            turn_id,
+            connected: Box::new(connected),
+            current: Box::new(current),
+            poll: std::time::Duration::from_millis(400),
+        }
+    }
+}
+
+/// How a hold ended ([`ApprovalStore::finish_wait`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum WaitFinish {
+    /// Approved while holding and used by this call.
+    Approved(ApprovalRecord),
+    /// Denied while holding; this call answers denied.
+    Denied(ApprovalRecord),
+    /// Still pending (timeout, caller gone, turn ended).
+    Pending(ApprovalRecord),
+    /// Decided while holding, but this call could not deliver it (the caller
+    /// went away or its turn ended): the requester needs the decision notice.
+    Undelivered(ApprovalRecord),
+    /// The record is gone or no longer live (expired, consumed elsewhere).
+    Gone,
 }
 
 /// A new approval request.
@@ -125,8 +264,12 @@ pub enum GateOutcome {
         record: ApprovalRecord,
         created: bool,
     },
-    /// The owner denied this request.
+    /// The owner denied this request while this call waited for the decision.
     Denied(ApprovalRecord),
+    /// An earlier identical request (same digest) was already denied and that
+    /// denial is still live: answered at once, so a retry loop stops, with a
+    /// detail that says it is the earlier decision.
+    DeniedEarlier(ApprovalRecord),
 }
 
 impl GateOutcome {
@@ -140,8 +283,18 @@ impl GateOutcome {
                 "code": "approval_required",
                 "approval_id": record.approval_id,
                 "detail": format!(
-                    "Nothing was done yet: this needs the owner's approval ({}). The owner sees the request in the cutex desktop. Retry the same call after they approve; until then it answers approval_required. Do not poll in a loop: end your turn or set an alarm.",
-                    record.summary
+                    "Nothing was done yet: {}this needs the owner's approval ({}). The owner sees the request in the cutex desktop. {}",
+                    if record.wait.as_ref().is_some_and(|wait| wait.end.as_deref() == Some("timeout")) {
+                        "the owner did not decide while this call waited; "
+                    } else {
+                        ""
+                    },
+                    record.summary,
+                    if decision_needs_retry(record.kind) {
+                        "When the owner decides you get a message from cutex; after an approval retry the same call (until then it answers approval_required). Do not poll in a loop: end your turn or continue with other work."
+                    } else {
+                        "Retry the same call after they approve; until then it answers approval_required. Do not poll in a loop: end your turn or set an alarm."
+                    }
                 ),
             })),
             Self::Denied(record) => Some(json!({
@@ -154,8 +307,106 @@ impl GateOutcome {
                     None => "The owner denied this request.".to_string(),
                 },
             })),
+            Self::DeniedEarlier(record) => {
+                let decided_at = record.decided_at.as_deref().unwrap_or(&record.created_at);
+                let until = denial_expiry(record);
+                let mut refusal = json!({
+                    "ok": false,
+                    "status": "no_write",
+                    "code": "approval_denied",
+                    "approval_id": record.approval_id,
+                    "detail": format!(
+                        "Nothing was done: the owner already denied this exact request at {decided_at}{}. This is that earlier decision, not a new one; the same request stays denied until {}. Change the request (for example another slug, command or target) or ask the owner; do not retry it unchanged.",
+                        record.note.as_deref().map(|note| format!(" ({note})")).unwrap_or_default(),
+                        until.as_deref().unwrap_or("the denial expires"),
+                    ),
+                    "denied_at": decided_at,
+                    "reused_denial": true,
+                });
+                if let Some(until) = until {
+                    refusal["denied_until"] = Value::String(until);
+                }
+                Some(refusal)
+            }
         }
     }
+}
+
+impl GateOutcome {
+    /// For a call that may proceed: the note its successful result carries
+    /// when the owner approved this request while this same call held for
+    /// the decision (approval-wait), see [`ApprovalRecord::approved_after_wait`].
+    pub fn approved_after_wait(&self) -> Option<Value> {
+        match self {
+            Self::Approved(record) => record.approved_after_wait(),
+            _ => None,
+        }
+    }
+}
+
+impl ApprovalRecord {
+    /// `{decision: "approved", waitedSecs, approvalId, detail}` when this
+    /// record was approved while a tool call held for the owner's decision
+    /// and that call used it (its hold ended `approved`), so the agent's
+    /// successful result says the owner reviewed it and it must not be
+    /// retried. `None` for an approval a later retry used, and for anything
+    /// not approved.
+    pub fn approved_after_wait(&self) -> Option<Value> {
+        let wait = self
+            .wait
+            .as_ref()
+            .filter(|wait| wait.end.as_deref() == Some("approved"))?;
+        let waited_secs = match (
+            timestamp(&wait.started_at),
+            wait.ended_at.as_deref().and_then(timestamp),
+        ) {
+            (Some(started), Some(ended)) => {
+                ((ended - started).num_milliseconds().max(0) + 500) / 1000
+            }
+            _ => 0,
+        };
+        Some(json!({
+            "decision": "approved",
+            "waitedSecs": waited_secs,
+            "approvalId": self.approval_id,
+            "detail": approved_after_wait_detail(waited_secs),
+        }))
+    }
+}
+
+/// The sentence a successful result carries after an approval-wait.
+pub fn approved_after_wait_detail(waited_secs: i64) -> String {
+    format!("The owner approved this request after {waited_secs} s; it has been carried out.")
+}
+
+/// Put an approved-after-wait note ([`ApprovalRecord::approved_after_wait`])
+/// on a successful tool result: `approval` is the note, and its sentence
+/// leads the result's `detail` (or becomes it).
+pub fn attach_approval_note(result: &mut Value, note: Value) {
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    let sentence = note["detail"].as_str().unwrap_or_default().to_string();
+    let detail = match object.get("detail").and_then(Value::as_str) {
+        Some(existing) if !existing.is_empty() => format!("{sentence} {existing}"),
+        _ => sentence,
+    };
+    object.insert("approval".into(), note);
+    object.insert("detail".into(), Value::String(detail));
+}
+
+/// `X-Cutex-Facade` part a façade sends when its management result parser
+/// accepts the approved-after-wait note (`approval`, `detail`) on a
+/// complete receipt; older façades refuse unknown top-level fields.
+pub const FACADE_APPROVAL_NOTE: &str = "approval-note=1";
+
+/// Whether an `X-Cutex-Facade` header value accepts the note.
+pub fn facade_takes_approval_note(header: Option<&str>) -> bool {
+    header
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|part| part.trim().strip_prefix("approval-note="))
+        .any(|level| level.trim().parse::<u32>().is_ok_and(|level| level >= 1))
 }
 
 /// Why a decision was refused.
@@ -209,17 +460,51 @@ pub struct ApprovalStore {
     path: PathBuf,
 }
 
-fn timestamp(value: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn timestamp(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|time| time.with_timezone(&Utc))
 }
 
+/// The default store file (`runtime/approvals/approvals.json`). Approvals are
+/// requested by the Agent Bus and decided by Management, so Management
+/// watches this file for `cutex/approvals/changed` (management::v2::approvals).
+pub fn store_path() -> anyhow::Result<PathBuf> {
+    Ok(crate::config::paths::runtime_dir()?.join("approvals/approvals.json"))
+}
+
+/// Every record in the store file at `path` without locking or expiring
+/// (writes are atomic renames, so a read sees one whole version). A missing
+/// file has none.
+pub fn read_all_at(path: &Path) -> anyhow::Result<Vec<ApprovalRecord>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice::<StoreFile>(&bytes)
+            .context("approval store is corrupt")?
+            .approvals),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether the requesting agent has to retry its own call after the owner's
+/// decision (the gate answered `approval_required` and nothing else acts on
+/// the decision). Ask deliveries are re-checked by the asks scheduler,
+/// workflow runs start from the engine, browser claims are consumed by the
+/// owner's tab selection.
+pub fn decision_needs_retry(kind: ApprovalKind) -> bool {
+    matches!(
+        kind,
+        ApprovalKind::ManagedService
+            | ApprovalKind::ServiceLifetime
+            | ApprovalKind::StaticRoot
+            | ApprovalKind::AgentProfile
+            | ApprovalKind::BrowserOpen
+    )
+}
+
 impl ApprovalStore {
     pub fn open_default() -> anyhow::Result<Self> {
-        Ok(Self::at(
-            crate::config::paths::runtime_dir()?.join("approvals/approvals.json"),
-        ))
+        Ok(Self::at(store_path()?))
     }
 
     pub fn at(path: impl Into<PathBuf>) -> Self {
@@ -302,12 +587,17 @@ impl ApprovalStore {
                         return Ok(GateOutcome::Approved(record.clone()));
                     }
                     ApprovalState::Pending => {
+                        // An earlier call's hold is not this call's.
+                        let mut record = record.clone();
+                        record.wait = None;
                         return Ok(GateOutcome::Pending {
-                            record: record.clone(),
+                            record,
                             created: false,
-                        })
+                        });
                     }
-                    ApprovalState::Denied => return Ok(GateOutcome::Denied(record.clone())),
+                    ApprovalState::Denied => {
+                        return Ok(GateOutcome::DeniedEarlier(record.clone()))
+                    }
                     _ => {}
                 }
             }
@@ -334,7 +624,9 @@ impl ApprovalStore {
                 created_at: now.to_rfc3339(),
                 decided_at: None,
                 note: None,
+                decided_by: None,
                 consumed_at: None,
+                wait: None,
             };
             store.approvals.push(record.clone());
             Ok(GateOutcome::Pending {
@@ -388,6 +680,7 @@ impl ApprovalStore {
                     if record.state == ApprovalState::Approved {
                         record.state = ApprovalState::Pending;
                         record.decided_at = None;
+                        record.decided_by = None;
                         record.consumed_at = None;
                         record.note = None;
                     }
@@ -415,7 +708,9 @@ impl ApprovalStore {
                 created_at: now.to_rfc3339(),
                 decided_at: None,
                 note: None,
+                decided_by: None,
                 consumed_at: None,
+                wait: None,
             };
             store.approvals.push(record.clone());
             Ok((record, true))
@@ -574,6 +869,18 @@ impl ApprovalStore {
         note: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<ApprovalRecord, DecideError> {
+        self.decide_as(approval_id, approve, note, None, now)
+    }
+
+    /// [`Self::decide`], recording who decided (`decidedBy`).
+    pub fn decide_as(
+        &self,
+        approval_id: &str,
+        approve: bool,
+        note: Option<String>,
+        decided_by: Option<ApprovalDecider>,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalRecord, DecideError> {
         self.with_store(|store| {
             expire_and_prune(&mut store.approvals, now);
             let record = store
@@ -591,10 +898,300 @@ impl ApprovalStore {
             };
             record.decided_at = Some(now.to_rfc3339());
             record.note = note;
+            record.decided_by = decided_by;
             Ok(record.clone())
         })
         .map_err(|error| DecideError::Store(format!("{error:#}")))?
     }
+}
+
+impl ApprovalStore {
+    /// Start a hold on a pending record (approval-wait). `None` when the
+    /// record is no longer pending (decided in the meantime: the caller
+    /// re-checks at once).
+    pub fn begin_wait(
+        &self,
+        approval_id: &str,
+        wait: ApprovalWait,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<ApprovalRecord>> {
+        self.with_store(|store| {
+            expire_and_prune(&mut store.approvals, now);
+            let record = store
+                .approvals
+                .iter_mut()
+                .find(|record| record.approval_id == approval_id)?;
+            if record.state != ApprovalState::Pending {
+                return None;
+            }
+            record.wait = Some(wait);
+            Some(record.clone())
+        })
+    }
+
+    /// End this call's hold (`wait_id`) atomically with what it answers. An
+    /// approval is used only when `deliverable` (the caller is connected and
+    /// still the runtime that asked) and the hold was not ended by someone
+    /// else (Management: the caller's turn ended). `end` is the reason
+    /// recorded when the record is still pending.
+    pub fn finish_wait(
+        &self,
+        approval_id: &str,
+        wait_id: &str,
+        end: &str,
+        deliverable: bool,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<WaitFinish> {
+        self.with_store(|store| {
+            expire_and_prune(&mut store.approvals, now);
+            let Some(record) = store
+                .approvals
+                .iter_mut()
+                .find(|record| record.approval_id == approval_id)
+            else {
+                return WaitFinish::Gone;
+            };
+            let ended_by_other = record
+                .wait
+                .as_ref()
+                .filter(|wait| wait.id == wait_id)
+                .is_none_or(|wait| wait.end.is_some());
+            let deliver = deliverable && !ended_by_other;
+            let close = |record: &mut ApprovalRecord, reason: &str| {
+                if let Some(wait) = record.wait.as_mut().filter(|wait| wait.id == wait_id) {
+                    if wait.end.is_none() {
+                        wait.end = Some(reason.to_string());
+                        wait.ended_at = Some(now.to_rfc3339());
+                    }
+                }
+            };
+            match record.state {
+                ApprovalState::Approved if deliver => {
+                    record.state = ApprovalState::Consumed;
+                    record.consumed_at = Some(now.to_rfc3339());
+                    close(record, "approved");
+                    WaitFinish::Approved(record.clone())
+                }
+                ApprovalState::Denied if deliver => {
+                    close(record, "denied");
+                    WaitFinish::Denied(record.clone())
+                }
+                ApprovalState::Approved | ApprovalState::Denied => {
+                    close(record, if ended_by_other { "turn_ended" } else { end });
+                    WaitFinish::Undelivered(record.clone())
+                }
+                ApprovalState::Pending => {
+                    close(record, end);
+                    WaitFinish::Pending(record.clone())
+                }
+                ApprovalState::Consumed | ApprovalState::Expired => WaitFinish::Gone,
+            }
+        })
+    }
+
+    /// Management: the caller's turn ended (`turn/completed` on `thread`), so
+    /// its holds stop (`end = turn_ended`) and never use an approval. A hold
+    /// whose turn is known ends only for that turn. Cheap when nothing holds
+    /// (one lockless read). Returns the records whose hold ended.
+    pub fn end_waits_for_turn(
+        &self,
+        requester: &str,
+        thread: Option<&str>,
+        turn: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<ApprovalRecord>> {
+        let matches = |record: &ApprovalRecord| {
+            record.requester_cutex_session_id == requester
+                && record.wait.as_ref().is_some_and(|wait| {
+                    wait.end.is_none()
+                        && (thread.is_none()
+                            || wait.thread_id.is_none()
+                            || wait.thread_id.as_deref() == thread)
+                        && (turn.is_none() || wait.turn_id.is_none() || wait.turn_id.as_deref() == turn)
+                })
+        };
+        if !read_all_at(&self.path)?.iter().any(matches) {
+            return Ok(Vec::new());
+        }
+        self.with_store(|store| {
+            let mut ended = Vec::new();
+            for record in store.approvals.iter_mut().filter(|record| matches(record)) {
+                if let Some(wait) = record.wait.as_mut() {
+                    wait.end = Some("turn_ended".into());
+                    wait.ended_at = Some(now.to_rfc3339());
+                }
+                ended.push(record.clone());
+            }
+            ended
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Remove every record of `kind` (rollback to a release that cannot
+    /// parse it, `upgrade::older_stores`); returns the removed records.
+    pub fn remove_kind(&self, kind: ApprovalKind) -> anyhow::Result<Vec<ApprovalRecord>> {
+        self.with_store(|store| {
+            let (removed, kept) = std::mem::take(&mut store.approvals).into_iter().partition(|record| record.kind == kind);
+            store.approvals = kept;
+            removed
+        })
+    }
+}
+
+/// [`ApprovalStore::gate`], holding a pending request up to the waiter's
+/// duration for the owner's decision (approval-wait): an approval within the
+/// window lets the call proceed (consumed once, like a retry), a denial
+/// answers denied, otherwise the call answers `approval_required` as before.
+/// Without a waiter it is exactly `gate`. `on_requested` runs for a newly
+/// created request (publish it). A decision this call could not deliver
+/// (caller gone, turn ended) is handed to `on_undelivered` (the decision
+/// notice).
+pub fn gate_with_wait(
+    store: &ApprovalStore,
+    request: ApprovalRequest,
+    waiter: Option<&Waiter>,
+    on_requested: impl FnOnce(&ApprovalRecord),
+    on_undelivered: impl FnOnce(&ApprovalRecord),
+) -> anyhow::Result<GateOutcome> {
+    let now = Utc::now();
+    let outcome = store.gate(request, now)?;
+    let GateOutcome::Pending { record, created } = &outcome else {
+        return Ok(outcome);
+    };
+    if *created {
+        on_requested(record);
+    }
+    let Some(waiter) = waiter.filter(|waiter| !waiter.duration.is_zero()) else {
+        return Ok(outcome);
+    };
+    let started = std::time::Instant::now();
+    let wait_id = uuid::Uuid::new_v4().simple().to_string();
+    let until = now + Duration::from_std(waiter.duration).unwrap_or_else(|_| Duration::seconds(0));
+    let begun = store.begin_wait(
+        &record.approval_id,
+        ApprovalWait {
+            id: wait_id.clone(),
+            started_at: now.to_rfc3339(),
+            until: until.to_rfc3339(),
+            thread_id: waiter.thread_id.clone(),
+            turn_id: waiter.turn_id.clone(),
+            ended_at: None,
+            end: None,
+        },
+        now,
+    )?;
+    if begun.is_none() {
+        // Decided between the gate and the hold: answer like a retry would
+        // (an approval used here still counts as decided during this call).
+        return store.gate_existing(&record.approval_id, &wait_id, now);
+    }
+    let path = store.path().to_path_buf();
+    let mut stamp = None;
+    let mut polls = 0_u32;
+    let end = loop {
+        if !(waiter.connected)() {
+            break "disconnected";
+        }
+        if started.elapsed() >= waiter.duration {
+            break "timeout";
+        }
+        // Lockless poll; re-read when the file changed (and every few polls,
+        // in case two writes share a modification time and length).
+        let now_stamp = std::fs::metadata(&path)
+            .ok()
+            .map(|m| (m.modified().ok(), m.len()));
+        polls = polls.wrapping_add(1);
+        if now_stamp != stamp || polls.is_multiple_of(5) {
+            stamp = now_stamp;
+            let row = read_all_at(&path)?
+                .into_iter()
+                .find(|row| row.approval_id == record.approval_id);
+            let settled = match &row {
+                None => true,
+                Some(row) => {
+                    row.state != ApprovalState::Pending
+                        || row.wait.as_ref().is_none_or(|wait| wait.id != wait_id || wait.end.is_some())
+                }
+            };
+            if settled {
+                // Decided, taken over or ended by Management: finish_wait
+                // decides under the lock (the reason applies only if still
+                // pending, which then means another call holds it).
+                break "superseded";
+            }
+        }
+        std::thread::sleep(waiter.poll.min(waiter.duration.saturating_sub(started.elapsed())).max(std::time::Duration::from_millis(10)));
+    };
+    let deliverable = end != "disconnected" && (waiter.connected)() && (waiter.current)();
+    let end = if end != "disconnected" && !deliverable {
+        if (waiter.connected)() { "runtime_changed" } else { "disconnected" }
+    } else {
+        end
+    };
+    match store.finish_wait(&record.approval_id, &wait_id, end, deliverable, Utc::now())? {
+        WaitFinish::Approved(record) => Ok(GateOutcome::Approved(record)),
+        WaitFinish::Denied(record) => Ok(GateOutcome::Denied(record)),
+        WaitFinish::Pending(record) => Ok(GateOutcome::Pending { record, created: false }),
+        WaitFinish::Undelivered(row) => {
+            on_undelivered(&row);
+            Ok(GateOutcome::Pending { record: row, created: false })
+        }
+        WaitFinish::Gone => Ok(GateOutcome::Pending { record: record.clone(), created: false }),
+    }
+}
+
+impl ApprovalStore {
+    /// What a retry of an existing record's request would answer now
+    /// (consumes an approval).
+    fn gate_existing(
+        &self,
+        approval_id: &str,
+        wait_id: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<GateOutcome> {
+        self.with_store(|store| {
+            expire_and_prune(&mut store.approvals, now);
+            let record = store
+                .approvals
+                .iter_mut()
+                .find(|record| record.approval_id == approval_id)
+                .context("approval vanished")?;
+            Ok(match record.state {
+                ApprovalState::Approved => {
+                    record.state = ApprovalState::Consumed;
+                    record.consumed_at = Some(now.to_rfc3339());
+                    // Approved while this call was in flight (it had not
+                    // begun holding yet): a zero-length hold that ended
+                    // approved, so the result says the owner decided.
+                    record.wait = Some(ApprovalWait {
+                        id: wait_id.to_string(),
+                        started_at: now.to_rfc3339(),
+                        until: now.to_rfc3339(),
+                        thread_id: None,
+                        turn_id: None,
+                        ended_at: Some(now.to_rfc3339()),
+                        end: Some("approved".into()),
+                    });
+                    GateOutcome::Approved(record.clone())
+                }
+                ApprovalState::Denied => GateOutcome::Denied(record.clone()),
+                _ => GateOutcome::Pending { record: record.clone(), created: false },
+            })
+        })?
+    }
+}
+
+/// When a denial stops answering identical requests ([`expire_and_prune`]).
+fn denial_expiry(record: &ApprovalRecord) -> Option<String> {
+    let since = record
+        .decided_at
+        .as_deref()
+        .and_then(timestamp)
+        .or_else(|| timestamp(&record.created_at))?;
+    Some((since + Duration::hours(APPROVAL_TTL_HOURS)).to_rfc3339())
 }
 
 fn lock_path(path: &Path) -> PathBuf {
@@ -743,11 +1340,21 @@ mod tests {
             )
             .unwrap();
         let denied = store.gate(request("d"), now).unwrap();
-        assert_eq!(denied.refusal().unwrap()["code"], "approval_denied");
-        assert!(denied.refusal().unwrap()["detail"]
-            .as_str()
-            .unwrap()
-            .contains("external service"));
+        assert!(matches!(denied, GateOutcome::DeniedEarlier(_)));
+        let refusal = denied.refusal().unwrap();
+        assert_eq!(refusal["code"], "approval_denied");
+        assert_eq!(refusal["approval_id"], record.approval_id.as_str());
+        let detail = refusal["detail"].as_str().unwrap();
+        let until = (now + Duration::hours(APPROVAL_TTL_HOURS)).to_rfc3339();
+        assert!(detail.contains("external service"), "{detail}");
+        assert!(detail.contains("already denied this exact request at"), "{detail}");
+        assert!(detail.contains(&now.to_rfc3339()), "{detail}");
+        assert!(detail.contains(&format!("stays denied until {until}")), "{detail}");
+        assert!(detail.contains("Change the request"), "{detail}");
+        // The desktop classifies a tool result by these words: never both.
+        assert!(!refusal.to_string().contains("approval_required"));
+        assert_eq!(refusal["denied_until"], until.as_str());
+        assert_eq!(refusal["reused_denial"], true);
         let later = now + Duration::hours(APPROVAL_TTL_HOURS + 1);
         assert!(matches!(
             store.gate(request("d"), later).unwrap(),
@@ -989,6 +1596,254 @@ mod tests {
         assert_eq!(records.len(), MAX_RECORDS);
         assert!(records.iter().any(|r| r.approval_id == record.approval_id));
         assert!(records.iter().all(|r| r.state == ApprovalState::Pending));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // approval-wait ------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn waiter(millis: u64, connected: Arc<AtomicBool>, current: Arc<AtomicBool>) -> Waiter {
+        let mut waiter = Waiter::new(
+            1,
+            Some("thread-1".into()),
+            Some("turn-1".into()),
+            move || connected.load(Ordering::SeqCst),
+            move || current.load(Ordering::SeqCst),
+        );
+        waiter.duration = std::time::Duration::from_millis(millis);
+        waiter.poll = std::time::Duration::from_millis(10);
+        waiter
+    }
+
+    fn flags() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)))
+    }
+
+    /// Run `act` on the pending record once the call holds for it.
+    fn when_holding(path: PathBuf, act: impl FnOnce(&ApprovalStore, &ApprovalRecord) + Send + 'static) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let store = ApprovalStore::at(&path);
+            for _ in 0..500 {
+                if let Some(record) = read_all_at(&path).unwrap_or_default().into_iter().find(|r| r.wait.as_ref().is_some_and(|w| w.end.is_none())) {
+                    act(&store, &record);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("the call never held");
+        })
+    }
+
+    fn notices() -> (Arc<AtomicUsize>, impl Fn(&ApprovalRecord)) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        (count, move |_: &ApprovalRecord| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+
+    #[test]
+    fn a_holding_call_proceeds_once_approved_in_the_window() {
+        let (store, dir) = store("wait-approve");
+        let (connected, current) = flags();
+        let decider = when_holding(store.path().to_path_buf(), |store, record| {
+            let wait = record.wait.clone().unwrap();
+            assert_eq!((wait.thread_id.as_deref(), wait.turn_id.as_deref()), (Some("thread-1"), Some("turn-1")));
+            // Management sees the hold: no decision notice is due.
+            assert!(wait.active(Utc::now()));
+            store.decide(&record.approval_id, true, None, Utc::now()).unwrap();
+        });
+        let requested = AtomicUsize::new(0);
+        let (undelivered, notice) = notices();
+        let outcome = gate_with_wait(&store, request("w1"), Some(&waiter(5_000, connected, current)), |_| { requested.fetch_add(1, Ordering::SeqCst); }, notice).unwrap();
+        decider.join().unwrap();
+        // Q21: the successful result says the owner approved it during the hold.
+        let note = outcome.approved_after_wait().expect("approved-after-wait note");
+        let GateOutcome::Approved(record) = outcome else { panic!("{outcome:?}") };
+        assert_eq!(note["decision"], "approved");
+        assert_eq!(note["approvalId"], record.approval_id.as_str());
+        assert!(note["waitedSecs"].as_i64().is_some_and(|secs| (0..=5).contains(&secs)), "{note}");
+        assert_eq!(note["detail"].as_str().unwrap(), approved_after_wait_detail(note["waitedSecs"].as_i64().unwrap()));
+        assert!(note["detail"].as_str().unwrap().starts_with("The owner approved this request after "));
+        assert_eq!(record.state, ApprovalState::Consumed);
+        assert_eq!(record.wait.unwrap().end.as_deref(), Some("approved"));
+        assert_eq!(requested.load(Ordering::SeqCst), 1);
+        assert_eq!(undelivered.load(Ordering::SeqCst), 0);
+        // Consumed once: the same request asks again.
+        assert!(matches!(store.gate(request("w1"), Utc::now()).unwrap(), GateOutcome::Pending { created: true, .. }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_holding_call_answers_denied_when_denied_in_the_window() {
+        let (store, dir) = store("wait-deny");
+        let (connected, current) = flags();
+        let decider = when_holding(store.path().to_path_buf(), |store, record| {
+            store.decide(&record.approval_id, false, Some("no".into()), Utc::now()).unwrap();
+        });
+        let (undelivered, notice) = notices();
+        let outcome = gate_with_wait(&store, request("w2"), Some(&waiter(5_000, connected, current)), |_| {}, notice).unwrap();
+        decider.join().unwrap();
+        assert_eq!(outcome.refusal().unwrap()["code"], "approval_denied");
+        // Decided during this call's hold: a fresh denial, not the earlier-decision text.
+        assert!(matches!(outcome, GateOutcome::Denied(_)));
+        assert_eq!(outcome.refusal().unwrap()["detail"], "The owner denied this request: no");
+        assert_eq!(undelivered.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_holding_call_times_out_with_approval_required_and_stays_pending() {
+        let (store, dir) = store("wait-timeout");
+        let (connected, current) = flags();
+        let started = std::time::Instant::now();
+        let (undelivered, notice) = notices();
+        let outcome = gate_with_wait(&store, request("w3"), Some(&waiter(150, connected, current)), |_| {}, notice).unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(150));
+        let refusal = outcome.refusal().unwrap();
+        assert_eq!(refusal["code"], "approval_required");
+        assert!(refusal["detail"].as_str().unwrap().contains("did not decide while this call waited"), "{refusal}");
+        let pending = store.list(false, Utc::now()).unwrap();
+        assert_eq!(pending.len(), 1);
+        let wait = pending[0].wait.clone().unwrap();
+        assert_eq!(wait.end.as_deref(), Some("timeout"));
+        assert!(!wait.active(Utc::now()));
+        assert_eq!(undelivered.load(Ordering::SeqCst), 0);
+        // A later plain retry does not claim it waited.
+        let retry = store.gate(request("w3"), Utc::now()).unwrap().refusal().unwrap();
+        assert!(!retry["detail"].as_str().unwrap().contains("waited"));
+        // Approved afterwards: a retry proceeds as before, without the
+        // approved-after-wait note (this call did not hold for it).
+        store.decide(&pending[0].approval_id, true, None, Utc::now()).unwrap();
+        let retried = gate_with_wait(&store, request("w3"), None, |_| {}, |_| {}).unwrap();
+        assert!(matches!(retried, GateOutcome::Approved(_)));
+        assert_eq!(retried.approved_after_wait(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_disconnected_caller_stops_holding_and_leaves_the_approval_unused() {
+        let (store, dir) = store("wait-disconnect");
+        let (connected, current) = flags();
+        let gone = connected.clone();
+        let decider = when_holding(store.path().to_path_buf(), move |store, record| {
+            gone.store(false, Ordering::SeqCst);
+            store.decide(&record.approval_id, true, None, Utc::now()).unwrap();
+        });
+        let (undelivered, notice) = notices();
+        let outcome = gate_with_wait(&store, request("w4"), Some(&waiter(5_000, connected, current)), |_| {}, notice).unwrap();
+        decider.join().unwrap();
+        assert!(matches!(outcome, GateOutcome::Pending { .. }), "{outcome:?}");
+        let record = store.peek(AGENT, "w4", Utc::now()).unwrap().unwrap();
+        // Either the hold saw the disconnect first (pending, then approved
+        // with no hold: Management sends the notice), or the approval first
+        // (unused: the Bus sends the notice). Never consumed.
+        assert_eq!(record.state, ApprovalState::Approved);
+        assert_eq!(record.wait.unwrap().end.as_deref(), Some("disconnected"));
+        assert!(undelivered.load(Ordering::SeqCst) <= 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_ended_turn_stops_the_hold_without_using_a_later_approval() {
+        let (store, dir) = store("wait-turn");
+        let (connected, current) = flags();
+        let decider = when_holding(store.path().to_path_buf(), |store, record| {
+            // Another turn of the same thread ending is not this call's.
+            assert!(store.end_waits_for_turn(AGENT, Some("thread-1"), Some("turn-0"), Utc::now()).unwrap().is_empty());
+            assert!(store.end_waits_for_turn(AGENT, Some("thread-2"), None, Utc::now()).unwrap().is_empty());
+            assert!(store.end_waits_for_turn("cutex.other", None, None, Utc::now()).unwrap().is_empty());
+            let ended = store.end_waits_for_turn(AGENT, Some("thread-1"), Some("turn-1"), Utc::now()).unwrap();
+            assert_eq!(ended.len(), 1);
+            store.decide(&record.approval_id, true, None, Utc::now()).unwrap();
+        });
+        let (undelivered, notice) = notices();
+        let outcome = gate_with_wait(&store, request("w5"), Some(&waiter(5_000, connected, current)), |_| {}, notice).unwrap();
+        decider.join().unwrap();
+        assert!(matches!(outcome, GateOutcome::Pending { .. }), "{outcome:?}");
+        let record = store.peek(AGENT, "w5", Utc::now()).unwrap().unwrap();
+        assert_eq!(record.state, ApprovalState::Approved, "left for a retry");
+        assert_eq!(record.wait.unwrap().end.as_deref(), Some("turn_ended"));
+        assert!(undelivered.load(Ordering::SeqCst) <= 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_replaced_runtime_never_uses_the_approval() {
+        let (store, dir) = store("wait-runtime");
+        let (connected, current) = flags();
+        let stale = current.clone();
+        let decider = when_holding(store.path().to_path_buf(), move |store, record| {
+            stale.store(false, Ordering::SeqCst);
+            store.decide(&record.approval_id, true, None, Utc::now()).unwrap();
+        });
+        let (undelivered, notice) = notices();
+        let outcome = gate_with_wait(&store, request("w6"), Some(&waiter(5_000, connected, current)), |_| {}, notice).unwrap();
+        decider.join().unwrap();
+        assert!(matches!(outcome, GateOutcome::Pending { .. }), "{outcome:?}");
+        let record = store.peek(AGENT, "w6", Utc::now()).unwrap().unwrap();
+        assert_eq!(record.state, ApprovalState::Approved);
+        assert_eq!(record.wait.unwrap().end.as_deref(), Some("runtime_changed"));
+        assert_eq!(undelivered.load(Ordering::SeqCst), 1, "the requester gets the notice instead");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn approval_note_attaches_to_results_and_facades_opt_in() {
+        let (store, dir) = store("note");
+        let GateOutcome::Pending { mut record, .. } = store.gate(request("n1"), Utc::now()).unwrap() else {
+            panic!("pending expected");
+        };
+        let _ = std::fs::remove_dir_all(dir);
+        // Pending, or approved without a hold that ended approved: no note.
+        assert_eq!(record.approved_after_wait(), None);
+        record.wait = Some(ApprovalWait {
+            id: "w".into(),
+            started_at: "2026-10-18T00:00:00Z".into(),
+            until: "2026-10-18T00:02:00Z".into(),
+            thread_id: None,
+            turn_id: None,
+            ended_at: Some("2026-10-18T00:00:41.600Z".into()),
+            end: Some("timeout".into()),
+        });
+        assert_eq!(record.approved_after_wait(), None);
+        record.wait.as_mut().unwrap().end = Some("approved".into());
+        let note = record.approved_after_wait().unwrap();
+        assert_eq!(note, json!({
+            "decision": "approved",
+            "waitedSecs": 42,
+            "approvalId": record.approval_id,
+            "detail": "The owner approved this request after 42 s; it has been carried out.",
+        }));
+        let mut result = json!({"ok": true, "created": true});
+        attach_approval_note(&mut result, note.clone());
+        assert_eq!(result["approval"], note);
+        assert_eq!(result["detail"], note["detail"]);
+        let mut with_detail = json!({"ok": true, "detail": "Started."});
+        attach_approval_note(&mut with_detail, note.clone());
+        assert_eq!(with_detail["detail"], "The owner approved this request after 42 s; it has been carried out. Started.");
+        assert!(facade_takes_approval_note(Some("delegations=2, approval-note=1")));
+        assert!(facade_takes_approval_note(Some("approval-note=2")));
+        assert!(!facade_takes_approval_note(Some("delegations=2")));
+        assert!(!facade_takes_approval_note(Some("approval-note=0")));
+        assert!(!facade_takes_approval_note(None));
+    }
+
+    #[test]
+    fn without_a_waiter_the_gate_answers_at_once() {
+        let (store, dir) = store("wait-none");
+        let started = std::time::Instant::now();
+        let outcome = gate_with_wait(&store, request("w7"), None, |_| {}, |_| {}).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(matches!(outcome, GateOutcome::Pending { created: true, .. }));
+        assert!(store.list(false, Utc::now()).unwrap()[0].wait.is_none());
+        assert_eq!(parse_wait_secs(Some("120")), Some(120));
+        assert_eq!(parse_wait_secs(Some("999")), Some(APPROVAL_WAIT_SECS));
+        assert_eq!(parse_wait_secs(Some("0")), None);
+        assert_eq!(parse_wait_secs(Some("x")), None);
+        assert_eq!(parse_wait_secs(None), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

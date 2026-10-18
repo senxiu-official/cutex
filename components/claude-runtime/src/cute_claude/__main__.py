@@ -42,6 +42,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--workspace", type=Path, required=True)
     p.add_argument("--managed-skills-root", type=Path, action="append", default=[],
                    help="host-selected skill root for this workspace/account; repeatable, no user settings discovery")
+    p.add_argument("--setting-sources", default="",
+                   help="subscription: comma-separated Claude Code settings sources to read: project (CLAUDE.md, "
+                        ".claude/ of the workspace), user (the account home, CLAUDE_CONFIG_DIR); default none")
+    p.add_argument("--mcp-servers-config", type=Path,
+                   help="subscription: host-selected external MCP servers (JSON {servers, toolFilters} in Claude Code "
+                        "format; secrets only as ${VAR} references), added next to the in-process cutex server")
+    p.add_argument("--claude-ai-connectors", choices=["enabled", "disabled"], default="disabled",
+                   help="subscription: let Claude Code load the login's claude.ai connectors (drops --strict-mcp-config)")
     p.add_argument("--external-owner-id", help="trusted cutex owner binding for thread/externalInput methods")
     p.add_argument("--external-runtime-generation", type=int, help="trusted cutex runtime generation; requires --external-owner-id")
     p.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/cute-claude-demo")
@@ -89,6 +97,10 @@ async def run(args) -> None:
         system_append = args.system_append_file.read_text(encoding="utf-8")
         if extra:
             system_append = system_append.rstrip() + "\n\n" + extra
+    mcp_servers, mcp_tool_filters = {}, {}
+    if args.mcp_servers_config:
+        from .config import load_mcp_servers_config
+        mcp_servers, mcp_tool_filters = load_mcp_servers_config(args.mcp_servers_config)
     settings = Settings(workspace, state, model=model, mock=args.mock, backend=args.backend,
             api_base=args.api_base, max_tokens=args.max_tokens if args.max_tokens is not None else 4096, max_steps=args.max_steps,
             effort=args.effort, thinking=args.thinking, thinking_display=args.thinking_display, allow_write=args.allow_write, allow_exec=args.allow_exec,
@@ -96,7 +108,10 @@ async def run(args) -> None:
             api_timeout=args.api_timeout, tool_timeout=args.tool_timeout, system=system, system_append=system_append,
             agent_turn_questions=args.agent_turn_questions,
             managed_skills_roots=tuple(root.expanduser().resolve() for root in args.managed_skills_root),
-            external_owner_id=args.external_owner_id, external_runtime_generation=args.external_runtime_generation)
+            external_owner_id=args.external_owner_id, external_runtime_generation=args.external_runtime_generation,
+            setting_sources=tuple(part.strip() for part in args.setting_sources.split(',') if part.strip()),
+            mcp_servers=mcp_servers, mcp_tool_filters=mcp_tool_filters,
+            claude_ai_connectors=args.claude_ai_connectors == "enabled")
     settings.validate()
     driver = None
     if args.backend == "subscription":

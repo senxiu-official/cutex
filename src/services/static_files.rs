@@ -1,74 +1,219 @@
 //! Static service validation and authenticated response writer. Authentication
 //! and traffic accounting belong to the service proxy, which calls `serve`.
+//!
+//! Root rules (capability `static-root-approval`, docs/SERVICES.md):
+//! - always: absolute, existing, a directory or an `.html` file, not inside
+//!   the cutex home;
+//! - agents additionally: never a filesystem root, the user home (or a
+//!   directory containing it) or a directory containing the cutex home; a
+//!   root inside the caller's cwd or its project's workspace needs nothing
+//!   more, any other root needs the owner's approval (`needs_approval`);
+//! - the one exception to the cutex-home rule: an agent whose own cwd is a
+//!   cutex-managed scratch workspace (`<home>/agents-scratch/<id>`,
+//!   `<home>/chats/<id>`) may serve from inside that cwd. The rest of the
+//!   home (config, tokens, profiles, runtime, archive, session store, other
+//!   agents' scratch dirs) stays forbidden.
 use super::store::{Caller, ServiceRecord, ServicesError, ServicesResult};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
-pub fn validate_root(root: &str, services_dir: &Path, caller: &Caller) -> ServicesResult<String> {
+/// Home areas whose direct children are cutex-allocated agent workspaces.
+const SCRATCH_AREAS: [&str; 2] = [
+    crate::management::v2::human_agents::AGENT_SCRATCH_DIR_NAME,
+    crate::management::v2::human_sessions::SCRATCH_DIR_NAME,
+];
+
+/// A root that passed the hard rules.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedRoot {
+    /// Canonical path (what the record stores and the approval binds to).
+    pub path: String,
+    /// Agent caller only: the root lies outside every directory in
+    /// `allowed_roots` and may be used only after the owner approved it.
+    pub needs_approval: bool,
+    /// Agent caller only: the directories this caller may serve from without
+    /// an approval (its cwd, its project workspace).
+    pub allowed_roots: Vec<String>,
+}
+
+fn display(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+}
+
+fn list(paths: &[String]) -> String {
+    if paths.is_empty() {
+        "none".into()
+    } else {
+        paths
+            .iter()
+            .map(|p| format!("`{p}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// `dir` is `<home>/<scratch area>/<entry>` exactly.
+fn is_scratch_workspace(dir: &Path, home: &Path) -> bool {
+    dir.parent().is_some_and(|area| {
+        area.parent() == Some(home)
+            && area
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| SCRATCH_AREAS.contains(&name))
+    })
+}
+
+/// The caller's own directories that need no approval: (allowed, inside the
+/// cutex home and therefore ignored).
+fn agent_roots(cutex_session_id: &str, home: Option<&Path>) -> ServicesResult<(Vec<PathBuf>, Vec<String>)> {
+    let sessions =
+        crate::session::store::load_cutex_session_store().map_err(ServicesError::unavailable)?;
+    let mut candidates = Vec::new();
+    if let Some(record) = sessions.sessions.get(cutex_session_id) {
+        candidates.push(PathBuf::from(&record.cwd));
+    }
+    if let Ok(snapshot) = crate::memory::load_agent_management_snapshot() {
+        if let Some(project) = crate::memory::project_for_session(&snapshot, cutex_session_id) {
+            if let Some(root) = snapshot
+                .project_states
+                .get(&project)
+                .and_then(|state| state.workspace_root.as_ref())
+            {
+                candidates.push(PathBuf::from(root));
+            }
+        }
+    }
+    let mut allowed: Vec<PathBuf> = Vec::new();
+    let mut ignored = Vec::new();
+    for dir in candidates.into_iter().filter_map(|p| p.canonicalize().ok()) {
+        let in_home = home.is_some_and(|home| dir.starts_with(home));
+        if in_home && !home.is_some_and(|home| is_scratch_workspace(&dir, home)) {
+            ignored.push(display(&dir));
+        } else if !allowed.contains(&dir) {
+            allowed.push(dir);
+        }
+    }
+    Ok((allowed, ignored))
+}
+
+fn user_homes() -> Vec<PathBuf> {
+    [crate::config::paths::home_dir(), crate::config::paths::real_user_home()]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect()
+}
+
+/// Check `root` for `caller` without deciding about approval.
+pub fn check_root(root: &str, services_dir: &Path, caller: &Caller) -> ServicesResult<CheckedRoot> {
     let path = Path::new(root);
     if !path.is_absolute() {
-        return Err(ServicesError::bad_request("root must be absolute"));
+        return Err(ServicesError::bad_request(format!(
+            "root must be an absolute path (got `{root}`)"
+        )));
     }
-    let real = path
-        .canonicalize()
-        .map_err(|_| ServicesError::bad_request("root does not exist"))?;
+    let real = path.canonicalize().map_err(|_| {
+        ServicesError::bad_request(format!("root `{root}` does not exist on this host"))
+    })?;
     if !(real.is_dir()
         || (real.is_file()
             && real
                 .extension()
                 .is_some_and(|v| v.eq_ignore_ascii_case("html"))))
     {
-        return Err(ServicesError::bad_request(
-            "root must be a directory or an .html file",
-        ));
+        return Err(ServicesError::bad_request(format!(
+            "root `{root}` must be a directory or an .html file"
+        )));
     }
     let home = services_dir.parent().and_then(|p| p.canonicalize().ok());
-    if home.as_ref().is_some_and(|home| real.starts_with(home)) {
-        return Err(ServicesError::new(
-            403,
-            "static_root_forbidden",
-            "root must be outside the cutex home",
-        ));
-    }
-    if let Caller::Agent {
+    let forbidden = |why: String| ServicesError::new(403, "static_root_forbidden", why);
+    let Caller::Agent {
         cutex_session_id, ..
     } = caller
-    {
-        let sessions = crate::session::store::load_cutex_session_store()
-            .map_err(ServicesError::unavailable)?;
-        let record = sessions.sessions.get(cutex_session_id).ok_or_else(|| {
-            ServicesError::new(
-                403,
-                "static_root_forbidden",
-                "caller workspace is unavailable",
-            )
-        })?;
-        let mut roots = vec![PathBuf::from(&record.cwd)];
-        if let Ok(snapshot) = crate::memory::load_agent_management_snapshot() {
-            if let Some(project) = crate::memory::project_for_session(&snapshot, cutex_session_id) {
-                if let Some(root) = snapshot
-                    .project_states
-                    .get(&project)
-                    .and_then(|state| state.workspace_root.as_ref())
-                {
-                    roots.push(PathBuf::from(root));
-                }
-            }
+    else {
+        if let Some(home) = home.as_ref().filter(|home| real.starts_with(home)) {
+            return Err(forbidden(format!(
+                "root `{root}` is inside the cutex home `{}`, which is never served",
+                display(home)
+            )));
         }
-        if !roots
-            .into_iter()
-            .filter_map(|p| p.canonicalize().ok())
-            .any(|p| real.starts_with(p))
-        {
-            return Err(ServicesError::new(
-                403,
-                "static_root_forbidden",
-                "root must be inside the caller cwd or project workspace",
+        return Ok(CheckedRoot {
+            path: real.to_string_lossy().into_owned(),
+            needs_approval: false,
+            allowed_roots: Vec::new(),
+        });
+    };
+    let (allowed, ignored) = agent_roots(cutex_session_id, home.as_deref())?;
+    let allowed_text: Vec<String> = allowed.iter().map(|p| display(p)).collect();
+    let rules = || {
+        let mut text = format!(
+            "Allowed without approval: your cwd / project workspace {}.",
+            list(&allowed_text)
+        );
+        if !ignored.is_empty() {
+            text.push_str(&format!(
+                " Not usable (inside the cutex home): {}.",
+                list(&ignored)
             ));
         }
+        text.push_str(" Any other existing directory or .html file outside the cutex home, the user home itself and filesystem roots can be served after the owner approves it (the call answers approval_required).");
+        text
+    };
+    let inside_allowed = allowed.iter().any(|dir| real.starts_with(dir));
+    if let Some(home) = &home {
+        // Only a scratch cwd that itself lies in the home opens part of it
+        // (a cwd that contains the home, e.g. the user home, does not).
+        let inside_scratch = allowed
+            .iter()
+            .any(|dir| dir.starts_with(home) && real.starts_with(dir));
+        if real.starts_with(home) && !inside_scratch {
+            return Err(forbidden(format!(
+                "root `{root}` is inside the cutex home `{}`, which is never served (only your own cutex-managed scratch cwd is an exception). Move the files elsewhere. {}",
+                display(home),
+                rules()
+            )));
+        }
+        if home.starts_with(&real) {
+            return Err(forbidden(format!(
+                "root `{root}` contains the cutex home `{}`; pick a narrower directory. {}",
+                display(home),
+                rules()
+            )));
+        }
     }
-    Ok(real.to_string_lossy().into_owned())
+    if real.parent().is_none() {
+        return Err(forbidden(format!(
+            "root `{root}` is a filesystem root; pick a narrower directory. {}",
+            rules()
+        )));
+    }
+    if let Some(user_home) = user_homes().into_iter().find(|h| h.starts_with(&real)) {
+        return Err(forbidden(format!(
+            "root `{root}` is or contains the user home `{}`; pick a narrower directory. {}",
+            display(&user_home),
+            rules()
+        )));
+    }
+    Ok(CheckedRoot {
+        path: real.to_string_lossy().into_owned(),
+        needs_approval: !inside_allowed,
+        allowed_roots: allowed_text,
+    })
+}
+
+/// The error for a root outside the caller's directories that reached the
+/// store without the owner's approval (the agent API gates it first).
+pub fn approval_missing(root: &str, checked: &CheckedRoot) -> ServicesError {
+    ServicesError::new(
+        403,
+        "static_root_forbidden",
+        format!(
+            "root `{root}` is outside your cwd / project workspace {} and needs the owner's approval, which this path cannot request",
+            list(&checked.allowed_roots)
+        ),
+    )
 }
 
 fn decode_path(target: &str) -> Option<String> {
@@ -256,22 +401,46 @@ mod tests {
             cutex_session_id: id,
             project_id: None,
         };
-        validate_root(workspace.to_str().unwrap(), &home.join("services"), &caller).unwrap();
+        let services = home.join("services");
+        let ok = check_root(workspace.to_str().unwrap(), &services, &caller).unwrap();
+        assert!(!ok.needs_approval);
+        // Outside the workspace: allowed only through the owner's approval.
+        let outside_check = check_root(outside.to_str().unwrap(), &services, &caller).unwrap();
+        assert!(outside_check.needs_approval);
         assert_eq!(
-            validate_root(outside.to_str().unwrap(), &home.join("services"), &caller)
-                .unwrap_err()
-                .code,
-            "static_root_forbidden"
+            outside_check.allowed_roots,
+            vec![display(&workspace.canonicalize().unwrap())]
+        );
+        let error = check_root(home.to_str().unwrap(), &services, &Caller::Owner).unwrap_err();
+        assert_eq!(error.code, "static_root_forbidden");
+        // Hard refusals name the sent root and the allowed roots.
+        std::fs::create_dir_all(home.join("profiles")).unwrap();
+        let error = check_root(home.join("profiles").to_str().unwrap(), &services, &caller)
+            .unwrap_err();
+        assert_eq!(error.code, "static_root_forbidden");
+        assert!(error.message.contains("profiles"), "{}", error.message);
+        assert!(
+            error.message.contains(&display(&workspace.canonicalize().unwrap())),
+            "{}",
+            error.message
+        );
+        for hard in [base.to_str().unwrap(), base.ancestors().last().unwrap().to_str().unwrap()] {
+            let error = check_root(hard, &services, &caller).unwrap_err();
+            assert_eq!(error.code, "static_root_forbidden", "{hard}");
+        }
+        if let Some(user_home) = crate::config::paths::home_dir().filter(|h| h.is_dir()) {
+            let error = check_root(user_home.to_str().unwrap(), &services, &caller).unwrap_err();
+            assert_eq!(error.code, "static_root_forbidden");
+        }
+        assert_eq!(
+            check_root("relative/dir", &services, &caller).unwrap_err().code,
+            "invalid_request"
         );
         assert_eq!(
-            validate_root(
-                home.to_str().unwrap(),
-                &home.join("services"),
-                &Caller::Owner
-            )
-            .unwrap_err()
-            .code,
-            "static_root_forbidden"
+            check_root(base.join("missing").to_str().unwrap(), &services, &caller)
+                .unwrap_err()
+                .code,
+            "invalid_request"
         );
         std::fs::remove_dir_all(base).unwrap();
     }

@@ -566,11 +566,18 @@ pub fn agent_row(
                 .and_then(Value::as_str)
                 .and_then(|text| preview_text(text, PREVIEW_CHARS))
         });
+    // Conversation activity only (turns, output, tools): never the runtime's
+    // last event (a restart / reconnect) nor `updatedAt` (metadata, profile,
+    // lifecycle), nor an interrupted turn's end (a resumed runtime interrupts
+    // the turn a restart left in progress). Without any: the creation time.
     let last_activity = later(
-        runtime["lastEventAt"].as_str(),
-        session.pointer("/activity/lastOutputAt").and_then(Value::as_str),
+        session.pointer("/activity/lastConversationAt").and_then(Value::as_str),
+        projection
+            .and_then(|p| p.last_turn.as_ref())
+            .filter(|turn| turn.status != "interrupted")
+            .map(|turn| turn.ended_at.as_str()),
     )
-    .or_else(|| session["updatedAt"].as_str().map(str::to_string))
+    .or_else(|| session["createdAt"].as_str().map(str::to_string))
     .map(|at| crate::management::instance::normalize_utc(&at));
     Some(json!({
         "id": id,

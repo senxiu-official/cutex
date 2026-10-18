@@ -104,6 +104,13 @@ struct ProviderResponse {
     schema: String,
     action_id: String,
     outcome: ProviderOutcome,
+    /// The owner approved this request while the call held for the
+    /// decision (Q21, `crate::approvals::attach_approval_note`; complete
+    /// receipts only). Sent only to façades that announce it.
+    #[serde(default)]
+    approval: Option<Value>,
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -178,6 +185,19 @@ fn sanitize_response(input: &Expect<'_>, digest: &str, value: Value) -> Value {
         }
         _ => return no_write(input.action_id, "invalid_provider_response"),
     };
+    // The approved-after-wait note rides only on a complete receipt.
+    let note_ok = match (&response.approval, &response.detail) {
+        (None, None) => true,
+        (Some(Value::Object(note)), Some(detail)) => {
+            matches!(response.outcome, ProviderOutcome::Complete { .. })
+                && note.get("decision").and_then(Value::as_str) == Some("approved")
+                && bounded_text(detail, 4096)
+        }
+        _ => false,
+    };
+    if !note_ok {
+        return no_write(input.action_id, "invalid_provider_response");
+    }
     let valid = match response.outcome {
         ProviderOutcome::Complete { receipt }
             if typed_payload_matches(&receipt, RECEIPT_SCHEMA, input, Some(digest)) =>
@@ -711,7 +731,7 @@ pub(super) fn tools() -> Vec<Value> {
         json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
     };
     const AUTHORITY: &str = "Your authority comes from your runtime, never from arguments. After response_uncertain, repeat the identical call (pass the action_id from the reply in a later turn).";
-    const LIMITS: &str = "A new agent never gets more than you have: a sandbox, approval policy, network access or writable roots beyond yours answers permission_exceeds_creator with the offending fields. A profile the owner marked as needing approval answers approval_required (approval_id): repeat the same call with the same action_id after the owner approves; do not poll.";
+    const LIMITS: &str = "A new agent never gets more than you have: a sandbox, approval policy, network access or writable roots beyond yours answers permission_exceeds_creator with the offending fields. A profile the owner marked as needing approval waits up to 2 minutes for the owner's decision; if none came it answers approval_required (approval_id): repeat the same call with the same action_id after the owner approves; do not poll.";
     const DEFAULTS: &str = "Leave the other fields empty unless needed: profile, model, reasoning, sandbox and approval policy default to yours, cwd to the project's workspace.";
     let mut create = agent_fields(name);
     create.insert("task".into(), task.clone());
@@ -794,6 +814,30 @@ mod tests {
             });
             assert_eq!(actual, expected, "{tool} {operation}");
         }
+    }
+
+    #[test]
+    fn approved_after_wait_note_passes_only_on_a_complete_receipt() {
+        let note = json!({"decision":"approved","waitedSecs":7,"approvalId":"apr-1",
+            "detail":"The owner approved this request after 7 s; it has been carried out."});
+        let detail = note["detail"].clone();
+        let args = || json!({"action_id":"noted","project_id":"private","cutex_session_id":"cutex.target","change":"online"});
+        let complete = call(MEMBER_RUNTIME, args(), |request| {
+            let typed: crate::agent_management::AgentManagementRequest = serde_json::from_value(request.clone())?;
+            Ok(json!({"schema":CONTRACT,"action_id":"noted","approval":note,"detail":detail,"outcome":{"status":"complete","receipt":{
+                "schema":RECEIPT_SCHEMA,"action_id":"noted","project_id":"private","operation":"online",
+                "request_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&typed)?)),
+                "completed_at":"immutable-time","result":{"kind":"lifecycle"}}}}))
+        });
+        assert_eq!(complete["outcome"]["status"], "complete", "{complete}");
+        assert_eq!(complete["approval"], note);
+        assert_eq!(complete["detail"], detail);
+        // A note on a refusal is not a valid provider response.
+        let refused = call(MEMBER_RUNTIME, args(), |_| {
+            Ok(json!({"schema":CONTRACT,"action_id":"noted","approval":note,"detail":detail,
+                "outcome":{"status":"no_write","code":"x","detail":"y"}}))
+        });
+        assert_eq!(refused["outcome"]["code"], "invalid_provider_response", "{refused}");
     }
 
     #[test]

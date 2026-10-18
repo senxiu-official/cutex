@@ -48,7 +48,9 @@
         "release": { "type": "string", "description": "Active release (unknown when undeterminable)." },
         "sequence": { "type": "integer", "minimum": 0, "description": "Channel sequence; 0 = not installed from a signed release." },
         "commit": { "$ref": "#/$defs/nullableString" },
-        "manifestSha256": { "$ref": "#/$defs/nullableString" }
+        "manifestSha256": { "$ref": "#/$defs/nullableString" },
+        "notes": { "type": ["object", "null"], "additionalProperties": { "type": "string" }, "description": "Capability upgrade-installed-notes: the installed release manifest's notes (language tag en, zh-CN -> text); null when unknown (no committed manifest under the release dir: hand-placed or older layouts)." },
+        "publishedAt": { "$ref": "#/$defs/nullableString", "description": "Capability upgrade-installed-notes: the installed release manifest's publishedAt; null when unknown." }
       }
     },
     "available": {

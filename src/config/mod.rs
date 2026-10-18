@@ -19,6 +19,7 @@ pub mod notification_levels;
 pub mod owner_notify;
 pub mod paths;
 pub mod proxy;
+pub mod proxy_outbound;
 pub mod session_store;
 pub mod store;
 pub mod text;

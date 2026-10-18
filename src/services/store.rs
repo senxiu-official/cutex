@@ -114,6 +114,11 @@ pub struct ServiceRecord {
     /// (also across daemon restarts) until it is started again.
     #[serde(default)]
     pub stopped: bool,
+    /// Managed only: the owning agent's latest `service_restart` request.
+    /// A change seen by the supervisor restarts the running process once
+    /// (not part of the launch fingerprint; ignored on daemon start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_requested_at: Option<String>,
     /// The port came from the allocator (informational).
     #[serde(default)]
     pub port_allocated: bool,
@@ -373,6 +378,10 @@ pub struct RegisterRequest {
     pub owner_cutex_session_id: Option<String>,
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Set by the agent API after the owner approved a static root outside
+    /// the caller's cwd / project workspace; never part of the wire format.
+    #[serde(skip)]
+    pub static_root_approved: bool,
 }
 
 /// Distinguishes an absent field from an explicit `null`.
@@ -417,6 +426,27 @@ pub struct UpdateRequest {
     pub owner_cutex_session_id: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
     pub project_id: Option<Option<String>>,
+    /// See `RegisterRequest::static_root_approved`.
+    #[serde(skip)]
+    pub static_root_approved: bool,
+}
+
+/// What a validate-only pass found that still needs the owner.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MutationCheck {
+    /// A static root outside the agent caller's cwd / project workspace that
+    /// the stored record does not already use: needs the owner's approval.
+    pub static_root_approval: Option<super::static_files::CheckedRoot>,
+}
+
+/// Root approval need for `checked` given the root already stored.
+fn root_review(
+    checked: Option<&super::static_files::CheckedRoot>,
+    stored: Option<&str>,
+) -> Option<super::static_files::CheckedRoot> {
+    checked
+        .filter(|root| root.needs_approval && stored != Some(root.path.as_str()))
+        .cloned()
 }
 
 /// `PATCH /v2/services` body (registry settings).
@@ -757,6 +787,14 @@ impl ServiceStore {
     }
 
     /// Locked read-modify-write; bumps `revision` when anything changed.
+    /// Run `f` on a copy of the registry and discard the result: the
+    /// validate-only path (nothing is written, no lock file is created).
+    fn dry_run<T>(&self, f: impl FnOnce(&mut Registry) -> ServicesResult<T>) -> ServicesResult<T> {
+        let mut registry = read_registry(&self.registry_path()).map_err(ServicesError::unavailable)?;
+        registry.schema_version = registry.schema_version.max(1);
+        f(&mut registry)
+    }
+
     pub fn mutate<T>(
         &self,
         f: impl FnOnce(&mut Registry) -> ServicesResult<T>,
@@ -807,6 +845,28 @@ impl ServiceStore {
         request: RegisterRequest,
         caller: &Caller,
     ) -> ServicesResult<(ServiceRecord, bool)> {
+        self.register_inner(request, caller, true)
+            .map(|(record, created, _)| (record, created))
+    }
+
+    /// Validate a register request exactly like `register` (slug, fields,
+    /// ownership, port, root) without changing anything, so an invalid request
+    /// never reaches an owner approval. Reports what still needs the owner.
+    pub fn validate_register(
+        &self,
+        request: RegisterRequest,
+        caller: &Caller,
+    ) -> ServicesResult<MutationCheck> {
+        self.register_inner(request, caller, false)
+            .map(|(_, _, check)| check)
+    }
+
+    fn register_inner(
+        &self,
+        request: RegisterRequest,
+        caller: &Caller,
+        commit: bool,
+    ) -> ServicesResult<(ServiceRecord, bool, MutationCheck)> {
         validate_slug(&request.slug)?;
         let runtime = match request.runtime.as_deref() {
             None => ServiceRuntime::External,
@@ -824,11 +884,12 @@ impl ServiceStore {
                 "static forbids port, command, cwd and env",
             ));
         }
-        let root = request
+        let checked_root = request
             .root
             .as_deref()
-            .map(|root| super::static_files::validate_root(root, &self.dir, caller))
+            .map(|root| super::static_files::check_root(root, &self.dir, caller))
             .transpose()?;
+        let root = checked_root.as_ref().map(|root| root.path.clone());
         let requested_lifetime = request
             .lifetime
             .as_deref()
@@ -882,7 +943,7 @@ impl ServiceStore {
         };
         let host = self.host.clone();
         let probe = self.port_probe;
-        self.mutate(|registry| {
+        let apply = |registry: &mut Registry| {
             let existing = registry.services.get(&request.slug).cloned();
             if let Some(existing) = &existing {
                 match caller {
@@ -943,6 +1004,17 @@ impl ServiceStore {
                 }
             };
             port_conflict(registry, &request.slug, &host, port)?;
+            let check = MutationCheck {
+                static_root_approval: root_review(
+                    checked_root.as_ref(),
+                    existing.as_ref().and_then(|r| r.root.as_deref()),
+                ),
+            };
+            if commit && !request.static_root_approved {
+                if let (Some(root), Some(review)) = (&request.root, &check.static_root_approval) {
+                    return Err(super::static_files::approval_missing(root, review));
+                }
+            }
             let now = now_rfc3339();
             let record = ServiceRecord {
                 proxy_host_header: validate_proxy_host_header(
@@ -973,6 +1045,9 @@ impl ServiceStore {
                 env: env.clone(),
                 login_link_command: request.login_link_command.clone(),
                 stopped: false,
+                restart_requested_at: existing
+                    .as_ref()
+                    .and_then(|record| record.restart_requested_at.clone()),
                 port_allocated,
                 ceiling: ceiling_for(runtime),
                 provenance: Some(provenance_for(caller)),
@@ -990,17 +1065,22 @@ impl ServiceStore {
                 } == *existing
             });
             if unchanged {
-                return Ok((existing.unwrap(), false));
+                return Ok((existing.unwrap(), false, check));
             }
             registry.tombstones.remove(&record.slug);
-            if existing.is_none() {
+            if existing.is_none() && commit {
                 super::lifecycle::for_store(self).forget(&record.slug);
             }
             registry
                 .services
                 .insert(record.slug.clone(), record.clone());
-            Ok((record, existing.is_none()))
-        })
+            Ok((record, existing.is_none(), check))
+        };
+        if commit {
+            self.mutate(apply)
+        } else {
+            self.dry_run(apply)
+        }
     }
 
     pub fn update(
@@ -1009,6 +1089,40 @@ impl ServiceStore {
         request: UpdateRequest,
         caller: &Caller,
     ) -> ServicesResult<ServiceRecord> {
+        self.update_inner(slug, request, caller, true)
+            .map(|(record, _)| record)
+    }
+
+    /// Validate an update like `update` without changing anything.
+    pub fn validate_update(
+        &self,
+        slug: &str,
+        request: UpdateRequest,
+        caller: &Caller,
+    ) -> ServicesResult<MutationCheck> {
+        self.preview_update(slug, request, caller)
+            .map(|(_, check)| check)
+    }
+
+    /// Validate an update like `update` and return the record it would
+    /// produce (nothing is written), so a caller can compare the effective
+    /// command / cwd / env / runtime with the stored record.
+    pub fn preview_update(
+        &self,
+        slug: &str,
+        request: UpdateRequest,
+        caller: &Caller,
+    ) -> ServicesResult<(ServiceRecord, MutationCheck)> {
+        self.update_inner(slug, request, caller, false)
+    }
+
+    fn update_inner(
+        &self,
+        slug: &str,
+        request: UpdateRequest,
+        caller: &Caller,
+        commit: bool,
+    ) -> ServicesResult<(ServiceRecord, MutationCheck)> {
         if matches!(caller, Caller::Agent { .. })
             && (request.owner_cutex_session_id.is_some() || request.project_id.is_some())
         {
@@ -1017,7 +1131,8 @@ impl ServiceStore {
             ));
         }
         let host = self.host.clone();
-        self.mutate(|registry| {
+        let apply = |registry: &mut Registry| {
+            let mut check = MutationCheck::default();
             let mut record = registry
                 .services
                 .get(slug)
@@ -1032,7 +1147,14 @@ impl ServiceStore {
                 record.lifetime = ServiceLifetime::parse(lifetime)?;
             }
             if let Some(root) = &request.root {
-                record.root = Some(super::static_files::validate_root(root, &self.dir, caller)?);
+                let checked = super::static_files::check_root(root, &self.dir, caller)?;
+                check.static_root_approval = root_review(Some(&checked), before.root.as_deref());
+                if commit && !request.static_root_approved {
+                    if let Some(review) = &check.static_root_approval {
+                        return Err(super::static_files::approval_missing(root, review));
+                    }
+                }
+                record.root = Some(checked.path);
             }
             if let Some(name) = &request.display_name {
                 record.display_name = validate_display_name(name)?;
@@ -1110,8 +1232,13 @@ impl ServiceStore {
                 record.updated_at = now_rfc3339();
                 registry.services.insert(slug.to_string(), record.clone());
             }
-            Ok(record)
-        })
+            Ok((record, check))
+        };
+        if commit {
+            self.mutate(apply)
+        } else {
+            self.dry_run(apply)
+        }
     }
 
     pub fn remove(&self, slug: &str, caller: &Caller) -> ServicesResult<ServiceRecord> {
@@ -1125,6 +1252,45 @@ impl ServiceStore {
             registry.services.remove(slug);
             super::lifecycle::for_store(self).forget(slug);
             Ok(record)
+        })
+    }
+
+    /// Ask the supervisor (which may run in another process) to restart a
+    /// running managed service with its unchanged command: records a new
+    /// `restartRequestedAt` that the supervisor picks up on its next pass
+    /// (`service_restart`). Only the owner of the record; managed services
+    /// only; a service the owner stopped stays stopped (409).
+    pub fn request_restart(&self, slug: &str, caller: &Caller) -> ServicesResult<ServiceRecord> {
+        self.mutate(|registry| {
+            let record = registry
+                .services
+                .get_mut(slug)
+                .ok_or_else(|| ServicesError::not_found(slug))?;
+            ensure_owns(record, caller)?;
+            if record.runtime != ServiceRuntime::Managed {
+                return Err(ServicesError::new(
+                    409,
+                    "not_managed",
+                    format!(
+                        "service `{slug}` is {}: only managed services are run (and restarted) by cutex",
+                        record.runtime.label()
+                    ),
+                ));
+            }
+            if record.stopped {
+                return Err(ServicesError::new(
+                    409,
+                    "service_stopped",
+                    format!("service `{slug}` was stopped by the owner; only the owner can start it again"),
+                ));
+            }
+            let mut at = now_rfc3339();
+            if record.restart_requested_at.as_deref() == Some(at.as_str()) {
+                // Same millisecond as the previous request: still a new token.
+                at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            }
+            record.restart_requested_at = Some(at);
+            Ok(record.clone())
         })
     }
 
@@ -1263,7 +1429,7 @@ fn migrate_legacy_registry(value: &mut Value) {
 /// Client view of a record: env values redacted (keys only), runtime facts
 /// merged in, and the URLs a client opens.
 pub fn service_view(record: &ServiceRecord, state: Option<&RuntimeSnapshot>) -> Value {
-    let traffic = super::traffic::snapshot(&record.slug);
+    let traffic = super::traffic::snapshot_for(record);
     let default_health = if record.runtime.supervised() {
         ServiceHealth::Stopped
     } else {
@@ -1274,7 +1440,9 @@ pub fn service_view(record: &ServiceRecord, state: Option<&RuntimeSnapshot>) -> 
         "proxyHost": format!("{}.svc.localhost", record.slug),
         "proxyHostHeader": record.proxy_host_header,
         "activeConnections": traffic.active_connections,
-        "lastTrafficAt": traffic.last_traffic_at.or_else(|| state.and_then(|s|s.last_traffic_at.clone())),
+        "lastTrafficAt": traffic.last_traffic_at.or_else(|| {
+            super::traffic::current_traffic(record, state.and_then(|s| s.last_traffic_at.clone()))
+        }),
         "slug": record.slug,
         "displayName": record.display_name,
         "host": record.host,
@@ -1786,6 +1954,40 @@ mod tests {
             .unwrap();
         store.remove("mine", &agent(S1)).unwrap();
         assert!(store.get("mine").is_err());
+        let _ = std::fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn a_service_registered_again_does_not_inherit_the_old_traffic() {
+        let store = temp_store();
+        let slug = format!("rereg-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        store.register(register(&slug), &agent(S1)).unwrap();
+        crate::services::traffic::touch(&slug);
+        let old = store.get(&slug).unwrap();
+        assert!(service_view(&old, None)["lastTrafficAt"].is_string());
+        let state = RuntimeSnapshot {
+            last_traffic_at: crate::services::traffic::snapshot(&slug).last_traffic_at,
+            health: ServiceHealth::Reachable,
+            last_seen_at: None,
+            last_probe_at: None,
+            pid: None,
+            started_at: None,
+            restarts: 0,
+            last_exit_code: None,
+            last_exit_at: None,
+            next_restart_at: None,
+        };
+        store.remove(&slug, &agent(S1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // No supervisor pass in between: the process-local counters and the
+        // persisted state still carry the old service's time.
+        let (new, _) = store.register(register(&slug), &agent(S1)).unwrap();
+        assert_ne!(new.created_at, old.created_at);
+        let view = service_view(&new, Some(&state));
+        assert!(view["lastTrafficAt"].is_null(), "{view}");
+        crate::services::traffic::touch(&slug);
+        assert!(service_view(&new, Some(&state))["lastTrafficAt"].is_string());
+        crate::services::traffic::forget(&slug);
         let _ = std::fs::remove_dir_all(store.dir());
     }
 

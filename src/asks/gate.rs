@@ -66,6 +66,7 @@ impl GateInputs {
         requester: Option<&str>,
         target: &str,
     ) -> Result<Self, AskError> {
+        let home = crate::config::paths::config_dir().ok();
         let party = |session: &str| -> Result<GateParty, AskError> {
             let record = store
                 .sessions
@@ -75,7 +76,7 @@ impl GateInputs {
             Ok(GateParty {
                 cutex_session_id: session.to_string(),
                 name: record.formal_agent_name.clone(),
-                caps: Capabilities::of_record(record, boundary),
+                caps: Capabilities::of_record_in(record, boundary, store, home.as_deref()),
                 profile: record.profile.clone(),
                 approval_policy: approval,
             })
@@ -255,7 +256,7 @@ pub fn check(
             gate.approval_id = Some(record.approval_id.clone());
             GateVerdict::Review { gate, approval: record, created }
         }
-        GateOutcome::Denied(record) => {
+        GateOutcome::Denied(record) | GateOutcome::DeniedEarlier(record) => {
             gate.approval_id = Some(record.approval_id.clone());
             GateVerdict::Rejected { gate, note: record.note }
         }

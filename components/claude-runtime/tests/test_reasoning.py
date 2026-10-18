@@ -84,7 +84,11 @@ async def test_streamed_thinking_is_a_reasoning_item_with_summary_deltas(sh):
         ('item/completed', 'reasoning'),
         ('item/started', 'agentMessage'),
         ('item/agentMessage/delta', None),
+        ('item/completed', 'agentMessage'),
+        # The terminal result names the last text the final answer, live too.
         ('item/completed', 'agentMessage')]
+    texts = [i for m, t, i in events if m == 'item/completed' and t == 'agentMessage']
+    assert [i['phase'] for i in texts] == ['commentary', 'final_answer'] and texts[0]['id'] == texts[1]['id']
     started = next(i for m, t, i in events if m == 'item/started' and t == 'reasoning')
     rid = started['id']
     assert started == {'type': 'reasoning', 'id': rid, 'summary': [], 'content': []}

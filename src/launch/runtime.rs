@@ -52,6 +52,7 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: "account-id".to_string(),
             name: "demo".to_string(),
             email: None,

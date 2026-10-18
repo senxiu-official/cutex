@@ -18,7 +18,7 @@ pub fn occurrence_launch_cwd(
         );
         return Ok(cwd.clone());
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let binding = receipt
             .binding
@@ -28,7 +28,7 @@ pub fn occurrence_launch_cwd(
             chrono::DateTime::parse_from_rfc3339(&binding.started_at)?.with_timezone(&chrono::Utc);
         let before = crate::platform::process::process_started_at(binding.pid)?;
         anyhow::ensure!(before == expected, "legacy runtime cwd owner birth changed");
-        let cwd = std::fs::read_link(format!("/proc/{}/cwd", binding.pid))?;
+        let cwd = crate::platform::process::process_cwd(binding.pid)?;
         anyhow::ensure!(
             crate::platform::process::process_started_at(binding.pid)? == before,
             "legacy runtime cwd owner changed during read"
@@ -38,7 +38,7 @@ pub fn occurrence_launch_cwd(
             .ok_or_else(|| anyhow::anyhow!("runtime cwd is not UTF-8"))?
             .to_string());
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     anyhow::bail!("legacy runtime cwd recovery requires Linux process identity")
 }
 
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn legacy_cwd_reads_only_exact_process_birth() {
         let (mut store, _) = fixture();
         let ExplicitLaunchActionReceipt::Runtime(receipt) = store

@@ -207,9 +207,15 @@ adapter defines must have exactly one row (unit test).
 |---|---|
 | asks tools (`agent_list`, … see the table in code) | everyone |
 | `alarm_set`, `alarm_list`, `alarm_cancel` | everyone |
-| `service_register`, `service_update`, `service_unregister`, `service_list` | everyone |
+| `service_register`, `service_update`, `service_restart`, `service_unregister`, `service_list` | everyone |
 | `web_search` | everyone whose profile has `searchTool` on (Codex API-key profiles; also the owner's quick chats), see `docs/PROFILE-SEARCH-TOOL.md` |
 | `agent_create`, `agent_archive`, `member_runtime`, `member_replace` | project managers: the project's Director or an Agent Operator grant |
+
+`agent_list` lists only what the caller may address (its project, or the agents it
+created outside a project, plus links), own project first and offline agents last, at most
+`limit` (default 50) per call with `next_cursor`; paired hosts appear in `otherHosts` as a
+count plus up to 10 idle / busy agents each, and `host` / `include_offline` / `cursor` page
+one host (docs/PEERS.md).
 
 `director_rotate` (Directors only) was removed in r219 together with the Director seat copy and the
 legacy `cutex-director` / `cutex-release` seats (see `docs/r219-removals.md`): the Director role comes
@@ -261,8 +267,39 @@ policy `never`, and because a gate must hold whatever adapter made the call.
 
 | Kind | When | Reason code |
 |---|---|---|
-| `managed_service` | `service_register` with `runtime: managed`, or `service_update` changing runtime/command/cwd/env of a managed service, by an agent that does not itself run with `danger-full-access` + approval `never` (S3: cutex runs managed commands unsandboxed as the owner). External services and identical re-registers are not gated. | `outside_caller_envelope` |
+| `managed_service` | `service_register` with `runtime: managed`, or `service_update` changing runtime/command/cwd/env of a managed service, by an agent that does not itself run with `danger-full-access` + approval `never` (S3: cutex runs managed commands unsandboxed as the owner). Q21: judged like `browser_open` from the live native thread settings of the caller's current runtime (the runtime manager writes their permission fields to `<cutex runtime dir>/live-thread-settings/<cutex session id>.json` for the Agent Bus; used only for the record's current runtime generation and thread), so switching a running agent to full access (完全访问) needs no card; without live settings, the record's stored launch permissions. External services, identical re-registers and updates whose effective runtime, command, cwd and env (after the env merge) equal the stored record are not gated; nor is `service_restart` (same command, the earlier grant covers restarts). | `outside_caller_envelope` |
 | `agent_profile` | `agent_create` / `member_replace` with a profile marked `agentUseRequiresApproval` | `profile_requires_approval` |
+| `ask_delivery` | an agent's `agent_delegate` (asks) whose target can do more than the requester: `caps(target) ⊄ caps(requester)` (below) | `target_capabilities_not_subset` |
+
+`ask_delivery` compares (`src/asks/caps.rs::subset_differences`, called by `src/asks/gate.rs`):
+sandbox level, then for two `workspace-write` agents the target's writable roots (launch cwd plus
+`sandbox_writable_roots`) against the requester's (each target root inside some requester root,
+lexical, case-insensitive on Windows), network access, the unrestricted managed-service ceiling and
+reach. Unknown permissions are never a subset. One exception (2026-10-17): the target's **own
+cutex-assigned scratch cwd** is left out of the writable-roots comparison. That is exactly
+`<cutex home>/agents-scratch/<yyyymmdd>-<8 hex>` or `<cutex home>/chats/<yyyymmdd>-<8 hex>` (as
+`POST /v2/human/agents` / quick chats allocate it, `docs/HUMAN-AGENT-SCRATCH-CWD.md`) being the
+target's launch cwd, while no other session's cwd or writable root is that directory or inside it.
+Such a directory is private to the target, so writing there gives the target nothing over data the
+requester could share, and two cwd-less agents in one project no longer gate every delegation. Any
+other path inside the cutex home (the area itself, a subdirectory, another area, a name cutex never
+allocates, a scratch dir another session also works in) and every root of the requester are still
+compared as before. The exempt path is part of the target capabilities digest (`targetCaps` in the
+snapshot versions), so another session starting to work in it makes an earlier review stale.
+
+Claude agents' tool switches count too (2026-10-18, r243 acceptance). A Claude agent has no OS
+sandbox: its sandbox label only names the composer preset (完全访问 / 自动 record
+`danger-full-access`, 每次询问 `read-only`, 自动编辑 `workspace-write`), so a Claude requester with
+command execution off looked like a superset of any Codex target. Now a Claude agent whose next
+start has command execution off (Profile rule, or the session's own rule;
+`runtime::claude::effective_tools`) carries `noCommandExecution`, and one with neither file editing
+nor command execution carries `noFileWrite` (with commands on it writes through the shell). A
+requester with `noCommandExecution` is gated by every target that can run commands
+(`commandExecution` difference: every Codex agent, a Claude agent with execution on); one with
+`noFileWrite` by a target that can write files (`workspace-write` or wider, `fileWrite`). A target
+with fewer switches never adds a difference, and a full-access Claude target still differs from a
+`workspace-write` Codex requester on `sandbox` (unchanged). Both fields are serialized only when
+set, so every other agent's capabilities digest is unchanged.
 
 Flow: the first call records a pending approval and answers
 `{ok:false, status:"approval_required", code:"approval_required", approval_id, detail}`.
@@ -279,19 +316,78 @@ Management v2 (root credential only):
 
 - `GET /v2/approvals?state=pending|all` (default `pending`) →
   `{hostId, approvals: [ApprovalRecord]}`, newest first.
-- `POST /v2/approvals/{approvalId}/approve` and `/deny`, body `{note?}` (≤ 1000 chars) →
+- `POST /v2/approvals/{approvalId}/approve` and `/deny`, body `{note?, client?}` (note ≤ 1000 chars) →
   `{approval}`; 404 `approval_not_found`; 409 `approval_not_pending` (`details.state`).
-- Event `cutex/approvals/changed` `{reason: "requested"|"approved"|"denied", approval}` on
-  the host event stream (`cutexSessionId` = the services host event session id).
+  `approval-decided-by`: the decided record carries `decidedBy {by: "owner", connection:
+  "loopback"|"remote", peer?, client?}`; `client {app, version, device, surface, input}` (each one line,
+  ≤ 80 chars) is what the deciding client says about itself (unverified, diagnosis only). Every
+  decision is also logged as one `cutex-approval-decided {…}` line in the Management log. No cutex
+  path decides an approval by itself: a denial always comes from a root-credential client.
+- Event `cutex/approvals/changed` `{reason: "requested"|"approved"|"denied"|"consumed"|"expired"|"waiting"|"wait_ended", approval}`
+  on the host event stream (`cutexSessionId` = the services host event session id). Most
+  requests come from the Agent Bus process, whose appends never reach Management's live
+  subscribers, so Management serve watches the store (2 s metadata check) and publishes every
+  state change it did not publish itself (capability `approvals-live`).
 
 `ApprovalRecord` (camelCase): `approvalId`, `kind`, `reason`, `requesterCutexSessionId`,
 `requesterName?`, `projectId?`, `summary`, `details`, `requestSha256`,
 `state: pending|approved|denied|consumed|expired`, `createdAt`, `decidedAt?`, `note?`,
-`consumedAt?`.
+`consumedAt?`, `wait?` (below).
 
-The agent is not notified of the decision (the stock bridge does not deliver
-owner-originated bus messages); the tool text tells it to end its turn or set an alarm and
-retry. A push notification is a follow-up of the ask primitive.
+### 7.1 Holding the call for the owner (approval-wait, 2026-10-17)
+
+The service gates (`managed_service`, `service_lifetime`, `static_root`) and the agent-profile
+gate of `agent_create` / `member_replace` hold the agent's tool call up to **120 s**
+(`approvals::APPROVAL_WAIT_SECS`) instead of answering at once, when the caller opted in:
+
+| Outcome within the hold | The tool call returns |
+|---|---|
+| owner approves | the normal success result plus `approval {decision: "approved", waitedSecs, approvalId, detail}` and `detail` led by "The owner approved this request after N s; it has been carried out." (Q21; `approvals::attach_approval_note`; Agent Management results only for façades whose `X-Cutex-Facade` lists `approval-note=1`, and only on a complete receipt); the approval is consumed by this call (no retry, no decision notice) |
+| owner denies | `approval_denied` (no notice) |
+| no decision | `approval_required` exactly as before (the detail adds "the owner did not decide while this call waited"); the request stays pending on 审批 and the decision notice follows the later decision |
+
+Opt-in, so older callers keep the immediate answer:
+
+- Façade: env `CUTEX_MCP_APPROVAL_WAIT_SECS` (1–120). cutex writes it into the Codex
+  launch's `mcp_servers.cutex.env` (Codex's own MCP tool timeout is 300 s) and passes it to
+  Claude adapters that declare `features.approvalWait` (claude-r16+) through the descriptor's
+  `approvalWaitSecs`; such an adapter gives the façade the hold and a 150 s timeout to
+  `service_register`, `service_update`, `agent_create`, `member_replace` (and `delegation_wait`,
+  whose Bus wait is 120 s). A pinned older façade or adapter ignores it.
+- Façade → Agent Bus: headers `X-Cutex-Approval-Wait: <secs>` and, when known,
+  `X-Cutex-Mcp-Turn-Id` (Codex: the call's `_meta.x-codex-turn-metadata.turn_id`; Claude: env
+  `CUTEX_MCP_TURN_ID` set per call by the adapter). The façade's read timeout grows by the hold
+  (services 120 + 120 s, Agent Management 30 + 120 s).
+
+The Bus holds in the request thread: it marks the record with `wait {id, startedAt, until,
+threadId?, turnId?}`, polls the store (a metadata check every 400 ms) and ends the hold with
+`wait.end` + `endedAt`:
+
+- `approved` / `denied`: decided within the hold and returned by this call.
+- `timeout`: answered `approval_required`.
+- `disconnected`: the façade's connection closed (a peek on the socket each poll); nothing used.
+- `turn_ended`: Management saw `turn/completed` for the caller's thread (and turn, when both are
+  known) and ended the hold (`approvals::ApprovalStore::end_waits_for_turn`, called for every runtime
+  event in Management). Codex does not cancel an MCP call on interrupt, so this is what stops an
+  approval from running into a turn the agent no longer sees.
+- `runtime_changed`: before using an approval the Bus re-checks that the session's current runtime
+  is still the caller's (runtime id, generation, thread); if not, nothing is used.
+
+Using an approval happens under the store lock together with ending the hold, and only if the hold
+was not ended by someone else. A decision the call could not deliver (it ended for one of the
+last three reasons) stays on the record (an approval stays approved for a retry) and the Bus queues
+the decision notice; Management skips the notice for a decision made while a hold is active. The
+watcher publishes `cutex/approvals/changed` with reason `waiting` when a hold starts on a pending
+record and `wait_ended` when it ends without a decision, so clients can show the hold (desktop: a
+countdown on the conversation card). Capability `approval-wait`. Browser opens, ask deliveries and
+workflow runs do not hold.
+
+After a decision on a request the agent retries itself (`managed_service`,
+`service_lifetime`, `static_root`, `agent_profile`, `browser_open`), the requester gets a short cutex
+message through the alarm scheduler (owner `cutex.approvals`, delivered `after_turn` like any
+alarm, so a busy agent reads it after its turn): approved → retry the same call now; denied →
+do not retry (with the owner's note). Capability `approval-decision-notice`. Ask deliveries,
+workflow runs and browser claims act on the decision themselves and get no such message.
 
 ## 8. Native subagents per profile (decision 4)
 

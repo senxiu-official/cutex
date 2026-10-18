@@ -35,10 +35,51 @@ pub fn process_started_at(pid: u32) -> anyhow::Result<DateTime<Utc>> {
     {
         return windows_process_started_at(pid);
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        return super::macos_proc::stat(pid)?
+            .with_context(|| format!("failed to read process identity of pid {pid}"))?
+            .started_at()
+            .context("process creation time is out of range");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = pid;
         anyhow::bail!("process creation time is unsupported on this platform");
+    }
+}
+
+/// Executable image of a live process (`/proc/<pid>/exe` on Linux,
+/// `proc_pidpath` on macOS). A process that does not exist is
+/// `ErrorKind::NotFound`, like the Linux read_link.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn process_executable(pid: u32) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        super::macos_proc::exe(pid)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("no process {pid}"))
+        })
+    }
+}
+
+/// Current working directory of a live process (`/proc/<pid>/cwd` on
+/// Linux, `PROC_PIDVNODEPATHINFO` on macOS); a missing process is
+/// `ErrorKind::NotFound`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn process_cwd(pid: u32) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        super::macos_proc::cwd(pid)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("no process {pid}"))
+        })
     }
 }
 
@@ -66,7 +107,11 @@ pub fn system_boot_time() -> anyhow::Result<DateTime<Utc>> {
             .checked_sub_signed(uptime)
             .context("boot time is out of range");
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        return super::macos_proc::boot_time();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         anyhow::bail!("system boot time is unsupported on this platform");
     }
@@ -163,7 +208,14 @@ pub fn terminate_process_and_wait(
             detail: "process_already_exited".to_string(),
         });
     }
-    if let Err(err) = terminate_process(pid, false) {
+    // macOS: no cgroup / job object holds the runtime's descendants, so the
+    // whole family (process group, session and parent tree) gets SIGTERM,
+    // as `systemctl kill --kill-whom=all` does for a Linux scope.
+    #[cfg(target_os = "macos")]
+    let graceful = terminate_process_tree(&tracked_pids, false);
+    #[cfg(not(target_os = "macos"))]
+    let graceful = terminate_process(pid, false);
+    if let Err(err) = graceful {
         if !force {
             return Err(err);
         }
@@ -176,6 +228,9 @@ pub fn terminate_process_and_wait(
         });
     }
     if force {
+        // Descendants started while the family was stopping join it.
+        #[cfg(target_os = "macos")]
+        let tracked_pids = macos_refresh_family(&tracked_pids);
         terminate_process_tree(&tracked_pids, true)?;
         if wait_for_processes_exit(&tracked_pids, Duration::from_secs(2)) {
             return Ok(ProcessTerminateOutcome {
@@ -202,10 +257,75 @@ fn process_tree_pids(pid: u32) -> Vec<u32> {
     {
         windows_process_tree_pids(pid).unwrap_or_else(|_| vec![pid])
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        super::macos_proc::snapshot()
+            .map(|snapshot| macos_family(&[pid], &snapshot))
+            .unwrap_or_else(|_| vec![pid])
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         vec![pid]
     }
+}
+
+/// The process family of `roots` on macOS: the roots, every process in a
+/// process group or session one of them leads (or led, when it exited), and their descendants by
+/// parent PID, repeated until nothing is added. Roots come first and children
+/// after their parents, so a reverse walk signals leaves first. A runtime is
+/// started with `setsid()`, so its group and session hold every descendant
+/// that did not start its own session; those are found through the parent
+/// tree while their parent lives.
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_family(roots: &[u32], snapshot: &[super::macos_proc::ProcStat]) -> Vec<u32> {
+    let mut family: Vec<u32> = Vec::new();
+    for root in roots {
+        if !family.contains(root) {
+            family.push(*root);
+        }
+    }
+    // A root that already exited still names its group and session: the
+    // kernel never hands out a PID that is a live process group ID, so
+    // members with that group or session are the root's.
+    let absent: Vec<u32> = roots
+        .iter()
+        .copied()
+        .filter(|root| !snapshot.iter().any(|p| p.pid == *root))
+        .collect();
+    loop {
+        let leaders: Vec<u32> = snapshot
+            .iter()
+            .filter(|p| family.contains(&p.pid) && (p.pgid == p.pid || p.sid == p.pid))
+            .map(|p| p.pid)
+            .chain(absent.iter().copied())
+            .collect();
+        let added: Vec<u32> = snapshot
+            .iter()
+            .filter(|p| p.pid > 1 && !family.contains(&p.pid))
+            .filter(|p| {
+                family.contains(&p.ppid) || leaders.contains(&p.pgid) || leaders.contains(&p.sid)
+            })
+            .map(|p| p.pid)
+            .collect();
+        if added.is_empty() {
+            return family;
+        }
+        family.extend(added);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_refresh_family(tracked: &[u32]) -> Vec<u32> {
+    let Ok(snapshot) = super::macos_proc::snapshot() else {
+        return tracked.to_vec();
+    };
+    let mut family = tracked.to_vec();
+    for pid in macos_family(tracked, &snapshot) {
+        if !family.contains(&pid) {
+            family.push(pid);
+        }
+    }
+    family
 }
 
 pub fn any_process_is_running(pids: &[u32]) -> bool {
@@ -550,5 +670,89 @@ mod tests {
     #[test]
     fn terminate_process_rejects_zero_pid() {
         assert!(terminate_process_and_wait(0, false).is_err());
+    }
+
+    /// macOS: a runtime started in its own session is stopped with its whole
+    /// family: a child in the same group, a grandchild that ignores SIGTERM
+    /// and a grandchild that started its own session.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminate_stops_the_whole_process_family() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let script = "import os,time,signal,sys\n\
+pids=[]\n\
+a=os.fork()\n\
+if a==0:\n time.sleep(600)\n\
+pids.append(a)\n\
+r,w=os.pipe()\n\
+b=os.fork()\n\
+if b==0:\n signal.signal(signal.SIGTERM,signal.SIG_IGN)\n c=os.fork()\n if c==0:\n  os.setsid()\n  signal.signal(signal.SIGTERM,signal.SIG_IGN)\n  os.write(w,(str(os.getpid())+'\\n').encode())\n  time.sleep(600)\n time.sleep(600)\n\
+pids.append(b)\n\
+line=os.read(r,64).decode().strip()\n\
+pids.append(int(line))\n\
+print(' '.join(map(str,pids)),flush=True)\n\
+time.sleep(600)\n";
+        let mut command = std::process::Command::new("/usr/bin/python3");
+        command.args(["-c", script]).stdout(std::process::Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let descendants: Vec<u32> = line.split_whitespace().map(|p| p.parse().unwrap()).collect();
+        assert_eq!(descendants.len(), 3);
+        let root = child.id();
+        let family = process_tree_pids(root);
+        for pid in std::iter::once(root).chain(descendants.iter().copied()) {
+            assert!(family.contains(&pid), "{pid} missing from {family:?}");
+        }
+        assert!(!family.contains(&std::process::id()));
+        // Without force the SIGTERM-ignoring members survive.
+        let soft = terminate_process_and_wait(root, false).unwrap();
+        assert!(!soft.stopped);
+        let _ = child.try_wait();
+        let hard = terminate_process_and_wait(root, true).unwrap();
+        let _ = child.wait();
+        assert!(hard.stopped, "{hard:?}");
+        for pid in descendants {
+            assert!(!process_is_running(pid) || super::super::macos_proc::stat(pid).unwrap().is_some_and(|s| s.zombie));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_family_walks_groups_sessions_and_parents() {
+        use super::super::macos_proc::ProcStat;
+        let p = |pid, ppid, pgid, sid| ProcStat { pid, ppid, pgid, sid, start_ticks: 1, zombie: false, uid: 0 };
+        let snapshot = vec![
+            p(1, 0, 1, 1),
+            p(100, 1, 100, 100),  // root, session leader
+            p(101, 100, 100, 100), // child
+            p(102, 1, 100, 100),  // orphan still in the root's session
+            p(103, 101, 103, 103), // grandchild with its own session
+            p(104, 103, 103, 103), // its child
+            p(200, 1, 200, 200),  // unrelated
+        ];
+        let family = macos_family(&[100], &snapshot);
+        assert_eq!(family[0], 100);
+        for pid in [101, 102, 103, 104] {
+            assert!(family.contains(&pid));
+        }
+        assert!(!family.contains(&200) && !family.contains(&1));
+        assert_eq!(macos_family(&[999], &snapshot), vec![999]);
+        // The root exited: its session members are still its family.
+        let without_root: Vec<_> = snapshot.into_iter().filter(|p| p.pid != 100).collect();
+        let family = macos_family(&[100], &without_root);
+        for pid in [101, 102, 103, 104] {
+            assert!(family.contains(&pid));
+        }
+        assert!(!family.contains(&200));
     }
 }

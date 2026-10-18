@@ -23,7 +23,7 @@ pub struct ReviewedChatgptAuth {
     pub account_sha256: crate::role_revision::Sha256,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn review(path: PathBuf) -> anyhow::Result<ReviewedChatgptAuth> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -173,12 +173,12 @@ pub(super) fn account_identity(bytes: &[u8]) -> anyhow::Result<crate::role_revis
     Ok(account_sha256)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn review(_: PathBuf) -> anyhow::Result<ReviewedChatgptAuth> {
     anyhow::bail!("reviewed private ChatGPT auth file currently supports Linux only")
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

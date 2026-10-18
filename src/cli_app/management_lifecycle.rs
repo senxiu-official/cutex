@@ -1892,6 +1892,7 @@ mod profile_tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: "account-live-remote-tui".to_string(),
             name: "live-remote-tui".to_string(),
             email: None,

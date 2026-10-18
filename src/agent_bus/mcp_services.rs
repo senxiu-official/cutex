@@ -9,12 +9,13 @@ use serde_json::Value;
 
 pub(super) const REGISTER: &str = "service_register";
 pub(super) const UPDATE: &str = "service_update";
+pub(super) const RESTART: &str = "service_restart";
 pub(super) const UNREGISTER: &str = "service_unregister";
 pub(super) const LIST: &str = "service_list";
 pub(super) const PATH: &str = "/api/services/v1";
 
 pub(super) fn is_tool(name: &str) -> bool {
-    matches!(name, REGISTER | UPDATE | UNREGISTER | LIST)
+    matches!(name, REGISTER | UPDATE | RESTART | UNREGISTER | LIST)
 }
 
 fn command_schema() -> Value {
@@ -23,31 +24,32 @@ fn command_schema() -> Value {
 
 pub(super) fn tools() -> Vec<Value> {
     vec![
-        json!({"name":REGISTER,"description":"Register a web server or static HTML report (dev server, preview, API, docs) so the owner can find, open and monitor it. Do this instead of picking a random port: omit `port` and cutex allocates a free one and returns it, then start your server on that port, bound to 127.0.0.1 (managed commands get PORT and HOST=127.0.0.1). With runtime `external` (default) you run the process and cutex only health-checks it; with `managed` cutex runs `command`, restarts it on crashes, and starts it again when the owner opens it after a stop. To show the owner a single page, chart or picture, publish it with artifact_publish show: true instead (it opens beside your conversation); services are for real servers and multi-file sites. A static service serves an absolute root (directory or .html file, no port/command/env). Vite commands must use --port {port} --strictPort. New services default to ephemeral and are reclaimed after idle/TTL or owner archive; persistent may need owner approval (owner setting; same approval_required flow as below). Link the returned cutex:service/ link. reveal requests an owner notification. Re-registering your own slug updates it. Unregister it when the service is gone for good. A `managed` command runs outside your sandbox, so unless you already run with full access and approval `never` it needs the owner's approval: the call answers `approval_required` with an approval_id; retry the same call after the owner approves (end your turn or set an alarm instead of polling).","inputSchema":{"type":"object","properties":{
+        json!({"name":REGISTER,"description":"Register a web server or static HTML report (dev server, preview, API, docs) so the owner can find, open and monitor it. Do this instead of picking a random port: omit `port` and cutex allocates a free one and returns it, then start your server on that port, bound to 127.0.0.1 (managed commands get PORT and HOST=127.0.0.1). With runtime `external` (default) you run the process and cutex only health-checks it; with `managed` cutex runs `command`, restarts it on crashes, and starts it again when the owner opens it after a stop. To show the owner a single page, chart or picture, publish it with artifact_publish show: true instead (it opens beside your conversation); services are for real servers and multi-file sites. A static service serves an absolute root (directory or .html file, no port/command/env): a root inside your cwd or project workspace needs nothing; any other existing root outside the cutex home needs the owner's approval (approval_required, one approval together with a persistent lifetime); the cutex home (except your own cutex-made scratch cwd), filesystem roots and the user home itself are always refused. The request is fully validated before any approval is asked, so fix static_root_forbidden / invalid errors first. Vite commands must use --port {port} --strictPort. New services default to ephemeral and are reclaimed after idle/TTL or owner archive; persistent may need owner approval (owner setting; same approval_required flow as below). Link the returned cutex:service/ link. reveal requests an owner notification. Re-registering your own slug updates it. Unregister it when the service is gone for good. A `managed` command runs outside your sandbox, so unless you already run with full access and approval `never` it needs the owner's approval: the call waits up to 2 minutes for the owner's decision and then proceeds (or answers approval_denied); if the owner has not decided by then it answers `approval_required` with an approval_id: retry the same call after the owner approves (end your turn or set an alarm instead of polling).","inputSchema":{"type":"object","properties":{
             "slug":{"type":"string","description":"Stable id, unique on this host: a-z, 0-9 and '-', e.g. `myapp-web`."},
             "display_name":{"type":"string","description":"Human name; defaults to the slug."},
             "reveal":{"type":"boolean","description":"Request that the owner see this page (rate limited)."},
             "port":{"type":"integer","minimum":1,"maximum":65535,"description":"Omit to get a free port allocated."},
             "path":{"type":"string","description":"URL path to open and health-check, e.g. `/` or `/health`."},
             "runtime":{"type":"string","enum":["external","managed","static"],"description":"Default external."},
-            "root":{"type":"string","description":"Absolute static directory or .html file in your cwd or project workspace."},
+            "root":{"type":"string","description":"Absolute static directory or .html file. Inside your cwd or project workspace: no approval; elsewhere (outside the cutex home, not a filesystem root or the user home): owner approval."},
             "lifetime":{"type":"string","enum":["ephemeral","persistent"]},
             "command":command_schema(),
             "cwd":{"type":"string","description":"Absolute working directory for managed."},
             "env":{"type":"object","additionalProperties":{"type":"string"},"description":"Extra environment for managed (values are never shown back)."}
         },"required":["slug"],"additionalProperties":false}}),
-        json!({"name":UPDATE,"description":"Change a service you registered (port, path, name, command, cwd, env, lifetime). Upgrading lifetime to persistent may require owner approval (owner setting); downgrade only your own service. Only your own services. `path`/`cwd`/`command` null clears; env entries merge, null removes a key. Changing what a managed service runs (runtime, command, cwd, env) needs the owner's approval like registering it.","inputSchema":{"type":"object","properties":{
+        json!({"name":UPDATE,"description":"Change a service you registered (port, path, name, command, cwd, env, lifetime). Upgrading lifetime to persistent may require owner approval (owner setting); downgrade only your own service. Only your own services. `path`/`cwd`/`command` null clears; env entries merge, null removes a key. Changing what a managed service runs (runtime, command, cwd, env) needs the owner's approval like registering it; restating unchanged values does not. To restart it unchanged (e.g. after editing its code) use service_restart.","inputSchema":{"type":"object","properties":{
             "slug":{"type":"string"},
             "display_name":{"type":"string"},
             "port":{"type":"integer","minimum":1,"maximum":65535},
             "path":{"type":["string","null"]},
             "runtime":{"type":"string","enum":["external","managed","static"]},
-            "root":{"type":"string","description":"Absolute static directory or .html file in your cwd or project workspace."},
+            "root":{"type":"string","description":"Absolute static directory or .html file. Inside your cwd or project workspace: no approval; elsewhere (outside the cutex home, not a filesystem root or the user home): owner approval."},
             "lifetime":{"type":"string","enum":["ephemeral","persistent"]},
             "command":command_schema(),
             "cwd":{"type":["string","null"]},
             "env":{"type":"object","additionalProperties":{"type":["string","null"]}}
         },"required":["slug"],"additionalProperties":false}}),
+        json!({"name":RESTART,"description":"Restart a managed service you registered (e.g. after editing its code) with its unchanged command, cwd and env. No owner approval: the approval that let the command run covers its restarts. The call returns once the restart is requested; cutex stops the running process and starts it again about a second later (check service_list for health and process.startedAt). Refused for external and static services (not_managed: restart your own process) and for a service the owner stopped (service_stopped: only the owner starts it again). To change what it runs, use service_update instead (it restarts the service itself). Only your own services.","inputSchema":{"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"],"additionalProperties":false}}),
         json!({"name":UNREGISTER,"description":"Remove a service you registered (managed ones are stopped). Only your own services.","inputSchema":{"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"],"additionalProperties":false}}),
         json!({"name":LIST,"description":"List web services you may use, with lifetime, cutex:service/ link, port, URL and health (reachable/unreachable/starting/stopped): your own, your project's (outside a project: those of the cutex agents you created and the ones they created; native subagents are not cutex agents) and the owner's shared ones. Command, cwd and env keys are shown only for your own services. Check it before starting a server to reuse an existing one.","inputSchema":{"type":"object","properties":{"mine":{"type":"boolean","description":"Only services you registered."}},"required":[],"additionalProperties":false}}),
     ]
@@ -94,6 +96,7 @@ pub(super) fn request_body(name: &str, args: Value) -> anyhow::Result<Value> {
     let op = match name {
         REGISTER => "register",
         UPDATE => "update",
+        RESTART => "restart",
         UNREGISTER => "unregister",
         LIST => "list",
         _ => anyhow::bail!("unsupported services tool"),
@@ -125,7 +128,7 @@ pub(super) fn request_body(name: &str, args: Value) -> anyhow::Result<Value> {
         .filter(|slug| !slug.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("slug is required"))?;
     out.insert("slug".into(), json!(slug));
-    if op == "unregister" {
+    if op == "unregister" || op == "restart" {
         anyhow::ensure!(
             parsed.display_name.is_none()
                 && parsed.port.is_none()
@@ -137,7 +140,7 @@ pub(super) fn request_body(name: &str, args: Value) -> anyhow::Result<Value> {
                 && parsed.root.is_none()
                 && parsed.lifetime.is_none()
                 && parsed.reveal.is_none(),
-            "unregister takes only `slug`"
+            "{op} takes only `slug`"
         );
         return Ok(json!({"op": op, "args": out}));
     }
@@ -224,6 +227,12 @@ mod tests {
             request_body(UNREGISTER, json!({"slug":"web"})).unwrap()["op"],
             "unregister"
         );
+        assert_eq!(
+            request_body(RESTART, json!({"slug":"web"})).unwrap(),
+            json!({"op":"restart","args":{"slug":"web"}})
+        );
+        assert!(request_body(RESTART, json!({"slug":"web","command":"x"})).is_err());
+        assert!(request_body(RESTART, json!({})).is_err());
         assert_eq!(
             request_body(LIST, json!({})).unwrap(),
             json!({"op":"list","args":{}})

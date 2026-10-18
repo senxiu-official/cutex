@@ -700,7 +700,7 @@ pub(super) fn validate_asset(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn review_auth(path: &Path, route: &Route) -> anyhow::Result<AuthCustody> {
     use std::os::unix::fs::MetadataExt;
     ensure!(
@@ -770,7 +770,7 @@ pub fn review_auth(path: &Path, route: &Route) -> anyhow::Result<AuthCustody> {
         api_file,
     })
 }
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn review_auth(_: &Path, _: &Route) -> anyhow::Result<AuthCustody> {
     anyhow::bail!("selected auth requires Linux")
 }
@@ -814,7 +814,7 @@ impl ApiKey {
             .map_err(|_| anyhow::anyhow!("invalid API credential"))
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_api_key(path: &Path) -> anyhow::Result<ApiKey> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -988,7 +988,7 @@ impl Projection {
     }
     pub fn secret(&self) -> anyhow::Result<Option<ApiKey>> {
         self.validate()?;
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         if matches!(self.route, Route::GlmApiKey | Route::ApiKey) {
             let key = read_api_key(&self.auth.path)?;
             ensure!(
@@ -1184,7 +1184,7 @@ trust_level = "untrusted"
         assert!(validate_model(&Route::GlmApiKey, "glm-5.3", Some("max"), None).is_err());
     }
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn new_account_identity_uses_configured_route_and_forwards_enabled_settings() {
         use base64::Engine;
         use std::os::unix::fs::PermissionsExt;
@@ -1240,7 +1240,7 @@ trust_level = "untrusted"
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn glm_model_selection_uses_supplied_catalog_instead_of_hardcoded_slug() {
         use std::os::unix::fs::PermissionsExt;
         let root =
@@ -1424,7 +1424,7 @@ trust_level = "untrusted"
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn api_key_route_blanks_provider_key_for_native_tools_after_profile_policy() {
         use std::os::unix::fs::PermissionsExt;
         // Same custody rules as above: a disposable 0700 dir in the real home.

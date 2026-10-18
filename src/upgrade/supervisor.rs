@@ -565,7 +565,8 @@ impl Spawner for ProcessSpawner {
             Service::Bus => self.bus_port,
             Service::Management => self.management_port,
         };
-        std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(500)).is_ok()
+        crate::config::instance::ensure_port_allowed(port).is_ok()
+            && std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(500)).is_ok()
     }
 
     fn adopt(&self, service: Service, pid: u32, process_started_at: Option<&str>) -> Option<Box<dyn Child>> {

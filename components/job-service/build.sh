@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build the job-service component archive of one platform (components/README.md, Layout):
 #
-#   component-job-service-<version>-<platform>.tar.gz   cutex-job-service at the archive root
+#   component-job-service-<version>-<platform>.tar.gz   cutex-job-service at the archive root, with LICENSE,
+#                                                       NOTICE and THIRD_PARTY_NOTICES.md next to it
 #   SHA256SUMS-component-job-service-<platform>
 #   BUILD-INFO-component-job-service-<platform>.json     {name, version, commit, platform}
 #
@@ -11,7 +12,10 @@
 # Same rules as the cutex archive (.github/ci/build-cutex.sh): builds an LF `git archive` export of
 # HEAD's components/job-service under BUILD_ROOT, no build paths in the binary (remap + leak check),
 # stripped, ustar with fixed owner and mtime (last commit of the binary's sources), `gzip -n`. Linux
-# only (the Job Service is Linux-only).
+# only (the Job Service is Linux-only). LICENSE and NOTICE are the repository's (the public export's root);
+# THIRD_PARTY_NOTICES.md comes from Cargo.lock and the crate sources the build downloaded
+# (.github/ci/third_party_notices.py of the public export; no network). A change of any of them changes
+# the archive, so it needs a new component version like a source change (see the mtime below).
 # Environment (optional): BUILD_ROOT (default <checkout>/../build-root), CARGO_HOME, RUST_TOOLCHAIN
 # (default 1.95.0), LEAK_POLICY fail (default) | warn.
 set -euo pipefail
@@ -76,6 +80,20 @@ stage="$build_root/job-service-stage-$platform"
 rm -rf "${stage:?}"
 mkdir -p "$stage"
 cp "$src/target/release/cutex-job-service" "$stage/"
+for f in LICENSE NOTICE; do
+  [ -f "$root/$f" ] || { echo "no $f at the repository root (build from the public export)" >&2; exit 1; }
+  cp "$root/$f" "$stage/$f"
+done
+notices_tool="$root/.github/ci/third_party_notices.py"
+[ -f "$notices_tool" ] || { echo "no $notices_tool (build from the public export)" >&2; exit 1; }
+# `cargo metadata --offline` (the notices tool) needs every locked package's sources, dev-dependencies
+# too (tempfile -> fastrand), which the release build above does not download.
+(cd "$src" && cargo "+$toolchain" fetch --locked)
+python3 "$notices_tool" --manifest-path "$src/Cargo.toml" --target "$target" --toolchain "$toolchain" \
+  --package cutex-job-service --title "cutex Job Service: third-party notices" \
+  --intro "cutex-job-service in this archive is part of cutex, licensed under the Apache License 2.0 (LICENSE; attributions in NOTICE). It is built from the third-party Rust crates below." \
+  --out "$stage/THIRD_PARTY_NOTICES.md"
+chmod 0644 "$stage/LICENSE" "$stage/NOTICE" "$stage/THIRD_PARTY_NOTICES.md"
 leaks=0
 for p in $(printf '%s\n' "$root" "$cargo_home" "$sysroot" "$HOME" "$src" | sort -u); do
   [ -n "$p" ] && [ "$p" != / ] || continue
@@ -92,7 +110,8 @@ name="component-job-service-$version-$platform.tar.gz"
 sums="SHA256SUMS-component-job-service-$platform"
 info="BUILD-INFO-component-job-service-$platform.json"
 chmod 0755 "$stage/cutex-job-service"
-tar -C "$stage" --format=ustar --owner=0 --group=0 --numeric-owner --mtime="@$mtime" -cf - cutex-job-service | gzip -n -9 > "$out/$name"
+tar -C "$stage" --format=ustar --owner=0 --group=0 --numeric-owner --mtime="@$mtime" -cf - \
+  cutex-job-service LICENSE NOTICE THIRD_PARTY_NOTICES.md | gzip -n -9 > "$out/$name"
 (cd "$out" && sha256sum "$name" > "$sums")
 python3 - "$out/$info" "$version" "$commit" "$platform" <<'PY'
 import json, sys

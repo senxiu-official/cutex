@@ -14,7 +14,6 @@ use crate::config::agent_security::{
     AgentSecurityConfig, CrossProjectAccess, DomainLink, ExternalAgentGrant,
 };
 use crate::config::global_settings::{apply_global_config_patch, ConfigValueUpdate, GlobalConfigPatch};
-use crate::config::proxy::proxy_config_from_parts;
 use crate::config::store::{load_codez_config_checked, save_codez_config};
 use crate::http::server::write_json_response;
 use crate::http::server::SimpleHttpRequest;
@@ -70,43 +69,59 @@ const PATCH_FIELDS: &[&str] = &[
     "workflows",
 ];
 
-/// Proxy URL with any `user:password@` removed.
-fn redacted_proxy_url(url: &str) -> (String, bool) {
-    match url::Url::parse(url) {
-        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            (parsed.to_string(), true)
-        }
-        Ok(_) => (url.to_string(), false),
-        // Unparseable: drop anything before '@' defensively.
-        Err(_) => match url.rsplit_once('@') {
-            Some((prefix, host)) => {
-                let scheme = prefix.split_once("://").map(|(s, _)| s).unwrap_or("");
-                (format!("{scheme}://{host}"), true)
-            }
-            None => (url.to_string(), false),
-        },
-    }
-}
-
-fn proxy_view(proxy: Option<&ProxyConfig>) -> Value {
-    let Some(proxy) = proxy else {
-        return Value::Null;
-    };
+/// Host proxy (`proxy-modes`): the default every Profile inherits and the proxy of cutex's own
+/// outbound requests. `mode` system (nothing stored: daemon environment, then the Windows system
+/// proxy; no PAC) | none | manual. Credentials are never returned (`urlHasCredentials`); loopback
+/// always bypasses (`loopbackNoProxy`, not editable); `system` = what "follow system" resolves to
+/// on this host right now; `editable` = this caller may change it (root credential, never a
+/// client / device token).
+pub(crate) fn proxy_view(proxy: Option<&ProxyConfig>) -> Value {
+    use crate::config::proxy_outbound::{http_proxy_scheme, redacted_proxy_url, system_proxy, OutboundProxy};
+    let mode = OutboundProxy::from_config(proxy);
     let (url, has_credentials) = proxy
-        .url
-        .as_deref()
+        .and_then(|proxy| proxy.url.as_deref())
         .map(redacted_proxy_url)
         .map(|(url, creds)| (Some(url), creds))
         .unwrap_or((None, false));
+    let warning = match &mode {
+        OutboundProxy::Manual { url, .. } if !http_proxy_scheme(url) => Some(
+            "cutex's own downloads (upgrades, components, quota readers) need an http:// or https:// proxy; a SOCKS URL only reaches the runtimes",
+        ),
+        _ => None,
+    };
     json!({
-        "enabled": proxy.enabled,
+        "mode": mode.mode(),
+        "enabled": proxy.is_some_and(|proxy| proxy.enabled),
         "url": url,
         "urlHasCredentials": has_credentials,
-        "noProxy": proxy.no_proxy,
-        "forceHttpTransport": proxy.force_http_transport,
+        "noProxy": proxy.and_then(|proxy| proxy.no_proxy.clone()),
+        "loopbackNoProxy": crate::config::proxy::LOOPBACK_NO_PROXY,
+        "system": system_proxy().map(|resolved| json!({
+            "url": redacted_proxy_url(&resolved.url).0,
+            "source": resolved.source.as_str(),
+        })),
+        "pacSupported": false,
+        "editable": proxy_editable(),
+        "warning": warning,
     })
+}
+
+/// Proxy settings change where traffic goes: only the root credential (this machine, an SSH
+/// tunnel, the desktop's host token) may change them, never a client / device token.
+pub(crate) fn proxy_editable() -> bool {
+    crate::management::listeners::current_client_token().is_none()
+}
+
+pub(crate) fn proxy_owner_required(stream: &mut TcpStream) -> anyhow::Result<()> {
+    super::server::write_v2_error(
+        stream,
+        403,
+        "Forbidden",
+        "proxy_owner_credential_required",
+        "proxy settings can only be changed with the host's own credential (not a client or device token)",
+        false,
+        json!({ "field": "proxy" }),
+    )
 }
 
 /// Profile a quick chat (`POST /v2/human/sessions`) uses: the request's,
@@ -755,7 +770,7 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<SettingsRequest, String> {
         Some(Value::Object(map)) => {
             if let Some(key) = map
                 .keys()
-                .find(|k| !["enabled", "url", "noProxy", "forceHttpTransport"].contains(&k.as_str()))
+                .find(|k| !["mode", "enabled", "url", "noProxy"].contains(&k.as_str()))
             {
                 return Err(format!("proxy: unsupported field {key}"));
             }
@@ -875,33 +890,12 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<SettingsRequest, String> {
     })
 }
 
-/// Merge a partial proxy object onto the current proxy. Omitted `url` keeps
-/// the stored URL (so credentials embedded in it survive toggles).
-fn merged_proxy(
+/// Merge a partial proxy object onto the current proxy; `None` = follow system (nothing stored).
+pub(crate) fn merged_proxy(
     current: Option<&ProxyConfig>,
     update: &Map<String, Value>,
-) -> anyhow::Result<ProxyConfig> {
-    let bool_field = |key: &str, fallback: bool| -> anyhow::Result<bool> {
-        match update.get(key) {
-            None => Ok(fallback),
-            Some(Value::Bool(value)) => Ok(*value),
-            Some(_) => anyhow::bail!("proxy.{key} must be a boolean"),
-        }
-    };
-    let string_field = |key: &str, fallback: Option<String>| -> anyhow::Result<Option<String>> {
-        match update.get(key) {
-            None => Ok(fallback),
-            Some(Value::Null) => Ok(None),
-            Some(Value::String(value)) => Ok(Some(value.clone())),
-            Some(_) => anyhow::bail!("proxy.{key} must be a string or null"),
-        }
-    };
-    proxy_config_from_parts(
-        bool_field("enabled", current.is_some_and(|p| p.enabled))?,
-        string_field("url", current.and_then(|p| p.url.clone()))?,
-        string_field("noProxy", current.and_then(|p| p.no_proxy.clone()))?,
-        bool_field("forceHttpTransport", current.map_or(true, |p| p.force_http_transport))?,
-    )
+) -> anyhow::Result<Option<ProxyConfig>> {
+    crate::config::proxy::apply_proxy_update(current, update, "system")
 }
 
 fn apply(request: SettingsRequest) -> anyhow::Result<(CodezConfig, bool)> {
@@ -929,7 +923,10 @@ fn apply(request: SettingsRequest) -> anyhow::Result<(CodezConfig, bool)> {
     patch.proxy = match &request.proxy {
         None => ConfigValueUpdate::Unchanged,
         Some(None) => ConfigValueUpdate::Clear,
-        Some(Some(update)) => ConfigValueUpdate::Set(merged_proxy(config.proxy.as_ref(), update)?),
+        Some(Some(update)) => match merged_proxy(config.proxy.as_ref(), update)? {
+            Some(proxy) => ConfigValueUpdate::Set(proxy),
+            None => ConfigValueUpdate::Clear,
+        },
     };
     if let Some(defaults) = &request.new_thread_defaults {
         patch.new_thread_defaults = Some(
@@ -1072,6 +1069,9 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
                 Ok(parsed) => parsed,
                 Err(message) => return bad_request(stream, &message),
             };
+            if parsed.proxy.is_some() && !proxy_editable() {
+                return proxy_owner_required(stream);
+            }
             if !crate::management::listeners::current_request_is_loopback() {
                 // The daemon fetches usage.catalogUrl itself: only from this machine.
                 let catalog_url = parsed
@@ -1461,7 +1461,6 @@ mod tests {
                 enabled: true,
                 url: Some("http://alice:pw-secret@127.0.0.1:7890".into()),
                 no_proxy: None,
-                force_http_transport: true,
             }),
             ..CodezConfig::default()
         };
@@ -1478,6 +1477,12 @@ mod tests {
 
     #[test]
     fn listen_settings_parse_validate_and_view() {
+        // Default-instance rules: a bare address takes the default port 24270
+        // (nothing here connects or binds).
+        crate::config::instance::with_default_ports_for_test(listen_settings_parse_validate_and_view_inner);
+    }
+
+    fn listen_settings_parse_validate_and_view_inner() {
         let parsed = parse_patch(br#"{"managementListen":["127.0.0.1","tailscale","10.0.0.5:24270"],"managementCorsOrigins":["capacitor://localhost"]}"#).unwrap();
         assert_eq!(
             parsed.listen,
@@ -1524,7 +1529,7 @@ mod tests {
             headers: Default::default(),
             body: br#"{"managementListen":["127.0.0.1","0.0.0.0:24280"]}"#.to_vec(),
         };
-        handle(&mut stream, &request).unwrap();
+        crate::config::instance::with_default_ports_for_test(|| handle(&mut stream, &request)).unwrap();
         crate::management::listeners::set_current_connection(None);
         drop(stream);
         let response = client.join().unwrap();
@@ -1798,13 +1803,92 @@ mod tests {
             enabled: true,
             url: Some("http://u:p@127.0.0.1:1".into()),
             no_proxy: None,
-            force_http_transport: true,
         };
-        let update = json!({ "forceHttpTransport": false });
-        let merged = merged_proxy(Some(&current), update.as_object().unwrap()).unwrap();
+        let update = json!({ "noProxy": "corp.example" });
+        let merged = merged_proxy(Some(&current), update.as_object().unwrap()).unwrap().unwrap();
         assert_eq!(merged.url.as_deref(), Some("http://u:p@127.0.0.1:1"));
-        assert!(!merged.force_http_transport);
+        assert_eq!(merged.no_proxy.as_deref(), Some("corp.example"));
         let enable_without_url = json!({ "enabled": true });
         assert!(merged_proxy(None, enable_without_url.as_object().unwrap()).is_err());
+        let retired = parse_patch(br#"{"proxy":{"forceHttpTransport":false}}"#).unwrap_err();
+        assert!(retired.contains("forceHttpTransport"), "{retired}");
+    }
+
+    #[test]
+    fn proxy_modes_round_trip() {
+        let manual = ProxyConfig { enabled: true, url: Some("http://u:p@127.0.0.1:1".into()), no_proxy: None };
+        let set = |current: Option<&ProxyConfig>, body: Value| merged_proxy(current, body.as_object().unwrap());
+        assert_eq!(set(Some(&manual), json!({"mode": "system"})).unwrap(), None);
+        // Off keeps the manual address (never used while off); manual restores it.
+        let none = set(Some(&manual), json!({"mode": "none"})).unwrap().unwrap();
+        assert!(!none.enabled);
+        assert_eq!(none.url.as_deref(), Some("http://u:p@127.0.0.1:1"));
+        assert!(matches!(
+            crate::config::proxy_outbound::OutboundProxy::from_config(Some(&none)),
+            crate::config::proxy_outbound::OutboundProxy::Direct
+        ));
+        assert!(crate::config::proxy::proxy_envs(Some(&none), None)
+            .iter()
+            .all(|(key, value)| key.eq_ignore_ascii_case("no_proxy") || value.is_empty()));
+        let again = set(Some(&none), json!({"mode": "manual"})).unwrap().unwrap();
+        assert!(again.enabled);
+        assert_eq!(again.url.as_deref(), Some("http://u:p@127.0.0.1:1"));
+        // An edit while off is remembered; `url: null` forgets; an invalid one is refused.
+        let edited = set(Some(&none), json!({"url": "http://127.0.0.1:2"})).unwrap().unwrap();
+        assert!(!edited.enabled && edited.url.as_deref() == Some("http://127.0.0.1:2"));
+        assert!(set(Some(&none), json!({"mode": "none", "url": "not a url"})).is_err());
+        let forgotten = set(Some(&none), json!({"mode": "none", "url": null})).unwrap().unwrap();
+        assert!(!forgotten.enabled && forgotten.url.is_none());
+        assert!(set(Some(&forgotten), json!({"mode": "manual"})).is_err(), "manual needs a URL");
+        assert!(set(None, json!({"mode": "none"})).unwrap().unwrap().url.is_none());
+        assert!(set(None, json!({"mode": "pac"})).is_err());
+        assert!(set(None, json!({"mode": "manual", "url": "not a url"})).is_err());
+        assert!(set(None, json!({"mode": "manual", "url": "ftp://proxy:21"})).is_err());
+
+        let view = |proxy: Option<ProxyConfig>| settings_view(&CodezConfig { proxy, ..CodezConfig::default() })["proxy"].clone();
+        assert_eq!(view(None)["mode"], "system");
+        assert_eq!(view(None)["editable"], true);
+        assert_eq!(view(None)["loopbackNoProxy"], json!(["127.0.0.1", "localhost", "::1"]));
+        let none_view = view(Some(none));
+        assert_eq!(none_view["mode"], "none");
+        assert_eq!(none_view["url"], "http://127.0.0.1:1/");
+        assert_eq!(none_view["urlHasCredentials"], true);
+        let manual_view = view(Some(manual));
+        assert_eq!(manual_view["mode"], "manual");
+        assert_eq!(manual_view["url"], "http://127.0.0.1:1/");
+        assert!(manual_view.get("forceHttpTransport").is_none());
+        let socks = view(Some(ProxyConfig { enabled: true, url: Some("socks5h://127.0.0.1:1080".into()), no_proxy: None }));
+        assert!(socks["warning"].as_str().unwrap().contains("SOCKS"));
+    }
+
+    #[test]
+    fn proxy_writes_need_the_root_credential() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            let mut text = String::new();
+            stream.read_to_string(&mut text).unwrap();
+            text
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        crate::management::listeners::set_current_client_token(Some(
+            crate::management::client_tokens::VerifiedClientToken::test_token("mct-proxy-test"),
+        ));
+        let request = SimpleHttpRequest {
+            method: "PATCH".into(),
+            path: PATH.into(),
+            headers: Default::default(),
+            body: br#"{"proxy":{"mode":"none"}}"#.to_vec(),
+        };
+        let editable = settings_view(&CodezConfig::default())["proxy"]["editable"].clone();
+        handle(&mut stream, &request).unwrap();
+        crate::management::listeners::set_current_client_token(None);
+        drop(stream);
+        let response = client.join().unwrap();
+        assert_eq!(editable, false);
+        assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+        assert!(response.contains("\"proxy_owner_credential_required\""), "{response}");
     }
 }

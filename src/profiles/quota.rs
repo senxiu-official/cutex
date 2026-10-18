@@ -764,13 +764,29 @@ fn auth_path(a: &StoredAccount) -> anyhow::Result<PathBuf> {
         .join(&a.id)
         .join("auth.json"))
 }
+#[cfg(test)]
 fn fetch(c: &Config, auth: &[u8], now: i64) -> anyhow::Result<Display> {
     parse(c, &fetch_json(c, auth)?, now)
 }
+#[cfg(test)]
 fn fetch_json(c: &Config, auth: &[u8]) -> anyhow::Result<Value> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(8)))
-        .max_redirects(0)
+    fetch_json_via(c, auth, &crate::config::proxy_outbound::OutboundProxy::System)
+}
+/// The Profile's effective proxy (proxy-modes: quota readers go the same way as its model traffic).
+fn profile_proxy(a: &StoredAccount) -> crate::config::proxy_outbound::OutboundProxy {
+    crate::config::proxy_outbound::OutboundProxy::for_profile(a, &crate::config::store::load_codez_config())
+}
+fn fetch_json_via(
+    c: &Config,
+    auth: &[u8],
+    proxy: &crate::config::proxy_outbound::OutboundProxy,
+) -> anyhow::Result<Value> {
+    let agent = proxy
+        .apply(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(std::time::Duration::from_secs(8)))
+                .max_redirects(0),
+        )?
         .build()
         .new_agent();
     let mut req = agent.get(&c.url).header("Accept", "application/json");
@@ -783,9 +799,14 @@ fn fetch_json(c: &Config, auth: &[u8]) -> anyhow::Result<Value> {
         let value = if c.auth == Auth::ProfileApiKey { format!("Bearer {key}") } else { key.to_string() };
         req = req.header("Authorization", &value);
     }
-    let mut response = req.call().map_err(|e| match e {
-        ureq::Error::StatusCode(s) => anyhow::anyhow!("Quota endpoint returned HTTP {s}"),
-        _ => anyhow::anyhow!("Quota endpoint unavailable"),
+    let mut response = req.call().map_err(|e| {
+        if let Some(message) = crate::config::proxy_outbound::proxy_error_message(&e) {
+            return anyhow::anyhow!("Quota endpoint unavailable: {message}");
+        }
+        match e {
+            ureq::Error::StatusCode(s) => anyhow::anyhow!("Quota endpoint returned HTTP {s}"),
+            _ => anyhow::anyhow!("Quota endpoint unavailable"),
+        }
     })?;
     ensure!(
         response.status().is_success(),
@@ -801,11 +822,12 @@ fn fetch_json(c: &Config, auth: &[u8]) -> anyhow::Result<Value> {
 }
 /// Shared per-profile cache and nonblocking lock prevent multiple TUI windows from multiplying requests.
 pub fn read(a: &StoredAccount, force: bool) -> anyhow::Result<Option<Display>> {
+    let proxy = profile_proxy(a);
     read_cached(
         a,
         force,
         &crate::config::paths::runtime_dir()?.join("profile-quota"),
-        fetch,
+        |c, auth, now| parse(c, &fetch_json_via(c, auth, &proxy)?, now),
     )
 }
 
@@ -1022,11 +1044,12 @@ pub fn resolve_extras(a: &StoredAccount) -> Vec<(usize, anyhow::Result<Config>)>
 /// Read every enabled gauge of a profile through the shared private cache.
 /// One HTTP response is reused for gauges that share a URL within a call.
 pub fn gauges(a: &StoredAccount, force: bool) -> anyhow::Result<Vec<Gauge>> {
+    let proxy = profile_proxy(a);
     let gauges = gauges_in(
         a,
         force,
         &crate::config::paths::runtime_dir()?.join("profile-quota"),
-        fetch_json,
+        |c, auth| fetch_json_via(c, auth, &proxy),
     )?;
     // Best-effort trend snapshots (throttled per gauge); never fails the read.
     crate::management::v2::usage::record_quota_gauges(&a.id, &a.name, &gauges);

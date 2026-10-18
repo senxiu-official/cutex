@@ -870,7 +870,6 @@ pub(super) enum GlobalSettingsField {
     ProxyEnabled,
     ProxyUrl,
     ProxyNoProxy,
-    ProxyForceHttp,
     NotifyServiceUrl,
     NotifyServiceToken,
     NotifyIdleTimeout,
@@ -899,7 +898,6 @@ impl GlobalSettingsField {
             | Self::DefaultProfile
             | Self::DefaultProfileDirectLaunch
             | Self::ProxyEnabled
-            | Self::ProxyForceHttp
             | Self::NotifyMessageContent
             | Self::DesktopNotifyEnabled
             | Self::RateLimitThresholdWarning
@@ -1018,7 +1016,6 @@ impl GlobalSettingsSnapshot {
             | GlobalSettingsField::DockerSudo
             | GlobalSettingsField::DefaultProfileDirectLaunch
             | GlobalSettingsField::ProxyEnabled
-            | GlobalSettingsField::ProxyForceHttp
             | GlobalSettingsField::DesktopNotifyEnabled
             | GlobalSettingsField::AgentBusEnabled => ENABLED_CHOICES,
             GlobalSettingsField::NotifyMessageContent => NOTIFY_MESSAGE_CONTENT_CHOICES,
@@ -1274,7 +1271,6 @@ pub(super) struct GlobalSettingsDraft {
     proxy_enabled: Option<bool>,
     proxy_url: ConfigValueUpdate<String>,
     proxy_no_proxy: ConfigValueUpdate<String>,
-    proxy_force_http: Option<bool>,
     notify_service_url: ConfigValueUpdate<String>,
     notify_service_token: ConfigValueUpdate<String>,
     notify_idle_timeout: ConfigValueUpdate<u64>,
@@ -1435,7 +1431,6 @@ impl GlobalSettingsDraft {
                 if !next {
                     self.proxy_url = ConfigValueUpdate::Unchanged;
                     self.proxy_no_proxy = ConfigValueUpdate::Unchanged;
-                    self.proxy_force_http = None;
                 }
             }
             GlobalSettingsField::ProxyUrl => {
@@ -1457,15 +1452,6 @@ impl GlobalSettingsDraft {
                         .and_then(|proxy| proxy.no_proxy.as_deref()),
                     value,
                 );
-            }
-            GlobalSettingsField::ProxyForceHttp => {
-                let current = snapshot
-                    .config
-                    .proxy
-                    .as_ref()
-                    .map(|proxy| proxy.force_http_transport)
-                    .unwrap_or(true);
-                self.proxy_force_http = changed_bool(current, parse_enabled(value.as_deref())?);
             }
             GlobalSettingsField::NotifyServiceUrl => {
                 self.notify_service_url =
@@ -1705,16 +1691,6 @@ impl GlobalSettingsDraft {
                     .and_then(|proxy| proxy.no_proxy.as_deref()),
                 &self.proxy_no_proxy,
             )),
-            GlobalSettingsField::ProxyForceHttp => {
-                enabled(self.proxy_force_http.unwrap_or_else(|| {
-                    snapshot
-                        .config
-                        .proxy
-                        .as_ref()
-                        .map(|proxy| proxy.force_http_transport)
-                        .unwrap_or(true)
-                }))
-            }
             GlobalSettingsField::NotifyServiceUrl => optional_owned(effective_optional_string(
                 snapshot.config.notify_service_url.as_deref(),
                 &self.notify_service_url,
@@ -1847,7 +1823,6 @@ impl GlobalSettingsDraft {
             GlobalSettingsField::ProxyNoProxy => {
                 !matches!(self.proxy_no_proxy, ConfigValueUpdate::Unchanged)
             }
-            GlobalSettingsField::ProxyForceHttp => self.proxy_force_http.is_some(),
             GlobalSettingsField::NotifyServiceUrl => {
                 !matches!(self.notify_service_url, ConfigValueUpdate::Unchanged)
             }
@@ -1918,7 +1893,6 @@ impl GlobalSettingsDraft {
             GlobalSettingsField::ProxyEnabled,
             GlobalSettingsField::ProxyUrl,
             GlobalSettingsField::ProxyNoProxy,
-            GlobalSettingsField::ProxyForceHttp,
             GlobalSettingsField::NotifyServiceUrl,
             GlobalSettingsField::NotifyServiceToken,
             GlobalSettingsField::NotifyIdleTimeout,
@@ -1951,7 +1925,6 @@ impl GlobalSettingsDraft {
             GlobalSettingsField::ProxyEnabled,
             GlobalSettingsField::ProxyUrl,
             GlobalSettingsField::ProxyNoProxy,
-            GlobalSettingsField::ProxyForceHttp,
         ]
         .into_iter()
         .any(|field| self.field_is_dirty(field));
@@ -1965,9 +1938,8 @@ impl GlobalSettingsDraft {
             if !enabled {
                 if !matches!(self.proxy_url, ConfigValueUpdate::Unchanged)
                     || !matches!(self.proxy_no_proxy, ConfigValueUpdate::Unchanged)
-                    || self.proxy_force_http.is_some()
                 {
-                    anyhow::bail!("Enable Proxy before saving its URL or transport settings");
+                    anyhow::bail!("Enable Proxy before saving its URL or bypass settings");
                 }
                 ConfigValueUpdate::Clear
             } else {
@@ -1981,11 +1953,6 @@ impl GlobalSettingsDraft {
                         current_proxy.and_then(|proxy| proxy.no_proxy.as_deref()),
                         &self.proxy_no_proxy,
                     ),
-                    self.proxy_force_http.unwrap_or_else(|| {
-                        current_proxy
-                            .map(|proxy| proxy.force_http_transport)
-                            .unwrap_or(true)
-                    }),
                 )?)
             }
         };
@@ -3026,7 +2993,6 @@ mod tests {
             enabled: true,
             url: Some("http://127.0.0.1:7890".to_string()),
             no_proxy: None,
-            force_http_transport: true,
         });
         let snapshot = GlobalSettingsSnapshot::from_config(&config);
         let mut draft = GlobalSettingsDraft::default();
@@ -3058,15 +3024,8 @@ mod tests {
                 Some("localhost,127.0.0.1".to_string()),
             )
             .expect("stage NO_PROXY");
-        draft
-            .stage(
-                &snapshot,
-                GlobalSettingsField::ProxyForceHttp,
-                Some("disabled".to_string()),
-            )
-            .expect("stage transport");
 
-        assert_eq!(draft.dirty_count(), 5);
+        assert_eq!(draft.dirty_count(), 4);
         assert_eq!(
             draft.value(&snapshot, GlobalSettingsField::ProxyUrl),
             "socks5h://127.0.0.1:7891"
@@ -3080,7 +3039,6 @@ mod tests {
                     enabled: true,
                     url: Some("socks5h://127.0.0.1:7891".to_string()),
                     no_proxy: Some("localhost,127.0.0.1".to_string()),
-                    force_http_transport: false,
                 }),
                 ..GlobalConfigPatch::default()
             }
@@ -3290,6 +3248,11 @@ mod tests {
 
     #[test]
     fn global_agent_bus_draft_validates_port_and_masks_token() {
+        // Default-instance port rules (59995 invalid, 24261 valid).
+        cutex::config::instance::with_default_ports_for_test(global_agent_bus_draft_validates_port_and_masks_token_inner);
+    }
+
+    fn global_agent_bus_draft_validates_port_and_masks_token_inner() {
         let mut config = CodezConfig::default();
         config.agent_bus_enabled = false;
         config.agent_bus_token = Some("stored-bus-secret".to_string());

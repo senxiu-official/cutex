@@ -48,15 +48,38 @@ class Pending:
     future: asyncio.Future
     kind: str = 'elicitation'  # elicitation | command | fileChange | question
     questions: list | None = None
+    rules: list | None = None  # offered Claude permission rules (command / fileChange)
 
 
-def decision_of(result) -> str | None:
-    """Codex v2 approval decision; object forms (policy amendments) accept once."""
+# "Always allow in this project" (cutex `claude-permission-rules`): the
+# request offers Claude permission rules (`claudePermissionRules`), the answer
+# `{"decision": {"acceptWithClaudeRules": {"rules": [...]}}}` names the ones
+# to keep. cutex persists them per workspace; the adapter adds them to the
+# native session at once (`updated_permissions`, destination session).
+RULE_DECISION = 'acceptWithClaudeRules'
+
+
+def decision_of(result, offered: list | None = None):
+    """Codex v2 approval decision; object forms (policy amendments) accept once.
+
+    ``acceptWithClaudeRules`` returns ``('acceptWithClaudeRules', rules)`` for
+    a non-empty subset of the ``offered`` rules, else it accepts once."""
     decision = result.get('decision') if isinstance(result, dict) else None
     if isinstance(decision, dict) and len(decision) == 1 and next(iter(decision)) in {
             'acceptWithExecpolicyAmendment', 'applyNetworkPolicyAmendment'}:
         return 'accept'
+    if isinstance(decision, dict) and len(decision) == 1 and RULE_DECISION in decision:
+        body = decision[RULE_DECISION]
+        rules = body.get('rules') if isinstance(body, dict) else None
+        if (isinstance(rules, list) and rules and offered
+                and all(isinstance(rule, str) and rule in offered for rule in rules)):
+            return (RULE_DECISION, tuple(dict.fromkeys(rules)))
+        return 'accept'
     return decision if decision in {'accept', 'acceptForSession', 'decline', 'cancel'} else None
+
+
+def is_allowed(decision) -> bool:
+    return decision in {'accept', 'acceptForSession'} or (isinstance(decision, tuple) and decision[0] == RULE_DECISION)
 
 
 class Approvals:
@@ -80,10 +103,11 @@ class Approvals:
         return 'plan' if self.planning(tid) else self.mode(tid)
 
     async def set_plan(self, tid, enabled):
+        # Like Claude Code (shift+tab), plan mode can change while a turn runs:
+        # the native session applies it from its next tool call on.
         self.server.store.thread(tid)
         if self.planning(tid) == enabled:
             return
-        require(not self.server.store.user_turn_busy(tid), 'Finish or interrupt the turn before changing mode', -32009)
         owner = getattr(self.server.engine.driver, 'owners', {}).get(tid)
         if owner is not None:
             await owner.set_permission_mode('plan' if enabled else self.mode(tid))
@@ -92,7 +116,8 @@ class Approvals:
     async def configure(self, tid, mode):
         self.server.store.thread(tid)
         require(mode in MODES, 'mode must be default, acceptEdits, auto or bypassPermissions')
-        require(tid not in self.server.engine.workers, 'Change approvals while the thread is idle', -32009)
+        # A running turn may change mode (Claude Code's shift+tab): the SDK's
+        # set_permission_mode applies it to the live session at once.
         owner = getattr(self.server.engine.driver, 'owners', {}).get(tid) if hasattr(self.server.engine, 'driver') else None
         if owner is not None:
             await owner.set_permission_mode('plan' if self.planning(tid) else mode)
@@ -117,21 +142,21 @@ class Approvals:
         if p.kind == 'question':
             p.future.set_result(read_answers(result, p.questions) if result is not None else None)
         elif p.kind in {'command', 'fileChange'}:
-            p.future.set_result(decision_of(result))
+            p.future.set_result(decision_of(result, p.rules))
         else:
             content = result.get('content') if isinstance(result,dict) else None
             accepted = (isinstance(result,dict) and result.get('action') == 'accept' and
                         isinstance(content,dict) and content.get('approved') is True)
             p.future.set_result('accept' if accepted else ('cancel' if isinstance(result, dict) and result.get('action') == 'cancel' else 'decline'))
 
-    async def _request(self, tid, method, params, kind, *, flag='waitingOnApproval', questions=None):
+    async def _request(self, tid, method, params, kind, *, flag='waitingOnApproval', questions=None, rules=None):
         """Send one server request to every interactive client; None if nobody answers."""
         peers = self.targets(tid)
         if not peers:
             return None
         rid = f'claude-{"question" if kind == "question" else "approval"}-' + identifier()
         future = asyncio.get_running_loop().create_future()
-        self.pending[rid] = Pending(set(peers), tid, future, kind, questions)
+        self.pending[rid] = Pending(set(peers), tid, future, kind, questions, rules)
         try:
             await self.server.engine.emit(tid, 'thread/status/changed', {
                 'threadId':tid,'status':{'type':'active','activeFlags':[flag]}})
@@ -151,39 +176,53 @@ class Approvals:
                 await self.server.engine.emit(tid,'thread/status/changed',{
                     'threadId':tid,'status':{'type':'active','activeFlags':[]}})
 
-    async def request_command(self, tid, turn_id, item_id, command, reason=None):
-        """`item/commandExecution/requestApproval` for a native tool call; returns the decision."""
-        return await self._request(tid, 'item/commandExecution/requestApproval', {
+    async def request_command(self, tid, turn_id, item_id, command, reason=None, rules=None):
+        """`item/commandExecution/requestApproval` for a native tool call; returns the decision.
+        ``rules``: Claude permission rules offered for "always allow in this project"."""
+        decisions = ['accept', 'acceptForSession']
+        if rules:
+            decisions.append({RULE_DECISION: {'rules': list(rules)}})
+        params = {
             'kind': 'command', 'threadId': tid, 'turnId': turn_id, 'itemId': item_id,
             'startedAtMs': int(time.time()*1000), 'approvalId': None, 'environmentId': None,
             'command': command, 'cwd': str(self.server.settings.workspace),
             'reason': reason or 'Claude requests permission to use this tool.', 'commandActions': None,
-            'availableDecisions': ['accept', 'acceptForSession', 'decline', 'cancel']}, 'command')
+            'availableDecisions': decisions + ['decline', 'cancel']}
+        if rules:
+            params['claudePermissionRules'] = list(rules)
+        return await self._request(tid, 'item/commandExecution/requestApproval', params, 'command', rules=rules)
 
-    async def request_file_change(self, tid, turn_id, item_id, reason=None):
+    async def request_file_change(self, tid, turn_id, item_id, reason=None, rules=None):
         """`item/fileChange/requestApproval` for the fileChange item already started."""
-        return await self._request(tid, 'item/fileChange/requestApproval', {
+        params = {
             'threadId': tid, 'turnId': turn_id, 'itemId': item_id, 'startedAtMs': int(time.time()*1000),
-            'reason': reason or 'Claude requests permission to edit this file.', 'grantRoot': None}, 'fileChange')
+            'reason': reason or 'Claude requests permission to edit this file.', 'grantRoot': None}
+        if rules:
+            params['claudePermissionRules'] = list(rules)
+        return await self._request(tid, 'item/fileChange/requestApproval', params, 'fileChange', rules=rules)
 
     async def approve(self, tid, turn_id, name, arguments, call_id=None):
-        # Called only when the official SDK requests a human decision for a host
-        # tool. Services subscribing to runtime events must not consume prompts.
+        """A host (cutex) tool call the official SDK asks a human about (mode
+        ``default``): an ordinary approval card naming the tool and its
+        arguments, answered with the approval buttons. Returns the decision
+        (``accept`` / ``acceptForSession`` / ``decline`` / ``cancel``) or None
+        when nobody answered. Services subscribing to runtime events must not
+        consume prompts.
+
+        Until claude-r18 this was an MCP elicitation form whose "Allow this
+        invocation" checkbox defaulted to false: accepting the card without
+        ticking it declined the call ("Not approved", r243 acceptance)."""
         preview = json.dumps(arguments, ensure_ascii=False, indent=2)
         # Never approve an invocation whose full arguments cannot be reviewed.
         if len(preview.encode('utf-8')) > 65536:
-            return False
+            return None
         if name in {'exec', 'Bash'}:
             command = arguments.get('command','') if name == 'Bash' else shlex.join(arguments.get('argv', []))
-            decision = await self.request_command(tid, turn_id, call_id or identifier(), command,
-                                                  'Claude requests permission to run this command.')
-            return decision in {'accept', 'acceptForSession'}
-        decision = await self._request(tid, 'mcpServer/elicitation/request', {
-            'threadId':tid,'turnId':turn_id,'serverName':'cutex', 'mode':'form',
-            'message':f'Allow Claude to run {name} once?\n{preview}',
-            'requestedSchema':{'type':'object','properties':{'approved':{
-                'type':'boolean','title':'Allow this invocation','default':False}},'required':['approved']}}, 'elicitation')
-        return decision == 'accept'
+            reason = 'Claude requests permission to run this command.'
+        else:
+            command = f'{name} {preview}'
+            reason = f'Claude requests permission to use the cutex tool {name}.'
+        return await self.request_command(tid, turn_id, call_id or identifier(), command, reason)
 
     async def decline_unattended(self, tid, turn_id, arguments, call_id) -> str | None:
         """AskUserQuestion in a turn started by another agent or a service:

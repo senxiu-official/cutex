@@ -44,7 +44,6 @@ pub(crate) fn global(command: GlobalCommand) -> anyhow::Result<()> {
             default_profile_direct_launch,
             proxy_url,
             proxy_no_proxy,
-            proxy_force_http_transport,
             proxy_clear,
             agent_bus_enable,
             agent_bus_port,
@@ -57,7 +56,6 @@ pub(crate) fn global(command: GlobalCommand) -> anyhow::Result<()> {
             default_profile_direct_launch,
             proxy_url,
             proxy_no_proxy,
-            proxy_force_http_transport,
             proxy_clear,
             notify_idle_timeout: None,
             notify_composer_idle_timeout: None,
@@ -81,15 +79,13 @@ pub(crate) fn proxy(command: ProxyCommand) -> anyhow::Result<()> {
         ProxyCommand::Set {
             url,
             no_proxy,
-            force_http_transport,
-        } => cmd_proxy_set(url, no_proxy, force_http_transport),
+        } => cmd_proxy_set(url, no_proxy),
         ProxyCommand::Clear => cmd_proxy_clear(),
         ProxyCommand::SetProfile {
             profile,
             url,
             no_proxy,
-            force_http_transport,
-        } => cmd_proxy_set_profile(&profile, url, no_proxy, force_http_transport),
+        } => cmd_proxy_set_profile(&profile, url, no_proxy),
         ProxyCommand::DisableProfile { profile } => cmd_proxy_disable_profile(&profile),
         ProxyCommand::ClearProfile { profile } => cmd_proxy_clear_profile(&profile),
     }
@@ -109,7 +105,6 @@ pub(crate) struct GlobalSetOptions {
     pub(crate) default_profile_direct_launch: Option<bool>,
     pub(crate) proxy_url: Option<String>,
     pub(crate) proxy_no_proxy: Option<String>,
-    pub(crate) proxy_force_http_transport: Option<bool>,
     pub(crate) proxy_clear: bool,
     pub(crate) notify_idle_timeout: Option<u64>,
     pub(crate) notify_composer_idle_timeout: Option<u64>,
@@ -144,7 +139,6 @@ pub(crate) fn cmd_global_set(options: GlobalSetOptions) -> anyhow::Result<()> {
         default_profile_direct_launch,
         proxy_url,
         proxy_no_proxy,
-        proxy_force_http_transport,
         proxy_clear,
         notify_idle_timeout,
         notify_composer_idle_timeout,
@@ -161,9 +155,6 @@ pub(crate) fn cmd_global_set(options: GlobalSetOptions) -> anyhow::Result<()> {
     } = options;
     if proxy_no_proxy.is_some() && proxy_url.is_none() {
         anyhow::bail!("--proxy-no-proxy requires --proxy-url");
-    }
-    if proxy_force_http_transport.is_some() && proxy_url.is_none() {
-        anyhow::bail!("--proxy-force-http requires --proxy-url");
     }
     if let Some(port) = agent_bus_port {
         validate_agent_bus_port(port)?;
@@ -202,7 +193,6 @@ pub(crate) fn cmd_global_set(options: GlobalSetOptions) -> anyhow::Result<()> {
             true,
             Some(url),
             proxy_no_proxy,
-            proxy_force_http_transport.unwrap_or(true),
         )?)
     } else {
         ConfigValueUpdate::Unchanged
@@ -307,10 +297,9 @@ pub(crate) fn cmd_proxy_show(profile: Option<String>) -> anyhow::Result<()> {
 pub(crate) fn cmd_proxy_set(
     url: String,
     no_proxy: Option<String>,
-    force_http_transport: bool,
 ) -> anyhow::Result<()> {
     let mut config = load_codez_config_checked()?;
-    set_global_proxy_config(&mut config, url, no_proxy, force_http_transport)?;
+    set_global_proxy_config(&mut config, url, no_proxy)?;
     save_codez_config(&config)?;
     println!(
         "{GREEN}Updated{RESET} global proxy: {}",
@@ -331,7 +320,6 @@ pub(crate) fn cmd_proxy_set_profile(
     profile: &str,
     url: String,
     no_proxy: Option<String>,
-    force_http_transport: bool,
 ) -> anyhow::Result<()> {
     let mut store = load_store()?;
     let account = store
@@ -339,7 +327,7 @@ pub(crate) fn cmd_proxy_set_profile(
         .iter_mut()
         .find(|account| account.name == profile || account.id == profile)
         .ok_or_else(|| anyhow!("Account not found: {profile}"))?;
-    set_account_proxy_config(account, url, no_proxy, force_http_transport)?;
+    set_account_proxy_config(account, url, no_proxy)?;
     let name = account.name.clone();
     let label = proxy_config_label(account.proxy.as_ref());
     save_store(&store)?;

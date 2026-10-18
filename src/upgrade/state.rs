@@ -159,6 +159,14 @@ pub struct Installed {
     pub commit: Option<String>,
     #[serde(default)]
     pub manifest_sha256: Option<String>,
+    /// Capability upgrade-installed-notes: the installed release manifest's
+    /// `notes` (language tag -> text) and `publishedAt`; None when unknown
+    /// (no manifest under the release dir, or a record from before these
+    /// fields; [`super::stage::with_manifest_details`] fills them in).
+    #[serde(default)]
+    pub notes: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub published_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

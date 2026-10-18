@@ -1,11 +1,11 @@
 {
   "version": 1,
-  "release": "claude-r14",
+  "release": "claude-r19",
   "comment": "Feature switches cutex reads before it starts or talks to this adapter (components/claude-runtime/README.md). Catalog entries do not confirm account access.",
   "features": {
     "turnStart": true,
     "launchModelUpdate": true,
-    "turnSteer": false,
+    "turnSteer": true,
     "queueWhileBusy": true,
     "turnInterrupt": true,
     "imageInput": true,
@@ -29,6 +29,7 @@
     "versionedModelCatalog": true,
     "modelObservation": true,
     "effort": true,
+    "fastMode": true,
     "tokenUsage": true,
     "rateLimits": true,
     "history": true,
@@ -36,6 +37,7 @@
     "fork": true,
     "backgroundTerminals": true,
     "subagents": true,
+    "subagentTranscripts": true,
     "autoReconnect": true,
     "fileRewind": true,
     "fileCheckpointing": true,
@@ -48,7 +50,14 @@
     "managedSkills": true,
     "memoryMode": false,
     "permissionPresets": ["full", "auto", "readOnly"],
+    "claudePermissionModes": ["default", "acceptEdits", "plan", "auto", "bypassPermissions"],
+    "livePermissionMode": true,
+    "permissionRules": true,
     "apiAccounts": true,
-    "safetyGrants": true
+    "safetyGrants": true,
+    "settingSources": ["project", "user"],
+    "mcpServers": true,
+    "claudeAiConnectors": true,
+    "approvalWait": true
   }
 }

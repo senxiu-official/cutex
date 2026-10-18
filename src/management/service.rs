@@ -94,6 +94,14 @@ pub fn management_health_local_url(port: u16) -> String {
 /// Port of this home's Management API (`management_port`, default 24270;
 /// an instance without one gets 0, which fails closed).
 pub fn management_port(config: &CodezConfig) -> u16 {
+    // A test process never resolves a default-instance port (test port guard,
+    // `config::instance::default_ports_forbidden`).
+    if crate::config::instance::default_ports_forbidden() {
+        return config
+            .management_port
+            .filter(|port| !crate::config::instance::RESERVED_DEFAULT_PORTS.contains(port))
+            .unwrap_or(0);
+    }
     config.management_port.unwrap_or(if crate::config::instance::is_isolated() {
         0
     } else {
@@ -102,7 +110,7 @@ pub fn management_port(config: &CodezConfig) -> u16 {
 }
 
 pub fn validate_management_port(port: u16) -> anyhow::Result<()> {
-    if crate::config::instance::is_isolated() {
+    if crate::config::instance::uses_isolated_ports() {
         return crate::config::instance::validate_isolated_port(port, "Management API port");
     }
     if !(24000..=24999).contains(&port) {

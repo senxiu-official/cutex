@@ -46,6 +46,17 @@ pub struct SessionActivityState {
     pub last_turn_completed_at: Option<String>,
     #[serde(default)]
     pub last_file_change_at: Option<String>,
+    /// Last native `turn/started` (the owner's or an agent's input starting a turn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_started_at: Option<String>,
+    /// Last real conversation activity: a turn started, output, a tool call,
+    /// a file change, or a turn that ended other than interrupted. Runtime
+    /// lifecycle (start / stop / restart, reconnects, the interrupt of a
+    /// stale turn on resume) and session metadata never move it. Absent in
+    /// stores written before `session-conversation-activity`: see
+    /// [`SessionActivityState::conversation_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_conversation_at: Option<String>,
     #[serde(default)]
     pub last_output: Option<SafeOutputProjection>,
     #[serde(default)]
@@ -57,6 +68,36 @@ pub struct SessionActivityState {
 }
 
 impl SessionActivityState {
+    /// When the agent last had real conversation activity (resource field
+    /// `lastConversationAt`). The maintained `last_conversation_at` once
+    /// written; before that (stores of older binaries) the newest of the
+    /// older conversation fields, all fed by native turn / item events only.
+    pub fn conversation_at(&self) -> Option<String> {
+        if self.last_conversation_at.is_some() {
+            return self.last_conversation_at.clone();
+        }
+        let mut newest: Option<(DateTime<chrono::FixedOffset>, &str)> = None;
+        for value in [
+            self.last_turn_started_at.as_deref(),
+            self.last_output_at.as_deref(),
+            self.last_output_completed_at.as_deref(),
+            self.last_turn_completed_at.as_deref(),
+            self.last_file_change_at.as_deref(),
+            self.last_output.as_ref().map(|output| output.updated_at.as_str()),
+            self.last_tool_call.as_ref().map(|tool| tool.updated_at.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(at) = parse_timestamp(value) {
+                if newest.is_none_or(|(current, _)| at > current) {
+                    newest = Some((at, value));
+                }
+            }
+        }
+        newest.map(|(_, value)| value.to_string())
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         if self.revision > MAX_SAFE_SEQUENCE {
             anyhow::bail!("session activity revision exceeds the JSON-safe range");
@@ -78,6 +119,8 @@ impl SessionActivityState {
                 self.last_turn_completed_at.as_deref(),
             ),
             ("lastFileChangeAt", self.last_file_change_at.as_deref()),
+            ("lastTurnStartedAt", self.last_turn_started_at.as_deref()),
+            ("lastConversationAt", self.last_conversation_at.as_deref()),
         ] {
             if let Some(value) = value {
                 parse_timestamp(value)
@@ -225,7 +268,10 @@ impl ActivityRecorder {
                     root,
                     &envelope.cutex_session_id,
                     runtime_generation,
-                    |state| merge_timestamp(&mut state.last_output_at, latest_at),
+                    |state| {
+                        let changed = merge_timestamp(&mut state.last_output_at, latest_at)?;
+                        Ok(merge_timestamp(&mut state.last_conversation_at, latest_at)? | changed)
+                    },
                 )?;
             }
             ActivityEvent::OutputCompleted {
@@ -252,6 +298,10 @@ impl ActivityRecorder {
                             &mut state.last_output_completed_at,
                             &envelope.received_at,
                         )?;
+                        changed |= merge_timestamp(
+                            &mut state.last_conversation_at,
+                            &envelope.received_at,
+                        )?;
                         if let Some(display_text) = display_text.as_deref() {
                             changed |= update_last_output(
                                 state,
@@ -270,7 +320,20 @@ impl ActivityRecorder {
                     runtime_generation,
                 );
             }
-            ActivityEvent::TurnCompleted => {
+            ActivityEvent::TurnStarted => {
+                update_activity_at(
+                    root,
+                    &envelope.cutex_session_id,
+                    runtime_generation,
+                    |state| {
+                        let changed =
+                            merge_timestamp(&mut state.last_turn_started_at, &envelope.received_at)?;
+                        Ok(merge_timestamp(&mut state.last_conversation_at, &envelope.received_at)?
+                            | changed)
+                    },
+                )?;
+            }
+            ActivityEvent::TurnCompleted { interrupted } => {
                 let pending_at = output
                     .get(&envelope.cutex_session_id)
                     .filter(|checkpoint| checkpoint.runtime_generation == Some(runtime_generation))
@@ -288,6 +351,19 @@ impl ActivityRecorder {
                             &mut state.last_turn_completed_at,
                             &envelope.received_at,
                         )?;
+                        // Output the turn produced is conversation; its end
+                        // only when not interrupted: a resumed runtime
+                        // interrupts a turn left in progress by the restart.
+                        changed |= merge_optional_timestamp(
+                            &mut state.last_conversation_at,
+                            pending_at.as_deref(),
+                        )?;
+                        if !interrupted {
+                            changed |= merge_timestamp(
+                                &mut state.last_conversation_at,
+                                &envelope.received_at,
+                            )?;
+                        }
                         Ok(changed)
                     },
                 )?;
@@ -305,6 +381,8 @@ impl ActivityRecorder {
                     |state| {
                         let mut changed =
                             merge_timestamp(&mut state.last_file_change_at, &envelope.received_at)?;
+                        changed |=
+                            merge_timestamp(&mut state.last_conversation_at, &envelope.received_at)?;
                         changed |= update_last_tool_call(
                             state,
                             envelope,
@@ -322,13 +400,15 @@ impl ActivityRecorder {
                     &envelope.cutex_session_id,
                     runtime_generation,
                     |state| {
-                        update_last_tool_call(
+                        let changed = update_last_tool_call(
                             state,
                             envelope,
                             runtime_generation,
                             class,
                             status,
-                        )
+                        )?;
+                        Ok(merge_timestamp(&mut state.last_conversation_at, &envelope.received_at)?
+                            | changed)
                     },
                 )?;
             }
@@ -359,7 +439,10 @@ enum ActivityEvent {
         class: SafeOutputClass,
         display_text: Option<String>,
     },
-    TurnCompleted,
+    TurnStarted,
+    TurnCompleted {
+        interrupted: bool,
+    },
     FileChangeCompleted,
     ToolLifecycle {
         class: SafeToolCallClass,
@@ -504,7 +587,11 @@ fn activity_event(envelope: &EventEnvelope) -> Option<ActivityEvent> {
             class: SafeToolCallClass::CollaborationTool,
             status: SafeToolCallStatus::Progress,
         }),
-        "turn/completed" => Some(ActivityEvent::TurnCompleted),
+        "turn/started" => Some(ActivityEvent::TurnStarted),
+        "turn/completed" => Some(ActivityEvent::TurnCompleted {
+            interrupted: params.pointer("/turn/status").and_then(serde_json::Value::as_str)
+                == Some("interrupted"),
+        }),
         _ => None,
     }
 }
@@ -871,6 +958,85 @@ mod tests {
         assert!(states.is_empty());
         assert!(!root.join(ACTIVITY_STATE_FILE).exists());
         fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn conversation_activity_follows_turns_but_not_a_restart_interrupt() {
+        let root = test_root("conversation");
+        let recorder = ActivityRecorder::new(Duration::ZERO);
+        let state = |root: &Path| {
+            load_session_activity_states_at(root)
+                .expect("load activity")
+                .remove("cutex.session-a")
+                .expect("activity state")
+        };
+        recorder
+            .record_at(
+                &root,
+                &envelope(
+                    "2026-10-18T01:00:00Z",
+                    "turn/started",
+                    json!({ "threadId": "thread-1", "turn": { "id": "turn-1" } }),
+                ),
+            )
+            .expect("record turn start");
+        let started = state(&root);
+        assert_eq!(started.last_turn_started_at.as_deref(), Some("2026-10-18T01:00:00Z"));
+        assert_eq!(started.conversation_at().as_deref(), Some("2026-10-18T01:00:00Z"));
+
+        // The runtime restarts (new generation) and interrupts the turn the
+        // restart left in progress: not conversation activity.
+        recorder
+            .record_at(
+                &root,
+                &envelope_at_generation(
+                    "2026-10-18T03:00:00Z",
+                    "turn/completed",
+                    json!({ "threadId": "thread-1", "turn": { "id": "turn-1", "status": "interrupted" } }),
+                    2,
+                ),
+            )
+            .expect("record restart interrupt");
+        let restarted = state(&root);
+        assert_eq!(restarted.last_turn_completed_at.as_deref(), Some("2026-10-18T03:00:00Z"));
+        assert_eq!(restarted.conversation_at().as_deref(), Some("2026-10-18T01:00:00Z"));
+        // Lifecycle-only events are not recorded at all.
+        recorder
+            .record_at(
+                &root,
+                &envelope_at_generation("2026-10-18T03:00:01Z", "thread/started", json!({ "thread": { "id": "thread-1" } }), 2),
+            )
+            .expect("ignore thread start");
+        assert_eq!(state(&root).conversation_at().as_deref(), Some("2026-10-18T01:00:00Z"));
+
+        for (at, method, params) in [
+            ("2026-10-18T04:00:00Z", "item/started", json!({ "item": { "type": "commandExecution" } })),
+            ("2026-10-18T04:00:05Z", "turn/completed", json!({ "turn": { "id": "turn-2", "status": "completed" } })),
+        ] {
+            recorder
+                .record_at(&root, &envelope_at_generation(at, method, params, 2))
+                .expect("record conversation event");
+        }
+        let resource = state(&root);
+        assert_eq!(resource.last_conversation_at.as_deref(), Some("2026-10-18T04:00:05Z"));
+        let persisted = fs::read_to_string(root.join(ACTIVITY_STATE_FILE)).expect("read store");
+        assert!(persisted.contains("lastConversationAt") && persisted.contains("lastTurnStartedAt"));
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn older_stores_derive_conversation_activity_from_their_turn_and_item_fields() {
+        let legacy: SessionActivityState = serde_json::from_value(json!({
+            "revision": 4,
+            "runtimeGeneration": 1,
+            "lastOutputAt": "2026-10-18T01:00:00Z",
+            "lastTurnCompletedAt": "2026-10-18T01:00:09.5+00:00",
+            "lastFileChangeAt": "2026-10-18T00:59:00Z"
+        }))
+        .expect("decode a pre-conversation-activity state");
+        assert!(legacy.last_conversation_at.is_none());
+        assert_eq!(legacy.conversation_at().as_deref(), Some("2026-10-18T01:00:09.5+00:00"));
+        assert_eq!(SessionActivityState::default().conversation_at(), None);
     }
 
     #[test]
@@ -1512,6 +1678,7 @@ mod tests {
                 "lastOutputCompletedAt": null,
                 "lastTurnCompletedAt": "2026-08-13T05:00:00Z",
                 "lastFileChangeAt": null,
+                "lastConversationAt": "2026-08-13T05:00:00Z",
                 "lastOutput": null,
                 "lastToolCall": null
             }))

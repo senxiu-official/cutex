@@ -1,5 +1,6 @@
 //! OpenAI-compatible model discovery. Only model IDs come from /models;
 //! instructions and tool behavior are never imported from the response.
+use crate::config::proxy_outbound::OutboundProxy;
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -106,39 +107,33 @@ fn apply_discovered_metadata(row: &mut Value, model: &DiscoveredModel) {
 }
 
 /// A provider HTTP agent: global timeout, no redirects, the profile's
-/// effective proxy (`Some(None)`: none; `None`: ureq's default). Shared by
-/// discovery and the `web_search` cutex tool; this one returns non-success
-/// statuses as responses (the caller reads the provider's error body).
-pub(crate) fn provider_agent(timeout: std::time::Duration, proxy: Option<Option<&str>>, no_proxy: Option<&str>) -> anyhow::Result<ureq::Agent> {
-    provider_agent_with(timeout, proxy, no_proxy, false)
+/// effective proxy (loopback always direct). Shared by discovery and the
+/// `web_search` cutex tool; this one returns non-success statuses as
+/// responses (the caller reads the provider's error body).
+pub(crate) fn provider_agent(timeout: std::time::Duration, proxy: &OutboundProxy) -> anyhow::Result<ureq::Agent> {
+    provider_agent_with(timeout, proxy, false)
 }
 
-fn provider_agent_with(timeout: std::time::Duration, proxy: Option<Option<&str>>, no_proxy: Option<&str>, status_as_error: bool) -> anyhow::Result<ureq::Agent> {
-    let mut config = ureq::Agent::config_builder()
+fn provider_agent_with(timeout: std::time::Duration, proxy: &OutboundProxy, status_as_error: bool) -> anyhow::Result<ureq::Agent> {
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout)).max_redirects(0).http_status_as_error(status_as_error);
-    if let Some(proxy) = proxy {
-        let proxy = proxy.map(|url| -> anyhow::Result<ureq::Proxy> {
-            let parsed = ureq::Proxy::new(url)?;
-            let mut builder = ureq::Proxy::builder(parsed.protocol()).host(parsed.host()).port(parsed.port());
-            if let Some(user) = parsed.username() { builder = builder.username(user); }
-            if let Some(password) = parsed.password() { builder = builder.password(password); }
-            if let Some(no_proxy) = no_proxy { builder = builder.no_proxy(no_proxy); }
-            Ok(builder.build()?)
-        }).transpose()?;
-        config = config.proxy(proxy);
-    }
-    Ok(config.build().new_agent())
+    Ok(proxy.apply(config)?.build().new_agent())
 }
 
-pub fn fetch(base: &str, key: &str, proxy: Option<Option<&str>>, no_proxy: Option<&str>) -> anyhow::Result<ModelCatalog> {
+pub fn fetch(base: &str, key: &str, proxy: &OutboundProxy) -> anyhow::Result<ModelCatalog> {
     let url = models_url(base)?;
     ensure!(!key.is_empty() && !key.chars().any(char::is_control), "invalid API credential");
-    let agent = provider_agent_with(std::time::Duration::from_secs(20), proxy, no_proxy, true)?;
+    let agent = provider_agent_with(std::time::Duration::from_secs(20), proxy, true)?;
     let mut response = agent.get(url.as_str()).header("Authorization", &format!("Bearer {key}"))
         .header("Accept", "application/json").call()
-        .map_err(|error| match error {
-            ureq::Error::StatusCode(status) => anyhow::anyhow!("model discovery returned HTTP {status}; cached models retained"),
-            _ => anyhow::anyhow!("model discovery connection failed; cached models retained"),
+        .map_err(|error| {
+            if let Some(message) = crate::config::proxy_outbound::proxy_error_message(&error) {
+                return anyhow::anyhow!("model discovery connection failed ({message}); cached models retained");
+            }
+            match error {
+                ureq::Error::StatusCode(status) => anyhow::anyhow!("model discovery returned HTTP {status}; cached models retained"),
+                _ => anyhow::anyhow!("model discovery connection failed; cached models retained"),
+            }
         })?;
     ensure!(response.status().is_success(), "model discovery did not return success");
     let value: Value = response.body_mut().with_config().limit(4 * 1024 * 1024).read_json()
@@ -374,7 +369,7 @@ mod tests {
             let body=r#"{"data":[{"id":"generic-model"}]}"#;
             write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         });
-        let result=fetch(&format!("http://{addr}/v1"),"fixture-token",Some(None),None).unwrap();
+        let result=fetch(&format!("http://{addr}/v1"),"fixture-token",&OutboundProxy::Direct).unwrap();
         thread.join().unwrap();
         assert_eq!(result.models, ["generic-model"]);
         assert!(!serde_json::to_string(&result).unwrap().contains("fixture-token"));

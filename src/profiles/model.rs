@@ -162,6 +162,11 @@ pub struct StoredAccount {
     /// (the reviewed auth in the launch configuration already carries it).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub private_chatgpt_auth_file: bool,
+    /// Claude profiles: Claude Code settings sources and claude.ai
+    /// connectors (`profiles::claude_code`). Top level for the same reason
+    /// as `browser_tools`.
+    #[serde(default, skip_serializing_if = "super::claude_code::ClaudeCodeOptions::is_empty")]
+    pub claude_code: super::claude_code::ClaudeCodeOptions,
 }
 
 impl StoredAccount {
@@ -172,6 +177,7 @@ impl StoredAccount {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: Uuid::new_v4().to_string(),
             name,
             email: snapshot.email.clone(),
@@ -596,8 +602,8 @@ pub struct ProxyConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub no_proxy: Option<String>,
-    #[serde(default = "default_true")]
-    pub force_http_transport: bool,
+    // `force_http_transport` (retired, never read by any native) is ignored on read and dropped on
+    // the next save.
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -852,6 +858,7 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: "0b2f6987-6b65-4aac-8e0f-e14b9e0a4d63".to_string(),
             name: "compat".to_string(),
             email: None,

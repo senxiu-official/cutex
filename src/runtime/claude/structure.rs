@@ -36,24 +36,46 @@ fn finish_temporary_owner(session: &ClaudeSession, owner: &mut Value, state: &st
     }
 }
 
-/// Only project skills and a dedicated per-account managed catalog are opened.
-/// The general Claude home/settings/plugin discovery remains disabled.
+/// Directory under the cutex home with the user-level skills every Claude
+/// agent of this host sees (all Claude accounts share it). cutex manages it;
+/// Claude Code's own `~/.claude/skills` is never read.
+pub const USER_SKILLS_DIR: &str = "claude-skills";
+
+/// `~/.cutex/claude-skills` (it may not exist).
+pub fn user_skills_root() -> anyhow::Result<PathBuf> {
+    Ok(crate::config::paths::config_dir()?.join(USER_SKILLS_DIR))
+}
+
+/// Only project skills, a dedicated per-account managed catalog and the
+/// cutex-managed user-level directory are opened. The general Claude
+/// home/settings/plugin discovery remains disabled.
 pub fn managed_skill_roots(record: &CutexSessionRecord) -> anyhow::Result<Vec<PathBuf>> {
+    managed_skill_roots_with(record, Some(&user_skills_root()?))
+}
+
+pub(crate) fn managed_skill_roots_with(record: &CutexSessionRecord, user: Option<&Path>) -> anyhow::Result<Vec<PathBuf>> {
     let session = record
         .claude_session
         .as_ref()
         .context("Claude session missing")?;
     let workspace = Path::new(&record.cwd).canonicalize()?;
     let account = session.deployment.claude_home.canonicalize()?;
+    // The user-level root contains itself (a link to elsewhere is followed
+    // once, then every skill must stay inside its target).
+    let user = user.filter(|path| path.is_dir()).map(Path::canonicalize).transpose()?;
+    let mut candidates = vec![
+        (workspace.clone(), workspace.join(".agents/skills")),
+        (workspace.clone(), workspace.join(".claude/skills")),
+        (account.clone(), account.join("cutex-skills")),
+    ];
+    if let Some(user) = user {
+        candidates.push((user.clone(), user));
+    }
     let mut roots = Vec::new();
-    for (base, path) in [
-        (&workspace, workspace.join(".agents/skills")),
-        (&workspace, workspace.join(".claude/skills")),
-        (&account, account.join("cutex-skills")),
-    ] {
+    for (base, path) in candidates {
         if path.is_dir() {
             let resolved = path.canonicalize()?;
-            if !resolved.starts_with(base) {
+            if !resolved.starts_with(&base) {
                 eprintln!("Skipping managed skill root outside its workspace/account: {}", path.display());
                 continue;
             }
@@ -104,6 +126,12 @@ pub fn request(id: &str, method: &str, mut params: Value) -> anyhow::Result<Valu
         adapter_features(&session.deployment.adapter_source)[feature] == true,
         "this adapter does not support {feature}; install and repin to claude-r8"
     );
+    if params["rewindFiles"] == true {
+        ensure!(
+            adapter_features(&session.deployment.adapter_source)["fileRewind"] == true,
+            "this adapter does not support fileRewind; install and repin to claude-r8"
+        );
+    }
     params["threadId"] = json!(session.thread_id);
     let temporary = connect(session).is_err();
     let (client, ready) = ensure_server(&record)?;

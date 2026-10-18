@@ -497,6 +497,16 @@ impl VerifiedClientToken {
         users.principal_for_token(&self.token_id).access_stamp() == self.principal.access_stamp()
     }
 
+    /// An owner-bound token value for request-context tests.
+    #[cfg(test)]
+    pub fn test_token(token_id: &str) -> Self {
+        Self {
+            token_id: token_id.to_string(),
+            presented: String::new(),
+            principal: crate::management::users::Principal::Owner,
+        }
+    }
+
     #[cfg(test)]
     pub fn still_valid_in(&self, store: &ClientTokenStore) -> bool {
         verify_cached_at(store, &self.presented).is_some_and(|id| id == self.token_id)

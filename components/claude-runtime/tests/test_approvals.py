@@ -41,16 +41,22 @@ async def test_actual_write_waits_for_correct_peer_and_decision(tmp_path, monkey
             return await bridge.execute(tool,permit.updated_input)
         task=asyncio.create_task(invoke())
         request=await wait_for_request(h)
+        # An ordinary approval card that names the tool and its arguments (never
+        # an elicitation form whose unticked checkbox declines).
+        assert request['method']=='item/commandExecution/requestApproval'
+        if tool=='write_file':
+            assert request['params']['command'].startswith('write_file {') and 'approved.txt' in request['params']['command']
+            assert 'write_file' in request['params']['reason']
         assert not (work/'approved.txt').exists()
         other=h.server.connect(h.send)
-        await h.server.handle(other,{'id':request['id'],'result':({'decision':'accept'} if tool=='exec' else {'action':'accept','content':{'approved':True}})})
+        await h.server.handle(other,{'id':request['id'],'result':{'decision':'accept'}})
         await asyncio.sleep(.01)
         assert not task.done() and not (work/'approved.txt').exists()
         if answer=='disconnect':h.server.disconnect(h.peer)
         elif answer=='cancel':
-            await h.server.handle(h.peer,{'id':request['id'],'result':({'decision':'cancel'} if tool=='exec' else {'action':'cancel','content':{'approved':True}})})
+            await h.server.handle(h.peer,{'id':request['id'],'result':{'decision':'cancel'}})
         else:
-            await h.server.handle(h.peer,{'id':request['id'],'result':({'decision':'accept' if answer else 'decline'} if tool=='exec' else {'action':'accept','content':{'approved':answer}})})
+            await h.server.handle(h.peer,{'id':request['id'],'result':{'decision':'accept' if answer else 'decline'}})
         result=await asyncio.wait_for(task,2)
         assert (work/'approved.txt').exists() is exists
         assert result['is_error'] is not exists
@@ -106,3 +112,39 @@ async def test_permission_settings_roundtrip_and_sdk_failure_keeps_previous_mode
     assert result['code'] == -32020
     assert ph.server.approvals.mode(tid)=='bypassPermissions'
     assert client.options.permission_mode=='bypassPermissions'
+
+
+@pytest.mark.parametrize('decision', ['acceptForSession', 'decline', 'cancel'])
+async def test_host_tool_card_session_and_owner_answers(tmp_path, monkeypatch, decision):
+    """r243: a cutex tool in mode default waits on an approval card naming the
+    tool; "this session" allows that tool for the live session, a decline
+    says the owner refused (not "Not approved")."""
+    work=tmp_path/'work'; work.mkdir()
+    driver,sdk,_=install_fake_sdk(monkeypatch,tmp_path)
+    h=SubHarness(Settings(work,tmp_path/'state',mock=False,backend='subscription',model='sonnet',allow_write=True,allow_exec=True),driver)
+    try:
+        await h.init(); h.peer.interactive=True
+        tid=await h.thread()
+        await h.call('claude/approvals/set',{'threadId':tid,'mode':'default'})
+        await h.call('claude/runtime/start',{'threadId':tid})
+        h.store.enqueue(tid,identifier(),{'text':'test','eventType':'message','source':{'kind':'user','id':'fixture'}},10)
+        turn=h.store.claim(tid)['turn_id']
+        bridge=driver.owners[tid].bridge
+        bridge.begin_turn(turn)
+        args={'path':'x.txt','content':'y'}
+        grant=await bridge.pre_tool({'session_id':bridge.sid,'tool_name':'mcp__cutex__write_file','tool_input':{'arguments':args}},identifier(),{})
+        native_args=grant['hookSpecificOutput']['updatedInput']
+        task=asyncio.create_task(sdk.clients[0].options.can_use_tool('mcp__cutex__write_file',native_args,{}))
+        request=await wait_for_request(h)
+        assert 'acceptForSession' in request['params']['availableDecisions']
+        await h.server.handle(h.peer,{'id':request['id'],'result':{'decision':decision}})
+        permit=await asyncio.wait_for(task,2)
+        if decision=='acceptForSession':
+            assert permit.behavior=='allow'
+            [update]=permit.updated_permissions
+            assert [r.tool_name for r in update.rules]==['mcp__cutex__write_file'] and update.destination=='session'
+        else:
+            assert permit.behavior=='deny' and 'owner declined' in permit.message
+            assert permit.interrupt is (decision=='cancel')
+    finally:
+        await h.close()

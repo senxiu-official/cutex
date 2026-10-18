@@ -6,7 +6,24 @@ A crash between claiming and SDK acknowledgement is uncertain, never replayed.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+
+
+STEER_FRAME = ('The user sent this message while you were working. Read it now and take it into '
+               'account before you continue:\n')
+
+
+def steer_frame(text: str) -> str:
+    return STEER_FRAME + text
+
+
+def steer_item(mid: str, payload: dict) -> dict:
+    """The timeline `userMessage` of a steered owner input (same shape as a
+    turn's first user message, keyed by its inbox message id)."""
+    parts = [{'type': 'text', 'text': payload['text'], 'text_elements': []}] if payload['text'] else []
+    return {'type': 'userMessage', 'id': mid, 'clientId': payload.get('clientId'),
+            'content': parts + list(payload.get('display') or []), 'steered': True}
 
 
 class BusyDelivery:
@@ -45,7 +62,7 @@ class BusyDelivery:
                 'contextTurnId': context if row['context_turn_id'] or row['persisted'] else None}
 
     def inject(self, tid, turn_id):
-        taken = []
+        taken, steered = [], []
         with self.store.transaction():
             active = self.store.db.execute("SELECT 1 FROM turns WHERE thread_id=? AND id=? AND state='inProgress'",
                                             (tid, turn_id)).fetchone()
@@ -57,6 +74,16 @@ class BusyDelivery:
                 WHERE i.thread_id=? AND i.state='queued' ORDER BY i.seq''', (tid,)).fetchall()
             for row in rows:
                 payload = json.loads(row['payload'])
+                if payload['source']['kind'] == 'user':
+                    # Owner steer (`turn/steer`): a user message of this turn.
+                    item, frame = steer_item(row['message_id'], payload), steer_frame(payload['text'])
+                    self.store.put_item(turn_id, item)
+                    self.store.db.execute("UPDATE inputs SET state='injecting' WHERE seq=?", (row['seq'],))
+                    self.store.db.execute('UPDATE busy_inputs SET context_turn_id=? WHERE thread_id=? AND message_id=?',
+                                          (turn_id, tid, row['message_id']))
+                    taken.append((item, frame))
+                    steered.append(item)
+                    continue
                 # External provenance and ask metadata remain unchanged.
                 item = self.store.external_item(row['message_id'], payload)
                 self.store.put_item(turn_id, item)
@@ -67,7 +94,17 @@ class BusyDelivery:
         # No await after the claim: the hook records offered and returns in the
         # same event-loop step. Publish timeline notifications at acknowledgement
         # so a terminal callback cannot overtake a not-yet-returned hook body.
+        # The owner's own steered message is shown at once (scheduled, never
+        # awaited here): the composer's pending row then reads "inserted".
+        if steered:
+            loop = asyncio.get_running_loop()
+            for item in steered:
+                loop.create_task(self._publish(tid, turn_id, item))
         return '\n\n'.join(frame for _, frame in taken)
+
+    async def _publish(self, tid, turn_id, item):
+        await self.server.engine.emit(tid, 'item/started', {'threadId': tid, 'turnId': turn_id, 'item': item})
+        await self.server.engine.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})
 
     async def acknowledge(self, tid, turn_id):
         """Called only when the SDK successfully completes the consuming turn.
@@ -81,8 +118,9 @@ class BusyDelivery:
         items = {item['id']: item for item in self.store.items(turn_id)} if rows else {}
         for row in rows:
             item = items[row['message_id']]
-            await self.server.engine.emit(tid, 'item/started', {'threadId': tid, 'turnId': turn_id, 'item': item})
-            await self.server.engine.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})
+            if item.get('type') != 'userMessage':  # a steered owner message is already shown
+                await self.server.engine.emit(tid, 'item/started', {'threadId': tid, 'turnId': turn_id, 'item': item})
+                await self.server.engine.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})
             await self.server.engine.emit(tid, 'claude/input/contextPersisted',
                 {'threadId': tid, 'turnId': turn_id, 'messageId': row['message_id']})
 

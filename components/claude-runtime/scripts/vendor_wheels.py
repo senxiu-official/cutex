@@ -1,6 +1,6 @@
 """Vendor the runtime wheels of the Claude runtime for one platform and write a hash lock.
 
-    python scripts/vendor_wheels.py --platform linux-x64|windows-x64 --out DIR
+    python scripts/vendor_wheels.py --platform linux-x64|windows-x64|darwin-arm64 --out DIR
                                     [--requirements requirements-runtime.txt]
 
 Writes DIR/wheels/*.whl and DIR/requirements.lock, which cutex installs with
@@ -38,6 +38,8 @@ PLATFORM_TAGS = {
     # cutex's Linux binaries target glibc 2.35 (Ubuntu 22.04); wheels up to manylinux_2_34.
     "linux-x64": ["manylinux2014_x86_64", "manylinux_2_17_x86_64", "manylinux_2_28_x86_64", "manylinux_2_34_x86_64"],
     "windows-x64": ["win_amd64"],
+    # Apple silicon, macOS 11+ (pip also accepts the older and universal2 macOS tags these imply).
+    "darwin-arm64": ["macosx_14_0_arm64"],
 }
 SDK = "claude-agent-sdk"
 # Build backend of the SDK sdist (hatchling) and its dependencies, pinned for a reproducible wheel.

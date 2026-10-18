@@ -214,6 +214,17 @@ pub fn handle_v2_request(
         return super::upgrade_api::handle(stream, request);
     }
     if super::owner_rotation_api::is_path(path) { return super::owner_rotation_api::handle(stream, request, agent_management_admin_token, context); }
+    if super::claude_skills_import::is_path(path) {
+        // Import skills into the host's shared Claude skills directory
+        // (capability claude-skills-import): the owner only.
+        if !authenticated_root_request(request, agent_management_admin_token)
+            || crate::management::users::current_principal().is_some_and(|p| !p.is_owner())
+        {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required to import Claude skills", false, json!({}));
+        }
+        return super::claude_skills_import::handle(stream, request);
+    }
     if super::claude_accounts_api::is_path(path) {
         // Claude accounts (logins / API keys of the owner): root, incl.
         // client / device tokens.
@@ -299,6 +310,37 @@ pub fn handle_v2_request(
         }
         return super::agent_harness::handle(stream, request);
     }
+    if super::claude_runtime_api::is_path(path) {
+        // The Claude runtime pin of one Claude agent (claude-runtime-repin):
+        // GET root (incl. device / client tokens); the repin itself is the
+        // owner's (root, or an owner-bound token).
+        if !authenticated_root_request(request, agent_management_admin_token)
+            || (request.method != "GET"
+                && crate::management::users::current_principal().is_some_and(|p| !p.is_owner()))
+        {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for the Claude runtime pin", false, json!({}));
+        }
+        return super::claude_runtime_api::handle(stream, request);
+    }
+    if super::claude_code_sources::is_path(path) {
+        // Claude Code sources / MCP of one Claude agent (claude-code-sources):
+        // root (incl. device / client tokens), read-only, no secret values.
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for Claude Code sources", false, json!({}));
+        }
+        return super::claude_code_sources::handle(stream, request);
+    }
+    if super::session_skills::is_path(path) {
+        // The skill catalog of one Claude session (capability
+        // claude-session-skills): root (incl. device / client tokens).
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for session skills", false, json!({}));
+        }
+        return super::session_skills::handle(stream, request);
+    }
     if super::sandbox_extras::is_path(path) {
         // Network / extra writable roots of one session (capability
         // session-sandbox-extras): the owner only (root, or an owner-bound
@@ -310,6 +352,17 @@ pub fn handle_v2_request(
                 "the Management root credential is required for session sandbox settings", false, json!({}));
         }
         return super::sandbox_extras::handle(stream, request, context);
+    }
+    if super::claude_permission_rules::is_path(path) {
+        // Persistent "always allow" rules of a Claude agent's workspace
+        // (capability claude-permission-rules): the owner only.
+        if !authenticated_root_request(request, agent_management_admin_token)
+            || crate::management::users::current_principal().is_some_and(|p| !p.is_owner())
+        {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for Claude permission rules", false, json!({}));
+        }
+        return super::claude_permission_rules::handle(stream, request);
     }
     if super::safety_checks::is_path(path) {
         // Safety blocks (owner decisions): root (incl. device / client tokens).
@@ -1672,6 +1725,15 @@ fn handle_native_server_response(
         &response.native_message,
     )? {
         ServerResponseClaimDecision::Submit => {
+            // "Always allow in this project" answers keep their rules once delivered.
+            let pending_params = server_requests::request_native(
+                cutex_session_id,
+                expected_runtime_generation,
+                &native_request_id,
+            )
+            .ok()
+            .flatten()
+            .and_then(|native| native.get("params").cloned());
             match (context.respond_native_server_request)(
                 cutex_session_id,
                 expected_runtime_generation,
@@ -1683,6 +1745,9 @@ fn handle_native_server_response(
                         expected_runtime_generation,
                         &response.response_id,
                     )?;
+                    if let (Some(params), Some(result)) = (&pending_params, response.native_message.get("result")) {
+                        super::claude_permission_rules::remember_from_answer(cutex_session_id, params, result);
+                    }
                     write_server_response_result(
                         stream,
                         cutex_session_id,
@@ -4556,6 +4621,7 @@ pub(super) fn cutex_operation_error_status(code: &str, outcome_unknown: bool) ->
         | "revision_conflict"
         | "already_retired"
         | "already_active"
+        | "agent_name_taken"
         | "turn_conflict"
         | "session_offline"
         | "turn_active"

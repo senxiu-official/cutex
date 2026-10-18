@@ -811,6 +811,7 @@ mod tests {
             exec_explicit: false,
             native_session_id: Some("native-session".into()),
             connection_id: Some("connection".into()),
+            initial_permission_mode: None,
         });
         r
     }

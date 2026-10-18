@@ -8,10 +8,44 @@ from .tools import ToolContext, ToolResult
 from .browser_content import BROWSER_TOOLS
 
 
+# Tools whose owner-approval gate may hold the call on the Agent Bus
+# (cutex approval-wait): a managed / persistent / outside-root service and an
+# agent launch on an approval-gated profile.
+HOLDING_TOOLS = frozenset({'service_register', 'service_update', 'agent_create', 'member_replace'})
+# delegation_wait blocks up to 120 s on the Agent Bus (cutex asks §5.8).
+DELEGATION_WAIT = 'delegation_wait'
+DELEGATION_WAIT_SECS = 120
+# Slack for the façade, the Bus and the action itself after a hold.
+HOLD_SLACK_SECS = 30
+
+
+def approval_wait_secs(config: dict) -> int | None:
+    """The hold cutex opted this adapter in to (descriptor `approvalWaitSecs`, cutex
+    sets it for adapters declaring features.approvalWait); None = answer at once."""
+    value = config.get('approvalWaitSecs')
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return min(value, 600)
+
+
+def tool_timeout(name: str, wait: int | None, default: float | None) -> float | None:
+    """A per-tool timeout for cutex tools that may block on the Bus; None keeps the default."""
+    floor = 0
+    if wait and name in HOLDING_TOOLS:
+        floor = wait + HOLD_SLACK_SECS
+    if name == DELEGATION_WAIT:
+        floor = DELEGATION_WAIT_SECS + HOLD_SLACK_SECS
+    if not floor:
+        return None
+    return max(float(floor), float(default or 0))
+
+
 def load(registry, descriptor: Path) -> None:
     config = json.loads(descriptor.read_text())
     executable = str(Path(config['executable']).resolve(strict=True))
     binding_path = descriptor.parent / 'cutex-mcp-binding.json'
+    wait = approval_wait_secs(config)
+    default_timeout = getattr(getattr(registry, 'settings', None), 'tool_timeout', None)
     for tool in config['tools']:
         async def invoke(arguments: dict, context: ToolContext, name=tool['name']):
             binding = json.loads(binding_path.read_text())
@@ -25,6 +59,15 @@ def load(registry, descriptor: Path) -> None:
                 'CUTEX_AGENT_BUS_URL': binding['url'],
                 'CUTEX_AGENT_BUS_TOKEN': binding['token'],
             })
+            env.pop('CUTEX_MCP_APPROVAL_WAIT_SECS', None)
+            env.pop('CUTEX_MCP_TURN_ID', None)
+            if wait:
+                # approval-wait: the façade may hold a gated call for the owner and
+                # names this turn, so cutex stops holding when the turn ends.
+                env['CUTEX_MCP_APPROVAL_WAIT_SECS'] = str(wait)
+                turn = getattr(context, 'turn_id', None)
+                if isinstance(turn, str) and turn:
+                    env['CUTEX_MCP_TURN_ID'] = turn
             proc = await asyncio.create_subprocess_exec(executable, env=env,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL)
@@ -66,3 +109,4 @@ def load(registry, descriptor: Path) -> None:
         registry.register(tool['name'], tool['description'], tool['inputSchema'], invoke,
                           read_only=tool.get('annotations', {}).get('readOnlyHint') is True)
         registry.tools[tool['name']].mcp_server = 'cutex'
+        registry.tools[tool['name']].timeout = tool_timeout(tool['name'], wait, default_timeout)

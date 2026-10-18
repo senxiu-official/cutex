@@ -12,6 +12,14 @@
         "contractVersion": { "const": 2 },
         "hostId": { "type": "string" },
         "management": {},
+        "claudeRuntime": {
+          "type": "object",
+          "description": "Capability session-claude-runtime: the Claude runtime the host uses for new Claude sessions. Compare with each Claude session's runtime.claudeRuntime to offer an upgrade (POST /v2/sessions/{id}/claude-runtime/repin).",
+          "required": ["selectedRelease"],
+          "properties": {
+            "selectedRelease": { "type": ["string", "null"], "description": "Runtime directory label such as claude-r19; null when no usable Claude runtime is installed." }
+          }
+        },
         "sessions": { "type": "array", "items": { "$ref": "#/$defs/session" } }
       }
     },
@@ -22,7 +30,7 @@
         "protocol": { "type": "string", "description": "codex-app-server | claude-app-server-subset" },
         "majorVersion": { "type": "integer" },
         "version": { "type": "string" },
-        "sha256": { "type": "string" },
+        "sha256": { "type": ["string", "null"], "description": "null for Claude sessions (claude-app-server-subset)." },
         "channel": { "type": "string" },
         "capabilities": {},
         "extensions": { "type": "array", "items": { "type": "string" } }
@@ -44,7 +52,28 @@
         "requiresVisibleTerminal": { "type": "boolean" },
         "tuiAttached": { "type": "boolean" },
         "lastEventAt": { "type": ["string", "null"] },
-        "lastError": {}
+        "lastError": {},
+        "pendingServerRequests": {
+          "type": "array",
+          "description": "Capability session-pending-server-requests: native server requests (approvals, questions, ...) of this runtime generation still waiting for an answer, oldest first; the full message is in GET /v2/sessions/{id}/bootstrap pendingServerRequests. Empty when none.",
+          "items": {
+            "type": "object",
+            "required": ["id", "method"],
+            "properties": {
+              "id": { "type": ["string", "integer"] },
+              "method": { "type": "string" }
+            }
+          }
+        },
+        "claudeRuntime": {
+          "type": "object",
+          "description": "Capability session-claude-runtime; Claude sessions only (absent on others): the pinned Claude runtime and a repin saved for the next fresh runtime start (claude-runtime.json).",
+          "required": ["release", "pendingRelease"],
+          "properties": {
+            "release": { "type": "string", "description": "Runtime directory label such as claude-r17, never a path." },
+            "pendingRelease": { "type": ["string", "null"], "description": "A deferred repin's release (applies at the next fresh runtime start); null when none." }
+          }
+        }
       }
     },
     "avatar": {

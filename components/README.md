@@ -5,7 +5,7 @@ managed installs (`cutex service install`) only. Since cutex 0.1.1. Current comp
 
 | Name | What it is | Platforms |
 |---|---|---|
-| `claude-runtime` | Claude agent runtime; needs Python 3.11+ and your own Claude Code CLI and login ([README](claude-runtime/README.md)) | linux-x64, windows-x64 |
+| `claude-runtime` | Claude agent runtime; needs Python 3.11+ and your own Claude Code CLI and login ([README](claude-runtime/README.md)) | linux-x64, windows-x64, darwin-arm64 |
 | `job-service` | Job Service: long-running agent jobs, the desktop's Jobs page ([README](job-service/README.md)) | linux-x64 |
 
 The user-facing install steps are in the install guide
@@ -68,7 +68,9 @@ components/<name>/
 
 `build.sh` writes `component-<name>-<version>-<platform>.tar.gz` (ustar, regular files and
 directories only, owner 0:0, one mtime, `gzip -n`), `SHA256SUMS-component-<name>-<platform>` and
-`BUILD-INFO-component-<name>-<platform>.json` (`name`, `version`, `commit`, `platform`).
+`BUILD-INFO-component-<name>-<platform>.json` (`name`, `version`, `commit`, `platform`). The archive
+carries its license files (the component's LICENSE / NOTICE and a THIRD_PARTY_NOTICES.md for what it
+bundles); like any other file, a change to them changes the archive and needs a new version (rule 5).
 
 ## Releases
 

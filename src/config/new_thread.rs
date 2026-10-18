@@ -273,7 +273,17 @@ pub struct LaunchOverrides {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Claude profiles only (capability `claude-launch-permission-mode`):
+    /// the Claude Code permission mode the new agent starts in, one of
+    /// [`CLAUDE_PERMISSION_MODES`]. Applied once, at the first runtime start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_permission_mode: Option<String>,
 }
+
+/// Claude Code permission modes a Claude agent can be created in
+/// (`launch.claudePermissionMode`); `plan` keeps the adapter's default mode
+/// underneath.
+pub const CLAUDE_PERMISSION_MODES: &[&str] = &["default", "acceptEdits", "plan", "auto", "bypassPermissions"];
 
 impl LaunchOverrides {
     pub fn is_empty(&self) -> bool {
@@ -323,6 +333,14 @@ impl LaunchOverrides {
         if self.model.as_deref().is_some_and(|model| !visible(model)) {
             return Err("launch.model must be a non-empty model slug".into());
         }
+        if let Some(mode) = &self.claude_permission_mode {
+            if !CLAUDE_PERMISSION_MODES.contains(&mode.as_str()) {
+                return Err(format!(
+                    "launch.claudePermissionMode must be one of {}",
+                    CLAUDE_PERMISSION_MODES.join(", ")
+                ));
+            }
+        }
         if let Some(effort) = &self.reasoning_effort {
             if !visible(effort) || !effort.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
                 return Err("launch.reasoningEffort must be a reasoning effort name".into());
@@ -368,6 +386,18 @@ pub fn resolve_for_create(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_permission_mode_is_not_a_codex_permission_override() {
+        for mode in super::CLAUDE_PERMISSION_MODES {
+            let parsed: super::LaunchOverrides =
+                serde_json::from_value(serde_json::json!({"claudePermissionMode": mode})).unwrap();
+            assert_eq!(parsed.claude_permission_mode.as_deref(), Some(*mode));
+            assert!(parsed.validate().is_ok());
+            assert!(!parsed.has_permission_overrides(), "Claude creates still refuse Codex-only fields only");
+            assert!(!parsed.is_empty());
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -430,6 +460,8 @@ mod tests {
             serde_json::json!({"approvalsReviewer": ""}),
             serde_json::json!({"model": " x"}),
             serde_json::json!({"reasoningEffort": "hi gh"}),
+            serde_json::json!({"claudePermissionMode": "plan-mode"}),
+            serde_json::json!({"claudePermissionMode": "dontAsk"}),
         ] {
             let parsed: LaunchOverrides = serde_json::from_value(bad.clone()).unwrap();
             assert!(parsed.validate().is_err(), "{bad}");

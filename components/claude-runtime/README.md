@@ -156,7 +156,7 @@ mock backend needs no Claude at all:
 python -m cute_claude --mock --workspace "$PWD/demo-workspace" --state-dir "$PWD/.state" --listen stdio://
 ```
 
-Release archive: `bash components/claude-runtime/build.sh <linux-x64|windows-x64> <rN> <out-dir>`
+Release archive: `bash components/claude-runtime/build.sh <linux-x64|windows-x64|darwin-arm64> <rN> <out-dir>`
 writes `component-claude-runtime-<rN>-<platform>.tar.gz` (the shipped source, `wheels/` and
 `requirements.lock`, made by `scripts/vendor_wheels.py`), `SHA256SUMS-component-claude-runtime-<platform>`
 and `BUILD-INFO-component-claude-runtime-<platform>.json`. The component version is `version` in
@@ -166,6 +166,56 @@ pin in `requirements-runtime.txt` changes. A new `claude-agent-sdk` pin also nee
 in `scripts/vendor_wheels.py`.
 
 Protocol notes: [docs/BUSY_DELIVERY.md](docs/BUSY_DELIVERY.md) (busy wakes and delegation results).
+
+### Cutex tools that hold for the owner (feature `approvalWait`, claude-r16)
+
+cutex writes `approvalWaitSecs` into the cutex MCP descriptor for an adapter declaring
+`features.approvalWait`. The adapter then runs each cutex façade call with
+`CUTEX_MCP_APPROVAL_WAIT_SECS` and `CUTEX_MCP_TURN_ID` (the calling turn), so a gated
+`service_register` / `service_update` / `agent_create` / `member_replace` holds on the Agent Bus for
+the owner's decision, and gives those tools `approvalWaitSecs + 30` seconds instead of `--tool-timeout`.
+`delegation_wait` always gets 150 s. Without `approvalWaitSecs` nothing is set and the façade answers
+`approval_required` at once (cutex `docs/agent-tool-security.md` §7.1).
+
+### Auto mode and cutex approvals (claude-r19)
+
+When a thread's Claude permission mode is `auto` (desktop 「自动」) as its Claude Code session starts,
+the runtime-limits note in the preset system prompt append also says that this mode only covers Claude
+Code's own tool permissions: cutex approvals (managed and persistent services, delegation reviews,
+browser grants, other cutex tool approvals) still go to the owner, and such a call may wait for the
+decision. The note follows the mode the session started with; a switch while it runs changes Claude
+Code's permission mode at once but not the prompt until the session's next start.
+
+### Steers after an interrupt, runtime limits note (claude-r18)
+
+An owner `turn/interrupt` drops the running turn's unread steers when it is requested, not only when
+the turn ends `interrupted` / `failed` (claude-r17): the client resends them (desktop interrupt &
+send), so a PostToolUse before the abort lands, or a turn that completes anyway, never delivers them
+a second time. A failed interrupt request puts them back. Steers with images are dropped the same way.
+The preset system prompt append now ends the host text with a short runtime-limits note: background
+subagents are refused (use foreground ones), and a turn Claude Code starts by itself when a background
+shell command finishes cannot use tools and is not shown (docs/BUSY_DELIVERY.md, "Autonomous turns").
+
+### Hooks and auto memory (claude-r17)
+
+With the profile's command execution off (`--allow-exec` not given) the adapter's flag settings
+(`--settings`, also the live `apply_flag_settings`) carry `disableAllHooks: true`, so hooks from the
+project / user settings sources, skill or agent frontmatter and plugins, and a statusLine command,
+never run; with exec on hooks behave as before. The adapter's own hooks are SDK callbacks registered
+through `initialize` and keep running (verified against Claude Code 2.1.289). Claude Code's built-in
+auto memory is off for every Claude agent (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), not only when a
+settings source is on.
+
+### Turns cut off by a stop or restart (claude-r16)
+
+`claude/runtime/close` (cutex Offline / Restart runtime / profile switch / archive) interrupts a running
+turn first, like cutex's `turn/interrupt` before a Codex runtime stops: the turn ends `interrupted`,
+its open tool calls closed, and the terminal events reach subscribers before the close returns. Only an
+interrupt Claude Code confirms within `interrupt_timeout` claims that; otherwise the turn ends `failed`
+(outcome uncertain) as before. A turn the previous adapter process left running (killed, crashed) is
+settled on the next start: `interrupted`, every open item closed (`failed`), its input `uncertain`, the
+queue paused; the settling `item/completed` / `turn/completed` / `thread/status/changed` events are sent
+to each peer that resumes the thread (`thread/resume`) until the thread's next turn starts.
 
 ### Protocol: safety checks under full access (feature `safetyGrants`)
 

@@ -74,7 +74,7 @@ fn context() -> ManagementRequestContext {
         load_bootstrap_state: |_, _| panic!("unexpected bootstrap"),
         load_latest_plan: |_| panic!("unexpected plan"),
         load_latest_token_usage: |_| panic!("unexpected usage"),
-        revert_session_history: |_, _| panic!("unexpected revert"),
+        revert_session_history: |_, _, _| panic!("unexpected revert"),
         delete_session: |_, _| panic!("unexpected session delete"),
         fork_session: |_, _, _| panic!("unexpected fork"),
         side_chat: |_, _, _| panic!("unexpected side chat"),

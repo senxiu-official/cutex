@@ -132,7 +132,7 @@ pub fn gate(
                 approval_id: record.approval_id,
             })
         }
-        GateOutcome::Denied(record) => Ok(Decision::Refused {
+        GateOutcome::Denied(record) | GateOutcome::DeniedEarlier(record) => Ok(Decision::Refused {
             code: "approval_denied",
             approval_id: record.approval_id,
         }),

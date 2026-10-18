@@ -71,6 +71,40 @@ Run with the repository's required private HOME / CUTEX_TEST_PRIVATE_HOME and
 marker. The probe is skipped by default, and refuses an occupied port by failing
 the bind. It closes only the runtime and provider it starts.
 
+## Owner steer (2026-10-17)
+
+`turn/steer` reuses this path for the owner's own input: a `soon` row with message id
+`steer-<clientUserMessageId>` and a user source. At the claiming PostToolUse it is injected like a
+wake, and the adapter also writes the user message into the running turn (item started / completed,
+`steered: true`); `acknowledge` does not emit it again. Unclaimed at turn end, the FIFO runs it as
+the next turn. A resend with the same client id is deduplicated by the queue.
+
+### Interrupt and unread steers (claude-r17, claude-r18)
+
+A steer the turn never read is dropped (input state `interrupted`) when the owner interrupts: since
+claude-r18 at the `turn/interrupt` request, before the abort reaches Claude Code (claude-r17: only
+when the turn ended `interrupted` / `failed`). The desktop's interrupt & send reads the stopped turn
+and resends every steer it did not record (a new client id, merged with the composer text), so the
+adapter must not deliver it as well: before claude-r17 the stale `soon` row was injected into the
+resent turn at its next PostToolUse, or ran as one more turn after it (owner notes, claude-r16). A
+hook between the request and the abort, and a turn that completes anyway, now find nothing to
+inject. If the interrupt request itself fails, the dropped steers are queued again. A steer with
+images (no `busy_inputs` row, never a hook) carries `metadata.steer` and is dropped the same way.
+A steer already read by a hook stays read: the desktop sees its `steered` item and does not resend.
+
+## Autonomous turns (claude-r18 decision)
+
+Claude Code starts a turn by itself when a `run_in_background` Bash command finishes (its task
+notification). That turn has no adapter input: the reader reports its messages only as
+`claude/runtime/event` (`whileIdle: true`, kind and status only, no content), nothing reaches the
+timeline, and the PreToolUse hook denies every tool (`No active turn accepts tools`). Attributing it
+to a synthetic system turn would need the adapter to own a turn Claude Code started (input, receipts,
+interrupt, usage) and is not done; tool admission is not loosened for an unattributed turn. Instead
+the preset system prompt append ends with a runtime-limits note (`config.RUNTIME_LIMITS`): such a
+turn cannot use tools and is not seen by the user, so the model checks the result in the next turn the
+user starts. The same note says background subagents (`Agent` / `Task` with `run_in_background`) are
+refused and to use foreground ones; the hook refusal stays.
+
 ## Validation (Windows, 2026-10-11)
 
 | Check | Baseline `47cab2d` | Task 07 |

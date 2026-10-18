@@ -29,6 +29,15 @@ class ReadOnlyStore(Store):
     def __init__(self, db: sqlite3.Connection):  # noqa: super().__init__ would take the writer lease
         self.db = db
 
+    def turn(self, turn_id: str, *, include_items: bool = True) -> dict:
+        # No adapter runs this agent: a turn still saved as running was cut off
+        # (the next start settles it). Like cute-codex's read of a thread that
+        # is not loaded, it reads `interrupted`; its items stay as saved.
+        turn = super().turn(turn_id, include_items=include_items)
+        if turn["status"] == "inProgress":
+            turn["status"] = "interrupted"
+        return turn
+
 
 def open_database(state_dir: Path) -> sqlite3.Connection | None:
     path = state_dir / "state.sqlite3"

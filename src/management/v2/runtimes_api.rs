@@ -302,7 +302,7 @@ pub fn build(inputs: &Inputs<'_>) -> Built {
 }
 
 /// Compare `0.160.0-r50` / `claude-r5` by their numbers.
-fn natural_key(value: Option<&str>) -> Vec<(u64, String)> {
+pub(crate) fn natural_key(value: Option<&str>) -> Vec<(u64, String)> {
     let Some(value) = value else { return Vec::new() };
     let mut out = Vec::new();
     let mut digits = String::new();

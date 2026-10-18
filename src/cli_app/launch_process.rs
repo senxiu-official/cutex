@@ -107,7 +107,11 @@ pub(crate) fn ensure_management_api_for_launch(account: &StoredAccount) -> anyho
     if account.cli_kind != CliKind::Codex || !matches!(account.runtime, RuntimeConfig::Host) {
         return Ok(());
     }
-    let config = agent_bus_config::ensure_agent_bus_config(true, None)?;
+    // Keep the owner's bus switch: forcing it on here made the agent-mode
+    // check in `ensure_agent_bus_for_launch` always pass, so a home with
+    // `agent_bus_enabled: false` still started / probed a bus.
+    let enabled = cutex::config::store::load_codez_config().agent_bus_enabled;
+    let config = agent_bus_config::ensure_agent_bus_config(enabled, None)?;
     if let Err(err) =
         cutex::management::launch::require_management_api_running(&config, cutex::management::service::management_port(&config))
     {

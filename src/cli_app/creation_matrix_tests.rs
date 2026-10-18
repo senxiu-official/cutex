@@ -446,7 +446,8 @@ fn human_agent_without_cwd_or_project_gets_a_private_scratch_workspace() {
     let cwd = std::path::PathBuf::from(&record.cwd);
     assert!(cwd.is_dir(), "scratch cwd exists: {}", cwd.display());
     let canonical_area = area.canonicalize().unwrap();
-    assert_eq!(cwd.parent().unwrap(), canonical_area, "under agents-scratch");
+    // The stored cwd is plain (no `\\?\` on Windows); compare canonical forms.
+    assert_eq!(cwd.parent().unwrap().canonicalize().unwrap(), canonical_area, "under agents-scratch");
     assert_eq!(entries().len(), 1);
     #[cfg(unix)]
     {

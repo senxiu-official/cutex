@@ -231,7 +231,7 @@ struct Forked {
     through_turn_id: Option<String>,
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn fork_native(record: &CutexSessionRecord, source_thread: &str, after_turn_id: Option<&str>) -> Result<Forked, UserInputExecutionError> {
     let home = super::session_history::native_home_for(Some(record))
         .map_err(|e| failed("resolving the native home", e, json!({})))?;
@@ -313,7 +313,7 @@ fn fork_native(record: &CutexSessionRecord, source_thread: &str, after_turn_id: 
     Ok(Forked { home, thread, cwd, through_turn_id: boundary.through_turn_id })
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn fork_native(_: &CutexSessionRecord, _: &str, _: Option<&str>) -> Result<Forked, UserInputExecutionError> {
     Err(unsupported("session fork requires a local Linux or Windows runtime"))
 }

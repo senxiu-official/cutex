@@ -29,7 +29,7 @@ mod tests {
     fn unavailable_service_returns_manual_start_instruction_without_starting_service() {
         // Keep the port reserved without accepting requests: the check must return
         // an actionable error and must not try to launch a competing server.
-        let listener = (24000..=24999).find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok()).expect("free management test port");
+        let listener = (24000..=24999).filter(|port| !crate::config::instance::RESERVED_DEFAULT_PORTS.contains(port)).find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok()).expect("free management test port");
         let port = listener.local_addr().unwrap().port();
         let error = require_management_api_running(&CodezConfig::default(), port).unwrap_err();
         assert!(error.to_string().contains(&format!("cutex management serve --port {port}")));

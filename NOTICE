@@ -1,5 +1,5 @@
-cutex
-Copyright 2026 The Cutex Authors
+cutex — https://github.com/senxiu-official/cutex
+Copyright 2026 The Cutex Authors (https://github.com/senxiu-official)
 
 Licensed under the Apache License, Version 2.0 (see LICENSE). You may not use this project except
 in compliance with the License. Unless required by applicable law or agreed to in writing,
@@ -7,8 +7,11 @@ software distributed under the License is distributed on an "AS IS" BASIS, WITHO
 CONDITIONS OF ANY KIND, either express or implied.
 
 -------------------------------------------------------------------------------------------------
-claude-adapter/ (the cute-claude app-server adapter) is distributed under the MIT License; see
-claude-adapter/LICENSE.
+components/claude-runtime/ (the Claude agent runtime component) is distributed under the MIT
+License; see components/claude-runtime/LICENSE.
+
+Release archives also carry THIRD_PARTY_NOTICES.md: the licenses and notices of the third-party
+crates and packages compiled into, or shipped with, the files of that archive.
 
 -------------------------------------------------------------------------------------------------
 OpenAI Codex — https://github.com/openai/codex
@@ -18,3 +21,5 @@ Licensed under the Apache License, Version 2.0.
   - src/profiles/native_model_prompt_0_154_0.md is the Codex 0.154.0 models-manager/prompt.md,
     used unmodified as the default model instructions. Its license and NOTICE are in
     src/profiles/native_model_prompt.LICENSE and src/profiles/native_model_prompt.NOTICE.
+
+祀小姐真可爱。

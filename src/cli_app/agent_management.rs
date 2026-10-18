@@ -36,6 +36,7 @@ use cutex::session::service::{
     cutex_session_key_for_user_id_including_retired, cutex_session_launch_cwd,
     persist_cutex_session_store_and_im_record, CutexSessionAdoptOptions, CutexSessionEnsureSeed,
 };
+use cutex::session::metadata::same_session_cwd;
 use cutex::session::store::load_cutex_session_store;
 
 use super::{management_archive, management_lifecycle};
@@ -99,13 +100,13 @@ fn reconcile_claude_bootstrap(spec: &ManagedAgentSpec, started: &Rfc3339, failed
     // Agents share cwds: a record saved before this attempt began is another
     // Agent, never this attempt's creation.
     let candidates: Vec<_> = store.sessions.values().filter(|r| !predates_attempt(&r.created_at, started)
-        && (r.cwd == spec.cwd || r.formal_agent_name.as_deref() == Some(spec.name.as_str()))).collect();
+        && (same_session_cwd(&r.cwd, &spec.cwd) || r.formal_agent_name.as_deref() == Some(spec.name.as_str()))).collect();
     if candidates.is_empty() { return Ok(NativeBootstrapIdentityReconciliation::Absent { reason: "No saved Claude adapter record; bootstrap does not spawn before durable capture".into() }); }
     if let [record] = candidates.as_slice() {
         let timestamp = chrono::DateTime::parse_from_rfc3339(&record.created_at).map_err(unknown("claude_bootstrap_timestamp_invalid"))?;
         let start = chrono::DateTime::parse_from_rfc3339(started.as_str()).map_err(unknown("claude_bootstrap_timestamp_invalid"))?;
         let end = chrono::DateTime::parse_from_rfc3339(failed.as_str()).map_err(unknown("claude_bootstrap_timestamp_invalid"))?;
-        if record.claude_session.is_some() && record.cwd == spec.cwd && record.profile == spec.profile
+        if record.claude_session.is_some() && same_session_cwd(&record.cwd, &spec.cwd) && record.profile == spec.profile
             && record.formal_agent_name.as_deref() == Some(spec.name.as_str()) && timestamp >= start && timestamp <= end {
             return Ok(NativeBootstrapIdentityReconciliation::Exact { native_session_id: record.app_server_thread_id().unwrap().into(), reason: "Exact saved Claude adapter identity and creation interval".into() });
         }
@@ -389,8 +390,8 @@ fn try_load_agent_reservation_absence_evidence(
     }
 
     if durable.sessions.values().any(|record| {
-        (record.cwd == reserved_cwd
-            || record.managed_cwd.as_deref() == Some(reserved_cwd)
+        (same_session_cwd(&record.cwd, reserved_cwd)
+            || record.managed_cwd.as_deref().is_some_and(|cwd| same_session_cwd(cwd, reserved_cwd))
             || record.thread_name.as_deref() == Some(reserved_name)
             || record.display_name_hint.as_deref() == Some(reserved_name))
             && !predates_attempt(&record.created_at, started_at)
@@ -431,9 +432,9 @@ fn try_load_agent_reservation_absence_evidence(
                 },
             );
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let process_cwd = std::fs::read_link(format!("/proc/{}/cwd", session.pid));
+            let process_cwd = cutex::platform::process::process_cwd(session.pid);
             match process_cwd {
                 Ok(process_cwd) if process_cwd == Path::new(reserved_cwd) => {
                     return Ok(AgentReservationReconciliationEvidence::Present {
@@ -568,7 +569,7 @@ fn legacy_director_ownership_evidence_from_record(
         record.managed_cwd.as_deref(),
         "durable_director_managed_cwd_missing",
     )?;
-    if cutex_session_launch_cwd(record) != cwd {
+    if !same_session_cwd(cutex_session_launch_cwd(record), cwd) {
         return Err(AgentManagementError::Conflict(
             "durable_director_cwd_ambiguous",
         ));
@@ -1036,8 +1037,8 @@ impl AgentLifecycle for CutexAgentLifecycle {
             .sessions
             .values()
             .filter(|record| {
-                (record.cwd == spec.cwd
-                    || record.managed_cwd.as_deref() == Some(spec.cwd.as_str()))
+                (same_session_cwd(&record.cwd, &spec.cwd)
+                    || record.managed_cwd.as_deref().is_some_and(|cwd| same_session_cwd(cwd, &spec.cwd)))
                     && !predates_attempt(&record.created_at, started_at)
             })
             .collect::<Vec<_>>();
@@ -1219,8 +1220,8 @@ impl AgentLifecycle for CutexAgentLifecycle {
             .sessions
             .values()
             .filter(|record| {
-                (record.cwd == spec.cwd
-                    || record.managed_cwd.as_deref() == Some(spec.cwd.as_str()))
+                (same_session_cwd(&record.cwd, &spec.cwd)
+                    || record.managed_cwd.as_deref().is_some_and(|cwd| same_session_cwd(cwd, &spec.cwd)))
                     && !predates_attempt(&record.created_at, started_at)
             })
             .collect::<Vec<_>>();
@@ -1873,8 +1874,22 @@ pub(super) fn validate_managed_recovery_record(
         Some(&cwd_hash[..7]),
         &spec.cwd,
     );
-    let groups_match =
-        record.agent_groups == spec.groups || record.agent_groups == effective_groups;
+    // The cwd group of a record whose cwd is the Windows verbatim spelling
+    // of the spec cwd (Claude records before r245) is the same directory's.
+    let verbatim_groups_match = record.cwd != spec.cwd
+        && same_session_cwd(&record.cwd, &spec.cwd)
+        && {
+            let hash = cutex::agent_bus::identity::fnv1a_hex(&record.cwd);
+            record.agent_groups
+                == cutex::agent_bus::groups::normalize_registered_agent_groups(
+                    spec.groups.clone(),
+                    Some(&hash[..7]),
+                    &record.cwd,
+                )
+        };
+    let groups_match = record.agent_groups == spec.groups
+        || record.agent_groups == effective_groups
+        || verbatim_groups_match;
     let quick_action = if spec.pin {
         CutexSessionQuickActionMode::Pinned
     } else {
@@ -1896,10 +1911,10 @@ pub(super) fn validate_managed_recovery_record(
     } else if record
         .managed_cwd
         .as_deref()
-        .is_some_and(|cwd| cwd != spec.cwd)
+        .is_some_and(|cwd| !same_session_cwd(cwd, &spec.cwd))
     {
         Some("managed_cwd")
-    } else if cutex_session_launch_cwd(record) != spec.cwd {
+    } else if !same_session_cwd(cutex_session_launch_cwd(record), &spec.cwd) {
         Some("launch_cwd")
     } else if record.runtime_backend != backend
         && !(record.explicit_launch.is_some()
@@ -2265,6 +2280,7 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: "account-id".to_string(),
             name: "profile".to_string(),
             email: None,

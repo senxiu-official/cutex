@@ -14902,7 +14902,6 @@ mod tests {
             (GlobalSettingsField::ProxyEnabled, "enabled"),
             (GlobalSettingsField::ProxyUrl, "socks5h://127.0.0.1:7890"),
             (GlobalSettingsField::ProxyNoProxy, "localhost"),
-            (GlobalSettingsField::ProxyForceHttp, "disabled"),
         ] {
             model
                 .global_settings_draft
@@ -14915,7 +14914,7 @@ mod tests {
             SelectorControl::ApplyGlobalSettings(request) => request,
             control => panic!("expected global apply request, got {control:?}"),
         };
-        assert_eq!(request.changed_count, 5);
+        assert_eq!(request.changed_count, 4);
         let mut updated = config.clone();
         assert!(apply_global_settings_to_config(&mut updated, &request).expect("apply global"));
         assert!(updated.proxy.as_ref().unwrap().enabled);
@@ -14923,7 +14922,6 @@ mod tests {
         let proxy = updated.proxy.as_ref().expect("enabled proxy");
         assert_eq!(proxy.url.as_deref(), Some("socks5h://127.0.0.1:7890"));
         assert_eq!(proxy.no_proxy.as_deref(), Some("localhost"));
-        assert!(!proxy.force_http_transport);
         assert_eq!(
             updated.notify_service_user_message_content.as_deref(),
             Some("legacy-mode")
@@ -14936,7 +14934,7 @@ mod tests {
             request.changed_count,
         );
         assert_eq!(model.settings_dirty_count(), 0);
-        assert_eq!(model.notice.as_deref(), Some("Saved 5 setting(s)"));
+        assert_eq!(model.notice.as_deref(), Some("Saved 4 setting(s)"));
         assert!(model
             .active_row()
             .expect("updated global row")
@@ -16948,12 +16946,13 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn selector_runtime_version_uses_local_live_process_evidence() {
         let mut record = editable_record();
         record.host_id = cutex::platform::host::current_host_name();
         record.runtime_pid = Some(std::process::id());
-        let executable = std::fs::read_link("/proc/self/exe").unwrap();
+        let executable = cutex::platform::process::process_executable(std::process::id()).unwrap();
         let record_version = |version: &str| {
             cutex::launch::version_registry::NativeVersionRecord {
                 version: version.to_string(),

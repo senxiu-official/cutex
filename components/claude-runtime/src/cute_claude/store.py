@@ -221,26 +221,54 @@ class Store:
 
     def recover(self) -> None:
         # Starting/resuming the server NEVER creates a paid model request.
+        # A turn this store still holds as running was cut off by the previous
+        # adapter process (killed, crashed, host restart): it is settled as
+        # `interrupted` (what cute-codex reports for a turn a restart cut off),
+        # every open item closed, and the settling events are kept for the
+        # first subscribers of this process (`recovered_events`): nobody was
+        # connected when they were written, so a client would otherwise keep
+        # showing the turn and its tool as running.
+        self.recovered_events: dict[str, list[tuple[str, dict]]] = {}
+        from .native_tools import interrupted_item
+        note = "Adapter restarted during this tool call. Outcome is uncertain; inspect side effects before retrying."
         with self.transaction():
             tids = self.db.execute("SELECT DISTINCT thread_id FROM inputs WHERE state IN ('queued','processing')").fetchall()
             for row in tids:
                 self.db.execute("UPDATE threads SET halted=1 WHERE id=?", (row[0],))
             active = self.db.execute("SELECT turn_id,thread_id FROM inputs WHERE state='processing'").fetchall()
-            for row in active:
-                self.clear_browser_replay(row[1], row[0])
+            stale = self.db.execute("SELECT id,thread_id FROM turns WHERE state='inProgress'").fetchall()
+            seen, settle = set(), []
+            for turn_id, tid in [(r[0], r[1]) for r in active] + [(r[0], r[1]) for r in stale]:
+                if turn_id not in seen:
+                    seen.add(turn_id)
+                    settle.append((turn_id, tid))
+            for turn_id, tid in settle:
+                if self.db.execute("SELECT 1 FROM turns WHERE id=? AND state='inProgress'", (turn_id,)).fetchone() is None:
+                    # Already terminal (a processing input of a finished turn): inputs only.
+                    self.db.execute("UPDATE inputs SET state='uncertain' WHERE turn_id=? AND state='processing'", (turn_id,))
+                    continue
+                self.clear_browser_replay(tid, turn_id)
                 error = {"message": "Server stopped during this turn. Tool effects may be uncertain; inspect before resuming.", "codexErrorInfo": "other", "additionalDetails": None}
-                self.db.execute("UPDATE turns SET state='failed',completed=?,error=? WHERE id=?", (time.time(), dump(error), row[0]))
-                self.db.execute("UPDATE inputs SET state='uncertain' WHERE turn_id=?", (row[0],))
-                self.db.execute("UPDATE tool_calls SET state='uncertain' WHERE turn_id=? AND state='started'", (row[0],))
+                self.db.execute("UPDATE turns SET state='interrupted',completed=?,error=? WHERE id=?", (time.time(), dump(error), turn_id))
+                self.db.execute("UPDATE inputs SET state='uncertain' WHERE turn_id=? AND state='processing'", (turn_id,))
+                self.db.execute("UPDATE threads SET halted=1 WHERE id=?", (tid,))
+                self.db.execute("UPDATE tool_calls SET state='uncertain' WHERE turn_id=? AND state='started'", (turn_id,))
+                self.drop_unread_steers(tid)
+                events = self.recovered_events.setdefault(tid, [])
                 # A restored UI must not keep displaying a tool as running forever.
-                from .native_tools import interrupted_item
-                for item in self.items(row[0]):
-                    if item.get("status") == "inProgress" and item.get("type") in {"dynamicToolCall", "mcpToolCall", "commandExecution", "fileChange"}:
-                        interrupted_item(item, "Adapter restarted during this tool call. Outcome is uncertain; inspect side effects before retrying.")
-                        self.put_item(row[0], item)
-                        self.event(row[1], "item/completed", {"threadId": row[1], "turnId": row[0], "item": item})
-                self.event(row[1], "turn/completed", {"threadId": row[1], "turn": self.turn(row[0])})
-                self.event(row[1], "thread/status/changed", {"threadId": row[1], "status": {"type": "idle"}})
+                for item in self.items(turn_id):
+                    if item.get("status") == "inProgress":
+                        interrupted_item(item, note)
+                        if item.get("status") == "inProgress":
+                            item["status"] = "failed"  # any other item kind with a status
+                        self.put_item(turn_id, item)
+                        params = {"threadId": tid, "turnId": turn_id, "item": item}
+                        self.event(tid, "item/completed", params)
+                        events.append(("item/completed", params))
+                self.event(tid, "turn/completed", {"threadId": tid, "turn": self.turn(turn_id)})
+                events.append(("turn/completed", {"threadId": tid, "turn": self.turn(turn_id)}))
+                self.event(tid, "thread/status/changed", {"threadId": tid, "status": {"type": "idle"}})
+                events.append(("thread/status/changed", {"threadId": tid, "status": {"type": "idle"}}))
 
     def new_thread(self, model: str, cwd: str, instructions: str = "") -> str:
         tid, now = identifier(), time.time()
@@ -429,6 +457,8 @@ class Store:
             content = self.project_input(payload)
             now = time.time()
             self.db.execute("INSERT INTO turns(id,thread_id,state,started) VALUES(?,?,'inProgress',?)", (row["turn_id"], tid, now))
+            # Clients saw this thread again once a new turn runs: no more replay.
+            self.recovered_events.pop(tid, None)
             # Notes waiting for this thread are read at the start of a turn an
             # agent or service started (before its own input). An owner turn keeps
             # its text as written (@path mentions expand), so notes wait for its
@@ -548,6 +578,42 @@ class Store:
             self.db.execute("UPDATE threads SET updated=?,halted=? WHERE id=?", (time.time(), state != "completed", tid))
             if state != "completed":
                 self.db.execute("UPDATE tool_calls SET state='uncertain' WHERE turn_id=? AND state='started'", (turn_id,))
+                self.drop_unread_steers(tid)
+
+    def drop_unread_steers(self, tid: str) -> list[int]:
+        """An owner steer (`turn/steer`) the running turn never read is dropped
+        when that turn ends interrupted or failed, as cute-codex drops pending
+        steer input on an abort: clients resend it (the desktop's "interrupt &
+        send" does, under a new id). Kept queued it was injected into a later,
+        unrelated turn at its first tool call, so the model got the message
+        twice. A turn that completes still runs it as the next ordinary turn.
+
+        Also called when the owner requests the interrupt (before the abort
+        reaches Claude Code: a PostToolUse in between, or a turn that still
+        completes, must not deliver it besides the client's resend). Image
+        steers have no busy_inputs row (they never ride a hook) and are
+        dropped too.
+        Returns the dropped input seqs."""
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='busy_inputs'").fetchone():
+            return []
+        rows = self.db.execute("""SELECT i.seq,i.payload FROM inputs i LEFT JOIN busy_inputs b
+            ON b.thread_id=i.thread_id AND b.message_id=i.message_id
+            WHERE i.thread_id=? AND i.state='queued' AND b.context_turn_id IS NULL""", (tid,)).fetchall()
+        dropped = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            if payload.get("source", {}).get("kind") != "user" or (payload.get("metadata") or {}).get("steer") is not True:
+                continue
+            self.db.execute("UPDATE inputs SET state='interrupted' WHERE seq=?", (row["seq"],))
+            dropped.append(row["seq"])
+        return dropped
+
+    def restore_steers(self, tid: str, seqs: list[int]) -> None:
+        """Undo an interrupt-time drop when the interrupt request itself failed
+        and the turn keeps running (its steers then still wait for it)."""
+        for seq in seqs:
+            self.db.execute("""UPDATE inputs SET state='queued' WHERE seq=? AND thread_id=? AND state='interrupted'
+                AND EXISTS(SELECT 1 FROM turns WHERE thread_id=? AND state='inProgress')""", (seq, tid, tid))
 
     @staticmethod
     def stamp_event(method: str, params: dict) -> dict:

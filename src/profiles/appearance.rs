@@ -219,6 +219,16 @@ pub struct ProfileOptions {
     /// Read at the next runtime launch, independently of file editing tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_file_checkpointing: Option<bool>,
+    /// Avatar themes clients pick agent emoji from (capability
+    /// `profile-avatar`; ids from `profiles::avatar::AVATAR_THEMES`, canonical
+    /// order, never empty); absent = the client's default by model family.
+    /// An older cutex keeps it in `extra`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_themes: Option<Vec<String>>,
+    /// Custom intro greeting (capability `profile-avatar`); absent = the
+    /// client's provider greetings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intro_greeting: Option<String>,
     /// Fields a newer cutex wrote (kept on save; persistence is not
     /// `deny_unknown_fields`, RFC backend-auto-update §6.2).
     #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]

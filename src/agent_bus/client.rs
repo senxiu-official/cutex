@@ -478,6 +478,59 @@ pub fn submit_mcp_control(
     path: &str,
     body: &Value,
 ) -> anyhow::Result<Value> {
+    submit_mcp_control_with_wait(port, token, sender, fence, path, body, None)
+}
+
+/// A façade call that may hold on the Agent Bus for the owner's decision
+/// (approval-wait): seconds to hold and the calling turn, when known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalWaitRequest {
+    pub secs: u64,
+    pub turn_id: Option<String>,
+}
+
+impl ApprovalWaitRequest {
+    fn headers(&self) -> String {
+        let mut headers = format!("X-Cutex-Approval-Wait: {}\r\n", self.secs);
+        if let Some(turn) = self.turn_id.as_deref().filter(|turn| {
+            !turn.is_empty() && turn.len() <= 200 && !turn.chars().any(char::is_control)
+        }) {
+            headers.push_str(&format!("X-Cutex-Mcp-Turn-Id: {turn}\r\n"));
+        }
+        headers
+    }
+}
+
+/// How long a façade waits for the Agent Bus's answer on `path`, plus the
+/// approval hold it asked for (approval-wait).
+fn mcp_response_timeout(path: &str, wait: Option<&ApprovalWaitRequest>) -> Duration {
+    let hold = wait.map_or(Duration::ZERO, |wait| Duration::from_secs(wait.secs));
+    hold + if path == "/api/agent-management/v1/actions" {
+        // Fixed native Management wrapper budget; timeout is uncertain,
+        // never permission to issue a replacement action identity.
+        Duration::from_secs(30)
+    } else if path == crate::agent_bus::web_search::PATH {
+        // One provider request (its own timeout) plus slack.
+        crate::agent_bus::web_search::BUS_TIMEOUT
+    } else if path == crate::asks::tools::PATH {
+        // agent_wait blocks up to 120 s on the bus (asks §5.8).
+        Duration::from_millis(crate::asks::WAIT_MAX_MS + 30_000)
+    } else {
+        AGENT_MANAGEMENT_ACTION_TIMEOUT
+    }
+}
+
+/// [`submit_mcp_control`]; with `wait` the request carries the hold headers
+/// and its read timeout grows by the hold.
+pub fn submit_mcp_control_with_wait(
+    port: u16,
+    token: &str,
+    sender: &RuntimeAgentId,
+    fence: &crate::agent_bus::mcp::CallerFence,
+    path: &str,
+    body: &Value,
+    wait: Option<&ApprovalWaitRequest>,
+) -> anyhow::Result<Value> {
     if !crate::agent_bus::agent_auth::MCP_ROUTE_PATHS.contains(&path) {
         anyhow::bail!("unsupported MCP route");
     }
@@ -485,27 +538,16 @@ pub fn submit_mcp_control(
     if body.len() > 262144 || token.trim().is_empty() || token.contains(['\r', '\n']) {
         anyhow::bail!("invalid MCP request configuration");
     }
-    let response = match submit_authenticated_agent_control_with_fence(
+    let response = match submit_authenticated_agent_control_with_headers(
         port,
         token,
         sender,
         path,
         &body,
         "MCP",
-        if path == "/api/agent-management/v1/actions" {
-            // Fixed native Management wrapper budget; timeout is uncertain,
-            // never permission to issue a replacement action identity.
-            Duration::from_secs(30)
-        } else if path == crate::agent_bus::web_search::PATH {
-            // One provider request (its own timeout) plus slack.
-            crate::agent_bus::web_search::BUS_TIMEOUT
-        } else if path == crate::asks::tools::PATH {
-            // agent_wait blocks up to 120 s on the bus (asks §5.8).
-            Duration::from_millis(crate::asks::WAIT_MAX_MS + 30_000)
-        } else {
-            AGENT_MANAGEMENT_ACTION_TIMEOUT
-        },
+        mcp_response_timeout(path, wait),
         Some(fence),
+        &wait.map(ApprovalWaitRequest::headers).unwrap_or_default(),
     ) {
         Ok(response) => response,
         Err(error) if error.downcast_ref::<BusUnreachable>().is_some() => return Err(error),
@@ -526,21 +568,51 @@ fn submit_authenticated_agent_control_with_fence(
     response_timeout: Duration,
     fence: Option<&crate::agent_bus::mcp::CallerFence>,
 ) -> anyhow::Result<Vec<u8>> {
+    submit_authenticated_agent_control_with_headers(
+        port,
+        route_token,
+        sender,
+        path,
+        body,
+        label,
+        response_timeout,
+        fence,
+        "",
+    )
+}
+
+/// `fenced_headers`: extra header lines (each ending in CRLF), sent only
+/// with a fence.
+#[allow(clippy::too_many_arguments)]
+fn submit_authenticated_agent_control_with_headers(
+    port: u16,
+    route_token: &str,
+    sender: &RuntimeAgentId,
+    path: &str,
+    body: &[u8],
+    label: &str,
+    response_timeout: Duration,
+    fence: Option<&crate::agent_bus::mcp::CallerFence>,
+    fenced_headers: &str,
+) -> anyhow::Result<Vec<u8>> {
     let extra = if let Some(fence) = fence {
         let thread = crate::session::identity::normalize_codex_session_id(&fence.thread_id)?;
         format!(
-            "X-Cutex-Mcp-Thread-Id: {thread}\r\nX-Cutex-Mcp-Generation: {}\r\nX-Cutex-Facade: delegations={}\r\n",
+            "X-Cutex-Mcp-Thread-Id: {thread}\r\nX-Cutex-Mcp-Generation: {}\r\nX-Cutex-Facade: delegations={}, {}\r\n{fenced_headers}",
             fence.generation,
-            crate::asks::tools::FACADE_DELEGATIONS
+            crate::asks::tools::FACADE_DELEGATIONS,
+            crate::approvals::FACADE_APPROVAL_NOTE
         )
     } else {
         String::new()
     };
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|error| {
-        anyhow::Error::new(error).context(BusUnreachable(format!(
-            "Failed to connect local cutex agent bus {label} route"
-        )))
-    })?;
+    let mut stream = crate::config::instance::ensure_port_allowed(port)
+        .and_then(|()| TcpStream::connect(("127.0.0.1", port)))
+        .map_err(|error| {
+            anyhow::Error::new(error).context(BusUnreachable(format!(
+                "Failed to connect local cutex agent bus {label} route"
+            )))
+        })?;
     stream.set_write_timeout(Some(AGENT_BUS_HTTP_TIMEOUT)).ok();
     stream.set_read_timeout(Some(response_timeout)).ok();
     let method = if fence.is_some() && path == crate::agent_bus::agent_auth::MCP_AGENT_LIST_PATH {
@@ -786,6 +858,45 @@ mod tests {
                 "{removed}"
             );
         }
+    }
+
+    #[test]
+    fn approval_wait_headers_and_timeout_only_when_opted_in() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_simple_http_request(&mut stream).unwrap();
+                seen.push((
+                    request.headers.get(crate::approvals::APPROVAL_WAIT_HEADER).cloned(),
+                    request.headers.get(crate::approvals::TURN_HEADER).cloned(),
+                ));
+                write_json_response(&mut stream, 200, "OK", &json!({"ok": true})).unwrap();
+            }
+            seen
+        });
+        let fence = crate::agent_bus::mcp::CallerFence {
+            thread_id: "11111111-1111-4111-8111-111111111111".into(),
+            generation: 3,
+        };
+        let sender = RuntimeAgentId::new("stock.worker").unwrap();
+        let wait = ApprovalWaitRequest { secs: 120, turn_id: Some("turn-7".into()) };
+        let body = json!({"op": "list", "args": {}});
+        submit_mcp_control_with_wait(port, "private-test-token", &sender, &fence, "/api/services/v1", &body, Some(&wait)).unwrap();
+        submit_mcp_control(port, "private-test-token", &sender, &fence, "/api/services/v1", &body).unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            [(Some("120".to_string()), Some("turn-7".to_string())), (None, None)]
+        );
+        // The read timeout grows by the hold; a turn id with a line break is dropped.
+        let path = "/api/agent-management/v1/actions";
+        assert_eq!(mcp_response_timeout(path, None), Duration::from_secs(30));
+        assert_eq!(mcp_response_timeout(path, Some(&wait)), Duration::from_secs(150));
+        assert_eq!(mcp_response_timeout("/api/services/v1", Some(&wait)), AGENT_MANAGEMENT_ACTION_TIMEOUT + Duration::from_secs(120));
+        let injected = ApprovalWaitRequest { secs: 5, turn_id: Some("t\r\nX-Evil: 1".into()) };
+        assert_eq!(injected.headers(), "X-Cutex-Approval-Wait: 5\r\n");
     }
 
     #[test]

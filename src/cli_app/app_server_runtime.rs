@@ -701,7 +701,15 @@ fn binding_endpoint_is_owned_by_process(
                     .context("runtime Unix endpoint is invalid")?;
                 return linux_unix_socket_is_owned_by_process(Path::new(socket_path), pid);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            {
+                let socket_path = binding
+                    .endpoint
+                    .strip_prefix("unix://")
+                    .context("runtime Unix endpoint is invalid")?;
+                return macos_unix_socket_is_owned_by_process(Path::new(socket_path), pid);
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             anyhow::bail!("Unix socket PID ownership verification is unsupported on this platform")
         }
         CutexAppServerTransport::LoopbackWebSocket => {
@@ -715,6 +723,34 @@ fn binding_endpoint_is_owned_by_process(
             )
         }
     }
+}
+
+/// macOS has no `/proc/net/unix` or descriptor links: the kernel-backed peer
+/// PID of a one-shot connection (`LOCAL_PEERPID`, the Linux fallback's
+/// `SO_PEERCRED`) must be the claimed PID, owned by this user, on an
+/// endpoint that did not change while it was inspected.
+#[cfg(target_os = "macos")]
+fn macos_unix_socket_is_owned_by_process(path: &Path, pid: u32) -> anyhow::Result<bool> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let resolved_path = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve runtime socket {}", path.display()))?;
+    let metadata = fs::metadata(&resolved_path)
+        .with_context(|| format!("failed to inspect runtime socket {}", path.display()))?;
+    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Ok(false);
+    }
+    let Ok(stream) = std::os::unix::net::UnixStream::connect(&resolved_path) else {
+        return Ok(false);
+    };
+    let peer = cutex::platform::macos_proc::unix_peer(&stream);
+    drop(stream);
+    let endpoint_is_stable = fs::canonicalize(path).ok().as_ref() == Some(&resolved_path)
+        && fs::metadata(path).is_ok_and(|current| {
+            current.dev() == metadata.dev() && current.ino() == metadata.ino()
+        });
+    Ok(peer.is_some_and(|(peer_pid, uid)| peer_pid == pid && uid == unsafe { libc::geteuid() })
+        && endpoint_is_stable)
 }
 
 #[cfg(target_os = "linux")]
@@ -1868,6 +1904,29 @@ mod tests {
         .expect("persistent absence remains rejected");
         assert_eq!(observations, 3);
         assert!(error.to_string().contains("runtime endpoint"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unix_socket_claim_requires_the_claimed_process_to_own_the_live_endpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "own-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        fs::create_dir(&root).expect("runtime ownership fixture directory");
+        let socket = root.join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket)
+            .expect("bind runtime ownership fixture socket");
+        assert!(macos_unix_socket_is_owned_by_process(&socket, std::process::id()).unwrap());
+        assert!(!macos_unix_socket_is_owned_by_process(&socket, 1).unwrap());
+        let alias = root.join("rendezvous");
+        std::os::unix::fs::symlink(&socket, &alias).unwrap();
+        assert!(macos_unix_socket_is_owned_by_process(&alias, std::process::id()).unwrap());
+        drop(listener);
+        assert!(!macos_unix_socket_is_owned_by_process(&socket, std::process::id()).unwrap());
+        fs::remove_file(&alias).unwrap();
+        fs::remove_file(&socket).expect("remove fixture socket");
+        fs::remove_dir(&root).expect("remove runtime ownership fixture directory");
     }
 
     #[cfg(target_os = "linux")]

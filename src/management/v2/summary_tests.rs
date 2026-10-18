@@ -187,9 +187,10 @@ fn session(id: &str, online: bool, active: Option<&str>) -> Value {
         "cutexSessionId": id,
         "displayName": format!("Agent {id}"),
         "lifecycle": "active",
-        "updatedAt": "2026-10-08T00:00:00Z",
-        "runtime": {"status": if online {"online"} else {"offline"}, "activeTurnId": active, "lastEventAt": "2026-10-08T00:05:00Z", "runtimeGeneration": 1},
-        "activity": {"lastOutput": {"displayText": "fallback   text"}},
+        "createdAt": "2026-10-07T00:00:00Z",
+        "updatedAt": "2026-10-08T00:09:00Z",
+        "runtime": {"status": if online {"online"} else {"offline"}, "activeTurnId": active, "lastEventAt": "2026-10-08T00:09:00Z", "runtimeGeneration": 1},
+        "activity": {"lastOutput": {"displayText": "fallback   text"}, "lastConversationAt": "2026-10-08T00:05:00Z"},
     })
 }
 
@@ -259,6 +260,24 @@ fn synthesize_builds_rows_status_needs_and_counts() {
     assert_eq!(synthesis.asks_count, 1);
     // cutex.need + the approval of an unlisted agent.
     assert_eq!(synthesis.needs_you_count, 2);
+}
+
+#[test]
+fn last_activity_ignores_runtime_events_metadata_and_interrupted_turns() {
+    let mut fresh = session("cutex.fresh", true, None);
+    fresh["activity"] = json!({});
+    // No conversation yet: the creation time, never lastEventAt / updatedAt.
+    let row = agent_row(&fresh, None, &[], None).unwrap();
+    assert_eq!(row["lastActivityAt"], "2026-10-07T00:00:00.000Z");
+    let turn = |status: &str| AgentProjection {
+        last_turn: Some(LastTurn { turn_id: "t1".into(), status: status.into(), ended_at: "2026-10-07T06:00:00Z".into() }),
+        ..Default::default()
+    };
+    let row = agent_row(&fresh, None, &[], Some(&turn("completed"))).unwrap();
+    assert_eq!(row["lastActivityAt"], "2026-10-07T06:00:00.000Z");
+    // The interrupt of a turn a restart left in progress is not activity.
+    let row = agent_row(&fresh, None, &[], Some(&turn("interrupted"))).unwrap();
+    assert_eq!(row["lastActivityAt"], "2026-10-07T00:00:00.000Z");
 }
 
 #[test]
@@ -520,7 +539,7 @@ fn bench_context() -> ManagementRequestContext {
         load_bootstrap_state: |_, _| panic!("unexpected bootstrap"),
         load_latest_plan: |_| panic!("unexpected plan"),
         load_latest_token_usage: |_| panic!("unexpected usage"),
-        revert_session_history: |_, _| panic!("unexpected revert"),
+        revert_session_history: |_, _, _| panic!("unexpected revert"),
         delete_session: |_, _| panic!("unexpected session delete"),
         fork_session: |_, _, _| panic!("unexpected fork"),
         side_chat: |_, _, _| panic!("unexpected side chat"),

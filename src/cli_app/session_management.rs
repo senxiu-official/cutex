@@ -306,6 +306,7 @@ mod tests {
                 thread_id: "claude-thread".into(), state_dir: home.root().join(id), model: "sonnet".into(),
                 effort: None, instructions: String::new(), allow_write: false, allow_exec: false, write_explicit: false, exec_explicit: false,
                 native_session_id: None, connection_id: None,
+                initial_permission_mode: None,
             });
             save_cutex_session_store(&store).unwrap();
             let set = |target: &str| -> Result<(), String> {
@@ -375,6 +376,7 @@ mod tests {
                 thread_id: "claude-thread".into(), state_dir: home.root().join(id), model: "sonnet".into(),
                 effort: None, instructions: String::new(), allow_write: false, allow_exec: false, write_explicit: false, exec_explicit: false,
                 native_session_id: None, connection_id: None,
+                initial_permission_mode: None,
             });
             save_cutex_session_store(&store).unwrap();
             if management {
@@ -397,6 +399,7 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: format!("{name}-id"),
             name: name.to_string(),
             email: None,

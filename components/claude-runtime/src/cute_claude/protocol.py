@@ -27,7 +27,7 @@ from .errors import RpcError, require, text
 from .provider import ProviderError
 from .store import COMPACT_EVENT, Store, dump, identifier
 from .model_config import ModelConfig
-from .model_catalog import ModelCatalog, native_models
+from .model_catalog import FAST_TIER, ModelCatalog, fast_mode_supported, native_models
 from .approvals import Approvals
 from .history import PROVIDER, History, thread_wire
 from .inputs import parse_turn_input
@@ -46,7 +46,8 @@ FEATURES = json.loads((Path(__file__).with_name("features.json")).read_text(enco
 # Codex v2 methods with no Claude equivalent: a typed error, never a hang.
 # `data.feature` names the `features` flag a client can use to hide the UI.
 UNSUPPORTED = {
-    "turn/steer": ("turnSteer", "Claude cannot add input to a running turn; it runs as the next turn instead"),
+    # Served for the subscription backend (`_steer`); only other backends refuse it.
+    "turn/steer": ("turnSteer", "Adding input to a running turn requires the Claude subscription backend"),
     "thread/goal/set": ("goals", "Codex thread goals have no Claude Agent SDK equivalent"),
     "review/start": ("review", "Codex review mode has no Claude equivalent; ask for a review in a normal turn"),
     "thread/memoryMode/set": ("memoryMode", "Codex native memories do not apply to Claude agents"),
@@ -113,6 +114,7 @@ class Server:
         self.runtime_id = identifier()
         self.shutdown_requested = False
         engine.notify = self.broadcast
+        engine.notify_view = self.broadcast_view
         self.peer_sequence = 0
         self.approvals = Approvals(self)
         engine.approve_tool = self.approvals.approve
@@ -143,6 +145,17 @@ class Server:
             if not peer.ready or tid not in peer.subscriptions or method in peer.opted_out:
                 continue
             if method.startswith("claude/") and not peer.extensions:
+                continue
+            try:
+                await peer.send({"method": method, "params": params})
+            except Exception:
+                self.disconnect(peer)
+
+    async def broadcast_view(self, tid: str, method: str, params: dict) -> None:
+        """Presentation frames for subscribers of `tid` whose `params.threadId` names another
+        (subagent) thread: never logged as `tid`'s events nor observed by its input bookkeeping."""
+        for peer in list(self.peers):
+            if not peer.ready or tid not in peer.subscriptions or method in peer.opted_out:
                 continue
             try:
                 await peer.send({"method": method, "params": params})
@@ -210,7 +223,10 @@ class Server:
                 "cliDependency": subscription, "apiKeyRequired": not subscription and not self.settings.mock,
                 "subscriptionEntitlementVerified": False, "extraChargesDisabled": False, "input": {"version": 1, "submit": "claude/input/submit",
                     "status": "claude/input/status", "policy": "fifo-separate-turns", "receiptScope": "local-inbox",
-                    "callerSuppliedSource": True, "sameTurnSteering": False,
+                    "callerSuppliedSource": True,
+                    # Owner `turn/steer`: read after the running turn's next main-agent tool
+                    # call (PostToolUse), else the next turn (docs/BUSY_DELIVERY.md).
+                    "sameTurnSteering": subscription, "steerDelivery": "next-tool-call-or-next-turn" if subscription else None,
                     "admissions": [asks.ADMISSION], "askEvents": list(asks.EVENT_TYPES),
                     # cutex agent messaging v2 (0.4.0): `view` param, passive notes,
                     # `external_event` timeline items keyed by message id.
@@ -223,6 +239,7 @@ class Server:
                     "osSandbox": False, "interactiveApprovals": subscription,
                     "interactiveApprovalScope": "sdk-tools" if subscription else [],
                     "interactiveApprovalConfiguration": "claude/approvals/set", "nativePermissionPolicy": subscription, "askUserQuestion": subscription, "planMode": subscription,
+                    "livePermissionMode": subscription, "persistentAllowRules": "claude/permissionRules/reload" if subscription else None,
                     "agentTurnQuestions": self.settings.agent_turn_questions if subscription else None},
                 "presentationOnly": False, "automaticCompaction": False,
                 "contextManagement": "official-sdk-native" if subscription else "local-messages-history",
@@ -242,10 +259,12 @@ class Server:
         if self.settings.backend != "subscription":
             native = {"imageInput", "reasoning", "commandItems", "fileChangeItems", "turnDiff", "approvals",
                       "userInputRequests", "agentTurnQuestions", "planMode", "planChecklist", "compact", "effort", "rateLimits",
-                      "historyRevert", "fork", "threadDelete", "subagents", "autoReconnect", "backgroundTerminals", "mcpStatus", "fileRewind",
-                      "versionedModelCatalog", "modelObservation", "safetyGrants"}
+                      "historyRevert", "fork", "threadDelete", "subagents", "subagentTranscripts", "autoReconnect", "backgroundTerminals", "mcpStatus", "fileRewind",
+                      "versionedModelCatalog", "modelObservation", "safetyGrants", "fastMode",
+                      "turnSteer", "permissionRules"}
             features.update({name: False for name in native})
             features["permissionPresets"] = ["full"]
+            features["claudePermissionModes"] = ["bypassPermissions"]
         return features
 
     def _thread_wire(self, tid: str, include_turns: bool = False) -> dict:
@@ -259,7 +278,7 @@ class Server:
 
     def _thread_response(self, tid: str, include_turns: bool = False) -> dict:
         return {"thread": self._thread_wire(tid, include_turns), "model": self.store.thread(tid)["model"],
-                "modelProvider": PROVIDER, "serviceTier": None, "cwd": str(self.settings.workspace),
+                "modelProvider": PROVIDER, "serviceTier": self._service_tier(tid), "cwd": str(self.settings.workspace),
                 "instructionSources": [], **self._permission_wire(tid),
                 "sandbox": self._sandbox_wire(tid), "reasoningEffort": self._effort(tid)}
 
@@ -272,10 +291,24 @@ class Server:
         model = self.store.thread(tid)['model']
         return {"cwd": str(self.settings.workspace), **self._permission_wire(tid),
                 "sandboxPolicy": self._sandbox_wire(tid), "activePermissionProfile": None,
-                "model": model, "modelProvider": PROVIDER, "serviceTier": None, "effort": self._effort(tid),
+                "model": model, "modelProvider": PROVIDER, "serviceTier": self._service_tier(tid), "effort": self._effort(tid),
                 "summary": None, "personality": None,
                 "collaborationMode": {"mode": "plan" if self.approvals.planning(tid) else "default",
                     "settings": {"model": model, "reasoning_effort": self._effort(tid), "developer_instructions": None}}}
+
+    async def _replay_recovered(self, peer: Peer, tid: str) -> None:
+        """The events that settled a turn the previous adapter process left
+        running (Store.recover): written while nobody was connected, so each
+        subscriber of this process gets them once it resumes the thread,
+        until the thread's next turn starts."""
+        for method, params in list(getattr(self.store, 'recovered_events', {}).get(tid, ())):
+            if not peer.ready or method in peer.opted_out:
+                continue
+            try:
+                await peer.send({"method": method, "params": params})
+            except Exception:
+                self.disconnect(peer)
+                return
 
     async def _emit_settings(self, tid):
         await self.engine.metrics.refresh_context(tid)
@@ -285,6 +318,14 @@ class Server:
         mode = self.approvals.mode(tid)
         return {'approvalPolicy':'never' if mode == 'bypassPermissions' else 'on-request',
                 'approvalsReviewer':'auto_review' if mode == 'auto' else 'user'}
+
+    def _fast(self, tid) -> bool:
+        thread_fast = getattr(self.engine, 'thread_fast', None)
+        return bool(self.settings.backend == 'subscription' and thread_fast and thread_fast(tid))
+
+    def _service_tier(self, tid):
+        """Codex `serviceTier` of Claude Code fast mode: the Fast tier or null (standard)."""
+        return FAST_TIER if self._fast(tid) else None
 
     def _effort(self, tid):
         return self.engine.thread_effort(tid) if self.settings.backend == 'subscription' else self.settings.effort
@@ -317,7 +358,9 @@ class Server:
         require(not params.get("permissionProfile"), "permission profile enforcement is unsupported")
         require(not params.get("ephemeral"), "ephemeral threads are not supported")
         require(not params.get("dynamicTools"), "client-owned dynamic tools unsupported; register host Python/HTTP tools")
-        require(params.get("serviceTier") in (None, "default"), "serviceTier override unsupported")
+        require(params.get("serviceTier") in (None, "default")
+                or (params.get("serviceTier") == FAST_TIER and params.get("threadId") and self._fast(params["threadId"])),
+                "Use thread/settings/update to change Claude fast mode (serviceTier priority)")
         selected_effort = self._effort(params["threadId"]) if params.get("threadId") else self.model_config.effort()
         for field_name in ("reasoningEffort", "effort"):
             requested_effort = params.get(field_name)
@@ -481,11 +524,20 @@ class Server:
                 requested = "\n".join(text(params[k], k) for k in ("baseInstructions", "developerInstructions") if params.get(k))
                 require(requested == saved["instructions"], "resume cannot change saved instructions; create a new thread")
             peer.subscriptions.add(tid)
-            return self._thread_response(tid), lambda: self._emit_settings(tid)
+            async def after_resume():
+                await self._replay_recovered(peer, tid)
+                await self._emit_settings(tid)
+            return self._thread_response(tid), after_resume
         if method in {"thread/turns/list", "thread/items/list"}:
             tid = text(params.get("threadId"), "threadId", limit=256)
             return self.history.page(tid, params, items=method == "thread/items/list"), None
         if method == "thread/read":
+            subagents = getattr(self.engine, "subagents", None)
+            if subagents is not None and isinstance(params.get("threadId"), str):
+                # A foreground subagent's read-only transcript (subagent_transcripts.py).
+                wire = subagents.thread_wire(params["threadId"], bool(params.get("includeTurns")))
+                if wire is not None:
+                    return {"thread": wire}, None
             tid = text(params.get("threadId"), "threadId", limit=256)
             return {"thread": self._thread_wire(tid, bool(params.get("includeTurns")))}, None
         if method == "thread/unsubscribe":
@@ -529,10 +581,9 @@ class Server:
         if method == "thread/settings/update":
             require(self.settings.backend == "subscription", "model switching requires the Claude subscription backend", -32601)
             tid = text(params.get("threadId"), "threadId", limit=256)
-            require(not self.store.user_turn_busy(tid), "Finish or interrupt the current turn before changing Claude settings", -32009)
             mode = params.get("collaborationMode")
             checked = dict(params)
-            for field_name in ('effort', 'reasoningEffort'):
+            for field_name in ('effort', 'reasoningEffort', 'serviceTier'):
                 checked.pop(field_name, None)
             self._validate_launch(checked)
             for name in ("permissions", "personality", "summary", "multiAgentMode"):
@@ -545,10 +596,35 @@ class Server:
                 desired_effort = None
             owner = getattr(getattr(self.engine, 'driver', None), 'owners', {}).get(tid)
             levels = getattr(owner, 'model_efforts', {}).get(model)
+            if desired_effort is not None and levels is None:
+                # Same levels model/list advertises: the live handshake when it names
+                # this model, else the reference catalog (pinned IDs are not in the
+                # handshake, and an offline thread has no handshake at all).
+                entry = next((e for e in (await self.model_catalog.read(tid))['entries'] if e['id'] == model), None)
+                levels = entry.get('supportedEffortLevels') if entry else None
             if desired_effort is not None:
-                require(desired_effort in (levels if levels is not None else [self._effort(tid)]), 'This model does not advertise the selected effort')
-            if model != self.store.thread(tid)['model'] or desired_effort != self._effort(tid):
-                await self.engine.set_model_effort(tid, model, desired_effort)
+                require(desired_effort in (levels if levels is not None else [self._effort(tid)]),
+                        f'Claude model {model} does not offer effort {desired_effort}'
+                        + (f" (offered: {', '.join(levels)})" if levels else ' (it offers no effort levels)' if levels is not None
+                           else ' (its effort levels are unknown)'))
+            # Fast mode = Codex service tier: the Fast tier on, `default` / null off.
+            tier = params.get('serviceTier', 'unchanged')
+            require(tier in ('unchanged', None, 'default', FAST_TIER), 'serviceTier must be priority (Fast), default or null')
+            fast = None if tier == 'unchanged' else tier == FAST_TIER
+            if fast:
+                require(fast_mode_supported(model), 'Claude fast mode needs an Opus 4.8 or Opus 5 model')
+            elif fast is None and self._fast(tid) and not fast_mode_supported(model):
+                fast = False  # A model without fast mode turns it off.
+            if fast is not None and fast == self._fast(tid):
+                fast = None
+            if model != self.store.thread(tid)['model'] or desired_effort != self._effort(tid) or fast is not None:
+                # Permission mode and plan mode may change while a turn runs (Claude
+                # Code's shift+tab); a model, effort or fast mode change needs an idle thread.
+                require(not self.store.user_turn_busy(tid), "Finish or interrupt the current turn before changing Claude settings", -32009)
+                if fast is None:
+                    await self.engine.set_model_effort(tid, model, desired_effort)
+                else:
+                    await self.engine.set_model_effort(tid, model, desired_effort, fast)
             requested = requested_mode(params, self.approvals.mode(tid))
             if requested is not None and requested != self.approvals.mode(tid):
                 await self.approvals.configure(tid, requested)
@@ -591,6 +667,14 @@ class Server:
             assert record is not None
             peer.subscriptions.add(tid)
             return {"turn": self.store.turn(receipt["turnId"], include_items=False)}, lambda: self.engine.wake(tid)
+        if method == "turn/steer":
+            return self._steer(peer, params)
+        if method == "claude/permissionRules/reload":
+            require(self.settings.backend == "subscription", "Claude subscription backend required", -32601)
+            require(set(params) <= {"threadId"}, "only threadId is accepted")
+            tid = text(params.get("threadId"), "threadId", limit=256)
+            self.store.thread(tid)
+            return await self._reload_rules(tid), None
         if method == "thread/compact/start":
             if self.settings.backend != "subscription":
                 raise unsupported(method)
@@ -713,6 +797,73 @@ class Server:
                     "localHistoryScope": "audit-projection" if self.settings.backend == "subscription" else "canonical-messages"}, None
         raise RpcError(-32601, f"Method not supported by the Claude adapter: {method}",
                        {"unsupported": True, "runtime": "claude", "feature": method, "method": method})
+
+    def _steer(self, peer: Peer, params: dict) -> tuple[dict, Callable | None]:
+        """Owner input into the running turn (Codex `turn/steer`).
+
+        The input waits in the durable FIFO as a `soon` input: the next
+        main-agent PostToolUse of that turn reads it (busy_delivery); a turn
+        that completes first runs it as the next ordinary turn, a turn that
+        ends interrupted or failed drops it (Store.drop_unread_steers, like
+        cute-codex): the client resends it. Images cannot ride
+        a hook's text context, so input with images is queued for the next
+        turn at once."""
+        if self.settings.backend != "subscription":
+            raise unsupported("turn/steer")
+        require(set(params) <= {"threadId", "input", "clientUserMessageId", "expectedTurnId"}, "unsupported steer fields")
+        tid = text(params.get("threadId"), "threadId", limit=256)
+        thread = self.store.thread(tid)
+        row = self.store.db.execute("SELECT id FROM turns WHERE thread_id=? AND state='inProgress' ORDER BY rowid DESC LIMIT 1", (tid,)).fetchone()
+        if row is None:
+            raise RpcError(-32600, "no active turn to steer")
+        active = row[0]
+        expected = params.get("expectedTurnId")
+        if expected is not None and expected != active:
+            raise RpcError(-32600, f"expected active turn id {expected} but found {active}")
+        require(not thread["archived"], "thread is archived", -32009)
+        require(not thread["halted"], "queue paused; resume the agent before adding input", -32009)
+        value, attachments, display = parse_turn_input(params.get("input"), images=True,
+            skills=self.skills, cwd=thread["cwd"])
+        # `steer` marks it for Store.drop_unread_steers (with or without images).
+        payload = {"source": {"kind": "user", "id": "local-controller"}, "eventType": "user.message", "text": value,
+                   "metadata": {"steer": True} if attachments else {"deliveryMode": "soon", "steer": True}}
+        if attachments:
+            payload["attachments"] = attachments
+        if display:
+            payload["display"] = display
+        client_id = params.get("clientUserMessageId")
+        mid = identifier()
+        if isinstance(client_id, str) and client_id.strip():
+            payload["clientId"] = client_id[:256]
+            mid = "steer-" + client_id[:200]
+        with self.store.transaction():
+            receipt = self.store.enqueue(tid, mid, payload, self.settings.max_pending)
+            if not attachments:
+                self.busy_delivery.register(tid, mid, receipt)
+        peer.subscriptions.add(tid)
+        return {"turnId": active}, (None if receipt["duplicate"] else lambda: self.engine.wake(tid))
+
+    async def _reload_rules(self, tid: str) -> dict:
+        """cutex changed the persisted allow rules (permission-rules.json): new
+        connections read the file; a live one gets them as flag settings when
+        the runtime accepts that, else at its next start."""
+        from . import permission_rules
+        rules = permission_rules.load(self.settings.state_dir)
+        driver = getattr(self.engine, "driver", None)
+        owner = getattr(driver, "owners", {}).get(tid)
+        applied = "nextStart"
+        if owner is not None and not owner.task.done():
+            if hasattr(self.engine, "flag_settings_dict"):
+                settings = self.engine.flag_settings_dict(tid, explicit_rules=True)
+            else:
+                base = driver.api_account.cli_settings() if getattr(driver, "api_account", None) else {}
+                settings = permission_rules.with_rules(dict(base or {}), rules, explicit=True)
+            try:
+                await owner.control("flag_settings", settings=settings)
+                applied = "live"
+            except Exception:
+                applied = "nextStart"
+        return {"threadId": tid, "rules": len(rules), "applied": applied}
 
     @staticmethod
     def _limit(value: object, default: int) -> int:

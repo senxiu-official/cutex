@@ -444,6 +444,7 @@ pub fn rebind(
     if current.as_ref().is_some_and(|listener| listener.socket() == socket) {
         return Ok(None);
     }
+    crate::config::instance::ensure_port_allowed(socket.port())?;
     let listener = StoppableListener::spawn(TcpListener::bind(socket)?, true, serve)?;
     let old = current.replace(listener);
     Ok(old.map(|old| {
@@ -472,6 +473,7 @@ pub fn start_listeners(
         }
         match spec {
             ListenSpec::Socket(socket) => {
+                crate::config::instance::ensure_port_allowed(socket.port())?;
                 let listener = match TcpListener::bind(socket) {
                     Ok(listener) => listener,
                     Err(error) if !socket.ip().is_loopback() => {
@@ -650,6 +652,8 @@ mod tests {
         Ok(text)
     }
 
+    // macOS lo0 carries only 127.0.0.1 (127.0.0.2 needs an `ifconfig lo0 alias`).
+    #[cfg_attr(target_os = "macos", ignore = "macOS loopback has no 127.0.0.2")]
     #[test]
     fn rebind_stops_the_old_listener_and_serves_the_new_address() {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();

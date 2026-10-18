@@ -58,6 +58,8 @@ fn fixture() -> Fixture {
     let home = root.join("home");
     std::fs::create_dir_all(home.join(".cutex/codex-home")).unwrap();
     std::fs::write(home.join(".cutex/codex-home/config.toml"), b"").unwrap();
+    // A test home has a bus port of its own (test port guard: never 24260).
+    std::fs::write(home.join(".cutex/config.json"), br#"{"agent_bus_port":41260}"#).unwrap();
     let previous_home = std::env::var_os("HOME");
     unsafe { std::env::set_var("HOME", &home) };
     let layout = Layout::at(root.join("b"));

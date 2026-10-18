@@ -109,6 +109,31 @@ automatic retry. Explicit owner `/start` or `/open` resets the budget. Persisten
 services retain the existing exponential backoff. The exhausted state and
 restart count are persisted with runtime state.
 
+### Agent restart (`service_restart`, capability `services-agent-restart`)
+
+`service_restart {slug}` lets the owning agent restart its managed service after
+editing the code it runs. Ownership is the same as for `service_update` /
+`service_unregister` (only the agent that owns the record; `not_service_owner`
+otherwise). It needs no approval: command, cwd and env are unchanged, and the
+`managed_service` grant that let the command run covers its restarts. It
+refuses external and static services with 409 `not_managed` (cutex runs no
+process for them) and a service the owner stopped with 409 `service_stopped`:
+only the owner's `/start` or `/open` brings that back (the owner-start path also
+clears `stopped`, which an agent must not override).
+
+The Agent Bus serves agent tools and the supervisor runs in Management serve,
+so the Bus only records a fresh `restartRequestedAt` on the registry record
+(a revision bump, reason `updated`; not part of the launch fingerprint). On its
+next pass (about a second) the supervisor sees the changed value and restarts the
+process through the same path as `POST /v2/services/{slug}/restart`: kill the
+running tree, wait up to 5 s for the port to free, start again with the restart
+budget and backoff reset. If the owner stopped it (or it stopped being managed)
+between the request and that pass, the request is dropped and noted in the log. A
+value already present when the daemon starts is ignored. The tool answers right
+after recording the request (`{ok, slug, restartRequested: true, service}`); the
+agent checks `service_list` (`health`, `process.startedAt`) for the outcome.
+Changing what the service runs is `service_update`, which restarts it by itself.
+
 ## Routes
 
 | Method and path | Behavior |
@@ -160,7 +185,10 @@ active state directory. Release builds omit this override.
 
 `service_register` accepts `lifetime`, `runtime: "static"`, `root` and `reveal`.
 `service_update` accepts `lifetime`; only the owning agent can edit or downgrade
-its service. The owner setting `agentPersistentApproval` (services settings,
+its service. `service_update` raises the managed-execution approval only when
+the effective runtime, command, cwd or env (after the env merge) differ from the
+stored record; restating unchanged values, or changing only port, path, name or
+lifetime, does not. The owner setting `agentPersistentApproval` (services settings,
 `PATCH /v2/services`, capability `services-persistent-approval`) decides
 whether requesting persistent lifetime (explicitly, or through a persistent
 `agentExternalDefaultLifetime`) needs an owner approval:
@@ -171,6 +199,13 @@ whether requesting persistent lifetime (explicitly, or through a persistent
 - `off`: the persistent lifetime is granted without an approval.
 
 The owner can always set lifetime directly through the management route.
+
+Every service approval (`managed_service`, `service_lifetime`, `static_root`)
+holds the agent's call up to 120 s when its façade opted in (capability
+`approval-wait`, `docs/agent-tool-security.md` §7.1): approved in that window,
+the call registers / updates and returns the normal result; denied, it answers
+`approval_denied`; otherwise `approval_required` as described here, and the
+agent retries after the decision notice.
 
 The managed-execution gate (`managed_service`) is separate and does not depend
 on this setting. With `ask`, when a single request also needs a
@@ -191,6 +226,8 @@ its digest. Managed-only requests always use `managed_service`.
 | off | managed outside the caller's envelope + persistent | `managed_service` |
 | off | managed inside the caller's envelope + persistent | none |
 | either | managed outside the envelope, ephemeral | `managed_service` |
+| ask | static root outside the caller's cwd / workspace + persistent | one `service_lifetime` (both grants) |
+| either | static root outside the caller's cwd / workspace, otherwise | `static_root` |
 
 Successful registration with `reveal: true` publishes
 `cutex/services/revealRequested` on `cutex.host` with `slug`, `hostId`,
@@ -209,9 +246,26 @@ unchanged.
 ## Static runtime
 
 `root` must be an absolute existing directory or `.html` file. A single-file
-root serves its containing directory, with `/` mapped to that file. Agent roots
-must canonically lie inside the agent's cwd or project workspace. Owner and
-agent roots cannot be inside the cutex home. Static services have no command,
+root serves its containing directory, with `/` mapped to that file. Owner roots
+cannot be inside the cutex home. Agent roots (capability `static-root-approval`,
+`services::static_files::check_root`), compared canonically:
+
+| Agent root | Result |
+| --- | --- |
+| inside the caller's cwd or its project's `workspace_root` | allowed |
+| inside the caller's own cwd when that cwd is a cutex-managed scratch workspace `<home>/agents-scratch/<id>` or `<home>/chats/<id>` | allowed (the only part of the cutex home that can be served) |
+| any other existing directory / `.html` file outside the cutex home | owner approval: kind `static_root` (reason `static_root_outside_workspace`), or folded into the one `service_lifetime` approval of a persistent request; `details.staticRoot` = the canonical root, bound by the digest |
+| inside the cutex home (otherwise), containing the cutex home, a filesystem root, the user home or a directory containing it | 403 `static_root_forbidden` |
+| relative, missing, neither a directory nor an `.html` file | 400 |
+
+The agent API validates the whole request (`ServiceStore::validate_register` /
+`validate_update`, a dry run of the store mutation) before any approval gate, so
+an approval is only raised for a request that would then succeed. Refusal
+details name the root that was sent and list the caller's allowed roots (and
+cwd / workspace entries ignored because they lie in the cutex home). A
+re-register or update that keeps the root its record already stores asks
+nothing again; a different root is a new request and a new approval.
+Static services have no command,
 cwd, environment or port; storage uses port zero, while `port`, `url` and
 `localUrl` in views are null. Health follows root existence.
 

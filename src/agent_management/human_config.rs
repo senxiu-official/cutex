@@ -119,7 +119,9 @@ fn patch_values(
                 Some(value) => {
                     let path = std::fs::canonicalize(value).context("cwd does not exist")?;
                     ensure!(path.is_dir(), "cwd must be a directory");
-                    json!(path.to_str().context("cwd is not UTF-8")?)
+                    json!(super::strip_verbatim_prefix(
+                        path.to_str().context("cwd is not UTF-8")?
+                    ))
                 }
                 None => Value::Null,
             },

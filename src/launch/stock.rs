@@ -510,7 +510,7 @@ impl StockBundle {
     fn validate_components_with_config(&self, validate_config: bool) -> anyhow::Result<()> {
         let bundle = self;
         ensure!(
-            cfg!(any(target_os = "linux", windows)),
+            cfg!(any(target_os = "linux", target_os = "macos", windows)),
             "stock runtime unsupported on this platform"
         );
         #[cfg(windows)]

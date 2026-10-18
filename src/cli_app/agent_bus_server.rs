@@ -297,6 +297,7 @@ mod job_service_completion_lane_tests {
         )
         .unwrap();
         let port = (24000..=24999)
+            .filter(|port| !cutex::config::instance::RESERVED_DEFAULT_PORTS.contains(port))
             .find(|port| TcpListener::bind(("127.0.0.1", *port)).is_ok())
             .unwrap();
         let test_name = "cli_app::agent_bus_server::job_service_completion_lane_tests::actual_http_submit_query_replay_and_conflict_use_private_durable_repository";
@@ -3029,6 +3030,7 @@ mod tests {
 
         let port = (24000..=24999)
             .rev()
+            .filter(|port| !cutex::config::instance::RESERVED_DEFAULT_PORTS.contains(port))
             .find(|port| TcpListener::bind(("127.0.0.1", *port)).is_ok())
             .expect("free Bridgeboard-range test port");
         let root = std::env::temp_dir().join(format!(

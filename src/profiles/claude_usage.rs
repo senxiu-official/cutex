@@ -49,6 +49,8 @@ pub enum HttpFailure {
     Status(u16),
     Unavailable,
     InvalidBody,
+    /// Proxy refused / needs credentials (message is credential-free).
+    Proxy(String),
 }
 
 /// Raw usage payload, read with `<claude_home>/.credentials.json`. An
@@ -101,14 +103,16 @@ fn read_with(
         ),
         Err(HttpFailure::Status(status)) => anyhow::bail!("official usage endpoint returned HTTP {status}"),
         Err(HttpFailure::Unavailable) => anyhow::bail!("official usage endpoint unavailable"),
+        Err(HttpFailure::Proxy(message)) => anyhow::bail!("official usage endpoint unavailable: {message}"),
         Err(HttpFailure::InvalidBody) => anyhow::bail!("invalid or oversized official usage JSON"),
     }
 }
 
 fn http_get(access_token: &str) -> Result<Value, HttpFailure> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(REQUEST_TIMEOUT))
-        .max_redirects(0)
+    // A Claude account is not one Profile: its usage endpoint goes through the host proxy.
+    let agent = crate::config::proxy_outbound::OutboundProxy::host()
+        .apply(ureq::Agent::config_builder().timeout_global(Some(REQUEST_TIMEOUT)).max_redirects(0))
+        .map_err(|error| HttpFailure::Proxy(error.to_string()))?
         .build()
         .new_agent();
     let mut response = agent
@@ -118,9 +122,14 @@ fn http_get(access_token: &str) -> Result<Value, HttpFailure> {
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("User-Agent", "cutex")
         .call()
-        .map_err(|error| match error {
-            ureq::Error::StatusCode(status) => HttpFailure::Status(status),
-            _ => HttpFailure::Unavailable,
+        .map_err(|error| {
+            if let Some(message) = crate::config::proxy_outbound::proxy_error_message(&error) {
+                return HttpFailure::Proxy(message);
+            }
+            match error {
+                ureq::Error::StatusCode(status) => HttpFailure::Status(status),
+                _ => HttpFailure::Unavailable,
+            }
         })?;
     if !response.status().is_success() {
         return Err(HttpFailure::Status(response.status().as_u16()));

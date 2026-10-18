@@ -5,7 +5,10 @@
 //! in place, so the PID recorded by the durable runtime binding remains the
 //! app-server PID while all tool/build descendants inherit the Agent cgroup.
 //! Platforms without that boundary keep the existing direct launch and expose
-//! a precise fallback reason in the child environment and service log.
+//! a precise fallback reason in the child environment and service log. On
+//! macOS (`direct:macos_process_group`) the runtime is started with setsid()
+//! and the PID-based stop signals its whole process family
+//! (`platform::process::terminate_process_and_wait`).
 
 use std::fmt;
 #[cfg(target_os = "linux")]
@@ -38,6 +41,9 @@ const SCOPE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedAgentIsolationFallback {
     WindowsNoSystemd,
+    /// macOS: no systemd; the runtime is its own session / process group
+    /// leader and stop signals its whole family (platform::process).
+    MacosProcessGroup,
     UnsupportedPlatform,
     SystemdNotBooted,
     CgroupV2Unavailable,
@@ -51,6 +57,7 @@ impl ManagedAgentIsolationFallback {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::WindowsNoSystemd => "windows_no_systemd",
+            Self::MacosProcessGroup => "macos_process_group",
             Self::UnsupportedPlatform => "unsupported_platform",
             Self::SystemdNotBooted => "systemd_not_booted",
             Self::CgroupV2Unavailable => "cgroup_v2_unavailable",
@@ -402,7 +409,12 @@ fn current_systemd_scope_support(_require_launcher: bool) -> SystemdScopeSupport
     SystemdScopeSupport::Unavailable(ManagedAgentIsolationFallback::WindowsNoSystemd)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn current_systemd_scope_support(_require_launcher: bool) -> SystemdScopeSupport {
+    SystemdScopeSupport::Unavailable(ManagedAgentIsolationFallback::MacosProcessGroup)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn current_systemd_scope_support(_require_launcher: bool) -> SystemdScopeSupport {
     SystemdScopeSupport::Unavailable(ManagedAgentIsolationFallback::UnsupportedPlatform)
 }

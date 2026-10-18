@@ -207,6 +207,14 @@ impl CutexSessionArchiveTransaction for ManagementArchiveTransaction {
                 .cloned()
                 .ok_or_else(|| session_missing(cutex_session_id))?;
             validate_restore_commit_snapshot(&current, expected_revision)?;
+            if let Some(holder) =
+                cutex::session::metadata::live_formal_name_holder(&store, &current)
+            {
+                return Err(CutexSessionArchiveError::AgentNameTaken {
+                    name: current.formal_agent_name.clone().unwrap_or_default(),
+                    holder: holder.cutex_session_id.clone(),
+                });
+            }
             let transition = commit_restore_record(
                 store
                     .sessions
@@ -538,6 +546,16 @@ fn archive_error(error: CutexSessionArchiveError) -> UserInputExecutionError {
         }
         CutexSessionArchiveError::RuntimeStopFailed { detail } => runtime_stop_failed(detail),
         CutexSessionArchiveError::PersistenceUncertain { detail } => persistence_uncertain(detail),
+        CutexSessionArchiveError::AgentNameTaken { name, holder } => UserInputExecutionError {
+            stage: "route".to_string(),
+            code: "agent_name_taken".to_string(),
+            message: format!(
+                "the live Agent {holder} now holds the name '{name}'; rename or archive it before restoring this one"
+            ),
+            retryable: false,
+            details: serde_json::json!({ "name": name, "holderCutexSessionId": holder }),
+            outcome_unknown: false,
+        },
         CutexSessionArchiveError::UnsupportedMethod { method } => UserInputExecutionError {
             stage: "route".to_string(),
             code: "cutex_method_denied".to_string(),

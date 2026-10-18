@@ -127,7 +127,7 @@ fn context() -> ManagementRequestContext {
         },
         load_latest_plan: |_| Value::Null,
         load_latest_token_usage: |_| Value::Null,
-        revert_session_history: |id, turn| {
+        revert_session_history: |id, turn, _| {
             let before: usize = turn.strip_prefix("turn-").unwrap().parse().unwrap();
             let mut fixtures = fixtures();
             let fixture = fixtures.get_mut(id).unwrap();

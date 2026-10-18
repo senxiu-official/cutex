@@ -1,6 +1,11 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -13,6 +18,10 @@ struct LaunchFixture {
 
 impl LaunchFixture {
     fn new() -> Self {
+        Self::with_config(r#"{"desktop_notify_enabled":false,"agent_bus_enabled":false}"#)
+    }
+
+    fn with_config(config_json: &str) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
@@ -53,7 +62,7 @@ impl LaunchFixture {
         .expect("write fixture account store");
         fs::write(
             home.join(".cutex/config.json"),
-            r#"{"desktop_notify_enabled":false,"agent_bus_enabled":false}"#,
+            config_json,
         )
         .expect("write fixture global config");
 
@@ -118,6 +127,38 @@ esac
             .output()
             .expect("execute actual Cutex run wrapper")
     }
+}
+
+impl LaunchFixture {
+    fn stored_config(&self) -> serde_json::Value {
+        let text = fs::read_to_string(self.home.join(".cutex/config.json")).expect("read config");
+        serde_json::from_str(&text).expect("config is JSON")
+    }
+}
+
+/// Default-instance ports (management, bus, their tunnels, desktop notify).
+const DEFAULT_PORTS: [u64; 5] = [24270, 24260, 24670, 24660, 24250];
+
+/// A stand-in bus on a free loopback port: answers `200 OK` to every request
+/// and counts the connections it accepted.
+fn fake_bus() -> (u16, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake bus");
+    let port = listener.local_addr().expect("fake bus address").port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            counter.fetch_add(1, Ordering::SeqCst);
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buffer = [0u8; 8192];
+            let _ = stream.read(&mut buffer);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+        }
+    });
+    (port, hits)
 }
 
 impl Drop for LaunchFixture {
@@ -210,4 +251,52 @@ fn ordinary_interactive_launch_keeps_compatible_stdout_presentation() {
     assert!(stdout.contains("Running"));
     assert!(stdout.contains("Launch: cli=codex"));
     assert!(stdout.ends_with("child human output\n"));
+}
+
+#[test]
+fn agent_launch_keeps_a_disabled_bus_off_and_never_takes_a_default_port() {
+    // Regression (2026-10-18): the launch forced the bus on and normalized
+    // the fixture to 24260, then probed / handed off the machine's live bus
+    // or spawned a detached `agent serve --port 24260`.
+    let fixture = LaunchFixture::new();
+    let output = fixture.machine_output("json_ok");
+    assert!(output.status.success(), "{}", utf8(&output.stderr));
+
+    let config = fixture.stored_config();
+    assert_eq!(config["agent_bus_enabled"], false, "{config}");
+    let port = config["agent_bus_port"].as_u64().expect("a bus port of its own");
+    assert!(!DEFAULT_PORTS.contains(&port), "{config}");
+    assert!(config.get("management_port").is_none_or(|value| !DEFAULT_PORTS.contains(&value.as_u64().unwrap_or(0))));
+}
+
+#[test]
+fn agent_launch_with_an_enabled_bus_targets_only_the_homes_own_port() {
+    let (port, hits) = fake_bus();
+    let fixture = LaunchFixture::with_config(&format!(
+        r#"{{"desktop_notify_enabled":false,"agent_bus_enabled":true,"agent_bus_port":{port},"agent_bus_token":"fixture-bus-token-0123456789"}}"#
+    ));
+    let output = fixture.machine_output("json_ok");
+    assert!(output.status.success(), "{}", utf8(&output.stderr));
+
+    // The health probe reached this home's bus (so nothing was spawned), and
+    // the stored port was kept rather than normalized to the default bus.
+    assert!(hits.load(Ordering::SeqCst) >= 1, "{}", utf8(&output.stderr));
+    let config = fixture.stored_config();
+    assert_eq!(config["agent_bus_port"].as_u64(), Some(u64::from(port)), "{config}");
+}
+
+#[test]
+fn agent_launch_replaces_a_stored_default_bus_port_and_never_probes_it() {
+    // An old fixture that stores the default port: the guard swaps in a free
+    // port of its own (nothing listens there, the launch stays offline).
+    let fixture = LaunchFixture::with_config(
+        r#"{"desktop_notify_enabled":false,"agent_bus_enabled":false,"agent_bus_port":24260,"management_port":24270}"#,
+    );
+    let output = fixture.machine_output("json_ok");
+    assert!(output.status.success(), "{}", utf8(&output.stderr));
+    let config = fixture.stored_config();
+    let port = config["agent_bus_port"].as_u64().expect("bus port");
+    assert!(!DEFAULT_PORTS.contains(&port), "{config}");
+    // The management probe refuses the stored default port with a warning.
+    assert!(utf8(&output.stderr).contains("management"), "{}", utf8(&output.stderr));
 }

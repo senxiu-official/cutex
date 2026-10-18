@@ -513,9 +513,12 @@ pub struct HttpFetcher;
 
 impl Fetcher for HttpFetcher {
     fn get(&self, url: &str, etag: Option<&str>, last_modified: Option<&str>) -> anyhow::Result<FetchResponse> {
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(90)))
-            .max_redirects(3)
+        let agent = crate::config::proxy_outbound::OutboundProxy::host()
+            .apply(
+                ureq::Agent::config_builder()
+                    .timeout_global(Some(std::time::Duration::from_secs(90)))
+                    .max_redirects(3),
+            )?
             .build()
             .new_agent();
         let mut request = agent
@@ -528,9 +531,14 @@ impl Fetcher for HttpFetcher {
         if let Some(last_modified) = last_modified {
             request = request.header("If-Modified-Since", last_modified);
         }
-        let mut response = request.call().map_err(|error| match error {
-            ureq::Error::StatusCode(status) => anyhow::anyhow!("HTTP {status}"),
-            other => anyhow::anyhow!("connection failed: {other}"),
+        let mut response = request.call().map_err(|error| {
+            if let Some(message) = crate::config::proxy_outbound::proxy_error_message(&error) {
+                return anyhow::anyhow!("connection failed: {message}");
+            }
+            match error {
+                ureq::Error::StatusCode(status) => anyhow::anyhow!("HTTP {status}"),
+                other => anyhow::anyhow!("connection failed: {other}"),
+            }
         })?;
         let status = response.status().as_u16();
         let header = |name: &str| {

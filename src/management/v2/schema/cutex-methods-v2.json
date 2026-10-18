@@ -268,7 +268,8 @@
       "required": ["beforeTurnId"],
       "properties": {
         "beforeTurnId": { "$ref": "#/$defs/nonEmptyString" },
-        "expectedRevision": { "$ref": "#/$defs/safeInteger" }
+        "expectedRevision": { "$ref": "#/$defs/safeInteger" },
+        "rewindFiles": { "type": "boolean", "description": "Claude agents (capability claude-rewind-files): also restore files from Claude Code's file checkpoint of the first removed turn. Codex agents refuse true (rewind_files_unsupported); they use cutex/session/files/revert." }
       }
     },
     "sessionFilesRevert": {
@@ -1845,7 +1846,8 @@
         "removed": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyString" } },
         "changed": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyString" } },
         "projectsChanged": { "type": "boolean" },
-        "hostId": { "$ref": "#/$defs/nonEmptyString" }
+        "hostId": { "$ref": "#/$defs/nonEmptyString" },
+        "claudeRuntimeChanged": { "const": true, "description": "Capability session-claude-runtime: present (true) only when the host's selected Claude runtime for new sessions changed." }
       }
     },
     "alarmsChanged": {

@@ -18,6 +18,7 @@ struct World {
     gate_closed: bool,
     pins: BTreeMap<String, usize>,
     external: bool,
+    by_hand: bool,
 }
 
 thread_local! {
@@ -47,6 +48,9 @@ impl Handler for Fake {
     }
     fn external(&self, _: &Layout) -> bool {
         world(|w| w.external)
+    }
+    fn configured_by_hand(&self) -> bool {
+        world(|w| w.by_hand)
     }
     fn prepare(&self, ctx: &Context) -> anyhow::Result<Value> {
         if !ctx.dry_run {
@@ -109,7 +113,12 @@ fn register() {
 fn ship(layout: &Layout, source: &Path, key: &TestKey, release: &str, version: Option<&str>, payload: &[u8]) -> Option<Artifact> {
     let mut m = manifest::fixtures::manifest(release, 50);
     let artifact = version.map(|version| {
-        let archive = tar_gz(&[Item::File { path: "tool", data: payload, mode: 0o755 }]);
+        // With the license files the component builds put next to their payload.
+        let archive = tar_gz(&[
+            Item::File { path: "tool", data: payload, mode: 0o755 },
+            Item::File { path: "LICENSE", data: b"license", mode: 0o644 },
+            Item::File { path: "THIRD_PARTY_NOTICES.md", data: b"# Third-party notices\n", mode: 0o644 },
+        ]);
         let name = format!("component-{FAKE}-{version}-{}.tar.gz", platform_key());
         let tag = format!("component-{FAKE}-{version}");
         std::fs::create_dir_all(source.join(&tag)).unwrap();
@@ -156,6 +165,17 @@ fn status(layout: &Layout, keys: &[PublicKey]) -> Value {
 }
 
 #[test]
+fn unmanaged_host_reports_a_hand_configured_component_as_external() {
+    register();
+    let handler = handler(FAKE).unwrap();
+    world(|w| w.by_hand = false);
+    assert_eq!(status_of(None, &[], handler.as_ref(), None)["state"], states::MISSING);
+    world(|w| w.by_hand = true);
+    assert_eq!(status_of(None, &[], handler.as_ref(), None)["state"], states::EXTERNAL);
+    world(|w| w.by_hand = false);
+}
+
+#[test]
 fn install_downloads_verifies_unpacks_selects_and_removes() {
     register();
     let key = TestKey::new(7);
@@ -181,6 +201,7 @@ fn install_downloads_verifies_unpacks_selects_and_removes() {
     let receipt = read_receipt(&dir).unwrap();
     assert_eq!((receipt.origin.as_str(), receipt.version.as_str()), (ORIGIN_SIGNED, "0.1.0"));
     assert!(receipt.files.contains_key("tool"));
+    assert!(receipt.files.contains_key("THIRD_PARTY_NOTICES.md"), "license files are unpacked and recorded");
     assert_eq!(out["component"]["state"], states::READY, "{out}");
     assert_eq!(out["component"]["selected"], "0.1.0");
     assert_eq!(out["component"]["versions"][0]["version"], "0.1.0");

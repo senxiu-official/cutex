@@ -166,6 +166,7 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: format!("{name}-id"),
             name: name.to_string(),
             email: None,
@@ -1161,6 +1162,7 @@ base_url = "https://new.example"
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: "demo-id".to_string(),
             name: "demo".to_string(),
             email: None,
@@ -1212,6 +1214,7 @@ base_url = "https://new.example"
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: "demo-id".to_string(),
             name: "demo".to_string(),
             email: None,
@@ -1388,7 +1391,6 @@ exclude = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "PATH"]
                 true,
                 Some("socks5h://127.0.0.1:7890".to_string()),
                 Some("localhost,127.0.0.1".to_string()),
-                true,
             )
             .expect("proxy config should be valid"),
         );
@@ -4242,7 +4244,6 @@ requires_openai_auth = false
                 true,
                 Some("http://127.0.0.1:7890".to_string()),
                 Some("localhost,127.0.0.1".to_string()),
-                true,
             )
             .expect("proxy config should be valid"),
         );
@@ -4265,10 +4266,8 @@ requires_openai_auth = false
         assert!(launch
             .envs
             .iter()
-            .any(|(key, value)| key == "NO_PROXY" && value == "localhost,127.0.0.1"));
-        assert!(launch.envs.iter().any(|(key, value)| {
-            key == CUTE_CODEX_FORCE_HTTP_TRANSPORT_ENV_VAR && value == "1"
-        }));
+            .any(|(key, value)| key == "NO_PROXY" && value == "localhost,127.0.0.1,::1"));
+        assert!(!launch.envs.iter().any(|(key, _)| key == "CUTE_CODEX_FORCE_HTTP_TRANSPORT"));
 
         match old_home {
             Some(value) => unsafe { std::env::set_var("HOME", value) },
@@ -4298,7 +4297,6 @@ requires_openai_auth = false
                 true,
                 Some("socks5h://127.0.0.1:7890".to_string()),
                 None,
-                true,
             )
             .expect("proxy config should be valid"),
         );
@@ -4340,7 +4338,6 @@ requires_openai_auth = false
             true,
             Some("socks5h://127.0.0.1:7891".to_string()),
             Some("localhost,127.0.0.1,::1".to_string()),
-            true,
         )
         .expect("proxy config should be valid");
         let envs = proxy_envs(
@@ -4370,7 +4367,6 @@ requires_openai_auth = false
                     true,
                     Some("socks5h://127.0.0.1:7891".to_string()),
                     None,
-                    true,
                 )
                 .expect("global proxy should be valid"),
             ),
@@ -4381,13 +4377,13 @@ requires_openai_auth = false
         assert_eq!(account_proxy_scope_label(&account, &global), "on(global)");
 
         account.proxy = Some(
-            proxy_config_from_parts(false, None, None, /*force_http_transport*/ true)
+            proxy_config_from_parts(false, None, None)
                 .expect("disabled proxy should be valid"),
         );
         assert_eq!(account_proxy_scope_label(&account, &global), "off(profile)");
 
         account.proxy = Some(
-            proxy_config_from_parts(true, Some("http://127.0.0.1:8080".to_string()), None, true)
+            proxy_config_from_parts(true, Some("http://127.0.0.1:8080".to_string()), None)
                 .expect("profile proxy should be valid"),
         );
         assert_eq!(account_proxy_scope_label(&account, &global), "on(profile)");
@@ -4875,7 +4871,6 @@ status_line = ["current-dir"]
                 true,
                 Some("socks5h://127.0.0.1:7891".to_string()),
                 Some("localhost,127.0.0.1,::1".to_string()),
-                true,
             )
             .expect("proxy config should be valid"),
         );

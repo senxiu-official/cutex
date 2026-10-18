@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
-**0.1.3**：新的 cute-codex 原生运行时 0.160.0-r52.3（Windows 免管理员沙箱下商店版 PowerShell 可用）；运行中会话的联网与额外可写目录可以修改；独立实例里的智能体浏览器工具可用；用量估价修复（0.1.0「First Take」是第一个公开版本）。更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+**0.1.4**：Claude 智能体大幅增强（启动权限模式、claude-r19 运行时、上下文窗口与推理强度、更换运行时、导入技能、查看子代理过程、回退文件、权限规则）；Profile 形象保存在主机上；审批更清楚；代理模式；回退更安全（0.1.x 为「First Take」，0.1.0 是第一个公开版本）。更新内容见 [CHANGELOG.md](CHANGELOG.md)。
 
 > **0.1.x 的已知缺口**（正在修，修好后删除这段）：
 > - **手机推送 / 配对手机**：还没有公开的手机应用。
@@ -185,6 +185,7 @@ CUTEX_TEST_PRIVATE_HOME=~/cutex-test-home HOME=~/cutex-test-home cargo test --lo
 
 这样 cutex 会使用 `~/cutex-test-home/.cutex`。设置了 `CUTEX_TEST_PRIVATE_HOME` 时，发布版本会拒绝运行。调试版的
 `cutex management serve` 请用单独的端口（`--port`），避免和已安装的后台服务冲突。
+这些进程同样拒绝默认端口（24270、24260、24670、24660、24250）：测试目录没有自己的 Bus 端口时会分到一个空闲端口，并写进它的 `config.json`。
 
 Claude 适配器是一个 Python 包，测试在 `components/claude-runtime/` 里。
 

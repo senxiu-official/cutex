@@ -441,7 +441,7 @@ mod tests {
             load_bootstrap_state: |_, _| panic!("unused"),
             load_latest_plan: |_| panic!("unused"),
             load_latest_token_usage: |_| panic!("unused"),
-            revert_session_history: |_, _| panic!("unused"),
+            revert_session_history: |_, _, _| panic!("unused"),
             delete_session: |_, _| panic!("unused"),
             fork_session: |_, _, _| panic!("unused"),
             side_chat: |_, _, _| panic!("unused"),

@@ -187,6 +187,7 @@ fn login_api_key(
         search_tool: false,
         quota_reader: None,
         private_chatgpt_auth_file: false,
+        claude_code: cutex::profiles::claude_code::ClaudeCodeOptions::for_new_profile(&cli_kind),
         id,
         name: name.to_string(),
         email: None,

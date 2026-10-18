@@ -1,4 +1,4 @@
-//! `cutex/session/history/revert {beforeTurnId, expectedRevision?}`: remove a
+//! `cutex/session/history/revert {beforeTurnId, expectedRevision?, rewindFiles?}`: remove a
 //! turn and every newer turn from the agent's native thread, keeping the same
 //! agent, thread and (when online) the same runtime process.
 //!
@@ -33,6 +33,9 @@ pub const EVENT: &str = "cutex/session/historyReverted";
 pub(super) struct RevertParams {
     pub(super) before_turn_id: String,
     pub(super) expected_revision: bool,
+    /// Claude agents: also restore files from Claude Code's checkpoint
+    /// (capability `claude-rewind-files`). Codex refuses it.
+    pub(super) rewind_files: bool,
 }
 
 pub(super) fn parse_params(params: &Value) -> Result<RevertParams, UserInputExecutionError> {
@@ -41,7 +44,7 @@ pub(super) fn parse_params(params: &Value) -> Result<RevertParams, UserInputExec
         .ok_or_else(|| invalid_user_input_error("params must be an object"))?;
     if let Some(key) = object
         .keys()
-        .find(|key| !matches!(key.as_str(), "beforeTurnId" | "expectedRevision"))
+        .find(|key| !matches!(key.as_str(), "beforeTurnId" | "expectedRevision" | "rewindFiles"))
     {
         return Err(invalid_user_input_error(&format!("unknown parameter {key}")));
     }
@@ -52,9 +55,15 @@ pub(super) fn parse_params(params: &Value) -> Result<RevertParams, UserInputExec
         .filter(|turn| !turn.is_empty())
         .ok_or_else(|| invalid_user_input_error("beforeTurnId must be a non-empty string"))?
         .to_string();
+    let rewind_files = match object.get("rewindFiles") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(invalid_user_input_error("rewindFiles must be a boolean")),
+    };
     Ok(RevertParams {
         before_turn_id,
         expected_revision: object.contains_key("expectedRevision"),
+        rewind_files,
     })
 }
 
@@ -82,7 +91,7 @@ pub(super) fn dispatch(
     }
     crate::asks::lifecycle::check_no_obligations_default(cutex_session_id, "revert")
         .map_err(super::asks::operation_error)?;
-    let result = revert(cutex_session_id, &params.before_turn_id);
+    let result = revert(cutex_session_id, &params.before_turn_id, params.rewind_files);
     super::history::invalidate_session(cutex_session_id);
     let result = result?;
     // A reverted turn that answered an ask: flag it and tell the requester.
@@ -148,6 +157,9 @@ mod tests {
         let parsed = parse_params(&json!({ "beforeTurnId": "turn-2" })).unwrap();
         assert_eq!(parsed.before_turn_id, "turn-2");
         assert!(!parsed.expected_revision);
+        assert!(!parsed.rewind_files);
+        assert!(parse_params(&json!({ "beforeTurnId": "t", "rewindFiles": true })).unwrap().rewind_files);
+        assert!(!parse_params(&json!({ "beforeTurnId": "t", "rewindFiles": false })).unwrap().rewind_files);
         assert!(parse_params(&json!({ "beforeTurnId": "t", "expectedRevision": 4 }))
             .unwrap()
             .expected_revision);
@@ -156,6 +168,7 @@ mod tests {
             json!({ "beforeTurnId": "" }),
             json!({ "beforeTurnId": 3 }),
             json!({ "beforeTurnId": "t", "numTurns": 1 }),
+            json!({ "beforeTurnId": "t", "rewindFiles": "yes" }),
             json!("turn"),
         ] {
             assert!(parse_params(&bad).is_err(), "{bad}");
@@ -177,12 +190,13 @@ mod tests {
         (root, repository)
     }
 
-    fn ok_handler(_: &str, before: &str) -> Result<Value, UserInputExecutionError> {
+    fn ok_handler(_: &str, before: &str, rewind_files: bool) -> Result<Value, UserInputExecutionError> {
+        assert!(!rewind_files);
         assert_eq!(before, "turn-2");
         Ok(sample_result())
     }
 
-    fn refusing_handler(_: &str, _: &str) -> Result<Value, UserInputExecutionError> {
+    fn refusing_handler(_: &str, _: &str, _: bool) -> Result<Value, UserInputExecutionError> {
         panic!("handler must not run")
     }
 

@@ -148,8 +148,8 @@ pub struct SearchTarget {
     /// The session's model slug (usage attribution).
     pub model: String,
     pub provider: Option<String>,
-    pub proxy: Option<Option<String>>,
-    pub no_proxy: Option<String>,
+    /// The profile's effective proxy.
+    pub proxy: crate::config::proxy_outbound::OutboundProxy,
 }
 
 pub fn responses_url(base: &str) -> anyhow::Result<url::Url> {
@@ -391,12 +391,8 @@ pub fn search(target: &SearchTarget, query: &str, timeout: Duration) -> Result<S
     if target.key.is_empty() || target.key.chars().any(char::is_control) {
         return Err(failure("profile_unavailable", "The profile has no usable API key.".into(), None));
     }
-    let agent = crate::profiles::model_discovery::provider_agent(
-        timeout,
-        target.proxy.as_ref().map(|proxy| proxy.as_deref()),
-        target.no_proxy.as_deref(),
-    )
-    .map_err(|_| failure("profile_unavailable", "The profile's proxy setting is invalid.".into(), None))?;
+    let agent = crate::profiles::model_discovery::provider_agent(timeout, &target.proxy)
+        .map_err(|_| failure("profile_unavailable", "The profile's proxy setting is invalid (an http:// or https:// proxy URL is needed).".into(), None))?;
     let body = request_body(&target.wire_model, query);
     let response = agent
         .post(target.responses_url.as_str())
@@ -408,7 +404,12 @@ pub fn search(target: &SearchTarget, query: &str, timeout: Duration) -> Result<S
         Err(ureq::Error::Timeout(_)) => {
             return Err(failure("provider_timeout", format!("The provider did not answer within {} s.", timeout.as_secs()), None))
         }
-        Err(_) => return Err(failure("provider_unreachable", "The provider could not be reached.".into(), None)),
+        Err(error) => {
+            let detail = crate::config::proxy_outbound::proxy_error_message(&error)
+                .map(|message| format!("The provider could not be reached: {message}."))
+                .unwrap_or_else(|| "The provider could not be reached.".into());
+            return Err(failure("provider_unreachable", detail, None));
+        }
     };
     let status = response.status().as_u16();
     let text = response
@@ -501,15 +502,14 @@ pub fn target_for(record: &crate::session::model::CutexSessionRecord, account: &
         })
         .unwrap_or_else(|| model.clone());
     let global = crate::config::store::load_codez_config();
-    let proxy = crate::config::proxy::effective_proxy_config(account, &global);
+    let proxy = crate::config::proxy_outbound::OutboundProxy::for_profile(account, &global);
     Ok(SearchTarget {
         responses_url: responses_url(&base)?,
         key,
         wire_model,
         model,
         provider: snapshot.model_provider.clone(),
-        proxy: proxy.map(|proxy| if proxy.enabled { proxy.url.clone() } else { None }),
-        no_proxy: proxy.and_then(|proxy| proxy.no_proxy.clone()),
+        proxy,
     })
 }
 

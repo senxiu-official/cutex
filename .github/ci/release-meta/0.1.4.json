@@ -1,0 +1,23 @@
+{
+  "_comment": "upgrade-manifest.py --meta for cutex 0.1.4 \"First Take\" (sign-and-upload.sh uses release-meta/<release>.json by itself). No new native (hosts keep cute-codex 0.160.0-r52.3, no --native-run); mode full so new agents get releases/0.1.4/manifests/default.json = the host's current native + the 0.1.4 cutex-mcp facade (approval-note, resources/prompts lists), and packageRunRecommended moves idle agents. Components: claude-runtime claude-r19, job-service 0.1.1 (licence files only). Migration live-thread-settings: no startup migration, but the store must be moved aside on rollback so a later roll-forward never trusts permission snapshots an older cutex did not update. The two shapes 0.1.3 cannot parse at all (static_root approvals, a pending Claude initial_permission_mode) are rewritten by the 0.1.4 rollback itself (src/upgrade/older_stores.rs), not by this file. Previous capability list: the published cutex-0.1.3/capabilities.json (capabilities-0.1.3.json here is a sorted copy for the upgrade e2e); 0.1.4 adds 23, removes none. Owner commands: docs/release/RUNBOOK-0.1.4.md.",
+  "mode": "full",
+  "packageRunRecommended": true,
+  "migrations": [
+    {
+      "id": "live-thread-settings",
+      "class": "rollback-safe",
+      "since": "0.1.4",
+      "notes": {
+        "en": "Live permission snapshots of running agents for the Agent Bus; moved aside on rollback.",
+        "zh-CN": "运行中智能体的实时权限快照（供 Agent Bus 使用）；回退时移到一旁。"
+      },
+      "newStores": [
+        "runtime/live-thread-settings"
+      ]
+    }
+  ],
+  "notes": {
+    "en": "Claude agents: launch permission modes (Auto does not decide cutex approvals), Claude runtime claude-r19, context windows and effort levels from the runtime, repin to the selected Claude runtime from the app, skills import, subagent transcripts. Profile pictures, avatar themes and greetings are stored on the host; agents' pending requests are visible after reconnecting; approvals record who decided; proxy modes per Profile; agents can use browser tabs in the background. New agents start with this release's tools; idle agents move over after the update.",
+    "zh-CN": "Claude 智能体：启动时可选权限模式（「自动」不代替 cutex 审批）、Claude 运行时 claude-r19、上下文窗口和思考强度来自运行时、可在应用里迁到所选 Claude 运行时、导入技能、查看子智能体记录。Profile 头像、头像主题和开场白保存在主机上；重新连接后能看到智能体待处理的请求；审批记录由谁决定；Profile 可单独设置代理模式；智能体可在后台使用浏览器标签页。新智能体使用本版本的工具，空闲的智能体会在更新后自动迁移。"
+  }
+}

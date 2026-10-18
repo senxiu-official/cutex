@@ -199,6 +199,10 @@ pub fn claim_for_wait(
             claimed.push(delivery.clone());
         }
     }
+    // In the order the results arrived, not the map's (random id) order.
+    claimed.sort_by(|a, b| {
+        (super::parse_time(&a.created_at), &a.delivery_id).cmp(&(super::parse_time(&b.created_at), &b.delivery_id))
+    });
     claimed.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     claimed
 }
@@ -218,6 +222,20 @@ pub fn requesters_with_pending(state: &AskState) -> Vec<String> {
 
 /// Move a requester's actionable pending deliveries into one event record.
 /// Returns the event id, or `None` when there is nothing to send.
+/// Deliveries as they became pending (creation time, then id). The store map
+/// is keyed by random delivery ids, so its order put a later result before an
+/// earlier one (r243 acceptance: delegation-9be907 above delegation-e37ed4).
+fn in_creation_order(state: &AskState, mut ids: Vec<String>) -> Vec<String> {
+    let created = |id: &String| {
+        state
+            .deliveries
+            .get(id)
+            .and_then(|delivery| super::parse_time(&delivery.created_at))
+    };
+    ids.sort_by(|a, b| created(a).cmp(&created(b)).then_with(|| a.cmp(b)));
+    ids
+}
+
 pub fn coalesce_into_event(state: &mut AskState, requester: &str, native_message_id: &str, now: DateTime<Utc>) -> Option<String> {
     let ids: Vec<String> = state
         .deliveries
@@ -240,6 +258,7 @@ pub fn coalesce_selected_into_event(state: &mut AskState, requester: &str, nativ
     if ids.is_empty() {
         return None;
     }
+    let ids = in_creation_order(state, ids);
     let event_id = new_id("aev");
     for id in &ids {
         if let Some(delivery) = state.deliveries.get_mut(id) {
@@ -341,6 +360,30 @@ mod tests {
         acknowledge_event(&mut state, &event, "turn-1", now);
         assert!(state.deliveries.values().any(|d| d.state == DeliveryState::Acknowledged));
         assert_eq!(state.deliveries[&first].state, DeliveryState::ClaimedByWait);
+    }
+
+    /// r243 acceptance: two results in one event came in delivery-id (random) order.
+    #[test]
+    fn results_keep_the_order_they_arrived_in() {
+        let now = Utc::now();
+        for ids in [["dlv-z", "dlv-a"], ["dlv-a", "dlv-z"]] {
+            let mut state = AskState::default();
+            let (first, _) = state.create_ask(new_ask("a", "x"), now).unwrap();
+            let (second, _) = state.create_ask(new_ask("b", "y"), now).unwrap();
+            let one = record_answer_delivery(&mut state, &first, "ans-1", now).unwrap();
+            let two = record_answer_delivery(&mut state, &second, "ans-2", now + chrono::Duration::milliseconds(5)).unwrap();
+            // Re-key them so the map order is the opposite of (or the same as) arrival order.
+            for (old, new) in [(&one, ids[0]), (&two, ids[1])] {
+                let mut record = state.deliveries.remove(old).unwrap();
+                record.delivery_id = new.into();
+                state.deliveries.insert(new.into(), record);
+            }
+            let mut waited = state.clone();
+            let event = coalesce_into_event(&mut state, REQUESTER, "msg", now).unwrap();
+            assert_eq!(state.events[&event].delivery_ids, ids.to_vec(), "event");
+            let claimed: Vec<String> = claim_for_wait(&mut waited, REQUESTER, &[], "w", now).into_iter().map(|d| d.delivery_id).collect();
+            assert_eq!(claimed, ids.to_vec(), "wait");
+        }
     }
 
     #[test]

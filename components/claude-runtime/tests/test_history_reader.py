@@ -96,3 +96,21 @@ def test_module_entry_point_serves_stdio(tmp_path):
     responses = [json.loads(line) for line in done.stdout.splitlines()]
     assert [r['id'] for r in responses] == [1, 2]
     assert responses[1]['result']['thread']['id'] == tid and responses[1]['result']['thread']['turns'] == []
+
+
+def test_reader_shows_a_turn_cut_off_by_a_killed_adapter_as_interrupted(tmp_path):
+    state = tmp_path / 'state'
+    store = Store(state)
+    tid = store.new_thread('mock', str(tmp_path), '')
+    store.enqueue(tid, 'cut', {'source': {'kind': 'user', 'id': 'owner'}, 'eventType': 'user.message',
+                               'text': 'long tool', 'metadata': {}}, 4)
+    turn = store.claim(tid)['turn_id']
+    store.close()  # as left by a killed adapter: still saved as running
+    reader = Reader(state)
+    try:
+        read = ask(reader, 'thread/read', {'threadId': tid, 'includeTurns': True})['result']
+        assert [t['status'] for t in read['thread']['turns']] == ['interrupted']
+        page = ask(reader, 'thread/turns/list', {'threadId': tid})['result']
+        assert page['data'][0]['id'] == turn and page['data'][0]['status'] == 'interrupted'
+    finally:
+        reader.db.close()

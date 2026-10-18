@@ -552,10 +552,9 @@ fn reviewed_request(
             return Err(conflict("approval_policy"));
         }
     }
-    if given(&agent.cwd).is_some_and(|cwd| {
-        crate::session::metadata::normalize_session_cwd(cwd)
-            != crate::session::metadata::normalize_session_cwd(&spec.cwd)
-    }) {
+    if given(&agent.cwd)
+        .is_some_and(|cwd| !crate::session::metadata::same_session_cwd(cwd, &spec.cwd))
+    {
         return Err(conflict("cwd"));
     }
     // `expose_to_im` is retired (`im-exposure-retired`): accepted, ignored.

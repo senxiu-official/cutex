@@ -20,7 +20,7 @@ impl LocalDeployment {
     /// Select an installed artifact template; existing agent bindings are not rewritten.
     pub fn install(&self) -> anyhow::Result<()> {
         ensure!(
-            cfg!(any(target_os = "linux", windows)),
+            cfg!(any(target_os = "linux", target_os = "macos", windows)),
             "local runtime deployment is unsupported on this platform"
         );
         ensure!(self.native_home.is_dir(), "saved native home missing");
@@ -702,7 +702,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn open_history_writer_blocks_adoption_until_closed() {
         let path =
@@ -907,7 +907,11 @@ fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
         Err(error) => Err(error.into()),
     }
 }
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
+    Ok(!crate::platform::macos_proc::open_writers(history)?.is_empty())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn has_history_writer(_: &Path) -> anyhow::Result<bool> {
     anyhow::bail!("local adoption requires Linux")
 }

@@ -4,13 +4,14 @@
 #
 #   bash components/claude-runtime/build.sh <platform> <version> <out-dir>
 #
-# <platform>: linux-x64 | windows-x64 (the archive is built the same way on any host: the wheels
+# <platform>: linux-x64 | windows-x64 | darwin-arm64 (the archive is built the same way on any host: the wheels
 # are downloaded for the target platform). <version>: must equal component.json `version` and the
 # `release` in src/cute_claude/features.json (claude-rN); a mismatch fails the build.
 # Writes to <out-dir>:
 #   component-claude-runtime-<version>-<platform>.tar.gz   adapter source (component.json, README.md,
 #                     LICENSE, pyproject.toml, src/, scripts/connect_tui.py) + wheels/ (that platform's
 #                     vendored dependencies) + requirements.lock (runtime only, --hash per wheel)
+#                     + THIRD_PARTY_NOTICES.md (the wheels' licenses and license texts)
 #   SHA256SUMS-component-claude-runtime-<platform>
 #   BUILD-INFO-component-claude-runtime-<platform>.json     name, version, commit, platform
 # No venv and no test dependencies; ustar, regular files only, owner 0, a fixed mtime,
@@ -20,10 +21,10 @@
 # Needs: git, GNU tar, gzip, sha256sum, Python 3.11+ with pip (PYTHON, default python3) and PyPI.
 set -euo pipefail
 
-platform="${1:?platform: linux-x64 | windows-x64}"
+platform="${1:?platform: linux-x64 | windows-x64 | darwin-arm64}"
 version="${2:?version (claude-rN)}"
 out="${3:?out dir}"
-case "$platform" in linux-x64 | windows-x64) ;; *) echo "claude-runtime is built for linux-x64 and windows-x64 (got $platform)" >&2; exit 2 ;; esac
+case "$platform" in linux-x64 | windows-x64 | darwin-arm64) ;; *) echo "claude-runtime is built for linux-x64, windows-x64 and darwin-arm64 (got $platform)" >&2; exit 2 ;; esac
 unixpath() { if command -v cygpath > /dev/null 2>&1; then cygpath -u "$1"; else printf '%s' "$1"; fi; }
 out="$(unixpath "$out")"
 python="${PYTHON:-}"
@@ -71,7 +72,8 @@ cp -R "$src/src" "$stage/src"
 cp "$src/scripts/connect_tui.py" "$stage/scripts/"
 find "$stage" \( -name __pycache__ -o -name '*.pyc' -o -name '*.egg-info' \) -prune -exec rm -rf {} +
 "$python" "$src/scripts/vendor_wheels.py" --platform "$platform" --requirements "$src/requirements-runtime.txt" --out "$stage"
-for f in src/cute_claude/__main__.py src/cute_claude/features.json scripts/connect_tui.py requirements.lock; do
+"$python" "$src/scripts/wheel_notices.py" --wheels "$stage/wheels" --out "$stage/THIRD_PARTY_NOTICES.md"
+for f in src/cute_claude/__main__.py src/cute_claude/features.json scripts/connect_tui.py requirements.lock LICENSE THIRD_PARTY_NOTICES.md; do
   [ -f "$stage/$f" ] || { echo "archive would lack $f" >&2; exit 1; }
 done
 if find "$stage" -type l | grep -q .; then echo "links in the archive tree" >&2; exit 1; fi

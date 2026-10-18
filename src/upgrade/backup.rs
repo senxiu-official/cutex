@@ -30,6 +30,7 @@ pub const STATE_FILES: &[&str] = &[
     "runtime/agent-bus-registry.json",
     "runtime/light/deployment.json",
     "runtime/native-version-registry-v1.json",
+    "claude-permission-rules.json",
 ];
 
 /// Directories under the cutex home.
@@ -64,6 +65,9 @@ pub const STATE_DIRS: &[&str] = &[
     "runtime/workflows",
     "runtime/runtime-intent",
     "runtime/quota-continue",
+    "runtime/profile-avatars",
+    "runtime/live-thread-settings",
+    "claude-skills",
 ];
 
 /// What selects runtimes for new agents; a binary rollback puts these back.

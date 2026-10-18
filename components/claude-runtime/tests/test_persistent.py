@@ -285,10 +285,27 @@ def test_schema_verifier_uses_v1_initialization():
     data=runpy.run_path(str(Path(__file__).parents[1]/'scripts/verify_r91.py'))
     assert data['RPC']['initialize'] == ('v1/InitializeParams','v1/InitializeResponse')
 
+async def test_close_during_query_interrupts_the_turn_first(ph):
+    # Restart / offline while a turn runs (desktop 重启运行时): the turn ends
+    # `interrupted` like a Codex turn cutex interrupts before a stop, and
+    # subscribers receive its terminal events before Close returns.
+    tid = await ph.thread()
+    turn = await ph.turn(tid, 'HANG')
+    await until(lambda: len(ph.sdk.clients) and ph.sdk.clients[0].query_count == 1)
+    closed = await ph.call('claude/runtime/close', {'threadId':tid})
+    assert closed['processExitConfirmed'] is True
+    assert ph.store.turn(turn)['status'] == 'interrupted'
+    assert ph.store.thread(tid)['halted']
+    assert ph.sdk.clients[0].query_count == 1 and ph.sdk.clients[0].interrupt_count == 1
+    completed = [m for m in ph.out if m.get('method') == 'turn/completed']
+    assert completed and completed[-1]['params']['turn']['status'] == 'interrupted'
+
+
 async def test_close_during_query_does_not_claim_clean_interruption(ph):
     tid = await ph.thread()
     turn = await ph.turn(tid, 'HANG')
     await until(lambda: len(ph.sdk.clients) and ph.sdk.clients[0].query_count == 1)
+    ph.sdk.clients[0].drop_interrupt = True  # the native runtime never drains the interrupt
     closed = await ph.call('claude/runtime/close', {'threadId':tid})
     assert closed['processExitConfirmed'] is True
     assert ph.store.turn(turn)['status'] == 'failed'

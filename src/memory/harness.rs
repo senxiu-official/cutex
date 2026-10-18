@@ -257,6 +257,26 @@ fn read_agents_file(dir: &Path) -> Option<(std::path::PathBuf, String)> {
 /// AGENTS.md files Codex would load for `cwd`: from the enclosing git root
 /// (or `cwd` when there is none) down to `cwd`, concatenated in that order.
 pub fn project_agents_md(cwd: &Path) -> Option<AgentsMd> {
+    project_agents_md_except(cwd, |_| false)
+}
+
+/// Whether `dir`'s CLAUDE.md (`CLAUDE.md`, `.claude/CLAUDE.md` or
+/// `CLAUDE.local.md`) imports that directory's AGENTS.md (`@AGENTS.md` /
+/// `@./AGENTS.md`). Claude Code then loads that AGENTS.md itself when it reads
+/// project settings, so cutex must not inject it a second time.
+pub fn claude_md_imports_agents_md(dir: &Path) -> bool {
+    ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"].iter().any(|name| {
+        let base = if name.starts_with(".claude/") { "../AGENTS.md" } else { "AGENTS.md" };
+        std::fs::read_to_string(dir.join(name)).is_ok_and(|text| {
+            text.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '`')
+                .filter_map(|token| token.strip_prefix('@'))
+                .any(|path| path == base || path == format!("./{base}") || (base == "AGENTS.md" && path == "./AGENTS.md"))
+        })
+    })
+}
+
+/// [`project_agents_md`] without the AGENTS.md of directories `skip` names.
+fn project_agents_md_except(cwd: &Path, skip: impl Fn(&Path) -> bool) -> Option<AgentsMd> {
     let mut dirs: Vec<&Path> = Vec::new();
     let mut root_found = false;
     for dir in cwd.ancestors() {
@@ -273,6 +293,10 @@ pub fn project_agents_md(cwd: &Path) -> Option<AgentsMd> {
     let mut files = Vec::new();
     for dir in dirs.iter().rev() {
         if let Some((path, content)) = read_agents_file(dir) {
+            // AGENTS.override.md is never what CLAUDE.md imports.
+            if path.file_name().is_some_and(|name| name == "AGENTS.md") && skip(dir) {
+                continue;
+            }
             if !text.is_empty() {
                 text.push_str("\n\n");
             }
@@ -291,17 +315,20 @@ pub fn user_agents_md() -> Option<AgentsMd> {
 }
 
 /// Sections of the system prompt append cutex gives a Claude agent: the
-/// `# Cutex` section (when enabled), the user and project AGENTS.md (Claude
-/// Code loads no settings or CLAUDE.md here: `setting_sources=[]`),
-/// `# File references` and, for project members, `# Memory`.
+/// `# Cutex` section (when enabled), the user and project AGENTS.md,
+/// `# File references` and, for project members, `# Memory`. When the
+/// profile has Claude Code read the project settings (`claude-code-sources`),
+/// project AGENTS.md files that a CLAUDE.md next to them imports are left to
+/// Claude Code (no double injection); every other AGENTS.md stays here.
 pub fn claude_system_append_sections(record: &CutexSessionRecord) -> Vec<(&'static str, String)> {
     let cwd = Path::new(&record.cwd);
+    let claude_md = crate::runtime::claude::code_sources::project_settings_active(record);
     let memory = super::launch_memory_context_or_warn(&record.cutex_session_id);
     let root = memory.as_ref().map(|memory| memory.file_reference_root(cwd)).unwrap_or(cwd);
     compose_claude_sections(
         launch_harness(record),
         user_agents_md(),
-        project_agents_md(cwd),
+        project_agents_md_except(cwd, |dir| claude_md && claude_md_imports_agents_md(dir)),
         super::render_file_citation_instructions(root),
         memory.map(|memory| memory.instructions),
         CLAUDE_APPEND_MAX_BYTES,
@@ -393,6 +420,32 @@ mod tests {
         let text = project_agents_md(&lone).unwrap().section();
         assert!(text.contains("[truncated at 32 KiB]") && !text.contains("outside the repo"));
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn agents_md_imported_by_claude_md_is_left_to_claude_code() {
+        let base = std::env::temp_dir().join(format!("cutex-claude-md-{}", uuid::Uuid::new_v4()));
+        let sub = base.join("crate");
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        std::fs::create_dir_all(sub.join(".claude")).unwrap();
+        std::fs::write(base.join("AGENTS.md"), "root rules").unwrap();
+        std::fs::write(base.join("CLAUDE.md"), "Read this:\n@AGENTS.md\n").unwrap();
+        std::fs::write(sub.join("AGENTS.md"), "crate rules").unwrap();
+        assert!(claude_md_imports_agents_md(&base));
+        assert!(!claude_md_imports_agents_md(&sub), "no CLAUDE.md there");
+        let kept = project_agents_md_except(&sub, claude_md_imports_agents_md).unwrap();
+        assert_eq!(kept.files, vec![sub.join("AGENTS.md")]);
+        assert!(!kept.text.contains("root rules"));
+        // `.claude/CLAUDE.md` imports the parent's file.
+        std::fs::write(sub.join(".claude/CLAUDE.md"), "see @../AGENTS.md").unwrap();
+        assert!(claude_md_imports_agents_md(&sub));
+        assert!(project_agents_md_except(&sub, claude_md_imports_agents_md).is_none());
+        // A CLAUDE.md that only mentions AGENTS.md (no import) keeps it.
+        std::fs::write(base.join("CLAUDE.md"), "AGENTS.md has the rules").unwrap();
+        assert!(!claude_md_imports_agents_md(&base));
+        // Without project settings nothing is left out.
+        assert_eq!(project_agents_md(&sub).unwrap().files.len(), 2);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     fn docs(label: &str, bytes: usize) -> AgentsMd {

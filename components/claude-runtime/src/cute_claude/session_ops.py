@@ -278,7 +278,7 @@ class SessionOperations:
                     target.db.execute('INSERT INTO inputs(thread_id,message_id,semantic_hash,payload,turn_id,state,created) VALUES(?,?,?,?,?,\'inherited\',?)',
                         (new_id, original['message_id'], original['semantic_hash'], original['payload'], copied_id, original['created']))
             # Copy durable preferences only, never per-session approval grants.
-            for table in ('thread_efforts', 'thread_tool_approvals', 'thread_launch_models', 'thread_plan_mode'):
+            for table in ('thread_efforts', 'thread_tool_approvals', 'thread_launch_models', 'thread_plan_mode', 'thread_fast_mode'):
                 schema = self.store.db.execute('SELECT sql FROM sqlite_master WHERE type=\'table\' AND name=?', (table,)).fetchone()
                 if schema:
                     target.db.execute(schema[0].replace('CREATE TABLE ', 'CREATE TABLE IF NOT EXISTS ', 1))

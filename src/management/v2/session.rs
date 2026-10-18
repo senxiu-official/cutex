@@ -159,7 +159,7 @@ impl Default for FocusState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionProjectionEntry {
+pub(super) struct SessionProjectionEntry {
     revision: u64,
     fingerprint: String,
     focus: FocusState,
@@ -277,6 +277,9 @@ pub fn session_list_resource_with_hidden(
         "contractVersion": 2,
         "hostId": host_id,
         "management": management,
+        // session-claude-runtime: compared with each Claude session's
+        // runtime.claudeRuntime by clients offering the upgrade.
+        "claudeRuntime": super::claude_runtime_api::host_selected_json(),
         "sessions": sessions,
     }))
 }
@@ -407,7 +410,7 @@ pub fn management_identity(repository: &EventRepository) -> anyhow::Result<Value
                     "restoreStartsRuntime": false,
                 },
                 "sessionActivity": {
-                    "version": 2,
+                    "version": 3,
                     "source": "native_app_server_events",
                     "fields": [
                         "runtimeGeneration",
@@ -415,6 +418,8 @@ pub fn management_identity(repository: &EventRepository) -> anyhow::Result<Value
                         "lastOutputCompletedAt",
                         "lastTurnCompletedAt",
                         "lastFileChangeAt",
+                        "lastTurnStartedAt",
+                        "lastConversationAt",
                         "lastOutput",
                         "lastToolCall"
                     ],
@@ -538,7 +543,17 @@ fn insert_claude_account(object: &mut serde_json::Map<String, Value>, record: &C
     }
 }
 
-fn retired_session_resource_value(
+/// Claude sessions: `runtime.claudeRuntime {release, pendingRelease}`, the
+/// pinned Claude runtime and a repin waiting for the next fresh start
+/// (capability `session-claude-runtime`). Absent on other sessions. Part of
+/// the fingerprint, so a repin moves the session revision.
+fn insert_claude_runtime(value: &mut Value, record: &CutexSessionRecord) {
+    if let Some(pin) = super::claude_runtime_api::session_pin_json(record) {
+        value["runtime"]["claudeRuntime"] = pin;
+    }
+}
+
+pub(super) fn retired_session_resource_value(
     record: &CutexSessionRecord,
     activity: Option<&SessionActivityState>,
 ) -> Value {
@@ -552,6 +567,7 @@ fn retired_session_resource_value_with(
 ) -> Value {
     let mut value = retired_session_resource_fields(record, activity, context);
     insert_claude_account(value.as_object_mut().expect("session resource object"), record);
+    insert_claude_runtime(&mut value, record);
     value
 }
 
@@ -592,6 +608,7 @@ fn retired_session_resource_fields(
             "status": "offline",
             "runtimeGeneration": record.runtime_generation,
             "runtimeAgentId": Value::Null,
+            "pendingServerRequests": [],
         },
         "runtimeDefaults": runtime_defaults_resource(record),
         "activity": activity_resource(activity),
@@ -644,6 +661,8 @@ fn activity_resource(activity: Option<&SessionActivityState>) -> Value {
         "lastOutputCompletedAt": activity.last_output_completed_at,
         "lastTurnCompletedAt": activity.last_turn_completed_at,
         "lastFileChangeAt": activity.last_file_change_at,
+        "lastTurnStartedAt": activity.last_turn_started_at,
+        "lastConversationAt": activity.conversation_at(),
     });
     let object = resource
         .as_object_mut()
@@ -777,7 +796,7 @@ fn project_session(
 }
 
 #[cfg(test)]
-fn project_session_entry(
+pub(super) fn project_session_entry(
     record: &CutexSessionRecord,
     visible: bool,
     runtime_status: Option<AppServerManagedRuntimeStatus>,
@@ -802,6 +821,8 @@ fn project_session_entry(
 #[derive(Default)]
 struct ProjectionContext {
     global_default_profile: std::cell::OnceCell<Option<String>>,
+    pending_server_requests:
+        std::cell::OnceCell<std::collections::HashMap<(String, u64), Vec<Value>>>,
 }
 
 impl ProjectionContext {
@@ -814,6 +835,25 @@ impl ProjectionContext {
                     .filter(|profile| !profile.is_empty())
             })
             .as_deref()
+    }
+
+    /// `[{id, method}]` of the native server requests (approvals, questions,
+    /// …) still waiting for an answer in this runtime generation, so a
+    /// client that connects later sees them (`session-pending-server-requests`).
+    /// The pending-request store is read at most once per request.
+    fn pending_server_requests(&self, cutex_session_id: &str, runtime_generation: u64) -> Value {
+        let summaries = self.pending_server_requests.get_or_init(|| {
+            super::server_requests::pending_summaries().unwrap_or_else(|error| {
+                eprintln!("session resource: pending server requests unavailable: {error:#}");
+                Default::default()
+            })
+        });
+        Value::Array(
+            summaries
+                .get(&(cutex_session_id.to_string(), runtime_generation))
+                .cloned()
+                .unwrap_or_default(),
+        )
     }
 }
 
@@ -1023,6 +1063,7 @@ fn prepare_session_projection(
             "tuiAttached": tui_is_known_attached(record, app_server_connected),
             "lastEventAt": runtime_status.as_ref().and_then(|status| status.last_event_at.clone()),
             "lastError": runtime_status.as_ref().and_then(|status| status.last_error.clone()),
+            "pendingServerRequests": context.pending_server_requests(&record.cutex_session_id, record.runtime_generation),
         },
         "runtimeDefaults": runtime_defaults_resource(record),
         "activity": activity_resource(activity),
@@ -1044,6 +1085,7 @@ fn prepare_session_projection(
     presentation.insert("note".to_string(), json!(record.note));
     presentation.insert("avatar".to_string(), json!(record.avatar));
     insert_claude_account(presentation, record);
+    insert_claude_runtime(&mut value, record);
     let fingerprint_base = session_fingerprint_base(&value)?;
     Ok(PreparedSessionProjection {
         value,
@@ -1940,6 +1982,9 @@ mod tests {
                 "lastOutputCompletedAt": "2026-07-24T00:00:05Z",
                 "lastTurnCompletedAt": "2026-07-24T00:00:06Z",
                 "lastFileChangeAt": "2026-07-24T00:00:03Z",
+                // Derived for a state written before session-conversation-activity.
+                "lastTurnStartedAt": null,
+                "lastConversationAt": "2026-07-24T00:00:06Z",
                 "lastOutput": {
                     "cutexSessionId": "cutex-test-session",
                     "assignmentId": "assignment-1",
@@ -2022,6 +2067,40 @@ mod tests {
         assert_eq!(resource["launchedProfile"], "legacy-profile");
         assert_eq!(resource["launchProfileSource"], "unknown");
         assert_eq!(resource["configuredProfile"], "configured-profile");
+    }
+
+    #[test]
+    fn session_resource_lists_pending_server_requests_of_the_current_generation() {
+        // Other tests point HOME (so the store) elsewhere while they run.
+        let _home = crate::config::paths::test_home_env_lock();
+        let id = format!("cutex.pending-requests-{}", uuid::Uuid::new_v4());
+        let mut record = CutexSessionRecord::from_codex_session_id("thread-pending-requests")
+            .expect("durable test session");
+        record.cutex_session_id = id.clone();
+        record.runtime_generation = 5;
+        let mut entry = SessionProjectionEntry::default();
+        let none = project_session_entry(&record, true, None, None, &json!({}), &mut entry).unwrap();
+        assert_eq!(none["runtime"]["pendingServerRequests"], json!([]));
+        crate::management::v2::server_requests::record_request(
+            &id,
+            5,
+            json!({"id": 9, "method": "item/fileChange/requestApproval",
+                   "params": {"threadId": "thread-pending-requests", "turnId": "turn-1"}}),
+        )
+        .unwrap();
+        crate::management::v2::server_requests::record_request(
+            &id,
+            4,
+            json!({"id": 1, "method": "item/tool/requestUserInput", "params": {}}),
+        )
+        .unwrap();
+        let pending = project_session_entry(&record, true, None, None, &json!({}), &mut entry).unwrap();
+        assert_eq!(
+            pending["runtime"]["pendingServerRequests"],
+            json!([{"id": 9, "method": "item/fileChange/requestApproval"}])
+        );
+        crate::management::v2::schema_export::assert_valid("sessions", "session", &pending);
+        crate::management::v2::server_requests::clear_session(&id).unwrap();
     }
 
     #[test]
@@ -2353,7 +2432,9 @@ mod tests {
                 "lastOutputAt": null,
                 "lastOutputCompletedAt": null,
                 "lastTurnCompletedAt": null,
-                "lastFileChangeAt": null
+                "lastFileChangeAt": null,
+                "lastTurnStartedAt": null,
+                "lastConversationAt": null
             }))
         );
     }

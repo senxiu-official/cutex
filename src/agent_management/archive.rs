@@ -146,6 +146,7 @@ mod tests {
             allow_exec: false, write_explicit: false, exec_explicit: false,
             native_session_id: native_session_id.map(str::to_string),
             connection_id: Some("connection".into()),
+            initial_permission_mode: None,
         });
         record
     }
@@ -176,6 +177,29 @@ mod tests {
         let mut changed = request.clone();
         changed.review.formal_name = "changed".into();
         assert_eq!(f.execute(&changed, &mut runtime).unwrap(), receipt);
+    }
+
+    /// An archived Agent's name may be reused (r244); restoring the archived
+    /// one while a live Agent holds the name is refused, nothing changes.
+    #[test]
+    fn restore_is_refused_while_a_live_agent_holds_the_name() {
+        let f = Fixture::new();
+        let mut runtime = Offline { stops: 0, reject: false };
+        let archive = f.request(AgentArchiveOperation::Archive, "archive-name");
+        assert_eq!(f.execute(&archive, &mut runtime).unwrap().stage, AgentArchiveStage::Committed);
+        let restore = f.request(AgentArchiveOperation::Restore, "restore-name");
+        let mut sessions = load_cutex_session_store_from_path(&f.path).unwrap();
+        let mut successor = sessions.sessions["cutex.archive-test"].clone();
+        successor.cutex_session_id = "cutex.successor".into();
+        successor.codex_session_id = Some("native-successor".into());
+        successor.archive_state = crate::session::model::CutexSessionArchiveState::Active;
+        successor.retired_at = None;
+        sessions.sessions.insert("cutex.successor".into(), successor);
+        save_cutex_session_store_to_path(&f.path, &sessions).unwrap();
+        let error = f.execute(&restore, &mut runtime).unwrap_err().to_string();
+        assert!(error.contains("agent_name_taken") && error.contains("cutex.successor"), "{error}");
+        let after = load_cutex_session_store_from_path(&f.path).unwrap();
+        assert!(after.sessions["cutex.archive-test"].is_retired());
     }
 
     /// A committed archive settles the agent's open delegations as target
@@ -1068,6 +1092,15 @@ impl AgentManagementProvider {
             let revision = before.durable_revision();
             if restoring {
                 crate::session::archive::validate_restore_preconditions(&before, revision)?;
+                if let Some(holder) =
+                    crate::session::metadata::live_formal_name_holder(sessions, &before)
+                {
+                    return Err(crate::session::archive::CutexSessionArchiveError::AgentNameTaken {
+                        name: before.formal_agent_name.clone().unwrap_or_default(),
+                        holder: holder.cutex_session_id.clone(),
+                    }
+                    .into());
+                }
             } else {
                 crate::session::archive::validate_retire_preconditions(
                     &before,

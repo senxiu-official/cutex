@@ -167,6 +167,8 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("PUT", "/v2/users/token-persons/mct-1/previous"),
         ("DELETE", "/v2/users/token-persons/mct-1/previous"),
         ("GET", "/v2/sessions/s1/harness"),
+        ("GET", "/v2/sessions/s1/claude-runtime"),
+        ("POST", "/v2/sessions/s1/claude-runtime/repin"),
         ("GET", "/v2/sessions/s1/mcp"),
         ("GET", "/v2/sessions/s1/side-chats"),
         ("POST", "/v2/terminals"),

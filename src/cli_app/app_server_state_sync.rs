@@ -60,6 +60,22 @@ fn apply_notification_side_effects(
                 )?;
             }
         }
+        "turn/completed" => {
+            // A request still pending when its turn ends can no longer be
+            // answered (session resource `runtime.pendingServerRequests`).
+            if let Some(turn_id) = notification.params.as_ref().and_then(|params| {
+                params
+                    .pointer("/turn/id")
+                    .or_else(|| params.get("turnId"))
+                    .and_then(Value::as_str)
+            }) {
+                app_server_pending_requests::resolve_turn_requests(
+                    cutex_session_id,
+                    runtime_generation,
+                    turn_id,
+                )?;
+            }
+        }
         "thread/name/updated" => {
             update_session_record(cutex_session_id, runtime_generation, notification)?;
         }
@@ -131,10 +147,20 @@ fn apply_durable_notification(
             };
             let mut changed = false;
             if let Some(cwd) = settings.get("cwd").and_then(Value::as_str) {
-                changed |= replace_if_changed(
-                    &mut record.managed_cwd,
-                    Some(cutex::session::metadata::normalize_session_cwd(cwd)),
-                );
+                // The runtime reports the cwd it was launched with; a Claude
+                // adapter started on a `\\?\F:\x` record cwd echoes that
+                // verbatim spelling. Same directory = no change (r244: the
+                // verbatim text replaced the managed cwd and every managed
+                // check then failed with `mismatch: cwd`); a real move is
+                // stored without the verbatim prefix.
+                let launch = cutex::session::metadata::cutex_session_launch_cwd(record).to_string();
+                let managed = if cutex::session::metadata::same_session_cwd(cwd, &launch) {
+                    // Pin the current spelling (as before for an unpinned record).
+                    record.managed_cwd.clone().or(Some(launch))
+                } else {
+                    Some(cutex::session::metadata::session_cwd_identity(cwd))
+                };
+                changed |= replace_if_changed(&mut record.managed_cwd, managed);
             }
             if let Some(model) = settings.get("model").and_then(Value::as_str) {
                 changed |= replace_if_changed(&mut record.model_defaults, Some(model.to_string()));
@@ -473,6 +499,38 @@ mod tests {
             params.config.and_then(|config| config.get("sandbox_workspace_write").cloned()),
             params.approvals_reviewer,
         )
+    }
+
+    #[test]
+    fn verbatim_runtime_cwd_does_not_replace_the_managed_cwd() {
+        // On Windows a Claude agent's record cwd was the canonicalize()
+        // output `\\?\F:\cutex-test\r244`, its managed cwd the Project root
+        // `F:\cutex-test\r244`. The adapter echoes its launch cwd in every
+        // settings update; storing that text made `member_runtime restart`
+        // fail with `runtime recovery mismatch: cwd`.
+        let mut record = cutex::session::model::CutexSessionRecord::new_at(
+            "cutex.verbatim".to_string(),
+            Some("thread-verbatim".to_string()),
+            "winbox".to_string(),
+            r"\\?\F:\cutex-test\r244".to_string(),
+            None,
+            "2026-10-18T00:00:00Z".to_string(),
+        )
+        .unwrap();
+        record.runtime_generation = 7;
+        record.managed_cwd = Some(r"F:\cutex-test\r244".to_string());
+        let echo = settings_updated(serde_json::json!({ "cwd": r"\\?\F:\cutex-test\r244" }));
+        assert!(!apply_durable_notification(&mut record, 7, &echo, "t").unwrap());
+        assert_eq!(record.managed_cwd.as_deref(), Some(r"F:\cutex-test\r244"));
+        // A real move is kept, without the verbatim prefix.
+        let moved = settings_updated(serde_json::json!({ "cwd": r"\\?\G:\elsewhere" }));
+        assert!(apply_durable_notification(&mut record, 7, &moved, "t").unwrap());
+        assert_eq!(record.managed_cwd.as_deref(), Some(r"G:\elsewhere"));
+        // An unpinned record still pins its current spelling.
+        let mut unpinned = record.clone();
+        unpinned.managed_cwd = None;
+        assert!(apply_durable_notification(&mut unpinned, 7, &echo, "t").unwrap());
+        assert_eq!(unpinned.managed_cwd.as_deref(), Some(r"\\?\F:\cutex-test\r244"));
     }
 
     #[test]

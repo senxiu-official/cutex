@@ -105,6 +105,9 @@ class Tool:
     handler: Handler
     mcp_server: str | None = None
     read_only: bool = False
+    # Seconds; None = Settings.tool_timeout. Cutex tools that may hold on the
+    # Agent Bus (approval-wait, delegation_wait) need longer than the default.
+    timeout: float | None = None
 
 
 class ToolRegistry:
@@ -139,7 +142,7 @@ class ToolRegistry:
             # Validation messages may include caller data; keep result structural.
             return ToolResult("Invalid tool arguments: schema validation failed", False)
         try:
-            async with asyncio.timeout(self.settings.tool_timeout):
+            async with asyncio.timeout(tool.timeout or self.settings.tool_timeout):
                 value = await tool.handler(arguments, context)
             result = value if isinstance(value, ToolResult) else ToolResult(value if isinstance(value, str) else dump(value))
         except asyncio.CancelledError:

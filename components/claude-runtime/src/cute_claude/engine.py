@@ -20,6 +20,8 @@ class Engine:
         self.settings, self.store, self.provider, self.tools = settings, store, provider, tools
         self.workers: dict[str, asyncio.Task] = {}
         self.notify: Notify = self._noop
+        # Frames for frontends only (subagent transcripts): no event log, no input observers.
+        self.notify_view: Notify = self._noop
         self.closing = False
 
     @staticmethod

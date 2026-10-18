@@ -15,8 +15,13 @@
 //! where the list came from: `catalog`, `nativeCache` (the shared native
 //! home's `models_cache.json`, with `fetchedAt` / `clientVersion`),
 //! `nativeBundled` (the selected native CLI's compiled-in catalog) or
-//! `claudeAliases`; `null` with `modelsUnavailableReason` when no source is
-//! available. Feature `profileModelsNative`; see `profiles::native_models`.
+//! `claudeReference` (the selected Claude adapter's reference catalog) or
+//! `claudeAliases` (its fallback); `null` with `modelsUnavailableReason` when
+//! no source is available. Feature `profileModelsNative`; see
+//! `profiles::native_models`. Claude rows carry the adapter's nominal context
+//! window (`effective.contextWindowSource: "reference"`, null for aliases) and
+//! no auto-compact limit (`autoCompactTokenLimitSource: "notApplicable"`);
+//! `autoCompactApplies` is false for Claude profiles (absent on older cutex).
 //! An official profile with edits reports `overlay` (the live upstream list
 //! in `modelsSource.upstream` plus this profile's overlay) and
 //! `unavailableModels`; feature `profileCatalogOverlay`, see

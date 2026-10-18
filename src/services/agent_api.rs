@@ -2,7 +2,7 @@
 //! `POST /api/services/v1` after it authenticated the MCP caller. The caller's
 //! durable session is the owner; its current project is the project.
 //!
-//! Body: `{"op": "register"|"update"|"unregister"|"list", "args": {...}}` with
+//! Body: `{"op": "register"|"update"|"restart"|"unregister"|"list", "args": {...}}` with
 //! camelCase args (the MCP adapter translates). Always answers JSON
 //! `{ok: true, ...}` or `{ok: false, code, detail}`.
 //!
@@ -31,6 +31,7 @@ use super::store::ServiceRuntime;
 use super::store::ServiceStore;
 use super::store::ServicesError;
 use super::store::UpdateRequest;
+use super::static_files::CheckedRoot;
 use crate::agent_bus::boundary::AgentBoundary;
 use crate::agent_management::envelope::PermissionEnvelope;
 use crate::approvals::request_digest;
@@ -102,6 +103,9 @@ pub struct AgentServicePolicy {
     /// need an approval (fail closed).
     pub approvals: Option<ApprovalStore>,
     pub requester_name: Option<String>,
+    /// The call may hold for the owner's decision (approval-wait); `None`
+    /// answers `approval_required` at once (older façades / adapters).
+    pub waiter: Option<crate::approvals::Waiter>,
 }
 
 impl AgentServicePolicy {
@@ -112,6 +116,7 @@ impl AgentServicePolicy {
             managed_within_envelope: true,
             approvals: None,
             requester_name: None,
+            waiter: None,
         }
     }
 
@@ -127,15 +132,18 @@ impl AgentServicePolicy {
         let record = crate::session::store::load_cutex_session_store()
             .ok()
             .and_then(|store| store.sessions.get(cutex_session_id).cloned());
-        let managed_within_envelope = record
-            .as_ref()
-            .and_then(|record| PermissionEnvelope::from_record(record).ok())
-            .is_some_and(|envelope| envelope.runs_unsandboxed_without_approval());
+        let managed_within_envelope = record.as_ref().is_some_and(|record| {
+            managed_within_envelope(
+                record,
+                crate::app_server::live_settings::current_for(record).as_ref(),
+            )
+        });
         Self {
             boundary,
             managed_within_envelope,
             approvals: ApprovalStore::open_default().ok(),
             requester_name: record.and_then(|record| record.formal_agent_name),
+            waiter: None,
         }
     }
 
@@ -149,6 +157,23 @@ impl AgentServicePolicy {
             (None, None) => true,
             (Some(_), None) => false,
         }
+    }
+}
+
+/// Whether a managed command is within the caller's own envelope (it runs
+/// with full access: unsandboxed, approval `never`). Q21: judged like
+/// `browser_open` (`browser_relay::owner::full_access`) from the live native
+/// thread settings of its current runtime, so switching a running agent to
+/// full access (完全访问) takes effect at once; without live settings, from
+/// the record's stored launch permissions as before. Unknown is not full.
+pub fn managed_within_envelope(
+    record: &crate::session::model::CutexSessionRecord,
+    live_settings: Option<&Value>,
+) -> bool {
+    match live_settings {
+        Some(settings) => crate::browser_relay::owner::full_access(record, Some(settings)),
+        None => PermissionEnvelope::from_record(record)
+            .is_ok_and(|envelope| envelope.runs_unsandboxed_without_approval()),
     }
 }
 
@@ -174,6 +199,39 @@ fn redact_for(caller: &str, record: &ServiceRecord, mut view: Value) -> Value {
     view
 }
 
+/// Ask the owner for exactly this request (holding the call when the policy
+/// has a waiter, approval-wait).
+fn gate(
+    policy: &AgentServicePolicy,
+    store: &ApprovalStore,
+    request: ApprovalRequest,
+) -> anyhow::Result<GateOutcome> {
+    crate::approvals::gate_with_wait(
+        store,
+        request,
+        policy.waiter.as_ref(),
+        |record| crate::management::v2::approvals::publish_changed(record, "requested"),
+        crate::management::v2::approvals::queue_decision_notice,
+    )
+}
+
+/// `Ok(note)` lets the request proceed (`note`: the owner approved it while
+/// this call held, [`crate::approvals::ApprovalRecord::approved_after_wait`]);
+/// otherwise the tool's refusal.
+type GateResult = Result<Option<Value>, Value>;
+
+fn gate_result(outcome: anyhow::Result<GateOutcome>) -> GateResult {
+    match outcome {
+        Ok(outcome @ GateOutcome::Approved(_)) => Ok(outcome.approved_after_wait()),
+        Ok(outcome) => Err(outcome.refusal().unwrap_or_default()),
+        Err(error) => Err(rejected(ServicesError::new(
+            503,
+            "approvals_unavailable",
+            error.to_string(),
+        ))),
+    }
+}
+
 /// The approval gate for a request that would run (or change) a managed
 /// command. `Ok(())` lets it proceed.
 fn managed_gate(
@@ -183,16 +241,16 @@ fn managed_gate(
     slug: &str,
     args: &Value,
     command: Option<&ServiceCommand>,
-) -> Result<(), Value> {
+) -> GateResult {
     if policy.managed_within_envelope {
-        return Ok(());
+        return Ok(None);
     }
     let Caller::Agent {
         cutex_session_id,
         project_id,
     } = caller
     else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(store) = &policy.approvals else {
         return Err(rejected(ServicesError::new(
@@ -219,7 +277,9 @@ fn managed_gate(
         .and_then(Value::as_object)
         .map(|env| env.keys().collect())
         .unwrap_or_default();
-    let outcome = store.gate(
+    let outcome = gate(
+        policy,
+        store,
         ApprovalRequest {
             kind: ApprovalKind::ManagedService,
             reason: "outside_caller_envelope".into(),
@@ -243,26 +303,8 @@ fn managed_gate(
             }),
             request_sha256: request_digest(&json!({"op": op, "slug": slug, "args": args})),
         },
-        chrono::Utc::now(),
     );
-    match outcome {
-        Ok(GateOutcome::Approved(_)) => Ok(()),
-        Ok(outcome) => {
-            if let GateOutcome::Pending {
-                record,
-                created: true,
-            } = &outcome
-            {
-                crate::management::v2::approvals::publish_changed(record, "requested");
-            }
-            Err(outcome.refusal().unwrap_or_default())
-        }
-        Err(error) => Err(rejected(ServicesError::new(
-            503,
-            "approvals_unavailable",
-            error.to_string(),
-        ))),
-    }
+    gate_result(outcome)
 }
 
 fn lifetime_gate(
@@ -272,13 +314,14 @@ fn lifetime_gate(
     slug: &str,
     args: &Value,
     managed: bool,
-) -> Result<(), Value> {
+    root: Option<&CheckedRoot>,
+) -> GateResult {
     let Caller::Agent {
         cutex_session_id,
         project_id,
     } = caller
     else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(store) = &policy.approvals else {
         return Err(rejected(ServicesError::new(
@@ -290,31 +333,96 @@ fn lifetime_gate(
     // One exact-payload approval covers both grants, so consuming one approval
     // cannot strand a request behind a second gate and cause an approval loop.
     let execution = managed && !policy.managed_within_envelope;
-    let outcome = store.gate(ApprovalRequest {
+    let mut details = json!({"op":op,"slug":slug,"lifetime":"persistent","managedExecution":execution,"command":args.get("command"),"cwd":args.get("cwd"),"envKeys":args.get("env").and_then(Value::as_object).map(|v| v.keys().collect::<Vec<_>>()),"grants":if execution { "persistent lifetime and unrestricted execution of this exact command/cwd/env" } else { "persistent lifetime" }});
+    let mut digest = json!({"op":op,"slug":slug,"args":args,"managedExecution":execution});
+    let mut summary = format!("Keep service {slug} persistently{}", if execution { "; run its command unrestricted as the owner" } else { "" });
+    // A root outside the caller's directories rides on the same approval
+    // (static-root-approval); without one the payload is unchanged.
+    if let Some(root) = root {
+        summary.push_str(&format!("; serve {} (outside the agent's cwd / project workspace)", root.path));
+        details["staticRoot"] = json!(root.path);
+        details["allowedRoots"] = json!(root.allowed_roots);
+        details["grants"] = json!("persistent lifetime and serving every file under this exact root to the owner's browser");
+        digest["staticRoot"] = json!(root.path);
+    }
+    let outcome = gate(policy, store, ApprovalRequest {
         kind: ApprovalKind::ServiceLifetime, reason: "persistent_service".into(),
         requester_cutex_session_id: cutex_session_id.clone(), requester_name: policy.requester_name.clone(), project_id: project_id.clone(),
-        summary: format!("Keep service {slug} persistently{}", if execution { "; run its command unrestricted as the owner" } else { "" }),
-        details: json!({"op":op,"slug":slug,"lifetime":"persistent","managedExecution":execution,"command":args.get("command"),"cwd":args.get("cwd"),"envKeys":args.get("env").and_then(Value::as_object).map(|v| v.keys().collect::<Vec<_>>()),"grants":if execution { "persistent lifetime and unrestricted execution of this exact command/cwd/env" } else { "persistent lifetime" }}),
-        request_sha256: request_digest(&json!({"op":op,"slug":slug,"args":args,"managedExecution":execution})),
-    }, chrono::Utc::now());
-    match outcome {
-        Ok(GateOutcome::Approved(_)) => Ok(()),
-        Ok(outcome) => {
-            if let GateOutcome::Pending {
-                record,
-                created: true,
-            } = &outcome
-            {
-                crate::management::v2::approvals::publish_changed(record, "requested");
-            }
-            Err(outcome.refusal().unwrap_or_default())
-        }
-        Err(error) => Err(rejected(ServicesError::new(
+        summary: summary.chars().take(300).collect(),
+        details,
+        request_sha256: request_digest(&digest),
+    });
+    gate_result(outcome)
+}
+
+/// The approval gate for a static root outside the caller's cwd / project
+/// workspace (no persistent-lifetime approval in the same request).
+fn static_root_gate(
+    policy: &AgentServicePolicy,
+    caller: &Caller,
+    op: &str,
+    slug: &str,
+    args: &Value,
+    root: &CheckedRoot,
+) -> GateResult {
+    let Caller::Agent {
+        cutex_session_id,
+        project_id,
+    } = caller
+    else {
+        return Ok(None);
+    };
+    let Some(store) = &policy.approvals else {
+        return Err(rejected(ServicesError::new(
             503,
             "approvals_unavailable",
-            error.to_string(),
-        ))),
+            "a static root outside your cwd / project workspace requires owner approval; nothing was changed",
+        )));
+    };
+    let outcome = gate(
+        policy,
+        store,
+        ApprovalRequest {
+            kind: ApprovalKind::StaticRoot,
+            reason: "static_root_outside_workspace".into(),
+            requester_cutex_session_id: cutex_session_id.clone(),
+            requester_name: policy.requester_name.clone(),
+            project_id: project_id.clone(),
+            summary: format!(
+                "{op} static service {slug}: serve {} (outside the agent's cwd / project workspace)",
+                root.path
+            )
+            .chars()
+            .take(300)
+            .collect(),
+            details: json!({
+                "op": op,
+                "slug": slug,
+                "staticRoot": root.path,
+                "allowedRoots": root.allowed_roots,
+                "grants": "serving every file under this exact root to the owner's browser",
+            }),
+            request_sha256: request_digest(
+                &json!({"op": op, "slug": slug, "args": args, "staticRoot": root.path}),
+            ),
+        },
+    );
+    gate_result(outcome)
+}
+
+/// A gate's result for a request that collects approved-after-wait notes.
+fn pass(result: GateResult, notes: &mut Vec<Value>) -> Result<(), Value> {
+    result.map(|note| notes.extend(note))
+}
+
+/// The last approved-after-wait note on a successful result (Q21): the
+/// agent sees the owner reviewed the request while the call waited, so it
+/// neither assumes it ran unreviewed nor retries it.
+fn with_notes(mut result: Value, notes: Vec<Value>) -> Value {
+    if let Some(note) = notes.into_iter().last() {
+        crate::approvals::attach_approval_note(&mut result, note);
     }
+    result
 }
 
 /// The caller's current project (member or Director seat), if any.
@@ -324,8 +432,13 @@ pub fn caller_project(cutex_session_id: &str) -> Option<String> {
         .map(|id| id.as_str().to_string())
 }
 
-/// Serve one authenticated agent request on the default store.
-pub fn handle(cutex_session_id: &str, body: &[u8]) -> Value {
+/// Serve one authenticated agent request on the default store; `waiter`
+/// lets an approval gate hold the call for the owner (approval-wait).
+pub fn handle(
+    cutex_session_id: &str,
+    body: &[u8],
+    waiter: Option<crate::approvals::Waiter>,
+) -> Value {
     let store = match ServiceStore::open_default() {
         Ok(store) => store,
         Err(error) => return rejected(ServicesError::unavailable(error)),
@@ -334,12 +447,9 @@ pub fn handle(cutex_session_id: &str, body: &[u8]) -> Value {
         cutex_session_id: cutex_session_id.to_string(),
         project_id: caller_project(cutex_session_id),
     };
-    handle_with_policy(
-        &store,
-        &caller,
-        body,
-        &AgentServicePolicy::for_caller(cutex_session_id),
-    )
+    let mut policy = AgentServicePolicy::for_caller(cutex_session_id);
+    policy.waiter = waiter;
+    handle_with_policy(&store, &caller, body, &policy)
 }
 
 /// Ownership rules only (no boundary, no approvals).
@@ -404,6 +514,14 @@ pub fn handle_with_policy(
                     .into(),
                 );
             }
+            // Approved-after-wait notes of the gates below (Q21).
+            let mut notes = Vec::new();
+            // Validate everything before any approval: an invalid request
+            // never reaches the owner (static-root-approval).
+            let root_review = match store.validate_register(request.clone(), caller) {
+                Ok(check) => check.static_root_approval,
+                Err(error) => return rejected(error),
+            };
             // With `agentPersistentApproval = off` a persistent request is
             // granted without the lifetime approval; a managed command then
             // still goes through the separate `managed_service` gate below.
@@ -423,12 +541,25 @@ pub fn handle_with_policy(
                         ));
                     }
                 }
+                if let Err(refusal) = pass(lifetime_gate(
+                    policy,
+                    caller,
+                    "register",
+                    &request.slug,
+                    &args,
+                    managed,
+                    root_review.as_ref(),
+                ), &mut notes) {
+                    return refusal;
+                }
+            } else if let Some(root) = &root_review {
                 if let Err(refusal) =
-                    lifetime_gate(policy, caller, "register", &request.slug, &args, managed)
+                    pass(static_root_gate(policy, caller, "register", &request.slug, &args, root), &mut notes)
                 {
                     return refusal;
                 }
             }
+            request.static_root_approved = root_review.is_some();
             let reveal = request.reveal;
             if managed && request.command.is_some() && !needs_lifetime {
                 // Gate only what the store would accept: another agent's slug
@@ -446,14 +577,14 @@ pub fn handle_with_policy(
                             && request.env.as_ref().is_none_or(|env| *env == existing.env))
                 });
                 if !skip {
-                    if let Err(refusal) = managed_gate(
+                    if let Err(refusal) = pass(managed_gate(
                         policy,
                         caller,
                         "register",
                         &request.slug,
                         &args,
                         request.command.as_ref(),
-                    ) {
+                    ), &mut notes) {
                         return refusal;
                     }
                 }
@@ -466,7 +597,7 @@ pub fn handle_with_policy(
                     if reveal {
                         result["reveal"] = json!(super::reveal::request(&record, cutex_session_id));
                     }
-                    result
+                    with_notes(result, notes)
                 }
                 Err(error) => rejected(error),
             }
@@ -476,9 +607,15 @@ pub fn handle_with_policy(
                 Ok(args) => args,
                 Err(error) => return parse_error(error),
             };
-            let request: UpdateRequest = match serde_json::from_value(patch.clone()) {
+            let mut request: UpdateRequest = match serde_json::from_value(patch.clone()) {
                 Ok(request) => request,
                 Err(error) => return parse_error(error),
+            };
+            let mut notes = Vec::new();
+            let (preview, root_review) = match store.preview_update(&slug, request.clone(), caller)
+            {
+                Ok((preview, check)) => (preview, check.static_root_approval),
+                Err(error) => return rejected(error),
             };
             let (existing, lifetime_approval) = match store.load() {
                 Ok(registry) => (
@@ -492,46 +629,77 @@ pub fn handle_with_policy(
             if let Some(existing) = existing.filter(|existing| {
                 existing.owner_cutex_session_id.as_deref() == Some(cutex_session_id.as_str())
             }) {
-                let runtime = match request.runtime.as_deref() {
-                    Some(value) => ServiceRuntime::parse(value),
-                    None => Some(existing.runtime),
-                };
-                let changes_process = request.runtime.is_some()
-                    || request.command.is_some()
-                    || request.cwd.is_some()
-                    || request.env.is_some();
+                let runtime = Some(preview.runtime);
+                // Compare what would run after the update with what runs now:
+                // restating the same command / cwd / env / runtime (or an env
+                // merge that ends up identical) is no change and is not gated
+                // again, like an identical re-register.
+                let changes_process = preview.runtime != existing.runtime
+                    || preview.command != existing.command
+                    || preview.cwd != existing.cwd
+                    || preview.env != existing.env;
                 let needs_lifetime = lifetime_approval == AgentPersistentApproval::Ask
                     && request.lifetime.as_deref() == Some("persistent")
                     && existing.lifetime != super::store::ServiceLifetime::Persistent;
                 if needs_lifetime {
-                    if let Err(refusal) = lifetime_gate(
+                    if let Err(refusal) = pass(lifetime_gate(
                         policy,
                         caller,
                         "update",
                         &slug,
                         &patch,
                         runtime == Some(ServiceRuntime::Managed) && changes_process,
-                    ) {
+                        root_review.as_ref(),
+                    ), &mut notes) {
                         return refusal;
                     }
-                }
-                if runtime == Some(ServiceRuntime::Managed) && changes_process && !needs_lifetime {
-                    let command = match &request.command {
-                        Some(command) => command.clone(),
-                        None => existing.command.clone(),
-                    };
+                } else if let Some(root) = &root_review {
                     if let Err(refusal) =
-                        managed_gate(policy, caller, "update", &slug, &patch, command.as_ref())
+                        pass(static_root_gate(policy, caller, "update", &slug, &patch, root), &mut notes)
                     {
                         return refusal;
                     }
                 }
+                if runtime == Some(ServiceRuntime::Managed) && changes_process && !needs_lifetime {
+                    if let Err(refusal) = pass(managed_gate(
+                        policy,
+                        caller,
+                        "update",
+                        &slug,
+                        &patch,
+                        preview.command.as_ref(),
+                    ), &mut notes) {
+                        return refusal;
+                    }
+                }
             }
+            request.static_root_approved = root_review.is_some();
             match store.update(&slug, request, caller) {
                 Ok(record) => {
                     after_change();
                     let state = snapshots(store);
-                    json!({"ok": true, "service": service_view(&record, state.get(&record.slug))})
+                    with_notes(
+                        json!({"ok": true, "service": service_view(&record, state.get(&record.slug))}),
+                        notes,
+                    )
+                }
+                Err(error) => rejected(error),
+            }
+        }
+        "restart" => {
+            // Same command / cwd / env as the record (the grant that let it
+            // run covers its restarts), so no approval; ownership as for
+            // update / unregister. The supervisor (Management serve) restarts
+            // it on its next pass, about a second later.
+            let SlugArgs { slug } = match serde_json::from_value(args) {
+                Ok(args) => args,
+                Err(error) => return parse_error(error),
+            };
+            match store.request_restart(&slug, caller) {
+                Ok(record) => {
+                    after_change();
+                    let state = snapshots(store);
+                    json!({"ok": true, "slug": slug, "restartRequested": true, "service": service_view(&record, state.get(&record.slug))})
                 }
                 Err(error) => rejected(error),
             }
@@ -840,6 +1008,7 @@ mod tests {
             managed_within_envelope: false,
             approvals: Some(ApprovalStore::at(dir.join("approvals.json"))),
             requester_name: Some("worker".into()),
+            waiter: None,
         };
         let call = |body: Value| {
             handle_with_policy(&store, &agent(S1), body.to_string().as_bytes(), &policy)
@@ -921,6 +1090,7 @@ mod tests {
             managed_within_envelope: false,
             approvals: Some(ApprovalStore::at(dir.join("approvals.json"))),
             requester_name: None,
+            waiter: None,
         };
         let call = |body: Value| {
             handle_with_policy(&store, &agent(S1), body.to_string().as_bytes(), &policy)
@@ -959,13 +1129,210 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// service_update re-asks only when the effective command / cwd / env /
+    /// runtime change; service_restart never asks and follows ownership.
+    #[test]
+    fn unchanged_update_and_restart_need_no_new_approval() {
+        let dir = std::env::temp_dir().join(format!("cutex-services-restart-{}", uuid::Uuid::new_v4().simple()));
+        let cwd = dir.join("app");
+        let other_cwd = dir.join("other");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&other_cwd).unwrap();
+        let cwd = cwd.to_string_lossy().into_owned();
+        let other_cwd = other_cwd.to_string_lossy().into_owned();
+        let store = ServiceStore::new(dir.join("services"), "host");
+        let approvals = ApprovalStore::at(dir.join("approvals.json"));
+        let policy = gated_policy(&dir);
+        let call = |session: &str, body: Value| {
+            handle_with_policy(&store, &agent(session), body.to_string().as_bytes(), &policy)
+        };
+        let pending = || approvals.list(false, chrono::Utc::now()).unwrap().len();
+        let register = json!({"op":"register","args":{"slug":"forum","runtime":"managed","command":"node server.js {port}","cwd":cwd,"env":{"MODE":"dev"}}});
+        let refusal = call(S1, register.clone());
+        assert_eq!(refusal["status"], "approval_required", "{refusal}");
+        approvals
+            .decide(refusal["approval_id"].as_str().unwrap(), true, None, chrono::Utc::now())
+            .unwrap();
+        assert_eq!(call(S1, register)["ok"], true);
+        assert_eq!(pending(), 0);
+
+        // Restating what already runs (and an env merge that changes nothing) is no change.
+        for args in [
+            json!({"slug":"forum","runtime":"managed","command":"node server.js {port}","cwd":cwd,"env":{"MODE":"dev"}}),
+            json!({"slug":"forum","command":"node server.js {port}"}),
+            json!({"slug":"forum","env":{"MODE":"dev"}}),
+            json!({"slug":"forum","cwd":cwd,"displayName":"Forum"}),
+        ] {
+            let result = call(S1, json!({"op":"update","args":args}));
+            assert_eq!(result["ok"], true, "{args}: {result}");
+            assert_eq!(pending(), 0, "{args} raised an approval");
+        }
+        assert_eq!(store.get("forum").unwrap().display_name, "Forum");
+        // Any change of what runs is gated as before.
+        for args in [
+            json!({"slug":"forum","command":"node server.js --debug {port}"}),
+            json!({"slug":"forum","cwd":other_cwd}),
+            json!({"slug":"forum","cwd":null}),
+            json!({"slug":"forum","env":{"MODE":"prod"}}),
+            json!({"slug":"forum","env":{"TOKEN":"x"}}),
+            json!({"slug":"forum","env":{"MODE":null}}),
+        ] {
+            let result = call(S1, json!({"op":"update","args":args}));
+            assert_eq!(result["status"], "approval_required", "{args}: {result}");
+        }
+        let unchanged = store.get("forum").unwrap();
+        assert_eq!(unchanged.cwd.as_deref(), Some(cwd.as_str()));
+        assert_eq!(unchanged.env.get("MODE").map(String::as_str), Some("dev"));
+        let before = pending();
+
+        // Restart: no approval, a new request token each time.
+        let restarted = call(S1, json!({"op":"restart","args":{"slug":"forum"}}));
+        assert_eq!(restarted["ok"], true, "{restarted}");
+        assert_eq!(restarted["restartRequested"], true);
+        assert_eq!(restarted["service"]["slug"], "forum");
+        let first = store.get("forum").unwrap().restart_requested_at.unwrap();
+        assert_eq!(call(S1, json!({"op":"restart","args":{"slug":"forum"}}))["ok"], true);
+        assert_ne!(store.get("forum").unwrap().restart_requested_at.unwrap(), first);
+        assert_eq!(pending(), before);
+        // Another agent's service, unknown slugs and extra arguments are refused.
+        assert_eq!(call(S2, json!({"op":"restart","args":{"slug":"forum"}}))["code"], "not_service_owner");
+        assert_eq!(call(S1, json!({"op":"restart","args":{"slug":"nope"}}))["ok"], false);
+        assert_eq!(call(S1, json!({"op":"restart","args":{"slug":"forum","command":"x"}}))["ok"], false);
+        // External services are not cutex's to restart.
+        assert_eq!(call(S1, json!({"op":"register","args":{"slug":"ext"}}))["ok"], true);
+        assert_eq!(call(S1, json!({"op":"restart","args":{"slug":"ext"}}))["code"], "not_managed");
+        // A service the owner stopped stays stopped.
+        store.set_stopped("forum", true).unwrap();
+        let stopped = call(S1, json!({"op":"restart","args":{"slug":"forum"}}));
+        assert_eq!(stopped["code"], "service_stopped", "{stopped}");
+        assert!(store.get("forum").unwrap().stopped);
+        assert_eq!(pending(), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn managed_services_follow_the_live_thread_permissions() {
+        let path = if cfg!(windows) { "C:\\work" } else { "/work" };
+        let mut record = crate::session::model::CutexSessionRecord::new(
+            S1.into(),
+            None,
+            "host".into(),
+            path.into(),
+            None,
+        )
+        .unwrap();
+        record.sandbox_mode = Some("workspace-write".into());
+        record.approval_policy = Some("on-request".into());
+        let full = json!({"approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}});
+        let auto = json!({"approvalPolicy":"on-request","sandboxPolicy":{"type":"workspaceWrite"}});
+        // Launched restricted: a card, unless the running thread switched to full access.
+        assert!(!managed_within_envelope(&record, None));
+        assert!(managed_within_envelope(&record, Some(&full)));
+        assert!(!managed_within_envelope(&record, Some(&auto)));
+        // Launched with full access, switched away while running: a card again.
+        record.sandbox_mode = Some("danger-full-access".into());
+        record.approval_policy = Some("never".into());
+        assert!(managed_within_envelope(&record, None));
+        assert!(!managed_within_envelope(&record, Some(&auto)));
+        // Live settings without the approval field use the record's.
+        assert!(managed_within_envelope(&record, Some(&json!({"sandboxPolicy":{"type":"dangerFullAccess"}}))));
+        // No permissions known: fail closed.
+        record.sandbox_mode = None;
+        record.approval_policy = None;
+        assert!(!managed_within_envelope(&record, None));
+    }
+
+    /// End to end through the live-settings file the runtime manager writes.
+    #[test]
+    fn managed_services_read_the_current_runtimes_live_settings_file() {
+        let dir = std::env::temp_dir().join(format!("cutex-services-live-{}", uuid::Uuid::new_v4().simple()));
+        let path = if cfg!(windows) { "C:\\work" } else { "/work" };
+        let mut record = crate::session::model::CutexSessionRecord::new(S1.into(), None, "host".into(), path.into(), None).unwrap();
+        record.sandbox_mode = Some("workspace-write".into());
+        record.approval_policy = Some("on-request".into());
+        record.codex_session_id = Some("thread-1".into());
+        record.runtime_generation = 2;
+        let full = json!({"approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}});
+        crate::app_server::live_settings::record_at(&dir, S1, "thread-1", 2, &full).unwrap();
+        let live = crate::app_server::live_settings::current_at(&dir, &record);
+        assert!(managed_within_envelope(&record, live.as_ref()));
+        // The next runtime has not reported yet: the record decides.
+        record.runtime_generation = 3;
+        let live = crate::app_server::live_settings::current_at(&dir, &record);
+        assert!(!managed_within_envelope(&record, live.as_ref()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn gated_policy(dir: &std::path::Path) -> AgentServicePolicy {
         AgentServicePolicy {
             boundary: None,
             managed_within_envelope: false,
             approvals: Some(ApprovalStore::at(dir.join("approvals.json"))),
             requester_name: None,
+            waiter: None,
         }
+    }
+
+    /// approval-wait: the register call holds while the owner decides and
+    /// then returns the normal result; a denial answers denied; without a
+    /// decision it answers approval_required as before.
+    #[test]
+    fn a_holding_service_call_proceeds_when_the_owner_approves() {
+        let dir = std::env::temp_dir().join(format!("cutex-services-wait-{}", uuid::Uuid::new_v4().simple()));
+        let store = ServiceStore::new(dir.join("services"), "host");
+        let path = dir.join("approvals.json");
+        let mut policy = gated_policy(&dir);
+        let hold = |millis: u64| {
+            let mut waiter = crate::approvals::Waiter::new(1, Some("t".into()), None, || true, || true);
+            waiter.duration = std::time::Duration::from_millis(millis);
+            waiter.poll = std::time::Duration::from_millis(10);
+            waiter
+        };
+        let decide_when_holding = |approve: bool| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    let rows = crate::approvals::read_all_at(&path).unwrap_or_default();
+                    if let Some(row) = rows.iter().find(|r| r.wait.as_ref().is_some_and(|w| w.end.is_none())) {
+                        ApprovalStore::at(&path).decide(&row.approval_id, approve, None, chrono::Utc::now()).unwrap();
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                panic!("never held");
+            })
+        };
+        let register = json!({"op": "register", "args": {"slug": "web", "runtime": "managed", "command": "serve {port}"}});
+        policy.waiter = Some(hold(5_000));
+        let decider = decide_when_holding(true);
+        let created = handle_with_policy(&store, &agent(S1), register.to_string().as_bytes(), &policy);
+        decider.join().unwrap();
+        assert_eq!(created["ok"], true, "{created}");
+        assert!(store.load().unwrap().services.contains_key("web"));
+        // Q21: the result says the owner approved it while the call waited.
+        assert_eq!(created["approval"]["decision"], "approved", "{created}");
+        assert!(created["approval"]["waitedSecs"].as_i64().is_some(), "{created}");
+        assert!(created["approval"]["approvalId"].as_str().is_some_and(|id| !id.is_empty()), "{created}");
+        assert!(created["detail"].as_str().unwrap().starts_with("The owner approved this request after "), "{created}");
+        assert!(created["detail"].as_str().unwrap().ends_with("it has been carried out."), "{created}");
+        // An update the gate does not stop (no process change) has no note.
+        let renamed = json!({"op": "update", "args": {"slug": "web", "displayName": "Web"}});
+        let plain = handle_with_policy(&store, &agent(S1), renamed.to_string().as_bytes(), &policy);
+        assert_eq!(plain["ok"], true, "{plain}");
+        assert!(plain.get("approval").is_none() && plain.get("detail").is_none(), "{plain}");
+
+        let update = json!({"op": "update", "args": {"slug": "web", "command": "serve2 {port}"}});
+        let decider = decide_when_holding(false);
+        let denied = handle_with_policy(&store, &agent(S1), update.to_string().as_bytes(), &policy);
+        decider.join().unwrap();
+        assert_eq!(denied["code"], "approval_denied", "{denied}");
+
+        let other = json!({"op": "register", "args": {"slug": "api", "runtime": "managed", "command": "api {port}"}});
+        policy.waiter = Some(hold(100));
+        let pending = handle_with_policy(&store, &agent(S1), other.to_string().as_bytes(), &policy);
+        assert_eq!(pending["status"], "approval_required", "{pending}");
+        assert!(!store.load().unwrap().services.contains_key("api"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -992,7 +1359,10 @@ mod tests {
         approvals
             .decide(refusal["approval_id"].as_str().unwrap(), true, None, chrono::Utc::now())
             .unwrap();
-        assert_eq!(call(explicit)["ok"], true);
+        let retried = call(explicit);
+        assert_eq!(retried["ok"], true);
+        // A retry that used an earlier approval did not wait: no note.
+        assert!(retried.get("approval").is_none(), "{retried}");
         // The owner's persistent external default is gated the same way.
         store
             .update_settings(super::super::store::SettingsPatch {
@@ -1083,5 +1453,154 @@ mod tests {
         );
         assert_eq!(own["ok"], true, "{own}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// Thread-local cutex home with the given sessions (id -> cwd).
+    fn static_fixture(sessions: &[(&str, &std::path::Path)], home: &std::path::Path) -> impl Drop {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::config::instance::set_test_selection(
+                    crate::config::instance::Selection::Default,
+                );
+            }
+        }
+        crate::config::instance::set_test_selection(crate::config::instance::Selection::Custom(
+            home.to_path_buf(),
+        ));
+        for (id, cwd) in sessions {
+            let record: crate::session::model::CutexSessionRecord = serde_json::from_value(json!({"cutex_session_id":id,"host_id":"fixture","cwd":cwd,"created_at":"2026-10-17T00:00:00Z","updated_at":"2026-10-17T00:00:00Z"})).unwrap();
+            let before = crate::session::store::load_cutex_session_store().unwrap();
+            let mut after = before.clone();
+            after.sessions.insert(id.to_string(), record);
+            crate::session::store::save_cutex_session_record(&before, &after, id).unwrap();
+        }
+        Reset
+    }
+
+    #[test]
+    fn static_roots_are_validated_before_any_approval_and_outside_roots_ask_the_owner() {
+        let base = std::env::temp_dir().join(format!("cutex-static-root-{}", uuid::Uuid::new_v4()));
+        let home = base.join("state");
+        let workspace = base.join("workspace");
+        let outside = base.join("outside");
+        let scratch = home.join("agents-scratch").join("20261017-0a1b2c3d");
+        let other_scratch = home.join("agents-scratch").join("20261017-ffffffff");
+        for path in [&workspace, &outside, &scratch, &other_scratch, &home.join("profiles")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(outside.join("blank.html"), "<html></html>").unwrap();
+        std::fs::write(scratch.join("blank.html"), "<html></html>").unwrap();
+        let _reset = static_fixture(&[(S1, &workspace), (S2, &scratch)], &home);
+        let store = ServiceStore::new(home.join("services"), "host");
+        let approvals = ApprovalStore::at(base.join("approvals.json"));
+        let policy = gated_policy(&base);
+        let call = |caller: &Caller, body: Value| {
+            handle_with_policy(&store, caller, body.to_string().as_bytes(), &policy)
+        };
+        let pending = || approvals.list(false, chrono::Utc::now()).unwrap();
+        let static_args = |slug: &str, root: &std::path::Path, lifetime: &str| {
+            json!({"op":"register","args":{"slug":slug,"runtime":"static","root":root,"lifetime":lifetime}})
+        };
+
+        // 1. The reported case: a persistent static root inside the cutex
+        // home is refused before the owner is asked, with an actionable detail.
+        let refused = call(&agent(S1), static_args("blank-persist", &home.join("profiles"), "persistent"));
+        assert_eq!(refused["code"], "static_root_forbidden", "{refused}");
+        let detail = refused["detail"].as_str().unwrap();
+        assert!(detail.contains("profiles") && detail.contains("cutex home"), "{detail}");
+        assert!(detail.contains(&*workspace.canonicalize().unwrap().to_string_lossy()), "{detail}");
+        // Other invalid requests never reach the owner either.
+        assert_eq!(
+            call(&agent(S1), json!({"op":"register","args":{"slug":"Bad Slug","lifetime":"persistent"}}))["code"],
+            "invalid_slug"
+        );
+        assert_eq!(
+            call(&agent(S1), json!({"op":"register","args":{"slug":"st","runtime":"static","root":outside,"port":9,"lifetime":"persistent"}}))["code"],
+            "invalid_request"
+        );
+        assert_eq!(
+            call(&agent(S1), static_args("gone", &base.join("missing"), "persistent"))["code"],
+            "invalid_request"
+        );
+        assert!(pending().is_empty(), "no approval for invalid requests");
+
+        // 2. Persistent + outside root: one service_lifetime approval naming
+        // the canonical root; the retry succeeds; a re-register asks nothing.
+        let persist = static_args("blank-persist", &outside.join("blank.html"), "persistent");
+        let first = call(&agent(S1), persist.clone());
+        assert_eq!(first["status"], "approval_required", "{first}");
+        let cards = pending();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].kind, ApprovalKind::ServiceLifetime);
+        let canonical = outside.join("blank.html").canonicalize().unwrap();
+        assert_eq!(cards[0].details["staticRoot"], json!(canonical.to_string_lossy()));
+        assert!(cards[0].summary.contains("blank.html"), "{}", cards[0].summary);
+        approvals
+            .decide(first["approval_id"].as_str().unwrap(), true, None, chrono::Utc::now())
+            .unwrap();
+        let created = call(&agent(S1), persist.clone());
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(call(&agent(S1), persist)["ok"], true);
+
+        // 3. Ephemeral + outside root: a static_root approval.
+        let eph = static_args("eph", &outside, "ephemeral");
+        let gated = call(&agent(S1), eph.clone());
+        assert_eq!(gated["status"], "approval_required", "{gated}");
+        let card = pending().into_iter().find(|c| c.kind == ApprovalKind::StaticRoot).unwrap();
+        assert_eq!(card.details["staticRoot"], json!(outside.canonicalize().unwrap().to_string_lossy()));
+        approvals
+            .decide(gated["approval_id"].as_str().unwrap(), true, None, chrono::Utc::now())
+            .unwrap();
+        assert_eq!(call(&agent(S1), eph)["ok"], true);
+
+        // 4. Inside the cwd: no approval.
+        let before = pending().len();
+        assert_eq!(call(&agent(S1), static_args("ws", &workspace, "ephemeral"))["ok"], true);
+        // Update to the cwd: no approval; back outside: a new approval.
+        assert_eq!(
+            call(&agent(S1), json!({"op":"update","args":{"slug":"eph","root":workspace}}))["ok"],
+            true
+        );
+        let moved = call(&agent(S1), json!({"op":"update","args":{"slug":"eph","root":outside.join("blank.html")}}));
+        assert_eq!(moved["status"], "approval_required", "{moved}");
+        assert_eq!(pending().len(), before + 1);
+        let refused = call(&agent(S1), json!({"op":"update","args":{"slug":"eph","root":home.join("profiles")}}));
+        assert_eq!(refused["code"], "static_root_forbidden");
+        assert_eq!(pending().len(), before + 1);
+
+        // 5. A scratch-cwd agent serves from its own scratch cwd only.
+        assert_eq!(
+            call(&agent(S2), static_args("scratch-page", &scratch.join("blank.html"), "ephemeral"))["ok"],
+            true
+        );
+        for forbidden in [home.join("agents-scratch"), other_scratch.clone(), home.join("profiles")] {
+            let refused = call(&agent(S2), static_args("scratch-bad", &forbidden, "ephemeral"));
+            assert_eq!(refused["code"], "static_root_forbidden", "{forbidden:?}: {refused}");
+        }
+        // The first agent's cwd is not a scratch dir: the scratch area stays closed to it.
+        assert_eq!(
+            call(&agent(S1), static_args("x", &scratch, "ephemeral"))["code"],
+            "static_root_forbidden"
+        );
+        // 6. Hard refusals: filesystem root, a directory containing the cutex home.
+        for hard in [base.ancestors().last().unwrap().to_path_buf(), base.clone()] {
+            assert_eq!(
+                call(&agent(S1), static_args("hard", &hard, "ephemeral"))["code"],
+                "static_root_forbidden",
+                "{hard:?}"
+            );
+        }
+        assert_eq!(pending().len(), before + 1);
+
+        // 7. The store never accepts an unapproved outside root on its own.
+        let direct: RegisterRequest = serde_json::from_value(json!({"slug":"direct","runtime":"static","root":outside})).unwrap();
+        assert_eq!(store.register(direct.clone(), &agent(S1)).unwrap_err().code, "static_root_forbidden");
+        let check = store.validate_register(direct, &agent(S1)).unwrap();
+        assert!(check.static_root_approval.is_some());
+        assert!(store.get("direct").is_err(), "validate-only writes nothing");
+        // The approval flag is not part of the wire format.
+        assert!(serde_json::from_value::<RegisterRequest>(json!({"slug":"a","staticRootApproved":true})).is_err());
+        drop(_reset);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -21,6 +21,9 @@ use crate::session::store::{
     cutex_sessions_path, with_locked_session_rows,
 };
 
+pub mod permission_rules;
+pub mod code_sources;
+pub mod skill_catalog;
 pub mod structure;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +79,7 @@ impl ClaudeDeployment {
     }
 }
 
-fn deployment_path() -> anyhow::Result<PathBuf> {
+pub(crate) fn deployment_path() -> anyhow::Result<PathBuf> {
     Ok(crate::config::paths::runtime_dir()?.join("claude/deployment.json"))
 }
 
@@ -110,6 +113,13 @@ pub struct ClaudeSession {
     pub native_session_id: Option<String>,
     #[serde(default)]
     pub connection_id: Option<String>,
+    /// The Claude Code permission mode the owner created the agent in
+    /// (`launch.claudePermissionMode`, capability
+    /// `claude-launch-permission-mode`). Sent once as
+    /// `thread/settings/update` at the first successful start, then cleared:
+    /// afterwards the adapter keeps the thread's mode itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_permission_mode: Option<String>,
 }
 
 /// Exact-occurrence proof for Archive. The controller lock remains held from
@@ -433,6 +443,12 @@ pub fn create_profile(name:&str,cwd:&Path,model:&str,allow_write:Option<bool>,al
     }
     let cwd = cwd.canonicalize()?;
     ensure!(cwd.is_dir(), "working directory required");
+    // The record keeps the ordinary spelling, not the Win32 verbatim form
+    // canonicalize() returns on Windows (`\\?\F:\x`): Projects, specs and
+    // the owner name the directory without it (r244 `mismatch: cwd`).
+    let cwd = std::path::PathBuf::from(crate::agent_management::strip_verbatim_prefix(
+        cwd.to_str().context("working directory must be valid Unicode")?,
+    ));
     let thread_id = uuid::Uuid::new_v4().to_string();
     let id = format!("cutex.{}", uuid::Uuid::new_v4());
     let mut record = CutexSessionRecord::new(
@@ -468,6 +484,7 @@ pub fn create_profile(name:&str,cwd:&Path,model:&str,allow_write:Option<bool>,al
         exec_explicit: allow_exec.is_some(),
         native_session_id: None,
         connection_id: None,
+        initial_permission_mode: None,
     });
     let path = cutex_sessions_path()?;
     with_locked_session_rows(&path, |rows| {
@@ -475,7 +492,7 @@ pub fn create_profile(name:&str,cwd:&Path,model:&str,allow_write:Option<bool>,al
             !rows
                 .sessions()
                 .map(|(_, record)| record)
-                .any(|r| r.formal_agent_name.as_deref() == Some(name)),
+                .any(|r| !r.is_retired() && r.formal_agent_name.as_deref() == Some(name)),
             "agent name already exists"
         );
         rows.insert_session(id, record.clone());
@@ -624,15 +641,16 @@ impl ClaudeProfileRuntime {
     }
 }
 /// Applies the profile's native runtime overrides and returns its
-/// AskUserQuestion mode and opt-in file checkpointing policy.
+/// AskUserQuestion mode and file checkpointing policy (default on).
 fn apply_profile_runtime(record: &CutexSessionRecord, command: &mut Command) -> anyhow::Result<(AgentTurnQuestions, bool)> {
-    let Some(name) = record.profile.as_deref() else { return Ok((AgentTurnQuestions::default(), false)); };
+    let default_checkpointing = crate::profiles::settings_api::DEFAULT_CLAUDE_FILE_CHECKPOINTING;
+    let Some(name) = record.profile.as_deref() else { return Ok((AgentTurnQuestions::default(), default_checkpointing)); };
     let accounts: crate::profiles::model::AccountsStore = serde_json::from_slice(
         &std::fs::read(crate::config::paths::accounts_path()?)?)?;
     let account = crate::profiles::lookup::find_account(&accounts, name)?
         .context("Claude launch profile missing")?;
     let questions = account.options.agent_turn_questions.unwrap_or_default();
-    let checkpointing = account.options.claude_file_checkpointing.unwrap_or(false);
+    let checkpointing = account.options.claude_file_checkpointing.unwrap_or(default_checkpointing);
     let path = crate::profiles::materialize::materialized_profiles_dir()?
         .join(&account.id).join("claude-runtime.json");
     let raw = match std::fs::read(&path) {
@@ -684,6 +702,18 @@ fn file_checkpointing_args(features: &Value, enabled: bool) -> Vec<&'static str>
     }
 }
 
+/// `cutex-mcp-tools.json`: the façade and the agent's tools. An adapter
+/// declaring `features.approvalWait` (claude-r16+) also gets
+/// `approvalWaitSecs`: it gives the façade that hold (approval-wait) and
+/// lets the cutex tools that may hold run past its usual tool timeout.
+fn mcp_tools_descriptor(executable: &std::path::Path, tools: Value, features: &Value) -> Value {
+    let mut descriptor = json!({"executable": executable, "tools": tools});
+    if features["approvalWait"] == true {
+        descriptor["approvalWaitSecs"] = json!(crate::approvals::APPROVAL_WAIT_SECS);
+    }
+    descriptor
+}
+
 fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient, Ready)> {
     let session = record
         .claude_session
@@ -699,7 +729,8 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
     ensure!(mcp.is_file(), "Cutex MCP executable missing: {}", mcp.display());
     write_private_pretty_json_atomic(&session.state_dir.join("cutex-mcp-tools.json"),
         // Role-filtered at launch, like a stock runtime's tools/list.
-        &json!({"executable":mcp,"tools":if record.agent_enabled || record.is_owned_session() {crate::agent_bus::tool_policy::tools_list_for_session(&record.cutex_session_id)["tools"].clone()}else{json!([])}}), "Claude MCP tools")?;
+        &mcp_tools_descriptor(&mcp, if record.agent_enabled || record.is_owned_session() {crate::agent_bus::tool_policy::tools_list_for_session(&record.cutex_session_id)["tools"].clone()}else{json!([])},
+            &adapter_features(&session.deployment.adapter_source)), "Claude MCP tools")?;
     let log_path = session.state_dir.join("adapter.stderr.log");
     if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
         let previous = session.state_dir.join("adapter.stderr.log.1");
@@ -727,6 +758,8 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
     command.env("CUTEX_CLAUDE_RESET_LAUNCH_MODEL", if record.profile.is_some()
         && previous_profile.as_ref().is_some_and(|previous| previous != &profile_launch) { "1" } else { "0" });
     let (agent_turn_questions, checkpointing) = apply_profile_runtime(record, &mut command)?;
+    // proxy-modes: the Profile's effective proxy (loopback always in NO_PROXY).
+    command.envs(crate::config::proxy_outbound::claude_runtime_proxy_envs(record.profile.as_deref())?);
     command
         .args([
             "-u",
@@ -788,8 +821,26 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
             }
         }
     }
+    // Persistent "always allow" rules of this workspace (claude-permission-rules).
+    permission_rules::prepare_launch(record, session)?;
     command.args(agent_turn_questions_args(&features, agent_turn_questions));
     command.args(file_checkpointing_args(&features, checkpointing));
+    // claude-code-sources: Claude Code settings sources, claude.ai connectors
+    // and the host's MCP layers (secret values only in this env). A broken MCP
+    // store must not block the agent: warn and launch without these flags.
+    let code_plan = match code_sources::prepare_launch(record, &session.state_dir, &features) {
+        Ok((plan, args)) => {
+            command.args(args);
+            for (key, value) in &plan.envs {
+                command.env(key, value);
+            }
+            Some(plan)
+        }
+        Err(error) => {
+            eprintln!("claude: Claude Code sources / MCP layers skipped for {}: {error:#}", record.cutex_session_id);
+            None
+        }
+    };
     if let Some(path) = write_system_append(record, session, &features)? {
         command.arg("--system-append-file").arg(path);
     }
@@ -840,8 +891,68 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
         if let Err(error) = write_private_pretty_json_atomic(&profile_launch_path, &profile_launch, "Claude launch profile") {
             eprintln!("claude: launch profile hint not written for {}: {error:#}", record.cutex_session_id);
         }
+        if let Some(plan) = &code_plan {
+            code_sources::record_launch(&session.state_dir, plan);
+        }
     }
     result
+}
+
+/// The Claude permission modes a new agent may start in with the selected
+/// Claude runtime (`features.json` `claudePermissionModes`; empty = the
+/// runtime does not offer them, or none is installed).
+pub fn launch_permission_modes() -> Vec<String> {
+    let Ok(deployment) = ClaudeDeployment::selected() else {
+        return Vec::new();
+    };
+    permission_modes_of(&adapter_features(&deployment.adapter_source))
+}
+
+fn permission_modes_of(features: &Value) -> Vec<String> {
+    let listed = features["claudePermissionModes"].as_array().cloned().unwrap_or_default();
+    crate::config::new_thread::CLAUDE_PERMISSION_MODES
+        .iter()
+        .filter(|mode| listed.iter().any(|value| value.as_str() == Some(**mode)))
+        .map(|mode| mode.to_string())
+        .collect()
+}
+
+/// Records the permission mode a just-created Claude agent starts in
+/// (`launch.claudePermissionMode`). Refused unless the selected Claude
+/// runtime offers it.
+pub fn set_initial_permission_mode(id: &str, mode: &str) -> anyhow::Result<()> {
+    ensure!(
+        launch_permission_modes().iter().any(|offered| offered == mode),
+        "the installed Claude runtime does not offer the permission mode `{mode}`; update the claude-runtime component"
+    );
+    let path = cutex_sessions_path()?;
+    crate::session::store::update_session_row(&path, id, |current| {
+        let binding = current.claude_session.as_mut().context("Claude session missing")?;
+        binding.initial_permission_mode = Some(mode.to_string());
+        Ok(())
+    })?
+    .context("session removed after creation")?;
+    Ok(())
+}
+
+/// `thread/settings/update` for a starting mode, in the Codex v2 shape the
+/// adapter maps (components/claude-runtime protocol.py `requested_mode`):
+/// plan turns plan mode on over the adapter's default mode.
+fn initial_mode_patch(thread_id: &str, mode: &str) -> anyhow::Result<Value> {
+    let workspace = json!({"type": "workspaceWrite", "writableRoots": [], "networkAccess": true,
+        "excludeTmpdirEnvVar": false, "excludeSlashTmp": false});
+    let mut patch = match mode {
+        "bypassPermissions" => json!({"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}}),
+        "auto" => json!({"approvalPolicy": "on-request", "approvalsReviewer": "auto_review", "sandboxPolicy": workspace}),
+        "acceptEdits" => json!({"approvalPolicy": "on-request", "approvalsReviewer": "user", "sandboxPolicy": workspace}),
+        "default" => json!({"approvalPolicy": "on-request", "approvalsReviewer": "user",
+            "sandboxPolicy": {"type": "readOnly", "networkAccess": false}}),
+        "plan" => json!({"collaborationMode": {"mode": "plan",
+            "settings": {"model": "", "reasoning_effort": null, "developer_instructions": null}}}),
+        other => anyhow::bail!("unknown Claude permission mode `{other}`"),
+    };
+    patch["threadId"] = json!(thread_id);
+    Ok(patch)
 }
 
 fn validate_status(session: &ClaudeSession, status: &Value) -> anyhow::Result<()> {
@@ -879,6 +990,14 @@ pub fn start_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
         .context("Claude session missing")?;
     let (client, ready) = ensure_server(&record)?;
     client.handle().request("claude/thread/ensure", json!({"threadId":session.thread_id,"cwd":record.cwd,"model":session.model,"instructions":session.instructions}))?;
+    if let Some(mode) = &session.initial_permission_mode {
+        // Before claude/runtime/start: the adapter stores the mode and the
+        // native session connects in it.
+        let patch = initial_mode_patch(&session.thread_id, mode)?;
+        client.handle().request("thread/settings/update", patch).with_context(|| {
+            format!("the Claude agent could not be put into its permission mode `{mode}`")
+        })?;
+    }
     if let Some(expected) = &session.native_session_id {
         let saved = client.handle().request(
             "claude/thread/inspect",
@@ -917,6 +1036,8 @@ pub fn start_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
         }
         binding.connection_id = Some(connection.into());
         binding.native_session_id = Some(native.into());
+        // Applied above; from now on the adapter keeps the thread's mode.
+        binding.initial_permission_mode = None;
         current.current_runtime_agent_id = Some(format!("claude.{connection}"));
         current.runtime_pid = Some(ready.pid);
         current.updated_at = chrono::Utc::now().to_rfc3339();
@@ -1113,9 +1234,11 @@ pub const ADAPTER_SCHEMA_VERSION: &str = "0.3.0+cutex";
 pub fn native_schema(session: &ClaudeSession) -> Value {
     let source = session.deployment.adapter_source.join("src/cute_claude");
     let mut features = adapter_features(&session.deployment.adapter_source);
-    // Desktop's current skill picker uses the Codex catalog. Advertising it
-    // here would offer Claude paths outside this session's managed catalog.
-    // The adapter's own skills/list + skill input remain available to its TUI.
+    // Desktops before `claude-session-skills` list the Codex catalog in their
+    // skill picker. Advertising it here would offer Claude paths outside this
+    // session's managed catalog. Newer desktops read GET /v2/sessions/{id}/skills
+    // and key on `managedSkills` instead. The adapter's own skills/list + skill
+    // input remain available to its TUI.
     if features["skillInput"] == true {
         features["skillInput"] = json!(false);
     }
@@ -1326,6 +1449,51 @@ pub fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn approval_wait_only_for_adapters_that_declare_it() {
+        let path = std::path::Path::new("/x/cutex-mcp");
+        let old = super::mcp_tools_descriptor(path, json!([]), &json!({"externalInput": true}));
+        assert!(old.get("approvalWaitSecs").is_none(), "{old}");
+        let new = super::mcp_tools_descriptor(path, json!([{"name": "service_register"}]), &json!({"approvalWait": true}));
+        assert_eq!(new["approvalWaitSecs"], 120);
+        assert_eq!(new["tools"][0]["name"], "service_register");
+        assert_eq!(new["executable"], "/x/cutex-mcp");
+    }
+
+    #[test]
+    fn launch_permission_modes_follow_the_adapter_in_display_order() {
+        let features = json!({"claudePermissionModes": ["bypassPermissions", "plan", "default", "bogus"]});
+        assert_eq!(super::permission_modes_of(&features), ["default", "plan", "bypassPermissions"]);
+        assert!(super::permission_modes_of(&json!({})).is_empty());
+        assert!(super::permission_modes_of(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn initial_mode_patches_are_the_adapter_mapping() {
+        let patch = |mode| super::initial_mode_patch("t1", mode).unwrap();
+        assert_eq!(patch("bypassPermissions")["approvalPolicy"], "never");
+        assert_eq!(patch("auto")["approvalsReviewer"], "auto_review");
+        assert_eq!(patch("acceptEdits")["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(patch("acceptEdits")["approvalsReviewer"], "user");
+        assert_eq!(patch("default")["sandboxPolicy"]["type"], "readOnly");
+        let plan = patch("plan");
+        assert_eq!(plan["collaborationMode"]["mode"], "plan");
+        assert!(plan.get("approvalPolicy").is_none(), "plan keeps the mode underneath");
+        assert!(["default", "acceptEdits", "plan", "auto", "bypassPermissions"].iter().all(|m| patch(m)["threadId"] == "t1"));
+        assert!(super::initial_mode_patch("t1", "dontAsk").is_err());
+    }
+
+    #[test]
+    fn initial_permission_mode_is_omitted_when_unset() {
+        let session: super::ClaudeSession = serde_json::from_value(json!({
+            "deployment": {"python": "p", "adapter_source": "a", "claude_cli": "c", "claude_home": "h", "tui_binary": "t"},
+            "thread_id": "t", "state_dir": "s", "model": "m"
+        })).unwrap();
+        assert!(session.initial_permission_mode.is_none());
+        let saved = serde_json::to_value(&session).unwrap();
+        assert!(saved.get("initial_permission_mode").is_none());
+    }
+
     use super::*;
 
     #[cfg(unix)]
@@ -1362,6 +1530,7 @@ mod tests {
             allow_exec: false, write_explicit: false, exec_explicit: false,
             native_session_id: Some("native-session".into()),
             connection_id: Some("connection".into()),
+            initial_permission_mode: None,
         };
         let mut record = CutexSessionRecord::new_at(
             "cutex.archive-replay".into(),
@@ -1434,6 +1603,7 @@ mod tests {
             allow_exec: false, write_explicit: false, exec_explicit: false,
             native_session_id: Some("native-session".into()),
             connection_id: Some("connection".into()),
+            initial_permission_mode: None,
         });
         record
     }
@@ -1545,7 +1715,8 @@ mod tests {
 
 
     #[test]
-    fn checkpointing_flag_is_opt_in_and_compatible_with_old_adapters() {
+    fn checkpointing_flag_defaults_on_and_is_compatible_with_old_adapters() {
+        assert!(crate::profiles::settings_api::DEFAULT_CLAUDE_FILE_CHECKPOINTING);
         assert_eq!(file_checkpointing_args(&json!({"fileCheckpointing": true}), true),
             ["--file-checkpointing", "enabled"]);
         assert_eq!(file_checkpointing_args(&json!({"fileCheckpointing": true}), false),
@@ -1601,6 +1772,7 @@ mod tests {
             allow_exec: false, write_explicit: false, exec_explicit: false,
             native_session_id: None,
             connection_id: None,
+            initial_permission_mode: None,
         };
         let mut record = CutexSessionRecord::new(
             "cutex.append-test".into(),

@@ -48,6 +48,7 @@ pub fn http_json_request(options: HttpJsonRequest<'_>) -> anyhow::Result<Value> 
         .ok_or_else(|| anyhow::anyhow!("{}", options.missing_host_message))?;
     let port = url.port_or_known_default().unwrap_or(80);
     let addr = format!("{host}:{port}");
+    crate::config::instance::ensure_port_allowed(port).with_context(|| options.connect_context.to_string())?;
     let mut stream =
         TcpStream::connect(addr).with_context(|| options.connect_context.to_string())?;
     stream.set_write_timeout(Some(options.timeout)).ok();
@@ -303,6 +304,7 @@ pub fn http_post_json_expect_success(options: HttpPostStatusRequest<'_>) -> anyh
         .ok_or_else(|| anyhow::anyhow!("{}", options.missing_host_message))?;
     let port = url.port_or_known_default().unwrap_or(80);
     let addr = format!("{host}:{port}");
+    crate::config::instance::ensure_port_allowed(port).with_context(|| options.connect_context.to_string())?;
     let mut stream =
         TcpStream::connect(addr).with_context(|| options.connect_context.to_string())?;
     stream.set_write_timeout(Some(options.timeout)).ok();
@@ -335,6 +337,9 @@ pub fn http_post_json_expect_success(options: HttpPostStatusRequest<'_>) -> anyh
 }
 
 pub fn http_local_root_status_ok(port: u16, token: Option<&str>, timeout: Duration) -> bool {
+    if crate::config::instance::ensure_port_allowed(port).is_err() {
+        return false;
+    }
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
         return false;
@@ -359,6 +364,9 @@ pub fn http_base_url_root_status_ok(base_url: &str, timeout: Duration) -> bool {
         return false;
     };
     let port = url.port_or_known_default().unwrap_or(80);
+    if crate::config::instance::ensure_port_allowed(port).is_err() {
+        return false;
+    }
     let Ok(mut stream) = TcpStream::connect(format!("{host}:{port}")) else {
         return false;
     };
@@ -366,6 +374,7 @@ pub fn http_base_url_root_status_ok(base_url: &str, timeout: Duration) -> bool {
 }
 
 pub fn connect_local_port(port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+    crate::config::instance::ensure_port_allowed(port)?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, timeout)
 }

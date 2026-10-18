@@ -309,6 +309,9 @@ struct Inner {
     state_dirty: bool,
     last_health: Option<Instant>,
     shutdown: bool,
+    /// Slugs whose `restartRequestedAt` changed since the last reload
+    /// (`service_restart`, possibly written by the Agent Bus process).
+    pending_restarts: Vec<String>,
 }
 
 pub struct Supervisor {
@@ -423,11 +426,41 @@ impl Supervisor {
                 .is_none_or(|last| last.elapsed() >= interval)
         };
         self.emit(events);
+        self.run_pending_restarts();
         if due {
             self.probe_all();
         }
         let mut inner = self.inner.lock().expect("services supervisor");
         self.persist_locked(&mut inner);
+    }
+
+    /// Restart the services an owning agent asked to restart
+    /// (`ServiceStore::request_restart`) through the same path as the owner's
+    /// `POST /v2/services/{slug}/restart`. A service the owner stopped (or that
+    /// is no longer managed) since the request stays as it is.
+    fn run_pending_restarts(self: &Arc<Self>) {
+        let pending = {
+            let mut inner = self.inner.lock().expect("services supervisor");
+            std::mem::take(&mut inner.pending_restarts)
+        };
+        for slug in pending {
+            match self.store.get(&slug) {
+                Ok(record) if record.runtime == ServiceRuntime::Managed && !record.stopped => {
+                    if let Ok(logs) = self.ring(&slug) {
+                        logs.note("restart requested by the owning agent");
+                    }
+                    if let Err(error) = self.restart_service(&slug) {
+                        eprintln!("services: agent restart of {slug} failed: {error}");
+                    }
+                }
+                Ok(_) => {
+                    if let Ok(logs) = self.ring(&slug) {
+                        logs.note("agent restart request ignored: service stopped or not managed");
+                    }
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     fn reload_locked(&self, inner: &mut Inner, events: &mut Vec<ServiceEvent>, initial: bool) {
@@ -469,6 +502,7 @@ impl Supervisor {
                     running.tree.kill();
                 }
             }
+            super::traffic::forget(&slug);
             inner.state_dirty = true;
             events.push(ServiceEvent {
                 reason: if registry.tombstones.contains_key(&slug) {
@@ -482,6 +516,21 @@ impl Supervisor {
         }
         for (slug, record) in registry.services {
             let previous = inner.records.insert(slug.clone(), record.clone());
+            if previous
+                .as_ref()
+                .is_some_and(|previous| previous.created_at != record.created_at)
+            {
+                // Unregistered (or reclaimed) and registered again between two
+                // passes: a new service under the old slug. Nothing of the old
+                // one carries over (process, restarts, health, traffic).
+                if let Some(mut entry) = inner.entries.remove(&slug) {
+                    if let Some(running) = entry.running.take() {
+                        entry.logs.note("service registered again; stopping the previous one");
+                        running.tree.kill();
+                    }
+                }
+                super::traffic::forget(&slug);
+            }
             let entry = inner
                 .entries
                 .entry(slug.clone())
@@ -496,6 +545,15 @@ impl Supervisor {
                 if entry.snapshot.health == ServiceHealth::Stopped {
                     entry.snapshot.health = ServiceHealth::Unreachable;
                 }
+            }
+            if !initial
+                && record.restart_requested_at.is_some()
+                && previous.as_ref().is_some_and(|previous| {
+                    previous.restart_requested_at != record.restart_requested_at
+                })
+                && !inner.pending_restarts.contains(&slug)
+            {
+                inner.pending_restarts.push(slug.clone());
             }
             let reason = match &previous {
                 None if initial => None,
@@ -885,6 +943,7 @@ impl Supervisor {
             self.persist_locked(&mut inner);
         }
         self.emit(events);
+        self.run_pending_restarts();
         self.kick();
     }
 
@@ -895,7 +954,7 @@ impl Supervisor {
             .get(slug)
             .ok_or_else(|| ServicesError::not_found(slug))?;
         let mut view = service_view(record, inner.entries.get(slug).map(|entry| &entry.snapshot));
-        let traffic = super::traffic::snapshot(slug);
+        let traffic = super::traffic::snapshot_for(record);
         self.lifecycle.augment_view(
             record,
             &inner.settings,
@@ -922,7 +981,7 @@ impl Supervisor {
                 .services
                 .values()
                 .filter_map(|record| {
-                    let traffic = super::traffic::snapshot(&record.slug);
+                    let traffic = super::traffic::snapshot_for(record);
                     let archived = record
                         .owner_cutex_session_id
                         .as_ref()
@@ -964,6 +1023,7 @@ impl Supervisor {
                     self.lifecycle.forget(&record.slug);
                     inner.records.remove(&record.slug);
                     inner.entries.remove(&record.slug);
+                    super::traffic::forget(&record.slug);
                     inner.state_dirty = true;
                     events.push(ServiceEvent {
                         reason: "reclaimed",
@@ -1817,6 +1877,85 @@ mod tests {
         assert!(wait_until(Duration::from_secs(10), || {
             !crate::services::health::probe(managed.port, None)
         }));
+        supervisor.shutdown();
+        let _ = std::fs::remove_dir_all(store.dir());
+    }
+
+    /// `service_restart`: a new `restartRequestedAt` written by another
+    /// process (the Agent Bus) restarts the running process once through
+    /// `restart_service`; a request the owner overrode with a stop is dropped.
+    #[test]
+    fn agent_restart_request_restarts_once_and_respects_owner_stop() {
+        if !node_available() {
+            eprintln!("node not found; skipping");
+            return;
+        }
+        let store = temp_store();
+        let agent = Caller::Agent {
+            cutex_session_id: "cutex.00000000-0000-0000-0000-0000000000a1".into(),
+            project_id: None,
+        };
+        let (managed, _) = store
+            .register(
+                RegisterRequest {
+                    slug: "own".into(),
+                    runtime: Some("managed".into()),
+                    // The fixture session does not exist: keep an ephemeral
+                    // service from being reclaimed as owner-archived.
+                    lifetime: Some("persistent".into()),
+                    command: Some(server_command()),
+                    path: Some("/".into()),
+                    port: Some(
+                        crate::services::store::allocate_port(
+                            &ServicesSettings {
+                                port_range_start: 45100,
+                                port_range_end: 45900,
+                                ..Default::default()
+                            },
+                            &Default::default(),
+                            crate::services::store::os_port_free,
+                        )
+                        .unwrap(),
+                    ),
+                    ..Default::default()
+                },
+                &agent,
+            )
+            .unwrap();
+        let (supervisor, _) = recording_supervisor(store.clone());
+        supervisor.start().unwrap();
+        let reachable = |supervisor: &Arc<Supervisor>| {
+            wait_until(Duration::from_secs(20), || {
+                supervisor.probe_all();
+                supervisor.snapshots()["own"].health == ServiceHealth::Reachable
+            })
+        };
+        assert!(reachable(&supervisor), "managed service becomes reachable");
+        let first_pid = supervisor.snapshots()["own"].pid.unwrap();
+
+        store.request_restart("own", &agent).unwrap();
+        supervisor.tick();
+        assert!(reachable(&supervisor), "reachable again after the restart");
+        let second_pid = supervisor.snapshots()["own"].pid.unwrap();
+        assert_ne!(first_pid, second_pid, "a new process runs");
+        // The same request is not replayed by later passes.
+        supervisor.tick();
+        supervisor.tick();
+        assert_eq!(supervisor.snapshots()["own"].pid, Some(second_pid));
+        assert!(supervisor.logs("own", 200).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("restart requested by the owning agent"));
+
+        // Stopped by the owner after the request: it stays down.
+        store.request_restart("own", &agent).unwrap();
+        store.set_stopped("own", true).unwrap();
+        supervisor.tick();
+        assert!(wait_until(Duration::from_secs(10), || {
+            !crate::services::health::probe(managed.port, None)
+        }));
+        assert!(store.get("own").unwrap().stopped);
+        assert_eq!(supervisor.snapshots()["own"].pid, None);
         supervisor.shutdown();
         let _ = std::fs::remove_dir_all(store.dir());
     }

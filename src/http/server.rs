@@ -310,9 +310,20 @@ pub fn write_http_response(
         set_keep_alive(KeepAlive::Kept);
         stream.flush().ok();
     } else {
-        let _ = stream.shutdown(Shutdown::Both);
+        close_after_response(stream);
     }
     Ok(())
+}
+
+/// End a `Connection: close` response so the client reads EOF now, even while
+/// the handler still holds the stream. macOS (BSD) refuses `shutdown(Both)`
+/// with ENOTCONN once the client has half-closed its side (it sent the whole
+/// request and shut down writing); shutting down our write side still works
+/// there. Linux accepts `Both` in that state.
+pub fn close_after_response(stream: &TcpStream) {
+    if stream.shutdown(Shutdown::Both).is_err() {
+        let _ = stream.shutdown(Shutdown::Write);
+    }
 }
 
 pub fn write_json_response(
@@ -328,6 +339,29 @@ pub fn write_json_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client that half-closes after its request still reads EOF right
+    /// after the response, while the handler keeps the stream (macOS:
+    /// `shutdown(Both)` fails with ENOTCONN in that state).
+    #[test]
+    fn response_reaches_eof_for_a_half_closed_client() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // Before the exchange: macOS refuses setsockopt (EINVAL) once the
+        // connection is fully shut down.
+        client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        read_simple_http_request(&mut server).unwrap();
+        write_http_response(&mut server, 200, "OK", "text/plain", b"ok").unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("EOF while the server still holds the stream");
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"\r\n\r\nok"));
+        drop(server);
+    }
 
     #[test]
     fn accept_encoding_parsing() {

@@ -23,6 +23,8 @@ import re
 import time
 
 from .safety_grants import BLOCKED_EVENT, UPDATED_EVENT
+from . import permission_rules
+from .approvals import is_allowed
 
 # These require lifecycle/UI contracts beyond a main-thread native tool call.
 # The second group can start native turns on their own (wake-ups, schedules,
@@ -56,8 +58,43 @@ def exclusions(settings):
     if not settings.allow_write:
         result += ['Write', 'Edit', 'MultiEdit', 'NotebookEdit']
     if not settings.allow_exec:
-        result += ['Bash']
+        # PowerShell: Claude Code's Windows shell tool next to Bash.
+        result += ['Bash', 'PowerShell']
+    # Tools the owner turned off on a host-selected MCP server (`disabled_tools`).
+    for server, rule in sorted(getattr(settings, 'mcp_tool_filters', {}).items()):
+        result += [f'mcp__{server}__{tool}' for tool in rule.get('disabled') or []]
     return result
+
+
+CONNECTOR_PREFIX = 'claude_ai_'
+
+
+def external_mcp_tool(settings, full_name):
+    """(server, tool) when ``full_name`` is a tool of a host-selected external MCP
+    server or (when enabled) a claude.ai connector; None for the in-process
+    cutex server and anything else. Claude Code names MCP tools
+    ``mcp__<server>__<tool>``; host server names are already in its normalized
+    alphabet, so the longest matching configured name wins."""
+    if not isinstance(full_name, str) or not full_name.startswith('mcp__'):
+        return None
+    rest = full_name[5:]
+    best = None
+    for name in getattr(settings, 'mcp_servers', {}):
+        if rest.startswith(name + '__') and len(rest) > len(name) + 2 and (best is None or len(name) > len(best)):
+            best = name
+    if best is not None:
+        return best, rest[len(best) + 2:]
+    if getattr(settings, 'claude_ai_connectors', False) and rest.startswith(CONNECTOR_PREFIX) and '__' in rest[len(CONNECTOR_PREFIX):]:
+        server, tool = rest.rsplit('__', 1)
+        return server, tool
+    return None
+
+
+def external_mcp_allowed(settings, server, tool):
+    """The server's `enabled_tools` / `disabled_tools` (connectors: no filters)."""
+    rule = getattr(settings, 'mcp_tool_filters', {}).get(server) or {}
+    enabled = rule.get('enabled')
+    return (enabled is None or tool in enabled) and tool not in (rule.get('disabled') or [])
 
 
 def preview(value, budget=16384):
@@ -88,6 +125,17 @@ def bounded(text, limit=OUTPUT_BYTES):
     half = limit // 2
     return (raw[:half].decode('utf-8', 'ignore') + '\n[… output truncated …]\n'
             + raw[-half:].decode('utf-8', 'ignore'))
+
+
+# Permission denials the adapter itself answers (never Claude Code's "The user doesn't want…"): say
+# what happened, and blame the owner only for the owner's own answer.
+STALE_PERMISSION = ('cutex runtime: this permission request no longer matches a live tool call of the running '
+                    'turn (the turn ended or the runtime is restarting). Nobody refused it; the tool did not run.')
+UNANSWERED_PERMISSION = ('cutex runtime: nobody answered this permission request (no owner client was connected, '
+                         'or the request was withdrawn). The owner did not refuse it; the tool did not run. Tell the '
+                         'owner what you need it for and wait, or continue without it.')
+OWNER_DECLINED = 'The owner declined this tool call in cutex. Do not retry it without new instructions.'
+OWNER_STOPPED = 'The owner declined this tool call in cutex and stopped the turn. Wait for the owner.'
 
 
 def interrupted_item(item, note):
@@ -406,6 +454,11 @@ class NativeTools:
         if name in EDIT_TOOLS:
             return {'type': 'fileChange', 'id': call_id, 'changes': [proposed_change(name, arguments)],
                     'status': 'inProgress'}
+        external = external_mcp_tool(b.engine.settings, name)
+        if external:
+            return {'type': 'mcpToolCall', 'id': call_id, 'server': external[0], 'tool': external[1],
+                    'arguments': preview(arguments), 'status': 'inProgress', 'result': None, 'error': None,
+                    'appContext': None, 'pluginId': None, 'readOnlyHint': None, 'durationMs': None}
         if name == 'WebSearch':
             query = str(arguments.get('query', ''))
             return {'type': 'webSearch', 'id': call_id, 'query': query,
@@ -416,8 +469,11 @@ class NativeTools:
 
     async def start(self, name, arguments, call_id, *, observation=False):
         b = self.bridge
-        if not observation and (name in exclusions(b.engine.settings) or name.startswith('mcp__')):
+        external = external_mcp_tool(b.engine.settings, name)
+        if not observation and (name in exclusions(b.engine.settings) or (name.startswith('mcp__') and not external)):
             return b.denied('Tool is not enabled by this runtime configuration')
+        if external and not external_mcp_allowed(b.engine.settings, *external):
+            return b.denied('This MCP tool is turned off for this agent')
         if not isinstance(call_id, str) or not call_id or not isinstance(arguments, dict):
             return b.denied('Native tool call omitted its identity or arguments')
         if not b.accepting or not b.binding:
@@ -454,7 +510,7 @@ class NativeTools:
         call_id = getattr(context, 'tool_use_id', None)
         call = self.calls.get(call_id)
         if not call or not b.accepting or call[:3] != (b.binding, name, arguments):
-            return {'allow': False, 'session': False, 'interrupt': False}
+            return {'allow': False, 'session': False, 'interrupt': False, 'message': STALE_PERMISSION}
         item = call[3]
         reason = getattr(context, 'title', None) or getattr(context, 'decision_reason', None)
         reason = reason if isinstance(reason, str) and reason.strip() else None
@@ -476,23 +532,30 @@ class NativeTools:
                 await b.engine.emit(b.tid, BLOCKED_EVENT, {'threadId': b.tid, 'turnId': call[0][0],
                                                           'itemId': call_id, 'block': block})
             return {'allow': False, 'session': False, 'interrupt': False, 'message': message}
+        # "Always allow in this project" (cutex keeps the chosen rules per workspace).
+        rules = permission_rules.offered(name, arguments, context, b.engine.settings.workspace)
         if item is not None and item['type'] == 'fileChange':
-            request = approvals.request_file_change(b.tid, call[0][0], call_id, reason)
+            request = approvals.request_file_change(b.tid, call[0][0], call_id, reason, rules)
         else:
             command = item['command'] if item is not None and item['type'] == 'commandExecution' else (
                 f"{name} {json.dumps(preview(arguments, 2048), ensure_ascii=False)}")
-            request = approvals.request_command(b.tid, call[0][0], call_id, command, reason)
+            request = approvals.request_command(b.tid, call[0][0], call_id, command, reason, rules)
         task = asyncio.create_task(request)
         b.host_tasks.add(task)
         try:
             decision = await task
         finally:
             b.host_tasks.discard(task)
-        allowed = decision in {'accept', 'acceptForSession'}
+        allowed = is_allowed(decision)
         if not allowed:
             await self.finish(call_id, 'Permission declined.' if decision in {'decline', 'cancel'}
                               else 'No approval received.', False, declined=True)
-        return {'allow': allowed, 'session': decision == 'acceptForSession', 'interrupt': decision == 'cancel'}
+        kept = list(decision[1]) if isinstance(decision, tuple) else None
+        # What the model reads: only an owner's answer may say the owner refused.
+        message = None if allowed else (OWNER_STOPPED if decision == 'cancel' else OWNER_DECLINED
+                                        if decision == 'decline' else UNANSWERED_PERMISSION)
+        return {'allow': allowed, 'session': decision == 'acceptForSession', 'interrupt': decision == 'cancel',
+                **({'rules': kept} if kept else {}), **({'message': message} if message else {})}
 
     async def finish(self, call_id, result, success, *, declined=False):
         call = self.calls.pop(call_id, None)
@@ -501,6 +564,8 @@ class NativeTools:
             return
         binding, name, arguments, item, started = call
         duration = int((time.monotonic() - started) * 1000)
+        if name in {'Agent', 'Task'} and getattr(b.engine, 'subagents', None) is not None:
+            await b.engine.subagents.finished(call_id, success, declined=declined)
         if name == 'Bash' and success and isinstance(result, dict):
             task_id = result.get('backgroundTaskId') or result.get('task_id') or result.get('background_task_id')
             owner = getattr(b.engine.driver, 'owners', {}).get(b.tid)
@@ -533,6 +598,14 @@ class NativeTools:
         elif kind == 'webSearch':
             if isinstance(result, dict) and isinstance(result.get('results'), list):
                 item['results'] = preview(result['results'])
+        elif kind == 'mcpToolCall':
+            if success:
+                content = result if isinstance(result, list) else [{'type': 'text', 'text': text_of(result)}]
+                item.update(status='completed', result={'content': preview(content), 'structuredContent': None},
+                            error=None, durationMs=duration)
+            else:
+                item.update(status='failed', result=None, error={'message': bounded(text_of(result), 16384)},
+                            durationMs=duration)
         else:
             text = json.dumps(preview(result), ensure_ascii=False) if not isinstance(result, str) else preview(result)
             item.update(status='completed' if success else 'failed', success=success,
@@ -563,7 +636,7 @@ class NativeTools:
             kind=field(block,'type',type(block).__name__)
             if kind in {'ToolUseBlock','tool_use'}:
                 name=field(block,'name','')
-                if name and name!='AskUserQuestion' and not name.startswith('mcp__'):
+                if name and name!='AskUserQuestion' and (not name.startswith('mcp__') or external_mcp_tool(self.bridge.engine.settings,name)):
                     await self.start(name,field(block,'input',{}),field(block,'id'),observation=True)
             elif kind in {'ToolResultBlock','tool_result'}:
                 await self.finish(field(block,'tool_use_id'),field(block,'content'),not field(block,'is_error',False))

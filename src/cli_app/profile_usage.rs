@@ -183,7 +183,14 @@ fn read_codex(request: &UsageRequest) -> anyhow::Result<Vec<ProfileUsageMeter>> 
     {
         headers.push(("ChatGPT-Account-Id", account_id.to_string()));
     }
-    let payload = get_json(CODEX_USAGE_URL, &headers)?;
+    let proxy = cutex::profiles::settings_api::load_store()
+        .ok()
+        .and_then(|store| cutex::profiles::settings_api::find(&store, &request.profile_id).cloned())
+        .map(|account| {
+            cutex::config::proxy_outbound::OutboundProxy::for_profile(&account, &cutex::config::store::load_codez_config())
+        })
+        .unwrap_or_else(cutex::config::proxy_outbound::OutboundProxy::host);
+    let payload = get_json(CODEX_USAGE_URL, &headers, &proxy)?;
     format_codex_usage(&payload)
 }
 
@@ -204,21 +211,29 @@ fn read_claude(request: &UsageRequest) -> anyhow::Result<Vec<ProfileUsageMeter>>
     format_claude_usage(&payload)
 }
 
-fn get_json(url: &str, headers: &[(&str, String)]) -> anyhow::Result<Value> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(REQUEST_TIMEOUT))
-        .max_redirects(0)
+fn get_json(
+    url: &str,
+    headers: &[(&str, String)],
+    proxy: &cutex::config::proxy_outbound::OutboundProxy,
+) -> anyhow::Result<Value> {
+    let agent = proxy
+        .apply(ureq::Agent::config_builder().timeout_global(Some(REQUEST_TIMEOUT)).max_redirects(0))?
         .build()
         .new_agent();
     let mut request = agent.get(url);
     for (name, value) in headers {
         request = request.header(*name, value.as_str());
     }
-    let mut response = request.call().map_err(|error| match error {
-        ureq::Error::StatusCode(status) => {
-            anyhow::anyhow!("official usage endpoint returned HTTP {status}")
+    let mut response = request.call().map_err(|error| {
+        if let Some(message) = cutex::config::proxy_outbound::proxy_error_message(&error) {
+            return anyhow::anyhow!("official usage endpoint unavailable: {message}");
         }
-        _ => anyhow::anyhow!("official usage endpoint unavailable"),
+        match error {
+            ureq::Error::StatusCode(status) => {
+                anyhow::anyhow!("official usage endpoint returned HTTP {status}")
+            }
+            _ => anyhow::anyhow!("official usage endpoint unavailable"),
+        }
     })?;
     anyhow::ensure!(
         response.status().is_success(),

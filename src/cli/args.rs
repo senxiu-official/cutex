@@ -353,9 +353,6 @@ pub enum GlobalCommand {
         /// Optional NO_PROXY value for --proxy-url
         #[arg(long = "proxy-no-proxy", value_name = "VALUE", requires = "proxy_url")]
         proxy_no_proxy: Option<String>,
-        /// Optional force-http value for --proxy-url (true/false)
-        #[arg(long = "proxy-force-http", value_name = "BOOL", requires = "proxy_url")]
-        proxy_force_http_transport: Option<bool>,
         /// Clear the global proxy fallback
         #[arg(long = "proxy-clear", conflicts_with = "proxy_url")]
         proxy_clear: bool,
@@ -386,9 +383,6 @@ pub enum ProxyCommand {
         /// Optional NO_PROXY value
         #[arg(long = "no-proxy")]
         no_proxy: Option<String>,
-        /// Force cute-codex model traffic away from WebSocket transport
-        #[arg(long = "force-http", default_value_t = true, action = ArgAction::Set)]
-        force_http_transport: bool,
     },
 
     /// Clear the global proxy
@@ -403,9 +397,6 @@ pub enum ProxyCommand {
         /// Optional NO_PROXY value
         #[arg(long = "no-proxy")]
         no_proxy: Option<String>,
-        /// Force cute-codex model traffic away from WebSocket transport
-        #[arg(long = "force-http", default_value_t = true, action = ArgAction::Set)]
-        force_http_transport: bool,
     },
 
     /// Disable proxy inheritance for one profile
@@ -1509,9 +1500,6 @@ pub enum ProfileCommand {
         /// Optional NO_PROXY value for --proxy-url
         #[arg(long = "proxy-no-proxy", value_name = "VALUE", requires = "proxy_url")]
         proxy_no_proxy: Option<String>,
-        /// Optional force-http value for --proxy-url (true/false)
-        #[arg(long = "proxy-force-http", value_name = "BOOL", requires = "proxy_url")]
-        proxy_force_http_transport: Option<bool>,
         /// Disable proxy inheritance for this profile
         #[arg(long = "proxy-disable", conflicts_with = "proxy_inherit")]
         proxy_disable: bool,

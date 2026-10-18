@@ -421,6 +421,7 @@ fn migrate_legacy_store_v2_to_v3(
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: legacy_account.id,
             name: legacy_account.name,
             email: legacy_account.email,

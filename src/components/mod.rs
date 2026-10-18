@@ -100,6 +100,11 @@ pub trait Handler: Send + Sync {
     fn from_source(&self, source: &Path, dest: &Path) -> anyhow::Result<()>;
     /// Whether a service cutex did not install occupies this component's place.
     fn external(&self, layout: &Layout) -> bool;
+    /// Unmanaged (hand-deployed) hosts: the component is set up by hand and
+    /// usable (`GET /v2/components` then reports `external`, not `missing`).
+    fn configured_by_hand(&self) -> bool {
+        false
+    }
     /// One-time preparation of `ctx.dir` (credentials, units, checks). Idempotent.
     fn prepare(&self, ctx: &Context) -> anyhow::Result<Value>;
     /// Select `ctx.dir` for new agents. Returns `{restartPending: bool, …}`.
@@ -670,8 +675,10 @@ pub fn status_of(layout: Option<&Layout>, keys: &[PublicKey], handler: &dyn Hand
     let running = operation.is_some_and(|op| op["name"] == meta.name.as_str() && op["state"] == "running");
     let state = if running {
         states::INSTALLING
-    } else if !supported || layout.is_none() {
+    } else if !supported {
         states::MISSING
+    } else if layout.is_none() {
+        if handler.configured_by_hand() { states::EXTERNAL } else { states::MISSING }
     } else if let Some(entry) = &entry {
         match probe["state"].as_str() {
             Some(state) => state,

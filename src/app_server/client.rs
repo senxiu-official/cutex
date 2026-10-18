@@ -1730,8 +1730,8 @@ mod tests {
         const EVENT_COUNT: usize = 16;
 
         let directory = std::env::temp_dir().join(format!(
-            "cutex-app-server-backpressure-test-{}",
-            uuid::Uuid::new_v4()
+            "cutex-as-backpressure-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
         fs::create_dir(&directory).expect("create test directory");
         let socket_path = directory.join("app-server.sock");

@@ -444,12 +444,15 @@ fn route_submit(
         }
     }
 
-    // Claude runtimes have no same-turn steering: an `auto` submit while a
+    // A Claude runtime without same-turn steering: an `auto` submit while a
     // turn runs becomes an ordinary Management queue item, flushed as the
-    // next turn when the active one completes.
+    // next turn when the active one completes. An adapter that steers
+    // (`input.sameTurnSteering`, claude-r15+) gets `turn/steer`: it reads the
+    // input after the turn's next tool call, else runs it as the next turn.
     let claude_queue = command.params.strategy == UserInputStrategy::Auto
         && active_turn_id.is_some()
-        && is_claude_session(&command.cutex_session_id);
+        && is_claude_session(&command.cutex_session_id)
+        && !claude_live_steers(&command.cutex_session_id);
     // Ask leases keep owner input separate (asks §5.3). Event/Owner leases
     // only block starts; they allow steering into an already running turn.
     let ask_queue = command.params.strategy == UserInputStrategy::Auto
@@ -1422,6 +1425,17 @@ fn wait_for_turn_to_stop(cutex_session_id: &str, turn_id: &str) -> anyhow::Resul
 
 /// Claude sessions are served by their own adapter runtime manager; every
 /// other app-server session by the Codex runtime manager.
+/// The connected Claude adapter generation of this session steers
+/// (`claude/capabilities` `input.sameTurnSteering`, cached per generation).
+fn claude_live_steers(cutex_session_id: &str) -> bool {
+    let Ok(Some(status)) = session_manager(cutex_session_id).status(cutex_session_id) else {
+        return false;
+    };
+    status.connected
+        && super::asks_claude::adapter_capabilities(cutex_session_id, status.runtime_generation)
+            .is_some_and(|caps| caps.pointer("/input/sameTurnSteering").and_then(Value::as_bool) == Some(true))
+}
+
 pub(crate) fn is_claude_session(cutex_session_id: &str) -> bool {
     cutex::session::store::with_cutex_session_store(|store| {
         store
@@ -1855,8 +1869,13 @@ mod tests {
     fn test_runs_in_private_home(name: &str) -> bool {
         const CHILD: &str = "CUTEX_OWNER_INPUT_TEST_CHILD";
         if std::env::var(CHILD).ok().as_deref() == Some(name) { return false; }
-        let parent = std::env::var_os("CUTEX_TEST_PRIVATE_HOME").map(std::path::PathBuf::from)
-            .expect("owner input tests require the private test home");
+        // Under the shared env lock: an IsolatedTestHome swaps CUTEX_TEST_PRIVATE_HOME for the
+        // process while it lives and deletes that dir on drop (a root made in it would vanish).
+        let parent = {
+            let _env = crate::cli_app::test_home::environment_lock().lock().expect("shared test environment lock is infallible");
+            std::env::var_os("CUTEX_TEST_PRIVATE_HOME").map(std::path::PathBuf::from)
+                .expect("owner input tests require the private test home")
+        };
         let root = parent.join(format!("owner-input-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".cutex-test-private-home"), b"owner input isolated test\n").unwrap();

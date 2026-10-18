@@ -1,6 +1,7 @@
 mod cli_app;
 
 fn main() {
+    cutex::config::proxy::ensure_process_loopback_no_proxy();
     if let Err(err) = cli_app::run() {
         if let Some(error) = cli_app::json_process_error(&err) {
             eprintln!(

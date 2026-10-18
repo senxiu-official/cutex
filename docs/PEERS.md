@@ -22,6 +22,18 @@ mutations require a loopback listener connection.
 5. A's `agent_list.otherHosts` exposes `worker@beta` for `agent_delegate.target`.
    B's owner reviews incoming delegations by default.
 
+`agent_list` keeps its answer small with a paired host (a host with hundreds of
+offline agents made it ~50K characters, over Claude Code's tool-result limit).
+By default `otherHosts[]` carries per host `agentCount`, `offlineCount`,
+`listedCount`, at most 10 idle / busy agents (rows unchanged: `cutexSessionId`,
+`name`, `short`, `status`, `runtime`, `address`) and, when agents were left out,
+`more`: the call that lists them. `agent_list {"host": "<label>"}` pages that
+host's agents instead of the local ones (`limit`, default 50, max 200; `cursor` =
+the previous `next_cursor`); `include_offline: true` includes offline agents (an
+offline peer agent is not auto-started). Local agents are always listed, own
+project first, offline ones last, paged by the same `limit` / `cursor`
+(`agents_total`, `agents_offline`, `next_cursor`).
+
 `human peer list` and `human peer remove <peerId>` inspect/remove relationships;
 `peers` is an alias of `peer`. Exports and remote visibility default to empty/
 disabled. The target retains its own permissions; peers never auto-start an

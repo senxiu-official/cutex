@@ -69,6 +69,38 @@ pub fn normalize_session_cwd(raw: &str) -> String {
     normalized
 }
 
+/// The identity of a session / agent cwd for comparisons: the spelling
+/// cleanup of [`normalize_session_cwd`] after dropping a Win32 verbatim
+/// prefix (`\\?\C:\x` -> `C:\x`, `\\?\UNC\h\s` -> `\\h\s`). `canonicalize()`
+/// on Windows returns the verbatim form while owners, Projects and specs
+/// spell the same directory without it; both name one directory. Also the
+/// form new records store. No case folding, no filesystem access.
+pub fn session_cwd_identity(raw: &str) -> String {
+    normalize_session_cwd(&crate::agent_management::strip_verbatim_prefix(raw))
+}
+
+/// True when two recorded cwds name the same directory spelling, tolerating
+/// a verbatim prefix on either side (records written before r245 may hold
+/// `\\?\…` from `canonicalize()`). See [`session_cwd_identity`].
+pub fn same_session_cwd(left: &str, right: &str) -> bool {
+    left == right || session_cwd_identity(left) == session_cwd_identity(right)
+}
+
+/// Another live (not archived) record holding `record`'s formal Agent name.
+/// Names are unique among live records only; an archived record keeps its
+/// name and may only be restored while no live record holds it.
+pub fn live_formal_name_holder<'a>(
+    store: &'a CutexSessionStore,
+    record: &CutexSessionRecord,
+) -> Option<&'a CutexSessionRecord> {
+    let name = record.formal_agent_name.as_deref()?;
+    store.sessions.values().find(|other| {
+        other.cutex_session_id != record.cutex_session_id
+            && !other.is_retired()
+            && other.formal_agent_name.as_deref() == Some(name)
+    })
+}
+
 /// `#[serde(deserialize_with)]` for request / spec cwd fields: the value as
 /// sent, through [`normalize_session_cwd`].
 pub fn deserialize_session_cwd<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -344,6 +376,24 @@ mod tests {
         assert_eq!(request.other.as_deref(), Some(r"D:\a"));
         let request: Request = serde_json::from_str(r#"{"cwd":"/tmp/x"}"#).unwrap();
         assert_eq!((request.cwd.as_str(), request.other), ("/tmp/x", None));
+    }
+
+    #[test]
+    fn verbatim_and_plain_windows_cwds_are_the_same_identity() {
+        // r244: a Claude agent created in `F:\cutex-test\r244` stored
+        // `\\?\F:\cutex-test\r244` (canonicalize) and every managed check
+        // compared the two texts.
+        assert_eq!(session_cwd_identity(r"\\?\F:\cutex-test\r244"), r"F:\cutex-test\r244");
+        assert_eq!(session_cwd_identity(r"\\?\F:\cutex-test\r244\"), r"F:\cutex-test\r244");
+        assert_eq!(session_cwd_identity(r"\\?\UNC\host\share\x"), r"\\host\share\x");
+        assert_eq!(session_cwd_identity(r"\\?\E:\"), r"E:\");
+        assert!(same_session_cwd(r"\\?\F:\cutex-test\r244", r"F:\cutex-test\r244"));
+        assert!(same_session_cwd(r"F:\cutex-test\r244", r"F:/cutex-test/r244/"));
+        assert!(!same_session_cwd(r"\\?\F:\cutex-test\r244", r"F:\cutex-test\r245"));
+        // Case is not folded and POSIX paths are compared as written.
+        assert!(!same_session_cwd(r"F:\X", r"f:\x"));
+        assert!(same_session_cwd("/srv/x", "/srv/x"));
+        assert!(!same_session_cwd("/srv/x", "/srv/y"));
     }
 
     #[test]

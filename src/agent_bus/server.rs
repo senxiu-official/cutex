@@ -347,6 +347,7 @@ pub fn handle_agent_bus_request(
                 Ok(Some(invocation)) => crate::services::agent_api::handle(
                     invocation.caller_cutex_session.as_str(),
                     &request.body,
+                    approval_waiter(&request, stream, &invocation),
                 ),
                 _ => serde_json::json!({"ok": false, "code": "unauthorized",
                     "detail": "services tools require the current persistent agent runtime"}),
@@ -790,7 +791,15 @@ pub fn handle_agent_bus_request(
                         },
                         None => payload,
                     };
-                    if let Some(refusal) = agent_launch_policy_refusal(&invocation, &payload) {
+                    let waiter = approval_waiter(&request, stream, &invocation);
+                    // Q21: the owner approved this launch while the call held.
+                    let mut approval_note = None;
+                    if let Some(refusal) = agent_launch_policy_refusal(
+                        &invocation,
+                        &payload,
+                        waiter.as_ref(),
+                        &mut approval_note,
+                    ) {
                         return write_json_response(
                             stream,
                             200,
@@ -798,8 +807,19 @@ pub fn handle_agent_bus_request(
                             &serde_json::to_value(refusal)?,
                         );
                     }
+                    // Only façades whose result parser takes the note get it
+                    // (older ones refuse unknown fields on a receipt).
+                    let approval_note = approval_note.filter(|_| {
+                        crate::approvals::facade_takes_approval_note(
+                            request
+                                .headers
+                                .get(crate::asks::tools::FACADE_HEADER)
+                                .map(String::as_str),
+                        )
+                    });
                     let Some(sparse_sha256) = sparse_sha256 else {
-                        let response = (handlers.agent_management)(state, invocation, payload)?;
+                        let mut response = (handlers.agent_management)(state, invocation, payload)?;
+                        attach_launch_approval_note(&mut response, approval_note);
                         return write_json_response(stream, 200, "OK", &response);
                     };
                     let full_sha256 = crate::agent_management::full_sha256(&payload);
@@ -833,6 +853,7 @@ pub fn handle_agent_bus_request(
                             *digest = serde_json::Value::String(sparse_sha256.as_str().to_string());
                         }
                     }
+                    attach_launch_approval_note(&mut response, approval_note);
                     return write_json_response(stream, 200, "OK", &response);
                 }
                 Err(_) => {
@@ -1205,9 +1226,24 @@ fn bounded_detail(mut detail: String) -> String {
 /// the owner marked as needing approval waits for that approval. Returns the
 /// no-write response to answer instead of executing. Exact replays of an
 /// admitted action and Human-reviewed bootstrap intents keep their admission.
+/// A complete Agent Management result after an approval-wait carries the
+/// approved-after-wait note (Q21), so the agent knows the owner reviewed
+/// the launch and does not retry it. Failed / refused results do not.
+fn attach_launch_approval_note(response: &mut serde_json::Value, note: Option<serde_json::Value>) {
+    if let Some(note) = note {
+        if response.pointer("/outcome/status").and_then(serde_json::Value::as_str) == Some("complete") {
+            crate::approvals::attach_approval_note(response, note);
+        }
+    }
+}
+
+/// `approval_note` receives the approved-after-wait note when the owner
+/// approved the launch while this call held for the decision.
 fn agent_launch_policy_refusal(
     invocation: &AgentManagementInvocation,
     request: &AgentManagementRequest,
+    waiter: Option<&crate::approvals::Waiter>,
+    approval_note: &mut Option<serde_json::Value>,
 ) -> Option<AgentManagementResponse> {
     use crate::agent_management::envelope::{
         clamp_or_refuse, requested_from_spec, PermissionEnvelope, PermissionExceedsCreator,
@@ -1300,7 +1336,8 @@ fn agent_launch_policy_refusal(
         "operation": request.operation,
     }));
     let gate = crate::approvals::ApprovalStore::open_default().and_then(|store| {
-        store.gate(
+        crate::approvals::gate_with_wait(
+            &store,
             crate::approvals::ApprovalRequest {
                 kind: crate::approvals::ApprovalKind::AgentProfile,
                 reason: "profile_requires_approval".into(),
@@ -1325,19 +1362,17 @@ fn agent_launch_policy_refusal(
                 }),
                 request_sha256: digest,
             },
-            chrono::Utc::now(),
+            waiter,
+            |record| crate::management::v2::approvals::publish_changed(record, "requested"),
+            crate::management::v2::approvals::queue_decision_notice,
         )
     });
     match gate {
-        Ok(crate::approvals::GateOutcome::Approved(_)) => None,
+        Ok(outcome @ crate::approvals::GateOutcome::Approved(_)) => {
+            *approval_note = outcome.approved_after_wait();
+            None
+        }
         Ok(outcome) => {
-            if let crate::approvals::GateOutcome::Pending {
-                record,
-                created: true,
-            } = &outcome
-            {
-                crate::management::v2::approvals::publish_changed(record, "requested");
-            }
             let refusal = outcome.refusal().unwrap_or_default();
             no_write(
                 refusal["code"].as_str().unwrap_or("approval_required"),
@@ -1353,6 +1388,77 @@ fn agent_launch_policy_refusal(
             "owner approval state is unavailable; nothing was created".into(),
         ),
     }
+}
+
+/// The hold an MCP call asked for (approval-wait: header
+/// [`crate::approvals::APPROVAL_WAIT_HEADER`], sent only by façades cutex
+/// opted in), bound to this connection and the caller's current runtime.
+/// `None` answers `approval_required` at once, as before.
+fn approval_waiter(
+    request: &crate::agent_bus::agent_auth::BusRequest,
+    stream: &TcpStream,
+    invocation: &AgentManagementInvocation,
+) -> Option<crate::approvals::Waiter> {
+    use crate::agent_bus::mcp::{GENERATION_HEADER, THREAD_HEADER};
+    let secs = crate::approvals::parse_wait_secs(
+        request
+            .headers
+            .get(crate::approvals::APPROVAL_WAIT_HEADER)
+            .map(String::as_str),
+    )?;
+    let thread = request.headers.get(THREAD_HEADER)?.clone();
+    let generation: u64 = request.headers.get(GENERATION_HEADER)?.parse().ok()?;
+    let turn = request
+        .headers
+        .get(crate::approvals::TURN_HEADER)
+        .map(|turn| turn.trim().to_string())
+        .filter(|turn| {
+            !turn.is_empty() && turn.len() <= 200 && !turn.chars().any(char::is_control)
+        });
+    let peer = stream.try_clone().ok()?;
+    let session = invocation.caller_cutex_session.as_str().to_string();
+    let runtime = invocation.caller_runtime_agent_id.clone();
+    let fence_thread = thread.clone();
+    Some(crate::approvals::Waiter::new(
+        secs,
+        Some(thread),
+        turn,
+        move || connection_open(&peer),
+        move || caller_still_current(&session, &runtime, generation, &fence_thread),
+    ))
+}
+
+/// The client still waits for the answer: it sent its whole request and
+/// reads, so a readable end of stream (or an error) means it went away.
+fn connection_open(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut byte = [0_u8; 1];
+    let open = match stream.peek(&mut byte) {
+        Ok(0) => false,
+        Ok(_) => true,
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ),
+    };
+    let _ = stream.set_nonblocking(false);
+    open
+}
+
+/// The runtime that asked is still the session's current one (same runtime
+/// id, generation and thread; not retired). Checked once, before a holding
+/// call uses an approval.
+fn caller_still_current(session: &str, runtime: &str, generation: u64, thread: &str) -> bool {
+    load_cutex_session_store_shared().is_ok_and(|store| {
+        store.sessions.get(session).is_some_and(|record| {
+            record.runtime_generation == generation
+                && record.current_runtime_agent_id.as_deref() == Some(runtime)
+                && record.app_server_thread_id() == Some(thread)
+                && !record.is_retired()
+        })
+    })
 }
 
 /// Stand-in for a sparse request until it is resolved: carries its action and
@@ -1680,6 +1786,46 @@ fn agent_is_registered(state: &Arc<Mutex<AgentBusState>>, agent_id: &str) -> any
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn launch_results_carry_the_approved_after_wait_note_only_when_complete() {
+        let note = serde_json::json!({"decision":"approved","waitedSecs":3,"approvalId":"a",
+            "detail":"The owner approved this request after 3 s; it has been carried out."});
+        let mut complete = serde_json::json!({"schema":"s","action_id":"x","outcome":{"status":"complete","receipt":{}}});
+        attach_launch_approval_note(&mut complete, Some(note.clone()));
+        assert_eq!(complete["approval"], note);
+        assert_eq!(complete["detail"], note["detail"]);
+        let mut refused = serde_json::json!({"schema":"s","action_id":"x","outcome":{"status":"no_write","code":"c","detail":"d"}});
+        let before = refused.clone();
+        attach_launch_approval_note(&mut refused, Some(note));
+        assert_eq!(refused, before);
+        let mut plain = before.clone();
+        attach_launch_approval_note(&mut plain, None);
+        assert_eq!(plain, before);
+    }
+
+    #[test]
+    fn approval_hold_notices_a_caller_that_went_away() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client.write_all(b"x").unwrap();
+        // Unread request bytes still mean "waiting"; so does nothing to read.
+        assert!(super::connection_open(&server));
+        let mut byte = [0_u8; 1];
+        std::io::Read::read_exact(&mut &server, &mut byte).unwrap();
+        assert!(super::connection_open(&server));
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while super::connection_open(&server) {
+            assert!(Instant::now() < deadline, "close never seen");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The socket is blocking again for the answer.
+        let mut server = server;
+        assert!(server.write_all(b"").is_ok());
+    }
 
     #[test]
     fn registration_refresh_redrive_is_rate_limited_but_new_registrations_are_not() {

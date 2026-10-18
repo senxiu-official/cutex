@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-10-11",
+  "updatedAt": "2026-10-18",
   "sourceUrls": [
     "https://code.claude.com/docs/en/model-config",
     "https://platform.claude.com/docs/en/about-claude/model-deprecations",
@@ -20,6 +20,7 @@
         "xhigh",
         "max"
       ],
+      "contextWindow": 1000000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -35,6 +36,7 @@
         "xhigh",
         "max"
       ],
+      "contextWindow": 1000000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -50,6 +52,7 @@
         "xhigh",
         "max"
       ],
+      "contextWindow": 1000000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -65,6 +68,7 @@
         "xhigh",
         "max"
       ],
+      "contextWindow": 1000000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -80,6 +84,7 @@
         "xhigh",
         "max"
       ],
+      "contextWindow": 1000000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -95,6 +100,7 @@
         "xhigh",
         "max"
       ],
+      "contextWindow": 1000000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -110,6 +116,7 @@
         "xhigh",
         "max"
       ],
+      "contextWindow": 1000000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -125,6 +132,7 @@
         "xhigh",
         "max"
       ],
+      "contextWindow": 1000000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -140,6 +148,7 @@
         "xhigh",
         "max"
       ],
+      "contextWindow": 1000000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -154,6 +163,7 @@
         "high",
         "max"
       ],
+      "contextWindow": 200000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -168,6 +178,7 @@
         "high",
         "max"
       ],
+      "contextWindow": 200000,
       "description": "Fixed model ID; account availability unknown."
     },
     {
@@ -177,6 +188,7 @@
       "kind": "pinned",
       "minCliVersion": null,
       "supportedEffortLevels": [],
+      "contextWindow": 200000,
       "description": "Fixed dated model ID; account availability unknown."
     },
     {
@@ -186,6 +198,7 @@
       "kind": "pinned",
       "minCliVersion": null,
       "supportedEffortLevels": [],
+      "contextWindow": 200000,
       "description": "Fixed dated model ID; account availability unknown."
     },
     {
@@ -195,6 +208,7 @@
       "kind": "pinned",
       "minCliVersion": null,
       "supportedEffortLevels": [],
+      "contextWindow": 200000,
       "description": "Fixed dated model ID; account availability unknown. Anthropic API retirement scheduled for 2026-11-30."
     },
     {
@@ -204,6 +218,7 @@
       "kind": "alias",
       "minCliVersion": null,
       "supportedEffortLevels": null,
+      "contextWindow": null,
       "description": "Dynamic alias; target depends on CLI, provider and configuration. Account availability unknown."
     },
     {
@@ -213,6 +228,7 @@
       "kind": "alias",
       "minCliVersion": null,
       "supportedEffortLevels": null,
+      "contextWindow": null,
       "description": "Dynamic alias; target depends on CLI, provider and configuration. Account availability unknown."
     },
     {
@@ -222,6 +238,7 @@
       "kind": "alias",
       "minCliVersion": null,
       "supportedEffortLevels": null,
+      "contextWindow": null,
       "description": "Dynamic alias; target depends on CLI, provider and configuration. Account availability unknown."
     },
     {
@@ -231,6 +248,7 @@
       "kind": "alias",
       "minCliVersion": null,
       "supportedEffortLevels": null,
+      "contextWindow": null,
       "description": "Dynamic alias; target depends on CLI, provider and configuration. Account availability unknown."
     },
     {
@@ -240,6 +258,7 @@
       "kind": "alias",
       "minCliVersion": null,
       "supportedEffortLevels": null,
+      "contextWindow": null,
       "description": "Dynamic Fable or Opus selection; account availability unknown."
     },
     {
@@ -249,6 +268,7 @@
       "kind": "alias",
       "minCliVersion": null,
       "supportedEffortLevels": null,
+      "contextWindow": null,
       "description": "Opus during planning, Sonnet for execution; account availability unknown."
     },
     {
@@ -258,6 +278,7 @@
       "kind": "alias",
       "minCliVersion": null,
       "supportedEffortLevels": null,
+      "contextWindow": 1000000,
       "description": "Sonnet alias with extended context where applicable; account availability unknown."
     },
     {
@@ -267,6 +288,7 @@
       "kind": "alias",
       "minCliVersion": null,
       "supportedEffortLevels": null,
+      "contextWindow": 1000000,
       "description": "Opus alias with extended context where applicable; account availability unknown."
     },
     {
@@ -276,7 +298,8 @@
       "family": null,
       "kind": "default",
       "minCliVersion": null,
-      "supportedEffortLevels": null
+      "supportedEffortLevels": null,
+      "contextWindow": null
     }
   ]
 }

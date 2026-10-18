@@ -145,6 +145,9 @@ fn managed_status_with_staged_release_matches_the_schema() {
     assert_eq!(status["staged"]["release"], "r240");
     assert_eq!(status["available"]["mode"], "full");
     assert!(status["staging"].is_null());
+    // upgrade-installed-notes: the installed release's own manifest notes.
+    assert_eq!(status["installed"]["notes"], json!({ "en": "r239 notes" }));
+    assert_eq!(status["installed"]["publishedAt"], "2026-10-20T03:00:00Z");
     assert_valid("upgradeStatus", &status);
     // A failed background stage is visible in the status (not only in events).
     set_staging(&layout, json!({

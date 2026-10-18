@@ -220,8 +220,15 @@ fn save_cutex_session_record_to_path(
                     || other.codex_session_id != replacement.codex_session_id,
                 "native session was concurrently bound to another record"
             );
+            // Names are unique among live records only: an archived
+            // (retired) Agent keeps its name for history, and the name may
+            // be reused once it is archived (r244: recreating a closed
+            // Agent's name failed here after the native thread existed).
+            // Restoring an archived record checks the name again.
             anyhow::ensure!(
                 replacement.formal_agent_name.is_none()
+                    || replacement.is_retired()
+                    || other.is_retired()
                     || other.formal_agent_name != replacement.formal_agent_name,
                 "agent name was concurrently assigned to another record"
             );
@@ -615,6 +622,40 @@ mod tests {
         assert!(current.sessions.contains_key("cutex.other"));
         assert!(current.sessions.contains_key("cutex.new"));
         assert!(save_cutex_session_record_to_path(&path, &before, &prepared, "cutex.new").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_archived_agents_name_may_be_reused_but_a_live_one_may_not() {
+        // r244: `agent_create` of a closed Agent's name created the native
+        // thread, then adoption failed here with `agent name was
+        // concurrently assigned to another record` (outcome unknown), which
+        // left the name reserved.
+        let root =
+            std::env::temp_dir().join(format!("cutex-record-name-{}", uuid::Uuid::new_v4()));
+        let path = root.join("cutex-sessions.json");
+        let mut initial = CutexSessionStore::default();
+        let mut archived = record("old");
+        archived.formal_agent_name = Some("r244-jia".into());
+        archived.archive_state = crate::session::model::CutexSessionArchiveState::Retired;
+        archived.retired_at = Some("2026-10-18T00:00:00Z".into());
+        initial.sessions.insert("cutex.old".into(), archived);
+        save_cutex_session_store_to_path(&path, &initial).unwrap();
+        let before = load_cutex_session_store_from_path(&path).unwrap();
+        let mut prepared = before.clone();
+        let mut successor = record("new");
+        successor.formal_agent_name = Some("r244-jia".into());
+        prepared.sessions.insert("cutex.new".into(), successor.clone());
+        save_cutex_session_record_to_path(&path, &before, &prepared, "cutex.new").unwrap();
+        // A second live record with the same name is still refused.
+        let before = load_cutex_session_store_from_path(&path).unwrap();
+        let mut prepared = before.clone();
+        let mut duplicate = record("dup");
+        duplicate.formal_agent_name = Some("r244-jia".into());
+        prepared.sessions.insert("cutex.dup".into(), duplicate);
+        let error = save_cutex_session_record_to_path(&path, &before, &prepared, "cutex.dup")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("agent name was concurrently assigned"));
         fs::remove_dir_all(root).unwrap();
     }
 

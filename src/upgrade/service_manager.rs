@@ -1,8 +1,8 @@
 //! Which service manager runs this daemon (`/v2/host` `serviceManager`).
 //!
-//! - `CUTEX_SERVICE_MANAGER` (set by the units `cutex service install`
-//!   writes and by the `cutex service run` supervisor): `systemd` |
-//!   `cutex-supervisor`;
+//! - `CUTEX_SERVICE_MANAGER` (set by the units / launchd agents `cutex
+//!   service install` writes and by the `cutex service run` supervisor):
+//!   `systemd` | `launchd` | `cutex-supervisor`;
 //! - else Linux: the process runs in a `.service` cgroup (the owner hosts'
 //!   hand-written units), the unit comes from `/proc/self/cgroup`
 //!   (`INVOCATION_ID` alone is inherited by hand-started processes);
@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 pub const SERVICE_MANAGER_ENV: &str = "CUTEX_SERVICE_MANAGER";
 pub const SYSTEMD: &str = "systemd";
 pub const SUPERVISOR: &str = "cutex-supervisor";
+/// macOS per-user launchd agents (`super::launchd`).
+pub const LAUNCHD: &str = "launchd";
 pub const RUNTIME_HOST: &str = "runtime-host";
 pub const NONE: &str = "none";
 
@@ -36,6 +38,7 @@ fn detect_with(env: Option<&str>, invocation_id: bool, unit: Option<String>, run
     match env.map(str::trim) {
         Some(SYSTEMD) => return Detected { kind: SYSTEMD, unit },
         Some(SUPERVISOR) => return Detected { kind: SUPERVISOR, unit: None },
+        Some(LAUNCHD) => return Detected { kind: LAUNCHD, unit: launchd_label() },
         _ => {}
     }
     // `INVOCATION_ID` alone is not enough: it is inherited by everything a
@@ -72,6 +75,12 @@ pub(crate) fn parse_cgroup_unit(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// launchd sets `XPC_SERVICE_NAME` to the job label for the processes it
+/// starts.
+fn launchd_label() -> Option<String> {
+    std::env::var("XPC_SERVICE_NAME").ok().filter(|label| label.starts_with(super::launchd::LABEL_PREFIX))
+}
+
 fn runtime_host_published() -> bool {
     if !cfg!(windows) {
         return false;
@@ -98,6 +107,7 @@ mod tests {
 
     #[test]
     fn explicit_environment_wins() {
+        assert_eq!(detect_with(Some("launchd"), false, None, false).kind, LAUNCHD);
         assert_eq!(detect_with(Some("systemd"), false, None, true).kind, SYSTEMD);
         assert_eq!(detect_with(Some("cutex-supervisor"), true, Some("x.service".into()), true).kind, SUPERVISOR);
     }

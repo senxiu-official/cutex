@@ -665,7 +665,7 @@ pub fn status_view(layout: &Layout) -> Value {
         "base": layout.base.display().to_string(),
         "serviceManager": super::service_manager::detect().kind,
         "build": crate::build_info::build_json(),
-        "installed": state.installed.clone().unwrap_or_else(|| stage::installed(layout)),
+        "installed": state.installed.clone().map_or_else(|| stage::installed(layout), |i| stage::with_manifest_details(layout, i)),
         "previousRelease": record.as_ref().and_then(|r| r.previous_release.clone()),
         "installedReleases": layout.installed_releases(),
         "lastCheckAt": state.last_check_at,

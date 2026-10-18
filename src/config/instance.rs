@@ -213,6 +213,82 @@ pub fn is_isolated() -> bool {
     !matches!(selected(), Ok(Selection::Default))
 }
 
+// Test port guard (2026-10-18: `cutex run --agent` from an integration test
+// normalized the fixture's bus to 24260, then probed / handed off the owner's
+// live bus, or spawned a detached `agent serve --port 24260`). Every process
+// the test-home guard covers (`paths::real_home_forbidden()`: cargo test
+// harnesses, debug `cutex` with `CUTEX_TEST_FORBID_REAL_HOME`) and every debug
+// process on a `CUTEX_TEST_PRIVATE_HOME` uses instance port rules: a default
+// port is never resolved, accepted, connected to, bound or handed off.
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static DEFAULT_PORTS_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests of the default-instance port rules only: lift the test port guard
+/// on this thread while `f` runs (nothing in `f` may connect or bind).
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn with_default_ports_for_test<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DEFAULT_PORTS_ALLOWED.with(|allowed| allowed.set(self.0));
+        }
+    }
+    let _reset = Reset(DEFAULT_PORTS_ALLOWED.with(|allowed| allowed.replace(true)));
+    f()
+}
+
+/// True when this process must never use a default-instance port (see the
+/// test port guard above). Always false in a release `cutex`.
+pub fn default_ports_forbidden() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        if DEFAULT_PORTS_ALLOWED.with(std::cell::Cell::get) {
+            return false;
+        }
+        if std::env::var_os("CUTEX_TEST_PRIVATE_HOME").is_some_and(|value| !value.is_empty()) {
+            return true;
+        }
+    }
+    crate::config::paths::real_home_forbidden()
+}
+
+/// Instance port rules apply: an independent instance, or a test process.
+pub fn uses_isolated_ports() -> bool {
+    is_isolated() || default_ports_forbidden()
+}
+
+/// Last line of defence before a connect / bind / handoff: a test process
+/// never reaches a default-instance port, on any host.
+pub fn ensure_port_allowed(port: u16) -> std::io::Result<()> {
+    if RESERVED_DEFAULT_PORTS.contains(&port) && default_ports_forbidden() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing port {port} of the default cutex instance from a test process (give the test home its own ports)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A free loopback port for a test home's own bus (never a default port).
+pub fn allocate_isolated_port() -> anyhow::Result<u16> {
+    for _ in 0..16 {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|listener| listener.local_addr())
+            .context("Failed to allocate a free loopback port")?
+            .port();
+        if validate_isolated_port(port, "port").is_ok() {
+            return Ok(port);
+        }
+    }
+    bail!("Failed to allocate a free loopback port outside the default cutex ports")
+}
+
 pub fn valid_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     !bytes.is_empty()
@@ -830,12 +906,70 @@ mod tests {
         inside.check_instance_paths().unwrap();
 
         set_test_selection(Selection::Default);
-        // The default instance is unchanged.
-        assert_eq!(crate::agent_bus::service::agent_bus_port(&CodezConfig::default()), 24260);
-        assert_eq!(crate::management::service::management_port(&CodezConfig::default()), 24270);
-        crate::agent_bus::service::validate_agent_bus_port(24260).unwrap();
-        assert!(crate::agent_bus::service::validate_agent_bus_port(25260).is_err());
+        // The default instance is unchanged (outside the test port guard).
+        with_default_ports_for_test(|| {
+            assert_eq!(crate::agent_bus::service::agent_bus_port(&CodezConfig::default()), 24260);
+            assert_eq!(crate::management::service::management_port(&CodezConfig::default()), 24270);
+            crate::agent_bus::service::validate_agent_bus_port(24260).unwrap();
+            assert!(crate::agent_bus::service::validate_agent_bus_port(25260).is_err());
+        });
         outside.check_instance_paths().unwrap();
+    }
+
+    #[test]
+    fn test_processes_never_resolve_accept_or_reach_default_ports() {
+        // A unit test is a test process: the guard is on without any env.
+        assert!(default_ports_forbidden());
+        assert!(uses_isolated_ports());
+        assert!(!is_isolated());
+
+        // Resolution: no fallback to, and no stored, default port.
+        assert_eq!(crate::agent_bus::service::agent_bus_port(&CodezConfig::default()), 0);
+        assert_eq!(crate::management::service::management_port(&CodezConfig::default()), 0);
+        let stored_defaults = CodezConfig {
+            agent_bus_port: Some(24260),
+            management_port: Some(24270),
+            ..CodezConfig::default()
+        };
+        assert_eq!(crate::agent_bus::service::agent_bus_port(&stored_defaults), 0);
+        assert_eq!(crate::management::service::management_port(&stored_defaults), 0);
+        let own = CodezConfig {
+            agent_bus_port: Some(41260),
+            management_port: Some(41270),
+            ..CodezConfig::default()
+        };
+        assert_eq!(crate::agent_bus::service::agent_bus_port(&own), 41260);
+        assert_eq!(crate::management::service::management_port(&own), 41270);
+
+        // Validation: instance rules (serve / remote-up / settings refuse them).
+        for port in RESERVED_DEFAULT_PORTS {
+            assert!(crate::agent_bus::service::validate_agent_bus_port(port).is_err());
+            assert!(crate::management::service::validate_management_port(port).is_err());
+            assert!(ensure_port_allowed(port).is_err());
+        }
+        crate::agent_bus::service::validate_agent_bus_port(41260).unwrap();
+        crate::management::service::validate_management_port(41270).unwrap();
+        ensure_port_allowed(41260).unwrap();
+
+        // Connects fail before any socket is opened.
+        assert!(!crate::http::client::http_local_root_status_ok(24260, None, std::time::Duration::from_millis(50)));
+        assert!(!crate::http::client::http_base_url_root_status_ok("http://127.0.0.1:24270/", std::time::Duration::from_millis(50)));
+        let refused = crate::http::client::connect_local_port(24260, std::time::Duration::from_millis(50)).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!crate::agent_bus::client::agent_bus_healthy(24260, None));
+        assert!(!crate::management::remote::management_api_healthy(24270, None));
+        let error = crate::management::remote::management_http_json("http://100.64.0.1:24270", "GET", "/", None, None).unwrap_err();
+        assert!(format!("{error:#}").contains("default cutex instance"), "{error:#}");
+
+        // A test home's own bus port: free, never a default one.
+        let port = allocate_isolated_port().unwrap();
+        assert!(validate_isolated_port(port, "port").is_ok());
+
+        // The lift is per thread and scoped.
+        with_default_ports_for_test(|| assert!(!default_ports_forbidden()));
+        assert!(default_ports_forbidden());
+        std::thread::spawn(|| with_default_ports_for_test(|| ())).join().unwrap();
+        assert!(default_ports_forbidden());
     }
 
     #[cfg(unix)]

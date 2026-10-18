@@ -358,10 +358,10 @@ async def test_sdk_public_driver_option_wiring_and_same_task_ownership(sh, monke
     assert o.tools == {'type':'preset','preset':'claude_code'} and o.allowed_tools == ['mcp__cutex__read_file','mcp__cutex__list_directory'] and o.strict_mcp_config
     assert o.permission_mode == 'bypassPermissions'
     assert o.extra_args == {'allow-dangerously-skip-permissions':None, 'replay-user-messages':None}
-    assert o.enable_file_checkpointing is False and o.forward_subagent_text is False
+    assert o.enable_file_checkpointing is False and o.forward_subagent_text is True  # subagent_transcripts
     assert o.setting_sources == [] and o.plugins == [] and not o.continue_conversation
     # Claude Code's preset prompt; the host note (no --system-append-file) is appended.
-    assert o.system_prompt == {'type': 'preset', 'preset': 'claude_code', 'append': sh.engine.settings.system}
+    assert o.system_prompt == {'type': 'preset', 'preset': 'claude_code', 'append': sh.engine.settings.preset_append('')}
     assert o.session_id and o.resume is None
     assert o.env['CLAUDE_CODE_MAX_RETRIES'] == '0'
     assert o.env['CLAUDE_CONFIG_DIR'] == str(tmp_path/'account')
@@ -373,14 +373,62 @@ async def test_sdk_public_driver_option_wiring_and_same_task_ownership(sh, monke
 
 
 def test_preset_append_uses_the_launch_file_text_and_thread_instructions(tmp_path):
-    base = Settings(tmp_path, tmp_path / 'state', model='sonnet', mock=False, backend='subscription')
-    assert base.preset_append('') == base.system.strip()
-    assert base.preset_append('Be terse.') == base.system.strip() + '\n\nBe terse.'
-    cutex = Settings(tmp_path, tmp_path / 'state', model='sonnet', mock=False, backend='subscription',
+    from cute_claude.config import RUNTIME_LIMITS
+    base = Settings(tmp_path, tmp_path / 'state', model='sonnet', mock=False, backend='subscription', allow_exec=True)
+    assert base.preset_append('') == base.system.strip() + '\n\n' + RUNTIME_LIMITS
+    assert base.preset_append('Be terse.') == base.system.strip() + '\n\n' + RUNTIME_LIMITS + '\n\nBe terse.'
+    cutex = Settings(tmp_path, tmp_path / 'state', model='sonnet', mock=False, backend='subscription', allow_exec=True,
                      system_append='# Cutex\n\nYou are a persistent agent managed by cutex.\n')
-    assert cutex.preset_append('') == '# Cutex\n\nYou are a persistent agent managed by cutex.'
-    assert cutex.preset_append('Role.') == '# Cutex\n\nYou are a persistent agent managed by cutex.\n\nRole.'
-    assert Settings(tmp_path, tmp_path, system_append='').preset_append('x') == 'x'
+    head = '# Cutex\n\nYou are a persistent agent managed by cutex.\n\n' + RUNTIME_LIMITS
+    assert cutex.preset_append('') == head
+    assert cutex.preset_append('Role.') == head + '\n\nRole.'
+    assert Settings(tmp_path, tmp_path, system_append='', allow_exec=True).preset_append('x') == RUNTIME_LIMITS + '\n\nx'
+
+
+def test_preset_append_tells_the_model_the_runtime_limits(tmp_path):
+    # Owner notes (claude-r16): background subagents were refused without warning, and a turn
+    # woken by a finished background shell command could not use tools.
+    text = Settings(tmp_path, tmp_path / 'state', mock=False, backend='subscription').preset_append('')
+    assert 'background subagents' in text and 'run_in_background' in text and 'foreground' in text
+    assert 'background shell command finishes' in text and 'cannot use tools' in text
+
+
+def test_preset_append_says_auto_mode_does_not_decide_cutex_approvals(tmp_path):
+    # Q21: Claude's auto mode only covers Claude Code's own tool permissions.
+    from cute_claude.config import AUTO_MODE_LIMIT
+    settings = Settings(tmp_path, tmp_path / 'state', mock=False, backend='subscription', allow_exec=True)
+    auto = settings.preset_append('Role.', 'auto')
+    assert AUTO_MODE_LIMIT in auto and auto.endswith('\n\nRole.')
+    assert "only covers Claude Code's own tool permissions" in auto and 'cutex approvals' in auto
+    assert 'managed services' in auto and 'delegation reviews' in auto and 'browser grants' in auto
+    assert 'go to the owner' in auto
+    for mode in (None, 'default', 'acceptEdits', 'bypassPermissions', 'plan'):
+        assert AUTO_MODE_LIMIT not in settings.preset_append('Role.', mode)
+
+
+async def test_auto_mode_thread_gets_the_cutex_approvals_note(sh, monkeypatch, tmp_path):
+    from cute_claude.config import AUTO_MODE_LIMIT
+    from fake_sdk import install_fake_sdk
+    driver, sdk, logins = install_fake_sdk(monkeypatch, tmp_path)
+    sh.engine.driver = sh.engine.provider = driver
+    tid = await sh.thread()
+    await sh.server.approvals.configure(tid, 'auto')
+    turn = await sh.turn(tid, 'TOOL:read_file')
+    await sh.drain()
+    assert sh.store.turn(turn)['status'] == 'completed'
+    append = sdk.clients[0].options.system_prompt['append']
+    assert append == sh.engine.settings.preset_append('', 'auto') and AUTO_MODE_LIMIT in append
+
+
+def test_preset_append_says_shell_tools_are_off_without_command_execution(tmp_path):
+    # r243 acceptance: Claude Code's environment block still named "Shell: PowerShell (primary); Bash tool
+    # also available" with command execution off.
+    off = Settings(tmp_path, tmp_path / 'state', mock=False, backend='subscription').preset_append('')
+    assert 'Command execution is off' in off and 'no Bash or PowerShell tool' in off and 'hooks do not run' in off
+    on = Settings(tmp_path, tmp_path / 'state', mock=False, backend='subscription', allow_exec=True).preset_append('')
+    assert 'Command execution is off' not in on
+    from cute_claude.native_tools import exclusions
+    assert {'Bash', 'PowerShell'} <= set(exclusions(Settings(tmp_path, tmp_path / 'state')))
 
 
 def test_system_append_file_requires_the_subscription_backend(tmp_path):
@@ -504,7 +552,7 @@ async def test_api_account_key_reaches_only_the_official_runtime_env(sh, monkeyp
     o = sdk.clients[0].options
     assert 'ANTHROPIC_API_KEY' not in o.env and 'ANTHROPIC_AUTH_TOKEN' not in o.env
     assert 'sk-test-only' not in json.dumps(o.env)
-    assert json.loads(o.settings) == account.cli_settings()
+    assert json.loads(o.settings) == {**account.cli_settings(), 'disableAllHooks': True}
     assert o.env['ANTHROPIC_BASE_URL'] == 'https://api.deepseek.com/anthropic'
     assert o.env['ANTHROPIC_DEFAULT_SONNET_MODEL'] == 'deepseek-v4-pro'
     assert o.env['CLAUDE_CODE_MAX_RETRIES'] == '3'
@@ -584,3 +632,25 @@ async def test_fresh_user_turn_after_failure_precedes_queued_input_without_repla
     assert [r['turn_id'] for r in sh.provider.requests]==[old,new,queued['turnId']]
     assert sh.store.turn(new)['status']=='completed'
     assert not sh.store.thread(tid)['halted']
+
+
+async def test_final_answer_phase_reaches_live_subscribers(sh):
+    tid = await sh.thread()
+    turn = await sh.turn(tid, 'answer me')
+    await sh.drain()
+    live = [m['params']['item'] for m in sh.out if m.get('method') == 'item/completed'
+            and m['params'].get('turnId') == turn and m['params']['item']['type'] == 'agentMessage']
+    saved = [i for i in sh.store.items(turn) if i['type'] == 'agentMessage']
+    assert live[-1] == saved[-1] and saved[-1]['phase'] == 'final_answer'
+    assert [i['phase'] for i in live].count('final_answer') == 1
+
+
+def test_claude_codes_synthetic_placeholder_is_never_an_agent_message():
+    # r243 acceptance: after "[Request interrupted by user]" a resumed session got Claude Code's own
+    # "No response requested." (model "<synthetic>") in its native transcript.
+    from cute_claude.subscription import synthetic_placeholder
+    text = lambda t: {'type': 'text', 'text': t}
+    assert synthetic_placeholder({'type': 'assistant', 'model': '<synthetic>', 'content': [text('No response requested.')]})
+    assert not synthetic_placeholder({'type': 'assistant', 'model': 'claude-opus-5-5', 'content': [text('No response requested.')]})
+    assert not synthetic_placeholder({'type': 'assistant', 'model': '<synthetic>', 'content': [text('API Error: overloaded')]})
+    assert not synthetic_placeholder({'type': 'assistant', 'model': '<synthetic>', 'content': []})

@@ -30,8 +30,10 @@ checks the files of, hashes and selects it.
 What it does (nothing here touches a real cutex home, the real service names or the real signing key):
 
 1. A throwaway minisign key. Release archives of both builds (ustar .tar.gz, cutex + cutex-mcp at the
-   root, BUILD-INFO with the build's `--version` line and capability list as build-cutex.sh writes them),
-   a STUB native (codex-app-server / codex-code-mode-host / codex / schema files that are never executed:
+   root, BUILD-INFO with the build's `--version` line and capability list as build-cutex.sh writes them;
+   the new release's archive, and the `stub` new native, also carry LICENSE / NOTICE /
+   THIRD_PARTY_NOTICES.md at the root as the real builds do: the installed updater must unpack them
+   next to the executables), a STUB native (codex-app-server / codex-code-mode-host / codex / schema files that are never executed:
    cutex only hashes and selects them) and a broken release (below). Manifests: 0.1.0 with sequence 1
    in the published 0.1.0 shape, native included (the generator refuses sequence 1); 0.1.1 and the
    broken release with the real generator and the REAL release's arguments, as sign-and-upload.sh runs
@@ -201,11 +203,25 @@ def cutex_build(out: Path, label: str, commit: str, line: str, caps: list[str], 
     return archive
 
 
-def native_build(out: Path, version: str = NATIVE_VERSION) -> Path:
+NOTICE_FILES = ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md")
+
+
+def notice_files(directory: Path) -> dict[str, Path]:
+    """Stand-ins for the license files build-cutex.sh / build-natives.sh put next to the executables. The
+    FROM build's updater must stage an archive that carries them."""
+    directory.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for name in NOTICE_FILES:
+        (directory / name).write_text(f"upgrade e2e stand-in for {name}\n", encoding="utf-8")
+        files[name] = directory / name
+    return files
+
+
+def native_build(out: Path, version: str = NATIVE_VERSION, notices: bool = False) -> Path:
     """A stub native: the updater stages, hashes and selects these files; nothing executes them here."""
     stubs = out / "files"
     stubs.mkdir(parents=True)
-    files = {}
+    files = notice_files(stubs) if notices else {}
     for name in (f"codex-app-server{EXE}", f"codex-code-mode-host{EXE}", f"codex{EXE}"):
         (stubs / name).write_text(f"#!/bin/sh\n# cutex upgrade e2e stub {name} {version}: never run\nexit 1\n", encoding="utf-8")
         files[name] = stubs / name
@@ -227,7 +243,7 @@ def new_native_build(spec: str, out: Path) -> tuple[Path, str] | None:
     if spec == "none":
         return None
     if spec == "stub":
-        return native_build(out, NEW_NATIVE_STUB), NEW_NATIVE_STUB
+        return native_build(out, NEW_NATIVE_STUB, notices=True), NEW_NATIVE_STUB
     given = Path(spec)
     archives = sorted(given.glob(f"native-*-{PLATFORM}.tar.gz"))
     if len(archives) != 1:
@@ -881,6 +897,8 @@ def upgrade_to_011(host: Host, url: str, to_label: str, to_commit: str, from_lab
     check(staged.get("preflightOk", staged.get("preflight_ok")) is True, f"preflight ok ({checks})")
     for name in ("integrity", "version", "selftest", "rollbackTarget"):
         check(checks.get(name) is True, f"preflight check {name} passed")
+    for name in NOTICE_FILES:
+        check((host.base / "releases" / to_label / name).is_file(), f"releases/{to_label}/{name} unpacked next to the executables")
     natives = sorted(p.name for p in (host.base / "natives").iterdir())
     if new_native:
         check(checks.get("native") is True, f"preflight check native passed (natives/{new_native} complete)")
@@ -889,6 +907,9 @@ def upgrade_to_011(host: Host, url: str, to_label: str, to_commit: str, from_lab
         staged_dir = host.base / "natives" / new_native
         for name in (f"codex-app-server{EXE}", f"codex-code-mode-host{EXE}", "codex_app_server_protocol.schemas.json"):
             check((staged_dir / name).is_file(), f"natives/{new_native}/{name} unpacked")
+        if new_native == NEW_NATIVE_STUB:
+            for name in NOTICE_FILES:
+                check((staged_dir / name).is_file(), f"natives/{new_native}/{name} unpacked next to the executables")
         selected = host.selected_runtime()
         check(same_path(selected.get("bundle_manifest"), host.base / "releases" / from_label / "manifests" / "default.json"),
               f"staging selects nothing yet: new agents still use releases/{from_label}/manifests/default.json")
@@ -1066,7 +1087,8 @@ def build_release(args: argparse.Namespace, work: Path, key, generator: Path) ->
         return {f"cutex{EXE}": d / f"cutex{EXE}", f"cutex-mcp{EXE}": d / f"cutex-mcp{EXE}"}
 
     from_archive = cutex_build(rel / "b-from", from_label, args.from_commit, from_line, from_caps, pair(args.from_cutex))
-    cutex_build(rel / "b-to", to_label, args.to_commit, to_line, to_caps, pair(args.to_cutex))
+    # The new release's archive carries the license files as the real build does (extra files at the root).
+    cutex_build(rel / "b-to", to_label, args.to_commit, to_line, to_caps, {**pair(args.to_cutex), **notice_files(rel / "b-notices")})
     native = native_build(rel / "b-native")
     brought = new_native_build(args.new_native, rel / "b-new-native")
     new_native = brought[1] if brought else None

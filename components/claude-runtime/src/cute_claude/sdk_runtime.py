@@ -127,7 +127,38 @@ class NativeSessionLease:
                 return f'{times[0].dwHighDateTime}:{times[0].dwLowDateTime}'
             finally:
                 kernel.CloseHandle(handle)
-        raise ProviderError('Native process occurrence checking requires Linux or Windows.')
+        if sys.platform == 'darwin':
+            # libproc PROC_PIDTBSDINFO: struct proc_bsdinfo (136 bytes); the
+            # occurrence is pid + start time (seconds:microseconds since epoch).
+            import ctypes
+            import errno
+
+            class BsdInfo(ctypes.Structure):
+                _fields_ = [('flags', ctypes.c_uint32), ('status', ctypes.c_uint32),
+                            ('xstatus', ctypes.c_uint32), ('pid', ctypes.c_uint32),
+                            ('ppid', ctypes.c_uint32), ('ids', ctypes.c_uint32 * 6),
+                            ('rfu', ctypes.c_uint32), ('comm', ctypes.c_char * 16),
+                            ('name', ctypes.c_char * 32), ('nfiles', ctypes.c_uint32),
+                            ('pgid', ctypes.c_uint32), ('pjobc', ctypes.c_uint32),
+                            ('tdev', ctypes.c_uint32), ('tpgid', ctypes.c_uint32),
+                            ('nice', ctypes.c_int32), ('start_sec', ctypes.c_uint64),
+                            ('start_usec', ctypes.c_uint64)]
+
+            libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+            libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                             ctypes.c_void_p, ctypes.c_int]
+            libproc.proc_pidinfo.restype = ctypes.c_int
+            info = BsdInfo()
+            size = ctypes.sizeof(info)
+            got = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+            if got != size:
+                if ctypes.get_errno() == errno.ESRCH:
+                    return None
+                raise ProviderError('Cannot inspect the prior native process occurrence.')
+            if info.status == 5:  # SZOMB
+                return None
+            return f'{info.start_sec}:{info.start_usec}'
+        raise ProviderError('Native process occurrence checking requires Linux, macOS or Windows.')
 
     def record_process(self, pid: int) -> None:
         stamp = self.process_stamp(pid)
@@ -167,6 +198,7 @@ class Control:
     effort: str | None = None
     permission_mode: str | None = None
     arguments: dict | None = None
+    fast: bool | None = None
 
 
 @dataclass
@@ -272,7 +304,7 @@ class RuntimeOwner:
         return await asyncio.wait_for(future, timeout=4)
 
     async def control(self, kind: str, **arguments):
-        if kind not in {'mcp_status', 'mcp_reconnect', 'mcp_toggle', 'task_list', 'task_stop', 'rewind_files'}:
+        if kind not in {'mcp_status', 'mcp_reconnect', 'mcp_toggle', 'task_list', 'task_stop', 'rewind_files', 'flag_settings'}:
             raise ProviderError('Unknown native runtime control operation')
         await asyncio.shield(self.ready)
         if not self.accepting or self.task.done():
@@ -300,13 +332,13 @@ class RuntimeOwner:
         await self.mailbox.put(Control('model', future, model=model))
         await asyncio.shield(future)
 
-    async def set_model_effort(self, model: str, effort: str | None) -> None:
+    async def set_model_effort(self, model: str, effort: str | None, fast: bool | None = None) -> None:
         await asyncio.shield(self.ready)
         if not self.accepting or self.task.done():
             raise ProviderError('Runtime is offline; start it before changing effort')
         future = asyncio.get_running_loop().create_future()
         future.add_done_callback(self._observe)
-        await self.mailbox.put(Control('model_effort', future, model=model, effort=effort))
+        await self.mailbox.put(Control('model_effort', future, model=model, effort=effort, fast=fast))
         await asyncio.shield(future)
 
     async def interrupt(self, turn_id: str) -> None:
@@ -356,6 +388,9 @@ class RuntimeOwner:
         # Subagent text and reasoning must never become the parent's reply.
         # Native hooks still enforce the same tool/permission policy for children.
         if field(message, 'parent_tool_use_id'):
+            subagents = getattr(self.engine, 'subagents', None)
+            if subagents is not None:
+                await subagents.observe(message)
             return
         if typ in {'SystemMessage', 'system'} and field(message, 'subtype') == 'init':
             names = field(message, 'data', {}).get('tools')
@@ -441,7 +476,7 @@ class RuntimeOwner:
             except BaseException as exc:
                 raise OutcomeUncertain(str(safe_error(exc, 'query'))) from None
             return True
-        if command.kind in {'mcp_status', 'mcp_reconnect', 'mcp_toggle', 'task_list', 'task_stop', 'rewind_files'}:
+        if command.kind in {'mcp_status', 'mcp_reconnect', 'mcp_toggle', 'task_list', 'task_stop', 'rewind_files', 'flag_settings'}:
             args = command.arguments or {}
             try:
                 if command.kind in {'mcp_reconnect', 'mcp_toggle', 'rewind_files'} and (
@@ -457,6 +492,12 @@ class RuntimeOwner:
                             result = await self.client.reconnect_mcp_server(args['server_name'])
                         elif command.kind == 'mcp_toggle':
                             result = await self.client.toggle_mcp_server(args['server_name'], args['enabled'])
+                        elif command.kind == 'flag_settings':
+                            # Claude Code's `apply_flag_settings` control request (persistent
+                            # allow rules changed in cutex). Python 0.2.166 has no public wrapper;
+                            # a runtime that refuses it applies the rules at its next start.
+                            result = await self.client._query._send_control_request(
+                                {'subtype': 'apply_flag_settings', 'settings': args['settings']})
                         elif command.kind == 'task_stop':
                             self.tasks.require_running(args['task_id'])
                             result = await self.client.stop_task(args['task_id'])
@@ -505,7 +546,10 @@ class RuntimeOwner:
                         queued.append(item)
                 for item in queued:
                     self.mailbox.put_nowait(item)
-                self.engine.save_model_effort(self.tid, command.model, command.effort)
+                if command.fast is None:
+                    self.engine.save_model_effort(self.tid, command.model, command.effort)
+                else:
+                    self.engine.save_model_effort(self.tid, command.model, command.effort, command.fast)
                 session = self.engine.session(self.tid)
                 self.resume = bool(session['attempted'])
                 self.client, self.bridge = await self.driver.make_client(self.engine, self.tid, self.session_id, self.resume)
@@ -527,8 +571,10 @@ class RuntimeOwner:
                 raise OutcomeUncertain(str(error)) from None
             return True
         if command.kind == 'permissions':
-            if self.active or not self.accepting:
-                command.future.set_exception(ProviderError('Finish or interrupt the turn before changing permissions'))
+            # Also while a turn runs (Claude Code's shift+tab): the control
+            # request is answered by the live native session.
+            if not self.accepting:
+                command.future.set_exception(ProviderError('Runtime is offline; start it before changing permissions'))
                 return True
             try:
                 async with asyncio.timeout(self.driver.control_timeout):

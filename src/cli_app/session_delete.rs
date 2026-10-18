@@ -98,13 +98,13 @@ fn rollout_shows_turns(rollout: &Path) -> bool {
     })
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn isolated_endpoint(record: &CutexSessionRecord) -> anyhow::Result<cutex::catalog::OwnedStdioEndpoint> {
     let home = super::session_history::native_home_for(Some(record))?;
     super::session_history::isolated_endpoint(Some(record), &home)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn isolated_endpoint(_: &CutexSessionRecord) -> anyhow::Result<cutex::catalog::OwnedStdioEndpoint> {
     anyhow::bail!("a local native runtime requires Linux or Windows")
 }
@@ -865,6 +865,7 @@ mod tests {
             allow_exec: false, write_explicit: false, exec_explicit: false,
             native_session_id: None,
             connection_id: None,
+            initial_permission_mode: None,
         });
         assert_eq!(not_empty_reason(&record), Some("unsupported"));
     }

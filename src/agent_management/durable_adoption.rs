@@ -506,7 +506,7 @@ mod tests {
     /// deployment against the *default* profile (record.profile was still
     /// unset), so an explicit profile failed without `default_profile` and was
     /// checked against the wrong account otherwise.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn c019_adoption_validates_the_requested_profile_not_the_default() {
         const CHILD: &str = "CUTEX_ADOPTION_PROFILE_TEST_CHILD";

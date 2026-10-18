@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Build the cutex release archive of one platform:
 #
-#   cutex-<release>-<platform>.tar.gz   cutex[.exe] and cutex-mcp[.exe] at the archive root
+#   cutex-<release>-<platform>.tar.gz   cutex[.exe] and cutex-mcp[.exe] at the archive root, with
+#                                       LICENSE, NOTICE and THIRD_PARTY_NOTICES.md next to them
 #
 # This is the archive a cutex release manifest names under `cutex.artifacts.<platform>` and that
 # `cutex upgrade stage` unpacks into `releases/<release>/` (src/upgrade/stage.rs: ustar, files only, no
-# directories or links). The binaries carry the release identity (src/build_info.rs): `cutex --version`
+# directories or links; it unpacks every file and needs only the two executables, so the notice files
+# land next to them in releases/<release>/ on every cutex since 0.1.0). The binaries carry the release identity (src/build_info.rs): `cutex --version`
 # prints `<version> (<release>, <commit7>)` and the channel is `release`.
 #
 #   bash .github/ci/build-cutex.sh <platform> <release> <out-dir>
@@ -87,6 +89,18 @@ stage="$build_root/cutex-stage-$platform"
 rm -rf "${stage:?}"
 mkdir -p "$stage"
 cp "$src/target/release/cutex$exe" "$src/target/release/cutex-mcp$exe" "$stage/"
+if [ "$platform" = windows-x64 ]; then py=python; else py=python3; fi
+# License files: the project's LICENSE and NOTICE, and the notices of every third-party crate compiled
+# into the binaries (from Cargo.lock and the downloaded crate sources; no network, deterministic).
+for f in LICENSE NOTICE; do
+  [ -f "$src/$f" ] || { echo "the checkout has no $f" >&2; exit 1; }
+  cp "$src/$f" "$stage/$f"
+done
+"$py" "$root/.github/ci/third_party_notices.py" --manifest-path "$(winpath "$src/Cargo.toml")" --target "$target" \
+  --toolchain "$toolchain" --package cutex --title "cutex: third-party notices" \
+  --intro "The cutex and cutex-mcp executables in this archive are licensed under the Apache License 2.0 (LICENSE; attributions in NOTICE) and are built from the third-party Rust crates below." \
+  --out "$(winpath "$stage/THIRD_PARTY_NOTICES.md")"
+chmod 0644 "$stage/LICENSE" "$stage/NOTICE" "$stage/THIRD_PARTY_NOTICES.md"
 line="$("$stage/cutex$exe" --version)"
 case "$line" in
   *"($release, ${commit:0:7})"*) echo "$line" ;;
@@ -97,7 +111,6 @@ esac
 # host-dependent ones such as job-external are absent here). upgrade-manifest.py diffs it against the
 # previous release's: a capability the previous release advertised must be in capabilities.removed,
 # or cutex's post-update verification rolls the update back.
-if [ "$platform" = windows-x64 ]; then py=python; else py=python3; fi
 schema_dir="$build_root/cutex-schema-$platform"
 rm -rf "${schema_dir:?}" "${build_root:?}/cutex-schema-home-$platform"
 mkdir -p "$build_root/cutex-schema-home-$platform"
@@ -123,7 +136,7 @@ if [ "$leaks" = 1 ] && [ "${LEAK_POLICY:-fail}" = fail ]; then
 fi
 
 name="cutex-$release-$platform.tar.gz"
-tar -C "$stage" --format=ustar --owner=0 --group=0 --numeric-owner --mtime="@$mtime" -cf - "cutex$exe" "cutex-mcp$exe" | gzip -n -9 > "$out/$name"
+tar -C "$stage" --format=ustar --owner=0 --group=0 --numeric-owner --mtime="@$mtime" -cf - "cutex$exe" "cutex-mcp$exe" LICENSE NOTICE THIRD_PARTY_NOTICES.md | gzip -n -9 > "$out/$name"
 rustc_version="$(rustc "+$toolchain" --version)"
 cat > "$out/BUILD-INFO-$platform.json" <<EOF
 {

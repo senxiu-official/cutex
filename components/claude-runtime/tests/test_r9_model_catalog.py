@@ -240,3 +240,49 @@ async def test_non_sdk_extensions_fail_typed_and_native_picker_stays_small(h):
         assert error["code"] == -32601 and error["data"]["feature"] == feature
     models = (await h.call("model/list"))["data"]
     assert len(models) == 1 and models[0]["id"] == h.settings.model
+
+
+def test_reference_context_windows_are_nominal_registry_values():
+    rows = {row["id"]: row for row in reference_catalog()["models"]}
+    for model, row in rows.items():
+        if row["kind"] == "pinned":
+            assert row["contextWindow"] in (200_000, 1_000_000), model
+    assert rows["claude-opus-5-5"]["contextWindow"] == 1_000_000
+    assert rows["claude-opus-4-6"]["contextWindow"] == 200_000
+    # Plain aliases resolve per account; only the explicit 1M aliases are known.
+    assert rows["sonnet"]["contextWindow"] is None and rows["default"]["contextWindow"] is None
+    assert rows["sonnet[1m]"]["contextWindow"] == rows["opus[1m]"]["contextWindow"] == 1_000_000
+
+
+@pytest.mark.parametrize("window", [0, -1, "1000000", 1.5, True, 100_000_001])
+def test_reference_rejects_invalid_context_window(tmp_path, monkeypatch, window):
+    import json
+    import cute_claude.model_catalog as catalog
+    data = json.loads(catalog.REFERENCE_PATH.read_text())
+    data["models"][0]["contextWindow"] = window
+    path = tmp_path / "model_catalog.json"
+    path.write_text(json.dumps(data))
+    monkeypatch.setattr(catalog, "REFERENCE_PATH", path)
+    with pytest.raises(ValueError):
+        catalog.reference_catalog()
+
+
+async def test_effort_change_accepts_reference_levels_the_picker_advertises(ph, monkeypatch):
+    # Pinned IDs are not in the SDK handshake; model/list offers their reference
+    # levels, so thread/settings/update must accept the same levels (owner report
+    # 2026-10-18: "This model does not advertise the selected effort").
+    tid = await ph.thread()
+    await ph.call("claude/runtime/start", {"threadId": tid})
+    monkeypatch.setattr(ph.server.model_catalog.probe, "read", AsyncMock(return_value="2.1.299"))
+    listed = {row["id"]: [x["reasoningEffort"] for x in row["supportedReasoningEfforts"]]
+              for row in (await ph.call("model/list"))["data"]}
+    assert "xhigh" in listed["claude-opus-4-8"]
+    await ph.call("thread/settings/update", {"threadId": tid, "model": "claude-opus-4-8", "effort": "xhigh"})
+    assert ph.engine.runtime_status(tid)["effort"] == "xhigh"
+    assert "xhigh" not in listed["claude-opus-4-6"]
+    error = await ph.call("thread/settings/update", {"threadId": tid, "model": "claude-opus-4-6", "effort": "xhigh"}, error=True)
+    assert error["code"] == -32602 and "offered: low, medium, high, max" in error["message"]
+    assert listed["claude-haiku-4-5-20251001"] == []
+    error = await ph.call("thread/settings/update", {"threadId": tid, "model": "claude-haiku-4-5-20251001", "effort": "high"}, error=True)
+    assert "offers no effort levels" in error["message"]
+    assert ph.engine.runtime_status(tid)["effort"] == "xhigh"

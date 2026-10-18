@@ -128,10 +128,15 @@ pub fn agent_turn_questions(account: &StoredAccount) -> Option<AgentTurnQuestion
         .then(|| account.options.agent_turn_questions.unwrap_or_default())
 }
 
-/// Native file snapshots are opt-in for Claude; Codex profiles do not use it.
+/// Claude Code file checkpointing when the profile sets nothing: on since
+/// 2026-10-17 (owner decision Q8), so "also rewind files" on a history revert
+/// works for most sessions. Snapshots live in the account's Claude home.
+pub const DEFAULT_CLAUDE_FILE_CHECKPOINTING: bool = true;
+
+/// Native file snapshots for Claude (default on); Codex profiles do not use it.
 pub fn claude_file_checkpointing(account: &StoredAccount) -> Option<bool> {
     (account.cli_kind == CliKind::Claude)
-        .then(|| account.options.claude_file_checkpointing.unwrap_or(false))
+        .then(|| account.options.claude_file_checkpointing.unwrap_or(DEFAULT_CLAUDE_FILE_CHECKPOINTING))
 }
 
 /// Whether agents need the owner's approval to launch agents on this profile.
@@ -315,6 +320,10 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
             "effectiveColor": effective_style.fg,
             "providerCategory": crate::profiles::provider_category::manual(account).map(|category| category.key()),
             "effectiveProviderCategory": effective_category,
+            // profile-avatar: null = the client's default by model family.
+            "avatarThemes": account.options.avatar_themes,
+            // profile-avatar: null = the client's provider greetings.
+            "introGreeting": account.options.intro_greeting,
         },
         "quotaEnabled": account.options.quota.enabled,
         "allowSessionSwitch": allow_session_switch(account),
@@ -332,6 +341,12 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
         "agentUseRequiresApproval": agent_use_requires_approval(account),
         "agentTurnQuestions": agent_turn_questions(account).map(AgentTurnQuestions::as_str),
         "claudeFileCheckpointing": claude_file_checkpointing(account),
+        // claude-code-sources: Claude Code settings sources new launches
+        // read (project / user = the account home) and claude.ai connectors;
+        // null on Codex profiles.
+        "claudeSettingSources": crate::profiles::claude_code::setting_sources(account)
+            .map(|sources| crate::profiles::claude_code::names(&sources)),
+        "claudeAiConnectors": crate::profiles::claude_code::claude_ai_connectors(account),
         // Claude only: whether new sessions get the file-editing tools
         // (Write/Edit/...) and Bash. Existing sessions keep their own copy.
         "claudeAllowWrite": (!codex).then_some(account.options.claude.write()),
@@ -348,6 +363,10 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
         // for that entry (display only; ids stay what is selected and sent).
         "modelDisplayNames": account.model_display_names,
     });
+    // claude-launch-permission-mode: the Claude Code permission modes a new
+    // agent of this profile can start in (`launch.claudePermissionMode`),
+    // from the selected Claude runtime; [] = none offered, null on Codex.
+    item["claudeLaunchPermissionModes"] = json!((!codex).then(crate::runtime::claude::launch_permission_modes));
     if detail {
         let config_provider = snapshot.as_ref().and_then(|s| s.model_provider.as_deref());
         let custom_provider = config_provider.is_some_and(|provider| !is_builtin_model_provider(provider));
@@ -377,7 +396,7 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
             "agentTurnQuestionsDefault": (!codex).then_some(AgentTurnQuestions::default().as_str()),
             "agentTurnQuestionsOptions": AgentTurnQuestions::ALL.map(AgentTurnQuestions::as_str),
             "claudeFileCheckpointingExplicit": account.options.claude_file_checkpointing,
-            "claudeFileCheckpointingDefault": (!codex).then_some(false),
+            "claudeFileCheckpointingDefault": (!codex).then_some(DEFAULT_CLAUDE_FILE_CHECKPOINTING),
             "providerCategoryOptions": crate::profiles::provider_category::ProviderCategory::ALL.map(|category| category.key()),
             "catalogEditable": crate::profiles::catalog_api::catalog_supported(account),
             "editable": {
@@ -413,7 +432,24 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
         // recursion limit).
         item["detail"]["editable"]["searchTool"] = json!(search_tool_supported(account));
         item["detail"]["editable"]["privateChatgptAuthFile"] = json!(codex);
+        // profile-avatar.
+        item["detail"]["editable"]["avatarThemes"] = json!(true);
+        item["detail"]["editable"]["introGreeting"] = json!(true);
+        item["detail"]["avatarThemeOptions"] = json!(crate::profiles::avatar::AVATAR_THEMES);
         item["detail"]["editable"]["toolSchemaCompat"] = json!(codex);
+        // claude-code-sources: stored choice (null = the default) and options.
+        item["detail"]["editable"]["claudeSettingSources"] = json!(!codex);
+        item["detail"]["editable"]["claudeAiConnectors"] = json!(!codex);
+        item["detail"]["claudeSettingSourcesExplicit"] = json!(account
+            .claude_code
+            .setting_sources
+            .as_deref()
+            .map(crate::profiles::claude_code::parse_stored)
+            .map(|sources| crate::profiles::claude_code::names(&sources)));
+        item["detail"]["claudeSettingSourcesDefault"] = json!((!codex)
+            .then(|| crate::profiles::claude_code::names(crate::profiles::claude_code::DEFAULT_SETTING_SOURCES)));
+        item["detail"]["claudeSettingSourcesOptions"] =
+            json!(crate::profiles::claude_code::names(&crate::profiles::claude_code::SettingSource::ALL));
         // Claude write / exec rules: explicit value (null = unset) and the
         // default unset means (on; Codex profiles: null).
         let default = (!codex).then_some(crate::profiles::appearance::CLAUDE_TOOLS_DEFAULT);
@@ -430,6 +466,7 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
             json!((!codex).then(|| new_session_model_override(config, account)).flatten());
         item["detail"]["claudeBuiltinDefaultModel"] = json!((!codex).then(claude_builtin_default_model));
     }
+    item["proxy"] = crate::config::proxy_outbound::profile_proxy_view(account, config);
     item
 }
 
@@ -449,12 +486,19 @@ pub struct ProfileApiPatch {
     pub color: ConfigValueUpdate<String>,
     /// `Clear` returns to the inferred category.
     pub provider_category: ConfigValueUpdate<crate::profiles::provider_category::ProviderCategory>,
+    /// profile-avatar: validated, canonical, non-empty theme ids; `Clear`
+    /// returns to the client's default by model family.
+    pub avatar_themes: ConfigValueUpdate<Vec<String>>,
+    /// profile-avatar: normalized greeting; `Clear` (or "") removes it.
+    pub intro_greeting: ConfigValueUpdate<String>,
     pub allow_session_switch: ConfigValueUpdate<bool>,
     /// `Clear` restores the native default (enabled).
     pub native_subagents: ConfigValueUpdate<bool>,
     /// `Clear` restores the per-runtime default.
     pub delegation_wait: ConfigValueUpdate<bool>,
     pub browser_tools: Option<bool>,
+    /// `profile-proxy`: partial `{mode: inherit|none|manual, url?, noProxy?}`; new runtimes only.
+    pub proxy: Option<crate::config::proxy::ProxyUpdate>,
     /// Codex API-key profiles only (`search_tool_supported`).
     pub search_tool: Option<bool>,
     /// Codex profiles only (`profile-generic-switches`).
@@ -464,6 +508,10 @@ pub struct ProfileApiPatch {
     pub agent_turn_questions: ConfigValueUpdate<AgentTurnQuestions>,
     /// Claude profiles only; effective on the next runtime launch. Clear = off.
     pub claude_file_checkpointing: ConfigValueUpdate<bool>,
+    /// Claude profiles only (`claude-code-sources`); next runtime launch.
+    /// `Clear` restores the default (none).
+    pub claude_setting_sources: ConfigValueUpdate<Vec<crate::profiles::claude_code::SettingSource>>,
+    pub claude_ai_connectors: Option<bool>,
     /// Claude profiles only: tools of sessions created from now on.
     pub claude_allow_write: ConfigValueUpdate<bool>,
     pub claude_allow_exec: ConfigValueUpdate<bool>,
@@ -582,6 +630,23 @@ fn apply_store_options(account: &mut StoredAccount, patch: &ProfileApiPatch) -> 
         }
         ConfigValueUpdate::Clear => crate::profiles::provider_category::set_manual(account, None),
     }
+    match &patch.avatar_themes {
+        ConfigValueUpdate::Unchanged => {}
+        ConfigValueUpdate::Set(themes) => {
+            let themes = crate::profiles::avatar::normalize_avatar_themes(themes)
+                .map_err(|message| anyhow::anyhow!("avatarThemes: {message}"))?;
+            account.options.avatar_themes = Some(themes);
+        }
+        ConfigValueUpdate::Clear => account.options.avatar_themes = None,
+    }
+    match &patch.intro_greeting {
+        ConfigValueUpdate::Unchanged => {}
+        ConfigValueUpdate::Set(text) => {
+            account.options.intro_greeting = crate::profiles::avatar::normalize_intro_greeting(text)
+                .map_err(|message| anyhow::anyhow!("introGreeting: {message}"))?;
+        }
+        ConfigValueUpdate::Clear => account.options.intro_greeting = None,
+    }
     match patch.allow_session_switch {
         ConfigValueUpdate::Unchanged => {}
         ConfigValueUpdate::Set(value) => account.options.allow_session_switch = Some(value),
@@ -605,6 +670,9 @@ fn apply_store_options(account: &mut StoredAccount, patch: &ProfileApiPatch) -> 
         account.options.agent_use_requires_approval = required;
     }
     if let Some(enabled) = patch.browser_tools { account.browser_tools = enabled; }
+    if let Some(update) = &patch.proxy {
+        account.proxy = crate::config::proxy::apply_proxy_update(account.proxy.as_ref(), &update.0, "inherit")?;
+    }
     if let Some(enabled) = patch.search_tool {
         anyhow::ensure!(
             !enabled || search_tool_supported(account),
@@ -631,6 +699,20 @@ fn apply_store_options(account: &mut StoredAccount, patch: &ProfileApiPatch) -> 
         }
         ConfigValueUpdate::Set(value) => account.options.claude_file_checkpointing = Some(value),
         ConfigValueUpdate::Clear => account.options.claude_file_checkpointing = None,
+    }
+    match &patch.claude_setting_sources {
+        ConfigValueUpdate::Unchanged => {}
+        ConfigValueUpdate::Set(_) | ConfigValueUpdate::Clear if codex => {
+            anyhow::bail!("claudeSettingSources applies to Claude profiles only")
+        }
+        ConfigValueUpdate::Set(sources) => {
+            account.claude_code.setting_sources = Some(crate::profiles::claude_code::store_names(sources))
+        }
+        ConfigValueUpdate::Clear => account.claude_code.setting_sources = None,
+    }
+    if let Some(enabled) = patch.claude_ai_connectors {
+        anyhow::ensure!(!enabled || !codex, "claudeAiConnectors applies to Claude profiles only");
+        account.claude_code.claude_ai_connectors = enabled;
     }
     for (update, field) in [
         (&patch.claude_allow_write, &mut account.options.claude.allow_write),
@@ -690,8 +772,10 @@ fn store_fields_changed(account: &StoredAccount, original: &StoredAccount) -> bo
         || account.claude_account != original.claude_account
         || account.model_display_names != original.model_display_names
         || account.browser_tools != original.browser_tools
+        || account.proxy != original.proxy
         || account.search_tool != original.search_tool
         || account.private_chatgpt_auth_file != original.private_chatgpt_auth_file
+        || account.claude_code != original.claude_code
 }
 
 /// Apply a validated patch to the stored profile and its materialized files.
@@ -942,6 +1026,7 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            claude_code: Default::default(),
             id: format!("settings-api-test-{}", uuid::Uuid::new_v4()),
             name: "alpha".into(),
             email: Some("owner-private@example.com".into()),
@@ -954,7 +1039,6 @@ mod tests {
                 enabled: true,
                 url: Some("http://bob:proxy-secret@127.0.0.1:1".into()),
                 no_proxy: None,
-                force_http_transport: true,
             }),
             session: None,
             cli_kind,
@@ -989,6 +1073,47 @@ mod tests {
             let legacy = (account.cli_kind == CliKind::Codex).then_some("pro");
             assert_eq!(item["planLabel"], json!(legacy));
         }
+    }
+
+    #[test]
+    fn profile_proxy_view_and_patch() {
+        let config = CodezConfig::default();
+        let mut account = account(CliKind::Claude, "official");
+        let item = profile_item(&account, &config, false);
+        assert_eq!(item["proxy"]["mode"], "manual");
+        assert_eq!(item["proxy"]["url"], "http://127.0.0.1:1/");
+        assert_eq!(item["proxy"]["urlHasCredentials"], true);
+        assert_eq!(item["proxy"]["effective"]["mode"], "manual");
+        assert_eq!(item["proxy"]["effective"]["source"], "manual");
+        let patch = |body: Value| ProfileApiPatch {
+            proxy: Some(crate::config::proxy::ProxyUpdate(body.as_object().unwrap().clone())),
+            ..ProfileApiPatch::default()
+        };
+        // Omitted URL keeps the stored one (with its credentials).
+        apply_store_options(&mut account, &patch(json!({"noProxy": "corp.example"}))).unwrap();
+        assert_eq!(account.proxy.as_ref().unwrap().url.as_deref(), Some("http://bob:proxy-secret@127.0.0.1:1"));
+        apply_store_options(&mut account, &patch(json!({"mode": "none"}))).unwrap();
+        assert_eq!(profile_item(&account, &config, false)["proxy"]["mode"], "none");
+        assert_eq!(profile_item(&account, &config, false)["proxy"]["effective"]["mode"], "none");
+        // Off keeps the manual address (unused while off); manual restores it.
+        assert_eq!(profile_item(&account, &config, false)["proxy"]["url"], "http://127.0.0.1:1/");
+        assert!(crate::config::proxy::native_proxy_envs(&account, &config)
+            .iter()
+            .all(|(key, value)| key.eq_ignore_ascii_case("no_proxy") || value.is_empty()));
+        apply_store_options(&mut account, &patch(json!({"mode": "manual"}))).unwrap();
+        assert_eq!(account.proxy.as_ref().unwrap().url.as_deref(), Some("http://bob:proxy-secret@127.0.0.1:1"));
+        assert_eq!(account.proxy.as_ref().unwrap().no_proxy.as_deref(), Some("corp.example"));
+        assert_eq!(profile_item(&account, &config, false)["proxy"]["effective"]["mode"], "manual");
+        apply_store_options(&mut account, &patch(json!({"mode": "none"}))).unwrap();
+        apply_store_options(&mut account, &patch(json!({"mode": "inherit"}))).unwrap();
+        assert!(account.proxy.is_none());
+        assert_eq!(profile_item(&account, &config, false)["proxy"]["mode"], "inherit");
+        assert!(apply_store_options(&mut account, &patch(json!({"mode": "system"}))).is_err());
+        assert!(apply_store_options(&mut account, &patch(json!({"mode": "manual"}))).is_err());
+        let original = account.clone();
+        apply_store_options(&mut account, &patch(json!({"mode": "manual", "url": "http://proxy.example:3128"}))).unwrap();
+        assert!(store_fields_changed(&account, &original));
+        assert!(!format!("{:?}", patch(json!({"url": "http://u:pw@h:1"}))).contains("pw"));
     }
 
     #[test]
@@ -1138,13 +1263,55 @@ mod tests {
     }
 
     #[test]
-    fn file_checkpointing_is_opt_in_and_claude_only() {
+    fn claude_code_sources_default_off_for_existing_profiles_and_patchable() {
+        use crate::profiles::claude_code::SettingSource;
         let mut claude = account(CliKind::Claude, "official");
-        assert_eq!(claude_file_checkpointing(&claude), Some(false));
+        let item = profile_item(&claude, &CodezConfig::default(), true);
+        assert_eq!(item["claudeSettingSources"], json!([]));
+        assert_eq!(item["claudeAiConnectors"], false);
+        assert_eq!(item["detail"]["claudeSettingSourcesExplicit"], Value::Null);
+        assert_eq!(item["detail"]["claudeSettingSourcesDefault"], json!([]));
+        assert_eq!(item["detail"]["claudeSettingSourcesOptions"], json!(["project", "user"]));
+        assert_eq!(item["detail"]["editable"]["claudeSettingSources"], true);
+        let patch = ProfileApiPatch {
+            claude_setting_sources: ConfigValueUpdate::Set(vec![SettingSource::User, SettingSource::Project]),
+            claude_ai_connectors: Some(true),
+            ..ProfileApiPatch::default()
+        };
+        let original = claude.clone();
+        apply_store_options(&mut claude, &patch).unwrap();
+        assert!(store_fields_changed(&claude, &original));
+        let raw = serde_json::to_value(&claude).unwrap();
+        assert_eq!(raw["claude_code"], json!({"setting_sources": ["project", "user"], "claude_ai_connectors": true}));
+        assert!(raw["options"].get("claude_code").is_none(), "top level, never in deny_unknown_fields options");
+        let item = profile_item(&claude, &CodezConfig::default(), false);
+        assert_eq!(item["claudeSettingSources"], json!(["project", "user"]));
+        assert_eq!(item["claudeAiConnectors"], true);
+        apply_store_options(&mut claude, &ProfileApiPatch {
+            claude_setting_sources: ConfigValueUpdate::Clear,
+            claude_ai_connectors: Some(false),
+            ..ProfileApiPatch::default()
+        }).unwrap();
+        assert!(serde_json::to_value(&claude).unwrap().get("claude_code").is_none());
+        // New Claude profiles read the project settings.
+        let fresh = crate::profiles::lifecycle::new_claude_account("fresh");
+        assert_eq!(crate::profiles::claude_code::setting_sources(&fresh), Some(vec![SettingSource::Project]));
+        let mut codex = account(CliKind::Codex, "api-key");
+        let item = profile_item(&codex, &CodezConfig::default(), true);
+        assert_eq!(item["claudeSettingSources"], Value::Null);
+        assert_eq!(item["detail"]["editable"]["claudeSettingSources"], false);
+        assert!(apply_store_options(&mut codex, &patch).is_err());
+        assert!(crate::profiles::claude_code::ClaudeCodeOptions::for_new_profile(&CliKind::Codex).is_empty());
+    }
+
+    #[test]
+    fn file_checkpointing_defaults_on_and_is_claude_only() {
+        let mut claude = account(CliKind::Claude, "official");
+        assert_eq!(claude_file_checkpointing(&claude), Some(true));
         let detail = profile_item(&claude, &CodezConfig::default(), true);
-        assert_eq!(detail["claudeFileCheckpointing"], false);
+        assert_eq!(detail["claudeFileCheckpointing"], true);
         assert_eq!(detail["detail"]["claudeFileCheckpointingExplicit"], Value::Null);
-        assert_eq!(detail["detail"]["claudeFileCheckpointingDefault"], false);
+        assert_eq!(detail["detail"]["claudeFileCheckpointingDefault"], true);
         assert_eq!(detail["detail"]["editable"]["claudeFileCheckpointing"], true);
         for value in [true, false] {
             let patch = ProfileApiPatch {
@@ -1167,7 +1334,7 @@ mod tests {
             ..ProfileApiPatch::default()
         };
         apply_store_options(&mut claude, &clear).unwrap();
-        assert_eq!(claude_file_checkpointing(&claude), Some(false));
+        assert_eq!(claude_file_checkpointing(&claude), Some(true));
         assert!(serde_json::to_value(&claude.options).unwrap().get("claude_file_checkpointing").is_none());
         let mut codex = account(CliKind::Codex, "api-key");
         let detail = profile_item(&codex, &CodezConfig::default(), true);

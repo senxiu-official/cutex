@@ -221,6 +221,36 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // GET /v2/approvals, POST /v2/approvals/{id}/approve|deny and the
     // cutex/approvals/changed host event.
     ("owner-approvals", "ownerApprovals"),
+    // 2026-10-17: Management serve watches the approval store, so approvals
+    // requested by the Agent Bus (services, agent profiles) and consumed by a
+    // retried call reach the host stream live as cutex/approvals/changed
+    // (reasons requested | approved | denied | consumed | expired).
+    ("approvals-live", "approvalsLive"),
+    // 2026-10-17: after the owner approves / denies a request the agent must
+    // retry itself (managed_service, service_lifetime, agent_profile,
+    // browser_open), the requester gets a short cutex message (alarm
+    // scheduler, owner "cutex.approvals", after_turn) saying to retry now /
+    // not to retry. The tool still answers approval_required until approved.
+    ("approval-decision-notice", "approvalDecisionNotice"),
+    // 2026-10-17: a gated service / agent launch holds the agent's tool call
+    // up to 120 s for the owner (opted-in façades: Codex launches, Claude
+    // adapters declaring features.approvalWait). Approve → the call proceeds
+    // (no retry, no notice); deny → denied; timeout → approval_required as
+    // before. While a call holds, the record carries `wait {until, end}` and
+    // cutex/approvals/changed reports `waiting` / `wait_ended`.
+    ("approval-wait", "approvalWait"),
+    // 2026-10-18: a decided approval records `decidedBy {by: owner,
+    // connection, peer?, client?}`; POST approve|deny accepts `client {app,
+    // version, device, surface, input}` (unverified client facts) and logs a
+    // `cutex-approval-decided` line (r243 acceptance: an untraceable denial).
+    ("approval-decided-by", "approvalDecidedBy"),
+    // 2026-10-18: session resources (GET /v2/sessions items, retired ones
+    // included) carry runtime.pendingServerRequests [{id, method}]: native
+    // server requests of the current runtime generation still unanswered
+    // (recorded from serverRequest, cleared by serverRequest/resolved, the
+    // end of their turn or a disconnect), so a client connecting later sees
+    // them. The full messages stay in the session bootstrap.
+    ("session-pending-server-requests", "sessionPendingServerRequests"),
     // Profile nativeSubagents (Codex) in /v2/profiles detail + PATCH.
     ("profile-native-subagents", "profileNativeSubagents"),
     // Profile agentUseRequiresApproval: agents launching agents on it wait
@@ -779,6 +809,10 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // `previousNativeVersion` and `runtimeChange` (`native` | `package` |
     // `none`), recorded when the run is prepared; null on older records.
     ("upgrade-run-native", "upgradeRunNative"),
+    // GET /v2/upgrade `installed` carries `notes` ({en, zh-CN, …} as in the
+    // release manifest) and `publishedAt`, read from the installed release's
+    // committed manifest; null when unknown (no manifest, older layouts).
+    ("upgrade-installed-notes", "upgradeInstalledNotes"),
     // Optional components (components/README.md, components_api.rs):
     // owner-only GET /v2/components, POST /v2/components/{name}/install|remove
     // (empty body, 202 {operation}); host event cutex/components/updated;
@@ -915,6 +949,11 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // new owner approval, only while the opener lease is active for that agent
     // on the same device connection; it inherits the opener lease's origin.
     ("browser-popup-grant", "browserPopupGrant"),
+    // 2026-10-18: a browser_act wheel scroll result may carry
+    // `scroll {dx, dy, atEdge}`: CSS px the scrolled container moved and
+    // whether it now sits at the edge in the requested direction (e.g. the
+    // bottom for `down`). The desktop sends it only when advertised.
+    ("browser-scroll-outcome", "browserScrollOutcome"),
     // 2026-10-16: Kimi Code membership plan. Quota reader `kimi_code_plan`
     // (quota-config `presetOptions`): GET <profile base URL>/usages on the
     // Kimi Code API (api.kimi.com / api.kimi.ai `/coding/v1`, Bearer key),
@@ -953,6 +992,163 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // session_retired; 400 invalid_writable_root (relative, missing, not a
     // directory, > 32) | writable_root_in_cutex_home.
     ("session-sandbox-extras", "sessionSandboxExtras"),
+    // 2026-10-17: persistent "always allow" rules of Claude agents, per
+    // workspace (claude_permission_rules.rs; runtime/claude/permission_rules.rs).
+    // GET|PUT /v2/sessions/{id}/claude-permission-rules -> {cutexSessionId,
+    // workspace, revision, updatedAt, allow, supported} (+ PUT `sessions:
+    // [{cutexSessionId, status: live | nextStart | unsupported}]`); PUT body
+    // {allow, expectedRevision?}; 409 unsupported_runtime / revision_conflict,
+    // 400 invalid_rule. An approval answered with `{"decision":
+    // {"acceptWithClaudeRules": {"rules": [...]}}}` (rules offered in the
+    // request's `claudePermissionRules`) adds them. Owner only.
+    ("claude-permission-rules", "claudePermissionRules"),
+    // 2026-10-17 (owner decision, claude-agent-gaps Q1 / Q3): Claude Code's
+    // own settings sources and the host's MCP layers for Claude agents
+    // (runtime/claude/code_sources.rs, profiles/claude_code.rs). Profiles
+    // (Claude): `claudeSettingSources` (effective, ["project","user"] subset;
+    // null on Codex), `claudeAiConnectors`; detail
+    // `claudeSettingSourcesExplicit` (null = default) / `…Default` ([]) /
+    // `…Options`; PATCH `claudeSettingSources` (list or null) and
+    // `claudeAiConnectors` (bool). Existing profiles keep no sources; Claude
+    // profiles created from now on start with ["project"]. `user` = the
+    // Claude account home, never ~/.claude. Claude agents also get the
+    // merged global / project / agent MCP servers (stdio + http; secrets in
+    // the adapter env only). GET /v2/sessions/{id}/claude-code -> {next,
+    // launched, servers [{name, layers, transport, status included |
+    // disabled | skipped, reason, ignoredFields}], adapterSupports,
+    // restartNeeded}; 409 unsupported_runtime for Codex agents. Applies at
+    // the next runtime launch; adapter-gated (features.json settingSources /
+    // mcpServers / claudeAiConnectors).
+    ("claude-code-sources", "claudeCodeSources"),
+    // 2026-10-17: Claude P0. GET /v2/sessions/{id}/skills (root) -> the
+    // Codex skills/list shape for a Claude agent's managed roots (workspace
+    // .agents/skills + .claude/skills, account cutex-skills, host
+    // ~/.cutex/claude-skills), read without the runtime; Codex agents 409
+    // unsupported_runtime. Clients send the listed paths as `skill` inputs.
+    ("claude-session-skills", "claudeSessionSkills"),
+    // 2026-10-17: cutex/session/history/revert accepts `rewindFiles: true`
+    // for Claude agents (the adapter restores files from Claude Code's
+    // checkpoint of the first removed turn; Codex refuses with
+    // rewind_files_unsupported). Claude file checkpointing now defaults on
+    // (profile claudeFileCheckpointingDefault true).
+    ("claude-rewind-files", "claudeRewindFiles"),
+    // 2026-10-17: POST /v2/human/agents and /v2/human/sessions accept
+    // `launch.claudePermissionMode` (default | acceptEdits | plan | auto |
+    // bypassPermissions) for Claude profiles: the agent starts in that Claude
+    // Code permission mode (sent once at its first runtime start; plan = plan
+    // mode over the adapter's default). Codex profiles and modes the selected
+    // Claude runtime does not offer answer 400 unsupported_launch_option.
+    // Profiles (Claude) list the offered modes as `claudeLaunchPermissionModes`.
+    ("claude-launch-permission-mode", "claudeLaunchPermissionMode"),
+    // 2026-10-17: owner-only import of Claude Code skills into the host's
+    // shared ~/.cutex/claude-skills (management/v2/claude_skills_import.rs).
+    // GET /v2/claude/skills/import[?source=<abs dir>] -> {source,
+    // defaultSource, sourceExists, target, skills [{name, title, description,
+    // bytes, files, exists, importable, reason?}], truncated}; POST {source?,
+    // names, overwrite?} -> {imported, skipped [{name, reason}], failed}.
+    // Default source = the host user's ~/.claude/skills. Copies only (never
+    // touches the source); symlinks leading out of the source are refused.
+    ("claude-skills-import", "claudeSkillsImport"),
+    // 2026-10-17: Claude P2. A Claude agent's foreground subagent transcripts
+    // (adapter features.subagentTranscripts): native `thread/read` on the
+    // `claude:<session>:task:<id>` reference of a subAgentActivity item passes
+    // the sub-agent lineage check (the adapter answers `parentThreadId`), and
+    // the adapter's live frames for it are published stream-only on the
+    // parent session (native threadId intact) once the parent's activity item
+    // named it. Without this capability reads still work, frames do not.
+    ("claude-subagent-transcripts", "claudeSubagentTranscripts"),
+    // 2026-10-17: native `thread/searchOccurrences` {threadId, searchTerm,
+    // cursor?, limit? 1..200} is forwarded for the bound thread (read grant;
+    // never a sub-agent thread; `thread/search` stays denied). Codex natives
+    // 0.160+ and Claude adapters (features.threadSearch) answer {data
+    // [{turnId, itemId, snippet, snippetMatchRange {start, end} (UTF-16),
+    // turnCursor}], nextCursor}; older natives answer method-not-found.
+    ("thread-search-occurrences", "threadSearchOccurrences"),
+    // 2026-10-17: host proxy modes. /v2/settings `proxy` = {mode: system | none
+    // | manual, url (credentials redacted), urlHasCredentials, noProxy,
+    // loopbackNoProxy (always bypassed, not editable), system {url, source:
+    // environment | windowsSystem | macosSystem} | null (what "follow system"
+    // resolves to now; Windows: env, then registry ProxyServer / ProxyOverride;
+    // macOS: env, then `scutil --proxy` HTTPS / HTTP + ExceptionsList; no PAC),
+    // editable, warning}; PATCH {mode, url?, noProxy?} (omitted url keeps the
+    // stored one). Also the proxy of cutex's own requests (upgrades,
+    // components, LiteLLM catalog, webhooks); loopback always direct; SOCKS
+    // only reaches runtimes. A 407 reads "the proxy requires authentication".
+    // Changing it needs the root credential: a client / device token gets 403
+    // proxy_owner_credential_required. `forceHttpTransport` is retired (400).
+    ("proxy-modes", "proxyModes"),
+    // 2026-10-17: /v2/profiles items `proxy` = {mode: inherit | none | manual,
+    // url (redacted), urlHasCredentials, noProxy, effective {mode, url,
+    // source}, editable}; PATCH `proxy` {mode, url?, noProxy?} | null
+    // (= inherit). Used by the Profile's runtimes (Codex and Claude, new
+    // runtimes only), quota readers, model discovery and web_search. Same
+    // root-credential rule as proxy-modes.
+    ("profile-proxy", "profileProxy"),
+    // 2026-10-17: agent service_register / service_update validate the whole
+    // request before raising any owner approval (an invalid request never
+    // reaches the owner). Static roots: inside the caller's cwd / project
+    // workspace (or its own cutex-managed scratch cwd under agents-scratch /
+    // chats) need nothing; any other existing root outside the cutex home
+    // raises an approval (kind static_root, or folded into the
+    // service_lifetime approval of a persistent request; details.staticRoot
+    // = the canonical root, allowedRoots); the cutex home, filesystem roots
+    // and the user home (or anything containing it or the cutex home) stay
+    // 403 static_root_forbidden, whose detail now lists the allowed roots.
+    ("static-root-approval", "staticRootApproval"),
+    // 2026-10-17: agent tool service_restart {slug}: the owning agent restarts
+    // its running managed service with the unchanged command (no approval;
+    // external / static 409 not_managed, owner-stopped 409 service_stopped).
+    // The Bus records `restartRequestedAt` on the registry record and the
+    // supervisor restarts it like POST /v2/services/{slug}/restart.
+    // service_update no longer asks again when the effective command, cwd,
+    // env and runtime are unchanged.
+    ("services-agent-restart", "servicesAgentRestart"),
+    // 2026-10-18: session resource activity.lastConversationAt (sessionActivity
+    // version 3, also activity.lastTurnStartedAt): the last real conversation
+    // activity (turn started, output, tool call, file change, a turn ended
+    // other than interrupted), persisted in session-activity-state.json.
+    // Runtime start / stop / restart, reconnects and session metadata never
+    // move it. /v2/summary agents[].lastActivityAt now follows it (then a
+    // non-interrupted lastTurn end, then createdAt) instead of the runtime's
+    // lastEventAt / updatedAt.
+    ("session-conversation-activity", "sessionConversationActivity"),
+    // 2026-10-18 (owner Q26): the desktop's "upgrade runtime" action for a
+    // Claude agent, the HTTP form of `cutex human claude repin <id>`
+    // (management/v2/claude_runtime_api.rs, rules in runtime/claude_pin.rs).
+    // GET /v2/sessions/{id}/claude-runtime (root) -> {current {release,
+    // missing}, pending {release, requestedAt} | null, selected {release} |
+    // null, selectedError, direction upgrade | downgrade | change | none,
+    // upgradeAvailable, dryRun {outcome applied | deferred | unchanged |
+    // skipped, reason, restartRequired} | null}; POST
+    // /v2/sessions/{id}/claude-runtime/repin {target?} (owner only) ->
+    // {result {outcome, reason, restartRequired, previous, target}, runtime}.
+    // A running agent is never restarted: deferred = applies at its next
+    // fresh runtime start. 409 claude_repin_refused (details.reason, nothing
+    // changed), claude_runtime_changed, claude_runtime_not_installed,
+    // unsupported_runtime, remote_session. Schema export `claude-runtime`.
+    ("claude-runtime-repin", "claudeRuntimeRepin"),
+    // 2026-10-18: the repin offer without a per-agent request. Claude session
+    // resources carry runtime.claudeRuntime {release, pendingRelease | null}
+    // (absent on other sessions; in single sessions, list items and archived
+    // ones) and GET /v2/sessions carries claudeRuntime {selectedRelease |
+    // null}, the release for new Claude sessions. cutex/sessions/changed
+    // names a session whose pin or pending repin changed (applied, deferred,
+    // applied at start, dropped) and sets claudeRuntimeChanged when the
+    // selected release changed (`cutex human claude install`), so a client
+    // that reloads the list on that event stays current.
+    ("session-claude-runtime", "sessionClaudeRuntime"),
+    // 2026-10-18: Profile looks on the host, the same on every device
+    // (crate::profiles::avatar). GET|PUT|DELETE /v2/profiles/{p}/avatar
+    // (PUT {contentType, data}: square PNG / JPEG / WebP <= 48 KiB, 16..=512
+    // px, like user avatars) and /v2/profiles/{p}/intro-portrait (<= 2 MiB,
+    // each side <= 1024 px); GET answers the image with an ETag
+    // (If-None-Match -> 304). Profile items carry avatarEtag /
+    // introPortraitEtag; appearance.avatarThemes (non-empty unique known
+    // ids, detail.avatarThemeOptions; null = default by model family) and
+    // appearance.introGreeting (<= 300 chars), both PATCHable (null clears).
+    // Keyed by profile id; removed with the profile. Images in
+    // runtime/profile-avatars/ (never config.json / accounts.json).
+    ("profile-avatar", "profileAvatar"),
     #[cfg(target_os = "linux")]
     ("job-service", "jobService"),
 ];
@@ -1033,6 +1229,9 @@ mod tests {
             assert!(value["cutexMethods"].as_array().unwrap().iter().any(|m| m == method));
         }
         for key in [
+            "sessionConversationActivity",
+            "proxyModes",
+            "profileProxy",
             "includeHidden",
             "sessionMetadata",
             "agentAvatarColor",
@@ -1086,6 +1285,8 @@ mod tests {
             "agentExternalGrants",
             "agentToolRoles",
             "ownerApprovals",
+            "approvalsLive",
+            "approvalDecisionNotice",
             "profileNativeSubagents",
             "profileAgentApproval",
             "profileAgentTurnQuestions",
@@ -1155,6 +1356,7 @@ mod tests {
             "windowsSandboxReadiness",
             "peerOwnerProfile",
             "sessionSandboxExtras",
+            "profileAvatar",
         ] {
             assert_eq!(value["features"][key], true, "{key}");
         }

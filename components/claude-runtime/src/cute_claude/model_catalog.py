@@ -5,6 +5,8 @@ connect the SDK, inspect credentials, resolve aliases, or send a model request.
 """
 from __future__ import annotations
 
+from copy import deepcopy
+
 import asyncio
 import json
 import os
@@ -124,6 +126,9 @@ def reference_catalog() -> dict:
         raise ValueError("Invalid model reference metadata")
     for row in models:
         minimum, levels = row["minCliVersion"], row["supportedEffortLevels"]
+        # Optional nominal context window (Claude Code's model registry); null for
+        # aliases that resolve per account. Display data only, never a limit.
+        window = row.get("contextWindow")
         if (not label(row["id"], 200) or any(ch.isspace() for ch in row["id"])
                 or not label(row["displayName"], 200)
                 or not isinstance(row["description"], str) or len(row["description"].encode("utf-8")) > 4000
@@ -132,7 +137,8 @@ def reference_catalog() -> dict:
                 or row["kind"] not in {"pinned", "alias", "default"}
                 or (minimum is not None and (not isinstance(minimum, str) or parse_cli_version(minimum) != minimum))
                 or (levels is not None and (not isinstance(levels, list)
-                    or any(not isinstance(level, str) or level not in EFFORT_LEVELS for level in levels)))):
+                    or any(not isinstance(level, str) or level not in EFFORT_LEVELS for level in levels)))
+                or (window is not None and (type(window) is not int or not 0 < window <= 100_000_000))):
             raise ValueError("Invalid model reference entry")
     ids = [row["id"] for row in models]
     if len(ids) != len(set(ids)):
@@ -231,6 +237,22 @@ class ModelCatalog:
                              retained_models=retained, sdk_names=names, sdk_efforts=efforts)
 
 
+# Codex service tier id the desktop's Fast toggle selects (`fastTierOf`).
+FAST_TIER = 'priority'
+FAST_TIERS = [{'id': FAST_TIER, 'name': 'Fast',
+               'description': 'Claude Code fast mode: faster output, billed as extra usage. Reconnects the same Claude session.'}]
+
+
+def fast_mode_supported(model: str | None) -> bool:
+    """Claude Code offers fast mode on Opus 4.8 and Opus 5.x (the CLI's own
+    model rule; its server flag and the account still decide). Aliases that
+    resolve to the current Opus count; anything else is standard speed only."""
+    if not isinstance(model, str):
+        return False
+    lowered = model.lower()
+    return 'opus-4-8' in lowered or 'opus-5' in lowered or lowered in {'opus', 'opus[1m]', 'best'}
+
+
 def native_models(entries: list[dict], *, default_model: str, configured_effort: str | None,
                   subscription: bool, mock: bool = False) -> dict:
     data = []
@@ -246,6 +268,7 @@ def native_models(entries: list[dict], *, default_model: str, configured_effort:
             "supportedReasoningEfforts": efforts,
             "defaultReasoningEffort": configured_effort if configured_effort in (levels or []) else "none",
             "inputModalities": ["text", "image"] if subscription else ["text"], "supportsPersonality": False,
-            "multiAgentVersion": None, "additionalSpeedTiers": [], "serviceTiers": [],
+            "multiAgentVersion": None, "additionalSpeedTiers": [],
+            "serviceTiers": deepcopy(FAST_TIERS) if subscription and fast_mode_supported(model) else [],
             "defaultServiceTier": None, "isDefault": model == default_model})
     return {"data": data, "nextCursor": None}

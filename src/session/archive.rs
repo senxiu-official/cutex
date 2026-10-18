@@ -26,6 +26,8 @@ pub enum CutexSessionArchiveError {
     PersistenceUnavailable { detail: String },
     PersistenceUncertain { detail: String },
     UnsupportedMethod { method: String },
+    /// Restore refused: a live Agent now holds this record's name.
+    AgentNameTaken { name: String, holder: String },
 }
 
 impl fmt::Display for CutexSessionArchiveError {
@@ -62,6 +64,10 @@ impl fmt::Display for CutexSessionArchiveError {
             Self::PersistenceUncertain { detail } => {
                 write!(formatter, "durable session outcome is uncertain: {detail}")
             }
+            Self::AgentNameTaken { name, holder } => write!(
+                formatter,
+                "agent_name_taken: the live Agent {holder} now holds the name '{name}'; rename or archive it before restoring this one"
+            ),
             Self::UnsupportedMethod { method } => {
                 write!(
                     formatter,

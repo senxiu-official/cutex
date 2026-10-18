@@ -1046,6 +1046,13 @@ impl AppServerRuntimeManager {
             }
         }
         let bootstrap_observed_at = Utc::now().to_rfc3339();
+        // Q21: the Agent Bus judges managed services by the live permissions.
+        crate::app_server::live_settings::record(
+            cutex_session_id,
+            &response_thread_id,
+            runtime_generation,
+            &thread_settings_from_resume_response(&thread_response),
+        );
         let status = Arc::new(Mutex::new(AppServerManagedRuntimeStatus {
             cutex_session_id: cutex_session_id.to_string(),
             thread_id: response_thread_id.clone(),
@@ -1529,6 +1536,12 @@ fn update_runtime_status_from_event(
                     .and_then(|params| params.get("threadSettings"))
                     .cloned()
                 {
+                    crate::app_server::live_settings::record(
+                        &status.cutex_session_id,
+                        &status.thread_id,
+                        status.runtime_generation,
+                        &thread_settings,
+                    );
                     status.thread_settings = Some(thread_settings);
                     status.thread_settings_source = Some("thread/settings/updated".to_string());
                     status.thread_settings_complete = true;
@@ -2263,8 +2276,8 @@ mod tests {
     #[test]
     fn durable_event_sink_failure_disconnects_runtime_and_stops_consumption() {
         let directory = std::env::temp_dir().join(format!(
-            "cutex-app-server-sink-failure-test-{}",
-            uuid::Uuid::new_v4()
+            "cutex-as-sink-failure-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
         fs::create_dir(&directory).expect("create test directory");
         let socket_path = directory.join("app-server.sock");

@@ -290,9 +290,9 @@ pub(super) fn stock_runtime_has_exited(
         )?
         .is_none());
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        match std::fs::read_link(format!("/proc/{}/exe", binding.pid)) {
+        match cutex::platform::process::process_executable(binding.pid) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
             Err(error) => return Err(error.into()),
             Ok(_) => {}
@@ -675,7 +675,7 @@ pub(super) fn bootstrap_native(
     let mut spawned = false;
     let mut operation = || -> anyhow::Result<String> {
         ensure!(
-            cfg!(any(target_os = "linux", windows)),
+            cfg!(any(target_os = "linux", target_os = "macos", windows)),
             "private bootstrap unsupported on this platform"
         );
         ensure!(
@@ -886,9 +886,23 @@ impl StockRuntimeExecutor for StockExecutor {
             .binding
             .as_ref()
             .context("published binding missing")?;
-        #[cfg(target_os = "linux")]
+        #[cfg(target_os = "macos")]
         {
+            if let Some(stat) = cutex::platform::macos_proc::stat(binding.pid)? {
+                if !stat.zombie {
+                    let actual = cutex::platform::process::process_started_at(binding.pid)?;
+                    let original = chrono::DateTime::parse_from_rfc3339(&binding.started_at)?;
+                    if actual.timestamp() == original.timestamp() {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            #[cfg(target_os = "linux")]
             let stat = std::fs::read_to_string(format!("/proc/{}/stat", binding.pid));
+            #[cfg(target_os = "linux")]
             match stat {
                 Ok(stat) => {
                     let state = stat
@@ -950,7 +964,7 @@ impl StockRuntimeExecutor for StockExecutor {
             self.publication(receipt)?;
             Ok(true)
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         anyhow::bail!("stock publication unsupported on this platform")
     }
     fn publication(
@@ -1416,10 +1430,10 @@ pub(super) fn verify_stock_process_with_bundle(
         binding.schema_sha256 == bundle.schema.sha256.as_str(),
         "stock binding schema mismatch"
     );
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         ensure!(
-            std::fs::read_link(format!("/proc/{}/exe", binding.pid))? == bundle.executable.path,
+            cutex::platform::process::process_executable(binding.pid)? == bundle.executable.path,
             "stock process executable mismatch"
         );
         let actual = cutex::platform::process::process_started_at(binding.pid)?;
@@ -1447,7 +1461,7 @@ pub(super) fn verify_stock_process_with_bundle(
         );
         Ok(())
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = bundle;
         anyhow::bail!("stock subset requires Linux")
@@ -1715,9 +1729,15 @@ pub(super) fn foreground_status(
 /// so an independent instance or a private dev home sent
 /// `/v2/browser/commands` to another daemon, which refused every call with
 /// `permission_denied`.
+///
+/// `CUTEX_MCP_APPROVAL_WAIT_SECS` opts the façade in to approval-wait: a
+/// gated service / agent launch holds up to that long for the owner's
+/// decision (Codex's MCP tool timeout is 300 s, so the hold fits). A pinned
+/// older façade ignores it and answers `approval_required` at once.
 fn facade_config_env(management_port: u16) -> serde_json::Value {
     serde_json::json!({
         "CUTEX_MANAGEMENT_URL": cutex::management::service::management_base_url(management_port),
+        (cutex::approvals::APPROVAL_WAIT_ENV): cutex::approvals::APPROVAL_WAIT_SECS.to_string(),
     })
 }
 
@@ -1727,7 +1747,8 @@ mod facade_env_tests {
     fn facade_gets_this_daemons_management_endpoint_only_via_mcp_config() {
         let env = super::facade_config_env(25070);
         let object = env.as_object().unwrap();
-        assert_eq!(object.len(), 1, "only the endpoint; secrets stay in env_vars");
+        assert_eq!(object.len(), 2, "the endpoint and the approval hold; secrets stay in env_vars");
+        assert_eq!(object["CUTEX_MCP_APPROVAL_WAIT_SECS"], "120");
         let raw = object["CUTEX_MANAGEMENT_URL"].as_str().unwrap();
         // Exactly the shape the façade's browser transport accepts.
         let url = url::Url::parse(raw).unwrap();

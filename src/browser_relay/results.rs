@@ -27,6 +27,16 @@ struct Snapshot {
 struct Page {
     kind: String,
     page_generation: u64,
+    /// browser-scroll-outcome: a wheel scroll's observed effect on the
+    /// container that moved (CSS px) and whether it is at the requested edge.
+    scroll: Option<ScrollOutcome>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScrollOutcome {
+    dx: i64,
+    dy: i64,
+    at_edge: bool,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -176,8 +186,15 @@ pub fn project(value: Value, kind: &str) -> Result<Projection> {
             let page: Page = parsed(value)?;
             seq(page.page_generation)?;
             projection.page_generation = Some(page.page_generation);
-            projection.content =
-                text_result(json!({"kind":page.kind,"pageGeneration":page.page_generation}));
+            let mut out = json!({"kind":page.kind,"pageGeneration":page.page_generation});
+            if let Some(scroll) = page.scroll {
+                const LIMIT: i64 = 1 << 53;
+                if scroll.dx.abs() >= LIMIT || scroll.dy.abs() >= LIMIT {
+                    return Err(bad());
+                }
+                out["scroll"] = json!({"dx":scroll.dx,"dy":scroll.dy,"atEdge":scroll.at_edge});
+            }
+            projection.content = text_result(out);
         }
         "tab.navigate" => {
             let page: Navigation = parsed(value)?;
@@ -283,6 +300,33 @@ mod tests {
         .is_err());
         assert!(project(json!({"kind":"tab.act","pageGeneration":1}), "tab.navigate").is_err());
         assert!(project(json!({"kind":"tab.act","pageGeneration":0}), "tab.act").is_err());
+    }
+    #[test]
+    fn browser_act_scroll_outcome_is_strict_and_reaches_the_model() {
+        let out = project(
+            json!({"kind":"tab.act","pageGeneration":3,"scroll":{"dx":0,"dy":812,"atEdge":true}}),
+            "tab.act",
+        )
+        .unwrap();
+        let text: Value =
+            serde_json::from_str(out.content["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            text,
+            json!({"kind":"tab.act","pageGeneration":3,"scroll":{"dx":0,"dy":812,"atEdge":true}})
+        );
+        assert_eq!(out.page_generation, Some(3));
+        for bad in [
+            json!({"dx":0,"dy":1.5,"atEdge":true}),
+            json!({"dx":0,"dy":1,"atEdge":true,"x":1}),
+            json!({"dx":0,"dy":1}),
+            json!({"dx":0,"dy":9007199254740993i64,"atEdge":false}),
+        ] {
+            assert!(project(
+                json!({"kind":"tab.act","pageGeneration":1,"scroll":bad}),
+                "tab.act"
+            )
+            .is_err());
+        }
     }
     #[test]
     fn browser_snapshot_incremental_budget_matches_nested_json_escaping() {

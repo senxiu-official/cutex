@@ -311,6 +311,38 @@ fn call_turn_id(params: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Cutex exposes no MCP resources or prompts, so `initialize` advertises only
+/// `tools`. Clients (Codex's `list_mcp_resources`) still call the listing
+/// methods without checking capabilities: answer them with empty lists.
+fn empty_listing(method: &str) -> Option<Value> {
+    match method {
+        "resources/list" => Some(json!({"resources": []})),
+        "resources/templates/list" => Some(json!({"resourceTemplates": []})),
+        "prompts/list" => Some(json!({"prompts": []})),
+        _ => None,
+    }
+}
+
+/// A request method the façade does not implement (JSON-RPC -32601).
+#[derive(Debug)]
+struct UnsupportedMethod;
+
+impl std::fmt::Display for UnsupportedMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unsupported MCP method")
+    }
+}
+
+impl std::error::Error for UnsupportedMethod {}
+
+/// The JSON-RPC error for a failed request; never echoes the cause.
+fn rpc_error(id: &Value, error: &anyhow::Error) -> Value {
+    if error.is::<UnsupportedMethod>() {
+        return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}});
+    }
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"Cutex rejected operation, caller metadata, or authenticated service request"}})
+}
+
 pub fn run() -> anyhow::Result<()> {
     use std::io::{BufRead, Read, Write};
     let runtime = RuntimeAgentId::new(std::env::var("CUTEX_AGENT_ID")?)
@@ -334,6 +366,17 @@ pub fn run() -> anyhow::Result<()> {
         bail!("MCP requires the configured local Cutex Bus endpoint");
     }
     let port = url.port().context("explicit local Bus port required")?;
+    // approval-wait: cutex opts this façade in (Codex launch config, Claude
+    // adapters declaring features.approvalWait); then gated service and
+    // agent launches hold on the Bus for the owner instead of answering
+    // approval_required at once. A Claude adapter runs one façade per call
+    // and names the calling turn.
+    let approval_wait = crate::approvals::parse_wait_secs(
+        std::env::var(crate::approvals::APPROVAL_WAIT_ENV).ok().as_deref(),
+    );
+    let env_turn = std::env::var(crate::approvals::TURN_ENV)
+        .ok()
+        .filter(|turn| !turn.trim().is_empty());
     let mut input = std::io::stdin().lock();
     // Calls run concurrently (asks §5.8: a long agent_wait must not block a
     // parallel agent_tell); responses are written whole under a lock.
@@ -356,7 +399,7 @@ pub fn run() -> anyhow::Result<()> {
         };
         let concurrent = message["method"] == "tools/call";
         let respond = {
-            let (token, runtime, bound_thread, output, process) = (token.clone(), runtime.clone(), bound_thread.clone(), output.clone(), process.clone());
+            let (token, runtime, bound_thread, output, process, env_turn) = (token.clone(), runtime.clone(), bound_thread.clone(), output.clone(), process.clone(), env_turn.clone());
             move || -> anyhow::Result<()> {
         let id = &id;
         let result = match message["method"].as_str() {
@@ -365,6 +408,7 @@ pub fn run() -> anyhow::Result<()> {
             ),
             Some("ping") => Ok(json!({})),
             Some("tools/list") => Ok(listed_tools(port, &token, &runtime)),
+            Some(method) if empty_listing(method).is_some() => Ok(empty_listing(method).unwrap_or_default()),
             Some("tools/call") => (|| -> anyhow::Result<Value> {
                 let thread = caller_thread(&message["params"], bound_thread.as_deref())?;
                 let name = message["params"]["name"]
@@ -376,6 +420,10 @@ pub fn run() -> anyhow::Result<()> {
                     generation,
                 };
                 let (name, mut args) = legacy_call(name, args).map_err(anyhow::Error::msg)?;
+                let wait = approval_wait.map(|secs| crate::agent_bus::client::ApprovalWaitRequest {
+                    secs,
+                    turn_id: call_turn_id(&message["params"]).or_else(|| env_turn.clone()),
+                });
                 if super::mcp_browser::is_tool(name) {
                     let request = super::mcp_browser::request_id(&process, id)?;
                     return Ok(super::mcp_browser::invoke(&token, &runtime, &fence, &request, name, &args));
@@ -417,13 +465,14 @@ pub fn run() -> anyhow::Result<()> {
                     }
                     // Management results keep their own receipt shape.
                     return Ok(management::invoke(management::operation_args(name, args), |body| {
-                        crate::agent_bus::client::submit_mcp_control(
+                        crate::agent_bus::client::submit_mcp_control_with_wait(
                             port,
                             &token,
                             &runtime,
                             &fence,
                             "/api/agent-management/v1/actions",
                             body,
+                            wait.as_ref(),
                         )
                     }));
                 } else if super::web_search::is_tool(name) {
@@ -434,8 +483,8 @@ pub fn run() -> anyhow::Result<()> {
                     crate::agent_bus::client::submit_mcp_control(port, &token, &runtime, &fence, super::web_search::PATH, &body)?
                 } else if services::is_tool(name) {
                     match services::request_body(name, args) {
-                        Ok(body) => crate::agent_bus::client::submit_mcp_control(
-                            port, &token, &runtime, &fence, services::PATH, &body,
+                        Ok(body) => crate::agent_bus::client::submit_mcp_control_with_wait(
+                            port, &token, &runtime, &fence, services::PATH, &body, wait.as_ref(),
                         )?,
                         Err(error) => json!({"ok":false,"code":"invalid_arguments","detail":error.to_string()}),
                     }
@@ -498,14 +547,12 @@ pub fn run() -> anyhow::Result<()> {
                     || result["ok"] == false;
                 json!({"isError":failed,"content":[{"type":"text","text":result.to_string()}]})
             }),
-            _ => Err(anyhow::anyhow!("unsupported MCP method")),
+            _ => Err(anyhow::Error::new(UnsupportedMethod)),
         };
         // Never echo transport errors/credentials into model-visible output.
         let response = match result {
             Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-            Err(_) => {
-                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"Cutex rejected operation, caller metadata, or authenticated service request"}})
-            }
+            Err(error) => rpc_error(id, &error),
         };
         let mut output = output.lock().map_err(|_| anyhow::anyhow!("MCP output lock poisoned"))?;
         serde_json::to_writer(&mut *output, &response)?;
@@ -532,6 +579,26 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_and_prompt_listings_are_empty() {
+        assert_eq!(empty_listing("resources/list"), Some(json!({"resources": []})));
+        assert_eq!(empty_listing("resources/templates/list"), Some(json!({"resourceTemplates": []})));
+        assert_eq!(empty_listing("prompts/list"), Some(json!({"prompts": []})));
+        assert_eq!(empty_listing("resources/read"), None);
+        assert_eq!(empty_listing("tools/list"), None);
+    }
+
+    #[test]
+    fn unknown_methods_answer_method_not_found() {
+        let id = json!(7);
+        let unknown = rpc_error(&id, &anyhow::Error::new(UnsupportedMethod));
+        assert_eq!(unknown["error"]["code"], -32601);
+        assert_eq!(unknown["id"], 7);
+        let rejected = rpc_error(&id, &anyhow::anyhow!("token=secret"));
+        assert_eq!(rejected["error"]["code"], -32602);
+        assert!(!rejected.to_string().contains("secret"));
+    }
 
     /// Strict function-declaration enum rules (Google / Vertex via
     /// OpenAI-compatible gateways): every `enum` / `const` sits next to a

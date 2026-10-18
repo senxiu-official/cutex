@@ -48,6 +48,10 @@ struct Model {
     kind: String,
     min_cli_version: Option<String>,
     supported_effort_levels: Option<Vec<String>>,
+    /// Nominal context window from Claude Code's model registry (absent in
+    /// older adapters, null for aliases resolved per account).
+    #[serde(default)]
+    context_window: Option<u64>,
     description: String,
 }
 
@@ -82,6 +86,7 @@ fn parse_catalog(bytes: &[u8]) -> Result<Catalog, CatalogError> {
                 || model.min_cli_version.as_deref().is_some_and(|v| version(v).is_none())
                 || model.supported_effort_levels.as_ref().is_some_and(|levels| levels.iter()
                     .any(|level| !super::native_models::CLAUDE_EFFORTS.contains(&level.as_str())))
+                || model.context_window.is_some_and(|window| window == 0 || window > 100_000_000)
         }) {
         return Err(CatalogError("claude_catalog_invalid"));
     }
@@ -154,7 +159,7 @@ fn render(catalog: Catalog, bytes: &[u8], path: &Path, account_id: &str,
             "source": "reference", "accountAvailability": "unknown",
             "minCliVersion": model.min_cli_version, "cliCompatibility": compatibility, "effortSupportKnown": levels.is_some(),
             "supported_reasoning_levels": levels.unwrap_or_default(), "default_reasoning_level": null,
-            "input_modalities": ["text", "image"]}));
+            "context_window": model.context_window, "input_modalities": ["text", "image"]}));
     }
     if let Some(selected) = selected.filter(|id| !id.trim().is_empty()) {
         if !rows.iter().any(|row| row["slug"] == selected) {
@@ -250,7 +255,7 @@ mod tests {
                 {"id": "alias", "displayName": "Family (alias)", "family": "family", "kind": "alias", "description": "Alias",
                     "minCliVersion": null, "supportedEffortLevels": null},
                 {"id": "pinned-old", "displayName": "Family old", "family": "family", "kind": "pinned", "description": "Reference",
-                    "minCliVersion": "2.1.9", "supportedEffortLevels": ["low", "high"]},
+                    "minCliVersion": "2.1.9", "supportedEffortLevels": ["low", "high"], "contextWindow": 200000},
                 {"id": "pinned-new", "displayName": "Family new", "family": "family", "kind": "pinned", "description": "Reference",
                     "minCliVersion": "2.1.100", "supportedEffortLevels": []}
             ]})).unwrap()
@@ -270,6 +275,9 @@ mod tests {
         assert_eq!(result.source["accountAvailability"], "unknown");
         assert_eq!(result.source["accountId"], "account-a");
         assert_eq!(result.source["digest"], format!("{:x}", Sha256::digest(reference())));
+        // Nominal window passes through; a catalog without the field (older adapters) gives null.
+        assert_eq!(result.rows[1]["context_window"], 200_000);
+        assert_eq!(result.rows[0]["context_window"], Value::Null);
         let other = models(Ok("2.1.10"), Some("pinned-new"), "account-b");
         assert_eq!(other.rows.len(), 3);
         assert_eq!(other.rows[2]["cliCompatibility"]["state"], "incompatible");
@@ -315,6 +323,10 @@ mod tests {
         assert_eq!(result.rows[0]["display_name"], "Family (alias)");
         assert_eq!(result.rows[0]["family"], Value::Null);
         assert_eq!(result.rows[1]["kind"], "default");
+        value["models"][1]["contextWindow"] = json!(0);
+        assert_eq!(parse_catalog(&serde_json::to_vec(&value).unwrap()).err(), Some(CatalogError("claude_catalog_invalid")));
+        value["models"][1]["contextWindow"] = json!(1_000_000);
+        assert!(parse_catalog(&serde_json::to_vec(&value).unwrap()).is_ok());
         value["models"][0]["displayName"] = json!("invalid\nlabel");
         assert_eq!(parse_catalog(&serde_json::to_vec(&value).unwrap()).err(), Some(CatalogError("claude_catalog_invalid")));
     }

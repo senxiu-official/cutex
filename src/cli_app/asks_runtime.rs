@@ -662,6 +662,11 @@ pub(crate) fn on_runtime_event(cutex_session_id: &str, runtime_generation: u64, 
                 if notification.method == "turn/started" {
                     note_turn_started(&store, cutex_session_id, params);
                 }
+                // approval-wait: a tool call holding for the owner in this
+                // turn stops holding (Codex never cancels it on interrupt).
+                if notification.method == "turn/completed" {
+                    cutex::management::v2::approvals::on_turn_completed(cutex_session_id, params);
+                }
                 cutex::agent_bus::wake_log::observe(cutex_session_id, &notification.method, params);
                 // A Claude delegation that failed on its exhausted usage limit
                 // goes back to the queue (held until the reset) when the

@@ -55,11 +55,11 @@ pub(super) fn run(selector: Option<&str>, check: bool, fix: bool, yes: bool) -> 
 }
 
 fn process_executable(pid: u32) -> Option<std::path::PathBuf> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+        cutex::platform::process::process_executable(pid).ok()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
         None
@@ -68,6 +68,14 @@ fn process_executable(pid: u32) -> Option<std::path::PathBuf> {
 
 fn running_cutex_executables() -> Vec<serde_json::Value> {
     let mut result = Vec::new();
+    #[cfg(target_os = "macos")]
+    for pid in cutex::platform::macos_proc::all_pids().unwrap_or_default() {
+        if let Some(executable) = process_executable(pid) {
+            if executable.file_name().is_some_and(|name| name == "cutex") {
+                result.push(json!({"pid":pid,"executable":executable}));
+            }
+        }
+    }
     #[cfg(target_os = "linux")]
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {

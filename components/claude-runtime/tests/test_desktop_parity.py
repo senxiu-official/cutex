@@ -363,14 +363,17 @@ async def test_codex_only_methods_answer_or_fail_typed(ph):
     assert await ph.call('thread/goal/get', {'threadId': tid}) == {'goal': None}
     assert await ph.call('thread/goal/clear', {'threadId': tid}) == {'cleared': False}
     assert await ph.call('thread/backgroundTerminals/list', {'threadId': tid, 'limit': 50}) == {'data': [], 'nextCursor': None}
-    for method, feature in [('thread/goal/set', 'goals'), ('turn/steer', 'turnSteer'), ('review/start', 'review'),
+    for method, feature in [('thread/goal/set', 'goals'), ('review/start', 'review'),
                             ('thread/memoryMode/set', 'memoryMode'), ('thread/rollback', 'historyRevert')]:
         error = await ph.call(method, {'threadId': tid}, error=True)
         assert error['code'] == -32601
         assert {key: error['data'][key] for key in ('unsupported', 'runtime', 'feature', 'method')} == {
             'unsupported': True, 'runtime': 'claude', 'feature': feature, 'method': method}
     features = (await ph.call('claude/capabilities'))['features']
-    assert features['planChecklist'] and features['imageInput'] and not features['goals'] and not features['turnSteer']
+    assert features['planChecklist'] and features['imageInput'] and not features['goals'] and features['turnSteer']
+    # Owner steer without an active turn: the Codex refusal text cutex maps to turn_conflict.
+    error = await ph.call('turn/steer', {'threadId': tid, 'input': [{'type': 'text', 'text': 'x'}]}, error=True)
+    assert error['code'] == -32600 and error['message'].startswith('no active turn to steer')
 
 
 async def test_rate_limit_summary_uses_primary_and_secondary_windows(ph):

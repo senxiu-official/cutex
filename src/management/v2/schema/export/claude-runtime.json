@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:claude-runtime",
+  "title": "ClaudeRuntime",
+  "description": "Claude agent runtime pin (capability claude-runtime-repin); the HTTP form of `cutex human claude repin <id> [--dry-run]`. GET /v2/sessions/{id}/claude-runtime (root) → runtimeView; POST /v2/sessions/{id}/claude-runtime/repin (owner only) repinRequest → repinResponse. A running agent is never restarted: the change is saved as pending and applies at its next fresh runtime start (restartRequired). Errors: 404 session_not_found, 409 unsupported_runtime (not a Claude agent), 409 remote_session, 409 claude_runtime_not_installed, 409 claude_runtime_changed (details.selected), 409 claude_repin_refused (details {outcome: skipped, reason, previous, target}; nothing changed), 503 session_store_unavailable.",
+  "anyOf": [{ "$ref": "#/$defs/runtimeView" }, { "$ref": "#/$defs/repinRequest" }, { "$ref": "#/$defs/repinResponse" }],
+  "$defs": {
+    "release": { "type": "string", "description": "Runtime directory label such as claude-r19 (else the adapter source directory name); never a full path." },
+    "outcome": {
+      "type": "object",
+      "required": ["outcome", "reason", "restartRequired"],
+      "properties": {
+        "outcome": { "enum": ["applied", "deferred", "unchanged", "skipped"], "description": "applied: the agent is offline and moved now. deferred: the agent is online; the change applies at its next fresh runtime start. unchanged: already on the target. skipped: refused, see reason." },
+        "reason": { "type": ["string", "null"] },
+        "restartRequired": { "type": "boolean", "description": "true for deferred: the running runtime keeps the old pin until it is restarted (cutex does not restart it)." }
+      }
+    },
+    "runtimeView": {
+      "type": "object",
+      "required": ["cutexSessionId", "name", "current", "pending", "selected", "selectedError", "direction", "upgradeAvailable", "dryRun"],
+      "properties": {
+        "cutexSessionId": { "type": "string" },
+        "name": { "type": "string" },
+        "current": {
+          "type": "object",
+          "required": ["release", "missing"],
+          "properties": {
+            "release": { "$ref": "#/$defs/release" },
+            "missing": { "type": "boolean", "description": "The pinned adapter source no longer exists." }
+          }
+        },
+        "pending": {
+          "type": ["object", "null"],
+          "description": "A change saved for the next fresh runtime start (null when none or stale).",
+          "required": ["release", "requestedAt"],
+          "properties": { "release": { "$ref": "#/$defs/release" }, "requestedAt": { "type": "string" } }
+        },
+        "selected": {
+          "type": ["object", "null"],
+          "description": "The runtime the host uses for new Claude sessions; null when none is installed or it is unusable (selectedError).",
+          "required": ["release"],
+          "properties": { "release": { "$ref": "#/$defs/release" } }
+        },
+        "selectedError": { "type": ["string", "null"] },
+        "direction": { "enum": ["upgrade", "downgrade", "change", "none"], "description": "Selected vs current by release number; change = same label, different pin; none = nothing would change." },
+        "upgradeAvailable": { "type": "boolean", "description": "direction is upgrade or change and that change is not already pending. Check dryRun.outcome for a refusal before offering the action." },
+        "dryRun": { "oneOf": [{ "$ref": "#/$defs/outcome" }, { "type": "null" }], "description": "What a repin now would do; null without a selected runtime." }
+      }
+    },
+    "repinRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "target": { "type": "string", "description": "The selected release the client showed; refused with 409 claude_runtime_changed when it differs now." } }
+    },
+    "repinResponse": {
+      "type": "object",
+      "required": ["result", "runtime"],
+      "properties": {
+        "result": {
+          "allOf": [{ "$ref": "#/$defs/outcome" }],
+          "required": ["previous", "target"],
+          "properties": { "previous": { "$ref": "#/$defs/release" }, "target": { "$ref": "#/$defs/release" } }
+        },
+        "runtime": { "$ref": "#/$defs/runtimeView" }
+      }
+    }
+  }
+}

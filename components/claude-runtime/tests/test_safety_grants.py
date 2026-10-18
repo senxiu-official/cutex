@@ -143,3 +143,21 @@ async def test_grant_survives_an_adapter_restart_and_is_still_single_use(ph):
         assert safety.consume(tid, 'Bash', {'command': 'rm -rf $S/$v'}, 'call-r2') is None
     finally:
         await newer.close()
+
+
+async def test_adapter_denials_never_claim_the_owner_refused(ph):
+    # Owner report: tool calls came back with a refusal the owner never gave. Only the owner's
+    # own answer may say the owner declined; anything else says what happened.
+    from cute_claude.native_tools import OWNER_DECLINED, STALE_PERMISSION, UNANSWERED_PERMISSION
+    tid, turn, b = await setup(ph)
+    await ph.server.approvals.configure(tid, 'default')
+    stale = await b.native.approve('Bash', {'command': 'ls'}, SimpleNamespace(tool_use_id='not-started'))
+    assert stale == {'allow': False, 'session': False, 'interrupt': False, 'message': STALE_PERMISSION}
+    ph.peer.interactive = False  # no owner client can answer
+    args = {'command': 'Start-Sleep 5', 'description': 'wait'}
+    await b.pre_tool({'session_id': b.sid, 'tool_name': 'Bash', 'tool_input': args}, 'call-1', {})
+    unanswered = await b.native.approve('Bash', args, SimpleNamespace(tool_use_id='call-1'))
+    assert unanswered['allow'] is False and unanswered['message'] == UNANSWERED_PERMISSION
+    for text in (STALE_PERMISSION, UNANSWERED_PERMISSION):
+        assert "doesn't want" not in text and 'Nobody refused' in text or 'did not refuse' in text
+    assert 'owner declined' in OWNER_DECLINED

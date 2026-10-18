@@ -39,7 +39,6 @@ pub(super) enum ProfileSettingsField {
     ProxyMode,
     ProxyUrl,
     ProxyNoProxy,
-    ProxyForceHttpTransport,
     ManagedSessions,
     DeepSeekPreset,
     Model,
@@ -67,7 +66,6 @@ impl ProfileSettingsField {
             Self::ApiKey => SessionSettingsEditorKind::Secret,
             Self::Runtime
             | Self::ProxyMode
-            | Self::ProxyForceHttpTransport
             | Self::ManagedSessions
             | Self::QuotaPreset
             | Self::DeepSeekPreset
@@ -111,7 +109,6 @@ const PROFILE_SETTINGS_FIELDS: &[ProfileSettingsField] = &[
     ProfileSettingsField::ProxyMode,
     ProfileSettingsField::ProxyUrl,
     ProfileSettingsField::ProxyNoProxy,
-    ProfileSettingsField::ProxyForceHttpTransport,
     ProfileSettingsField::ManagedSessions,
     ProfileSettingsField::DeepSeekPreset,
     ProfileSettingsField::Model,
@@ -454,9 +451,6 @@ impl ProfileSettingsSnapshot {
                 ("Disabled", "disabled"),
                 ("Enabled", "enabled"),
             ],
-            ProfileSettingsField::ProxyForceHttpTransport => {
-                &[("Enabled", "enabled"), ("Disabled", "disabled")]
-            }
             ProfileSettingsField::ManagedSessions => &[
                 ("Inherit global", "inherit"),
                 ("Enabled", "enabled"),
@@ -655,7 +649,6 @@ pub(super) struct ProfileSettingsDraft {
     proxy_mode: Option<ProfileProxyMode>,
     proxy_url: Option<Option<String>>,
     proxy_no_proxy: Option<Option<String>>,
-    proxy_force_http_transport: Option<bool>,
     session_mode: Option<ProfileSessionMode>,
     codex_config: CodexProfileConfigPatch,
 }
@@ -756,7 +749,6 @@ impl ProfileSettingsDraft {
                 if mode != ProfileProxyMode::Enabled {
                     self.proxy_url = None;
                     self.proxy_no_proxy = None;
-                    self.proxy_force_http_transport = None;
                 }
             }
             ProfileSettingsField::ProxyUrl => {
@@ -775,21 +767,6 @@ impl ProfileSettingsDraft {
                         .as_ref()
                         .and_then(|proxy| proxy.no_proxy.clone()))
                 .then_some(value);
-            }
-            ProfileSettingsField::ProxyForceHttpTransport => {
-                self.require_enabled_proxy(snapshot)?;
-                let enabled = match value.as_deref() {
-                    Some("enabled") => true,
-                    Some("disabled") => false,
-                    Some(other) => anyhow::bail!("unsupported HTTP transport mode: {other}"),
-                    None => anyhow::bail!("HTTP transport mode cannot be empty"),
-                };
-                let original = snapshot
-                    .proxy
-                    .as_ref()
-                    .map(|proxy| proxy.force_http_transport)
-                    .unwrap_or(true);
-                self.proxy_force_http_transport = (enabled != original).then_some(enabled);
             }
             ProfileSettingsField::ManagedSessions => {
                 let mode = match value.as_deref() {
@@ -948,16 +925,6 @@ impl ProfileSettingsDraft {
                     )
                     .as_deref(),
             ),
-            ProfileSettingsField::ProxyForceHttpTransport => {
-                let enabled = self.proxy_force_http_transport.unwrap_or_else(|| {
-                    snapshot
-                        .proxy
-                        .as_ref()
-                        .map(|proxy| proxy.force_http_transport)
-                        .unwrap_or(true)
-                });
-                enabled_label(enabled).to_string()
-            }
             ProfileSettingsField::ManagedSessions => {
                 self.effective_session_mode(snapshot).value().to_string()
             }
@@ -1066,7 +1033,6 @@ impl ProfileSettingsDraft {
             | ProfileSettingsField::DockerImage
             | ProfileSettingsField::DockerUser
             | ProfileSettingsField::ProxyMode
-            | ProfileSettingsField::ProxyForceHttpTransport
             | ProfileSettingsField::ManagedSessions => self.value(snapshot, field),
         }
     }
@@ -1095,9 +1061,6 @@ impl ProfileSettingsDraft {
             ProfileSettingsField::ProxyMode => self.proxy_mode.is_some(),
             ProfileSettingsField::ProxyUrl => self.proxy_url.is_some(),
             ProfileSettingsField::ProxyNoProxy => self.proxy_no_proxy.is_some(),
-            ProfileSettingsField::ProxyForceHttpTransport => {
-                self.proxy_force_http_transport.is_some()
-            }
             ProfileSettingsField::ManagedSessions => self.session_mode.is_some(),
             ProfileSettingsField::DeepSeekPreset => self.codex_config.apply_deepseek_preset,
             ProfileSettingsField::Model => {
@@ -1201,27 +1164,19 @@ impl ProfileSettingsDraft {
 
         let proxy_dirty = self.proxy_mode.is_some()
             || self.proxy_url.is_some()
-            || self.proxy_no_proxy.is_some()
-            || self.proxy_force_http_transport.is_some();
+            || self.proxy_no_proxy.is_some();
         let proxy = if !proxy_dirty {
             ConfigValueUpdate::Unchanged
         } else {
             match self.effective_proxy_mode(snapshot) {
                 ProfileProxyMode::Inherit => ConfigValueUpdate::Clear,
                 ProfileProxyMode::Disabled => {
-                    ConfigValueUpdate::Set(proxy_config_from_parts(false, None, None, true)?)
+                    ConfigValueUpdate::Set(proxy_config_from_parts(false, None, None)?)
                 }
                 ProfileProxyMode::Enabled => ConfigValueUpdate::Set(proxy_config_from_parts(
                     true,
                     self.effective_proxy_url(snapshot),
                     self.effective_proxy_no_proxy(snapshot),
-                    self.proxy_force_http_transport.unwrap_or_else(|| {
-                        snapshot
-                            .proxy
-                            .as_ref()
-                            .map(|proxy| proxy.force_http_transport)
-                            .unwrap_or(true)
-                    }),
                 )?),
             }
         };

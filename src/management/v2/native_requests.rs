@@ -49,6 +49,11 @@ const SESSION_THREAD_METHODS: &[&str] = &[
     "thread/read",
     "thread/turns/list",
     "thread/items/list",
+    // Capability `thread-search-occurrences`: in-thread search of the bound
+    // thread only (never a sub-agent's, never `thread/search`, which lists
+    // every thread of the native home). Newer than the pinned 0.144.1
+    // schema: [`validate_search_occurrences`] checks its narrow shape.
+    "thread/searchOccurrences",
     "claude/model/status",
     "turn/start",
     "turn/steer",
@@ -265,6 +270,9 @@ pub(super) fn validate_pinned_client_request_schema(
     if matches!(native_message["method"].as_str(), Some("claude/models/catalog" | "claude/model/status")) {
         return validate_claude_model_read(native_message);
     }
+    if native_message["method"] == "thread/searchOccurrences" {
+        return validate_search_occurrences(native_message);
+    }
     let validator = CLIENT_REQUEST_VALIDATOR.get_or_init(|| {
         let schema: Value = serde_json::from_str(CLIENT_REQUEST_SCHEMA)
             .expect("embedded app-server 0.144.1 ClientRequest schema must be valid JSON");
@@ -297,6 +305,33 @@ fn validate_claude_model_read(message: &Value) -> Result<(), NativeRequestValida
         || params.get("threadId").is_some_and(|id| id.as_str().is_none_or(str::is_empty))
         || (status && !params.contains_key("threadId")) {
         return Err(invalid());
+    }
+    Ok(())
+}
+
+/// `thread/searchOccurrences` (native 0.160+, Claude adapter r8+): a
+/// case-insensitive literal search of the bound thread's visible user and
+/// final assistant messages. Only its documented fields pass.
+fn validate_search_occurrences(message: &Value) -> Result<(), NativeRequestValidationError> {
+    let invalid = |why: &str| NativeRequestValidationError::Invalid(format!("thread/searchOccurrences: {why}"));
+    let object = message.as_object().ok_or_else(|| invalid("message must be an object"))?;
+    if object.keys().any(|key| !matches!(key.as_str(), "id" | "method" | "params" | "jsonrpc"))
+        || object.get("jsonrpc").is_some_and(|value| value != "2.0") {
+        return Err(invalid("unexpected message fields"));
+    }
+    let params = object.get("params").and_then(Value::as_object).ok_or_else(|| invalid("params must be an object"))?;
+    if let Some(key) = params.keys().find(|key| !matches!(key.as_str(), "threadId" | "searchTerm" | "cursor" | "limit")) {
+        return Err(invalid(&format!("unsupported field {key}")));
+    }
+    match params.get("searchTerm").and_then(Value::as_str) {
+        Some(term) if !term.trim().is_empty() && term.chars().count() <= 2048 => {}
+        _ => return Err(invalid("searchTerm must be a non-empty string of at most 2048 characters")),
+    }
+    if params.get("cursor").is_some_and(|cursor| !cursor.is_null() && cursor.as_str().is_none_or(|c| c.len() > 4096)) {
+        return Err(invalid("cursor must be a string or null"));
+    }
+    if params.get("limit").is_some_and(|limit| !limit.is_null() && limit.as_u64().is_none_or(|n| n == 0 || n > 200)) {
+        return Err(invalid("limit must be 1..200 or null"));
     }
     Ok(())
 }
@@ -402,6 +437,40 @@ mod tests {
             "native": { "message": { "id": "native-1", "method": method, "params": params } }
         }))
         .expect("serialize request")
+    }
+
+    #[test]
+    fn search_occurrences_is_narrow_and_bound_to_the_session_thread() {
+        let ok = validate_native_request(&native_request("thread/searchOccurrences",
+            json!({"threadId": "root", "searchTerm": "deploy", "cursor": null, "limit": 50})), "root").unwrap();
+        assert_eq!(ok.descendant_thread_id, None);
+        assert!(matches!(
+            validate_native_request(&native_request("thread/searchOccurrences",
+                json!({"threadId": "child", "searchTerm": "x"})), "root"),
+            Err(NativeRequestValidationError::ForeignThread { .. })
+        ));
+        assert!(matches!(
+            validate_native_request(&native_request("thread/searchOccurrences", json!({"searchTerm": "x"})), "root"),
+            Err(NativeRequestValidationError::MissingThreadId)
+        ));
+        for params in [
+            json!({"threadId": "root"}),
+            json!({"threadId": "root", "searchTerm": " "}),
+            json!({"threadId": "root", "searchTerm": "x", "limit": 0}),
+            json!({"threadId": "root", "searchTerm": "x", "limit": 500}),
+            json!({"threadId": "root", "searchTerm": "x", "cursor": 3}),
+            json!({"threadId": "root", "searchTerm": "x", "archived": true}),
+        ] {
+            assert!(matches!(
+                validate_native_request(&native_request("thread/searchOccurrences", params.clone()), "root"),
+                Err(NativeRequestValidationError::Invalid(_))
+            ), "{params}");
+        }
+        // The home-wide thread search stays denied.
+        assert!(matches!(
+            validate_native_request(&native_request("thread/search", json!({"searchTerm": "x"})), "root"),
+            Err(NativeRequestValidationError::MethodDenied(_))
+        ));
     }
 
     #[test]

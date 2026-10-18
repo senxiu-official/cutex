@@ -231,6 +231,7 @@ pub const NATIVE_READ: &[&str] = &[
     "thread/turns/list",
     "thread/items/list",
     "thread/goal/get",
+    "thread/searchOccurrences",
     "claude/model/status",
 ];
 pub const NATIVE_SEND: &[&str] = &["turn/interrupt"];

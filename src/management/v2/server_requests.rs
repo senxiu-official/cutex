@@ -281,6 +281,56 @@ pub fn resolve_request(
     })
 }
 
+/// A turn ended (`turn/completed`): its still-pending requests can no
+/// longer be answered. Marks every pending request of this runtime
+/// generation whose `params.turnId` is `turn_id` resolved; returns how many.
+pub fn resolve_turn_requests(
+    cutex_session_id: &str,
+    runtime_generation: u64,
+    turn_id: &str,
+) -> anyhow::Result<usize> {
+    if turn_id.is_empty() {
+        return Ok(0);
+    }
+    let matches = |request: &PendingNativeServerRequest| {
+        request.cutex_session_id == cutex_session_id
+            && request.runtime_generation == runtime_generation
+            && request.resolution == NativeServerRequestResolution::Pending
+            && request.native.pointer("/params/turnId").and_then(Value::as_str) == Some(turn_id)
+    };
+    // Most turns end without a pending request: no store write then.
+    if !read_store(|store| Ok(store.requests.iter().any(matches)))? {
+        return Ok(0);
+    }
+    mutate_store(|store| {
+        let mut resolved = 0;
+        for request in store.requests.iter_mut().filter(|request| matches(request)) {
+            request.resolution = NativeServerRequestResolution::Resolved;
+            resolved += 1;
+        }
+        Ok(resolved)
+    })
+}
+
+/// The recorded native request (claimed or not) with this id, if still kept.
+pub fn request_native(
+    cutex_session_id: &str,
+    runtime_generation: u64,
+    native_request_id: &Value,
+) -> anyhow::Result<Option<Value>> {
+    read_store(|store| {
+        Ok(store
+            .requests
+            .iter()
+            .find(|request| {
+                request.cutex_session_id == cutex_session_id
+                    && request.runtime_generation == runtime_generation
+                    && request_id(&request.native) == Some(native_request_id)
+            })
+            .map(|request| request.native.clone()))
+    })
+}
+
 pub fn snapshot(cutex_session_id: &str, runtime_generation: u64) -> anyhow::Result<Vec<Value>> {
     read_store(|store| {
         Ok(store
@@ -539,6 +589,41 @@ mod tests {
     }
 
     #[test]
+    fn turn_end_resolves_its_pending_requests_and_summaries_list_the_rest() {
+        // Other tests point HOME (so the store) elsewhere while they run.
+        let _home = crate::config::paths::test_home_env_lock();
+        let session = format!("cutex.server-request-turn-{}", uuid::Uuid::new_v4());
+        let approval = |id: i64, turn: &str| {
+            json!({
+                "id": id,
+                "method": "item/commandExecution/requestApproval",
+                "params": { "threadId": "thread-1", "turnId": turn, "itemId": "item" }
+            })
+        };
+        record_request(&session, 2, approval(1, "turn-a")).unwrap();
+        record_request(&session, 2, approval(2, "turn-b")).unwrap();
+        record_request(&session, 1, approval(3, "turn-a")).unwrap();
+        let listed = |generation: u64| {
+            pending_summaries().unwrap().remove(&(session.clone(), generation)).unwrap_or_default()
+        };
+        assert_eq!(
+            listed(2),
+            vec![
+                json!({"id": 1, "method": "item/commandExecution/requestApproval"}),
+                json!({"id": 2, "method": "item/commandExecution/requestApproval"}),
+            ]
+        );
+        assert_eq!(resolve_turn_requests(&session, 2, "turn-a").unwrap(), 1);
+        assert_eq!(resolve_turn_requests(&session, 2, "turn-a").unwrap(), 0);
+        assert_eq!(listed(2), vec![json!({"id": 2, "method": "item/commandExecution/requestApproval"})]);
+        // Another runtime generation is untouched.
+        assert_eq!(listed(1).len(), 1);
+        assert!(resolve_request(&session, 2, &json!(2)).unwrap());
+        assert!(listed(2).is_empty());
+        clear_session(&session).unwrap();
+    }
+
+    #[test]
     fn the_same_request_seen_on_a_second_connection_is_recorded_once() {
         let session = format!("cutex.server-request-twice-{}", uuid::Uuid::new_v4());
         let native = json!({
@@ -709,6 +794,23 @@ mod tests {
 
         fs::remove_dir_all(root).expect("remove scrub directory");
     }
+}
+
+/// `{id, method}` of every pending, unanswered native server request of this
+/// host, keyed by `(cutexSessionId, runtimeGeneration)` in arrival order
+/// (session resource `runtime.pendingServerRequests`). Same filter as
+/// [`snapshot`].
+pub fn pending_summaries(
+) -> anyhow::Result<std::collections::HashMap<(String, u64), Vec<Value>>> {
+    let mut summaries: std::collections::HashMap<(String, u64), Vec<Value>> =
+        std::collections::HashMap::new();
+    for (session, generation, native, _) in pending_all()? {
+        summaries.entry((session, generation)).or_default().push(json!({
+            "id": native.get("id").cloned().unwrap_or(Value::Null),
+            "method": native.get("method").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    Ok(summaries)
 }
 
 /// Every pending native server request of this host as

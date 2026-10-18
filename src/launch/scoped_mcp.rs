@@ -721,7 +721,7 @@ pub fn launch_injection_for_session(cutex_session_id: &str) -> anyhow::Result<La
 // Effective view
 // ---------------------------------------------------------------------------
 
-fn deep_merge(base: &mut Value, overlay: &Value) {
+pub(crate) fn deep_merge(base: &mut Value, overlay: &Value) {
     match (base, overlay) {
         (Value::Object(base), Value::Object(overlay)) => {
             for (key, value) in overlay {

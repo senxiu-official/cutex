@@ -914,8 +914,9 @@ mod tests {
     }
 
     /// Another process holding the pty slave (a leaked fd) cannot keep a
-    /// killed terminal from exiting.
-    #[cfg(unix)]
+    /// killed terminal from exiting. Linux: the slave path comes from
+    /// `/proc/<pid>/fd/0`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn exits_while_another_holder_keeps_the_pty_slave_open() {
         use std::os::unix::fs::OpenOptionsExt;

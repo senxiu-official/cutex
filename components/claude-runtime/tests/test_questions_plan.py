@@ -202,6 +202,13 @@ async def test_start_plan_and_busy_mode_change(ph):
     await ph.call('claude/runtime/start',{'threadId':tid})
     assert ph.sdk.clients[-1].options.permission_mode=='plan'
     ph.store.enqueue(tid,identifier(),{'text':'pending','eventType':'message','source':{'kind':'user','id':'test'}},10)
-    result=await ph.call('thread/settings/update',{'threadId':tid,'collaborationMode':{'mode':'default'}},error=True)
+    # Plan / permission mode change while busy (Claude Code's shift+tab) reaches the live session.
+    await ph.call('thread/settings/update',{'threadId':tid,'collaborationMode':{'mode':'default'}})
+    assert not ph.server.approvals.planning(tid)
+    assert ph.sdk.clients[-1].options.permission_mode=='bypassPermissions'
+    await ph.call('thread/settings/update',{'threadId':tid,'approvalPolicy':'on-request','approvalsReviewer':'user',
+                                             'sandboxPolicy':{'type':'workspaceWrite'}})
+    assert ph.server.approvals.mode(tid)=='acceptEdits' and ph.sdk.clients[-1].options.permission_mode=='acceptEdits'
+    # A model change still needs an idle thread.
+    result=await ph.call('thread/settings/update',{'threadId':tid,'model':'opus'},error=True)
     assert result['code']==-32009
-    assert ph.server.approvals.planning(tid)

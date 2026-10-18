@@ -110,7 +110,15 @@ and `runtimes` (owner only, else null): `{native: {selected, latest, inUse: [{re
                                                      native?{version, commit, nativePatchCommit?, artifacts{…}}, components?{<name>: {version, artifacts{…}}},
                                                      desktop{minCommit?, branch?}, mode: reload|full, packageRunRecommended}
 <source>/<tag>/<name>.tar.gz                         cutex archive: cutex[.exe] + cutex-mcp[.exe] at the root
+                                                     (+ LICENSE, NOTICE, THIRD_PARTY_NOTICES.md)
 ```
+
+The stager unpacks every regular file of an archive and requires only the
+executables it names (cutex: `cutex` + `cutex-mcp`; native: app server, code-mode
+host, schema), so files next to them — the license files, `cute-codex-build.json`
+— are tolerated by every release since 0.1.0 and land in `releases/<release>/` /
+`natives/<version>/`. Never ship a file named `manifest.json`, `manifest.json.minisig`
+or `release-receipt.json` (the stager writes those) or `receipt.json` in a component.
 
 Default source `https://github.com/senxiu-official/cutex/releases/download`
 (GitHub release assets); `cutex upgrade config --source` accepts an https URL,
@@ -196,7 +204,10 @@ apply that installed `to`, if still installed and not newer) or is cleared,
 so a second default rollback never goes forward to `from`.
 Run by the running (newer) binary: wait-idle, stop, backup, switch, restore
 the selection files saved by the apply that went `to → from` (if its backup
-is still there; then mode `full`), move new stores aside, start, check
+is still there; then mode `full`), move new stores aside, rewrite the records an
+older release cannot parse (`src/upgrade/older_stores.rs`: approval records of kind
+`static_root` removed, a pending Claude `initial_permission_mode` cleared; each copied to
+`displaced/older-stores/` first; the same step runs when a failed apply rolls back), start, check
 `cutexBuild.release` → `committed`. The preview lists `migrations`,
 `movedAside`, `selectionBackup` and `sessionDataRestored: false`.
 
@@ -227,7 +238,7 @@ error envelope (`error.code`, `error.details`).
 
 | route | answer |
 |---|---|
-| `GET /v2/upgrade` | `200` status: `{managed, base, serviceManager, build, installed, previousRelease, installedReleases, lastCheckAt, lastCheckError, available, staged, staging?, run, followUp, settings, trustedKeys}` (`$defs/upgradeStatus`) |
+| `GET /v2/upgrade` | `200` status: `{managed, base, serviceManager, build, installed, previousRelease, installedReleases, lastCheckAt, lastCheckError, available, staged, staging?, run, followUp, settings, trustedKeys}` (`$defs/upgradeStatus`); `installed` = `{release, sequence, commit, manifestSha256, notes, publishedAt}` (`notes` / `publishedAt` from the installed release's `releases/<release>/manifest.json`, capability `upgrade-installed-notes`; null when there is none) |
 | `POST /v2/upgrade/check` | `200` status after reading the channel |
 | `POST /v2/upgrade/stage` `{release?}` | `202 {staging: {release, state: "running"}}`; progress / failure in status `staging` (`state: failed`, `error`) and events |
 | `POST /v2/upgrade/apply` `{release?, mode?, maxWaitSecs?, confirmOneWay?, packageRun?}` | `202 {run}` |

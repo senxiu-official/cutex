@@ -1,6 +1,514 @@
 # Changelog
 
-## 0.1.3 (2026-10-17)
+<!-- Each entry: English text, then a Chinese text. The English part contains no Chinese characters:
+     name UI labels by their English strings (Approvals, "Auto"). -->
+
+## 0.1.4 "First Take" (2026-10-19)
+
+Claude agents: launch permission modes (including "Auto", which covers Claude Code's own tool
+permissions and never decides cutex approvals), context windows and effort levels from the Claude
+runtime's reference catalog, repin to the host's selected Claude runtime over the API, skills
+import, subagent transcripts, file rewind and permission rules. Profile looks (pictures, themes,
+greeting) live on the host; approvals record who decided, hold the agent's call while the owner
+decides and say when it was approved after waiting, and a static root outside the workspace asks
+the owner instead of failing; proxy modes; pending server requests and conversation activity on
+sessions; the browser scroll outcome; agents restart their own services; upgrades show the installed
+release's notes; and a rollback to an older cutex no longer leaves it unable to read its stores.
+Pairs with desktop 0.1.4. Components: claude-runtime claude-r19 and job-service 0.1.1 (licence files
+only); no new cute-codex native (stays 0.160.0-r52.3).
+Claude 智能体：启动时可选权限模式（含「自动」，它只管 Claude Code 自己的工具权限，不替你决定 cutex 审批）、
+上下文窗口与推理强度取自 Claude 运行时的参考目录、可通过 API 换到主机选定的 Claude 运行时、导入技能、查看子代理
+过程、回退文件、权限规则。Profile 形象（头像、主题、问候语）保存在主机上；审批记录谁做的决定，等待期间挂起
+智能体的调用、等待后批准会附说明，工作区外的静态根目录改为请主人审批；代理模式；会话上的待答请求与对话活动；
+浏览器滚动结果；智能体可重启自己的服务；升级页显示已安装版本的说明；回退到旧版不再导致无法读取存储。
+配合桌面端 0.1.4。组件：claude-runtime claude-r19、job-service 0.1.1（只加了许可证文件）；没有新的
+cute-codex 原生运行时（仍为 0.160.0-r52.3）。
+
+**Claude agents**
+
+- Claude agents can be created in a chosen Claude Code permission mode (capability
+  `claude-launch-permission-mode`): `POST /v2/human/agents` and `/v2/human/sessions` accept
+  `launch.claudePermissionMode` (`default` | `acceptEdits` | `plan` | `auto` | `bypassPermissions`) for
+  Claude profiles. cutex keeps it on the new session and sends it once, as `thread/settings/update`, at
+  the first runtime start (before the native session connects); `plan` turns plan mode on over the
+  adapter's default mode. Codex profiles, and modes the selected Claude runtime does not list in
+  `features.json` `claudePermissionModes`, answer 400 `unsupported_launch_option`. `/v2/profiles` items
+  of Claude profiles gain `claudeLaunchPermissionModes` (the offered modes; null on Codex). A session
+  record holding a not-yet-applied mode (`initial_permission_mode`, only between creation and the first
+  start) is not readable by an older cutex (a rollback clears it, see below).
+  新建 Claude agent / 快速对话时可以选择 Claude Code 的权限模式。
+- claude-runtime claude-r19 (adapter 0.7.6): a thread whose Claude permission mode is "auto" when
+  its session starts gets one more runtime-limits sentence in the system prompt: the mode only
+  covers Claude Code's own tool permissions and does not decide cutex approvals (managed services,
+  delegation reviews, browser grants and other cutex tool approvals still go to the owner).
+  The adapter's reference model catalog gains `contextWindow` per model: the nominal window from
+  Claude Code's own model registry (CLI 2.1.299: 1M for Opus 4.7 and later, Sonnet 5 / 5.5, Fable 5 /
+  5.1 and Haiku 5.5; 200K for Opus 4.5 / 4.6, Sonnet 4.5 / 4.6 and Haiku 4.5; 1M for the `[1m]`
+  aliases; null for the other aliases, which resolve per account). `thread/settings/update` now
+  accepts the effort levels `model/list` advertises: the live handshake's levels when it names the
+  model, else the reference catalog's. Before, a pinned model ID (not in Claude Code's handshake
+  list) or an offline thread only accepted its current effort, so the desktop's effort menu failed
+  with "This model does not advertise the selected effort". The refusal now names the model, the
+  requested effort and the offered levels.
+  claude-r19：「自动」模式的系统提示说明它不决定 cutex 审批；参考模型目录带上各模型的上下文窗口；推理强度
+  菜单接受 model/list 提供的所有档位，不再报「This model does not advertise the selected effort」。
+- Claude Profile model lists (`GET /v2/profiles/{p}/models`, `modelsSource.kind: claudeReference`):
+  rows carry the selected Claude adapter's nominal `contextWindow` (`effective.contextWindowSource:
+  "reference"`; null for aliases resolved per account, and with adapters before claude-r19) and no
+  auto-compact limit (`autoCompactTokenLimit: null`, `effective.autoCompactTokenLimitSource:
+  "notApplicable"`): Claude Code decides compaction itself. Before, the Codex rule could invent
+  "90 % of the window". The view gains `autoCompactApplies` (false for Claude profiles).
+  Claude Profile 的模型列表显示参考上下文窗口，不再套用 Codex 的自动压缩上限（压缩由 Claude Code 自己决定）。
+- Claude agents can be moved to the host's selected Claude runtime over Management v2 (capability
+  `claude-runtime-repin`), the HTTP form of `cutex human claude repin <id>`:
+  `GET /v2/sessions/{id}/claude-runtime` reports the pinned runtime, the selected one, a pending
+  change, `upgradeAvailable` and what a repin now would do (`dryRun`); owner-only
+  `POST /v2/sessions/{id}/claude-runtime/repin {target?}` performs it with the same rules as the
+  CLI. An offline agent moves at once; a running agent is never restarted, the change applies at its
+  next fresh runtime start (`restartRequired`). Refusals (another Claude config home, a schema-2
+  adapter state on a pre-r8 target, a lifecycle operation in progress) answer 409
+  `claude_repin_refused` and change nothing. Schema export `claude-runtime`.
+  Claude 智能体可通过 API 换到主机选定的 Claude 运行时；离线的立即生效，运行中的在下次全新启动时生效。
+- Claude session resources carry their runtime pin (capability `session-claude-runtime`):
+  `runtime.claudeRuntime {release, pendingRelease}` (release labels such as `claude-r17`;
+  `pendingRelease` is a repin waiting for the agent's next fresh runtime start, else null; absent on
+  other sessions), and `GET /v2/sessions` carries `claudeRuntime {selectedRelease}`, the release for
+  new Claude sessions (null when none is usable). A client can decide whether to offer the runtime
+  upgrade from the agent list alone, without `GET /v2/sessions/{id}/claude-runtime` per agent.
+  `cutex/sessions/changed` now lists a session whose pin or pending repin changed (repin applied or
+  deferred, applied at start) and sets `claudeRuntimeChanged: true` when the selected Claude runtime
+  changed (`cutex human claude install`). The sessions schema now allows a null
+  `native.schema.sha256` (Claude sessions without a protocol file).
+  Claude 会话带上所用运行时版本与待生效的更换，客户端从智能体列表即可判断是否提示升级运行时。
+- Import Claude Code skills into the host's shared Claude skills directory (capability
+  `claude-skills-import`, owner only): `GET /v2/claude/skills/import[?source=<abs dir>]` lists the
+  skills of a source directory (default: the host user's `~/.claude/skills`) with name, front-matter
+  title / description, size, whether one of that name already exists in `~/.cutex/claude-skills` and
+  whether it can be imported; `POST /v2/claude/skills/import` `{source?, names, overwrite?}` copies the
+  chosen ones (`{imported, skipped, failed}`). Copies only, the source is never changed; existing skills
+  are skipped unless `overwrite` (then replaced as a whole); symlinks never lead out of the source (such a
+  skill directory is refused, such a link inside a skill is left out); each skill at most 16 MiB / 2000
+  files / 16 levels, `SKILL.md` at most 48 KiB; copies are staged in the target and renamed into place.
+  从 `~/.claude/skills` 导入技能到主机共享的 `~/.cutex/claude-skills`（复制，不改动源目录）。
+- Claude agents: the skills a Claude agent loads are listed for the desktop's skill picker
+  (`GET /v2/sessions/{id}/skills`, capability `claude-session-skills`; works while the runtime is
+  offline), and a new host-level directory `~/.cutex/claude-skills` is shared by every Claude agent on
+  the host (next to the workspace `.agents/skills` / `.claude/skills` and the account's `cutex-skills`).
+  Claude 智能体的技能可在桌面技能选择器中列出和选用；新增主机级共享技能目录 `~/.cutex/claude-skills`。
+- Claude agents: a foreground subagent's work can be opened. The Claude runtime keeps a bounded
+  transcript of each Agent / Task subagent (its messages, thinking and tool calls; at most 400
+  entries per subagent and 100 subagents per agent, kept across restarts) and answers native
+  `thread/read` on the subagent reference its `subAgentActivity` items carry
+  (`claude:<session>:task:<id>`, `parentThreadId` = the agent's thread; adapter feature
+  `subagentTranscripts`). New capability `claude-subagent-transcripts`: the runtime's live frames for
+  such a subagent are published stream-only on the parent session (they never touch its record,
+  activity, usage or queue). Background subagents stay off. New capability
+  `thread-search-occurrences`: native `thread/searchOccurrences` (`{threadId, searchTerm, cursor?,
+  limit? 1..200}`) is forwarded for the bound thread only (read grant), for Claude agents and Codex
+  natives 0.160+; the home-wide `thread/search` stays denied.
+  Claude 智能体的前台子代理过程可以打开查看（有上限的记录，重启后仍在）；新增对话内搜索（Claude 智能体与
+  新版 Codex 原生）。
+- Claude agents: a history revert can also restore files (`cutex/session/history/revert`
+  `rewindFiles: true`, capability `claude-rewind-files`), and Claude Code file checkpointing is now on
+  by default for Claude profiles (applies from the agent's next start).
+  回退 Claude agent 的对话时可同时回退文件；Claude Profile 默认开启文件检查点（下次启动运行时生效）。
+- Claude agents: permission modes, project allow rules and same-turn steering (adapter feature flags
+  `claudePermissionModes`, `livePermissionMode`, `permissionRules`, `turnSteer`). The adapter now
+  changes the permission mode and plan mode during a running turn (a model / effort change still
+  waits for idle). New capability `claude-permission-rules`: `GET|PUT
+  /v2/sessions/{id}/claude-permission-rules` (owner only; `{allow, expectedRevision?}`, 409
+  `revision_conflict` / `unsupported_runtime`, 400 `invalid_rule`). cutex keeps the rules per working
+  directory in `~/.cutex/claude-permission-rules.json` (never in the repository), writes them to the
+  session's `permission-rules.json` at launch, and passes them to the SDK as flag settings
+  `permissions.allow`. A change reaches a running agent through `claude/permissionRules/reload`
+  (`apply_flag_settings`), otherwise its next start. An approval answered
+  `acceptWithClaudeRules` (offered from Claude's suggestions, at most 8) is applied for the session and
+  saved into the store. `turn/steer` on a busy subscription agent queues the input as a `soon` busy
+  delivery injected at the next main-agent PostToolUse, falling back to the next queued turn; the
+  user message appears in the running turn (`steered: true`). cutex then no longer routes such input
+  to the Claude queue (`input.sameTurnSteering`).
+  Claude 智能体：运行中可切换权限模式与计划模式；按工作目录保存的项目允许规则（保存在 cutex 主目录，不写入仓库）；
+  运行中发送的消息在同一回合内送达。
+- Claude agents can read Claude Code's own settings and use your MCP servers. A Claude Profile has two
+  new switches (Profile → Behaviour): the project's Claude Code settings (CLAUDE.md, `.claude/` rules,
+  subagents, commands, skills, hooks, permissions of the agent's workspace) and the account's user
+  settings (the Claude account's own folder, never `~/.claude`). Existing Profiles keep both off; Claude
+  Profiles created from now on start with the project settings on. Claude agents now also get the MCP
+  servers of the global / project / agent layers (stdio and streamable HTTP; secrets passed only in the
+  runtime environment), plus an off-by-default switch for the login's claude.ai connectors.
+  `GET /v2/sessions/{id}/claude-code` shows what an agent got and whether a restart is needed (capability
+  `claude-code-sources`; needs the Claude runtime from this release).
+  Claude 智能体可以读取 Claude Code 自己的设置并使用你配置的 MCP：Claude Profile 新增「读取项目的 Claude Code
+  设置」「读取账号的用户设置」开关（已有 Profile 默认关，新建的 Claude Profile 默认开项目设置），全局 / 项目 /
+  agent 三层 MCP 服务器也给 Claude 智能体；claude.ai 连接器单独开关、默认关；下次启动生效。
+- Claude runtime: fast mode for Opus 4.8 / Opus 5 models (the desktop's Fast toggle; reconnects the
+  same session), and a turn that fails on Claude Code's transient OAuth refresh lock before any output
+  is sent again automatically after 20 s, then 45 s, instead of failing.
+  Claude 运行时支持 Fast 模式；遇到 Claude Code 登录令牌刷新锁的瞬时失败时自动重发，不再直接失败。
+
+**Claude runtime fixes (claude-r16 to claude-r18)**
+
+- claude-runtime claude-r18 (adapter 0.7.5), r243 acceptance follow-ups: in "Ask first" mode a
+  cutex tool call (for example `agent_delegate`) waits for the owner on an ordinary approval card
+  that names the tool and its arguments, with Allow, Allow for this session, Decline and Cancel turn.
+  It used to be a form whose "Allow this invocation" checkbox started unticked, so accepting the card
+  without ticking it refused the call at once with "Not approved". Read-only cutex tools (for example
+  `agent_list`) no longer ask, like Claude Code's own read tools. With command execution off the
+  PowerShell tool is turned off too, and the system prompt says there is no shell tool and project
+  hooks do not run (Claude Code's own environment section still names the OS shell). Claude Code's
+  placeholder reply "No response requested." after an interrupted turn is never shown as Claude's
+  message.
+  「每次询问」模式下 cutex 工具调用改用写明工具名和参数的普通审批卡片并等待 owner 决定，只读工具不再询问；
+  关闭执行命令时同时关掉 PowerShell 并在系统提示里说明。
+- claude-runtime claude-r18 (adapter 0.7.5): a message sent while a Claude turn runs and then
+  interrupt & send reaches the model once. An owner interrupt now drops the turn's unread steers when
+  it is requested, so a tool call before the abort lands, or a turn that completes anyway, no longer
+  delivers the text besides the desktop's resend (claude-r16 delivered it as the new turn's message
+  and again as "The user sent this message while you were working" context); a failed interrupt keeps
+  them waiting, and steers with images are dropped the same way. The system prompt now tells Claude
+  that background subagents are refused (use foreground ones) and that a turn woken by a finished
+  background shell command cannot use tools, so it checks the result in the next user turn.
+  中断并发送时，运行中发出的消息只送达一次；系统提示词说明不支持后台子代理、后台命令完成通知唤醒的轮次不能用工具。
+- claude-runtime claude-r17 (adapter 0.7.4): with a Claude profile's command execution off, Claude
+  Code hooks no longer run. The adapter's flag settings carry `disableAllHooks: true`, so hooks from
+  the project / user settings sources (`.claude/settings.json`, the account home), skill or agent
+  frontmatter and plugins, and a statusLine command, are skipped; before, they ran as the OS user
+  even with Bash off. The adapter's own SDK callback hooks keep running (checked in Claude Code
+  2.1.289). With execution on, hooks behave as before. Claude Code's built-in auto memory is now off
+  for every Claude agent, not only when a settings source is on: memory stays cutex's project memory.
+  Claude Profile 关闭命令执行时，Claude Code 的 hooks 不再运行；Claude 自带的自动记忆对所有 Claude 智能体关闭。
+- claude-runtime claude-r16 (adapter 0.7.3): declares `features.approvalWait`; with the descriptor's
+  `approvalWaitSecs` it gives the façade the hold and the calling turn, and runs `service_register`,
+  `service_update`, `agent_create`, `member_replace` with a 150 s timeout instead of 30 s;
+  `delegation_wait` always gets 150 s (its Bus wait is up to 120 s and used to be cut at 30 s).
+  claude-r16 支持审批等待：相关工具调用超时延长到 150 秒，`delegation_wait` 不再在 30 秒时被截断。
+- claude-runtime claude-r16: restarting or stopping a Claude runtime while a turn runs (Restart
+  runtime, Offline, profile switch, archive) now interrupts that turn first, as cutex does for a
+  Codex runtime, so it ends `interrupted` with its open tool calls closed before the runtime goes
+  away (before: `failed`, "Runtime closed before terminal result"). Only a confirmed interrupt claims
+  that; if the native runtime does not drain it in time, the turn still ends `failed` (outcome
+  uncertain). A turn the previous adapter process left running (killed, crashed, host restart) is
+  settled on the next start as `interrupted` (was `failed`), every open item of it closed (not only
+  command, file, MCP and dynamic tool calls), and the settling `item/completed` / `turn/completed`
+  events are sent to each client that resumes the thread until its next turn starts: nobody was
+  connected when they were written, so clients kept showing the turn and its tool as running. The
+  offline history reader (a stopped agent) reads such a turn as `interrupted`, like cute-codex for a
+  thread not loaded.
+  Claude 智能体运行中重启运行时，正在进行的回合现在显示为已中断，工具不再一直转圈。
+- claude-runtime claude-r16: the last text of a Claude turn now reaches live clients as the final
+  answer (`agentMessage.phase` `final_answer`): it completed as commentary, and only the saved copy
+  was marked final, so a desktop or delegation watching live saw commentary until a reload. The
+  terminal result now sends the same item again with `item/completed`.
+  Claude 回合的最终回复现在实时标记为最终答案，无需重新加载。
+- claude-runtime claude-r16: an owner message steered into a running Claude turn (`turn/steer`) that
+  the turn never read is now dropped when the turn ends interrupted or failed, as cute-codex drops
+  unread steers on an abort; the desktop's "interrupt & send" resends it. Before, it stayed queued
+  and was injected into the next, unrelated turn at its first tool call: after Esc with a waiting
+  message the model got it twice and the conversation showed it twice. A turn that completes still
+  runs an unread steer as the next turn.
+  运行中发送给 Claude 的消息在回合被中断后不再被重复送达。
+- claude-runtime claude-r16: permission denials the Claude adapter answers itself no longer tell the
+  model "The user did not approve this tool call" when no owner answered: a request that matches no
+  live tool call (turn ended, runtime restarting) or that nobody answered (no owner client connected)
+  now says so and that nobody refused it; only the owner's own Decline or Cancel says the owner
+  declined. Claude Code's own "The user doesn't want to proceed with this tool use…" is not adapter
+  text: Claude Code writes it for every tool call of a batch when its turn is aborted (an approval
+  answered Cancel, or Claude Code's auto mode classifier notice it cannot show to an SDK host).
+  Claude 适配器自己拒绝工具调用时，不再声称是用户拒绝的。
+
+**Profiles**
+
+- Profile looks live on the host (capability `profile-avatar`), so every device that connects shows
+  the same ones. `GET|PUT|DELETE /v2/profiles/{p}/avatar` stores a Profile picture (PUT
+  `{contentType, data}`: a square PNG / JPEG / WebP of at most 48 KiB, 16..=512 px, the same rules
+  as user avatars) and `GET|PUT|DELETE /v2/profiles/{p}/intro-portrait` the intro portrait (at most
+  2 MiB, any aspect, each side at most 1024 px); GET answers the image with an ETag
+  (`If-None-Match` gives 304). Profile items carry `avatarEtag` / `introPortraitEtag`;
+  `appearance.avatarThemes` (a non-empty list of unique known theme ids, `detail.avatarThemeOptions`;
+  null = the client's default by model family) and `appearance.introGreeting` (at most 300
+  characters) are PATCHable like `color` (null clears). Images are keyed by profile id (a rename
+  keeps them), removed with the profile, not copied by duplicate / export, and stored under
+  `runtime/profile-avatars/` (never `config.json` / `accounts.json`); themes and greeting are
+  `accounts.json` `options.avatar_themes` / `options.intro_greeting`. No migration. Rollback: an
+  older cutex ignores `runtime/profile-avatars/` and keeps the two options in its unknown-field
+  `extra`, so a roll-forward finds them again; it does not serve or list them meanwhile.
+  Profile 的头像、介绍立绘、头像主题和问候语保存在主机上，所有连接的设备看到的都一样；不随复制 / 导出带走。
+
+**Approvals**
+
+- Approval decisions are traceable (capability `approval-decided-by`): a decided owner approval
+  records `decidedBy {by: "owner", connection: "loopback" | "remote", peer?, client?}`, where
+  `client` is what the deciding client sends about itself in the new optional `client {app, version,
+  device, surface, input}` field of `POST /v2/approvals/{id}/approve|deny`, and every decision writes
+  one `cutex-approval-decided` line to the Management log. Older records without `decidedBy` read as
+  before. Found while chasing an r243 acceptance denial nobody remembered making: only that endpoint
+  (root credential) ever denies an approval.
+  审批记录现在会记下是谁、从哪个客户端做的决定，管理日志里也有对应一行。
+- Owner approvals hold the agent's tool call (approval-wait): a gated `service_register` /
+  `service_update` (managed, persistent, outside static root) or an `agent_create` /
+  `member_replace` on an approval-gated profile now waits up to 120 s for the owner's decision.
+  Approved in the window, the call proceeds and returns its normal result (approval used once, no
+  retry, no decision notice); denied, it answers `approval_denied`; otherwise it answers
+  `approval_required` as before and the request stays on Approvals. Opt-in per caller, so pinned
+  older façades / adapters answer at once: cutex sets `CUTEX_MCP_APPROVAL_WAIT_SECS` for Codex
+  façades and for Claude adapters declaring `features.approvalWait` (claude-r16). The hold ends
+  without using an approval when the caller's connection closes, its turn ends (Management sees
+  `turn/completed`; Codex never cancels the MCP call on interrupt) or its runtime was replaced; the
+  decision notice then follows as before. Approval records gain `wait {id, startedAt, until,
+  threadId?, turnId?, endedAt?, end?}` and `cutex/approvals/changed` reports `waiting` /
+  `wait_ended`. Capability `approval-wait`.
+  审批时工具调用最多等待 120 秒：期间批准则直接继续执行并返回结果，拒绝则返回拒绝，超时才回到原来的
+  `approval_required` 流程。
+- Approved after waiting (Q21): when an agent's tool call held for the owner's decision
+  (approval-wait: `service_register` / `service_update` gates, `agent_create` / `member_replace`
+  with a profile that needs approval) and the owner approved it during the hold, the successful
+  result now says so: `approval {decision: "approved", waitedSecs, approvalId, detail}` and a
+  `detail` that starts with "The owner approved this request after N s; it has been carried out.",
+  so the agent neither assumes it ran unreviewed nor retries it. Results that needed no approval,
+  or used an approval granted before a retry, are unchanged. Agent Management results carry it only
+  to façades announcing `approval-note=1` in `X-Cutex-Facade` (this release's façade), and only on
+  a complete receipt; older façades get the old result.
+  等待期间被批准的调用，成功结果会说明「主人在 N 秒后批准，已执行」，智能体不会误以为未经审核或重复执行。
+- Owner approvals requested in the Agent Bus process (managed / persistent services, agent
+  profiles) now reach clients live: Management serve watches `runtime/approvals/approvals.json` (a
+  metadata check every 2 s) and publishes `cutex/approvals/changed` for every state it did not
+  publish itself (reasons `requested | approved | denied | consumed | expired`). Before, those events
+  were appended from the Bus process only and never reached Management's live subscribers, so the
+  desktop showed no alert, badge or card until something else reloaded the list. Capability
+  `approvals-live`.
+  Agent Bus 里发起的审批（托管 / 常驻服务、智能体 Profile）现在实时推送到客户端，桌面端立即显示提醒和卡片。
+- After the owner approves or denies a request the agent has to retry itself (`managed_service`,
+  `service_lifetime`, `static_root`, `agent_profile`, `browser_open`), the requester gets a short
+  cutex message ("approved apr-…: retry the same call now" / "denied …: do not retry"), queued
+  through the alarm scheduler (owner `cutex.approvals`, `after_turn`, so a busy agent reads it after
+  its turn). The tool still answers `approval_required` until approved; the refusal text now says
+  the message will come. Capability `approval-decision-notice`.
+  审批结果会以消息通知发起的智能体，不必轮询。
+- A tool call repeating a request the owner already denied (same digest, denial still live)
+  still answers `approval_denied` at once, but the detail now says it is that earlier decision:
+  when the owner denied it, until when the same request stays denied (24 h after the decision),
+  and to change the request (another slug, command or target) or ask the owner. New refusal
+  fields `denied_at`, `denied_until`, `reused_denial: true`. A denial decided while the call
+  waited keeps the old text.
+  重复已被拒绝的同一请求时，拒绝说明会写明这是先前的决定、拒绝时间和有效期。
+
+**Agent services**
+
+- Agent services: `service_register` / `service_update` validate the whole request (slug, fields,
+  ownership, port, root) before raising any owner approval, so the owner is never asked to approve a
+  request that then fails (capability `static-root-approval`). Static roots: a root inside the
+  caller's cwd or project workspace needs nothing; an agent whose cwd is its own cutex-managed
+  scratch workspace (`~/.cutex/agents-scratch/<id>`, `~/.cutex/chats/<id>`, e.g. a Human agent
+  created without cwd) may now serve from inside that cwd (the rest of the cutex home stays
+  forbidden); any other existing directory or `.html` file outside the cutex home now raises an owner
+  approval naming the canonical root (new approval kind `static_root`; folded into the one
+  `service_lifetime` approval when the request is also persistent, `details.staticRoot` /
+  `allowedRoots`) instead of a hard refusal. Still refused (403 `static_root_forbidden`): the cutex
+  home, filesystem roots, the user home or any directory containing it or the cutex home; the detail
+  now names the sent root and lists the caller's allowed roots. An agent's re-register of its own
+  service with an unchanged, already approved root asks nothing again.
+  静态服务根目录：先完整校验再请求审批；cwd / 项目工作区之外的目录改为请主人审批，不再直接拒绝；
+  scratch 工作区里的 agent 可以发布自己 cwd 下的页面。
+- Managed services follow the agent's live permissions (Q21): `service_register` /
+  `service_update` decide whether a managed command is within the caller's envelope (full access:
+  sandbox `danger-full-access` + approval `never`, no approval card) from the live native thread
+  settings of its current runtime, like `browser_open`, instead of the permissions it was launched
+  with; switching a running agent to Full access no longer leaves an approval card. Runtime
+  managers write the permission fields of those settings to
+  `runtime/live-thread-settings/<cutex session id>.json` for the Agent Bus; without a file for the
+  current runtime generation and thread the stored launch permissions decide, as before.
+  托管服务按智能体当前的实时权限判断是否需要审批；运行中切换到完全访问后不再弹出审批卡片。
+- New agent tool `service_restart {slug}` (capability `services-agent-restart`): the owning agent
+  restarts its running managed service with the unchanged command, cwd and env, e.g. after editing
+  its code. No owner approval (the grant that let the command run covers its restarts); same
+  ownership rule as `service_update` / `service_unregister`. External / static services answer
+  409 `not_managed`, a service the owner stopped 409 `service_stopped` (only the owner starts it
+  again). The Agent Bus records `restartRequestedAt` on the registry record; the supervisor in
+  Management serve restarts it on its next pass through the owner's restart path (kill, wait for
+  the port, start; restart budget reset). The call returns once the request is recorded.
+  智能体可用 `service_restart` 重启自己的托管服务（命令不变，无需审批）。
+- `service_update` no longer asks the owner again when the effective runtime, command, cwd and env
+  (after the env merge) equal the stored record (as an identical re-register already did); any
+  change of these is still gated.
+  `service_update` 的运行时、命令、cwd 和环境变量与已存记录相同时不再重复请求审批。
+- A service unregistered (or reclaimed) and registered again under the same slug no longer shows
+  the old service's `lastTrafficAt`: traffic from before a record's `createdAt` is ignored, the
+  supervisor drops the slug's traffic counters on removal, and a record replaced between two
+  supervisor passes starts with a fresh process / health / traffic entry. Ephemeral idle reclaim
+  is unchanged.
+  同名服务注销后重新注册，不再继承旧服务的最近流量时间。
+
+**Sessions and agents**
+
+- Session resources (`GET /v2/sessions` items and single sessions) carry
+  `runtime.pendingServerRequests: [{id, method}]` (capability `session-pending-server-requests`):
+  the native requests of the current runtime generation (approvals, questions, ...) still waiting
+  for an answer, oldest first, empty when none. A client that connects after a request was sent
+  now sees it without replaying the event stream; the full messages stay in the session bootstrap.
+  A request still pending when its turn completes is now marked resolved.
+  会话带上仍在等待回答的原生请求（审批、提问等），后连接的客户端无需回放事件流即可看到。
+- Session conversation activity (capability `session-conversation-activity`, `sessionActivity`
+  version 3): session resources carry `activity.lastConversationAt`, the last real conversation
+  activity (a turn started, agent output, a tool call, a file change, or a turn that ended other
+  than interrupted), and `activity.lastTurnStartedAt`, both kept in `session-activity-state.json`. A
+  runtime start, stop, restart or reconnect, the interrupt of a turn a restart left in progress, and
+  session metadata / profile / settings changes never move it; stores written by older binaries
+  derive it from their turn and item times until the next event. `/v2/summary`
+  `agents[].lastActivityAt` now follows it (then a non-interrupted last turn end, then `createdAt`)
+  instead of the runtime's `lastEventAt` / `updatedAt`, which a restart or a rename refreshed.
+  会话新增 lastConversationAt（只算真实对话活动），摘要的 lastActivityAt 不再因运行时重启、重连或改名而刷新。
+- An archived (closed) Agent's name can be used again: creating an Agent with it failed after the
+  native thread existed (`session_adopt_persistence_unknown: agent name was concurrently assigned to
+  another record`) and left the name reserved. Names stay unique among live Agents; restoring an
+  archived Agent while a live one holds its name is refused with `agent_name_taken` (409).
+  已归档智能体的名字可以重新使用；恢复归档智能体时若名字已被占用则拒绝。
+- A `member_replace` that stopped before its successor existed (for example while checking the
+  predecessor) no longer keeps the successor name reserved for good: the next request for that name
+  in the same Project releases it (`reservation_released_pre_effect`) instead of failing with
+  `unresolved_agent_reservation`.
+  中途停止的 `member_replace` 不再永久占用继任者的名字。
+- r244 acceptance (Windows): a Director's `member_runtime restart` and `member_replace` of a Claude
+  member failed with `runtime recovery mismatch: cwd` / `managed Agent observation mismatch: cwd`.
+  Claude agents stored the Win32 verbatim form of their directory (`\\?\F:\x`, from
+  `canonicalize()`), the adapter reports that form in every settings update, and that text replaced
+  the agent's managed cwd (`F:\x`). Managed cwd checks now treat a verbatim spelling as the same
+  directory (also for the derived cwd group), settings updates no longer rewrite a managed cwd that
+  names the same directory, and new Claude agents (and `human config` cwd changes) store the plain
+  form. Claude permission rules saved under a verbatim workspace key are found under the plain one.
+  Windows：修复 Director 重启或替换 Claude 成员时报 cwd 不一致（`\\?\` 路径形式）。
+- An agent launch (`cutex run --agent`, session runtimes) no longer turns the Agent Bus on in a
+  home whose `config.json` has `agent_bus_enabled: false`: the management check before the launch
+  forced the switch on, so the agent-mode bus check always passed and the launch probed or
+  started a bus anyway. Homes with the bus enabled behave as before.
+  智能体启动不再强行打开已关闭的 Agent Bus 开关。
+
+**Delegations and agent tools**
+
+- Delegation review (`ask_delivery`): a Claude agent's tool switches count as capabilities. A
+  Claude requester with command execution off is reviewed when it delegates to an agent that can run
+  commands (every Codex agent; difference `commandExecution`), and one with neither file editing nor
+  command execution when the target can write files (`fileWrite`). Before, its "Full access" /
+  "Auto" label made it look like it could do everything, so such delegations went straight to the
+  queue. Other agents' capability digests are unchanged.
+  关闭执行命令的 Claude 智能体委托能执行命令的智能体时，现在会进入待审核。
+- Delegation gate (`ask_delivery`): the target's own cutex-assigned scratch cwd
+  (`<cutex home>/agents-scratch/<id>` or `<cutex home>/chats/<id>`, used by no other session) is no
+  longer compared with the requester's writable roots, so two cwd-less agents of one project can
+  delegate to each other without a review per ask. Every other root, including any other path in
+  the cutex home, is compared as before (`docs/agent-tool-security.md` §7).
+  两个无工作目录（使用私有 scratch 目录）的智能体之间的委托不再每次都需要审批。
+- Delegation results that arrive together are listed in the order they arrived (by delivery time),
+  in the coalesced message and in `delegation_wait`; before, a later result could come first.
+  同一批送达的委托结果按到达顺序排列。
+- `agent_list` stays small with a paired host (one with hundreds of offline agents made it about
+  50K characters, over Claude Code's tool-result limit). Local agents: own project first, offline
+  last, at most `limit` (default 50, max 200) per call with `next_cursor` / `cursor`, plus
+  `agents_total` and `agents_offline`. `otherHosts[]`: per host `agentCount`, `offlineCount`,
+  `listedCount`, at most 10 idle / busy agents and `more` (the call that lists the rest);
+  `host: "<label>"` pages one host's agents, `include_offline: true` includes offline ones. Row
+  fields are unchanged.
+  `agent_list` 默认输出变得紧凑：其他主机的离线智能体只计数，可按主机分页查看。
+- Browser scroll outcome (capability `browser-scroll-outcome`): a `browser_act` wheel scroll result
+  may carry `scroll {dx, dy, atEdge}` from the desktop, the CSS px the scrolled container moved and
+  whether it is now at the edge in the requested direction (for example the bottom after `down`).
+  cutex validates the field strictly and passes it to the agent; desktops send it only to a host
+  that advertises the capability.
+  browser_act 的滚动结果可附带实际滚动距离和是否已到边缘（scroll {dx, dy, atEdge}）。
+- MCP façade (`cutex-mcp`): `resources/list`, `resources/templates/list` and `prompts/list` now
+  answer empty lists instead of the generic -32602 "Cutex rejected operation…" error (Codex's
+  `list_mcp_resources` calls them without checking capabilities; `initialize` still advertises only
+  `tools`). Other unknown request methods answer JSON-RPC -32601 "Method not found".
+  MCP 外观对 resources / prompts 列表请求返回空列表，不再报错；其他未知方法返回「Method not found」。
+
+**Proxy**
+
+- Proxy settings v1 (capabilities `proxy-modes`, `profile-proxy`). `/v2/settings` `proxy` now has a
+  `mode`: `system` (nothing stored: the daemon's environment, then on Windows the per-user system
+  proxy from the registry `ProxyServer` / `ProxyOverride`; no PAC / WPAD — PAC users enter a manual
+  URL), `none` or `manual` (URL with optional Basic `user:password@`, plus `noProxy`). The view adds
+  `system` (what "follow system" resolves to right now and from where), `loopbackNoProxy` (always
+  bypassed, not editable), `editable` and a `warning` for SOCKS URLs; credentials are never
+  returned. It is the default every Profile inherits and, new, the proxy of cutex's own requests:
+  backend upgrades and component downloads, the LiteLLM price catalog, webhooks and the official
+  Claude usage reader (all through one helper; loopback always direct). `/v2/profiles` items carry
+  `proxy` {`mode` inherit | none | manual, redacted URL, `effective` {mode, url, source}}; PATCH
+  `proxy` {mode, url?, noProxy?} | null. A Profile's effective proxy now also reaches its Claude
+  runtimes (the adapter and Claude CLI get `HTTPS_PROXY` / `NO_PROXY`; follow-system on Windows hands
+  over the registry proxy, which the Claude CLI does not read itself), its quota readers, model
+  discovery and `web_search`. An explicit "no proxy" sets `NO_PROXY=*,0.0.0.0/0,::/0` as well, so
+  runtimes that fall back to the Windows system proxy when `HTTP(S)_PROXY` is empty connect directly.
+  Only the root credential may change proxies (a client / device token gets 403
+  `proxy_owner_credential_required`); a proxy that wants credentials reads "the proxy requires
+  authentication (HTTP 407)". SOCKS URLs only reach the runtimes (cutex's own HTTP client has no
+  SOCKS support and refuses them instead of silently going direct). Retired: `forceHttpTransport`
+  (API 400), `--force-http` / `--proxy-force-http` and `CUTE_CODEX_FORCE_HTTP_TRANSPORT` (no native
+  read it); stored `force_http_transport` keys are ignored and dropped on the next save. `cutex proxy
+  show` redacts proxy credentials.
+  代理设置 v1：主机代理可选跟随系统 / 不使用 / 手动，同时作为 Profile 的默认值和 cutex 自身下载（升级、组件、
+  价格目录、webhook）的代理；Profile 可单独设置（继承 / 不使用 / 手动），并用于其 Claude 运行时、额度读取、
+  模型发现和 web_search；只有主机自己的凭据能修改。
+- Proxy settings: switching the host proxy (`/v2/settings` `proxy`) or a Profile's proxy
+  (`/v2/profiles` `proxy`) to `mode: none` no longer discards the manual address. It is stored with
+  the setting turned off (`enabled: false`, `url`, `noProxy`), still returned (redacted) in the
+  view, and switching back to `manual` without a `url` restores it. While off it is never used:
+  runtimes still get the explicit direct-connection variables and cutex's own requests go direct.
+  `url: null` forgets it; `system` / `inherit` still store nothing.
+  代理切换为“不使用”时保留之前填写的手动代理地址，切回“手动”即可恢复。
+- Loopback traffic never goes through a proxy. cutex and cutex-mcp add `127.0.0.1,localhost,::1`
+  to `NO_PROXY` / `no_proxy` at start (inherited by native runtimes, the Claude CLI and tools), and
+  the environment cutex builds from a configured global / Profile proxy always carries them too
+  (before, a proxy with no NO_PROXY sent the runtimes' own calls to cutex — the Claude MCP binding,
+  streamable-HTTP MCP servers — and requests to a model server on 127.0.0.1 through the proxy).
+  回环地址不再走代理：cutex 启动时把 127.0.0.1、localhost、::1 加入 NO_PROXY，配置的全局 / Profile 代理同样始终带上。
+
+**Upgrade and components**
+
+- Rollback to an older cutex no longer leaves it unable to read its stores. While the services are
+  stopped, the rollback removes approval records of kind `static_root` (an older release reported
+  the whole approval store as corrupt) and clears a Claude agent's pending launch permission mode
+  (set by `claude-launch-permission-mode` until the agent's first start; an older release could not
+  load any session). Both are copied to the run's `displaced/older-stores/` first. Upgrade backups
+  now also cover `claude-permission-rules.json`, `claude-skills/`, `runtime/profile-avatars/` and
+  `runtime/live-thread-settings/`.
+  回退到旧版 cutex 时，会先移走旧版无法读取的 static_root 审批记录并清除 Claude 智能体待生效的启动权限模式
+  （另存到本次运行的 displaced 目录），旧版不再因此无法读取审批或会话；升级备份也包含新增的存储。
+- `GET /v2/upgrade` `installed` gains `notes` (`{en, zh-CN}` as in the release manifest) and
+  `publishedAt`, read from the installed release's committed manifest
+  (`releases/<release>/manifest.json` under the install base); null when unknown (unmanaged
+  installs, a release without a manifest). Capability `upgrade-installed-notes`.
+  已安装版本也带上发布说明与发布时间。
+- Components: claude-runtime claude-r19 (adapter 0.7.6; the entries above) and job-service 0.1.1.
+  job-service 0.1.1 changes no behaviour: its archive now ships LICENSE, NOTICE and
+  THIRD_PARTY_NOTICES.md (Apache-2.0, like the rest of cutex), and the claude-runtime archive ships
+  THIRD_PARTY_NOTICES.md for its vendored wheels. No new cute-codex native (stays 0.160.0-r52.3).
+  组件：claude-runtime claude-r19、job-service 0.1.1（行为不变，只是压缩包附带许可证与第三方声明）；
+  没有新的 cute-codex 原生运行时。
+
+**Platforms**
+
+- macOS (Apple silicon) as a backend host, MVP level: cutex builds and runs there with Codex
+  agents on a Mac-built native (Seatbelt `workspace-write` sandbox) and Claude agents. Process
+  identity comes from libproc instead of `/proc`; stop and restart signal the runtime's whole
+  process family (process group, session, parent tree) since there is no cgroup; the follow-system
+  proxy reads `scutil --proxy` (source `macosSystem`); new platform key `darwin-arm64` (manifests,
+  components, upgrades; `claude-runtime` lists it); `cutex service install` gains a launchd backend
+  (per-user agents `dev.cutex.agent-bus` / `dev.cutex.management-api`; generated and unit-tested,
+  not yet exercised on a real Mac). Job Service, NCI and inbound mail stay Linux-only. No release
+  artifacts for macOS yet; see `docs/macos/PROBE.md` and `docs/macos/MVP.md`. Linux and Windows
+  behaviour is unchanged.
+  macOS（Apple 芯片）可作为后端主机运行（MVP）：Codex 与 Claude 智能体均可在 Mac 上运行，尚无正式发布包。
+- Test port guard (debug builds only): every process the test-home guard covers (cargo test
+  harnesses, debug `cutex` with `CUTEX_TEST_FORBID_REAL_HOME`) and every debug process on a
+  `CUTEX_TEST_PRIVATE_HOME` follows the instance port rules. It never resolves, accepts, connects
+  to, binds or hands off a default-instance port (24270, 24260, 24670, 24660, 24250): an unset or
+  stored default bus / management port resolves to 0, `ensure_agent_bus_config` gives the home a
+  free bus port of its own and keeps it in `config.json`, the shared HTTP / bus connect helpers
+  and the management listeners refuse those ports, and no Bridgeboard handoff is registered.
+  Integration tests that ran `cutex run --agent` could reach or spawn the machine's live bus on
+  24260 before. Release builds are unchanged.
+  调试构建的测试进程不再连接、注册或占用默认的 24260 / 24270 等端口。
+
+## 0.1.3 "First Take" (2026-10-17)
 
 New cute-codex native 0.160.0-r52.3 (Windows: Store PowerShell works under the sandbox without
 administrator rights), network access and extra writable folders changeable on a running session, agent
@@ -47,12 +555,12 @@ browser tools in independent instances, and usage fixes. 新的 cute-codex 原�
   `glm-5.3`) is one row in `GET /v2/usage?groupBy=model` and one `unpricedModels` entry, keyed by the
   lowercase id. Stored samples keep their spelling. 用量按模型：大小写不同的同一模型合并为一行（显示小写 id）。
 
-## 0.1.2 (2026-10-17)
+## 0.1.2 "First Take" (2026-10-17)
 
-Codex's automatic reviewer for 「自动」, Windows sandbox readiness, Profile transfer between hosts, and
+Codex's automatic reviewer for "Auto", Windows sandbox readiness, Profile transfer between hosts, and
 fixes for Windows API-key Profiles, forked agents and artifact previews. No new cute-codex native:
 new agents get this release's tools with the host's current native. 「自动」使用 Codex 自动审批员；
-Windows 沙箱就绪检查；Profile 可在主机之间复制；修复 Windows API-key Profile、分叉智能体删除和成果预览。
+Windows 沙箱就绪检查；Profile 可在主机之间复制；修复 Windows 上的 API-key Profile、分叉智能体删除和成果预览。
 
 **Permissions and approvals**
 
@@ -60,7 +568,7 @@ Windows 沙箱就绪检查；Profile 可在主机之间复制；修复 Windows A
   `launch.approvalsReviewer` (`user` | `auto_review`) on `POST /v2/human/agents` /
   `/v2/human/sessions`, `newThreadDefaults.<kind>.approvalsReviewer` (built-in `auto_review` for agents
   and quick chats), stored on the session, sent on every thread start / resume and kept in sync with
-  `thread/settings/updated`. The desktop's 「自动」 mode now means workspace-write + on-request +
+  `thread/settings/updated`. The desktop's "Auto" mode now means workspace-write + on-request +
   Codex's automatic reviewer. See [docs/FRESH-AGENT-PERMISSIONS.md](docs/FRESH-AGENT-PERMISSIONS.md).
   新线程默认使用 Codex 自动审批员。
 - Automatic reviewer on API-key profiles without a model catalog on their own provider (relays): the
@@ -75,7 +583,7 @@ Windows 沙箱就绪检查；Profile 可在主机之间复制；修复 Windows A
   runtime, or the shared Codex home, whether a Windows sandbox is set up (native
   `windowsSandbox/readiness`), and set up the unelevated one (`windowsSandbox/setupStart`
   `{mode: "unelevated"}`; no administrator rights). Without a sandbox native asks before every
-  command in 自动 / workspace-write. Elevated setup (UAC, local sandbox users, firewall rules) stays a
+  command in Auto / workspace-write. Elevated setup (UAC, local sandbox users, firewall rules) stays a
   manual step on that host. Windows 沙箱就绪检查与免管理员设置。
 
 **Profiles**
@@ -135,7 +643,7 @@ Windows 沙箱就绪检查；Profile 可在主机之间复制；修复 Windows A
   refuses. They now create it with the protected owner-only DACL. Existing installs recover on their
   own: the credential check re-protects a profile `auth.json` whose ACEs all grant only this account
   (e.g. one inherited `(I)(F)` ACE, also left by a native token refresh); a file shared with any other
-  account is still refused. 修复 Windows 上保存 API key Profile 后无法创建智能体（auth.json 权限），已有安装自动修复。
+  account is still refused. 修复 Windows 上保存 API key 的 Profile 后无法创建智能体（auth.json 权限），已有安装自动修复。
 - Deleting an agent that had been forked was refused with `session_referenced`
   (`nativeForkReferences`), also after the fork itself was deleted: `cutex/session/fork` left a native
   copy of the fork behind in the source's home. The fork now deletes that copy once adopted, and a
@@ -161,7 +669,7 @@ Windows 沙箱就绪检查；Profile 可在主机之间复制；修复 Windows A
   another process still holds its pty. 关闭终端一定会结束它。
 - Static services: `not_supervised` names the runtime (static / external) that has no process to stop.
 
-## 0.1.1 (2026-10-16)
+## 0.1.1 "First Take" (2026-10-16)
 
 Optional components and a notification worker for managed installs. 可选组件；托管安装自带通知 worker。
 

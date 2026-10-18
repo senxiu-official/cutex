@@ -6,7 +6,7 @@ fn metadata_is_the_component_json_and_matches_the_adapter_release() {
     let runtime = ClaudeRuntime::default();
     let meta = runtime.metadata();
     assert_eq!(meta.name, NAME);
-    assert_eq!(meta.platforms, vec!["linux-x64".to_string(), "windows-x64".to_string()]);
+    assert_eq!(meta.platforms, vec!["linux-x64".to_string(), "windows-x64".to_string(), "darwin-arm64".to_string()]);
     let features: Value =
         serde_json::from_str(include_str!("../../components/claude-runtime/src/cute_claude/features.json")).unwrap();
     assert_eq!(features["release"], meta.version.as_str(), "component version = features.json release (contract §0.5)");
@@ -127,6 +127,7 @@ fn fake_session(id: &str, deployment: ClaudeDeployment) {
         exec_explicit: false,
         native_session_id: None,
         connection_id: None,
+        initial_permission_mode: None,
     });
     let mut store = crate::session::store::load_cutex_session_store().unwrap();
     store.sessions.insert(id.to_string(), record);
