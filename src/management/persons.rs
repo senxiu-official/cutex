@@ -17,7 +17,12 @@
 //!   the token → user binding stays in `users-v1.json`). `tokenClaims`: when,
 //!   the self-set name a pending device sent, and the previous key when a
 //!   device later presented another one. `peerPersons`: peerId → the remote
-//!   owner's keys sent at peer pairing.
+//!   owner's keys sent at peer pairing. `ownerPerson` (capability
+//!   `host-owner-person`, cutex-desktop
+//!   docs/research/host-ownership-20261019.md §1): which owner key is the
+//!   host owner *in person*; see [`OwnerPerson`] and [`effective_owner_person`].
+//! - Fields this build does not know are kept on rewrite (`extra`), so a
+//!   later field survives a rollback to this build.
 //! - Challenges live in memory only: one use, [`CHALLENGE_TTL`], at most
 //!   [`MAX_CHALLENGES`] outstanding ([`MAX_CHALLENGES_PER_CALLER`] per caller).
 //! - Public keys are stored and shown as base64url without padding of the raw
@@ -81,6 +86,30 @@ pub struct TokenClaim {
     pub previous_public_key: Option<String>,
 }
 
+/// Sources of [`OwnerPerson`] with a key: the first key added to owner by a
+/// root-credential claim, by the host's first paired device, set locally
+/// (CLI / root credential on loopback), or inferred from the audit log /
+/// the only owner key when the field was first written.
+pub const OWNER_PERSON_SOURCES: &[&str] = &["firstRootClaim", "firstPairing", "local", "audit"];
+/// Sources of an explicitly unconfirmed [`OwnerPerson`] (`publicKey` null):
+/// cleared locally, its key removed from owner, or not determinable when the
+/// owner keys first changed after an upgrade.
+pub const OWNER_PERSON_UNSET_SOURCES: &[&str] = &["local", "keyRemoved", "undetermined"];
+
+/// `ownerPerson` in persons-v1.json: absent = never decided (inferred on
+/// read, see [`effective_owner_person`]); `publicKey` null = explicitly
+/// unconfirmed (no inference; only a local set confirms it again).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerPerson {
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub set_at: String,
+    #[serde(default)]
+    pub source: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
@@ -98,6 +127,12 @@ pub struct State {
     /// peerId → the remote owner's keys (sent at peer pairing).
     #[serde(default)]
     pub peer_persons: BTreeMap<String, Vec<String>>,
+    /// The owner in person (host-owner-person); absent on older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_person: Option<OwnerPerson>,
+    /// Unknown top-level fields, written back unchanged.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 impl Default for State {
@@ -109,6 +144,8 @@ impl Default for State {
             token_persons: BTreeMap::new(),
             token_claims: BTreeMap::new(),
             peer_persons: BTreeMap::new(),
+            owner_person: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -130,6 +167,51 @@ impl State {
         let keys = self.users.entry(user.to_string()).or_default();
         if !keys.iter().any(|k| k.public_key == key) {
             keys.push(PersonKey { public_key: key.to_string(), added_at: now.to_string(), label: None });
+        }
+    }
+
+    /// Add a claimed key to owner. The first key ever added to an owner
+    /// without an `ownerPerson` becomes the owner person (`source`); a file
+    /// written before host-owner-person first settles its inferred owner
+    /// person, so a later claim never takes over.
+    fn add_owner_key(&mut self, key: &str, source: &str, audit_dir: &Path) {
+        self.settle_owner_person(audit_dir);
+        let first = self.owner_person.is_none() && self.keys_of(OWNER).is_empty();
+        let now = crate::management::instance::now_utc();
+        self.add_key(OWNER, key, &now);
+        if first {
+            self.owner_person = Some(OwnerPerson { public_key: Some(key.to_string()), set_at: now, source: source.into() });
+        }
+    }
+
+    /// Before owner's keys change: a file without `ownerPerson` but with
+    /// owner keys gets its inferred owner person written down (source
+    /// `audit`), or an explicit unconfirmed marker (`undetermined`), so the
+    /// change cannot shift the inference.
+    fn settle_owner_person(&mut self, audit_dir: &Path) {
+        if self.owner_person.is_some() || self.keys_of(OWNER).is_empty() {
+            return;
+        }
+        let now = crate::management::instance::now_utc();
+        self.owner_person = Some(match infer_owner_person(self, audit_dir) {
+            Some(key) => OwnerPerson { public_key: Some(key), set_at: now, source: "audit".into() },
+            None => OwnerPerson { public_key: None, set_at: now, source: "undetermined".into() },
+        });
+    }
+
+    /// The owner person's key is no longer one of owner's keys: unconfirmed.
+    fn drop_removed_owner_person(&mut self) {
+        let removed = self
+            .owner_person
+            .as_ref()
+            .and_then(|person| person.public_key.as_deref())
+            .is_some_and(|key| !self.keys_of(OWNER).iter().any(|k| k.public_key == key));
+        if removed {
+            self.owner_person = Some(OwnerPerson {
+                public_key: None,
+                set_at: crate::management::instance::now_utc(),
+                source: "keyRemoved".into(),
+            });
         }
     }
 
@@ -307,15 +389,26 @@ impl UserStore {
         &self,
         mutate: impl FnOnce(&mut users::State, &mut State) -> Result<T, UserError>,
     ) -> Result<T, UserError> {
+        self.with_persons_via(users::VIA_ASSIGNED, mutate)
+    }
+
+    /// [`Self::with_persons`]; a token newly bound to owner is a new owner
+    /// device reached `via` (see `UserStore::with_via`).
+    pub fn with_persons_via<T>(
+        &self,
+        via: &str,
+        mutate: impl FnOnce(&mut users::State, &mut State) -> Result<T, UserError>,
+    ) -> Result<T, UserError> {
         let unavailable =
             |e: anyhow::Error| UserError::new(503, "users_unavailable", format!("the persons store is unavailable: {e:#}"));
         let known_tokens: Option<HashSet<String>> =
             self.tokens().list().ok().map(|tokens| tokens.into_iter().map(|t| t.token_id).collect());
-        self.with(|state| {
+        self.with_via(via, |state| {
             let mut persons = read(self.dir()).map_err(unavailable)?;
             let before = persons.clone();
             let result = mutate(state, &mut persons)?;
             persons.users.retain(|user, keys| state.user(user).is_some() && !keys.is_empty());
+            persons.drop_removed_owner_person();
             if let Some(known) = &known_tokens {
                 persons.token_persons.retain(|token, _| known.contains(token));
                 persons.token_claims.retain(|token, _| known.contains(token));
@@ -327,6 +420,97 @@ impl UserStore {
                     .map_err(unavailable)?;
             }
             Ok(result)
+        })
+    }
+
+    /// [`Self::with_persons`] plus an `ownerPersonSet {publicKey, source,
+    /// actor}` audit line when `ownerPerson` changed.
+    fn with_persons_as<T>(
+        &self,
+        actor: &str,
+        mutate: impl FnOnce(&mut users::State, &mut State) -> Result<T, UserError>,
+    ) -> Result<T, UserError> {
+        // Only a claim binds a token here: a pending device whose person key
+        // the owner holds (`personKey`).
+        let (result, changed) = self.with_persons_via(users::VIA_PERSON_KEY, |users_state, persons| {
+            let before = persons.owner_person.clone();
+            let result = mutate(users_state, persons)?;
+            persons.drop_removed_owner_person();
+            let changed = (persons.owner_person != before).then(|| persons.owner_person.clone()).flatten();
+            Ok((result, changed))
+        })?;
+        if let Some(person) = changed {
+            audit(
+                self.dir(),
+                "ownerPersonSet",
+                json!({ "publicKey": person.public_key, "source": person.source, "actor": actor }),
+            );
+        }
+        Ok(result)
+    }
+
+    /// The effective owner person `(publicKey, source)`; `None` = unconfirmed.
+    pub fn owner_person(&self) -> Option<(String, String)> {
+        self.persons_snapshot().ok().and_then(|persons| effective_owner_person(&persons, self.dir()))
+    }
+
+    /// `owner` of `GET /v2/host` (every principal): `{displayName,
+    /// fingerprint, confirmed, source}`. `displayName` = the owner's profile
+    /// displayName, else the owner user's name; `fingerprint` / `source` are
+    /// null while unconfirmed. Best effort (store errors read as unconfirmed).
+    pub fn owner_view(&self) -> Value {
+        let person = self.owner_person();
+        let display_name = crate::management::user_profiles::ProfileStore::at(self.dir())
+            .profile(OWNER)
+            .display_name
+            .or_else(|| self.snapshot().ok().and_then(|state| state.user(OWNER).map(|user| user.name.clone())));
+        json!({
+            "displayName": display_name,
+            "fingerprint": person.as_ref().map(|(key, _)| fingerprint(key)),
+            "confirmed": person.is_some(),
+            "source": person.map(|(_, source)| source),
+        })
+    }
+
+    /// Set the owner person locally (`PUT /v2/users/owner-person` from the
+    /// root credential on loopback, or the CLI): `public_key` must already be
+    /// one of owner's keys (400 `not_an_owner_key`). Source `local`.
+    pub fn set_owner_person(&self, public_key: &str, actor: &str) -> Result<(), UserError> {
+        let key = normalize_public_key(public_key)
+            .ok_or_else(|| UserError::new(400, "invalid_public_key", "publicKey must be base64 / base64url of a 32-byte Ed25519 key"))?;
+        self.with_persons_as(actor, |_, persons| {
+            if !persons.keys_of(OWNER).iter().any(|k| k.public_key == key) {
+                let mut error = UserError::new(400, "not_an_owner_key", "publicKey is not one of the owner's person keys");
+                error.details = json!({ "publicKey": key });
+                return Err(error);
+            }
+            let unchanged = persons
+                .owner_person
+                .as_ref()
+                .is_some_and(|p| p.public_key.as_deref() == Some(key.as_str()) && p.source == "local");
+            if !unchanged {
+                persons.owner_person = Some(OwnerPerson {
+                    public_key: Some(key.clone()),
+                    set_at: crate::management::instance::now_utc(),
+                    source: "local".into(),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    /// Mark the owner person unconfirmed locally (`DELETE
+    /// /v2/users/owner-person`, CLI `clear-person`); no inference afterwards.
+    pub fn clear_owner_person(&self, actor: &str) -> Result<(), UserError> {
+        self.with_persons_as(actor, |_, persons| {
+            if !persons.owner_person.as_ref().is_some_and(|p| p.public_key.is_none()) {
+                persons.owner_person = Some(OwnerPerson {
+                    public_key: None,
+                    set_at: crate::management::instance::now_utc(),
+                    source: "local".into(),
+                });
+            }
+            Ok(())
         })
     }
 
@@ -352,9 +536,12 @@ impl UserStore {
             wanted.push((key, label));
         }
         let now = crate::management::instance::now_utc();
-        let (keys, added, removed) = self.with_persons(|users_state, persons| {
+        let (keys, added, removed) = self.with_persons_as(actor, |users_state, persons| {
             if users_state.user(user).is_none() {
                 return Err(UserError::new(404, "user_not_found", "no user with this id"));
+            }
+            if user == OWNER {
+                persons.settle_owner_person(self.dir());
             }
             for (key, _) in &wanted {
                 if let Some(other) = persons.user_of_key(users_state, key).filter(|other| other != user) {
@@ -400,13 +587,13 @@ impl UserStore {
         let tokens = self.tokens().list().map_err(|e| UserError::new(503, "client_tokens_unavailable", format!("{e:#}")))?;
         let now = crate::management::instance::now_utc();
         let key = claim.public_key.clone();
-        let result = self.with_persons(|users_state, persons| {
+        let result = self.with_persons_as(actor, |users_state, persons| {
             let key_user = persons.user_of_key(users_state, &key);
             let Some(token_id) = claim.token_id.as_deref() else {
                 // Root credential: the host's owner; the key goes on owner
                 // unless another user holds it.
                 let outcome = if key_user.is_none() {
-                    persons.add_key(OWNER, &key, &now);
+                    persons.add_owner_key(&key, "firstRootClaim", self.dir());
                     ClaimOutcome::OwnerKeyAdded
                 } else {
                     ClaimOutcome::Recorded
@@ -436,7 +623,7 @@ impl UserStore {
                 (None, None) => ClaimOutcome::Pending,
                 // The host's first paired device: its person is the owner.
                 (Some(owner), None) if owner == OWNER && tokens.len() == 1 => {
-                    persons.add_key(OWNER, &key, &now);
+                    persons.add_owner_key(&key, "firstPairing", self.dir());
                     ClaimOutcome::OwnerKeyAdded
                 }
                 // Already bound: record only, never rebind.
@@ -509,6 +696,80 @@ impl UserStore {
             Ok(())
         });
     }
+}
+
+// ---------------------------------------------------------------- owner person
+
+/// The effective owner person `(publicKey, source)`; `None` = unconfirmed.
+/// A stored `ownerPerson` decides (its key must still be one of owner's);
+/// without one it is inferred ([`infer_owner_person`], source `audit`).
+pub fn effective_owner_person(persons: &State, audit_dir: &Path) -> Option<(String, String)> {
+    let on_owner = |key: &str| persons.keys_of(OWNER).iter().any(|k| k.public_key == key);
+    match &persons.owner_person {
+        Some(stored) => stored
+            .public_key
+            .as_deref()
+            .filter(|key| on_owner(key))
+            .map(|key| (key.to_string(), stored.source.clone())),
+        None => infer_owner_person(persons, audit_dir).map(|key| (key, "audit".to_string())),
+    }
+}
+
+/// The owner person of a file without `ownerPerson` (no write): the latest
+/// `ownerPersonSet` audit entry (the field was written by a build that was
+/// later rolled back), else the only owner key, else the earliest owner key
+/// added by a root-credential claim, else by the first paired device.
+pub fn infer_owner_person(persons: &State, audit_dir: &Path) -> Option<String> {
+    let owner_keys = persons.keys_of(OWNER);
+    if owner_keys.is_empty() {
+        return None;
+    }
+    let on_owner = |key: &str| owner_keys.iter().any(|k| k.public_key == key);
+    let entries = owner_audit_entries(audit_dir);
+    if let Some(last) = entries.iter().rev().find(|entry| entry["action"] == "ownerPersonSet") {
+        return last["details"]["publicKey"].as_str().filter(|key| on_owner(key)).map(str::to_string);
+    }
+    if owner_keys.len() == 1 {
+        return Some(owner_keys[0].public_key.clone());
+    }
+    ["rootCredential", "firstPairing"].iter().find_map(|reason| {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry["action"] == "personKeyAdded"
+                    && entry["details"]["userId"] == OWNER
+                    && entry["details"]["reason"] == *reason
+            })
+            .filter_map(|entry| entry["details"]["publicKey"].as_str())
+            .find(|key| on_owner(key))
+            .map(str::to_string)
+    })
+}
+
+/// `personKeyAdded` / `ownerPersonSet` lines of the users audit log, oldest
+/// first (missing or unreadable: none).
+fn owner_audit_entries(dir: &Path) -> Vec<Value> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(dir.join("audit.jsonl")) else {
+        return Vec::new();
+    };
+    std::io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| line.contains("\"personKeyAdded\"") || line.contains("\"ownerPersonSet\""))
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .collect()
+}
+
+/// An owner key by public key or fingerprint (16 hex digits) — for the CLI.
+pub fn resolve_owner_key(persons: &State, selector: &str) -> Option<String> {
+    let selector = selector.trim();
+    let keys = persons.keys_of(OWNER);
+    if let Some(key) = normalize_public_key(selector) {
+        return keys.iter().find(|k| k.public_key == key).map(|k| k.public_key.clone());
+    }
+    let wanted = selector.to_ascii_lowercase();
+    keys.iter().find(|k| fingerprint(&k.public_key) == wanted).map(|k| k.public_key.clone())
 }
 
 /// A claim whose signature verified.

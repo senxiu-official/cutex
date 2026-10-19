@@ -107,6 +107,7 @@ where the guarded value is used:
 | Legacy layout migration (`~/.codez-cli` → `~/.cutex`, `~/.codex-codez` → `codex-home`) and legacy native index lookups | on | off (legacy paths resolve inside the instance and do not exist) |
 | Remote management listeners (`tailscale`, LAN, wildcard) | as configured | refused unless `instance.remote_listeners: true` |
 | Linux transient scopes for agents | `cutex-agent-<id>.scope` in `cutex-agents.slice` | `cutex-<name>-agent-<id>.scope` in `cutex-<name>-agents.slice` |
+| Windows Job objects for agents | `Global\cutex-agent-<id>` | `Global\cutex-<name>-agent-<id>` |
 
 cutex itself writes nothing outside its home: Start-menu shortcuts, taskbar pins and the
 `HKCU\…\Run` key belong to the desktop app and runtime-host installers, systemd units to

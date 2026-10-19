@@ -1933,7 +1933,9 @@ mod windows_environment_tests {
             diagnostic_journal_path: home.root().join("journal.jsonl").display().to_string(),
             schema_version: "test".into(),
             schema_sha256: "a".repeat(64),
-            started_at: "2026-09-29T00:00:00Z".into(),
+            // After this boot: an older start time reads as a previous-boot occurrence
+            // (`native_owner_previous_boot`) on a host booted since then.
+            started_at: chrono::Utc::now().to_rfc3339(),
         };
         record.app_server_runtime = Some(binding.clone());
         assert!(stock_runtime_has_exited(&record, &binding).unwrap());

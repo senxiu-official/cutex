@@ -4,6 +4,11 @@
 //! launched through a transient scope. `systemd-run --scope` execs the target
 //! in place, so the PID recorded by the durable runtime binding remains the
 //! app-server PID while all tool/build descendants inherit the Agent cgroup.
+//! On Windows (`windows_job_object:<name>`) the runtime is created suspended
+//! inside its own named Job object with `KILL_ON_JOB_CLOSE`, whose last handle
+//! lives in the runtime root itself (`platform::windows_job`): the runtime
+//! survives management restarts like a scope does, its descendants die with
+//! the root, and stop terminates the whole job.
 //! Platforms without that boundary keep the existing direct launch and expose
 //! a precise fallback reason in the child environment and service log. On
 //! macOS (`direct:macos_process_group`) the runtime is started with setsid()
@@ -11,6 +16,8 @@
 //! (`platform::process::terminate_process_and_wait`).
 
 use std::fmt;
+#[cfg(any(target_os = "linux", windows))]
+use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
@@ -18,7 +25,7 @@ use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::thread;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use anyhow::Context;
@@ -33,14 +40,17 @@ pub const CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR: &str = "CUTEX_MANAGED_AGENT_ISO
 pub const CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR: &str = "CUTEX_MANAGED_AGENT_SCOPE_UNIT";
 
 const MANAGED_AGENT_SLICE: &str = "cutex-agents.slice";
-#[cfg(target_os = "linux")]
+/// Windows kernel object namespace of managed Agent jobs: `Global` so that a
+/// stop issued from another logon session (SSH, service) finds the same job;
+/// the job's DACL admits only the current user.
+const WINDOWS_JOB_NAMESPACE: &str = "Global\\";
+#[cfg(any(target_os = "linux", windows))]
 const SCOPE_STOP_WAIT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const SCOPE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedAgentIsolationFallback {
-    WindowsNoSystemd,
     /// macOS: no systemd; the runtime is its own session / process group
     /// leader and stop signals its whole family (platform::process).
     MacosProcessGroup,
@@ -56,7 +66,6 @@ pub enum ManagedAgentIsolationFallback {
 impl ManagedAgentIsolationFallback {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::WindowsNoSystemd => "windows_no_systemd",
             Self::MacosProcessGroup => "macos_process_group",
             Self::UnsupportedPlatform => "unsupported_platform",
             Self::SystemdNotBooted => "systemd_not_booted",
@@ -65,6 +74,19 @@ impl ManagedAgentIsolationFallback {
             Self::SystemdRunUnavailable => "systemd_run_unavailable",
             Self::SystemctlUnavailable => "systemctl_unavailable",
             Self::SystemdRunMissingRequiredOptions => "systemd_run_missing_required_options",
+        }
+    }
+}
+
+impl ManagedAgentProcessIsolation {
+    /// Value of `CUTEX_MANAGED_AGENT_ISOLATION` in the runtime environment
+    /// and of the service log line: `systemd_scope:<unit>`,
+    /// `windows_job_object:<job>` or `direct:<reason>`.
+    pub fn env_value(&self) -> String {
+        match self {
+            Self::SystemdScope { unit_name } => format!("systemd_scope:{unit_name}"),
+            Self::WindowsJobObject { job_name } => format!("windows_job_object:{job_name}"),
+            Self::Direct { reason } => format!("direct:{reason}"),
         }
     }
 }
@@ -79,6 +101,10 @@ impl fmt::Display for ManagedAgentIsolationFallback {
 pub enum ManagedAgentProcessIsolation {
     SystemdScope {
         unit_name: String,
+    },
+    /// Windows: a named Job object per Agent (`platform::windows_job`).
+    WindowsJobObject {
+        job_name: String,
     },
     Direct {
         reason: ManagedAgentIsolationFallback,
@@ -103,6 +129,10 @@ pub struct ManagedAgentScopeStopOutcome {
 enum SystemdScopeSupport {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Available,
+    /// Windows: no systemd; a per-Agent Job object is the boundary.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    WindowsJobObject,
+    #[cfg_attr(windows, allow(dead_code))]
     Unavailable(ManagedAgentIsolationFallback),
 }
 
@@ -125,6 +155,19 @@ pub fn managed_agent_scope_unit_name(cutex_session_id: &str) -> String {
 /// Slice of managed Agents; an independent instance (`CUTEX_HOME`) uses its own.
 pub fn managed_agent_slice() -> String {
     slice_name_for(crate::config::instance::current_name().as_deref())
+}
+
+/// Stable per-Agent Windows Job object name (`Global\cutex-agent-…`), with
+/// the same readable label, identity digest and instance qualification as
+/// the Linux scope unit.
+pub fn managed_agent_job_name(cutex_session_id: &str) -> String {
+    job_name_for(crate::config::instance::current_name().as_deref(), cutex_session_id)
+}
+
+fn job_name_for(instance: Option<&str>, cutex_session_id: &str) -> String {
+    let unit = scope_unit_name_for(instance, cutex_session_id);
+    let base = unit.strip_suffix(".scope").unwrap_or(&unit);
+    format!("{WINDOWS_JOB_NAMESPACE}{base}")
 }
 
 fn slice_name_for(instance: Option<&str>) -> String {
@@ -186,16 +229,30 @@ fn managed_agent_launch_plan_with_support(
                 isolation: ManagedAgentProcessIsolation::SystemdScope { unit_name },
             }
         }
-        SystemdScopeSupport::Unavailable(reason) => ManagedAgentLaunchPlan {
-            launch: launch
-                .env_unset(CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR)
-                .env_unset(CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR)
-                .env(
-                    CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR,
-                    format!("direct:{reason}"),
-                ),
-            isolation: ManagedAgentProcessIsolation::Direct { reason },
-        },
+        SystemdScopeSupport::WindowsJobObject => {
+            // The program is launched as is; the spawner creates the job and
+            // assigns the suspended runtime to it (`spawn_managed_agent_runtime_launch`).
+            let isolation = ManagedAgentProcessIsolation::WindowsJobObject {
+                job_name: managed_agent_job_name(cutex_session_id),
+            };
+            ManagedAgentLaunchPlan {
+                launch: launch
+                    .env_unset(CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR)
+                    .env_unset(CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR)
+                    .env(CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR, isolation.env_value()),
+                isolation,
+            }
+        }
+        SystemdScopeSupport::Unavailable(reason) => {
+            let isolation = ManagedAgentProcessIsolation::Direct { reason };
+            ManagedAgentLaunchPlan {
+                launch: launch
+                    .env_unset(CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR)
+                    .env_unset(CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR)
+                    .env(CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR, isolation.env_value()),
+                isolation,
+            }
+        }
     }
 }
 
@@ -236,7 +293,7 @@ fn wrap_in_systemd_scope(
 #[cfg(target_os = "linux")]
 pub fn managed_agent_scope_control_group(cutex_session_id: &str) -> anyhow::Result<Option<String>> {
     match current_systemd_scope_support(false) {
-        SystemdScopeSupport::Unavailable(_) => Ok(None),
+        SystemdScopeSupport::Unavailable(_) | SystemdScopeSupport::WindowsJobObject => Ok(None),
         SystemdScopeSupport::Available => Ok(query_scope_state(&managed_agent_scope_unit_name(
             cutex_session_id,
         ))?
@@ -258,9 +315,20 @@ pub fn managed_agent_scope_is_absent(cutex_session_id: &str) -> anyhow::Result<b
             SystemdScopeSupport::Unavailable(reason) => {
                 anyhow::bail!("managed Agent scope observation unavailable: {reason}")
             }
+            SystemdScopeSupport::WindowsJobObject => unreachable!("Linux never reports a Windows job"),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use crate::platform::windows_job;
+        Ok(
+            match windows_job::open_agent_job(&managed_agent_job_name(cutex_session_id))? {
+                None => true,
+                Some(job) => windows_job::active_processes(&job)? == 0,
+            },
+        )
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = cutex_session_id;
         anyhow::bail!("systemd scope recovery is unsupported on this platform")
@@ -287,7 +355,7 @@ pub fn terminate_managed_agent_scope(
     let support = current_systemd_scope_support(false);
     let SystemdScopeSupport::Available = support else {
         let SystemdScopeSupport::Unavailable(reason) = support else {
-            unreachable!()
+            unreachable!("Linux reports a systemd scope or a fallback")
         };
         return Ok(ManagedAgentScopeStopOutcome {
             found: false,
@@ -352,13 +420,56 @@ pub fn terminate_managed_agent_scope(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows: terminate every process of the Agent's Job object.
+///
+/// Windows has no graceful signal for a process tree; the graceful part of a
+/// stop (turn interrupt, manager disconnect) happened before this call, and
+/// the PID path it replaces already ended in a forced kill. `forced` echoes
+/// the caller's `force` so results read as on Linux.
+#[cfg(windows)]
+pub fn terminate_managed_agent_scope(
+    cutex_session_id: &str,
+    force: bool,
+) -> anyhow::Result<ManagedAgentScopeStopOutcome> {
+    use crate::platform::windows_job;
+    let job_name = managed_agent_job_name(cutex_session_id);
+    let Some(job) = windows_job::open_agent_job(&job_name)? else {
+        return Ok(ManagedAgentScopeStopOutcome {
+            found: false,
+            stopped: true,
+            forced: false,
+            detail: "job_not_found".to_string(),
+        });
+    };
+    if windows_job::active_processes(&job)? == 0 {
+        return Ok(ManagedAgentScopeStopOutcome {
+            found: false,
+            stopped: true,
+            forced: false,
+            detail: "job_empty".to_string(),
+        });
+    }
+    windows_job::terminate_job(&job)?;
+    let stopped = windows_job::wait_for_job_empty(&job, SCOPE_STOP_WAIT)?;
+    Ok(ManagedAgentScopeStopOutcome {
+        found: true,
+        stopped,
+        forced: force,
+        detail: if stopped {
+            "job_terminated".to_string()
+        } else {
+            "job_terminate_timeout".to_string()
+        },
+    })
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn terminate_managed_agent_scope(
     _cutex_session_id: &str,
     _force: bool,
 ) -> anyhow::Result<ManagedAgentScopeStopOutcome> {
     let SystemdScopeSupport::Unavailable(reason) = current_systemd_scope_support(false) else {
-        unreachable!("non-Linux platforms cannot expose a systemd scope")
+        unreachable!("this platform exposes no process boundary")
     };
     Ok(ManagedAgentScopeStopOutcome {
         found: false,
@@ -406,7 +517,7 @@ fn current_systemd_scope_support(require_launcher: bool) -> SystemdScopeSupport 
 
 #[cfg(windows)]
 fn current_systemd_scope_support(_require_launcher: bool) -> SystemdScopeSupport {
-    SystemdScopeSupport::Unavailable(ManagedAgentIsolationFallback::WindowsNoSystemd)
+    SystemdScopeSupport::WindowsJobObject
 }
 
 #[cfg(target_os = "macos")]
@@ -681,6 +792,118 @@ mod tests {
             .env_removes
             .iter()
             .any(|key| key == "STALE_VALUE"));
+    }
+
+    #[test]
+    fn windows_job_names_mirror_scope_identity_in_the_global_namespace() {
+        let id = "cutex.018e0000-0000-7000-8000-0002a0001f93";
+        let default = job_name_for(None, id);
+        let instance = job_name_for(Some("kutex"), id);
+        let other = job_name_for(None, "cutex.018e0000-0000-7000-8000-0002a0001f94");
+
+        assert_eq!(default, job_name_for(None, id));
+        assert_eq!(managed_agent_job_name(id), default);
+        assert_ne!(default, other);
+        assert_ne!(default, instance);
+        assert!(default.starts_with("Global\\cutex-agent-cutex.018e0000-"));
+        assert!(instance.starts_with("Global\\cutex-kutex-agent-cutex.018e0000-"));
+        // Same identity digest as the Linux scope unit, without the unit suffix.
+        let scope = scope_unit_name_for(None, id);
+        assert_eq!(
+            default.strip_prefix("Global\\"),
+            scope.strip_suffix(".scope")
+        );
+        // Kernel object names: one namespace separator, no other backslash,
+        // well below MAX_PATH.
+        let name = default.strip_prefix("Global\\").unwrap();
+        assert!(!name.contains('\\'));
+        assert!(default.len() < 260);
+        let long = job_name_for(Some("kutex"), &"x".repeat(500));
+        assert!(long.len() < 260, "{long}");
+    }
+
+    #[test]
+    fn windows_job_plan_launches_the_target_directly_and_reports_the_job() {
+        let target = LaunchCommand::new("C:\\cutex\\cute-codex.exe")
+            .args(["app-server", "--listen", "literal-%PATH%"])
+            .env("CUTEX_AGENT_ID", "runtime-agent")
+            .env(CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR, "inherited-unit")
+            .env(CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR, "stale")
+            .env_remove("STALE_VALUE");
+        let plan = managed_agent_launch_plan_with_support(
+            "cutex.job-test",
+            target.clone(),
+            SystemdScopeSupport::WindowsJobObject,
+        );
+        let ManagedAgentProcessIsolation::WindowsJobObject { job_name } = &plan.isolation else {
+            panic!("expected a Windows job object: {:?}", plan.isolation);
+        };
+
+        assert_eq!(job_name, &managed_agent_job_name("cutex.job-test"));
+        assert_eq!(plan.launch.program, target.program);
+        assert_eq!(plan.launch.args, target.args);
+        let isolation: Vec<_> = plan
+            .launch
+            .envs
+            .iter()
+            .filter(|(key, _)| key == CUTEX_MANAGED_AGENT_ISOLATION_ENV_VAR)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(isolation, [format!("windows_job_object:{job_name}").as_str()]);
+        assert!(plan
+            .launch
+            .envs
+            .iter()
+            .all(|(key, _)| key != CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR));
+        assert!(plan
+            .launch
+            .env_removes
+            .iter()
+            .any(|key| key == CUTEX_MANAGED_AGENT_SCOPE_UNIT_ENV_VAR));
+        assert!(plan
+            .launch
+            .envs
+            .iter()
+            .any(|(key, value)| key == "CUTEX_AGENT_ID" && value == "runtime-agent"));
+        assert!(plan
+            .launch
+            .env_removes
+            .iter()
+            .any(|key| key == "STALE_VALUE"));
+    }
+
+    #[test]
+    fn isolation_env_values_name_the_boundary() {
+        assert_eq!(
+            ManagedAgentProcessIsolation::SystemdScope {
+                unit_name: "u.scope".into()
+            }
+            .env_value(),
+            "systemd_scope:u.scope"
+        );
+        assert_eq!(
+            ManagedAgentProcessIsolation::WindowsJobObject {
+                job_name: "Global\\j".into()
+            }
+            .env_value(),
+            "windows_job_object:Global\\j"
+        );
+        assert_eq!(
+            ManagedAgentProcessIsolation::Direct {
+                reason: ManagedAgentIsolationFallback::MacosProcessGroup
+            }
+            .env_value(),
+            "direct:macos_process_group"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reports_a_job_object_boundary() {
+        assert!(matches!(
+            managed_agent_process_isolation("cutex.windows-job-probe"),
+            ManagedAgentProcessIsolation::WindowsJobObject { .. }
+        ));
     }
 
     #[test]

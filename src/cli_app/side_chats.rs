@@ -534,6 +534,9 @@ pub(super) fn claim_event(
 }
 
 pub(crate) fn dispatch(session: &str, action: &str, params: Value) -> Result<Value> {
+    if let Some(record) = claude_parent(session)? {
+        return claude_dispatch(&record, action, params);
+    }
     if action == "open" {
         return open(session, &params);
     }
@@ -603,6 +606,106 @@ pub(crate) fn dispatch(session: &str, action: &str, params: Value) -> Result<Val
     }
 }
 
+/// The session when it is a Claude agent: its Side lives in its adapter.
+fn claude_parent(session: &str) -> Result<Option<cutex::session::model::CutexSessionRecord>> {
+    let record = cutex::session::store::with_cutex_session_store(|store| store.sessions.get(session).cloned())
+        .map_err(native_error)?;
+    Ok(record.filter(|record| {
+        record.claude_session.is_some()
+            || record.runtime_backend == cutex::session::model::CutexSessionRuntimeBackend::ClaudeSubscription
+    }))
+}
+
+/// Claude agents (adapter feature `sideChat`, claude-r21): the adapter keeps
+/// the Side registry and answers the same snapshots; cutex relays the route,
+/// adds the session identity and maps the adapter's `data.code`.
+fn claude_dispatch(
+    record: &cutex::session::model::CutexSessionRecord,
+    action: &str,
+    params: Value,
+) -> Result<Value> {
+    use cutex::runtime::claude::side::{side_request, SideError};
+    let method = match action {
+        "open" => {
+            optional_id(&params, "anchorTurnId")?;
+            optional_id(&params, "lastTurnId")?;
+            optional_model(&params)?;
+            "open"
+        }
+        "get" => "read",
+        "list" | "send" | "interrupt" | "respond" | "close" => action,
+        _ => return Err(WorkspaceError::bad_request("unknown Side operation")),
+    };
+    match side_request(&record.cutex_session_id, method, params) {
+        Ok(mut result) => {
+            let generation = record.runtime_generation;
+            let annotate = |chat: &mut Value| {
+                if let Some(chat) = chat.as_object_mut() {
+                    chat.insert("sessionId".into(), json!(record.cutex_session_id));
+                    chat.insert("runtimeGeneration".into(), json!(generation));
+                    chat.remove("parentThreadId");
+                }
+            };
+            if let Some(chat) = result.get_mut("chat") {
+                annotate(chat);
+            }
+            if let Some(chats) = result.get_mut("chats").and_then(Value::as_array_mut) {
+                chats.iter_mut().for_each(annotate);
+            }
+            Ok(result)
+        }
+        // Nothing to list without a Side-capable running adapter.
+        Err(SideError::Unsupported | SideError::Offline) if action == "list" => Ok(json!({"chats": []})),
+        Err(error) => Err(claude_side_error(error)),
+    }
+}
+
+fn claude_side_error(error: cutex::runtime::claude::side::SideError) -> WorkspaceError {
+    use cutex::runtime::claude::side::SideError;
+    match error {
+        SideError::Unsupported => WorkspaceError::new(
+            409,
+            "side_runtime_unsupported",
+            "this agent's Claude runtime has no Side chats; repin it to claude-r21 or later",
+        ),
+        SideError::Offline => WorkspaceError::new(
+            409,
+            "side_runtime_offline",
+            "start the main conversation before opening Side",
+        ),
+        SideError::Failed(error) => native_error(error),
+        SideError::Refused { rpc_code, code, message, mut data } => {
+            let (status, code) = match code.as_str() {
+                "side_chat_already_open" => (409, "side_chat_already_open"),
+                "side_chat_opening" => (409, "side_chat_opening"),
+                "side_chat_not_ready" => (409, "side_chat_not_ready"),
+                "side_chat_busy" => (409, "side_chat_busy"),
+                "side_message_id_conflict" => (409, "side_message_id_conflict"),
+                "side_message_outcome_unknown" => (409, "side_message_outcome_unknown"),
+                "side_runtime_unsupported" => (409, "side_runtime_unsupported"),
+                "turn_not_found" => (409, "turn_not_found"),
+                "turn_in_progress" => (409, "turn_in_progress"),
+                // The kept turn is not on disk yet / a turn just started: retry.
+                "native_transcript_behind" => (409, "side_boundary_changed"),
+                "side_chat_not_found" => (404, "side_chat_not_found"),
+                "side_request_not_found" => (404, "side_request_not_found"),
+                "side_chat_capacity" => (429, "side_chat_capacity"),
+                _ if rpc_code == -32602 => (400, "invalid_request"),
+                _ => {
+                    return WorkspaceError::new(502, "side_native_error", message.clone()).with_details(
+                        json!({"nativeError":{"code":rpc_code,"message":message,"data":data}}),
+                    )
+                }
+            };
+            if let Some(object) = data.as_object_mut() {
+                object.remove("code");
+            }
+            let details = if data.is_object() { data } else { json!({}) };
+            WorkspaceError::new(status, code, message).with_details(details)
+        }
+    }
+}
+
 fn fork_params(
     thread: &str,
     cutoff: Option<&str>,
@@ -660,16 +763,6 @@ fn open(session: &str, params: &Value) -> Result<Value> {
         .find(|record| record.cutex_session_id == session)
         .cloned()
         .ok_or_else(|| WorkspaceError::new(404, "session_not_found", "session not found"))?;
-    if record.claude_session.is_some()
-        || record.runtime_backend
-            == cutex::session::model::CutexSessionRuntimeBackend::ClaudeSubscription
-    {
-        return Err(WorkspaceError::new(
-            409,
-            "side_runtime_unsupported",
-            "Side currently requires Codex",
-        ));
-    }
     let manager = super::app_server_runtime::runtime_manager();
     let status = manager
         .status(session)
@@ -1496,6 +1589,79 @@ mod tests {
             .unwrap()
             .is_none());
     }
+    #[test]
+    fn claude_side_is_gated_on_the_adapter_feature_and_a_running_adapter() {
+        use cutex::session::{
+            model::{CutexSessionRecord, CutexSessionRuntimeBackend},
+            store::{load_cutex_session_store, save_cutex_session_store},
+        };
+        let home = super::super::test_home::IsolatedTestHome::new("side-claude-gate").unwrap();
+        let adapter = home.root().join("adapter");
+        std::fs::create_dir_all(adapter.join("src/cute_claude")).unwrap();
+        let features = |side: bool| {
+            std::fs::write(adapter.join("src/cute_claude/features.json"),
+                serde_json::to_vec(&json!({"version":1,"features":{"fork":true,"sideChat":side}})).unwrap()).unwrap();
+        };
+        let mut record = CutexSessionRecord::new(
+            "side-claude".to_owned(), None, "test-host".to_owned(), home.root().display().to_string(), None,
+        )
+        .unwrap();
+        record.runtime_backend = CutexSessionRuntimeBackend::ClaudeSubscription;
+        record.claude_session = Some(cutex::runtime::claude::ClaudeSession {
+            deployment: cutex::runtime::claude::ClaudeDeployment {
+                python: "/python".into(), adapter_source: adapter.clone(), claude_cli: "/claude".into(),
+                claude_home: "/claude-home".into(), tui_binary: "/claude-tui".into(),
+            },
+            thread_id: uuid::Uuid::new_v4().to_string(),
+            state_dir: home.root().join("state"),
+            model: "sonnet".into(), effort: None, instructions: String::new(),
+            allow_write: false, allow_exec: false, write_explicit: false, exec_explicit: false,
+            native_session_id: None, connection_id: None, initial_permission_mode: None,
+        });
+        let mut sessions = load_cutex_session_store().unwrap();
+        sessions.sessions.insert(record.cutex_session_id.clone(), record.clone());
+        save_cutex_session_store(&sessions).unwrap();
+        // claude-r20 and older declare no sideChat: refused cleanly, never started.
+        features(false);
+        assert_eq!(dispatch("side-claude", "open", json!({})).unwrap_err().code, "side_runtime_unsupported");
+        assert_eq!(dispatch("side-claude", "list", json!({})).unwrap(), json!({"chats": []}));
+        std::thread::sleep(Duration::from_millis(50)); // features.json is cached by mtime.
+        features(true);
+        let error = dispatch("side-claude", "open", json!({})).unwrap_err();
+        assert_eq!(error.code, "side_runtime_offline", "{}", error.message);
+        assert_eq!(dispatch("side-claude", "open", json!({"model": ""})).unwrap_err().code, "invalid_request");
+        assert!(super::super::app_server_runtime::runtime_manager().status("side-claude").unwrap().is_none());
+    }
+
+    #[test]
+    fn claude_side_refusals_keep_the_side_contract_codes() {
+        use cutex::runtime::claude::side::SideError;
+        let refused = |rpc_code, code: &str, data: Value| SideError::Refused {
+            rpc_code, code: code.into(), message: "refused".into(), data,
+        };
+        let open = claude_side_error(refused(-32009, "side_chat_already_open",
+            json!({"code":"side_chat_already_open","chatId":"side-1","anchorTurnId":null})));
+        assert_eq!((open.status, open.code, open.details), (409, "side_chat_already_open",
+            json!({"chatId":"side-1","anchorTurnId":null})));
+        for (code, status, mapped) in [
+            ("side_chat_not_found", 404, "side_chat_not_found"),
+            ("side_request_not_found", 404, "side_request_not_found"),
+            ("side_chat_capacity", 429, "side_chat_capacity"),
+            ("turn_in_progress", 409, "turn_in_progress"),
+            ("native_transcript_behind", 409, "side_boundary_changed"),
+            ("side_runtime_unsupported", 409, "side_runtime_unsupported"),
+        ] {
+            let error = claude_side_error(refused(-32009, code, json!({"code": code})));
+            assert_eq!((error.status, error.code), (status, mapped), "{code}");
+        }
+        assert_eq!(claude_side_error(refused(-32602, "", Value::Null)).code, "invalid_request");
+        let native = claude_side_error(refused(-32020, "", json!({"x":1})));
+        assert_eq!((native.status, native.code), (502, "side_native_error"));
+        assert_eq!(native.details["nativeError"]["code"], -32020);
+        assert_eq!(claude_side_error(SideError::Unsupported).code, "side_runtime_unsupported");
+        assert_eq!(claude_side_error(SideError::Offline).code, "side_runtime_offline");
+    }
+
     #[test]
     fn logs_are_bounded_and_report_truncation() {
         let mut state = State::new();

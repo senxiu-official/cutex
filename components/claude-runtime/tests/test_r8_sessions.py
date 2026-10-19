@@ -400,3 +400,71 @@ def test_native_search_occurrence_shapes_unicode_pagination_and_reverted_filter(
         assert ops.search_occurrences(tid, {'searchTerm': 'needle'})['data'] == []
     finally:
         store.close()
+
+
+async def test_busy_fork_is_live_and_leaves_the_running_turn_and_runtime_alone(native, tmp_path):
+    """claude-r21 `forkWhileBusy`: a running turn is left out, the source's live
+    runtime is neither closed nor leased, its transcript is only read."""
+    from cute_claude.sdk_runtime import NativeSessionLease
+    n = native
+    n.store.enqueue(n.tid, identifier(), {'source': {'kind': 'user', 'id': 'owner'}, 'eventType': 'message', 'text': 'third prompt'}, 20)
+    running = n.store.claim(n.tid)['turn_id']
+    prompt = {'uuid': identifier(), 'parentUuid': n.entries[-1]['uuid'], 'sessionId': n.sid, 'type': 'user',
+              'cwd': str(tmp_path), 'timestamp': '2026-10-10T00:00:01Z', 'message': {'role': 'user', 'content': 'third prompt'}}
+    n.store.record_sdk_message(n.tid, running, prompt['uuid'], 'user')
+    with n.path.open('a', encoding='utf-8') as transcript:
+        transcript.write(dump(prompt) + '\n{"uuid": "still-being-writ')  # Claude Code is mid-append.
+    original = n.path.read_bytes()
+    closed = []
+    async def close_runtime(tid):
+        closed.append(tid)
+    n.engine.close_runtime = close_runtime
+    n.engine.driver.persistent = True
+    n.engine.driver.owners[n.tid] = SimpleNamespace(task=SimpleNamespace(done=lambda: False), lease=None)
+    lease = NativeSessionLease(n.api.config_dir, n.sid)  # Held by the live owner.
+    try:
+        result = await n.ops.fork(n.tid, {'targetStateDir': str(tmp_path / 'live-fork')})
+        with pytest.raises(RpcError) as refused:
+            await n.ops.fork(n.tid, {'lastTurnId': running})
+        assert refused.value.data == {'code': 'turn_in_progress', 'turnId': running}
+        partial = await n.ops.fork(n.tid, {'lastTurnId': n.turns[0], 'targetStateDir': str(tmp_path / 'first')})
+    finally:
+        lease.close()
+    assert closed == [] and n.path.read_bytes() == original
+    assert result['forkedThroughTurnId'] == n.turns[1] and partial['forkedThroughTurnId'] == n.turns[0]
+    assert result['sourceRuntime'] is None and result['sourceRuntimeUntouched'] is True
+    copied = [e for e in n.api.entries(result['nativeSessionId']) if 'message' in e]
+    assert [e['message']['content'] for e in copied][-2:] == ['second prompt', 'second answer']
+    assert len(copied) == 5
+    assert len([e for e in n.api.entries(partial['nativeSessionId']) if 'message' in e]) == 3
+    assert n.store.turn(running)['status'] == 'inProgress'
+    forked = Store(Path(result['stateDir']))
+    try:
+        assert len(History(forked).full_read(result['threadId'])) == 2
+        assert forked.claim(result['threadId']) is None
+    finally:
+        forked.close()
+
+
+async def test_busy_fork_refuses_a_running_turn_it_cannot_separate(native, tmp_path):
+    n = native
+    n.store.enqueue(n.tid, identifier(), {'source': {'kind': 'user', 'id': 'owner'}, 'eventType': 'message', 'text': 'third prompt'}, 20)
+    n.store.claim(n.tid)
+    # On disk but neither observed nor matching the stored text (notes rode along).
+    prompt = {'uuid': identifier(), 'parentUuid': n.entries[-1]['uuid'], 'sessionId': n.sid, 'type': 'user',
+              'message': {'role': 'user', 'content': [{'type': 'text', 'text': 'note'}, {'type': 'text', 'text': 'third prompt'}]}}
+    with n.path.open('a', encoding='utf-8') as transcript:
+        transcript.write(dump(prompt) + '\n')
+    with pytest.raises(RpcError) as refused:
+        await n.ops.fork(n.tid)
+    assert refused.value.data['code'] == 'native_transcript_behind'
+    assert n.store.db.execute('SELECT count(*) FROM threads').fetchone()[0] == 1
+
+
+async def test_fork_with_only_queued_notes_keeps_every_turn_without_closing(native):
+    n = native
+    n.store.enqueue_note(n.tid, identifier(), {'source': {'kind': 'agent', 'id': 'peer'}, 'eventType': 'message', 'text': 'pending'}, 20)
+    result = await n.ops.fork(n.tid)
+    assert result['forkedThroughTurnId'] == n.turns[1] and result['sourceRuntimeUntouched'] is True
+    assert len(History(n.store).full_read(result['threadId'])) == 2
+    assert n.store.pending_notes(n.tid) == 1 and n.store.pending_notes(result['threadId']) == 0

@@ -39,6 +39,7 @@ from .skills import ManagedSkills
 from .r8_services import read_usage
 from .busy_delivery import BusyDelivery
 from .safety_grants import SafetyGrants, METHODS as SAFETY_METHODS
+from .side_chats import SideChats, METHODS as SIDE_METHODS
 
 Send = Callable[[dict], Awaitable[None]]
 FEATURES = json.loads((Path(__file__).with_name("features.json")).read_text(encoding="utf-8"))
@@ -125,6 +126,7 @@ class Server:
         self.external_inputs = ExternalInputService(self)
         self.busy_delivery = engine.busy_delivery = BusyDelivery(self)
         self.safety_grants = engine.safety_grants = SafetyGrants(self)
+        self.side_chats = engine.side_chats = SideChats(self)
 
     def connect(self, send: Send) -> Peer:
         self.peer_sequence += 1
@@ -260,7 +262,7 @@ class Server:
             native = {"imageInput", "reasoning", "commandItems", "fileChangeItems", "turnDiff", "approvals",
                       "userInputRequests", "agentTurnQuestions", "planMode", "planChecklist", "compact", "effort", "rateLimits",
                       "historyRevert", "fork", "threadDelete", "subagents", "subagentTranscripts", "autoReconnect", "backgroundTerminals", "mcpStatus", "fileRewind",
-                      "versionedModelCatalog", "modelObservation", "safetyGrants", "fastMode",
+                      "versionedModelCatalog", "modelObservation", "safetyGrants", "fastMode", "sideChat", "forkWhileBusy",
                       "turnSteer", "permissionRules"}
             features.update({name: False for name in native})
             features["permissionPresets"] = ["full"]
@@ -409,6 +411,8 @@ class Server:
         if method in SAFETY_METHODS:
             require(self.settings.backend == 'subscription', 'Claude subscription backend required', -32601)
             return await self.safety_grants.dispatch(peer, method, params), None
+        if method in SIDE_METHODS:
+            return await self.side_chats.dispatch(peer, method, params), None
         extension = await self.r8.dispatch(peer, method, params)
         if extension is not None:
             return extension
@@ -422,6 +426,7 @@ class Server:
             return read_usage(self.store, params), None
         if method == "claude/server/shutdown":
             require(params.get("runtimeId") == self.runtime_id, "stale adapter identity", -32011)
+            await self.side_chats.close_parent()  # Side processes never outlive the adapter.
             require(not self.engine.workers, "turn workers are still active", -32009)
             for owner in getattr(self.engine.driver, "owners", {}).values() if hasattr(self.engine, "driver") else []:
                 require(owner.task.done() and owner.lease is None, "native child exit is not confirmed", -32009)
@@ -553,6 +558,7 @@ class Server:
             if method.endswith("/start"):
                 result = await self.engine.start_runtime(tid)
             elif method.endswith("/close"):
+                await self.side_chats.close_parent(tid)  # Side chats end with the parent's runtime.
                 result = await self.engine.close_runtime(tid)
             else:
                 result = self.engine.runtime_status(tid)
@@ -564,7 +570,10 @@ class Server:
             limit = self._limit(params.get("limit"), 50)
             offset = self._cursor(params.get("cursor"))
             archived = bool(params.get("archived", False))
-            rows = self.store.db.execute("SELECT id FROM threads WHERE archived=? ORDER BY updated DESC,id DESC LIMIT ? OFFSET ?", (archived, limit + 1, offset)).fetchall()
+            # Hidden Side threads (side_chats.py) are never listed.
+            rows = self.store.db.execute("SELECT id FROM threads WHERE archived=? AND id NOT IN "
+                                         "(SELECT thread_id FROM thread_properties WHERE data LIKE '%\"side\":{%') "
+                                         "ORDER BY updated DESC,id DESC LIMIT ? OFFSET ?", (archived, limit + 1, offset)).fetchall()
             return {"data": [self._thread_wire(r[0]) for r in rows[:limit]], "nextCursor": str(offset + limit) if len(rows) > limit else None}, None
         if method == "thread/name/set":
             tid = text(params.get("threadId"), "threadId", limit=256)

@@ -230,6 +230,14 @@ fn decode_response(bytes: &[u8]) -> Result<Value> {
         {
             error.details = serde_json::json!({"retryAfterSecs":delay.min(300)});
         }
+        // A refused cross-host wake keeps its closed-set reason.
+        if code == "wake_not_allowed" {
+            if let Some(reason @ ("policy" | "review" | "agent_disabled")) =
+                value.pointer("/details/reason").and_then(Value::as_str)
+            {
+                error.details = serde_json::json!({"reason":reason});
+            }
+        }
         return Err(error);
     }
     Ok(value)

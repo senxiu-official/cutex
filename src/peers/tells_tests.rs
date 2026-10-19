@@ -82,6 +82,7 @@ type Delivered = RefCell<
         String,
         crate::agent_bus::peer_tell::PeerTellFacts,
         String,
+        bool,
     )>,
 >;
 
@@ -92,6 +93,7 @@ fn recorder(delivered: &Delivered) -> impl Fn(&tells::Delivery<'_>) -> super::Re
             d.text.into(),
             d.facts.clone(),
             d.message_id.into(),
+            d.wake,
         ));
         Ok(format!("bus-{}", delivered.borrow().len()))
     }
@@ -137,7 +139,8 @@ fn receive_delivers_once_dedupes_and_applies_inbound_policy() {
     {
         let sent = delivered.borrow();
         assert_eq!(sent.len(), 1);
-        let (target, text, facts, message_id) = &sent[0];
+        let (target, text, facts, message_id, wake) = &sent[0];
+        assert!(!wake);
         assert_eq!((target.as_str(), text.as_str()), (LOCAL, "fyi /tmp/a"));
         assert_eq!(facts.sender_label(), "remote-worker@alpha");
         assert_eq!(facts.peer_id, p.peer_id);
@@ -171,9 +174,18 @@ fn receive_delivers_once_dedupes_and_applies_inbound_policy() {
         );
     }
     let mut future = request(&tell_id(2), LOCAL, "x");
-    future["schemaVersion"] = json!(2);
+    future["schemaVersion"] = json!(3);
     assert_eq!(
         tells::receive(&store, &p, future, &deliver)
+            .unwrap_err()
+            .code,
+        "peer_protocol_error"
+    );
+    // wake needs schemaVersion 2.
+    let mut v1_wake = request(&tell_id(2), LOCAL, "x");
+    v1_wake["wake"] = json!(true);
+    assert_eq!(
+        tells::receive(&store, &p, v1_wake, &deliver)
             .unwrap_err()
             .code,
         "peer_protocol_error"
@@ -402,9 +414,13 @@ fn agent_tell_to_name_at_host_sends_once_and_maps_refusals() {
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert_eq!(*local.borrow(), 0, "never the local bus");
 
-    // Options that cannot cross hosts are refused before any request.
+    // Options that cannot cross hosts are refused before any request (a
+    // wake to a peer that did not negotiate tells.v2 too).
     for (args, needle) in [
-        (json!({"to":"worker@beta","text":"x","wake":true}), "wake"),
+        (
+            json!({"to":"worker@beta","text":"x","wake":true}),
+            "does not support cross-host wake",
+        ),
         (
             json!({"to":"worker@beta","text":"x","attachments":["a.png"]}),
             "attachments",
@@ -507,12 +523,17 @@ fn alarm_and_other_tools_refuse_remote_targets_with_a_clear_detail() {
     });
 }
 
+/// A remote note's detail does not suggest wake=true (whether the other host
+/// allows it is its policy, not visible here); a remote wake says so.
 #[test]
 fn remote_tell_detail_never_suggests_wake() {
     for state in ["idle", "busy", "offline"] {
         let detail =
             tools::tell_detail_for("worker@beta", state, false, false, tools::FACADE_DELEGATIONS, false);
         assert!(!detail.contains("wake=true"), "{detail}");
+        let woke =
+            tools::tell_detail_for("worker@beta", state, true, false, tools::FACADE_DELEGATIONS, false);
+        assert!(woke.starts_with("Sent as a wake."), "{woke}");
     }
     let local = tools::tell_detail("worker", "idle", false, false, tools::FACADE_DELEGATIONS);
     assert!(local.contains("wake=true"), "local tells keep the hint: {local}");
@@ -522,6 +543,7 @@ fn remote_tell_detail_never_suggests_wake() {
 fn hello_advertises_tells_without_requiring_it() {
     let features = super::pair::features();
     assert!(features.iter().any(|f| f == tells::FEATURE));
+    assert!(features.iter().any(|f| f == tells::FEATURE_V2));
     let mut p = peer();
     let old = json!({"instanceId":p.peer_id,"protocol":1,"features":super::pair::FEATURES});
     super::pair::validate_hello(&p, &old).unwrap();
@@ -530,4 +552,219 @@ fn hello_advertises_tells_without_requiring_it() {
         .any(|f| f == tells::FEATURE));
     p.features = super::pair::declared_features(&json!({"features":["asks.v1","tells.v1"]}));
     assert!(p.features.iter().any(|f| f == tells::FEATURE));
+    // tells.v2 is optional too: an old peer is not a cross-host wake target.
+    assert!(!tells::supports_wake(&p));
+    p.negotiated_features = super::pair::negotiated_features(
+        &json!({"features":["asks.v1","asks.snapshot.v1","asks.close.v1","agents.list.v1","tells.v1","tells.v2"]}),
+    );
+    assert!(tells::supports_wake(&p));
+}
+
+/// `inbound.tellWake` defaults off (also for a stored policy without it),
+/// `tellWakesPerHour` 60; PATCH accepts both with range checks.
+#[test]
+fn tell_wake_policy_defaults_patch_and_old_config() {
+    let default = policy::Policy::default();
+    assert!(!default.inbound.tell_wake);
+    assert_eq!(default.inbound.tell_wakes_per_hour, 60);
+    let value = serde_json::to_value(&default).unwrap();
+    assert_eq!(value["inbound"]["tellWake"], false);
+    assert_eq!(value["inbound"]["tellWakesPerHour"], 60);
+    // A policy stored by an older binary.
+    let old: policy::Policy = serde_json::from_value(json!({"inbound":{"exports":[{"all":true}],"accept":true,"assumedCaps":{"sandbox":"read-only","networkAccess":false,"unrestrictedServices":false},"review":"never","maxOpenAsks":20,"asksPerHour":60},"outbound":{"visibility":"all"}})).unwrap();
+    assert!(!old.inbound.tell_wake);
+    assert_eq!(old.inbound.tell_wakes_per_hour, 60);
+    let on = old
+        .patched(&json!({"inbound":{"tellWake":true,"tellWakesPerHour":5}}))
+        .unwrap();
+    assert!(on.inbound.tell_wake);
+    assert_eq!(on.inbound.tell_wakes_per_hour, 5);
+    assert_eq!(on.inbound.review, policy::Review::Never, "other fields kept");
+    for bad in [
+        json!({"inbound":{"tellWakesPerHour":0}}),
+        json!({"inbound":{"tellWakesPerHour":100001}}),
+        json!({"inbound":{"tellWake":"yes"}}),
+        json!({"inbound":{"tellWakes":true}}),
+    ] {
+        assert!(old.patched(&bad).is_err(), "{bad}");
+    }
+}
+
+fn wake_request(id: &str, target: &str, text: &str) -> Value {
+    let mut value = request(id, target, text);
+    value["schemaVersion"] = json!(2);
+    value["wake"] = json!(true);
+    value
+}
+
+/// Receiving a wake: refused (nothing delivered or stored) unless the peer's
+/// tellWake is on and its review setting does not require review; delivered
+/// as a wake, replayed from the receipt, and past the hourly cap delivered
+/// as a note marked wakeDowngraded / rate_limited.
+#[test]
+fn receive_wake_needs_policy_and_downgrades_past_the_hourly_cap() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let instance = Instance::new(true);
+    instance.agents(&[(LOCAL, "local-worker")]);
+    let store = Store::open().unwrap();
+    let mut p = peer();
+    p.label = "alpha".into();
+    p.policy.inbound.exports = vec![policy::Export::Agent {
+        agent: LOCAL.into(),
+    }];
+    let receipts = store.dir.join("tell-receipts.json");
+    let delivered = Delivered::default();
+    let deliver = recorder(&delivered);
+    let narrow = || {
+        Some(policy::Caps {
+            sandbox: Some("read-only".into()),
+            network_access: false,
+            unrestricted_services: false,
+        })
+    };
+    let wide = || {
+        Some(policy::Caps {
+            sandbox: Some("danger-full-access".into()),
+            network_access: true,
+            unrestricted_services: false,
+        })
+    };
+
+    // Default policy: tellWake off (and review always).
+    let refused = |peer: &super::store::Peer, caps: &dyn Fn(&str) -> Option<policy::Caps>| {
+        tells::receive_with(&store, peer, wake_request(&tell_id(1), LOCAL, "wake up"), &deliver, caps)
+            .unwrap_err()
+    };
+    let e = refused(&p, &|_| narrow());
+    assert_eq!((e.code.as_str(), e.status), ("wake_not_allowed", 403));
+    assert_eq!(e.details["reason"], "policy");
+    // tellWake on but review required: always, or ifTargetWider for a wider
+    // (or unknown) target.
+    p.policy.inbound.tell_wake = true;
+    assert_eq!(refused(&p, &|_| narrow()).details["reason"], "review");
+    p.policy.inbound.review = policy::Review::IfTargetWider;
+    assert_eq!(refused(&p, &|_| wide()).details["reason"], "review");
+    assert_eq!(refused(&p, &|_| None).details["reason"], "review");
+    // validate_inbound still applies first.
+    let mut closed = p.clone();
+    closed.policy.inbound.asks = false;
+    assert_eq!(refused(&closed, &|_| narrow()).code, "peer_asks_disabled");
+    assert!(delivered.borrow().is_empty());
+    assert!(!receipts.exists(), "a refused wake writes nothing");
+
+    // Allowed: ifTargetWider with a target no wider than the assumed caps.
+    let first = tells::receive_with(&store, &p, wake_request(&tell_id(1), LOCAL, "wake up"), &deliver, &|_| narrow()).unwrap();
+    assert_eq!(first["deliveryKind"], "wake");
+    assert_eq!(first["schemaVersion"], 2);
+    assert!(first.get("wakeDowngraded").is_none());
+    {
+        let sent = delivered.borrow();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].4, "delivered as a wake");
+        assert_eq!(sent[0].2.wake_downgraded, None);
+    }
+    // Replay: the receipt answers, no second wake.
+    let again = tells::receive_with(&store, &p, wake_request(&tell_id(1), LOCAL, "wake up"), &deliver, &|_| narrow()).unwrap();
+    assert_eq!(again["deduplicated"], true);
+    assert_eq!(again["deliveryKind"], "wake");
+    assert_eq!(delivered.borrow().len(), 1);
+    // The digest includes wake: the same ID as a note conflicts.
+    let e = tells::receive(&store, &p, request(&tell_id(1), LOCAL, "wake up"), &deliver).unwrap_err();
+    assert_eq!((e.code.as_str(), e.status), ("idempotency_conflict", 409));
+
+    // review never: no caps needed. Hourly cap 2: the third wake is a note.
+    p.policy.inbound.review = policy::Review::Never;
+    p.policy.inbound.tell_wakes_per_hour = 2;
+    let no_caps = |_: &str| -> Option<policy::Caps> { panic!("review never reads no caps") };
+    // A plain note does not count against the wake cap.
+    tells::receive(&store, &p, request(&tell_id(2), LOCAL, "fyi"), &deliver).unwrap();
+    let second = tells::receive_with(&store, &p, wake_request(&tell_id(3), LOCAL, "again"), &deliver, &no_caps).unwrap();
+    assert_eq!(second["deliveryKind"], "wake");
+    let third = tells::receive_with(&store, &p, wake_request(&tell_id(4), LOCAL, "and again"), &deliver, &no_caps).unwrap();
+    assert_eq!(third["deliveryKind"], "note");
+    assert_eq!(third["wakeDowngraded"], true);
+    assert_eq!(third["reason"], "rate_limited");
+    {
+        let sent = delivered.borrow();
+        assert_eq!(sent.len(), 4);
+        assert!(!sent[1].4 && sent[2].4 && !sent[3].4);
+        assert_eq!(sent[3].2.wake_downgraded.as_deref(), Some("rate_limited"));
+    }
+    // Its replay keeps the downgrade.
+    let replay = tells::receive_with(&store, &p, wake_request(&tell_id(4), LOCAL, "and again"), &deliver, &no_caps).unwrap();
+    assert_eq!((replay["deduplicated"].as_bool(), replay["wakeDowngraded"].as_bool()), (Some(true), Some(true)));
+    assert_eq!(delivered.borrow().len(), 4);
+    drop(instance);
+}
+
+/// Sending a wake: only to a peer that negotiated tells.v2, as
+/// schemaVersion 2; the result carries what the other host did.
+#[test]
+fn agent_tell_wake_to_name_at_host() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = Instance::new(true);
+    let (w, _wd) = world("xtell-wake");
+    let (asks, _sd) = temp_store("xtell-wake");
+    let local = RefCell::new(0usize);
+    let target = json!({"cutexSessionId":REMOTE,"name":"worker"});
+    let (url, seen, server) = scripted(vec![
+        (200, json!({"schemaVersion":2,"tellId":"x","messageId":"bus-1","deliveryKind":"wake","recipientState":"idle","target":target})),
+        (200, json!({"schemaVersion":2,"tellId":"x","messageId":"bus-2","deliveryKind":"note","wakeDowngraded":true,"reason":"rate_limited","recipientState":"busy","target":target})),
+        (403, json!({"code":"wake_not_allowed","details":{"reason":"review"}})),
+        (400, json!({"code":"peer_protocol_error"})),
+        (200, json!({"schemaVersion":1,"tellId":"x","messageId":"bus-3","deliveryKind":"note","recipientState":"idle","target":target})),
+    ]);
+    let p = remote_peer(&url);
+    Store::open()
+        .unwrap()
+        .with(|state| {
+            state.peers.get_mut(&p.peer_id).unwrap().negotiated_features.push(tells::FEATURE_V2.into());
+            Ok(())
+        })
+        .unwrap();
+    let tell = |action: &str, wake: bool| {
+        call("agent_tell", json!({"to":"worker@beta","text":"look","wake":wake}), action, &asks, &w, &local)
+    };
+
+    let woke = tell("w1", true);
+    assert_eq!(woke["ok"], true, "{woke}");
+    assert_eq!(woke["deliveryKind"], "wake");
+    assert!(woke.get("wakeDowngraded").is_none());
+    assert!(woke["detail"].as_str().unwrap().starts_with("Delivered to host beta. Sent as a wake."), "{woke}");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].1["schemaVersion"], 2);
+        assert_eq!(seen[0].1["wake"], true);
+    }
+    // Replay of the same action: no second request.
+    assert_eq!(tell("w1", true)["deliveryKind"], "wake");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    let downgraded = tell("w2", true);
+    assert_eq!(downgraded["deliveryKind"], "note", "{downgraded}");
+    assert_eq!(downgraded["wakeDowngraded"], true);
+    assert_eq!(downgraded["reason"], "rate_limited");
+    assert!(downgraded["detail"].as_str().unwrap().contains("as a note, not a wake (rate_limited"), "{downgraded}");
+
+    let refused = tell("w3", true);
+    assert_eq!(refused["code"], "wake_not_allowed", "{refused}");
+    assert_eq!(refused["status"], "no_write");
+    let detail = refused["detail"].as_str().unwrap();
+    assert!(detail.contains("Nothing was sent") && detail.contains("wake=false") && detail.contains("agent_delegate"), "{detail}");
+    assert_eq!(refused["reason"], "review", "{refused}");
+
+    // An older receiver refuses schemaVersion 2.
+    let old = tell("w4", true);
+    assert_eq!(old["code"], "remote_unsupported", "{old}");
+    assert_eq!(old["detail"], tells::WAKE_UNSUPPORTED_DETAIL);
+
+    // A note stays schemaVersion 1 without a wake field.
+    let note = tell("w5", false);
+    assert_eq!(note["deliveryKind"], "note", "{note}");
+    server.join().unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 5);
+    assert_eq!(seen[4].1["schemaVersion"], 1);
+    assert!(seen[4].1.get("wake").is_none());
+    assert_eq!(*local.borrow(), 0);
 }

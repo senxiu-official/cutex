@@ -9,6 +9,11 @@
 //!   string) the owner-given display name. The label (which clients use to
 //!   find their own token) never changes. 400 `invalid_client_token_name`,
 //!   404 `client_token_not_found`
+//!   With `scope: "full"|"chat"|"read"` (capability `device-scope`; either
+//!   field or both) it sets the token's device scope → `{tokenId, ownerName,
+//!   scope}` (400 `invalid_scope`); a narrowed device's open streams end
+//!   (`cutex/access/changed`). Audit `tokenScopeChanged {tokenId, from, to,
+//!   actor}` in the users audit log.
 //! - `DELETE /v2/client-tokens/{tokenId}` → `{tokenId, revoked: true}`;
 //!   404 `client_token_not_found`
 //!
@@ -24,7 +29,7 @@ use std::net::TcpStream;
 use serde_json::json;
 
 use crate::http::server::{write_json_response, SimpleHttpRequest};
-use crate::management::client_tokens::{validate_owner_name, ClientTokenStore, TOKEN_ID_PREFIX};
+use crate::management::client_tokens::{validate_owner_name, ClientTokenStore, DeviceScope, TOKEN_ID_PREFIX};
 
 pub const PATH: &str = "/v2/client-tokens";
 
@@ -75,27 +80,25 @@ pub(crate) fn handle_with_store(
             Err(error) => unavailable(stream, &error),
         },
         ("PATCH", false, Some(token_id)) => {
-            let name = match parse_rename(&request.body) {
-                Ok(name) => name,
-                Err(message) => {
+            let patch = match parse_patch(&request.body) {
+                Ok(patch) => patch,
+                Err((code, message)) => {
                     return super::server::write_v2_error(
                         stream,
                         400,
                         "Bad Request",
-                        "invalid_client_token_name",
+                        code,
                         &message,
                         false,
-                        json!({ "maxChars": crate::management::client_tokens::MAX_OWNER_NAME_CHARS }),
+                        json!({
+                            "maxChars": crate::management::client_tokens::MAX_OWNER_NAME_CHARS,
+                            "scopes": ["full", "chat", "read"],
+                        }),
                     )
                 }
             };
-            match store.rename(token_id, name.as_deref()) {
-                Ok(Some(owner_name)) => write_json_response(
-                    stream,
-                    200,
-                    "OK",
-                    &json!({ "tokenId": token_id, "ownerName": owner_name }),
-                ),
+            match apply_patch(store, token_id, &patch) {
+                Ok(Some(value)) => write_json_response(stream, 200, "OK", &value),
                 Ok(None) => super::server::write_v2_error(
                     stream,
                     404,
@@ -147,19 +150,69 @@ pub(crate) fn handle_with_store(
     }
 }
 
-/// `{name: string|null}` → the validated name (`None` = clear; a blank
-/// string clears too).
-fn parse_rename(body: &[u8]) -> Result<Option<String>, String> {
+#[derive(Debug, Default)]
+struct Patch {
+    /// `Some(None)` clears the name.
+    name: Option<Option<String>>,
+    scope: Option<DeviceScope>,
+}
+
+/// `{name?: string|null, scope?: "full"|"chat"|"read"}` (at least one):
+/// the validated name (`None` = clear; a blank string clears too) and scope.
+fn parse_patch(body: &[u8]) -> Result<Patch, (&'static str, String)> {
+    let invalid_name = |message: String| ("invalid_client_token_name", message);
     let value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|_| "body must be a JSON object".to_string())?;
-    let object = value.as_object().ok_or("body must be a JSON object")?;
+        serde_json::from_slice(body).map_err(|_| invalid_name("body must be a JSON object".into()))?;
+    let object = value.as_object().ok_or_else(|| invalid_name("body must be a JSON object".into()))?;
+    let mut patch = Patch::default();
     match object.get("name") {
-        None => Err("name is required (a string, or null to clear)".into()),
-        Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(name)) if name.trim().is_empty() => Ok(None),
-        Some(serde_json::Value::String(name)) => validate_owner_name(name).map(Some),
-        Some(_) => Err("name must be a string or null".into()),
+        None => {}
+        Some(serde_json::Value::Null) => patch.name = Some(None),
+        Some(serde_json::Value::String(name)) if name.trim().is_empty() => patch.name = Some(None),
+        Some(serde_json::Value::String(name)) => {
+            patch.name = Some(Some(validate_owner_name(name).map_err(invalid_name)?))
+        }
+        Some(_) => return Err(invalid_name("name must be a string or null".into())),
     }
+    match object.get("scope") {
+        None => {}
+        Some(value) => {
+            let scope = value.as_str().and_then(DeviceScope::parse).ok_or((
+                "invalid_scope",
+                "scope must be \"full\", \"chat\" or \"read\"".to_string(),
+            ))?;
+            patch.scope = Some(scope);
+        }
+    }
+    if patch.name.is_none() && patch.scope.is_none() {
+        return Err(invalid_name("name is required (a string, or null to clear), or scope".into()));
+    }
+    Ok(patch)
+}
+
+/// Apply a PATCH → `{tokenId, ownerName, scope}`; `Ok(None)` = no such token.
+fn apply_patch(store: &ClientTokenStore, token_id: &str, patch: &Patch) -> anyhow::Result<Option<serde_json::Value>> {
+    if let Some(name) = &patch.name {
+        if store.rename(token_id, name.as_deref())?.is_none() {
+            return Ok(None);
+        }
+    }
+    if let Some(scope) = patch.scope {
+        let Some((from, to)) = store.set_scope(token_id, scope)? else {
+            return Ok(None);
+        };
+        if from != to {
+            crate::management::users::audit(
+                crate::management::users::UserStore::beside(store).dir(),
+                "tokenScopeChanged",
+                json!({ "tokenId": token_id, "from": from, "to": to, "actor": crate::management::users::current_actor() }),
+            );
+        }
+    }
+    let Some(token) = store.list()?.into_iter().find(|token| token.token_id == token_id) else {
+        return Ok(None);
+    };
+    Ok(Some(json!({ "tokenId": token_id, "ownerName": token.owner_name, "scope": token.scope })))
 }
 
 fn unavailable(stream: &mut TcpStream, error: &anyhow::Error) -> anyhow::Result<()> {

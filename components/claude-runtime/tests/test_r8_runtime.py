@@ -138,9 +138,10 @@ async def test_child_native_tools_keep_permissions_and_post_identity(ph):
 async def test_agent_tool_inherits_policy_and_cannot_create_unbound_turns(ph):
     tid, turn, bridge = await begin(ph)
     ph.store.db.execute('INSERT OR REPLACE INTO thread_tool_approvals VALUES(?,?)', (tid, 'default'))
-    data = {'session_id': bridge.sid, 'tool_name': 'Agent', 'tool_input': {'prompt': 'analyze'}}
+    data = {'session_id': bridge.sid, 'tool_name': 'Agent', 'tool_input': {'prompt': 'analyze', 'run_in_background': False}}
     assert await bridge.pre_tool(data, 'agent', {}) == {}
-    for args in [{'mode': 'bypassPermissions'}, {'run_in_background': True}]:
+    # Leaving run_in_background out is a background subagent in newer Claude Code.
+    for args in [{'mode': 'bypassPermissions', 'run_in_background': False}, {'run_in_background': True}, {'prompt': 'analyze'}]:
         denied = await bridge.pre_tool({**data, 'tool_input': args}, str(uuid.uuid4()), {})
         assert denied['hookSpecificOutput']['permissionDecision'] == 'deny'
     assert ph.sdk.clients[0].options.env['CLAUDE_CODE_HARBOR_KITE'] == '0'

@@ -459,22 +459,29 @@ class Store:
             self.db.execute("INSERT INTO turns(id,thread_id,state,started) VALUES(?,?,'inProgress',?)", (row["turn_id"], tid, now))
             # Clients saw this thread again once a new turn runs: no more replay.
             self.recovered_events.pop(tid, None)
-            # Notes waiting for this thread are read at the start of a turn an
-            # agent or service started (before its own input). An owner turn keeps
-            # its text as written (@path mentions expand), so notes wait for its
-            # first tool call (PostToolUse) or the next turn.
-            notes = [] if payload["source"]["kind"] == "user" else self._take_notes(tid, row["turn_id"])
+            owner = payload["source"]["kind"] == "user"
+            compact = payload.get("eventType") == COMPACT_EVENT
+            parts = [{"type": "text", "text": content[0]["text"], "text_elements": []}] if content[0]["text"] else []
+            item = {"type": "userMessage", "id": identifier(), "clientId": payload.get("clientId"),
+                    "content": parts + list(payload.get("display") or [])}
+            if owner and not compact:
+                self.put_item(row["turn_id"], item)
+            # Notes waiting for this thread are read at the start of every turn
+            # (Codex reads passive input at a turn's first request too): an owner
+            # turn, an owner's wake (cutex/agentBus/wake: "read the unread notes")
+            # and a turn an agent or service started. Their items follow the
+            # owner's message and precede an agent's input; the model reads them
+            # before the input text. The subscription backend sends them to an
+            # owner turn as separate text blocks before the owner's text
+            # (`turn_note_frames`), so only the owner's own text expands @path
+            # mentions. `/compact` reads none: they wait for the next turn.
+            notes = [] if compact else self._take_notes(tid, row["turn_id"])
             model_content = content
             if notes:
                 model_content = [{"type": "text", "text": "\n\n".join([frame for _, frame in notes] + [content[0]["text"]])}]
             if not self.db.execute("SELECT 1 FROM meta WHERE key='backend' AND value='subscription'").fetchone():
                 self.db.execute("INSERT INTO history(thread_id,turn_id,role,content) VALUES(?,?,'user',?)", (tid, row["turn_id"], dump(model_content)))
-            parts = [{"type": "text", "text": content[0]["text"], "text_elements": []}] if content[0]["text"] else []
-            item = {"type": "userMessage", "id": identifier(), "clientId": payload.get("clientId"),
-                    "content": parts + list(payload.get("display") or [])}
-            if payload["source"]["kind"] == "user" and payload.get("eventType") != COMPACT_EVENT:
-                self.put_item(row["turn_id"], item)
-            elif payload["source"]["kind"] != "user" and (isinstance(payload.get("view"), dict) or payload.get('metadata', {}).get('nativeExternalInput') is True):
+            if not owner and (isinstance(payload.get("view"), dict) or payload.get('metadata', {}).get('nativeExternalInput') is True):
                 # cutex r208 inputs with a view (agent wakes, 委托 events) show as
                 # `external_event` items, keyed by their message id.
                 self.put_item(row["turn_id"], self.external_item(row["message_id"], payload))
@@ -482,8 +489,15 @@ class Store:
             self.db.execute("UPDATE threads SET updated=? WHERE id=?", (now, tid))
             result = dict(row)
             result["state"] = "processing"
-            result["prompt"] = model_content[0]["text"]
+            # An owner turn's prompt stays its own text (see `turn_note_frames`).
+            result["prompt"] = content[0]["text"] if owner else model_content[0]["text"]
             return result
+
+    def turn_note_frames(self, turn_id: str) -> list[str]:
+        """Model frames of the notes read in at the start of `turn_id`, oldest
+        first. Called before the turn's first request (no PostToolUse yet)."""
+        rows = self.db.execute("SELECT payload FROM notes WHERE turn_id=? AND state='injected' ORDER BY seq", (turn_id,)).fetchall()
+        return [self.project_input(json.loads(row[0]))[0]["text"] for row in rows]
 
     def turn_source(self, turn_id: str) -> dict | None:
         """Who started a turn: {kind, id, name} of its input; None if unknown."""

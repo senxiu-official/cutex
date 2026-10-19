@@ -126,6 +126,17 @@ pub fn handle_v2_request(
         }
         return super::identity_api::handle(stream, request);
     }
+    if super::clients_api::is_path(path) {
+        // Desktop client presence and remote close (client-remote-close):
+        // any authenticated principal, pending included (the access gate
+        // lets every principal through); the handler decides who may list
+        // and close what.
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "valid cutex management authentication is required", false, json!({}));
+        }
+        return super::clients_api::handle(stream, request);
+    }
     if super::users_api::is_self_service_path(path) {
         // Self-service profile, avatars and own devices: any assigned
         // principal (the access gate refused pending tokens except for the
@@ -1585,8 +1596,9 @@ fn build_bootstrap_resource(
             // (`launch::native_plan`), or null.
             "latestPlan": collections.get("latestPlan").cloned().unwrap_or(Value::Null),
             // Newest native token_count from the current rollout
-            // (`launch::native_token_usage`) in the thread/tokenUsage/updated
-            // params shape plus updatedAt, or null.
+            // (`launch::native_token_usage`; Claude: the kept newest report,
+            // `claude_token_usage`) in the thread/tokenUsage/updated params
+            // shape plus updatedAt, or null.
             "latestTokenUsage": collections.get("latestTokenUsage").cloned().unwrap_or(Value::Null),
         }
     });
@@ -5556,6 +5568,7 @@ mod tests {
             "/v2/profiles/GLM",
             "/v2/profiles/GLM/models",
             "/v2/profiles/GLM/models/glm-5.3/reset",
+            "/v2/profile-imports/cc-switch",
             "/v2/settings",
             "/v2/notification-levels",
             "/v2/notification-levels/evaluate",

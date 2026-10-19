@@ -86,7 +86,12 @@ impl Source {
                 let agent = crate::config::proxy_outbound::OutboundProxy::host()
                     .apply(
                         ureq::Agent::config_builder()
+                            // Every phase is bounded: a stalled resolver, TLS handshake or response (seen
+                            // in Windows Sandbox, 2026-10-19) otherwise kept `upgrade check` waiting forever.
+                            .timeout_resolve(Some(Duration::from_secs(20)))
                             .timeout_connect(Some(Duration::from_secs(20)))
+                            .timeout_send_request(Some(Duration::from_secs(60)))
+                            .timeout_recv_response(Some(Duration::from_secs(60)))
                             .timeout_recv_body(Some(Duration::from_secs(60 * 30)))
                             .max_redirects(5)
                             .http_status_as_error(false),

@@ -24,6 +24,7 @@ use crate::session::store::{
 pub mod permission_rules;
 pub mod code_sources;
 pub mod skill_catalog;
+pub mod side;
 pub mod structure;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -856,8 +857,17 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
             });
         }
     }
+    // The adapter and its descendants (Claude Code, shells, dev servers) share
+    // the Agent's kill-on-close Job object, whose last handle lives in the
+    // adapter: when the adapter exits or is killed nothing is left behind,
+    // and a management restart does not touch it.
     #[cfg(windows)]
-    let mut child = crate::platform::windows_spawn::spawn_detached(&command, &log)?;
+    let mut child = {
+        let job = crate::platform::windows_job::create_or_join_agent_job(
+            &crate::runtime::process_scope::managed_agent_job_name(&record.cutex_session_id),
+        )?;
+        crate::platform::windows_spawn::spawn_detached_in_job(&command, &log, &job)?
+    };
     #[cfg(not(windows))]
     let mut child = command.spawn()?;
     let deadline = Instant::now() + Duration::from_secs(20);

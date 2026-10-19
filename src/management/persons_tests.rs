@@ -247,3 +247,156 @@ fn owner_acknowledges_a_device_key_change() {
     assert_eq!(audit.matches("tokenPersonChangeAcknowledged").count(), 1);
     let _ = std::fs::remove_dir_all(root);
 }
+
+fn owner_person_of(store: &UserStore) -> Option<(String, String)> {
+    store.owner_person()
+}
+
+fn write_persons(store: &UserStore, value: Value) {
+    std::fs::create_dir_all(store.dir()).unwrap();
+    std::fs::write(store.persons_path(), serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+fn audit_line(dir: &Path, action: &str, details: Value) {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut text = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+    text.push_str(&json!({ "ts": "2026-10-01T00:00:00Z", "action": action, "details": details }).to_string());
+    text.push('\n');
+    std::fs::write(dir.join("audit.jsonl"), text).unwrap();
+}
+
+#[test]
+fn first_root_claim_sets_the_owner_person_and_later_keys_do_not() {
+    let (root, store) = temp();
+    let me = TestPerson::new(11);
+    let colleague = TestPerson::new(12);
+    assert_eq!(owner_person_of(&store), None);
+    let view = store.owner_view();
+    assert_eq!((view["confirmed"].clone(), view["fingerprint"].clone(), view["source"].clone()), (json!(false), Value::Null, Value::Null));
+    assert_eq!(view["displayName"], "Owner", "{view}");
+
+    store.apply_claim(&claim(None, &me), "root").unwrap();
+    assert_eq!(owner_person_of(&store), Some((me.public(), "firstRootClaim".into())));
+    let raw: Value = serde_json::from_slice(&std::fs::read(store.persons_path()).unwrap()).unwrap();
+    assert_eq!(raw["ownerPerson"]["publicKey"], me.public().as_str());
+    assert_eq!(raw["ownerPerson"]["source"], "firstRootClaim");
+    assert!(raw["ownerPerson"]["setAt"].is_string());
+
+    // Someone else with the root credential (SSH as this account): their key
+    // goes on owner but they do not become the owner person.
+    store.apply_claim(&claim(None, &colleague), "root").unwrap();
+    assert_eq!(store.persons_snapshot().unwrap().keys_of(OWNER).len(), 2);
+    assert_eq!(owner_person_of(&store), Some((me.public(), "firstRootClaim".into())));
+    let view = store.owner_view();
+    assert_eq!(view["fingerprint"], fingerprint(&me.public()).as_str());
+    assert_eq!(view["confirmed"], true);
+
+    // Local set: only owner keys.
+    let err = store.set_owner_person(&TestPerson::new(13).public(), "root").unwrap_err();
+    assert_eq!((err.status, err.code), (400, "not_an_owner_key"));
+    assert_eq!(store.set_owner_person("junk", "root").unwrap_err().code, "invalid_public_key");
+    store.set_owner_person(&colleague.public(), "root").unwrap();
+    assert_eq!(owner_person_of(&store), Some((colleague.public(), "local".into())));
+
+    // Removing the owner person's key from owner: unconfirmed (no inference).
+    store.set_person_keys(OWNER, vec![(me.public(), None)], "root").unwrap();
+    assert_eq!(owner_person_of(&store), None);
+    let raw: Value = serde_json::from_slice(&std::fs::read(store.persons_path()).unwrap()).unwrap();
+    assert_eq!(raw["ownerPerson"]["publicKey"], Value::Null);
+    assert_eq!(raw["ownerPerson"]["source"], "keyRemoved");
+    // A later root claim does not confirm it either.
+    store.apply_claim(&claim(None, &TestPerson::new(14)), "root").unwrap();
+    assert_eq!(owner_person_of(&store), None);
+    store.set_owner_person(&me.public(), "root").unwrap();
+    store.clear_owner_person("root").unwrap();
+    assert_eq!(owner_person_of(&store), None);
+
+    let audit = std::fs::read_to_string(store.dir().join("audit.jsonl")).unwrap();
+    let sets: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["action"] == "ownerPersonSet")
+        .collect();
+    let sources: Vec<&str> = sets.iter().map(|s| s["details"]["source"].as_str().unwrap()).collect();
+    assert_eq!(sources, ["firstRootClaim", "local", "keyRemoved", "local", "local"]);
+    assert_eq!(sets[0]["details"]["publicKey"], me.public().as_str());
+    assert_eq!(sets[0]["details"]["actor"], "root");
+    assert_eq!(sets[2]["details"]["publicKey"], Value::Null);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn first_paired_device_sets_the_owner_person() {
+    let (root, store) = temp();
+    let me = TestPerson::new(21);
+    let first = store.tokens().issue("first").unwrap();
+    store.bind_token(&first.token_id, Some(OWNER), "root").unwrap();
+    store.apply_claim(&claim(Some(&first.token_id), &me), "t").unwrap();
+    assert_eq!(owner_person_of(&store), Some((me.public(), "firstPairing".into())));
+    // A later root claim adds a key but keeps the owner person.
+    store.apply_claim(&claim(None, &TestPerson::new(22)), "root").unwrap();
+    assert_eq!(owner_person_of(&store), Some((me.public(), "firstPairing".into())));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn owner_person_is_inferred_for_older_files_without_a_write() {
+    let (root, store) = temp();
+    let a = TestPerson::new(31);
+    let b = TestPerson::new(32);
+    let key = |p: &TestPerson, at: &str| json!({ "publicKey": p.public(), "addedAt": at });
+    // One owner key: it is the owner person.
+    write_persons(&store, json!({ "schema": SCHEMA, "revision": 3, "users": { "owner": [key(&a, "2026-10-01T00:00:00Z")] } }));
+    let before = std::fs::read(store.persons_path()).unwrap();
+    assert_eq!(owner_person_of(&store), Some((a.public(), "audit".into())));
+    assert_eq!(store.owner_view()["source"], "audit");
+    assert_eq!(std::fs::read(store.persons_path()).unwrap(), before, "no migration write");
+
+    // Several keys, no audit: unconfirmed.
+    write_persons(&store, json!({ "schema": SCHEMA, "users": { "owner": [key(&a, "2026-10-01T00:00:00Z"), key(&b, "2026-10-02T00:00:00Z")] } }));
+    assert_eq!(owner_person_of(&store), None);
+    // A later root claim settles "undetermined" first and does not take over.
+    let (root2, store2) = temp();
+    write_persons(&store2, json!({ "schema": SCHEMA, "users": { "owner": [key(&a, "2026-10-01T00:00:00Z"), key(&b, "2026-10-02T00:00:00Z")] } }));
+    store2.apply_claim(&claim(None, &TestPerson::new(33)), "root").unwrap();
+    assert_eq!(owner_person_of(&store2), None);
+    assert_eq!(store2.persons_snapshot().unwrap().owner_person.unwrap().source, "undetermined");
+
+    // Several keys: the earliest root-credential addition still on owner.
+    audit_line(store.dir(), "personKeyAdded", json!({ "userId": "owner", "publicKey": TestPerson::new(39).public(), "reason": "rootCredential" }));
+    audit_line(store.dir(), "personKeyAdded", json!({ "userId": "owner", "publicKey": b.public(), "reason": "firstPairing" }));
+    assert_eq!(owner_person_of(&store), Some((b.public(), "audit".into())), "firstPairing when no rootCredential key remains");
+    audit_line(store.dir(), "personKeyAdded", json!({ "userId": "owner", "publicKey": a.public(), "reason": "rootCredential" }));
+    assert_eq!(owner_person_of(&store), Some((a.public(), "audit".into())));
+    // A rolled-back newer build's explicit choice wins.
+    audit_line(store.dir(), "ownerPersonSet", json!({ "publicKey": b.public(), "source": "local", "actor": "cli" }));
+    assert_eq!(owner_person_of(&store), Some((b.public(), "audit".into())));
+
+    // Changing owner's keys writes the inferred person down first.
+    store.set_person_keys(OWNER, vec![(a.public(), None), (b.public(), None), (TestPerson::new(34).public(), None)], "root").unwrap();
+    let stored = store.persons_snapshot().unwrap().owner_person.unwrap();
+    assert_eq!((stored.public_key.as_deref(), stored.source.as_str()), (Some(b.public().as_str()), "audit"));
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(root2);
+}
+
+#[test]
+fn unknown_persons_fields_survive_and_old_shapes_read() {
+    let (root, store) = temp();
+    write_persons(&store, json!({ "schema": SCHEMA, "users": {}, "futureField": { "x": 1 } }));
+    store.apply_claim(&claim(None, &TestPerson::new(41)), "root").unwrap();
+    let raw: Value = serde_json::from_slice(&std::fs::read(store.persons_path()).unwrap()).unwrap();
+    assert_eq!(raw["futureField"], json!({ "x": 1 }));
+    assert_eq!(raw["ownerPerson"]["source"], "firstRootClaim");
+    // What an older build reads: the same struct without ownerPerson ignores it.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Older {
+        schema: String,
+        #[serde(default)]
+        users: BTreeMap<String, Vec<PersonKey>>,
+    }
+    let older: Older = serde_json::from_value(raw).unwrap();
+    assert_eq!(older.users[OWNER].len(), 1);
+    let _ = std::fs::remove_dir_all(root);
+}

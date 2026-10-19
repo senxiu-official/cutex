@@ -590,6 +590,8 @@ async def test_subscription_start_and_turn_run_no_auth_status(sh, monkeypatch, t
     assert [sh.store.turn(t)['status'] for t in (first, second)] == ['completed', 'completed']
     assert logins == [] and len(sdk.clients) == 1
     assert sdk.clients[0].options.env['CLAUDE_CONFIG_DIR'] == str(tmp_path/'account')
+    # A screenshot or large file in one tool result must not end the turn (SDK default 1 MiB).
+    assert sdk.clients[0].options.max_buffer_size == 64 * 1024 * 1024
     await sh.call('claude/runtime/close', {'threadId': tid})
 
 

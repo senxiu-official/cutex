@@ -33,9 +33,22 @@ def reply(text, *, interrupted=False):
     pending = None
 
 emit({'type': 'system', 'subtype': 'init', 'data': {'session_id': sid}})
-for line in sys.stdin:
-    command = json.loads(line)
-    if command['type'] == 'query':
+# Like Claude Code, a query arriving while an autonomous turn runs is queued
+# and answered after that turn's Result.
+autonomous_open = False
+queued = []
+lines = iter(sys.stdin)
+while True:
+    if queued and not autonomous_open:
+        command = queued.pop(0)
+    else:
+        line = next(lines, None)
+        if line is None:
+            break
+        command = json.loads(line)
+    if command['type'] == 'query' and autonomous_open:
+        queued.append(command)
+    elif command['type'] == 'query':
         prompt = command['prompt']
         data['prompts'].append(prompt)
         path.write_text(json.dumps(data))
@@ -58,5 +71,14 @@ for line in sys.stdin:
     elif command['type'] == 'interrupt':
         if not command.get('drop') and pending:
             reply('', interrupted=True)
+    elif command['type'] == 'autonomous':
+        # A turn Claude Code starts by itself (a background task finished): its
+        # frames, then its Result only if `finish`. No adapter query is involved.
+        emit({'type': 'assistant', 'session_id': sid, 'content': [{'type': 'text', 'text': '[FIXTURE] ' + command['text']}]})
+        # `hold: false`: a turn whose Result the adapter never sees.
+        autonomous_open = command.get('hold', True) and not command.get('finish')
+        if command.get('finish'):
+            emit({'type': 'result', 'session_id': sid, 'subtype': 'success', 'is_error': False,
+                  'terminal_reason': 'completed', 'num_turns': 1, 'usage': {'input_tokens': 2, 'output_tokens': 3}})
     elif command['type'] == 'idle_event':
         emit({'type': 'TaskNotificationMessage', 'session_id': sid, 'status': 'completed', 'message': 'not public log content'})

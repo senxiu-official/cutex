@@ -1544,6 +1544,16 @@
         "toRuntimeAgentId": { "type": ["string", "null"] }
       }
     },
+    "agentBusRemote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "peerId", "senderId"],
+      "properties": {
+        "host": { "$ref": "#/$defs/nonEmptyString" },
+        "peerId": { "$ref": "#/$defs/nonEmptyString" },
+        "senderId": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
     "agentBusQueued": {
       "type": "object",
       "additionalProperties": false,
@@ -1557,7 +1567,7 @@
       ],
       "properties": {
         "messageId": { "$ref": "#/$defs/nonEmptyString" },
-        "fromCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromCutexSessionId": { "anyOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }] },
         "toCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
         "fromRuntimeAgentId": { "type": ["string", "null"] },
         "toRuntimeAgentId": { "type": ["string", "null"] },
@@ -1565,6 +1575,7 @@
         "deliveryKind": { "enum": ["note", "wake", "interrupt"] },
         "sender": { "$ref": "#/$defs/agentParty" },
         "recipient": { "$ref": "#/$defs/agentParty" },
+        "remote": { "$ref": "#/$defs/agentBusRemote" },
         "narrowerCapabilities": { "const": true },
         "replyOnly": { "const": true },
         "wakeDowngraded": { "const": true },
@@ -1610,7 +1621,7 @@
       "required": ["messageId", "fromCutexSessionId", "toCutexSessionId", "deliveredAt"],
       "properties": {
         "messageId": { "$ref": "#/$defs/nonEmptyString" },
-        "fromCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromCutexSessionId": { "anyOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }] },
         "toCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
         "fromRuntimeAgentId": { "type": ["string", "null"] },
         "toRuntimeAgentId": { "type": ["string", "null"] },
@@ -1618,6 +1629,7 @@
         "deliveryKind": { "enum": ["note", "wake", "interrupt"] },
         "sender": { "$ref": "#/$defs/agentParty" },
         "recipient": { "$ref": "#/$defs/agentParty" },
+        "remote": { "$ref": "#/$defs/agentBusRemote" },
         "narrowerCapabilities": { "const": true },
         "replyOnly": { "const": true },
         "wakeDowngraded": { "const": true },
@@ -1635,7 +1647,7 @@
       "required": ["messageId", "fromCutexSessionId", "toCutexSessionId", "error", "failedAt"],
       "properties": {
         "messageId": { "$ref": "#/$defs/nonEmptyString" },
-        "fromCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromCutexSessionId": { "anyOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }] },
         "toCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
         "fromRuntimeAgentId": { "type": ["string", "null"] },
         "toRuntimeAgentId": { "type": ["string", "null"] },
@@ -1643,6 +1655,7 @@
         "deliveryKind": { "enum": ["note", "wake", "interrupt"] },
         "sender": { "$ref": "#/$defs/agentParty" },
         "recipient": { "$ref": "#/$defs/agentParty" },
+        "remote": { "$ref": "#/$defs/agentBusRemote" },
         "narrowerCapabilities": { "const": true },
         "replyOnly": { "const": true },
         "wakeDowngraded": { "const": true },

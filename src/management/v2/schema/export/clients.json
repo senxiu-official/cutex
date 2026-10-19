@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:clients",
+  "title": "ClientList",
+  "description": "Desktop client presence and remote close (capability client-remote-close). POST /v2/clients/presence body presenceRequest → presenceResponse (repeat = heartbeat; any principal, pending included); GET /v2/clients → clientList (owner with scope full: all; others: own user; pending: own token); POST /v2/clients/{instanceId}/close body closeRequest → 202 closeAccepted (403 client_close_forbidden {reason: pending|scope|otherUser}, 404 client_not_found, 409 remote_close_disabled); POST /v2/clients/{instanceId}/closing body closingRequest → closingResponse (the registering credential only; 403 client_close_forbidden {reason: notRegistrant}); host events cutex/client/closeRequested → closeRequestedEvent, cutex/client/stateChanged → stateChangedEvent.",
+  "anyOf": [
+    { "$ref": "#/$defs/presenceRequest" },
+    { "$ref": "#/$defs/presenceResponse" },
+    { "$ref": "#/$defs/clientList" },
+    { "$ref": "#/$defs/closeRequest" },
+    { "$ref": "#/$defs/closeAccepted" },
+    { "$ref": "#/$defs/closingRequest" },
+    { "$ref": "#/$defs/closingResponse" },
+    { "$ref": "#/$defs/closeRequestedEvent" },
+    { "$ref": "#/$defs/stateChangedEvent" }
+  ],
+  "$defs": {
+    "utcTimestamp": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{3})?Z$", "description": "RFC 3339 UTC with Z, milliseconds" },
+    "clientId": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$" },
+    "clientState": { "enum": ["online", "closeRequested", "closing", "cancelled"] },
+    "requestedBy": {
+      "type": "object",
+      "required": ["deviceName", "userId", "local"],
+      "properties": {
+        "deviceName": { "type": "string", "description": "The requester's own desktop (its latest presence), else its token's name, else the host name (root credential)." },
+        "userId": { "type": ["string", "null"] },
+        "local": { "type": "boolean", "description": "The request arrived on a loopback listener." }
+      }
+    },
+    "presenceRequest": {
+      "type": "object",
+      "required": ["installId", "instanceId", "appName"],
+      "properties": {
+        "installId": { "$ref": "#/$defs/clientId" },
+        "instanceId": { "$ref": "#/$defs/clientId", "description": "New per app start; an id registered by another credential: 409 client_instance_conflict." },
+        "appName": { "type": "string", "maxLength": 128, "description": "cutex-desktop" },
+        "appVersion": { "type": "string", "maxLength": 128 },
+        "deviceName": { "type": "string", "maxLength": 128 },
+        "platform": { "type": "string", "maxLength": 128 },
+        "allowRemoteClose": { "type": "boolean", "description": "Default true." }
+      }
+    },
+    "pendingCloseRequest": {
+      "type": "object",
+      "required": ["requestedBy", "graceSeconds", "at"],
+      "properties": {
+        "requestedBy": { "$ref": "#/$defs/requestedBy" },
+        "graceSeconds": { "type": "integer", "minimum": 0 },
+        "at": { "$ref": "#/$defs/utcTimestamp" }
+      }
+    },
+    "presenceResponse": {
+      "type": "object",
+      "required": ["instanceId", "heartbeatSeconds", "state", "closeRequest"],
+      "properties": {
+        "instanceId": { "type": "string" },
+        "heartbeatSeconds": { "const": 60, "description": "Send presence again this often; an instance is dropped after 3 × heartbeatSeconds without one (in memory only)." },
+        "state": { "$ref": "#/$defs/clientState" },
+        "closeRequest": { "anyOf": [{ "$ref": "#/$defs/pendingCloseRequest" }, { "type": "null" }], "description": "The open close request while state is closeRequested (for clients without the event stream, e.g. a pending device)." }
+      }
+    },
+    "client": {
+      "type": "object",
+      "required": ["instanceId", "installId", "appName", "appVersion", "deviceName", "platform", "userId", "tokenId", "local", "connectedSince", "lastSeen", "allowRemoteClose", "state", "current"],
+      "properties": {
+        "instanceId": { "type": "string" },
+        "installId": { "type": "string" },
+        "appName": { "type": "string" },
+        "appVersion": { "type": "string" },
+        "deviceName": { "type": "string" },
+        "platform": { "type": "string" },
+        "userId": { "type": ["string", "null"], "description": "User of the registering credential (owner for the root credential); null = pending device." },
+        "tokenId": { "type": ["string", "null"], "description": "Registering client / device token; null = the root credential." },
+        "local": { "type": "boolean", "description": "Registered over a loopback listener." },
+        "connectedSince": { "$ref": "#/$defs/utcTimestamp" },
+        "lastSeen": { "$ref": "#/$defs/utcTimestamp" },
+        "allowRemoteClose": { "type": "boolean" },
+        "state": { "$ref": "#/$defs/clientState" },
+        "current": { "type": "boolean", "description": "Registered by the credential of this request." }
+      }
+    },
+    "clientList": {
+      "type": "object",
+      "required": ["clients"],
+      "properties": { "clients": { "type": "array", "items": { "$ref": "#/$defs/client" } } }
+    },
+    "closeRequest": {
+      "type": "object",
+      "properties": { "graceSeconds": { "type": "integer", "minimum": 0, "maximum": 300, "description": "Default 15." } }
+    },
+    "closeAccepted": {
+      "type": "object",
+      "required": ["instanceId", "state"],
+      "properties": {
+        "instanceId": { "type": "string" },
+        "state": { "enum": ["closeRequested", "closing"], "description": "closing: the instance already reported closing (no new event)." }
+      }
+    },
+    "closingRequest": {
+      "type": "object",
+      "required": ["outcome"],
+      "properties": { "outcome": { "enum": ["closing", "cancelled"] } }
+    },
+    "closingResponse": {
+      "type": "object",
+      "required": ["instanceId", "state"],
+      "properties": { "instanceId": { "type": "string" }, "state": { "enum": ["closing", "cancelled"] } }
+    },
+    "closeRequestedEvent": {
+      "type": "object",
+      "required": ["instanceId", "requestedBy", "graceSeconds", "at"],
+      "properties": {
+        "instanceId": { "type": "string" },
+        "requestedBy": { "$ref": "#/$defs/requestedBy" },
+        "graceSeconds": { "type": "integer", "minimum": 0 },
+        "at": { "$ref": "#/$defs/utcTimestamp" }
+      }
+    },
+    "stateChangedEvent": {
+      "type": "object",
+      "required": ["instanceId", "state"],
+      "properties": { "instanceId": { "type": "string" }, "state": { "$ref": "#/$defs/clientState" } }
+    }
+  }
+}

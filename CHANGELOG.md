@@ -3,6 +3,238 @@
 <!-- Each entry: English text, then a Chinese text. The English part contains no Chinese characters:
      name UI labels by their English strings (Approvals, "Auto"). -->
 
+## 0.1.5 "First Take" (2026-10-20)
+
+Owner devices: every new device bound to the owner is listed and announced until the owner
+acknowledges it, actions that change who controls the host work only on the host itself or over SSH,
+and each device can be narrowed to chat or read; the host records the owner in person. Claude agents
+get Side chats and forks while busy, read waiting notes at the start of every turn, keep context usage
+after a reconnect and pick up a changed system prompt on resume. A cross-host `agent_tell` can wake the
+other agent when its host allows it. Per-user home pages and desktop presence with remote close live on
+the host; Profiles import from CC Switch; Windows runs every agent runtime in its own Job object. A
+rollback to an older cutex never gives a narrowed device more rights. Pairs with desktop 0.1.5.
+Components: claude-runtime claude-r21 (adapter 0.7.8); job-service stays 0.1.1; no new cute-codex
+native (stays 0.160.0-r52.3).
+主人的设备：每台新的主人设备都会列出并通知，直到主人确认；改变主机归属的操作只能在主机本机或通过 SSH 做；每台设备可限制为只聊天或只查看；主机记录「主人本人」。Claude 智能体支持侧聊和忙碌时分叉，每一轮开头读入待读留言，重新连接后保留上下文用量，恢复会话时使用更新后的系统提示。主机允许时，跨主机留言可以唤醒对方的智能体。按用户保存的主页、桌面在线状态与远程关闭保存在主机上；可从 CC Switch 导入 Profile；Windows 上每个智能体运行时放进自己的 Job 对象。回退到旧版 cutex 不会让受限设备获得更多权限。配合桌面端 0.1.5。组件：claude-runtime claude-r21（适配器 0.7.8）；job-service 仍为 0.1.1；没有新的 cute-codex 原生运行时（仍为 0.160.0-r52.3）。
+
+**Owner devices and access**
+
+- New owner devices are visible (cutex-desktop docs/research/host-ownership-20261019.md section 5; a
+  device bound to the owner has the owner's rights, with three limits; capability
+  `owner-device-notice`). A pairing code for the owner lives 5 minutes (others 10), is single use and
+  says `ownerDevice: true`. Every token newly bound to the owner (pairing, assignment of a pending
+  device, person-key auto-binding, `client-token issue` / `users assign` on the host) is listed by
+  `GET /v2/users/owner/new-devices` (`via`: `pairing` | `assigned` | `personKey` | `ssh`) until an
+  owner principal acknowledges it (`POST /v2/users/owner/new-devices/{tokenId}/ack`), and announced
+  once as host event `cutex/access/ownerDeviceAdded` (CLI-added ones on the daemon's next request).
+  Stored in `users-v1.json` `newOwnerDevices`.
+  每台新的主人设备都会列出并通知，直到主人确认；主人设备的配对码 5 分钟有效、只能用一次。
+- Root-identity actions only on the host itself or over SSH ("owner-local", capability
+  `owner-local-only`): a loopback listener with the root credential, or with an owner token issued by
+  `cutex management client-token issue` on the host (the SSH-tunnelled desktop), or the CLI. Tokens
+  now record `issuedVia`: `hostCli` | `pairing` (token items, `user.token.issuedVia`); tokens of older
+  builds are inferred from `kind` (exact: only `client-token issue` ever created client records, only
+  `POST /v2/pair` device records), so existing SSH hosts need no re-pairing. A paired device's token
+  never counts, even owner-bound on loopback. Owner-local only: setting the owner person, turning
+  "new devices need approval" off, creating pairing codes, pairing with or enabling a peer
+  (`POST /v2/peers`, `POST /v2/peers/invites`, `PATCH /v2/peers/{id}` `enabled: true`,
+  `PATCH /v2/settings` `peers.enabled: true`) and reading `config.json` through `GET /v2/fs/file`;
+  otherwise 403 `owner_local_only {action, clientToken, issuedVia}` (`owner_person_local_only` for the
+  owner person). `GET /v2/capabilities` `user.ownerLocal` says whether the connection counts. Turning
+  approval on, disabling peers and the older loopback-only settings stay open to owner devices on
+  loopback.
+  关闭「新设备需要批准」、和其他主机配对或启用对端、读取主人凭据、生成配对码只能在主机本机或通过 SSH 做（配对设备的 token 即使归主人也不算）。
+- Per-device scope `full` (default) | `chat` | `read` on client / device tokens (capability
+  `device-scope`): pairing-code `scope`, `client-token issue --scope`, `cutex management pair
+  --scope`, `PATCH /v2/client-tokens/{id} {scope}`. Effective rights = the user's rights intersected
+  with the scope, enforced in one gate (403 `device_scope_denied {scope, required}`): `read` = GET
+  routes, event streams and read-only methods; `chat` adds input, queue, interrupt / stop,
+  attachments and answering an agent's question, never approvals or any other write. Token items,
+  `user.token` and `user.scope` of `/v2/capabilities` carry it; `tokens.json` stores it only when
+  narrowed.
+  每台设备可设为完全控制、只聊天和查看、只查看。
+- Host owner in person: `GET /v2/host` gains `owner {displayName, fingerprint, confirmed, source}`
+  for everyone connected, members and pending devices included. The first desktop key claimed with
+  the root credential (or the first paired device's key) is the owner person; later keys added to
+  the owner never take over. Only the host itself can change it: `PUT|DELETE /v2/users/owner-person`
+  (owner-local: the root credential, or an owner token issued by `client-token issue` on the host
+  i.e. an SSH-tunnelled desktop, on a loopback listener; paired devices' tokens and remote listeners
+  get 403 `owner_person_local_only`) or `cutex management owner show|set-person|clear-person`. Older
+  hosts are inferred from the only owner key or the users audit log (capability `host-owner-person`;
+  docs/remote-clients.md). `cutex management client-token issue` prints `userId` and `pending`;
+  `cutex management pair` takes `--user <id>`.
+  主机记录「主人本人」：所有已连接的人（包括成员和待分配设备）都能在 `/v2/host` 看到主人的名字和指纹；第一次用主人凭据认领的个人密钥自动成为主人本人，只能在本机或通过 SSH 修改；配对命令可以直接指定用户。
+
+**Claude agents**
+
+- Side chats and busy forks for Claude agents (claude-runtime claude-r21, adapter features `sideChat`
+  and `forkWhileBusy`; docs/SIDE-CHATS.md "Claude agents", components/claude-runtime/README.md). The
+  `/v2/sessions/{id}/side-chats` routes now serve a Claude agent whose adapter declares `sideChat`:
+  cutex relays them to the running adapter (`claude/side/open|list|read|send|interrupt|respond|close`),
+  which keeps the Side state in memory and answers the same snapshot (`sessionId` and
+  `runtimeGeneration` added by cutex). The Side runs on an official-SDK fork (`fork_session`) of the
+  agent's native session through the selected finished turn, in a hidden thread with its own Claude
+  Code process and the agent's settings, permission mode and system prompt; the Side instructions and
+  boundary go before its first message. Its events and approvals stay in the Side chat; closing it
+  deletes the hidden thread and its native copy, and stopping the agent closes its Side chats. Older
+  adapters are refused as before (`409 side_runtime_unsupported`), a stopped agent with `409
+  side_runtime_offline`; `native_transcript_behind` (the kept turn not on disk yet) becomes `409
+  side_boundary_changed`. Forking (`cutex/session/fork`) a busy Claude agent (a running turn, queued
+  inputs or notes) no longer fails: the fork is made from its transcript without closing or leasing
+  the source runtime, leaves the running turn and the queue out, and the receipt says
+  `sourceRuntimeUntouched: true`; an idle agent is forked as before. No migration; Side state is lost
+  when the adapter restarts and a leftover hidden thread is deleted on the next Side request.
+  Claude 智能体也能用侧聊了（看得到主对话到选定回合为止的内容，但不写回主对话），正在工作的 Claude 智能体也能直接分叉，不用先停下。
+- Claude sessions now have `cutexState.latestTokenUsage` in `GET /v2/sessions/{id}/bootstrap` and
+  `GET /v2/sessions/{id}/history` (capability `bootstrap-token-usage`). It was always null for them:
+  the value is derived from the native rollout, which Claude sessions do not have. The daemon now
+  keeps the newest `thread/tokenUsage/updated` the adapter sent for the session's bound thread
+  (`runtime/management-v2/claude-token-usage/`, survives daemon restarts; dropped when a revert
+  removes its turn or the session is deleted) and serves it in the same shape, so a phone or a
+  restarted desktop shows context usage of Claude agents right away. Codex sessions are unchanged.
+  Claude 代理重新连接或重启后，上下文用量不再显示为空，会立即显示最近一次的用量。
+
+**Claude runtime (claude-r20, claude-r21)**
+
+- claude-runtime claude-r21: a changed system prompt (the cutex harness, runtime limits, instructions,
+  auto mode note) reaches resumed sessions. Claude Code replays the prompt recorded at a session's
+  first request (`systemPromptSnapshot`); the adapter now remembers a digest of what the session
+  recorded and resumes with the snapshot off when the text changed. Unchanged prompts keep the cached
+  record.
+  Claude 运行时 claude-r21：改过的系统提示（cutex 说明、运行限制、指令）在会话恢复后生效，不再沿用第一次请求时记录的旧提示。
+- claude-runtime claude-r21: notes other agents left (passive notes, cross-host tells) are read at the
+  start of the next owner turn too, including the turn the owner's Wake (`cutex/agentBus/wake`) starts:
+  they are in its first model request, before the owner's text, each as its own text block (the
+  owner's `@path` mentions still expand, the notes' do not). Before, an owner turn skipped them, so
+  they arrived only after its first tool call and a turn without tool calls never saw them. Each note
+  is still read once (components/claude-runtime/docs/BUSY_DELIVERY.md "Passive notes at turn start").
+  Claude 运行时 claude-r21：主人发消息或点「唤醒」开始的一轮，开头就带上待读留言，不再等到第一次工具调用之后。
+- claude-runtime claude-r21: a cutex input that arrives while Claude Code runs a turn it started by
+  itself (a background command's or subagent's task notification) waits for that turn to end (quiet
+  3 s, at most 120 s) instead of being submitted at once; before, the rest of that turn's messages and
+  its result were taken as the new turn's reply.
+  Claude 运行时 claude-r21：Claude Code 自己开的一轮（后台命令跑完的通知）还没结束时，cutex 送来的新消息先等它结束，不再把那一轮的回复算到新消息头上。
+- claude-runtime claude-r21 (adapter 0.7.8): a subagent call without `run_in_background: false` is
+  refused. Newer Claude Code runs a subagent in the background when the argument is left out, so the
+  old check (refuse only `run_in_background: true`) let background subagents start; they lost every
+  tool when the turn ended. The runtime limits told to the model say to pass `run_in_background: false`.
+  Claude 运行时 claude-r21：子智能体必须明确设置 run_in_background 为 false，不写也会被拒绝；以前不写时会悄悄在后台运行，回合结束后失去工具。
+- claude-runtime claude-r20 (adapter 0.7.7): Claude Code messages up to 64 MiB are read (SDK
+  `max_buffer_size`; the default was 1 MiB). A tool result over 1 MiB, such as a screenshot or a large
+  file read, ended the turn with "SDK receive failed (CLIJSONDecodeError)" (seen on a Windows host with
+  a 1.26 MB screenshot).
+  Claude 运行时 claude-r20：单条消息上限从 1 MiB 提高到 64 MiB，截图或大文件不再让这一轮以 CLIJSONDecodeError 中断。
+
+**Cross-host peers**
+
+- Cross-host wake (capability `cross-host-tell-wake`; cutex-desktop docs/research/peer-tell-wake-20261019.md
+  section 10; docs/PEERS.md "Cross-host wake"): `agent_tell to="name@host" wake=true` can start the
+  remote agent's turn when that host allows it. Per peer, new policy fields `inbound.tellWake` (default
+  false; older configs read as false) and `inbound.tellWakesPerHour` (default 60, 1-100000), both
+  accepted by `PATCH /v2/peers/{id}` `policy.inbound`. The receiver refuses a wake (403
+  `wake_not_allowed` with `reason` `policy` | `review` | `agent_disabled`; nothing delivered, no
+  receipt) unless `tellWake` is on, the target is enabled and the peer's review setting does not
+  require review; past the hourly cap the wake is delivered as a note with
+  `wakeDowngraded: true, reason: "rate_limited"`. No hop or cooldown control. Wire: optional hello
+  feature `tells.v2`; a wake is schemaVersion 2 with `wake: true` (notes stay version 1), sent only to a
+  peer that negotiated `tells.v2`, otherwise (or on an older receiver's 400) `remote_unsupported`.
+  Results carry `deliveryKind` `wake` | `note`; `agent_list` `otherHosts[].tellWake` shows version
+  support. A wake is queued with the new local control type `cutex.peer.tell.v2` and after-turn
+  delivery (busy wait applies; Codex and Claude both read it); its model text says an agent on another
+  host started the turn, and the recipient's message entries and events show `deliveryKind: "wake"`.
+  Older binaries ignore the new policy fields (wakes are then refused); a rollback turns wakes still
+  waiting into notes (see "Upgrade and components").
+  跨主机留言可以唤醒对方的智能体：每台对端主机新增「允许唤醒」开关（默认关）和每小时唤醒上限（默认 60 次）；未允许或对方要求审核时拒绝且什么都不发，超过上限时改作留言送达。
+- A cross-host note (`agent_tell to="name@host"`) waiting for its recipient is now visible to the
+  recipient's owner: the bootstrap `agentBusMessages` entry and a live `cutex/agentBus/messageQueued`
+  event carry its body, `deliveryKind: "note"`, the `name@host` sender and
+  `remote {host, peerId, senderId}`; `messageDelivered` / `messageFailed` follow when it is read in or
+  fails, and `cutex/agentBus/wake` counts it in `pendingNotes`. Before, it had no live event and the
+  snapshot entry had no body (docs/PEERS.md "Cross-host tells").
+  跨主机留言在对方的待读留言里可见：带正文、发送方「名字@主机」和来源主机，读入后消失。
+
+**Users and desktop clients**
+
+- Per-user home page settings on the host (capability `user-home`; cutex-desktop
+  docs/research/home-page-20261019.md section 1; docs/remote-clients.md "Home page"): `GET
+  /v2/users/me/home` answers `{revision, home: {...}|null, coverEtag, updatedAt}`; `PUT
+  /v2/users/me/home {revision, home}` replaces it with optimistic concurrency (409
+  `home_revision_conflict` with the current `revision`). `home` is the client's JSON object (at most
+  64 KiB, 413 `home_too_large`); the known keys `layout`, `blocks [{id, visible}]`, `bio` (at most 200
+  characters), `sidebarEntry`, `showWhenEmpty`, `homeHost` and `pins [{hostId, kind:
+  service|artifact|agent|url, key, title?, size?: s|m|w|l}]` (at most 64) are checked (400
+  `invalid_home`), unknown keys are kept. Cover image: `GET|PUT|DELETE /v2/users/me/home/cover` (PUT
+  `{contentType, data}`, PNG / JPEG / WebP at most 2 MiB, each side at most 4096 px; GET with ETag;
+  400 `invalid_cover`, 413 `cover_too_large`); `coverEtag` in the home answer. Own record only (owner
+  or a bound user; pending devices 403 `access_pending`); device scope `read` may only read, `chat`
+  and `full` may write. Stored per user in `runtime/users/home/`; removed with the user. Schema
+  export `users` (`homeView`, `homePut`, `homeCoverPut`).
+  主页设置存在主机上、按用户分开：同一个人的各台设备看到同一个主页（版式、区块、简介、开关、固定项和封面图），带版本号防止两台设备互相覆盖。
+- Remote close of a desktop client (capability `client-remote-close`; cutex-desktop
+  docs/research/remote-close-desktop-20261019.md; docs/remote-clients.md "Desktop presence and remote
+  close"): desktops report presence with `POST /v2/clients/presence` (repeat = heartbeat every 60 s;
+  kept only in memory, dropped after 180 s without one; any principal, pending and narrowed devices
+  included; 409 `client_instance_conflict` for an instance id of another credential). `GET
+  /v2/clients` lists them (an owner with scope `full` sees all, others their own user's, a pending
+  device only its own). `POST /v2/clients/{instanceId}/close {graceSeconds?}` (default 15) answers
+  202 for an owner or the same user with scope `full`; else 403 `client_close_forbidden {reason:
+  pending|scope|otherUser}`, 404 `client_not_found`, 409 `remote_close_disabled`; audited; host event
+  `cutex/client/closeRequested {instanceId, requestedBy {deviceName, userId, local}, graceSeconds,
+  at}`. The instance reports `POST /v2/clients/{instanceId}/closing {outcome: closing|cancelled}`
+  (only its registering credential), host event `cutex/client/stateChanged {instanceId, state}`.
+  Members' event streams now carry the `cutex/client/*` events of their own instances (and accept
+  `cutexSessionId=cutex.host`); the presence answer also carries `state` and `closeRequest` for
+  clients without an event stream. Schema export `clients`. Only the desktop app quits; the daemon and
+  agents are untouched.
+  主人可以从别的设备远程关闭忘了关的 cutex 桌面（只关桌面 app，不动守护进程和智能体）：桌面向主机报到和心跳，主人可关任何桌面，其他用户只能关自己的；桌面可关掉「允许远程关闭」。
+
+**Profiles**
+
+- Import Profiles from CC Switch: `GET /v2/profile-imports/cc-switch` lists the Claude Code and
+  Codex providers of a CC Switch install on this host (read-only, never a key; `existingProfile`
+  names a matching Profile), and `POST` creates Profiles from chosen rows: Codex rows become API-key
+  Profiles, Claude rows a Claude API account plus a Claude Profile (capability
+  `profile-import-cc-switch`; docs/management/profile-import-cc-switch.md).
+  可以从 CC Switch 导入 Profile：列出本机 CC Switch 的 Claude Code 与 Codex 供应商（只读，不返回密钥），并为选中的条目创建 Profile。
+
+**Platforms**
+
+- Windows: every managed Agent runtime (Codex app-server, Claude adapter) runs in its own Job object
+  (`Global\cutex-agent-...`, kill on close, no breakaway). Stopping, restarting or archiving an Agent
+  terminates the whole job, and a runtime that exits or crashes takes its descendants (Claude Code,
+  shells, dev servers, builds) with it; before, they survived as orphans. The job's last handle lives
+  in the runtime itself, so a management restart still leaves runtimes running for adoption. The
+  runtime environment reports `CUTEX_MANAGED_AGENT_ISOLATION=windows_job_object:<job>` (was
+  `direct:windows_no_systemd`); docs/agent-management-provider.md "Managed Agent process boundary".
+  在 Windows 上，每个智能体的运行时放进自己的 Job 对象，停止、重启或归档智能体会结束它启动的全部子进程（Claude Code、命令、开发服务器、构建），不再留下孤儿进程；守护进程重启不影响正在运行的智能体。
+
+**Upgrade and components**
+
+- A rollback to an older cutex never widens access and never leaves a wake stuck. The rollback step
+  that rewrites records for the older release (services stopped; each changed record copied to the
+  run's `displaced/older-stores/` first) now also holds every client / device token whose scope is
+  not `full`: a release without device scopes refuses it (401) instead of giving it the user's full
+  rights, and 0.1.5 reads it again with its scope after a roll-forward, without re-pairing
+  (`client-tokens-held.json`: ids, labels and scopes, never a secret). Cross-host wakes still waiting
+  and not yet handed to a runtime become cross-host notes, which an older release delivers; it would
+  otherwise never deliver them and hold the owner's input and new delegations to that agent
+  (`peer-wakes.json`). Unacknowledged new owner device notices, which an older release drops, are
+  copied aside (`new-owner-devices.json`). Each step now runs only when the rollback target is older
+  than the release that introduced its records (or is not a plain release label), so a rollback to
+  0.1.4 keeps `static_root` approvals and pending Claude launch permission modes, which 0.1.4 reads.
+  Left as they are, since an older release only ignores them: the owner person (if an older release
+  drops it, 0.1.5 reads it again from the users audit log), peer `tellWake` (dropped: wakes stay off),
+  home pages, Claude token usage and Side chat state.
+  回退到旧版 cutex 时，限制了范围的设备 token 会被暂停（旧版拒绝它，而不是给它完全权限；再升级回来后自动恢复原来的范围，无需重新配对），尚未送达的跨主机唤醒改为留言送达，未确认的新主人设备通知另存一份；回退到 0.1.4 时保留它能读取的 static_root 审批和 Claude 启动权限模式。
+- Backend updates no longer wait forever on a stalled connection: resolving the release host, sending
+  the request and waiting for the response are now bounded (20 s / 60 s / 60 s; the body download keeps
+  its 30 min). In Windows Sandbox `cutex upgrade check` hung for over 10 minutes; it now fails with
+  "cannot reach …" and can be retried.
+  后端更新遇到卡住的网络连接时不再无限等待：解析、发送请求和等待响应都有了超时，失败后可以重试。
+- Components: claude-runtime claude-r21 (adapter 0.7.8; the entries above; claude-r20 was never
+  published); job-service stays 0.1.1. No new cute-codex native (stays 0.160.0-r52.3).
+  组件：Claude 运行时更新为 claude-r21（适配器 0.7.8）；任务服务组件仍为 0.1.1；没有新的原生运行时（仍为 0.160.0-r52.3）。
+
 ## 0.1.4 "First Take" (2026-10-19)
 
 Claude agents: launch permission modes (including "Auto", which covers Claude Code's own tool

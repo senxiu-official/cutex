@@ -88,6 +88,7 @@ impl Error {
             "peer_asks_disabled" => "peer_asks_disabled",
             "peer_hops_exceeded" => "peer_hops_exceeded",
             "peer_rate_limited" => "peer_rate_limited",
+            "wake_not_allowed" => "wake_not_allowed",
             "ask_id_conflict" => "ask_id_conflict",
             "idempotency_conflict" => "idempotency_conflict",
             "ask_not_found" => "ask_not_found",

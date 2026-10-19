@@ -204,11 +204,20 @@ apply that installed `to`, if still installed and not newer) or is cleared,
 so a second default rollback never goes forward to `from`.
 Run by the running (newer) binary: wait-idle, stop, backup, switch, restore
 the selection files saved by the apply that went `to → from` (if its backup
-is still there; then mode `full`), move new stores aside, rewrite the records an
-older release cannot parse (`src/upgrade/older_stores.rs`: approval records of kind
-`static_root` removed, a pending Claude `initial_permission_mode` cleared; each copied to
-`displaced/older-stores/` first; the same step runs when a failed apply rolls back), start, check
-`cutexBuild.release` → `committed`. The preview lists `migrations`,
+is still there; then mode `full`), move new stores aside, rewrite the records the
+target release cannot parse or would read with more rights than they carry
+(`src/upgrade/older_stores.rs`; each changed record copied to `displaced/older-stores/` first;
+the same step runs when a failed apply rolls back), start, check `cutexBuild.release` →
+`committed`. Each rewrite runs only when the target is older than the release that introduced
+its records, or is not a plain `N.N.N` label (dev and `rN` labels: all run):
+
+| since | record | rewrite for an older target |
+|---|---|---|
+| 0.1.4 | approvals of kind `static_root` | removed (asked again) |
+| 0.1.4 | pending Claude `initial_permission_mode` | cleared (Profile default mode) |
+| 0.1.5 | client / device token with scope `chat` / `read` | held: `tokenSha256` = `rollbackHeld.v1:<scope>:<hash>`, so an older release (no scopes) refuses the token instead of granting full rights; 0.1.5+ read it back with its scope (no re-pairing) |
+| 0.1.5 | pending cross-host wake (`cutex.peer.tell.v2`) not yet handed to a runtime | turned into the v1 cross-host note (passive, digest recomputed); an older release would never deliver it and keep it as an eligible next step |
+| 0.1.5 | unacknowledged `newOwnerDevices` in `users-v1.json` | copied aside only (an older release drops them) | The preview lists `migrations`,
 `movedAside`, `selectionBackup` and `sessionDataRestored: false`.
 
 ## 6. CLI

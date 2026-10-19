@@ -137,6 +137,8 @@ fn claim(
         &VerifiedClaim { token_id: token_id.map(str::to_string), public_key: public_key.clone(), display_name },
         &users::current_actor(),
     )?;
+    // owner-device-notice: a pending device auto-bound to the owner.
+    users::announce_owner_devices(store);
     Ok(json!({
         "outcome": result.outcome.as_str(),
         "tokenId": result.token_id,

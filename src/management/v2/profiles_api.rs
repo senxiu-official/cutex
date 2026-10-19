@@ -2,7 +2,9 @@
 //! `GET|POST /v2/profiles`, `GET|PATCH|DELETE /v2/profiles/{profile}`,
 //! `POST /v2/profiles/{profile}/duplicate`, `GET /v2/profile-presets`,
 //! `POST /v2/profiles/{profile}/export`, `POST /v2/profiles/import`
-//! (`profile-transfer`; the export may carry an API key, loopback only).
+//! (`profile-transfer`; the export may carry an API key, loopback only),
+//! `GET|POST /v2/profile-imports/cc-switch` (`profile-import-cc-switch`,
+//! [`super::profile_import_cc_switch`]).
 //! `{profile}` is a profile ID or exact name (percent-encoded). Responses are
 //! camelCase and secret-free; `apiKey` is write-only.
 //!
@@ -96,6 +98,7 @@ pub fn is_profiles_path(path: &str) -> bool {
         || parse_duplicate_path(path).is_some()
         || parse_export_path(path).is_some()
         || parse_image_path(path).is_some()
+        || super::profile_import_cc_switch::is_path(path)
 }
 
 /// `avatarEtag` / `introPortraitEtag` of a profile item (profile-avatar).
@@ -120,11 +123,54 @@ fn profile_body(account: &crate::profiles::model::StoredAccount) -> Value {
     })
 }
 
-fn lifecycle_error(stream: &mut TcpStream, profile: &str, failure: LifecycleError) -> anyhow::Result<()> {
+/// An error answer not yet written (shared by `POST /v2/profiles` and the
+/// profile imports, which report it per item).
+#[derive(Debug)]
+pub(super) struct CreateFailure {
+    pub status: u16,
+    pub reason: &'static str,
+    pub code: &'static str,
+    pub message: String,
+    pub retryable: bool,
+    pub details: Value,
+}
+
+impl CreateFailure {
+    fn invalid(message: String) -> Self {
+        Self { status: 400, reason: "Bad Request", code: "invalid_request", message, retryable: false, details: json!({}) }
+    }
+
+    fn store(error: &anyhow::Error) -> Self {
+        Self {
+            status: 503,
+            reason: "Service Unavailable",
+            code: "profile_store_unavailable",
+            message: "the profile store could not be read".into(),
+            retryable: true,
+            details: json!({ "diagnostic": format!("{error:#}") }),
+        }
+    }
+
+    pub(super) fn write(self, stream: &mut TcpStream) -> anyhow::Result<()> {
+        super::server::write_v2_error(stream, self.status, self.reason, self.code, &self.message, self.retryable, self.details)
+    }
+}
+
+fn lifecycle_failure(profile: &str, failure: LifecycleError) -> CreateFailure {
     let message = failure.to_string();
     let (status, reason, code, retryable, details) = match failure {
         LifecycleError::Invalid(_) => (400, "Bad Request", "invalid_request", false, json!({})),
-        LifecycleError::NotFound => return not_found(stream, profile),
+        LifecycleError::NotFound => {
+            let available = crate::profiles::identity::current_profile_names();
+            return CreateFailure {
+                status: 404,
+                reason: "Not Found",
+                code: "profile_not_found",
+                message: crate::profiles::identity::unknown_profile_message(profile, &available),
+                retryable: false,
+                details: json!({ "profile": profile, "availableProfiles": available }),
+            };
+        }
         LifecycleError::NameConflict(name) => {
             (409, "Conflict", "profile_name_conflict", false, json!({ "name": name }))
         }
@@ -146,7 +192,47 @@ fn lifecycle_error(stream: &mut TcpStream, profile: &str, failure: LifecycleErro
             json!({ "diagnostic": format!("{error:#}") }),
         ),
     };
-    super::server::write_v2_error(stream, status, reason, code, &message, retryable, details)
+    CreateFailure { status, reason, code, message, retryable, details }
+}
+
+fn lifecycle_error(stream: &mut TcpStream, profile: &str, failure: LifecycleError) -> anyhow::Result<()> {
+    lifecycle_failure(profile, failure).write(stream)
+}
+
+/// `POST /v2/profiles`: parse, create, attach the Claude account; the 201
+/// body (`ProfileDetail` + created / kind / credentialsPresent).
+pub(super) fn create_from_body(body: &[u8]) -> Result<Value, CreateFailure> {
+    let create = parse_create(body).map_err(CreateFailure::invalid)?;
+    let claude_account = parse_create_claude_account(body).map_err(CreateFailure::invalid)?;
+    if let Some(id) = &claude_account {
+        match crate::runtime::claude_accounts::load() {
+            Ok(registry) if registry.find(id).is_some() => {}
+            Ok(_) => return Err(CreateFailure::invalid(format!("claudeAccount: no Claude account {id} on this host"))),
+            Err(error) => return Err(CreateFailure::store(&error)),
+        }
+    }
+    let account = lifecycle::create_profile(&create).map_err(|failure| lifecycle_failure(&create.name, failure))?;
+    let account = match &claude_account {
+        None => account,
+        Some(id) => {
+            let patch = settings_api::ProfileApiPatch {
+                claude_account: ConfigValueUpdate::Set(id.clone()),
+                ..Default::default()
+            };
+            match settings_api::update_profile(&account.id, &patch) {
+                Ok((account, _)) => account,
+                Err(error) => {
+                    let _ = lifecycle::delete_profile(&account.id);
+                    return Err(CreateFailure::invalid(format!("{error:#}")));
+                }
+            }
+        }
+    };
+    let mut body = profile_body(&account);
+    body["created"] = json!(true);
+    body["kind"] = json!(create.kind.as_str());
+    body["credentialsPresent"] = json!(create.api_key.is_some());
+    Ok(body)
 }
 
 fn bad_request(stream: &mut TcpStream, message: &str) -> anyhow::Result<()> {
@@ -189,6 +275,9 @@ pub fn list_resource() -> anyhow::Result<Value> {
 }
 
 pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: &str) -> anyhow::Result<()> {
+    if super::profile_import_cc_switch::is_path(path) {
+        return super::profile_import_cc_switch::handle(stream, request);
+    }
     if path == PRESETS_PATH {
         if request.method != "GET" {
             return method_not_allowed(stream, "use GET for /v2/profile-presets");
@@ -206,49 +295,10 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: 
                 Ok(value) => write_json_response(stream, 200, "OK", &value),
                 Err(error) => store_unavailable(stream, &error),
             },
-            "POST" => {
-                let create = match parse_create(&request.body) {
-                    Ok(create) => create,
-                    Err(message) => return bad_request(stream, &message),
-                };
-                let claude_account = match parse_create_claude_account(&request.body) {
-                    Ok(account) => account,
-                    Err(message) => return bad_request(stream, &message),
-                };
-                if let Some(id) = &claude_account {
-                    match crate::runtime::claude_accounts::load() {
-                        Ok(registry) if registry.find(id).is_some() => {}
-                        Ok(_) => return bad_request(stream, &format!("claudeAccount: no Claude account {id} on this host")),
-                        Err(error) => return store_unavailable(stream, &error),
-                    }
-                }
-                match lifecycle::create_profile(&create) {
-                    Ok(account) => {
-                        let account = match &claude_account {
-                            None => account,
-                            Some(id) => {
-                                let patch = settings_api::ProfileApiPatch {
-                                    claude_account: ConfigValueUpdate::Set(id.clone()),
-                                    ..Default::default()
-                                };
-                                match settings_api::update_profile(&account.id, &patch) {
-                                    Ok((account, _)) => account,
-                                    Err(error) => {
-                                        let _ = lifecycle::delete_profile(&account.id);
-                                        return bad_request(stream, &format!("{error:#}"));
-                                    }
-                                }
-                            }
-                        };
-                        let mut body = profile_body(&account);
-                        body["created"] = json!(true);
-                        body["kind"] = json!(create.kind.as_str());
-                        body["credentialsPresent"] = json!(create.api_key.is_some());
-                        write_json_response(stream, 201, "Created", &body)
-                    }
-                    Err(failure) => lifecycle_error(stream, &create.name, failure),
-                }
-            }
+            "POST" => match create_from_body(&request.body) {
+                Ok(body) => write_json_response(stream, 201, "Created", &body),
+                Err(failure) => failure.write(stream),
+            },
             _ => method_not_allowed(stream, "use GET or POST for /v2/profiles"),
         };
     }

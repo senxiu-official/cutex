@@ -15,6 +15,8 @@ pub mod owner_policy;
 pub mod private_fs;
 pub mod process;
 #[cfg(windows)]
+pub mod windows_job;
+#[cfg(windows)]
 pub mod windows_parent_guard;
 #[cfg(windows)]
 pub mod windows_spawn;

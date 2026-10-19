@@ -1,8 +1,10 @@
 # Ephemeral Codex Side conversations
 
 Capability: `side-chat` (`features.sideChat`). Side is an owner-only adapter of
-cute-codex's native `/side`, not another agent or a saved Cutex session. Claude
-and offline parents are rejected; opening Side never starts a parent runtime.
+cute-codex's native `/side`, not another agent or a saved Cutex session. Offline
+parents are rejected; opening Side never starts a parent runtime. Claude agents
+have Side when their adapter declares `features.sideChat` (claude-r21; see
+"Claude agents" below); older Claude runtimes are rejected.
 
 ## HTTP API
 
@@ -116,7 +118,8 @@ and survive; only an explicit owner action creates a note from Side output.
 
 Important error codes:
 
-- `side_runtime_unsupported` (409): Claude parent.
+- `side_runtime_unsupported` (409): a Claude parent whose adapter does not
+  declare `sideChat` (claude-r20 and older), or a Side thread as parent.
 - `side_runtime_offline` (409): parent is not connected.
 - `side_chat_already_open` (409): different requested origin/model; includes id.
 - `side_fork_outcome_unknown` (409): fork result has not yet resolved.
@@ -125,6 +128,43 @@ Important error codes:
 - `side_chat_not_found` (404): absent chat or wrong parent session.
 - `side_native_error` (502): native rejection/transport failure.
 - `side_chat_capacity` (429): close unused chats first.
+
+## Claude agents
+
+For a Claude parent the same routes, inputs and snapshots apply, but cutex holds
+no Side state: it relays each call to the agent's running adapter
+(`claude/side/open|list|read|send|interrupt|respond|close`, `threadId` set by
+cutex to the agent's thread) and adds `sessionId` and `runtimeGeneration` to the
+snapshots. The adapter answers refusals with `error.data.code`, mapped to the
+codes above (`native_transcript_behind` becomes `409 side_boundary_changed`).
+`GET` of the list answers `{chats: []}` while the adapter is stopped or lacks
+the feature.
+
+- Boundary: the same rule (an explicit `lastTurnId` must have ended; else the
+  newest ended turn, a running one excluded). The adapter waits up to 3 s for
+  the boundary turn's last observed message to reach Claude Code's transcript
+  and refuses (retryable) when a just-started running turn cannot be separated.
+- Fork: the official SDK `fork_session(up_to_message_id)` copies the parent's
+  native transcript through the boundary into a new native session. It only
+  reads the parent: no session lease, the parent's runtime is neither closed
+  nor interrupted. With no ended turn the Side starts a fresh native session.
+- Side thread: a hidden adapter thread (thread property `side`, never listed by
+  `thread/list`) bound to the copy, with the parent's model (or `model`),
+  effort, permission mode and instructions; plan mode, inputs, notes and grants
+  are not copied. It runs turns like any thread, with its own Claude Code
+  process. Claude Code keeps a resumed session's recorded system prompt, so the
+  Side does not change it (this also reuses the parent's prompt cache):
+  `SIDE_DEVELOPER_INSTRUCTIONS` and `SIDE_BOUNDARY_PROMPT` are two text blocks
+  before the first Side message, not shown in the Side timeline.
+- Events and approvals go to a private in-process peer of the adapter: never to
+  the parent's subscribers, the management observer, `/v2/approvals` or the
+  agent's inputs. Limits as above (4096 events / 8 MiB, 128 pending requests,
+  32 chats per adapter, one ongoing Side per parent).
+- Close interrupts the Side turn, stops its process and deletes the hidden
+  thread and its native copy. Stopping the agent's runtime (and the adapter's
+  shutdown) closes its Side chats first. An adapter restart loses all Side
+  state (`404 side_chat_not_found`); a leftover hidden thread is deleted on the
+  next Side request.
 
 An older Cutex has no Side routes/capability. No persistent Side migration or
 rollback is required. Native/model acceptance is separate from the automated

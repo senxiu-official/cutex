@@ -92,6 +92,33 @@ inject. If the interrupt request itself fails, the dropped steers are queued aga
 images (no `busy_inputs` row, never a hook) carries `metadata.steer` and is dropped the same way.
 A steer already read by a hook stays read: the desktop sees its `steered` item and does not resend.
 
+## Passive notes at turn start (claude-r21)
+
+A passive note (`deliveryMode: passive`, native `delivery: passive`) never starts a turn. It is read
+into context once, at the earliest of: the start of the next turn of any kind, or the next
+main-agent PostToolUse of a running turn. `Store.claim` takes the pending notes when it claims a
+turn (`notes.state = injected`, `turn_id` = that turn) and records their `external_event` items,
+which the turn emits at its start; cutex reads them as the delivery receipt (`messageDelivered`),
+native envelopes are context-persisted with the turn's successful Result. A later PostToolUse finds
+nothing left to inject.
+
+- An agent's or service's turn: the note frames precede its input in its one verbatim prompt
+  (unchanged).
+- An owner turn, including the owner's wake (`cutex/agentBus/wake`: "Read and handle the unread
+  notes other agents left for you.") and a FIFO-run steer: the SDK user message gets one text block
+  per note (`Store.turn_note_frames`) followed by the owner's text as the **last** text block (then
+  images). Claude Code reads only the last text block as typed input, so the owner's `@path`
+  mentions still expand and the notes' text is passed on as written. The timeline shows the
+  `userMessage` first, then the note items. With no note pending the message is unchanged.
+- `/compact` reads no notes; they wait for the next turn.
+
+Before claude-r21 an owner turn skipped pending notes to keep its text as written: they came only
+after its first tool call, and a turn without tool calls never saw them (owner's 唤醒 on hachimi,
+2026-10-19). Codex consumes passive ExternalInput at a turn's first input boundary, so both runtimes
+now behave alike. Opt-in check against the bundled CLI and a loopback model:
+`test_real_cli_owner_wake_reads_notes_in_its_first_request` (CLI 2.1.299, SDK 0.2.166, Linux): the
+note is in the first and only request, the owner's `@path` expands, the note's does not.
+
 ## Autonomous turns (claude-r18 decision)
 
 Claude Code starts a turn by itself when a `run_in_background` Bash command finishes (its task
@@ -104,6 +131,21 @@ the preset system prompt append ends with a runtime-limits note (`config.RUNTIME
 turn cannot use tools and is not seen by the user, so the model checks the result in the next turn the
 user starts. The same note says background subagents (`Agent` / `Task` with `run_in_background`) are
 refused and to use foreground ones; the hook refusal stays.
+
+Inputs wait for it (claude-r21, G5). Claude Code queues an input that arrives while its own turn runs
+and answers it after that turn's Result, so submitting at once would hand the rest of the autonomous
+turn (its text and its Result) to the new adapter turn: wrong reply text and a premature completion.
+The runtime owner therefore tracks the autonomous turn (`RuntimeOwner.autonomous_until`): with no
+adapter turn active, a stream frame (`stream_event`, `assistant`, `user`, not a subagent's) opens or
+extends a 3 s quiet window (`AUTONOMOUS_QUIET_SECONDS`), a task notification a 10 s start window
+(`AUTONOMOUS_START_SECONDS`, the turn's first frame follows the model's first-token latency), and any
+other non-rate-limit frame extends an open window; the autonomous Result closes it. A `Run` that
+arrives while the window is open is held in order, not refused, and submitted when the window closes,
+or after at most 120 s (`AUTONOMOUS_WAIT_SECONDS`, logged to stderr) anyway. The owner keeps reading
+while an input waits; `turn/interrupt` of a held input fails it as interrupted before submission, and
+close or a supervised reconnect fails held inputs as never submitted. Not covered: a notification that
+arrives during an adapter turn and makes Claude Code start its own turn right after that turn's Result,
+before any frame of it reaches the adapter.
 
 ## Validation (Windows, 2026-10-11)
 

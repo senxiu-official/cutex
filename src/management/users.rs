@@ -188,6 +188,32 @@ pub struct Migration {
     pub backup: Option<String>,
 }
 
+/// A token that became an owner device (owner-device-notice; cutex-desktop
+/// docs/research/host-ownership-20261019.md §5 limit 1) and that no owner
+/// principal has acknowledged yet. Dropped when the token is revoked or
+/// leaves the owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerDeviceNotice {
+    pub token_id: String,
+    /// When it was bound to the owner.
+    pub at: String,
+    /// `pairing` (an owner pairing code), `assigned` (the owner assigned a
+    /// pending device), `personKey` (a pending device claimed a person key
+    /// of the owner), `ssh` (issued or assigned with the CLI on the host).
+    pub via: String,
+    /// The host event `cutex/access/ownerDeviceAdded` was published.
+    #[serde(default)]
+    pub announced: bool,
+}
+
+pub const OWNER_DEVICE_ADDED: &str = "cutex/access/ownerDeviceAdded";
+pub const VIA_PAIRING: &str = "pairing";
+pub const VIA_ASSIGNED: &str = "assigned";
+pub const VIA_PERSON_KEY: &str = "personKey";
+pub const VIA_SSH: &str = "ssh";
+const MAX_OWNER_DEVICE_NOTICES: usize = 100;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
@@ -201,6 +227,10 @@ pub struct State {
     pub settings: Settings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration: Option<Migration>,
+    /// Unacknowledged new owner devices (older builds ignore the field and
+    /// drop it on their next write).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_owner_devices: Vec<OwnerDeviceNotice>,
 }
 
 impl State {
@@ -219,6 +249,7 @@ impl State {
             bindings: BTreeMap::new(),
             settings: Settings::default(),
             migration: None,
+            new_owner_devices: Vec::new(),
         }
     }
 
@@ -405,8 +436,22 @@ impl UserStore {
 
     /// Run `mutate` under the store lock (migrating first when the store does
     /// not exist yet); writes and bumps `revision` only when something changed.
+    /// A token newly bound to `owner` is recorded as a new owner device with
+    /// `via` [`VIA_ASSIGNED`]; see [`Self::with_via`].
     pub fn with<T>(
         &self,
+        mutate: impl FnOnce(&mut State) -> Result<T, UserError>,
+    ) -> Result<T, UserError> {
+        self.with_via(VIA_ASSIGNED, mutate)
+    }
+
+    /// [`Self::with`], recording every token that `mutate` newly bound to
+    /// `owner` as an unacknowledged new owner device reached `via` (one
+    /// place for every path: pairing, assignment, person-key auto-binding,
+    /// the CLI). The migration's bindings are not new devices.
+    pub fn with_via<T>(
+        &self,
+        via: &str,
         mutate: impl FnOnce(&mut State) -> Result<T, UserError>,
     ) -> Result<T, UserError> {
         crate::management::client_tokens::ensure_private_dir(&self.dir)
@@ -430,6 +475,7 @@ impl UserStore {
             let known: HashSet<String> = known.into_iter().map(|t| t.token_id).collect();
             state.bindings.retain(|token, _| known.contains(token));
         }
+        record_new_owner_devices(&before, &mut state, via);
         if state != before {
             state.revision = before.revision + 1;
             state.check().map_err(|e| UserError::new(500, "users_invalid", format!("{e:#}")))?;
@@ -500,6 +546,48 @@ impl UserStore {
         Ok(state)
     }
 
+    /// Acknowledge a new owner device notice (`POST
+    /// /v2/users/owner/new-devices/{tokenId}/ack`). `Ok(false)` when there was
+    /// none (idempotent).
+    pub fn ack_owner_device(&self, token_id: &str, actor: &str) -> Result<bool, UserError> {
+        let acked = self.with(|state| {
+            let before = state.new_owner_devices.len();
+            state.new_owner_devices.retain(|notice| notice.token_id != token_id);
+            Ok(state.new_owner_devices.len() != before)
+        })?;
+        if acked {
+            audit(&self.dir, "ownerDeviceAcknowledged", json!({ "tokenId": token_id, "actor": actor }));
+        }
+        Ok(acked)
+    }
+
+    /// Mark every not yet announced new owner device as announced and return
+    /// them (the caller publishes `cutex/access/ownerDeviceAdded`). Cheap
+    /// when there is nothing to announce (cached snapshot).
+    pub fn take_unannounced_owner_devices(&self) -> Vec<OwnerDeviceNotice> {
+        // Never create (migrate) the store just to look.
+        if !self.path().exists() {
+            return Vec::new();
+        }
+        let pending = self
+            .snapshot()
+            .is_ok_and(|state| state.new_owner_devices.iter().any(|notice| !notice.announced));
+        if !pending {
+            return Vec::new();
+        }
+        self.with(|state| {
+            let mut taken = Vec::new();
+            for notice in &mut state.new_owner_devices {
+                if !notice.announced {
+                    notice.announced = true;
+                    taken.push(notice.clone());
+                }
+            }
+            Ok(taken)
+        })
+        .unwrap_or_default()
+    }
+
     /// The principal of a verified client / device token. Store errors fail
     /// closed (pending).
     pub fn principal_for_token(&self, token_id: &str) -> Principal {
@@ -523,7 +611,9 @@ impl UserStore {
         })
     }
 
-    /// Bind (`Some(user)`) or unbind (`None` = pending) a token.
+    /// Bind (`Some(user)`) or unbind (`None` = pending) a token. A new owner
+    /// binding is recorded as a new owner device: `via` `pairing` for the
+    /// actor `pairing-code`, `ssh` for `cli`, else `assigned`.
     pub fn bind_token(&self, token_id: &str, user: Option<&str>, actor: &str) -> Result<(), UserError> {
         let exists = self
             .tokens
@@ -534,7 +624,12 @@ impl UserStore {
         if !exists {
             return Err(UserError::new(404, "client_token_not_found", "no client token with this id"));
         }
-        self.with(|state| {
+        let via = match actor {
+            "pairing-code" => VIA_PAIRING,
+            "cli" => VIA_SSH,
+            _ => VIA_ASSIGNED,
+        };
+        self.with_via(via, |state| {
             match user {
                 Some(user) => {
                     if state.user(user).is_none() {
@@ -656,6 +751,96 @@ impl UserStore {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+}
+
+/// Tokens bound to `owner` in `after` but not in `before` become new owner
+/// device notices; notices of tokens no longer bound to `owner` go.
+fn record_new_owner_devices(before: &State, after: &mut State, via: &str) {
+    let now = crate::management::instance::now_utc();
+    let added: Vec<String> = after
+        .bindings
+        .iter()
+        .filter(|(token, user)| user.as_str() == OWNER && before.bindings.get(*token).map(String::as_str) != Some(OWNER))
+        .map(|(token, _)| token.clone())
+        .collect();
+    for token in added {
+        after.new_owner_devices.retain(|notice| notice.token_id != token);
+        after.new_owner_devices.push(OwnerDeviceNotice { token_id: token, at: now.clone(), via: via.to_string(), announced: false });
+    }
+    let bindings = &after.bindings;
+    after.new_owner_devices.retain(|notice| bindings.get(&notice.token_id).map(String::as_str) == Some(OWNER));
+    let excess = after.new_owner_devices.len().saturating_sub(MAX_OWNER_DEVICE_NOTICES);
+    after.new_owner_devices.drain(..excess);
+}
+
+/// Publish `cutex/access/ownerDeviceAdded {tokenId, label, deviceName,
+/// platform, scope, at, via}` on the host event stream for every new owner
+/// device not announced yet (daemon only: the CLI never writes the event
+/// log; a device the CLI added is announced by the daemon's next request).
+pub fn announce_owner_devices(store: &UserStore) {
+    let notices = store.take_unannounced_owner_devices();
+    if notices.is_empty() {
+        return;
+    }
+    let tokens = store.tokens.list().unwrap_or_default();
+    for notice in notices {
+        let token = tokens.iter().find(|token| token.token_id == notice.token_id);
+        crate::management::v2::documents::publish_host_event(
+            OWNER_DEVICE_ADDED,
+            json!({
+                "tokenId": notice.token_id,
+                "label": token.map(|t| t.label.clone()),
+                "deviceName": token.and_then(|t| t.device_name.clone()),
+                "platform": token.and_then(|t| t.platform.clone()),
+                "scope": token.map(|t| t.scope),
+                "at": notice.at,
+                "via": notice.via,
+            }),
+        );
+    }
+}
+
+/// The owner-local rule (owner-local-only; cutex-desktop
+/// docs/research/host-ownership-20261019.md §5 limit 2, "本机和 SSH 都算"):
+/// a loopback listener AND either the root credential (the desktop on the
+/// host, the CLI) or a client token that is bound to the owner AND was
+/// issued on the host by `cutex management client-token issue` (someone
+/// with the host's OS account; an SSH-tunnelled desktop). A token from a
+/// pairing code never counts, owner-bound or not, loopback or not; nor does
+/// any remote listener. The device scope still applies on top (a narrowed
+/// owner-local token is refused by the scope gate first).
+pub fn request_is_owner_local() -> bool {
+    if !crate::management::listeners::current_request_is_loopback() {
+        return false;
+    }
+    match crate::management::listeners::current_client_token() {
+        None => true,
+        Some(token) => {
+            token.principal.is_owner()
+                && token.issued_via == crate::management::client_tokens::IssuedVia::HostCli
+        }
+    }
+}
+
+/// 403 `owner_local_only` for a root-identity action (owner-local-only;
+/// cutex-desktop docs/research/host-ownership-20261019.md §5 limit 2).
+pub fn owner_local_only(action: &str) -> UserError {
+    let mut error = UserError::new(
+        403,
+        "owner_local_only",
+        "this action changes who controls the host: only on the host itself or over SSH (the root credential, or an owner token issued with `cutex management client-token issue`, on a loopback listener) or with the cutex CLI there",
+    );
+    error.details = owner_local_details(json!({ "action": action }));
+    error
+}
+
+/// `details` of an owner-local refusal: `{…extra, clientToken, issuedVia}`
+/// (`issuedVia` null for the root credential).
+pub fn owner_local_details(mut extra: Value) -> Value {
+    let token = crate::management::listeners::current_client_token();
+    extra["clientToken"] = json!(token.is_some());
+    extra["issuedVia"] = json!(token.map(|token| token.issued_via));
+    extra
 }
 
 pub fn principal_in(state: &State, token_id: &str) -> Principal {

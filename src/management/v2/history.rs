@@ -23,7 +23,8 @@
 //! first; pass `nextCursor` back as `cursor` to load older turns.
 //! `cutexState.latestPlan` is the bootstrap's value (`launch::native_plan`,
 //! derived from the stored rollout for live and offline sources alike);
-//! `cutexState.latestTokenUsage` likewise (`launch::native_token_usage`).
+//! `cutexState.latestTokenUsage` likewise (`launch::native_token_usage`;
+//! Claude sessions: `claude_token_usage`).
 //!
 //! history-pages: `GET /v2/sessions/{id}/bootstrap?turnLimit=N` reads its
 //! live snapshot with `read_history_page` too (newest N turns + `historyPage`);

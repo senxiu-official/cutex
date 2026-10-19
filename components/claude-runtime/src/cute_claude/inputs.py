@@ -113,11 +113,15 @@ def parse_turn_input(items: list, *, images: bool, skills=None, cwd=None) -> tup
     return value, attachments, display
 
 
-def content_blocks(prompt: str, attachments: list[dict]) -> str | list[dict]:
-    """SDK user-message content: a plain string, or text + image blocks."""
-    if not attachments:
+def content_blocks(prompt: str, attachments: list[dict], preceding: list[str] = ()) -> str | list[dict]:
+    """SDK user-message content: a plain string, or text + image blocks.
+    `preceding` texts (passive notes) come first, one block each, so `prompt`
+    stays the last text block: the only one Claude Code reads as typed input."""
+    if not attachments and not preceding:
         return prompt
-    blocks: list[dict] = [{'type': 'text', 'text': prompt}] if prompt else []
+    blocks: list[dict] = [{'type': 'text', 'text': value} for value in preceding]
+    if prompt:
+        blocks.append({'type': 'text', 'text': prompt})
     for attachment in attachments:
         if attachment['type'] == 'url':
             blocks.append({'type': 'image', 'source': {'type': 'url', 'url': attachment['url']}})
@@ -127,10 +131,12 @@ def content_blocks(prompt: str, attachments: list[dict]) -> str | list[dict]:
     return blocks
 
 
-def sdk_user_message(prompt: str, attachments: list[dict], *, verbatim: bool) -> dict:
+def sdk_user_message(prompt: str, attachments: list[dict], *, verbatim: bool, preceding: list[str] = ()) -> dict:
     """One streamed SDK user message. `client_composed` (Claude Code >= 2.1.248)
-    delivers the text as written: no @path expansion, no slash-command dispatch."""
-    message = {'type': 'user', 'message': {'role': 'user', 'content': content_blocks(prompt, attachments)},
+    delivers the text as written: no @path expansion, no slash-command dispatch.
+    Without it, only the last text block is the typed input (@path mentions,
+    slash commands); `preceding` blocks are passed on as they are."""
+    message = {'type': 'user', 'message': {'role': 'user', 'content': content_blocks(prompt, attachments, preceding)},
                'parent_tool_use_id': None}
     if verbatim:
         message['client_composed'] = True

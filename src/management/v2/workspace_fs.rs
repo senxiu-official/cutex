@@ -248,6 +248,7 @@ pub fn file_resource(
             "path is not a regular file",
         ));
     }
+    super::host_files::refuse_root_credential_file(&file)?;
     file_content_value(&file, &rel, &meta, max_bytes)
 }
 

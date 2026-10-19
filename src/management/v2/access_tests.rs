@@ -95,6 +95,11 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("PATCH", "/v2/users/me", Class::Scoped(SelfProfile)),
         ("GET", "/v2/users/owner/avatar", Class::Scoped(UserAvatar)),
         ("GET", "/v2/users/u-0123456789ab/avatar", Class::Scoped(UserAvatar)),
+        ("GET", "/v2/users/me/home", Class::Scoped(UserHome)),
+        ("PUT", "/v2/users/me/home", Class::Scoped(UserHome)),
+        ("GET", "/v2/users/me/home/cover", Class::Scoped(UserHome)),
+        ("PUT", "/v2/users/me/home/cover", Class::Scoped(UserHome)),
+        ("DELETE", "/v2/users/me/home/cover", Class::Scoped(UserHome)),
         ("GET", "/v2/users/me/devices", Class::AnyPrincipal),
         ("DELETE", "/v2/users/me/devices/mct-0123abcd", Class::AnyPrincipal),
         ("GET", "/v2/projects/p1/fs/dir", Class::Scoped(WorkspaceRead)),
@@ -107,6 +112,10 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("GET", "/v2/sessions/s1/fs/file", Class::Scoped(WorkspaceRead)),
         ("GET", "/v2/sessions/s1/git/diff", Class::Scoped(WorkspaceRead)),
         ("POST", "/v2/sessions/s1/attachments", Class::Scoped(AttachmentUpload)),
+        ("POST", "/v2/clients/presence", Class::AnyPrincipal),
+        ("GET", "/v2/clients", Class::AnyPrincipal),
+        ("POST", "/v2/clients/inst-1/close", Class::AnyPrincipal),
+        ("POST", "/v2/clients/inst-1/closing", Class::AnyPrincipal),
     ];
     for (method, path, class) in expected {
         assert_eq!(classify(method, path), Some(*class), "{method} {path}");
@@ -134,6 +143,14 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("PATCH", "/v2/users/me/devices/mct-0123abcd"),
         ("DELETE", "/v2/users/me/devices/not-a-token"),
         ("DELETE", "/v2/users/me/devices/mct-1/extra"),
+        ("POST", "/v2/users/me/home"),
+        ("PATCH", "/v2/users/me/home"),
+        ("DELETE", "/v2/users/me/home"),
+        ("POST", "/v2/users/me/home/cover"),
+        ("PATCH", "/v2/users/me/home/cover"),
+        ("GET", "/v2/users/me/home/other"),
+        ("GET", "/v2/users/owner/home"),
+        ("PUT", "/v2/users/u-0123456789ab/home"),
         ("PATCH", "/v2/users/owner"),
         ("PATCH", "/v2/users/u-0123456789ab/avatar"),
         ("DELETE", "/v2/users/u-0123456789ab/avatar"),
@@ -192,6 +209,16 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("GET", "/v2/artifact-store"),
         ("GET", "/v2/health"),
         ("GET", "/v2"),
+        ("GET", "/v2/clients/presence"),
+        ("POST", "/v2/clients"),
+        ("DELETE", "/v2/clients"),
+        ("GET", "/v2/clients/inst-1"),
+        ("DELETE", "/v2/clients/inst-1"),
+        ("GET", "/v2/clients/inst-1/close"),
+        ("PATCH", "/v2/clients/inst-1/closing"),
+        ("POST", "/v2/clients/inst-1/other"),
+        ("POST", "/v2/clients/presence/close"),
+        ("POST", "/v2/clients/bad id/close"),
     ];
     for (method, path) in owner_only {
         assert_eq!(classify(method, path), Some(Class::OwnerOnly), "{method} {path}");
@@ -394,6 +421,76 @@ fn capabilities_carry_the_callers_user() {
 fn rewrite_query_replaces_one_parameter() {
     assert_eq!(rewrite_query("/v2/asks?limit=5&state=open", "limit", "1000"), "/v2/asks?state=open&limit=1000");
     assert_eq!(rewrite_query("/v2/asks", "limit", "1000"), "/v2/asks?limit=1000");
+}
+
+#[test]
+fn device_scope_needs_per_route_class() {
+    let none = |_: &str, _: &Value| None;
+    let need = |method: &str, path: &str, body: Value| scope_need(method, path, &body, Some("mct-self"), none);
+    // Reads: any GET (owner routes included), public / host routes, identity.
+    for path in ["/v2/settings", "/v2/users", "/v2/events/stream", "/v2/sessions/s/bootstrap", "/v2/client-tokens"] {
+        assert_eq!(need("GET", path, Value::Null), ScopeNeed::Read, "{path}");
+    }
+    assert_eq!(need("POST", "/v2/pair", Value::Null), ScopeNeed::Read);
+    assert_eq!(need("POST", "/v2/identity/claim", Value::Null), ScopeNeed::Read);
+    assert_eq!(need("DELETE", "/v2/users/me/devices/mct-self", Value::Null), ScopeNeed::Read, "sign itself out");
+    assert_eq!(need("DELETE", "/v2/users/me/devices/mct-other", Value::Null), ScopeNeed::Full);
+    // Native / cutex methods.
+    let native = |method: &str| json!({"native": {"message": {"method": method}}});
+    let path = "/v2/sessions/s/app-server/requests";
+    assert_eq!(need("POST", path, native("thread/read")), ScopeNeed::Read);
+    assert_eq!(need("POST", path, native("turn/interrupt")), ScopeNeed::Chat);
+    assert_eq!(need("POST", path, native("turn/start")), ScopeNeed::Full);
+    let path = "/v2/sessions/s/cutex/requests";
+    for (method, expected) in [
+        ("cutex/session/get", ScopeNeed::Read),
+        ("cutex/userInput/submit", ScopeNeed::Chat),
+        ("cutex/turn/stop", ScopeNeed::Chat),
+        ("cutex/ask/respond", ScopeNeed::Chat),
+        ("cutex/ask/close", ScopeNeed::Full),
+        ("cutex/session/retire", ScopeNeed::Full),
+    ] {
+        assert_eq!(need("POST", path, json!({"method": method})), expected, "{method}");
+    }
+    // Server responses: questions are chat, approvals (and unknown ids) full.
+    let pending = |_: &str, id: &Value| match id.as_i64() {
+        Some(1) => Some("item/tool/requestUserInput".to_string()),
+        Some(2) => Some("item/fileChange/requestApproval".to_string()),
+        _ => None,
+    };
+    let path = "/v2/sessions/s/app-server/server-request-responses";
+    let respond = |id: i64| json!({"native": {"message": {"id": id, "result": {}}}});
+    assert_eq!(scope_need("POST", path, &respond(1), None, pending), ScopeNeed::Chat);
+    assert_eq!(scope_need("POST", path, &respond(2), None, pending), ScopeNeed::Full);
+    assert_eq!(scope_need("POST", path, &respond(3), None, pending), ScopeNeed::Full);
+    assert_eq!(need("POST", "/v2/sessions/s/attachments", Value::Null), ScopeNeed::Chat);
+    // user-home: reading needs read, editing the own home page chat.
+    assert_eq!(need("GET", "/v2/users/me/home", Value::Null), ScopeNeed::Read);
+    assert_eq!(need("GET", "/v2/users/me/home/cover", Value::Null), ScopeNeed::Read);
+    for (method, path) in [("PUT", "/v2/users/me/home"), ("PUT", "/v2/users/me/home/cover"), ("DELETE", "/v2/users/me/home/cover")] {
+        assert_eq!(need(method, path, Value::Null), ScopeNeed::Chat, "{method} {path}");
+    }
+    // client-remote-close: presence and the own outcome for every scope; the
+    // close handler itself refuses narrowed scopes (client_close_forbidden).
+    for path in ["/v2/clients/presence", "/v2/clients/i-1/close", "/v2/clients/i-1/closing"] {
+        assert_eq!(need("POST", path, Value::Null), ScopeNeed::Read, "{path}");
+    }
+    // Every other write.
+    for (method, path) in [
+        ("PATCH", "/v2/settings"),
+        ("POST", "/v2/approvals/x"),
+        ("POST", "/v2/human/agents"),
+        ("POST", "/v2/pairing-codes"),
+        ("PUT", "/v2/users/token-bindings/mct-x"),
+        ("POST", "/v2/terminals"),
+        ("POST", "/v2/peers"),
+    ] {
+        assert_eq!(need(method, path, Value::Null), ScopeNeed::Full, "{method} {path}");
+    }
+    use crate::management::client_tokens::DeviceScope;
+    assert!(scope_allows(DeviceScope::Read, ScopeNeed::Read) && !scope_allows(DeviceScope::Read, ScopeNeed::Chat));
+    assert!(scope_allows(DeviceScope::Chat, ScopeNeed::Chat) && !scope_allows(DeviceScope::Chat, ScopeNeed::Full));
+    assert!(scope_allows(DeviceScope::Full, ScopeNeed::Full));
 }
 
 #[path = "access_http_tests.rs"]

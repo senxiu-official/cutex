@@ -137,6 +137,12 @@ fn handle_claude_event(
         ) {
             eprintln!("Claude usage for {} not recorded: {error:#}", context.cutex_session_id);
         }
+        // Claude has no native rollout to derive bootstrap's
+        // cutexState.latestTokenUsage from (Codex: launch::native_token_usage):
+        // keep the bound thread's newest usage report instead.
+        if let Err(error) = cutex::management::v2::claude_token_usage::record_event(&envelope, &context.thread_id) {
+            eprintln!("Claude latest token usage for {} not kept: {error:#}", context.cutex_session_id);
+        }
     }
     if !synchronize_before_publish {
         super::app_server_state_sync::handle_runtime_event(context, event)?;

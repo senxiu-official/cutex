@@ -1190,6 +1190,12 @@ pub enum ManagementCommand {
         /// Name shown for the device until it reports its own
         #[arg(long)]
         label: Option<String>,
+        /// The local user the paired device belongs to (`owner`, default, or `u-…`)
+        #[arg(long)]
+        user: Option<String>,
+        /// Device scope of the paired device: full (default), chat or read
+        #[arg(long, value_parser = ["full", "chat", "read"])]
+        scope: Option<String>,
         /// Local Management API port
         #[arg(long)]
         port: Option<u16>,
@@ -1214,6 +1220,14 @@ pub enum ManagementCommand {
     Users {
         #[command(subcommand)]
         command: ManagementUsersCommand,
+    },
+
+    /// The host owner in person (host-owner-person): which of the owner's
+    /// person keys is the owner themself. Writes the users store directly
+    /// (running as this account is the authority).
+    Owner {
+        #[command(subcommand)]
+        command: ManagementOwnerCommand,
     },
 
     /// Initialize or explicitly correct one project's authorized Director
@@ -1284,6 +1298,10 @@ pub enum ManagementClientTokenCommand {
         /// Leave the token pending (unassigned) even for a first device
         #[arg(long)]
         pending: bool,
+        /// Device scope: full (default), chat (read + talk to agents) or
+        /// read (read only); narrows whatever the token's user may do
+        #[arg(long, value_parser = ["full", "chat", "read"])]
+        scope: Option<String>,
     },
     /// List tokens (no secrets): tokenId, label, createdAt, lastUsedAt
     List,
@@ -1292,6 +1310,23 @@ pub enum ManagementClientTokenCommand {
         /// Token id (mct-…) from `list`
         token_id: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ManagementOwnerCommand {
+    /// The owner person (as GET /v2/host `owner`) and the owner's person keys
+    Show {
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make one of the owner's person keys the owner person (source `local`)
+    SetPerson {
+        /// Fingerprint (16 hex digits) or public key of an owner person key
+        key: String,
+    },
+    /// Mark the owner person unconfirmed (no inference until set again)
+    ClearPerson,
 }
 
 #[derive(Debug, Subcommand)]

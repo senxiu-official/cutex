@@ -1,0 +1,23 @@
+{
+  "_comment": "upgrade-manifest.py --meta for cutex 0.1.5 \"First Take\" (sign-and-upload.sh uses release-meta/<release>.json by itself). No new native (hosts keep cute-codex 0.160.0-r52.3, no --native-run); mode full so new agents get releases/0.1.5/manifests/default.json = the host's current native + the 0.1.5 cutex-mcp facade, and packageRunRecommended moves idle agents (the Claude runtime for new agents changes to claude-r21 too, which makes the generator choose full anyway). Components: claude-runtime claude-r21 (adapter 0.7.8; claude-r20 was never published), job-service stays 0.1.1 (unchanged since 0.1.4). Migration claude-token-usage: no startup migration, but the cache of the newest Claude token usage per session must be moved aside on rollback, because an older cutex neither updates it nor drops it on revert / delete, so a later roll-forward would serve a stale value. The records an older cutex would read with more rights or never deliver (client / device tokens with scope chat / read: held, so 0.1.4 refuses them instead of granting full rights; pending cross-host wakes: turned into notes; unacknowledged new owner device notices: copied aside) are rewritten by the 0.1.5 rollback itself (src/upgrade/older_stores.rs, steps gated on the rollback target), not by this file. Previous capability list: the published cutex-0.1.4/capabilities.json; capabilities-0.1.4.json here is a sorted copy for the upgrade e2e, taken from `cutex management schema export` of the published 0.1.4 linux-x64 binary (the windows-x64 list = linux-x64 minus the five Linux-only ones, as in 0.1.3); 0.1.5 adds 8, removes none. Owner commands: docs/release/RUNBOOK-0.1.5.md.",
+  "mode": "full",
+  "packageRunRecommended": true,
+  "migrations": [
+    {
+      "id": "claude-token-usage",
+      "class": "rollback-safe",
+      "since": "0.1.5",
+      "notes": {
+        "en": "Newest context usage of each Claude agent, kept by the host; moved aside on rollback.",
+        "zh-CN": "主机保存的每个 Claude 智能体最近一次的上下文用量；回退时移到一旁。"
+      },
+      "newStores": [
+        "runtime/management-v2/claude-token-usage"
+      ]
+    }
+  ],
+  "notes": {
+    "en": "Owner devices: every new device bound to the owner is announced until you acknowledge it, actions that change who controls the host work only on the host or over SSH, and each device can be limited to chat or read. Claude agents: Side chats and forks while busy, waiting notes read at the start of every turn, context usage kept after reconnecting, a changed system prompt reaches resumed sessions (Claude runtime claude-r21). A cross-host message can wake the other agent when its host allows it. Home pages and remote close of a desktop live on the host; Profiles import from CC Switch; on Windows every agent runtime runs in its own Job object. A rollback never gives a limited device more rights. New agents start with this release's tools; idle agents move over after the update.",
+    "zh-CN": "主人的设备：每台新的主人设备都会通知，直到你确认；改变主机归属的操作只能在主机本机或通过 SSH 做；每台设备可限制为只聊天或只查看。Claude 智能体：侧聊和忙碌时分叉、每一轮开头读入待读留言、重新连接后保留上下文用量、恢复会话时使用更新后的系统提示（Claude 运行时 claude-r21）。主机允许时，跨主机留言可以唤醒对方的智能体。主页和远程关闭桌面保存在主机上；可从 CC Switch 导入 Profile；Windows 上每个智能体运行时放进自己的 Job 对象。回退不会让受限设备获得更多权限。新智能体使用本版本的工具，空闲的智能体会在更新后自动迁移。"
+  }
+}

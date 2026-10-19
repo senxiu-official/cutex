@@ -60,6 +60,12 @@ pub(super) fn revert(
             revert_params(before, rewind_files),
         )?;
         drop(guard);
+        // Bootstrap's latestTokenUsage must not describe a removed turn.
+        let removed: Vec<&str> = result["removedTurnIds"].as_array().into_iter().flatten()
+            .filter_map(Value::as_str).collect();
+        if let Err(error) = cutex::management::v2::claude_token_usage::forget_removed_turns(id, &removed) {
+            eprintln!("Claude latest token usage for {id} not reset after revert: {error:#}");
+        }
         refresh_observer(record, &result["runtime"])?;
         let current = cutex::session::store::load_cutex_session_store()?;
         let generation = current

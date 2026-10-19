@@ -32,7 +32,7 @@ def make_sdk():
     fields = ['cli_path','cwd','model','tools','disallowed_tools','allowed_tools','permission_mode','mcp_servers',
               'strict_mcp_config','setting_sources','plugins','can_use_tool','hooks','system_prompt',
               'extra_args','effort','thinking','include_partial_messages','max_turns','session_id','resume','continue_conversation','env','stderr','settings',
-              'enable_file_checkpointing','forward_subagent_text']
+              'enable_file_checkpointing','forward_subagent_text','max_buffer_size']
     Options = make_dataclass('ClaudeAgentOptions', [(n, object, None) for n in fields])
     clients = []
 

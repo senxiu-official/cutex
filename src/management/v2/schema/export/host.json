@@ -34,10 +34,23 @@
         "cutexBuild": { "$ref": "#/$defs/cutexBuild" },
         "executable": { "$ref": "#/$defs/nullableString", "description": "Path of the running cutex executable." },
         "serviceManager": { "$ref": "#/$defs/serviceManager" },
+        "owner": { "$ref": "#/$defs/owner" },
         "runtimes": {
           "description": "Owner only (null for other principals or when the stores cannot be read): runtimes selected for new agents and how many agents use each.",
           "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/runtimes" }]
         }
+      }
+    },
+    "owner": {
+      "type": "object",
+      "description": "Capability host-owner-person; every authenticated principal (members and pending devices included): who owns this host in person. Absent on older daemons.",
+      "required": ["displayName", "fingerprint", "confirmed", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "displayName": { "$ref": "#/$defs/nullableString", "description": "The owner's profile displayName, else the owner user's name." },
+        "fingerprint": { "$ref": "#/$defs/nullableString", "description": "Person-key fingerprint (16 hex digits) of the owner person; null while unconfirmed." },
+        "confirmed": { "type": "boolean", "description": "An owner person is known (stored, or inferred from the only owner key / the users audit log)." },
+        "source": { "oneOf": [{ "type": "null" }, { "enum": ["firstRootClaim", "firstPairing", "local", "audit"] }], "description": "How the owner person was decided; null while unconfirmed." }
       }
     },
     "serviceManager": {

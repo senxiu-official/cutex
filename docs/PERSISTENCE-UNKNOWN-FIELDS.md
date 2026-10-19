@@ -29,6 +29,7 @@ store (several early rollbacks failed exactly there).
 | `config.json` `new_thread_defaults` | `NewThreadDefaults`, `ThreadLaunchDefaults` | strict | ignored, dropped on save |
 | session records | `LaunchPermissions` | strict | ignored, dropped on save |
 | `config.json` `browser` | `BrowserSettings` | strict | ignored, dropped on save (API input validated by `patched`) |
+| `runtime/users/persons-v1.json` | `persons::State` | unknown fields ignored, dropped on rewrite | unknown top-level fields kept in `extra` (with `ownerPerson`) |
 | profile `config.toml` (selected profile v2) | `selected_profile::Config` root, `model_providers.<id>` | strict: r233 `web_search` / r53 provider `capabilities` made older binaries refuse the profile | unknown keys ignored (never projected into a launch, listed in `Config::ignored_keys`); `api_key`, `notify`, `experimental_bearer_token`, `http_headers`, `env_http_headers`, `chatgpt_base_url` (root) and `http_headers`, `env_http_headers`, `experimental_bearer_token`, `api_key`, `query_params` (provider) stay refused; nested tables (`tools`, `tui`, `skills`, …) stay strict |
 
 ## Still strict and stored (follow-up list, by risk)

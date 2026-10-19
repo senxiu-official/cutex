@@ -17,6 +17,13 @@
 //!   larger. Binary content (NUL bytes, invalid UTF-8, images, PDF) comes
 //!   back base64 with its mime.
 //!
+//! - The host's Management root credential file (`<cutex home>/config.json`)
+//!   is a root-identity secret (owner-local-only): a paired device's token
+//!   or a remote listener gets 403 `owner_local_only`; only owner-local
+//!   requests (`users::request_is_owner_local`: the root credential, or an
+//!   owner token issued by `client-token issue` on the host, on loopback)
+//!   read it.
+//!
 //! Never reachable with per-agent Agent Bus credentials or the ordinary
 //! Management bridge token: only the root check in `server::handle_v2_request`
 //! lets a request through.
@@ -59,12 +66,34 @@ pub fn read_host_file(params: &HashMap<String, String>) -> WorkspaceResult<Value
         }
         _ => WorkspaceError::new(400, "invalid_path", format!("the path cannot be resolved: {error}")),
     })?;
+    refuse_root_credential_file(&canonical)?;
     let meta = std::fs::metadata(&canonical).map_err(WorkspaceError::internal)?;
     if !meta.is_file() {
         return Err(WorkspaceError::new(400, "not_a_file", "the path is not a regular file"));
     }
     let display = super::workspace::display_path(&canonical);
     super::workspace_fs::file_content_value(&canonical, &display, &meta, max_bytes)
+}
+
+/// 403 `owner_local_only` (`readRootCredential`) when `path` is the root
+/// credential file and the request is not owner-local. Also used by the
+/// workspace file read (`workspace_fs::file_resource`): a workspace rooted
+/// at the home directory must not hand it out either.
+pub(crate) fn refuse_root_credential_file(path: &std::path::Path) -> WorkspaceResult<()> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if is_root_credential_file(&canonical) && !crate::management::users::request_is_owner_local() {
+        let refused = crate::management::users::owner_local_only("readRootCredential");
+        return Err(WorkspaceError::new(403, refused.code, refused.message));
+    }
+    Ok(())
+}
+
+/// `<cutex home>/config.json` (holds `management_api_token`).
+fn is_root_credential_file(canonical: &std::path::Path) -> bool {
+    crate::config::paths::config_path()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .is_some_and(|config| config == canonical)
 }
 
 pub fn handle(stream: &mut TcpStream, request: &crate::http::server::SimpleHttpRequest) -> anyhow::Result<()> {

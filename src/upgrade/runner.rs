@@ -101,9 +101,10 @@ pub trait Host {
     fn restore_components(&self, _run_dir: &Path) -> Vec<String> {
         Vec::new()
     }
-    /// Rollback swap (services stopped): rewrite records an older release
-    /// cannot parse (`super::older_stores`); notes of what changed.
-    fn prepare_older_stores(&self, _displaced: &Path) -> anyhow::Result<Vec<String>> {
+    /// Rollback swap (services stopped): rewrite records release `target`
+    /// cannot parse or would read with more rights (`super::older_stores`);
+    /// notes of what changed.
+    fn prepare_older_stores(&self, _displaced: &Path, _target: &str) -> anyhow::Result<Vec<String>> {
         Ok(Vec::new())
     }
 }
@@ -323,7 +324,7 @@ fn roll_back(
                 Err(error) => return needs_owner(run, host, format!("could not move {store} aside: {error:#}"), manual),
             }
         }
-        match host.prepare_older_stores(&displaced) {
+        match host.prepare_older_stores(&displaced, from) {
             Ok(notes) => run.displaced.extend(notes),
             Err(error) => return needs_owner(run, host, format!("could not prepare the stores for {from}: {error:#}"), manual),
         }
@@ -518,7 +519,7 @@ pub fn rollback(run: &mut Run, plan: &Plan, host: &dyn Host) {
                 run.displaced.push(store.clone());
             }
         }
-        run.displaced.extend(host.prepare_older_stores(&displaced)?);
+        run.displaced.extend(host.prepare_older_stores(&displaced, &plan.to_release)?);
         // The versions the rollback target names (a release without a
         // components section leaves them as they are).
         let _ = host.select_components(&plan.run_dir);

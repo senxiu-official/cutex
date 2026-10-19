@@ -69,6 +69,10 @@ mod linux {
                 eprintln!("skipped real systemd scope boundary: {reason}");
                 return;
             }
+            ManagedAgentProcessIsolation::WindowsJobObject { job_name } => {
+                eprintln!("skipped real systemd scope boundary: Windows Job object {job_name}");
+                return;
+            }
         };
         let test_dir = std::env::temp_dir().join(format!(
             "cutex-managed-agent-scope-test-{}",

@@ -1,11 +1,19 @@
 //! Device pairing (capability `device-pairing`):
 //!
-//! - `POST /v2/pairing-codes` (root credential or client token, loopback
-//!   listener only) `{label?}` → 201 `{code, expiresAt, label, hostId, urls[], qr}`
+//! - `POST /v2/pairing-codes` (owner-local only: a loopback listener with
+//!   the root credential or an owner token issued by `client-token issue` on
+//!   the host; a remote listener gets 403 `loopback_only`, a paired device's
+//!   token 403 `owner_local_only {action: "pairingCode"}`)
+//!   `{label?, userId?, scope?}` → 201 `{code, expiresAt,
+//!   ttlSeconds, label, userId, scope, ownerDevice, hostId, urls[], qr}`
 //! - `POST /v2/pair` (public) `{code, deviceName, platform}` → 200
-//!   `{device, token, hostId, hostName}`
+//!   `{device, token, hostId, hostName}` (`device.scope`)
 //!
-//! Codes: 8 chars (no 0/O/1/I/L), single use, 10 minutes, daemon memory only.
+//! Codes: 8 chars (no 0/O/1/I/L), single use, daemon memory only; 10
+//! minutes, 5 for a code that pairs an owner device (`ownerDevice: true`:
+//! the device gets the owner's rights, narrowed only by `scope`;
+//! owner-device-notice). `scope` (`full` default, `chat`, `read`;
+//! device-scope) is the paired token's device scope.
 //! Failures: ≥ 5 from one source address in 10 minutes → 429
 //! `too_many_attempts`; ≥ 10 host-wide in 10 minutes → every live code is
 //! voided and pairing answers 429 `pairing_locked` until the window passes.
@@ -20,7 +28,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::http::server::{write_json_response, SimpleHttpRequest};
-use crate::management::client_tokens::ClientTokenStore;
+use crate::management::client_tokens::{ClientTokenStore, DeviceScope};
 
 pub const PAIRING_CODES_PATH: &str = "/v2/pairing-codes";
 pub const PAIR_PATH: &str = "/v2/pair";
@@ -28,6 +36,8 @@ pub const PAIR_PATH: &str = "/v2/pair";
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const CODE_LEN: usize = 8;
 pub const CODE_TTL: Duration = Duration::from_secs(10 * 60);
+/// A code that pairs an owner device lives shorter (owner-device-notice).
+pub const OWNER_CODE_TTL: Duration = Duration::from_secs(5 * 60);
 const FAILURE_WINDOW: Duration = Duration::from_secs(10 * 60);
 const MAX_FAILURES_PER_SOURCE: usize = 5;
 const MAX_FAILURES_HOST: usize = 10;
@@ -41,7 +51,21 @@ struct LiveCode {
     /// The local user the redeemed device / peer is bound to (P1 users;
     /// `None` = owner, as before).
     user: Option<String>,
+    scope: DeviceScope,
     expires: Instant,
+}
+
+/// What a redeemed code carries.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Redeemed {
+    pub label: Option<String>,
+    /// `None` = owner.
+    pub user: Option<String>,
+    pub scope: DeviceScope,
+}
+
+fn pairs_owner(user: Option<&str>) -> bool {
+    user.is_none_or(|user| user == crate::management::users::OWNER)
 }
 
 /// Pairing state; one per daemon (`PairingState::global`), tests make their own.
@@ -67,6 +91,7 @@ pub struct IssuedCode {
     /// `XXXX-XXXX`.
     pub code: String,
     pub expires_at: chrono::DateTime<Utc>,
+    pub ttl: Duration,
     pub label: Option<String>,
 }
 
@@ -143,6 +168,19 @@ impl PairingState {
         user: Option<String>,
         now: Instant,
     ) -> Option<IssuedCode> {
+        self.issue_scoped(label, user, DeviceScope::Full, now)
+    }
+
+    /// `issue_for` with the paired token's device scope. An owner code
+    /// (`user` `None` or `owner`) expires after [`OWNER_CODE_TTL`].
+    pub fn issue_scoped(
+        &self,
+        label: Option<String>,
+        user: Option<String>,
+        scope: DeviceScope,
+        now: Instant,
+    ) -> Option<IssuedCode> {
+        let ttl = if pairs_owner(user.as_deref()) { OWNER_CODE_TTL } else { CODE_TTL };
         let mut inner = self.lock();
         inner.codes.retain(|code| code.expires > now);
         if inner.codes.len() >= MAX_LIVE_CODES {
@@ -153,11 +191,13 @@ impl PairingState {
             hash: hash_code(&raw),
             label: label.clone(),
             user,
-            expires: now + CODE_TTL,
+            scope,
+            expires: now + ttl,
         });
         Some(IssuedCode {
             code: format!("{}-{}", &raw[..4], &raw[4..]),
-            expires_at: Utc::now() + chrono::Duration::from_std(CODE_TTL).unwrap_or_default(),
+            expires_at: Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default(),
+            ttl,
             label,
         })
     }
@@ -179,6 +219,16 @@ impl PairingState {
         source: Option<IpAddr>,
         now: Instant,
     ) -> Result<(Option<String>, Option<String>), PairError> {
+        self.redeem_code(code, source, now).map(|redeemed| (redeemed.label, redeemed.user))
+    }
+
+    /// Consume a code (single use) → its label, user and device scope.
+    pub fn redeem_code(
+        &self,
+        code: &str,
+        source: Option<IpAddr>,
+        now: Instant,
+    ) -> Result<Redeemed, PairError> {
         let mut inner = self.lock();
         inner.codes.retain(|code| code.expires > now);
         inner
@@ -221,7 +271,7 @@ impl PairingState {
         match matched {
             Some(index) => {
                 let live = inner.codes.remove(index);
-                Ok((live.label, live.user))
+                Ok(Redeemed { label: live.label, user: live.user, scope: live.scope })
             }
             None => {
                 inner.failures.push((now, source));
@@ -284,6 +334,9 @@ struct IssueRequest {
     /// is created by the owner, which is the owner's approval).
     #[serde(default)]
     user_id: Option<String>,
+    /// The paired token's device scope (`full` default, `chat`, `read`).
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// `POST /v2/pairing-codes`; the caller has checked root + loopback.
@@ -335,6 +388,23 @@ pub(crate) fn handle_issue_with(
                 .collect::<String>()
         })
         .filter(|label| !label.is_empty() && !label.chars().any(char::is_control));
+    let scope = match body.scope.as_deref() {
+        None => DeviceScope::Full,
+        Some(text) => match DeviceScope::parse(text) {
+            Some(scope) => scope,
+            None => {
+                return error(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "invalid_scope",
+                    "scope must be full, chat or read",
+                    false,
+                    json!({ "allowed": ["full", "chat", "read"] }),
+                )
+            }
+        },
+    };
     let user = body.user_id.unwrap_or_else(|| crate::management::users::OWNER.to_string());
     if user != crate::management::users::OWNER {
         let known = crate::management::users::valid_user_id(&user)
@@ -345,7 +415,7 @@ pub(crate) fn handle_issue_with(
             return error(stream, 404, "Not Found", "user_not_found", "no user with this id", false, json!({}));
         }
     }
-    let Some(issued) = state.issue_for(label, Some(user.clone()), Instant::now()) else {
+    let Some(issued) = state.issue_scoped(label, Some(user.clone()), scope, Instant::now()) else {
         return error(
             stream,
             429,
@@ -367,8 +437,13 @@ pub(crate) fn handle_issue_with(
         &json!({
             "code": issued.code,
             "expiresAt": crate::management::instance::format_utc(issued.expires_at),
+            "ttlSeconds": issued.ttl.as_secs(),
             "label": issued.label,
             "userId": user,
+            "scope": scope,
+            // The paired device gets the owner's rights (narrowed only by
+            // `scope`); clients say so before showing the code.
+            "ownerDevice": pairs_owner(Some(&user)),
             "hostId": host_id,
             "instanceId": instance_id,
             "urls": urls,
@@ -435,7 +510,7 @@ pub(crate) fn handle_pair_with(
         }
     };
     let source = stream.peer_addr().ok().map(|addr| addr.ip());
-    let (label, user) = match state.redeem_with_user(&body.code, source, Instant::now()) {
+    let Redeemed { label, user, scope } = match state.redeem_code(&body.code, source, Instant::now()) {
         Ok(redeemed) => redeemed,
         Err(PairError::InvalidCode) => {
             return error(
@@ -489,7 +564,10 @@ pub(crate) fn handle_pair_with(
         .unwrap_or_else(|| "other".to_string());
     let token_label = label.unwrap_or_else(|| device_name.clone());
     let user = user.unwrap_or_else(|| crate::management::users::OWNER.to_string());
-    let issued = store.issue_device(&token_label, &device_name, &platform).and_then(|(issued, device)| {
+    // The users store must exist before the token does: its one-time
+    // migration would bind the new token silently (no new owner device).
+    let _ = crate::management::users::UserStore::beside(store).snapshot();
+    let issued = store.issue_device_scoped(&token_label, &device_name, &platform, scope).and_then(|(issued, device)| {
         // Bind before the secret leaves; a failed binding revokes the token.
         let users = crate::management::users::UserStore::beside(store);
         match users.bind_token(&issued.token_id, Some(&user), "pairing-code") {
@@ -502,6 +580,8 @@ pub(crate) fn handle_pair_with(
     });
     match issued {
         Ok((issued, device)) => {
+            // owner-device-notice: an owner device is announced at once.
+            crate::management::users::announce_owner_devices(&crate::management::users::UserStore::beside(store));
             let host = crate::platform::host::current_host_name();
             write_json_response(
                 stream,
@@ -571,20 +651,37 @@ mod tests {
     }
 
     #[test]
-    fn codes_expire_after_ten_minutes() {
+    fn user_codes_expire_after_ten_minutes_owner_codes_after_five() {
         let state = PairingState::new();
         let now = Instant::now();
-        let issued = state.issue(None, now).unwrap();
+        let member = || Some("u-0123456789ab".to_string());
+        let issued = state.issue_for(None, member(), now).unwrap();
+        assert_eq!(issued.ttl, CODE_TTL);
         let later = now + CODE_TTL + Duration::from_secs(1);
         assert_eq!(
             state.redeem(&issued.code, ip(1), later),
             Err(PairError::InvalidCode)
         );
-        let fresh = state.issue(None, now).unwrap();
+        let fresh = state.issue_for(None, member(), now).unwrap();
         assert_eq!(
             state.redeem(&fresh.code, ip(1), now + CODE_TTL - Duration::from_secs(1)),
             Ok(None)
         );
+        // Owner codes (no user, or `owner`): five minutes, single use, scoped.
+        for user in [None, Some("owner".to_string())] {
+            let owner = state.issue_scoped(None, user.clone(), DeviceScope::Chat, now).unwrap();
+            assert_eq!(owner.ttl, OWNER_CODE_TTL);
+            assert_eq!(
+                state.redeem(&owner.code, ip(1), now + OWNER_CODE_TTL + Duration::from_secs(1)),
+                Err(PairError::InvalidCode)
+            );
+            let owner = state.issue_scoped(None, user.clone(), DeviceScope::Chat, now).unwrap();
+            assert_eq!(
+                state.redeem_code(&owner.code, ip(1), now + OWNER_CODE_TTL - Duration::from_secs(1)),
+                Ok(Redeemed { label: None, user, scope: DeviceScope::Chat })
+            );
+            assert_eq!(state.redeem(&owner.code, ip(1), now), Err(PairError::InvalidCode));
+        }
     }
 
     #[test]
@@ -692,6 +789,9 @@ mod tests {
         assert!(value["hostId"].is_string());
         let token_id = value["device"]["tokenId"].as_str().unwrap();
         assert_eq!(store.verify(token).unwrap().as_deref(), Some(token_id));
+        // Even the host's very first device (no users store yet) is a new owner device.
+        let users = crate::management::users::UserStore::beside(&store).snapshot().unwrap();
+        assert!(users.new_owner_devices.iter().any(|n| n.token_id == token_id && n.via == "pairing"));
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].kind, "device");

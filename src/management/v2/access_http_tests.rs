@@ -17,6 +17,11 @@ use std::{
 
 const ROOT: &str = "access-http-test-root-credential";
 
+thread_local! {
+    /// The next exchanges arrive on a remote (non-loopback) listener.
+    static REMOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct PrivateInstance {
     root: PathBuf,
     previous: Selection,
@@ -127,7 +132,7 @@ fn exchange_with(
     });
     let (mut server, _) = listener.accept().unwrap();
     listeners::set_current_connection(Some(ConnectionInfo {
-        remote: false,
+        remote: REMOTE.with(std::cell::Cell::get),
         peer: "127.0.0.1:43210".parse().unwrap(),
     }));
     listeners::set_current_client_token(None);
@@ -533,12 +538,12 @@ fn own_token_and_own_devices_for_owner_member_pending_and_root() {
     assert!(value["featureList"].as_array().unwrap().iter().any(|f| f == "user-own-devices"));
     assert_eq!(value["user"]["token"], json!({
         "id": a1.token_id, "label": "alice-laptop", "deviceName": "Alice Laptop",
-        "ownerName": "Alice's work laptop", "platform": "linux",
+        "ownerName": "Alice's work laptop", "platform": "linux", "scope": "full", "issuedVia": "pairing",
     }));
     crate::management::v2::schema_export::assert_valid("users", "capabilityUser", &value["user"]);
     let value = caps(&a2.token);
     assert_eq!(value["user"]["token"], json!({
-        "id": a2.token_id, "label": "alice-cli", "deviceName": null, "ownerName": null, "platform": null,
+        "id": a2.token_id, "label": "alice-cli", "deviceName": null, "ownerName": null, "platform": null, "scope": "full", "issuedVia": "hostCli",
     }));
     let value = caps(&owner.token);
     assert_eq!((&value["user"]["isOwner"], &value["user"]["token"]["id"]), (&json!(true), &json!(owner.token_id)));
@@ -1021,4 +1026,889 @@ fn safety_check_decisions_and_list_are_the_owners_only() {
     }
     let (status, value) = exchange("GET", "/v2/safety-checks?state=all", Some(ROOT), &Value::Null);
     assert_eq!((status, &value["blocks"]), (200, &json!([])), "{value}");
+}
+
+/// host-owner-person: every principal sees `/v2/host` `owner`; only
+/// owner-local requests (root or a CLI-issued owner token, on loopback) may
+/// set or clear the owner person.
+#[test]
+fn host_owner_is_visible_to_everyone_and_set_only_locally() {
+    use base64::Engine;
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let owner_device = tokens.issue("owner-desktop").unwrap();
+    let users = UserStore::open_default().unwrap();
+    users.snapshot().unwrap();
+    let pending = tokens.issue("ssh-device").unwrap();
+    let member = users.create_user("Member", None, Grant::default(), "root").unwrap();
+    let device = tokens.issue("member-phone").unwrap();
+    users.bind_token(&device.token_id, Some(&member.id), "root").unwrap();
+    let key = |seed: u8| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([seed; 32]);
+    for seed in [1, 2] {
+        let claim = crate::management::persons::VerifiedClaim { token_id: None, public_key: key(seed), display_name: None };
+        users.apply_claim(&claim, "root").unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    let fingerprint = crate::management::persons::fingerprint(&key(1));
+
+    for bearer in [ROOT, owner_device.token.as_str(), device.token.as_str(), pending.token.as_str()] {
+        let (status, host) = exchange("GET", "/v2/host", Some(bearer), &json!({}));
+        assert_eq!(status, 200, "{host}");
+        assert_eq!(
+            host["owner"],
+            json!({"displayName": "Owner", "fingerprint": fingerprint, "confirmed": true, "source": "firstRootClaim"}),
+            "{host}"
+        );
+        crate::management::v2::schema_export::assert_valid("host", "host", &host);
+    }
+    let caps = crate::management::v2::capabilities::capabilities_resource();
+    assert!(caps["featureList"].as_array().unwrap().iter().any(|f| f == "host-owner-person"));
+    assert_eq!(caps["features"]["hostOwnerPerson"], true);
+
+    // A paired device's token is refused, even owner-bound on loopback; so
+    // are member and pending tokens. (The SSH-tunnelled desktop's
+    // CLI-issued owner token may: below.)
+    let (paired, _) = tokens.issue_device("owner-phone", "Pixel", "android").unwrap();
+    users.bind_token(&paired.token_id, Some(OWNER), "pairing-code").unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    let path = "/v2/users/owner-person";
+    let (status, value) = exchange("PUT", path, Some(&paired.token), &json!({"publicKey": key(2)}));
+    assert_eq!((status, code(&value)), (403, "owner_person_local_only"), "{value}");
+    assert_eq!(value["error"]["details"], json!({"clientToken": true, "issuedVia": "pairing"}));
+    let (status, value) = exchange("DELETE", path, Some(&paired.token), &json!({}));
+    assert_eq!((status, code(&value)), (403, "owner_person_local_only"), "{value}");
+    for bearer in [device.token.as_str(), pending.token.as_str()] {
+        let (status, _) = exchange("PUT", path, Some(bearer), &json!({"publicKey": key(2)}));
+        assert_eq!(status, 403);
+    }
+    // A remote listener: refused (root is not even accepted there).
+    REMOTE.with(|remote| remote.set(true));
+    let (status, value) = exchange("PUT", path, Some(&owner_device.token), &json!({"publicKey": key(2)}));
+    assert_eq!((status, code(&value)), (403, "owner_person_local_only"), "{value}");
+    let (status, _) = exchange("PUT", path, Some(ROOT), &json!({"publicKey": key(2)}));
+    assert_eq!(status, 401);
+    let (status, host) = exchange("GET", "/v2/host", Some(&device.token), &json!({}));
+    assert_eq!((status, &host["owner"]["fingerprint"]), (200, &json!(fingerprint)));
+    REMOTE.with(|remote| remote.set(false));
+
+    // Root on loopback: set, validation, clear.
+    let (status, value) = exchange("PUT", path, Some(ROOT), &json!({"publicKey": key(9)}));
+    assert_eq!((status, code(&value)), (400, "not_an_owner_key"), "{value}");
+    let (status, value) = exchange("PUT", path, Some(ROOT), &json!({"publicKey": key(2), "x": 1}));
+    assert_eq!((status, code(&value)), (400, "invalid_request"), "{value}");
+    let (status, value) = exchange("PUT", path, Some(ROOT), &json!({"publicKey": key(2)}));
+    assert_eq!(status, 200, "{value}");
+    let second = crate::management::persons::fingerprint(&key(2));
+    assert_eq!(value["owner"], json!({"displayName": "Owner", "fingerprint": second, "confirmed": true, "source": "local"}));
+    let (_, host) = exchange("GET", "/v2/host", Some(&pending.token), &json!({}));
+    assert_eq!(host["owner"], value["owner"]);
+    let (status, value) = exchange("DELETE", path, Some(ROOT), &json!({}));
+    assert_eq!(status, 200, "{value}");
+    assert_eq!(value["owner"], json!({"displayName": "Owner", "fingerprint": null, "confirmed": false, "source": null}));
+    let (status, value) = exchange("GET", path, Some(ROOT), &json!({}));
+    assert_eq!((status, code(&value)), (405, "method_not_allowed"));
+    // "本机和 SSH 都算": the owner token issued by `client-token issue` on the
+    // host (an SSH-tunnelled desktop) on loopback sets and clears it too.
+    let (status, value) = exchange("PUT", path, Some(&owner_device.token), &json!({"publicKey": key(1)}));
+    assert_eq!(status, 200, "{value}");
+    assert_eq!(value["owner"]["fingerprint"], json!(fingerprint));
+    let (status, value) = exchange("DELETE", path, Some(&owner_device.token), &json!({}));
+    assert_eq!((status, &value["owner"]["confirmed"]), (200, &json!(false)), "{value}");
+    let audit = std::fs::read_to_string(users.dir().join("audit.jsonl")).unwrap();
+    assert!(audit.contains("\"ownerPersonSet\""));
+}
+
+/// The latest host events named `method` since `checkpoint`.
+fn host_events(checkpoint: &crate::management::v2::model::EventCheckpoint, method: &str) -> Vec<Value> {
+    let repository = crate::management::v2::repository::management_v2_repository().unwrap();
+    let page = repository
+        .page(crate::management::v2::repository::ReplayQuery {
+            stream_id: Some(checkpoint.stream_id.clone()),
+            after: checkpoint.cursor.clone(),
+            limit: 1000,
+            cutex_session_id: Some(crate::management::v2::services::HOST_EVENT_SESSION_ID.into()),
+        })
+        .unwrap();
+    page.events
+        .iter()
+        .filter_map(|event| event.cutex.as_ref())
+        .filter(|message| message.method == method)
+        .map(|message| message.params.clone())
+        .collect()
+}
+
+/// A v2 error code, or the peers routes' top-level `code`.
+fn any_code(value: &Value) -> &str {
+    value.pointer("/error/code").or_else(|| value.get("code")).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Owner's paired devices, limit 1 (owner-device-notice): owner pairing
+/// codes are short-lived and single use; every new owner device (pairing,
+/// assignment, person-key auto-binding, CLI) is listed until acknowledged
+/// and announced on the host event stream.
+#[test]
+fn owner_device_notices_for_pairing_assignment_person_key_and_cli() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let first = tokens.issue("local-desktop").unwrap();
+    users.snapshot().unwrap(); // migrated: the first token is the owner's, no notice
+    let member = users.create_user("Member", None, Grant::default(), "root").unwrap();
+    let member_token = tokens.issue("member-laptop").unwrap();
+    users.bind_token(&member_token.token_id, Some(&member.id), "root").unwrap();
+    let repository = crate::management::v2::repository::management_v2_repository().unwrap();
+    let checkpoint = repository.checkpoint().unwrap();
+
+    // Codes: owner 5 minutes and `ownerDevice`, a member's 10; scope checked.
+    let (status, owner_code) = exchange("POST", "/v2/pairing-codes", Some(ROOT), &json!({"label": "Phone", "scope": "chat"}));
+    assert_eq!(status, 201, "{owner_code}");
+    assert_eq!((&owner_code["ttlSeconds"], &owner_code["ownerDevice"], &owner_code["scope"]), (&json!(300), &json!(true), &json!("chat")));
+    crate::management::v2::schema_export::assert_valid("pair", "pairingCode", &owner_code);
+    let (status, member_code) = exchange("POST", "/v2/pairing-codes", Some(ROOT), &json!({"userId": member.id}));
+    assert_eq!(status, 201, "{member_code}");
+    assert_eq!((&member_code["ttlSeconds"], &member_code["ownerDevice"], &member_code["scope"]), (&json!(600), &json!(false), &json!("full")));
+    let (status, value) = exchange("POST", "/v2/pairing-codes", Some(ROOT), &json!({"scope": "admin"}));
+    assert_eq!((status, code(&value)), (400, "invalid_scope"));
+    // Loopback only (already): a remote listener never creates codes.
+    REMOTE.with(|remote| remote.set(true));
+    let (status, value) = exchange("POST", "/v2/pairing-codes", Some(&first.token), &json!({}));
+    assert_eq!((status, code(&value)), (403, "loopback_only"), "{value}");
+    REMOTE.with(|remote| remote.set(false));
+
+    // Pairing with the owner code: an owner device with the code's scope, announced at once.
+    let (status, paired) = exchange("POST", "/v2/pair", None, &json!({"code": owner_code["code"], "deviceName": "Pixel", "platform": "android"}));
+    assert_eq!(status, 200, "{paired}");
+    assert_eq!((&paired["userId"], &paired["device"]["scope"]), (&json!(OWNER), &json!("chat")));
+    let phone = paired["device"]["tokenId"].as_str().unwrap().to_string();
+    let phone_token = paired["token"].as_str().unwrap().to_string();
+    let (status, value) = exchange("POST", "/v2/pair", None, &json!({"code": owner_code["code"]}));
+    assert_eq!((status, code(&value)), (401, "invalid_pairing_code"), "single use");
+    let (status, _) = exchange("POST", "/v2/pair", None, &json!({"code": member_code["code"], "deviceName": "Tab"}));
+    assert_eq!(status, 200);
+    let added = host_events(&checkpoint, crate::management::users::OWNER_DEVICE_ADDED);
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert_eq!((&added[0]["tokenId"], &added[0]["via"], &added[0]["scope"], &added[0]["deviceName"]), (&json!(phone), &json!("pairing"), &json!("chat"), &json!("Pixel")));
+
+    // Assignment of a pending device by an owner principal.
+    let pending = tokens.issue("ssh-desktop").unwrap();
+    let (status, _) = exchange("PUT", &format!("/v2/users/token-bindings/{}", pending.token_id), Some(&first.token), &json!({"userId": "owner"}));
+    assert_eq!(status, 200);
+    // A pending device that claims a person key the owner holds.
+    let key = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [7u8; 32]);
+    users.apply_claim(&crate::management::persons::VerifiedClaim { token_id: None, public_key: key.clone(), display_name: None }, "root").unwrap();
+    let laptop = tokens.issue("laptop").unwrap();
+    let claimed = users.apply_claim(&crate::management::persons::VerifiedClaim { token_id: Some(laptop.token_id.clone()), public_key: key, display_name: None }, "laptop").unwrap();
+    assert_eq!(claimed.outcome, crate::management::persons::ClaimOutcome::AutoBound);
+    // The CLI on the host (`client-token issue --user owner`, `users assign`).
+    let cli = tokens.issue("desktop-over-ssh").unwrap();
+    users.bind_token(&cli.token_id, Some(OWNER), "cli").unwrap();
+    assert!(users.snapshot().unwrap().new_owner_devices.iter().any(|n| n.token_id == cli.token_id && !n.announced));
+    std::thread::sleep(Duration::from_millis(30));
+    // The daemon's next request announces what the CLI (or the store API) added.
+    let (status, _) = exchange("GET", "/v2/capabilities", Some(ROOT), &json!({}));
+    assert_eq!(status, 200);
+    let added = host_events(&checkpoint, crate::management::users::OWNER_DEVICE_ADDED);
+    let vias: Vec<(String, String)> = added.iter().map(|e| (e["tokenId"].as_str().unwrap().to_string(), e["via"].as_str().unwrap().to_string())).collect();
+    for (token, via) in [(&phone, "pairing"), (&pending.token_id, "assigned"), (&laptop.token_id, "personKey"), (&cli.token_id, "ssh")] {
+        assert_eq!(vias.iter().filter(|(t, v)| t == token && v == via).count(), 1, "{token} {via}: {vias:?}");
+    }
+    assert_eq!(vias.len(), 4, "each new owner device is announced once: {vias:?}");
+
+    // The list: owner principals only (a narrowed owner device may read it).
+    let path = "/v2/users/owner/new-devices";
+    let (status, listed) = exchange("GET", path, Some(&phone_token), &json!({}));
+    assert_eq!(status, 200, "{listed}");
+    let devices = listed["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 4, "{listed}");
+    let phone_item = devices.iter().find(|d| d["tokenId"] == phone.as_str()).unwrap();
+    assert_eq!((&phone_item["via"], &phone_item["current"], &phone_item["scope"], &phone_item["userId"]), (&json!("pairing"), &json!(true), &json!("chat"), &json!(OWNER)));
+    assert!(phone_item["at"].is_string() && phone_item["deviceName"] == "Pixel");
+    assert!(!listed.to_string().contains("cxm1."), "no secrets");
+    let (status, value) = exchange("GET", path, Some(&member_token.token), &json!({}));
+    assert_eq!((status, code(&value)), (403, "owner_required"));
+    // Ack: a full owner principal; the chat phone may not.
+    let ack = |id: &str| format!("{path}/{id}/ack");
+    let (status, value) = exchange("POST", &ack(&phone), Some(&phone_token), &json!({}));
+    assert_eq!((status, code(&value)), (403, "device_scope_denied"), "{value}");
+    let (status, value) = exchange("POST", &ack(&phone), Some(&first.token), &json!({}));
+    assert_eq!((status, &value), (200, &json!({"tokenId": phone, "acknowledged": true})));
+    let (status, value) = exchange("POST", &ack(&phone), Some(ROOT), &json!({}));
+    assert_eq!((status, &value["acknowledged"]), (200, &json!(false)), "idempotent");
+    let (status, value) = exchange("GET", &ack(&phone), Some(ROOT), &json!({}));
+    assert_eq!((status, code(&value)), (405, "method_not_allowed"));
+    // Revoking (or rebinding away from owner) drops the notice.
+    tokens.revoke(&cli.token_id).unwrap();
+    users.bind_token(&pending.token_id, Some(&member.id), "root").unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    let (_, listed) = exchange("GET", path, Some(ROOT), &json!({}));
+    let ids: Vec<&str> = listed["devices"].as_array().unwrap().iter().map(|d| d["tokenId"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec![laptop.token_id.as_str()], "{listed}");
+    let audit = std::fs::read_to_string(users.dir().join("audit.jsonl")).unwrap();
+    assert!(audit.contains("\"ownerDeviceAcknowledged\""));
+}
+
+/// Rewrite one record of the private `tokens.json` (simulating a record of
+/// an older build, or an unknown origin): `None` removes `issuedVia`.
+fn set_issued_via(tokens: &ClientTokenStore, token_id: &str, via: Option<&str>) {
+    let path = tokens.tokens_path();
+    let mut raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for record in raw["tokens"].as_array_mut().unwrap() {
+        if record["tokenId"] == token_id {
+            match via {
+                Some(via) => record["issuedVia"] = json!(via),
+                None => {
+                    record.as_object_mut().unwrap().remove("issuedVia");
+                }
+            }
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+}
+
+/// Owner's paired devices, limit 2 (owner-local-only; "本机和 SSH 都算"):
+/// root-identity actions need a loopback listener and either the root
+/// credential or an owner token issued by `client-token issue` on the host
+/// (the SSH-tunnelled desktop). A paired device's token never counts, even
+/// owner-bound on loopback; tightening stays open to it.
+#[test]
+fn root_identity_actions_are_owner_local_only() {
+    use crate::management::client_tokens::DeviceScope;
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    // The SSH-tunnelled desktop: `client-token issue` on the host, the owner's.
+    let ssh = tokens.issue("desktop-over-ssh").unwrap();
+    let users = UserStore::open_default().unwrap();
+    users.snapshot().unwrap();
+    // The owner's paired phone (an owner pairing code).
+    let (paired, _) = tokens.issue_device("owner-phone", "Pixel", "android").unwrap();
+    users.bind_token(&paired.token_id, Some(OWNER), "pairing-code").unwrap();
+    // Tokens of an older build (no issuedVia): inferred from kind.
+    let old_ssh = tokens.issue("old-ssh-desktop").unwrap();
+    users.bind_token(&old_ssh.token_id, Some(OWNER), "cli").unwrap();
+    let (old_paired, _) = tokens.issue_device("old-phone", "iPhone", "ios").unwrap();
+    users.bind_token(&old_paired.token_id, Some(OWNER), "pairing-code").unwrap();
+    // An origin this build does not know: never local.
+    let unknown = tokens.issue("unknown-origin").unwrap();
+    users.bind_token(&unknown.token_id, Some(OWNER), "cli").unwrap();
+    // CLI-issued but not the owner's (pending; a member), or narrowed.
+    let ssh_pending = tokens.issue("ssh-member-pending").unwrap();
+    let member = users.create_user("Member", None, Grant::default(), "root").unwrap();
+    let ssh_member = tokens.issue("ssh-member").unwrap();
+    users.bind_token(&ssh_member.token_id, Some(&member.id), "cli").unwrap();
+    let ssh_chat = tokens.issue_scoped("ssh-chat", DeviceScope::Chat).unwrap();
+    users.bind_token(&ssh_chat.token_id, Some(OWNER), "cli").unwrap();
+    set_issued_via(&tokens, &old_ssh.token_id, None);
+    set_issued_via(&tokens, &old_paired.token_id, None);
+    set_issued_via(&tokens, &unknown.token_id, Some("invite"));
+    std::thread::sleep(Duration::from_millis(30));
+    let via = |id: &str| tokens.list().unwrap().into_iter().find(|t| t.token_id == id).unwrap().issued_via;
+    use crate::management::client_tokens::IssuedVia;
+    assert_eq!(
+        (via(&ssh.token_id), via(&paired.token_id), via(&old_ssh.token_id), via(&old_paired.token_id), via(&unknown.token_id)),
+        (IssuedVia::HostCli, IssuedVia::Pairing, IssuedVia::HostCli, IssuedVia::Pairing, IssuedVia::Unknown)
+    );
+
+    // /v2/capabilities says whether the connection counts (user.ownerLocal).
+    let caps = |bearer: &str| exchange("GET", "/v2/capabilities", Some(bearer), &json!({})).1;
+    for (bearer, local) in [
+        (ROOT, true),
+        (ssh.token.as_str(), true),
+        (old_ssh.token.as_str(), true),
+        (ssh_chat.token.as_str(), true),
+        (paired.token.as_str(), false),
+        (old_paired.token.as_str(), false),
+        (unknown.token.as_str(), false),
+        (ssh_pending.token.as_str(), false),
+        (ssh_member.token.as_str(), false),
+    ] {
+        let value = caps(bearer);
+        assert_eq!(value["user"]["ownerLocal"], json!(local), "{bearer}: {}", value["user"]);
+        crate::management::v2::schema_export::assert_valid("users", "capabilityUser", &value["user"]);
+    }
+    let value = caps(&ssh.token);
+    assert_eq!((&value["user"]["token"]["issuedVia"], &value["features"]["ownerLocalOnly"]), (&json!("hostCli"), &json!(true)));
+    assert_eq!(caps(&paired.token)["user"]["token"]["issuedVia"], "pairing");
+    REMOTE.with(|remote| remote.set(true));
+    assert_eq!(caps(&ssh.token)["user"]["ownerLocal"], false, "a remote listener never counts");
+    REMOTE.with(|remote| remote.set(false));
+
+    let local_only = |value: &Value, action: &str| {
+        assert_eq!(any_code(value), "owner_local_only", "{value}");
+        let details = value.pointer("/error/details").or_else(|| value.get("details")).unwrap();
+        assert_eq!(details["action"], action, "{value}");
+    };
+    let refused = [paired.token.as_str(), old_paired.token.as_str(), unknown.token.as_str()];
+    let allowed = [ROOT, ssh.token.as_str(), old_ssh.token.as_str()];
+
+    // Approval: owner devices may turn it on; off only owner-local.
+    let settings = "/v2/users/settings";
+    for bearer in refused {
+        let (status, value) = exchange("PATCH", settings, Some(bearer), &json!({"ownerRequiresApproval": false}));
+        assert_eq!(status, 403, "{value}");
+        local_only(&value, "disableOwnerApproval");
+    }
+    let (_, value) = exchange("PATCH", settings, Some(&paired.token), &json!({"ownerRequiresApproval": false}));
+    assert_eq!(value["error"]["details"], json!({"action": "disableOwnerApproval", "clientToken": true, "issuedVia": "pairing"}));
+    let (status, value) = exchange("PATCH", settings, Some(&paired.token), &json!({"ownerRequiresApproval": true}));
+    assert_eq!(status, 200, "{value}");
+    for bearer in allowed {
+        let (status, value) = exchange("PATCH", settings, Some(bearer), &json!({"ownerRequiresApproval": false}));
+        assert_eq!((status, &value["settings"]["ownerRequiresApproval"]), (200, &json!(false)), "{value}");
+        exchange("PATCH", settings, Some(ROOT), &json!({"ownerRequiresApproval": true}));
+    }
+    // A narrowed SSH token: the scope gate refuses first.
+    let (status, value) = exchange("PATCH", settings, Some(&ssh_chat.token), &json!({"ownerRequiresApproval": false}));
+    assert_eq!((status, code(&value)), (403, "device_scope_denied"), "{value}");
+    // A member's CLI token: the user gate refuses first.
+    let (status, value) = exchange("PATCH", settings, Some(&ssh_member.token), &json!({"ownerRequiresApproval": false}));
+    assert_eq!((status, code(&value)), (403, "owner_required"), "{value}");
+    REMOTE.with(|remote| remote.set(true));
+    let (status, value) = exchange("PATCH", settings, Some(&ssh.token), &json!({"ownerRequiresApproval": false}));
+    assert_eq!(status, 403);
+    local_only(&value, "disableOwnerApproval");
+    REMOTE.with(|remote| remote.set(false));
+
+    // Peers: pairing and enabling.
+    for (method, path, body, action) in [
+        ("POST", "/v2/peers/invites", json!({}), "peerPair"),
+        ("POST", "/v2/peers", json!({"invite": "x"}), "peerPair"),
+        ("PATCH", "/v2/peers/peer-1", json!({"enabled": true}), "peerEnable"),
+        ("PATCH", "/v2/settings", json!({"peers": {"enabled": true}}), "peersEnable"),
+    ] {
+        for bearer in refused {
+            let (status, value) = exchange(method, path, Some(bearer), &body);
+            assert_eq!(status, 403, "{method} {path}: {value}");
+            local_only(&value, action);
+        }
+        for bearer in allowed {
+            let (_, value) = exchange(method, path, Some(bearer), &body);
+            assert_ne!(any_code(&value), "owner_local_only", "{method} {path} {bearer}: {value}");
+        }
+    }
+    // Pre-existing loopback-only writes stay open to every owner device on
+    // loopback (disabling a peer: refused later only because it does not exist).
+    for bearer in [paired.token.as_str(), ssh.token.as_str()] {
+        let (_, value) = exchange("PATCH", "/v2/peers/peer-1", Some(bearer), &json!({"enabled": false}));
+        assert_ne!(any_code(&value), "owner_local_only", "{value}");
+        let (status, value) = exchange("PATCH", "/v2/settings", Some(bearer), &json!({"peers": {"enabled": false}}));
+        assert_eq!(status, 200, "{value}");
+    }
+    let (status, value) = exchange("PATCH", "/v2/settings", Some(&ssh.token), &json!({"managementCorsOrigins": ["http://localhost:5173"]}));
+    assert_eq!(status, 200, "SSH keeps loopback-only settings: {value}");
+    REMOTE.with(|remote| remote.set(true));
+    let (status, value) = exchange("PATCH", "/v2/settings", Some(&ssh.token), &json!({"managementCorsOrigins": []}));
+    assert_eq!((status, code(&value)), (403, "loopback_only"), "{value}");
+    REMOTE.with(|remote| remote.set(false));
+
+    // The root credential file through the host file read.
+    let config = crate::config::paths::config_path().unwrap();
+    if !config.exists() {
+        std::fs::write(&config, b"{}").unwrap();
+    }
+    let read = format!("/v2/fs/file?path={}", config.display());
+    for bearer in refused {
+        let (status, value) = exchange("GET", &read, Some(bearer), &json!({}));
+        assert_eq!((status, code(&value)), (403, "owner_local_only"), "{value}");
+    }
+    for bearer in allowed {
+        let (status, value) = exchange("GET", &read, Some(bearer), &json!({}));
+        assert_eq!(status, 200, "{value}");
+    }
+    std::fs::write(instance.root.join("notes.txt"), b"ok").unwrap();
+    let (status, _) = exchange("GET", &format!("/v2/fs/file?path={}", instance.root.join("notes.txt").display()), Some(&paired.token), &json!({}));
+    assert_eq!(status, 200, "other files stay readable");
+    // The workspace file read (a workspace rooted at home) uses the same check.
+    let refuse = crate::management::v2::host_files::refuse_root_credential_file;
+    let mut token = crate::management::client_tokens::VerifiedClientToken::test_token(&paired.token_id);
+    token.issued_via = IssuedVia::Pairing;
+    listeners::set_current_client_token(Some(token.clone()));
+    assert_eq!(refuse(&config).unwrap_err().code, "owner_local_only");
+    assert!(refuse(&instance.root.join("notes.txt")).is_ok());
+    token.issued_via = IssuedVia::HostCli;
+    listeners::set_current_client_token(Some(token));
+    assert!(refuse(&config).is_ok());
+    listeners::set_current_client_token(None);
+
+    // Pairing codes: owner-local (the SSH desktop keeps creating them).
+    for bearer in allowed {
+        let (status, value) = exchange("POST", "/v2/pairing-codes", Some(bearer), &json!({}));
+        assert_eq!(status, 201, "{value}");
+    }
+    for bearer in refused {
+        let (status, value) = exchange("POST", "/v2/pairing-codes", Some(bearer), &json!({}));
+        assert_eq!(status, 403, "{value}");
+        local_only(&value, "pairingCode");
+    }
+    REMOTE.with(|remote| remote.set(true));
+    let (status, value) = exchange("POST", "/v2/pairing-codes", Some(&ssh.token), &json!({}));
+    assert_eq!((status, code(&value)), (403, "loopback_only"), "{value}");
+    REMOTE.with(|remote| remote.set(false));
+}
+
+/// Owner's paired devices, limit 3 (device-scope): effective rights = the
+/// user's rights ∩ the device scope, for owner and member tokens alike.
+#[test]
+fn device_scope_narrows_owner_and_member_tokens() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let host = crate::platform::host::current_host_name();
+    let mut store = crate::session::model::CutexSessionStore::default();
+    let mut record = crate::session::model::CutexSessionRecord::new(
+        "cutex.scope-solo".to_string(), None, host, "/tmp".to_string(), None,
+    )
+    .unwrap();
+    record.exposed_to_backend = true;
+    record.registration_class = crate::agent_bus::model::AgentRegistrationClass::Persistent;
+    store.sessions.insert("cutex.scope-solo".to_string(), record);
+    crate::session::store::save_cutex_session_store(&store).unwrap();
+    use crate::management::client_tokens::DeviceScope;
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let full = tokens.issue("owner-full").unwrap();
+    users.snapshot().unwrap();
+    let read = tokens.issue_scoped("owner-read", DeviceScope::Read).unwrap();
+    let chat = tokens.issue_scoped("owner-chat", DeviceScope::Chat).unwrap();
+    users.bind_token(&read.token_id, Some(OWNER), "root").unwrap();
+    users.bind_token(&chat.token_id, Some(OWNER), "root").unwrap();
+    let sender = users
+        .create_user("Sender", None, Grant { standalone_agents: vec!["cutex.scope-solo".into()], send: true, ..Grant::default() }, "root")
+        .unwrap();
+    let member_read = tokens.issue_scoped("member-read", DeviceScope::Read).unwrap();
+    users.bind_token(&member_read.token_id, Some(&sender.id), "root").unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+
+    // Capabilities report the scope.
+    let caps = |bearer: &str| exchange("GET", "/v2/capabilities", Some(bearer), &json!({})).1;
+    assert_eq!(caps(ROOT)["user"]["scope"], "full");
+    assert_eq!(caps(&full.token)["user"]["scope"], "full");
+    let read_caps = caps(&read.token);
+    assert_eq!((&read_caps["user"]["scope"], &read_caps["user"]["token"]["scope"], &read_caps["user"]["isOwner"]), (&json!("read"), &json!("read"), &json!(true)));
+    assert_eq!(read_caps["features"]["deviceScope"], true);
+    assert_eq!(caps(&member_read.token)["user"]["scope"], "read");
+
+    let denied = |bearer: &str, method: &str, path: &str, body: &Value, required: &str| {
+        let (status, value) = p2_exchange(method, path, bearer, body);
+        assert_eq!((status, code(&value)), (403, "device_scope_denied"), "{method} {path} {body}: {value}");
+        assert_eq!(value["error"]["details"]["required"], required, "{value}");
+    };
+    let passes = |bearer: &str, method: &str, path: &str, body: &Value| {
+        let (status, value) = p2_exchange(method, path, bearer, body);
+        assert_ne!(code(&value), "device_scope_denied", "{method} {path} {body}: {status} {value}");
+        (status, value)
+    };
+    let cutex = |method: &str, params: Value| json!({"requestId": "r-1", "method": method, "params": params});
+    let text = json!({"clientUserMessageId": "m", "origin": {"kind": "backend", "clientId": "c"}, "strategy": "queue", "input": [{"type": "text", "text": "hi"}]});
+    let requests = "/v2/sessions/cutex.scope-solo/cutex/requests";
+    let native = |method: &str| json!({"requestId": "r", "native": {"message": {"id": 1, "method": method, "params": {"threadId": "t"}}}});
+    let native_path = "/v2/sessions/cutex.scope-solo/app-server/requests";
+
+    // read: GETs pass (owner routes included), writes and talking do not.
+    for path in ["/v2/users", "/v2/client-tokens", "/v2/users/owner/new-devices", "/v2/host"] {
+        let (status, value) = passes(&read.token, "GET", path, &json!({}));
+        assert_eq!(status, 200, "{path}: {value}");
+    }
+    denied(&read.token, "PATCH", "/v2/settings", &json!({"attachments": {"retentionDays": 3}}), "full");
+    denied(&read.token, "POST", "/v2/users", &json!({"name": "x"}), "full");
+    denied(&read.token, "PATCH", &format!("/v2/client-tokens/{}", read.token_id), &json!({"scope": "full"}), "full");
+    denied(&read.token, "POST", "/v2/pairing-codes", &json!({}), "full");
+    denied(&read.token, "POST", requests, &cutex("cutex/userInput/submit", text.clone()), "chat");
+    denied(&read.token, "POST", native_path, &native("turn/interrupt"), "chat");
+    denied(&read.token, "POST", "/v2/sessions/cutex.scope-solo/attachments", &json!({}), "chat");
+    // Its own identity claim and signing itself out stay possible.
+    let (status, _) = passes(&read.token, "GET", "/v2/identity/challenge", &json!({}));
+    assert_eq!(status, 200);
+    denied(&read.token, "DELETE", &format!("/v2/users/me/devices/{}", chat.token_id), &json!({}), "full");
+
+    // chat: talking to agents, not approvals, settings or agent operations.
+    let (status, value) = passes(&chat.token, "POST", requests, &cutex("cutex/userInput/submit", text.clone()));
+    assert!(matches!(code(&value), "session_offline" | "test_user_input_reached"), "{status} {value}");
+    let image = json!({"clientUserMessageId": "m", "origin": {"kind": "backend", "clientId": "c"}, "strategy": "queue", "input": [{"type": "localImage", "path": "/etc/hostname"}]});
+    let (status, value) = p2_exchange("POST", requests, &chat.token, &cutex("cutex/userInput/submit", image));
+    assert_eq!((status, code(&value)), (403, "attachment_not_owned"), "{value}");
+    for method in ["cutex/session/retire", "cutex/session/delete", "cutex/ask/create", "cutex/ask/close", "cutex/runtime/online"] {
+        denied(&chat.token, "POST", requests, &cutex(method, json!({})), "full");
+    }
+    for method in ["turn/start", "turn/steer", "thread/settings/update"] {
+        denied(&chat.token, "POST", native_path, &native(method), "full");
+    }
+    denied(&chat.token, "PATCH", "/v2/settings", &json!({"attachments": {"retentionDays": 3}}), "full");
+    denied(&chat.token, "POST", "/v2/human/agents", &json!({}), "full");
+    denied(&chat.token, "POST", "/v2/terminals", &json!({}), "full");
+    denied(&chat.token, "PATCH", "/v2/users/settings", &json!({"ownerRequiresApproval": true}), "full");
+    // Server responses: questions yes, approvals no.
+    crate::management::v2::server_requests::record_request("cutex.scope-solo", 1, json!({"id": 41, "method": "item/tool/requestUserInput", "params": {"questions": []}})).unwrap();
+    crate::management::v2::server_requests::record_request("cutex.scope-solo", 1, json!({"id": 42, "method": "item/commandExecution/requestApproval", "params": {}})).unwrap();
+    let respond = |id: i64| json!({"responseId": format!("resp-{id}"), "native": {"message": {"id": id, "result": {}}}});
+    let responses = "/v2/sessions/cutex.scope-solo/app-server/server-request-responses";
+    let (status, value) = passes(&chat.token, "POST", responses, &respond(41));
+    assert_ne!(status, 403, "{value}");
+    denied(&chat.token, "POST", responses, &respond(42), "full");
+    denied(&chat.token, "POST", responses, &respond(99), "full");
+    denied(&read.token, "POST", responses, &respond(41), "chat");
+
+    // Members: the user's rights ∩ the scope (send granted, device read-only).
+    denied(&member_read.token, "POST", requests, &cutex("cutex/userInput/submit", text.clone()), "chat");
+    let (status, value) = passes(&member_read.token, "GET", "/v2/sessions/cutex.scope-solo", &json!({}));
+    assert_ne!(status, 403, "{value}");
+    // ... and the scope never widens the user: a full member token is still refused owner routes.
+    let member_full = tokens.issue("member-full").unwrap();
+    users.bind_token(&member_full.token_id, Some(&sender.id), "root").unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    let (status, value) = p2_exchange("GET", "/v2/users", &member_full.token, &json!({}));
+    assert_eq!((status, code(&value)), (403, "owner_required"));
+
+    // An owner principal changes the scope (PATCH); a narrowed device cannot.
+    let patch = |bearer: &str, id: &str, body: Value| exchange("PATCH", &format!("/v2/client-tokens/{id}"), Some(bearer), &body);
+    let (status, value) = patch(&full.token, &read.token_id, json!({"scope": "chat"}));
+    assert_eq!((status, &value), (200, &json!({"tokenId": read.token_id, "ownerName": null, "scope": "chat"})), "{value}");
+    crate::management::v2::schema_export::assert_valid("pair", "clientTokenRenamed", &value);
+    let (status, value) = patch(ROOT, &read.token_id, json!({"scope": "admin"}));
+    assert_eq!((status, code(&value)), (400, "invalid_scope"));
+    let (status, value) = patch(ROOT, &read.token_id, json!({"name": "Phone", "scope": "read"}));
+    assert_eq!((status, &value["ownerName"], &value["scope"]), (200, &json!("Phone"), &json!("read")));
+    let (status, value) = patch(ROOT, "mct-0000000000000000", json!({"scope": "read"}));
+    assert_eq!((status, code(&value)), (404, "client_token_not_found"));
+    let (_, listed) = exchange("GET", "/v2/client-tokens", Some(ROOT), &json!({}));
+    let scope_of = |id: &str| listed["tokens"].as_array().unwrap().iter().find(|t| t["tokenId"] == id).unwrap()["scope"].clone();
+    assert_eq!((scope_of(&read.token_id), scope_of(&full.token_id), scope_of(&chat.token_id)), (json!("read"), json!("full"), json!("chat")));
+    let (_, listing) = exchange("GET", "/v2/users", Some(ROOT), &json!({}));
+    assert!(listing["tokens"].as_array().unwrap().iter().any(|t| t["tokenId"] == chat.token_id.as_str() && t["scope"] == "chat"));
+    // Widened to full: the device may act again.
+    patch(ROOT, &chat.token_id, json!({"scope": "full"}));
+    std::thread::sleep(Duration::from_millis(30));
+    let (status, value) = p2_exchange("POST", "/v2/users", &chat.token, &json!({"name": "Now allowed"}));
+    assert_eq!(status, 201, "{value}");
+    let audit = std::fs::read_to_string(users.dir().join("audit.jsonl")).unwrap();
+    assert!(audit.contains("\"tokenScopeChanged\""));
+}
+
+/// Remote close of a desktop client (client-remote-close; cutex-desktop
+/// docs/research/remote-close-desktop-20261019.md) through the production
+/// dispatcher: presence for every principal (pending and narrowed included),
+/// list visibility, the close matrix, events, outcomes and expiry.
+#[test]
+fn desktop_presence_and_remote_close() {
+    use crate::management::client_tokens::DeviceScope;
+    use crate::management::v2::clients_api::{self, CLOCK_OFFSET};
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    clients_api::with_registry(|registry| registry.clear());
+    CLOCK_OFFSET.with(|offset| offset.set(0));
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let owner_device = tokens.issue("owner-laptop").unwrap();
+    users.snapshot().unwrap(); // migrated: the first token is the owner's
+    let owner_chat = tokens.issue_scoped("owner-phone", DeviceScope::Chat).unwrap();
+    users.bind_token(&owner_chat.token_id, Some(OWNER), "root").unwrap();
+    let alice = users.create_user("Alice", None, Grant::default(), "root").unwrap();
+    let alice_desktop = tokens.issue("alice-desktop").unwrap();
+    let alice_phone = tokens.issue_scoped("alice-phone", DeviceScope::Read).unwrap();
+    users.bind_token(&alice_desktop.token_id, Some(&alice.id), "root").unwrap();
+    users.bind_token(&alice_phone.token_id, Some(&alice.id), "root").unwrap();
+    let bob = users.create_user("Bob", None, Grant::default(), "root").unwrap();
+    let bob_desktop = tokens.issue("bob-desktop").unwrap();
+    users.bind_token(&bob_desktop.token_id, Some(&bob.id), "root").unwrap();
+    let pending = tokens.issue("pending-desktop").unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    let repository = crate::management::v2::repository::management_v2_repository().unwrap();
+    let checkpoint = repository.checkpoint().unwrap();
+
+    let present = |bearer: &str, instance: &str, device: &str, allow: bool| {
+        exchange("POST", "/v2/clients/presence", Some(bearer), &json!({
+            "installId": format!("install-{instance}"), "instanceId": instance, "appName": "cutex-desktop",
+            "appVersion": "0.9.0", "deviceName": device, "platform": "linux", "allowRemoteClose": allow,
+        }))
+    };
+    // Every principal reports presence: root, narrowed owner, user, read-only, pending.
+    for (bearer, instance, device, allow) in [
+        (ROOT, "i-host", "Host PC", true),
+        (owner_chat.token.as_str(), "i-owner-phone", "Owner phone", true),
+        (alice_desktop.token.as_str(), "i-alice", "Alice PC", true),
+        (alice_phone.token.as_str(), "i-alice-phone", "Alice tablet", true),
+        (bob_desktop.token.as_str(), "i-bob", "Bob PC", false),
+        (pending.token.as_str(), "i-pending", "Guest PC", true),
+    ] {
+        let (status, value) = present(bearer, instance, device, allow);
+        assert_eq!(status, 200, "{instance}: {value}");
+        assert_eq!(value, json!({"instanceId": instance, "heartbeatSeconds": 60, "state": "online", "closeRequest": null}));
+        crate::management::v2::schema_export::assert_valid("clients", "presenceResponse", &value);
+    }
+    let (status, value) = present(&bob_desktop.token, "i-alice", "Bob PC", true);
+    assert_eq!((status, code(&value)), (409, "client_instance_conflict"), "{value}");
+    let (status, value) = exchange("POST", "/v2/clients/presence", Some(ROOT), &json!({"instanceId": "x"}));
+    assert_eq!((status, code(&value)), (400, "invalid_request"));
+    let (status, _) = exchange("POST", "/v2/clients/presence", None, &json!({}));
+    assert_eq!(status, 401);
+
+    // List visibility.
+    let list = |bearer: &str| {
+        let (status, value) = exchange("GET", "/v2/clients", Some(bearer), &json!({}));
+        assert_eq!(status, 200, "{value}");
+        crate::management::v2::schema_export::assert_valid("clients", "clientList", &value);
+        let mut ids: Vec<String> = value["clients"].as_array().unwrap().iter().map(|c| c["instanceId"].as_str().unwrap().to_string()).collect();
+        ids.sort();
+        (ids, value)
+    };
+    let (all, listed) = list(ROOT);
+    assert_eq!(all, ["i-alice", "i-alice-phone", "i-bob", "i-host", "i-owner-phone", "i-pending"]);
+    let host = listed["clients"].as_array().unwrap().iter().find(|c| c["instanceId"] == "i-host").unwrap();
+    assert_eq!((&host["current"], &host["userId"], &host["tokenId"], &host["local"], &host["state"]), (&json!(true), &json!("owner"), &Value::Null, &json!(true), &json!("online")));
+    assert_eq!(list(&owner_device.token).0.len(), 6, "an owner token with full scope sees all");
+    assert_eq!(list(&owner_chat.token).0, ["i-host", "i-owner-phone"], "narrowed owner: the owner's own");
+    assert_eq!(list(&alice_phone.token).0, ["i-alice", "i-alice-phone"]);
+    assert_eq!(list(&bob_desktop.token).0, ["i-bob"]);
+    assert_eq!(list(&pending.token).0, ["i-pending"], "pending: its own only");
+
+    // Close matrix over HTTP.
+    let close = |bearer: &str, instance: &str, body: Value| exchange("POST", &format!("/v2/clients/{instance}/close"), Some(bearer), &body);
+    let refused = |bearer: &str, instance: &str, reason: &str| {
+        let (status, value) = close(bearer, instance, json!({}));
+        assert_eq!((status, code(&value), &value["error"]["details"]["reason"]), (403, "client_close_forbidden", &json!(reason)), "{instance}: {value}");
+    };
+    refused(&pending.token, "i-pending", "pending");
+    refused(&owner_chat.token, "i-alice", "scope");
+    refused(&alice_phone.token, "i-alice", "scope");
+    refused(&bob_desktop.token, "i-alice", "otherUser");
+    refused(&alice_desktop.token, "i-host", "otherUser");
+    let (status, value) = close(ROOT, "i-unknown", json!({}));
+    assert_eq!((status, code(&value)), (404, "client_not_found"));
+    let (status, value) = close(ROOT, "i-bob", json!({}));
+    assert_eq!((status, code(&value)), (409, "remote_close_disabled"));
+    let (status, value) = close(ROOT, "i-alice", json!({"graceSeconds": 9999}));
+    assert_eq!((status, code(&value)), (400, "invalid_request"));
+    assert!(host_events(&checkpoint, clients_api::CLOSE_REQUESTED).is_empty(), "refusals publish nothing");
+    // Same user from her full desktop; the owner (root) closes anything.
+    let (status, value) = close(&alice_desktop.token, "i-alice-phone", json!({}));
+    assert_eq!((status, &value), (202, &json!({"instanceId": "i-alice-phone", "state": "closeRequested"})));
+    crate::management::v2::schema_export::assert_valid("clients", "closeAccepted", &value);
+    let (status, _) = close(ROOT, "i-alice", json!({"graceSeconds": 30}));
+    assert_eq!(status, 202);
+    let (status, _) = close(&owner_device.token, "i-pending", json!({}));
+    assert_eq!(status, 202);
+    let requested = host_events(&checkpoint, clients_api::CLOSE_REQUESTED);
+    assert_eq!(requested.len(), 3, "{requested:?}");
+    assert_eq!(requested[0]["requestedBy"], json!({"deviceName": "Alice PC", "userId": alice.id, "local": true}));
+    assert_eq!((&requested[0]["instanceId"], &requested[0]["graceSeconds"]), (&json!("i-alice-phone"), &json!(15)));
+    assert_eq!((&requested[1]["requestedBy"]["deviceName"], &requested[1]["graceSeconds"]), (&json!("Host PC"), &json!(30)));
+    // The owner token without a presence of its own: its token's name.
+    assert_eq!(requested[2]["requestedBy"], json!({"deviceName": "owner-laptop", "userId": "owner", "local": true}));
+    for event in &requested {
+        crate::management::v2::schema_export::assert_valid("clients", "closeRequestedEvent", event);
+    }
+    let (_, listed) = list(ROOT);
+    let state = |id: &str| listed["clients"].as_array().unwrap().iter().find(|c| c["instanceId"] == id).unwrap()["state"].clone();
+    assert_eq!((state("i-alice"), state("i-host")), (json!("closeRequested"), json!("online")));
+    // A pending device sees the request on its heartbeat (no event stream).
+    let (_, beat) = present(&pending.token, "i-pending", "Guest PC", true);
+    assert_eq!((&beat["state"], &beat["closeRequest"]["requestedBy"]["deviceName"]), (&json!("closeRequested"), &json!("owner-laptop")));
+    crate::management::v2::schema_export::assert_valid("clients", "presenceResponse", &beat);
+
+    // A member's event page carries its own user's client events only.
+    // (After the checkpoint: the event log of the test process is shared.)
+    let since = match &checkpoint.cursor {
+        Some(cursor) => format!("streamId={}&after={cursor}", checkpoint.stream_id),
+        None => format!("streamId={}", checkpoint.stream_id),
+    };
+    let (status, page) = p2_exchange("GET", &format!("/v2/events?cutexSessionId=cutex.host&limit=1000&{since}"), &alice_phone.token, &json!({}));
+    assert_eq!(status, 200, "{page}");
+    let seen: Vec<&str> = page["events"].as_array().unwrap().iter().map(|e| e["cutex"]["params"]["instanceId"].as_str().unwrap_or("")).collect();
+    assert_eq!(seen, ["i-alice-phone", "i-alice"], "{page}");
+    let (_, page) = p2_exchange("GET", &format!("/v2/events?limit=1000&{since}"), &bob_desktop.token, &json!({}));
+    assert!(page["events"].as_array().unwrap().is_empty(), "{page}");
+
+    // Outcomes: only the registering credential.
+    let closing = |bearer: &str, instance: &str, outcome: &str| exchange("POST", &format!("/v2/clients/{instance}/closing"), Some(bearer), &json!({"outcome": outcome}));
+    let (status, value) = closing(ROOT, "i-alice", "closing");
+    assert_eq!((status, &value["error"]["details"]["reason"]), (403, &json!("notRegistrant")), "{value}");
+    let (status, value) = closing(&alice_phone.token, "i-alice", "closing");
+    assert_eq!((status, code(&value)), (403, "client_close_forbidden"), "same user, other device");
+    let (status, value) = closing(&alice_desktop.token, "i-alice", "maybe");
+    assert_eq!((status, code(&value)), (400, "invalid_request"));
+    let (status, value) = closing(&alice_desktop.token, "i-unknown", "closing");
+    assert_eq!((status, code(&value)), (404, "client_not_found"));
+    let (status, value) = closing(&alice_phone.token, "i-alice-phone", "cancelled");
+    assert_eq!((status, &value), (200, &json!({"instanceId": "i-alice-phone", "state": "cancelled"})));
+    crate::management::v2::schema_export::assert_valid("clients", "closingResponse", &value);
+    let (status, _) = closing(&alice_desktop.token, "i-alice", "closing");
+    assert_eq!(status, 200);
+    let changed = host_events(&checkpoint, clients_api::STATE_CHANGED);
+    assert_eq!(changed, vec![json!({"instanceId": "i-alice-phone", "state": "cancelled"}), json!({"instanceId": "i-alice", "state": "closing"})]);
+    for event in &changed {
+        crate::management::v2::schema_export::assert_valid("clients", "stateChangedEvent", event);
+    }
+    let (_, listed) = list(ROOT);
+    let state = |id: &str| listed["clients"].as_array().unwrap().iter().find(|c| c["instanceId"] == id).unwrap()["state"].clone();
+    assert_eq!((state("i-alice"), state("i-alice-phone")), (json!("closing"), json!("cancelled")));
+    let (status, value) = close(ROOT, "i-alice", json!({}));
+    assert_eq!((status, &value["state"]), (202, &json!("closing")), "already closing: no new request");
+    assert_eq!(host_events(&checkpoint, clients_api::CLOSE_REQUESTED).len(), 3);
+
+    // Other methods on the family: the owner's / 405.
+    let (status, value) = exchange("DELETE", "/v2/clients/i-host", Some(&alice_desktop.token), &json!({}));
+    assert_eq!((status, code(&value)), (403, "owner_required"));
+    let (status, value) = exchange("GET", "/v2/clients/i-host/close", Some(ROOT), &json!({}));
+    assert_eq!((status, code(&value)), (405, "method_not_allowed"));
+
+    // Expiry: 3 heartbeats (180 s) without presence.
+    CLOCK_OFFSET.with(|offset| offset.set(120));
+    let (status, _) = present(ROOT, "i-host", "Host PC", true);
+    assert_eq!(status, 200);
+    CLOCK_OFFSET.with(|offset| offset.set(clients_api::EXPIRE_SECONDS + 5));
+    assert_eq!(list(ROOT).0, ["i-host"], "only the instance with a recent heartbeat remains");
+    let (status, value) = close(ROOT, "i-alice", json!({}));
+    assert_eq!((status, code(&value)), (404, "client_not_found"));
+    CLOCK_OFFSET.with(|offset| offset.set(0));
+
+    let audit = std::fs::read_to_string(users.dir().join("audit.jsonl")).unwrap();
+    assert_eq!(audit.matches("\"clientCloseRequested\"").count(), 3);
+    assert!(audit.contains("\"clientCloseRefused\"") && audit.contains("\"clientCloseOutcome\""));
+    clients_api::with_registry(|registry| registry.clear());
+}
+
+/// user-home: every assigned principal reads and writes its own home page
+/// (revisioned) and cover; pending devices are refused, a `read` device may
+/// only read.
+#[test]
+fn own_home_page_and_cover_per_user() {
+    use base64::Engine;
+    use crate::management::client_tokens::DeviceScope;
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let owner = tokens.issue("owner-desktop").unwrap();
+    let users = UserStore::open_default().unwrap();
+    users.snapshot().unwrap();
+    let alice = users.create_user("Alice", None, Grant::default(), "root").unwrap();
+    let bob = users.create_user("Bob", None, Grant::default(), "root").unwrap();
+    let a = tokens.issue("alice-laptop").unwrap();
+    let a_read = tokens.issue_scoped("alice-read", DeviceScope::Read).unwrap();
+    let a_chat = tokens.issue_scoped("alice-chat", DeviceScope::Chat).unwrap();
+    let b = tokens.issue("bob-laptop").unwrap();
+    let pending = tokens.issue("stranger").unwrap();
+    for token in [&a, &a_read, &a_chat] {
+        users.bind_token(&token.token_id, Some(&alice.id), "root").unwrap();
+    }
+    users.bind_token(&b.token_id, Some(&bob.id), "root").unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+
+    let caps = exchange("GET", "/v2/capabilities", Some(&a.token), &json!({})).1;
+    assert!(caps["featureList"].as_array().unwrap().iter().any(|f| f == "user-home"));
+    assert_eq!(caps["features"]["userHome"], true);
+
+    // Empty, then a roundtrip with unknown keys kept and coverEtag server-owned.
+    let (status, value) = exchange("GET", "/v2/users/me/home", Some(&a.token), &json!({}));
+    assert_eq!((status, &value), (200, &json!({"revision": 0, "home": null, "coverEtag": null, "updatedAt": null})));
+    crate::management::v2::schema_export::assert_valid("users", "homeView", &value);
+    let home = json!({
+        "layout": "card",
+        "blocks": [{"id": "pins", "visible": true}, {"id": "stats", "visible": false}],
+        "bio": "Hello",
+        "sidebarEntry": true,
+        "showWhenEmpty": true,
+        "homeHost": "host-a",
+        "pins": [{"hostId": "host-a", "kind": "service", "key": "web", "title": "Web", "size": "m"}],
+        "coverEtag": "ffffffffffffffff",
+        "laterFeature": {"on": true},
+    });
+    crate::management::v2::schema_export::assert_valid("users", "homePut", &json!({"revision": 0, "home": home}));
+    let (status, value) = exchange("PUT", "/v2/users/me/home", Some(&a.token), &json!({"revision": 0, "home": home}));
+    assert_eq!((status, &value["revision"]), (200, &json!(1)), "{value}");
+    assert_eq!((&value["home"]["laterFeature"], &value["home"]["coverEtag"]), (&json!({"on": true}), &Value::Null));
+    crate::management::v2::schema_export::assert_valid("users", "homeView", &value);
+    let (_, again) = exchange("GET", "/v2/users/me/home", Some(&a_read.token), &json!({}));
+    assert_eq!(again, value, "another device of the same user reads the same");
+
+    // Optimistic concurrency.
+    let (status, value) = exchange("PUT", "/v2/users/me/home", Some(&a.token), &json!({"revision": 0, "home": {"layout": "gallery"}}));
+    assert_eq!((status, code(&value), &value["error"]["details"]["revision"]), (409, "home_revision_conflict", &json!(1)), "{value}");
+
+    // Shape and size.
+    for (body, status_code, expected) in [
+        (json!({"home": {}}), 400, "invalid_request"),
+        (json!({"revision": -1, "home": {}}), 400, "invalid_request"),
+        (json!({"revision": 1}), 400, "invalid_request"),
+        (json!({"revision": 1, "home": {}, "extra": 1}), 400, "invalid_request"),
+        (json!({"revision": 1, "home": []}), 400, "invalid_home"),
+        (json!({"revision": 1, "home": {"bio": "x".repeat(201)}}), 400, "invalid_home"),
+        (json!({"revision": 1, "home": {"pins": [{"hostId": "h", "kind": "folder", "key": "k"}]}}), 400, "invalid_home"),
+        (json!({"revision": 1, "home": {"blocks": [{"id": "a", "visible": "yes"}]}}), 400, "invalid_home"),
+        (json!({"revision": 1, "home": {"blob": "x".repeat(70 * 1024)}}), 413, "home_too_large"),
+    ] {
+        let (status, value) = exchange("PUT", "/v2/users/me/home", Some(&a.token), &body);
+        assert_eq!((status, code(&value)), (status_code, expected), "{body}: {value}");
+    }
+
+    // Per-user isolation: Bob and the owner start empty and keep their own.
+    let (_, value) = exchange("GET", "/v2/users/me/home", Some(&b.token), &json!({}));
+    assert_eq!((&value["revision"], &value["home"]), (&json!(0), &Value::Null));
+    let (status, value) = exchange("PUT", "/v2/users/me/home", Some(&owner.token), &json!({"revision": 0, "home": {"bio": "owner"}}));
+    assert_eq!(status, 200, "{value}");
+    let (_, value) = exchange("GET", "/v2/users/me/home", Some(ROOT), &json!({}));
+    assert_eq!(value["home"]["bio"], "owner", "root credential = owner");
+    let (_, value) = exchange("GET", "/v2/users/me/home", Some(&a.token), &json!({}));
+    assert_eq!(value["home"]["bio"], "Hello");
+    let (status, value) = exchange("POST", "/v2/users/me/home", Some(ROOT), &json!({}));
+    assert_eq!((status, code(&value)), (405, "method_not_allowed"));
+    let (status, value) = exchange("POST", "/v2/users/me/home", Some(&a.token), &json!({}));
+    assert_eq!((status, code(&value)), (403, "owner_required"));
+
+    // Pending devices are refused.
+    for (method, path) in [("GET", "/v2/users/me/home"), ("PUT", "/v2/users/me/home"), ("GET", "/v2/users/me/home/cover"), ("DELETE", "/v2/users/me/home/cover")] {
+        let (status, value) = exchange(method, path, Some(&pending.token), &json!({"revision": 0, "home": {}}));
+        assert_eq!((status, code(&value)), (403, "access_pending"), "{method} {path}");
+    }
+
+    // Device scope: read only reads; chat may edit the own home page.
+    for (method, path) in [("PUT", "/v2/users/me/home"), ("PUT", "/v2/users/me/home/cover"), ("DELETE", "/v2/users/me/home/cover")] {
+        let (status, value) = exchange(method, path, Some(&a_read.token), &json!({"revision": 1, "home": {}}));
+        assert_eq!((status, code(&value), &value["error"]["details"]["required"]), (403, "device_scope_denied", &json!("chat")), "{method} {path}");
+    }
+    let (status, value) = exchange("PUT", "/v2/users/me/home", Some(&a_chat.token), &json!({"revision": 1, "home": {"layout": "gallery"}}));
+    assert_eq!((status, &value["revision"]), (200, &json!(2)), "{value}");
+
+    // Cover: put, get (ETag), conditional get, size / type limits, delete.
+    let cover_png = {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1500, 500).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    };
+    let upload = |bytes: &[u8], content_type: &str| json!({"contentType": content_type, "data": base64::engine::general_purpose::STANDARD.encode(bytes)});
+    let (status, value) = exchange("GET", "/v2/users/me/home/cover", Some(&a.token), &json!({}));
+    assert_eq!((status, code(&value)), (404, "cover_not_found"));
+    let (status, value) = exchange("PUT", "/v2/users/me/home/cover", Some(&a_chat.token), &upload(&cover_png, "image/png"));
+    assert_eq!(status, 200, "{value}");
+    crate::management::v2::schema_export::assert_valid("users", "homeView", &value);
+    let etag = value["coverEtag"].as_str().unwrap().to_string();
+    assert_eq!((&value["home"]["coverEtag"], &value["revision"]), (&json!(etag), &json!(2)), "cover keeps the revision");
+    let (status, head, bytes) = exchange_raw("GET", "/v2/users/me/home/cover", Some(&a_read.token), &json!({}), "");
+    assert_eq!(status, 200);
+    assert!(head.contains("Content-Type: image/png") && head.contains(&format!("ETag: \"{etag}\"")), "{head}");
+    assert_eq!(bytes, cover_png);
+    let (status, _, bytes) = exchange_raw("GET", "/v2/users/me/home/cover", Some(&a.token), &json!({}), &format!("If-None-Match: \"{etag}\"\r\n"));
+    assert_eq!((status, bytes.len()), (304, 0));
+    let (status, value) = exchange("GET", "/v2/users/me/home/cover", Some(&b.token), &json!({}));
+    assert_eq!((status, code(&value)), (404, "cover_not_found"), "covers are per user");
+    let (_, value) = exchange("GET", "/v2/users/me/home", Some(&a.token), &json!({}));
+    assert_eq!(value["home"]["coverEtag"], json!(etag));
+    let (status, value) = exchange("PUT", "/v2/users/me/home/cover", Some(&a.token), &upload(&cover_png, "image/jpeg"));
+    assert_eq!((status, code(&value)), (400, "invalid_cover"));
+    let (status, value) = exchange("PUT", "/v2/users/me/home/cover", Some(&a.token), &upload(&vec![0u8; 2 * 1024 * 1024 + 1], "image/png"));
+    assert_eq!((status, code(&value)), (413, "cover_too_large"));
+    let (status, value) = exchange("DELETE", "/v2/users/me/home/cover", Some(&a.token), &json!({}));
+    assert_eq!((status, &value["coverEtag"]), (200, &Value::Null));
+    let (status, _) = exchange("GET", "/v2/users/me/home/cover", Some(&a.token), &json!({}));
+    assert_eq!(status, 404);
+
+    // Deleting a user drops its home page.
+    users.bind_token(&b.token_id, None, "root").unwrap();
+    exchange("PUT", "/v2/users/me/home", Some(&owner.token), &json!({"revision": 1, "home": null}));
+    let homes = crate::management::user_home::HomeStore::open_default().unwrap();
+    homes.put(&bob.id, 0, Some(serde_json::Map::new()), "root").unwrap();
+    let (status, _) = exchange("DELETE", &format!("/v2/users/{}", bob.id), Some(&owner.token), &json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(homes.get(&bob.id).unwrap().revision, 0);
+    assert_eq!(homes.get(&alice.id).unwrap().revision, 2);
 }

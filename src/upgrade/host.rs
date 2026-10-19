@@ -291,8 +291,8 @@ impl Host for RealHost {
         super::backup::move_aside(&self.home, store, displaced)
     }
 
-    fn prepare_older_stores(&self, displaced: &Path) -> anyhow::Result<Vec<String>> {
-        super::older_stores::prepare(&self.home, displaced)
+    fn prepare_older_stores(&self, displaced: &Path, target: &str) -> anyhow::Result<Vec<String>> {
+        super::older_stores::prepare(&self.home, displaced, target)
     }
 
     fn rollback_prep(&self, migrations: &[Migration]) -> anyhow::Result<Vec<String>> {

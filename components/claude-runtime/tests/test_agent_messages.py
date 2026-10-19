@@ -70,15 +70,19 @@ async def test_note_starts_no_turn_and_is_read_at_the_next_agent_turn(h):
     assert [i['id'] for i in turn['items'] if i['type'] == 'functionCallOutput'] == ['note-1', 'wake-1']
 
 
-async def test_owner_turn_leaves_notes_pending_and_bad_views_are_refused(h):
+async def test_owner_turn_reads_notes_at_its_start_and_bad_views_are_refused(h):
     tid = await h.thread()
     await h.call('claude/input/submit', message(tid, 'note-2', 'fyi'))
     turn = await h.turn(tid, 'hello')
     await h.drain()
     assert turn in turns_started(h)
-    assert h.store.pending_notes(tid) == 1, 'owner text stays as written; the note waits'
-    taken = h.store.take_notes(tid, turn)
-    assert [item['id'] for item, _ in taken] == ['note-2'] and h.store.pending_notes(tid) == 0
+    # Like Codex (passive input joins a turn's first request), an owner turn reads
+    # pending notes at its start, not only after its first tool call.
+    assert h.store.pending_notes(tid) == 0
+    prompt = h.provider.requests[0]['messages'][0]['content'][0]['text']
+    assert prompt.startswith('EXTERNAL_INPUT_JSON') and prompt.index('fyi') < prompt.index('hello')
+    assert [i['type'] for i in h.store.items(turn)][:2] == ['userMessage', 'functionCallOutput']
+    assert [p['item']['id'] for p in completed_items(h) if p['item']['type'] == 'functionCallOutput'] == ['note-2']
     assert h.store.take_notes(tid, turn) == [], 'at most once'
     bad = message(tid, 'note-3', 'x', view={'schema': 'x', 'data': {}, 'extra': 1})
     assert (await h.call('claude/input/submit', bad, error=True))['code'] < 0
@@ -108,3 +112,83 @@ async def test_post_tool_use_hook_reads_notes_into_the_running_turn(ph):
     assert context.startswith('EXTERNAL_INPUT_JSON') and 'fyi' in context
     assert [i['id'] for i in ph.store.items(turn) if i['type'] == 'functionCallOutput'] == ['note-9']
     assert await hook(data, 'call-3', {}) == {}, 'at most once'
+
+
+NOTE_TEXT = 'Message Type: MESSAGE\nSender: cutex.lead\nPayload:\nlog is in @/tmp/run.log'
+WAKE_TEXT = 'Read and handle the unread notes other agents left for you.'
+
+
+async def test_owner_wake_reads_pending_notes_in_its_first_input(ph):
+    """hachimi 2026-10-19: the owner's 唤醒 (cutex/agentBus/wake) started a turn
+    whose first request lacked the notes; they came only after the first tool call
+    (PostToolUse), and a turn without tools never saw them."""
+    tid = await ph.thread()
+    await ph.call('claude/runtime/start', {'threadId': tid})
+    client = ph.sdk.clients[0]
+    await ph.call('claude/input/submit', message(tid, 'note-a', NOTE_TEXT))
+    await ph.call('claude/input/submit', message(tid, 'note-b', 'second note'))
+    await ph.drain()
+    assert client.query_count == 0, 'notes start no turn'
+    turn = (await ph.call('turn/start', {'threadId': tid, 'clientUserMessageId': 'agent-bus-wake-1',
+                                         'input': [{'type': 'text', 'text': WAKE_TEXT}]}))['turn']['id']
+    await ph.drain()
+    [sent] = client.messages
+    content = sent['message']['content']
+    assert [b['type'] for b in content] == ['text', 'text', 'text']
+    assert content[0]['text'].startswith('EXTERNAL_INPUT_JSON') and 'log is in @/tmp/run.log' in content[0]['text']
+    assert 'second note' in content[1]['text']
+    # The owner's text is the last block, the only one Claude Code reads as typed
+    # input (@path mentions): the notes' text is passed on as written.
+    assert content[2] == {'type': 'text', 'text': WAKE_TEXT}
+    assert 'client_composed' not in sent
+    assert ph.store.pending_notes(tid) == 0
+    items = ph.store.items(turn)
+    assert [i['type'] for i in items][:3] == ['userMessage', 'functionCallOutput', 'functionCallOutput']
+    assert [i['id'] for i in items if i['type'] == 'functionCallOutput'] == ['note-a', 'note-b']
+    started = [m['params']['item']['id'] for m in ph.out if m.get('method') == 'item/completed'
+               and m['params']['item']['type'] == 'functionCallOutput']
+    assert started == ['note-a', 'note-b'], 'cutex reads the delivery from these items'
+    for mid in ('note-a', 'note-b'):
+        assert (await ph.call('claude/input/status', {'threadId': tid, 'messageId': mid}))['state'] == 'injected'
+
+
+async def test_owner_turn_notes_are_not_offered_again_by_post_tool_use(ph):
+    tid = await ph.thread()
+    await ph.call('claude/runtime/start', {'threadId': tid})
+    client = ph.sdk.clients[0]
+    await ph.call('claude/input/submit', message(tid, 'note-c', 'fyi'))
+    ph.store.enqueue(tid, 'owner-1', {'source': {'kind': 'user', 'id': 'local-controller'},
+                                      'eventType': 'user.message', 'text': 'see @hello.txt', 'metadata': {}}, 10)
+    record = ph.store.claim(tid)
+    turn = record['turn_id']
+    assert record['prompt'] == 'see @hello.txt', 'the owner text stays as written'
+    assert ph.store.turn_note_frames(turn)[0].startswith('EXTERNAL_INPUT_JSON')
+    bridge = ph.engine.driver.owners[tid].bridge
+    bridge.begin_turn(turn)
+    hook = client.options.hooks['PostToolUse'][0].hooks[0]
+    data = {'session_id': bridge.sid, 'hook_event_name': 'PostToolUse', 'tool_response': 'ok'}
+    assert await hook(data, 'call-1', {}) == {}, 'read at the turn start: never offered again'
+    assert [i['id'] for i in ph.store.items(turn) if i['type'] == 'functionCallOutput'] == ['note-c']
+
+
+async def test_owner_turn_with_images_and_compact_keep_their_shape(ph, tmp_path):
+    from test_desktop_parity import PNG
+    tid = await ph.thread()
+    await ph.call('claude/runtime/start', {'threadId': tid})
+    client = ph.sdk.clients[0]
+    await ph.call('claude/input/submit', message(tid, 'note-d', 'fyi'))
+    await ph.call('turn/start', {'threadId': tid, 'input': [
+        {'type': 'text', 'text': 'look'}, {'type': 'image', 'url': 'data:image/png;base64,' + PNG}]})
+    await ph.drain()
+    content = client.messages[-1]['message']['content']
+    assert [b['type'] for b in content] == ['text', 'text', 'image']
+    assert 'fyi' in content[0]['text'] and content[1] == {'type': 'text', 'text': 'look'}
+    # No note pending: an owner turn's message is unchanged (a plain string).
+    await ph.turn(tid, 'plain'); await ph.drain()
+    assert client.messages[-1]['message']['content'] == 'plain'
+    # /compact reads no note: it waits for the next turn.
+    await ph.call('claude/input/submit', message(tid, 'note-e', 'later'))
+    ph.store.enqueue(tid, 'compact-1', {'source': {'kind': 'user', 'id': 'local-controller'},
+                                     'eventType': 'thread.compact', 'text': '/compact', 'metadata': {}}, 10)
+    claimed = ph.store.claim(tid, 'compact-1')
+    assert ph.store.turn_note_frames(claimed['turn_id']) == [] and ph.store.pending_notes(tid) == 1

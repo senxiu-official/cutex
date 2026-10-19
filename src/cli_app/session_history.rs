@@ -234,11 +234,50 @@ pub(crate) fn latest_plan_for_management(cutex_session_id: &str) -> Value {
 /// `ManagementRequestContext::load_latest_token_usage`:
 /// `cutexState.latestTokenUsage` from the session's current native rollout
 /// (`cutex::launch::native_token_usage`); `null` in the same cases as
-/// [`latest_plan_for_management`].
+/// [`latest_plan_for_management`], except that a local Claude session serves
+/// the newest usage report its adapter sent for its current thread
+/// (`management::v2::claude_token_usage`; Claude has no rollout).
 pub(crate) fn latest_token_usage_for_management(cutex_session_id: &str) -> Value {
+    if let Some(usage) = claude_latest_token_usage(cutex_session_id) {
+        return usage;
+    }
     derive_from_native_rollout(
         cutex_session_id,
         cutex::launch::native_token_usage::latest_token_usage,
+    )
+}
+
+/// `Some` (a value or `null`) for a local Claude session, `None` otherwise.
+fn claude_latest_token_usage(cutex_session_id: &str) -> Option<Value> {
+    let store = cutex::session::store::load_cutex_session_store().ok()?;
+    claude_latest_token_usage_in(
+        &store,
+        cutex_session_id,
+        &cutex::platform::host::current_host_name(),
+        cutex::management::v2::claude_token_usage::latest,
+    )
+}
+
+fn claude_latest_token_usage_in(
+    store: &cutex::session::model::CutexSessionStore,
+    cutex_session_id: &str,
+    current_host: &str,
+    latest: impl Fn(&str, &str) -> anyhow::Result<Option<Value>>,
+) -> Option<Value> {
+    let key = cutex::session::service::cutex_session_key_for_user_id_including_retired(
+        store,
+        cutex_session_id,
+    )?;
+    let record = store.sessions.get(&key)?;
+    let claude = record.claude_session.as_ref()?;
+    if !cutex::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, current_host) {
+        return Some(Value::Null);
+    }
+    Some(
+        latest(&record.cutex_session_id, &claude.thread_id)
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Null),
     )
 }
 
@@ -1116,6 +1155,70 @@ mod tests {
         assert_eq!(generic.code, "history_revert_failed");
         assert!(generic.message.contains("boom"));
     }
+    /// A Claude `thread/tokenUsage/updated` (reported at turn end) becomes the
+    /// session's bootstrap / history `cutexState.latestTokenUsage`; Codex
+    /// sessions keep the rollout derivation.
+    #[test]
+    fn claude_token_usage_event_feeds_latest_token_usage() {
+        use cutex::management::v2::claude_token_usage;
+        use cutex::management::v2::model::{
+            EventCorrelation, EventEnvelope, EventSource, NativeMessage, NativeMessageKind,
+        };
+        let root = std::env::temp_dir().join(format!("cutex-claude-usage-{}", uuid::Uuid::new_v4()));
+        let thread = "8c0e4b8e-6f3a-4c1e-9a52-0d9f6e2b7a11";
+        let mut claude = cutex::session::model::CutexSessionRecord::new(
+            "cutex-claude-1".into(), None, "host-a".into(), "/w".into(), None).unwrap();
+        claude.claude_session = Some(serde_json::from_value(json!({
+            "deployment": {"python": "/py", "adapter_source": "/a", "claude_cli": "/claude",
+                           "claude_home": "/home", "tui_binary": "/tui"},
+            "thread_id": thread, "state_dir": "/state", "model": "opus"
+        })).unwrap());
+        let codex = cutex::session::model::CutexSessionRecord::new(
+            "cutex-codex-1".into(), Some("00000000-0000-7000-8000-000000000001".into()),
+            "host-a".into(), "/w".into(), None).unwrap();
+        let mut store = cutex::session::model::CutexSessionStore::default();
+        store.sessions.insert(claude.cutex_session_id.clone(), claude.clone());
+        store.sessions.insert(codex.cutex_session_id.clone(), codex.clone());
+        let latest = |session: &str, thread: &str| claude_token_usage::latest_at(&root, session, thread);
+        let read = |id: &str| claude_latest_token_usage_in(&store, id, "host-a", latest);
+
+        // No report yet: null (not the Codex rollout derivation).
+        assert_eq!(read(&claude.cutex_session_id), Some(Value::Null));
+        let usage = json!({
+            "total": {"totalTokens": 52000, "inputTokens": 50000, "cachedInputTokens": 40000,
+                      "cacheWriteInputTokens": 9000, "outputTokens": 2000, "reasoningOutputTokens": 0},
+            "last": {"totalTokens": 48000, "inputTokens": 48000, "cachedInputTokens": 0,
+                     "cacheWriteInputTokens": 0, "outputTokens": 0, "reasoningOutputTokens": 0},
+            "modelContextWindow": 1000000
+        });
+        let envelope = EventEnvelope {
+            contract_version: cutex::management::v2::model::CONTRACT_VERSION,
+            event_id: "e1".into(), cursor: "c1".into(), stream_id: "s".into(), sequence: 9,
+            received_at: "2026-10-20T03:04:05Z".into(),
+            cutex_session_id: claude.cutex_session_id.clone(), host_id: "host-a".into(),
+            source: EventSource::AppServer, sensitivity: "private".into(), schema: None,
+            correlation: EventCorrelation::default(),
+            native: Some(NativeMessage { kind: NativeMessageKind::Notification, message: json!({
+                "method": "thread/tokenUsage/updated",
+                "params": {"threadId": thread, "turnId": "turn-7", "tokenUsage": usage}
+            })}),
+            cutex: None,
+        };
+        assert!(claude_token_usage::record_event_at(&root, &envelope, thread).unwrap());
+        let expected = json!({"threadId": thread, "turnId": "turn-7", "tokenUsage": usage,
+                              "updatedAt": "2026-10-20T03:04:05Z"});
+        assert_eq!(read(&claude.cutex_session_id), Some(expected.clone()));
+        let mut body = json!({"cutexSessionId": claude.cutex_session_id});
+        cutex::management::v2::history::attach_cutex_state(
+            &mut body, Value::Null, read(&claude.cutex_session_id).unwrap());
+        assert_eq!(body["cutexState"]["latestTokenUsage"], expected);
+        // Codex: not answered here (falls through to the rollout).
+        assert_eq!(read(&codex.cutex_session_id), None);
+        // A Claude session of another host: null.
+        assert_eq!(claude_latest_token_usage_in(&store, &claude.cutex_session_id, "host-b", latest), Some(Value::Null));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn filtering_preserves_newest_first_and_real_removal_boundary() {
         let h = History {

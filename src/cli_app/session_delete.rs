@@ -583,6 +583,9 @@ pub(crate) fn delete_for_management(
         }
     }
     cutex::notes::mark_session_deleted_default(&key);
+    if let Err(error) = cutex::management::v2::claude_token_usage::remove(&key) {
+        eprintln!("session delete: Claude token usage cleanup failed for {key}: {error:#}");
+    }
     let deleted_at = chrono::Utc::now().to_rfc3339();
     receipt["status"] = json!("complete");
     receipt["deletedAt"] = json!(deleted_at);

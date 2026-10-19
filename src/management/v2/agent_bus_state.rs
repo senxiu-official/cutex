@@ -699,7 +699,7 @@ impl AgentBusMessageRepository {
     }
 
     #[cfg(test)]
-    fn record_queued_isolated(&self, message: AgentBusQueuedMessage) -> anyhow::Result<bool> {
+    pub(crate) fn record_queued_isolated(&self, message: AgentBusQueuedMessage) -> anyhow::Result<bool> {
         self.record_queued_internal(message, false, None, None)
     }
 
@@ -745,13 +745,12 @@ impl AgentBusMessageRepository {
                 }
                 anyhow::bail!("agent-bus messageId was reused with different canonical content");
             }
-            if record_management_event && message.from_cutex_session_id.is_some() {
-                append_event(
-                    &message.owner_cutex_session_id,
-                    &message.message_id,
-                    "cutex/agentBus/messageQueued",
-                    with_agent_fields(
-                        json!({
+            // Agent messages, and cross-host tells (no local sender session;
+            // `remote` names where they came from).
+            let peer = peer_tell_fields(message.from_cutex_session_id.as_deref(), &message.canonical_envelope);
+            if record_management_event && (message.from_cutex_session_id.is_some() || peer.is_some()) {
+                let mut params = with_agent_fields(
+                    json!({
                         "messageId": message.message_id,
                         "fromCutexSessionId": message.from_cutex_session_id,
                         "toCutexSessionId": message.to_cutex_session_id,
@@ -761,12 +760,20 @@ impl AgentBusMessageRepository {
                         "content": message.content,
                         "queuedAt": message.queued_at.to_rfc3339(),
                     }),
-                        &message.delivery_mode,
-                        &message.content,
-                        message.from_cutex_session_id.as_deref(),
-                        &message.to_cutex_session_id,
-                        meta.as_ref(),
-                    ),
+                    &message.delivery_mode,
+                    &message.content,
+                    message.from_cutex_session_id.as_deref(),
+                    &message.to_cutex_session_id,
+                    meta.as_ref(),
+                );
+                if let (Some(object), Some(peer)) = (params.as_object_mut(), peer) {
+                    object.extend(peer);
+                }
+                append_event(
+                    &message.owner_cutex_session_id,
+                    &message.message_id,
+                    "cutex/agentBus/messageQueued",
+                    params,
                 )?;
             }
             if message.canonical_envelope.control_type.as_deref()
@@ -1020,7 +1027,8 @@ impl AgentBusMessageRepository {
                 .values()
                 .filter(|m| {
                     m.snapshot.to_cutex_session_id == cutex_session_id
-                        && m.snapshot.from_cutex_session_id.is_some()
+                        && (m.snapshot.from_cutex_session_id.is_some()
+                            || m.canonical_envelope.as_ref().is_some_and(crate::agent_bus::peer_tell::is_peer_tell))
                         && m.snapshot.delivery_mode == "passive"
                         && matches!(m.snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held")
                 })
@@ -1440,6 +1448,72 @@ impl AgentBusMessageRepository {
                 *index = Some(refreshed);
             }
             action(&store, index.as_ref().unwrap())
+        })
+    }
+
+    /// Rollback step (services stopped; `src/upgrade/older_stores.rs`): every
+    /// cross-host wake (`cutex.peer.tell.v2`, `after_turn`) that is still
+    /// pending and was never handed to a runtime becomes the cross-host note
+    /// (`cutex.peer.tell.v1`, passive) a release without cross-host wakes
+    /// delivers. Such a release skips or keeps retrying an unknown control
+    /// type and lists the wake as an eligible next step forever, which holds
+    /// owner input ~30 s per message and new delegations to that agent
+    /// indefinitely. The digest is recomputed for the note's text; the
+    /// message id, sender and facts stay. A wake already frozen for a runtime
+    /// (or with any native receipt) is left as it is. Returns the canonical
+    /// records as they were before (to keep aside).
+    pub fn downgrade_pending_peer_wakes(&self) -> anyhow::Result<Vec<Value>> {
+        use crate::agent_bus::delivery::AgentDeliveryMode;
+        use crate::agent_bus::peer_tell::{CONTROL_TYPE, CONTROL_TYPE_V2};
+        self.update(|store| {
+            let mut before = Vec::new();
+            for (id, stored) in &mut store.messages {
+                let snapshot = &stored.snapshot;
+                let Some(canonical) = stored.canonical_envelope.as_ref() else {
+                    continue;
+                };
+                if canonical.control_type.as_deref() != Some(CONTROL_TYPE_V2)
+                    || snapshot.state != "pending"
+                    || snapshot.external_input.is_some()
+                    || snapshot.external_input_receipt.is_some()
+                    || snapshot.a2_submission_id.is_some()
+                    || snapshot.a4_receipt.is_some()
+                    || snapshot.local_inbox_receipt.is_some()
+                {
+                    continue;
+                }
+                let mut note = canonical.clone();
+                note.control_type = Some(CONTROL_TYPE.into());
+                note.delivery_mode = AgentDeliveryMode::Passive;
+                note.trigger_turn = false;
+                if let Some(Value::Object(facts)) = note.control_payload.as_mut() {
+                    facts.remove("wakeDowngraded");
+                }
+                // A record this build cannot project is left alone.
+                let Ok(params) = crate::app_server::bus_bridge::inter_agent_params(
+                    "",
+                    "",
+                    &snapshot.to_cutex_session_id,
+                    &note,
+                ) else {
+                    continue;
+                };
+                before.push(json!({
+                    "messageId": id,
+                    "toCutexSessionId": snapshot.to_cutex_session_id,
+                    "snapshotDeliveryMode": snapshot.delivery_mode,
+                    "semanticSha256": snapshot.semantic_sha256,
+                    "canonicalEnvelope": canonical,
+                }));
+                stored.snapshot.delivery_mode = AgentDeliveryMode::Passive.event_label().to_string();
+                stored.snapshot.semantic_sha256 =
+                    Some(crate::app_server::bus_bridge::inter_agent_semantic_sha256(&params));
+                stored.snapshot.error = None;
+                stored.canonical_envelope = Some(note);
+                stored.updated_at = Utc::now().to_rfc3339();
+            }
+            let changed = !before.is_empty();
+            Ok((before, changed))
         })
     }
 
@@ -1986,10 +2060,13 @@ impl AgentBusMessageRepository {
                 .filter(|stored| stored.owner_cutex_session_id == cutex_session_id)
                 .map(|stored| {
                     let mut value = serde_json::to_value(&stored.snapshot)?;
-                    // Agent messaging v2 additions for agent-sourced messages.
-                    if stored.snapshot.from_cutex_session_id.is_some() {
+                    let peer = stored_peer_tell_fields(stored);
+                    // Agent messaging v2 additions for agent-sourced messages
+                    // (a cross-host tell: `name@host` sender and `remote`).
+                    if stored.snapshot.from_cutex_session_id.is_some() || peer.is_some() {
                         if let Some(object) = value.as_object_mut() {
                             object.extend(stored_agent_fields(stored));
+                            object.extend(peer.unwrap_or_default());
                             object.insert("queuedAt".into(), json!(sent_at(stored)));
                             if let Some(meta) = &stored.meta {
                                 if let Some(turn) = &meta.context_turn_id {
@@ -2347,6 +2424,35 @@ fn system_sender_fields(canonical: &AgentBusMessage) -> serde_json::Map<String, 
     fields
 }
 
+/// Display fields of a cross-host tell (`agent_bus::peer_tell`), which has no
+/// local sender session: `sender` = the `name@host` label (id and name; never
+/// a local session or service) and `remote: {host, peerId, senderId}`. `None`
+/// for any other message, or a peer tell whose facts do not parse.
+fn peer_tell_fields(from_cutex_session_id: Option<&str>, canonical: &AgentBusMessage) -> Option<serde_json::Map<String, Value>> {
+    if from_cutex_session_id.is_some() || !crate::agent_bus::peer_tell::is_peer_tell(canonical) {
+        return None;
+    }
+    let facts: crate::agent_bus::peer_tell::PeerTellFacts =
+        serde_json::from_value(canonical.control_payload.clone()?).ok()?;
+    let label = facts.sender_label();
+    let mut fields = serde_json::Map::new();
+    fields.insert("sender".into(), json!({ "id": label, "name": label, "runtime": null }));
+    fields.insert("remote".into(), json!({
+        "host": crate::peers::wire::sanitize_name(&facts.host),
+        "peerId": facts.peer_id,
+        "senderId": crate::peers::wire::sanitize_name(&facts.sender_id),
+    }));
+    // A cross-host wake past the receiver's hourly cap arrived as a note.
+    if facts.wake_downgraded.is_some() {
+        fields.insert("wakeDowngraded".into(), json!(true));
+    }
+    Some(fields)
+}
+
+fn stored_peer_tell_fields(stored: &StoredAgentBusMessage) -> Option<serde_json::Map<String, Value>> {
+    peer_tell_fields(stored.snapshot.from_cutex_session_id.as_deref(), stored.canonical_envelope.as_ref()?)
+}
+
 fn with_agent_fields(
     mut params: Value,
     delivery_mode: &str,
@@ -2402,7 +2508,11 @@ fn delivered_event(
     recipient_runtime: &str,
     at: &str,
 ) -> Option<BusEvent> {
-    let from = stored.snapshot.from_cutex_session_id.as_ref()?;
+    let peer = stored_peer_tell_fields(stored);
+    let from = stored.snapshot.from_cutex_session_id.as_ref();
+    if from.is_none() && peer.is_none() {
+        return None;
+    }
     let mut params = json!({
         "messageId": stored.snapshot.message_id,
         "fromCutexSessionId": from,
@@ -2416,12 +2526,17 @@ fn delivered_event(
         "recipientRuntime": recipient_runtime,
     });
     params.as_object_mut()?.extend(stored_agent_fields(stored));
+    params.as_object_mut()?.extend(peer.unwrap_or_default());
     Some((both_streams(stored), stored.snapshot.message_id.clone(), "cutex/agentBus/messageDelivered", params))
 }
 
 /// `messageFailed` for an agent message, to both streams.
 fn failed_event(stored: &StoredAgentBusMessage, error: &Value, at: &str) -> Option<BusEvent> {
-    let from = stored.snapshot.from_cutex_session_id.as_ref()?;
+    let peer = stored_peer_tell_fields(stored);
+    let from = stored.snapshot.from_cutex_session_id.as_ref();
+    if from.is_none() && peer.is_none() {
+        return None;
+    }
     let mut params = json!({
         "messageId": stored.snapshot.message_id,
         "fromCutexSessionId": from,
@@ -2433,6 +2548,7 @@ fn failed_event(stored: &StoredAgentBusMessage, error: &Value, at: &str) -> Opti
         "deliveryMode": stored.snapshot.delivery_mode,
     });
     params.as_object_mut()?.extend(stored_agent_fields(stored));
+    params.as_object_mut()?.extend(peer.unwrap_or_default());
     Some((both_streams(stored), stored.snapshot.message_id.clone(), "cutex/agentBus/messageFailed", params))
 }
 
@@ -4626,6 +4742,138 @@ mod tests {
         assert!(validate_private_test_home("/home/user", "/tmp/private").is_err());
         assert!(validate_private_test_home("/", "/").is_err());
         assert!(validate_private_test_home("/tmp/private", "/tmp/private").is_ok());
+    }
+
+    /// A cross-host tell (`agent_bus::peer_tell`) has no local sender session;
+    /// the recipient's owner still sees it pending (bootstrap snapshot and the
+    /// live `messageQueued` event) under `name@host` with a `remote` marker, and
+    /// it leaves the pending list when read in (`messageDelivered`).
+    #[test]
+    fn pending_peer_tell_is_visible_to_the_recipient_owner() {
+        use crate::agent_bus::model::AgentMessageKind;
+        let root = std::env::temp_dir().join(format!("cutex-bus-peer-tell-{}", uuid::Uuid::new_v4()));
+        let repository = AgentBusMessageRepository::open(&root).unwrap();
+        let mut peer = system_queued_message("see /tmp/x on alpha");
+        let to = peer.to_cutex_session_id.clone();
+        peer.message_id = "ptell-abc".into();
+        peer.delivery_mode = "passive".into();
+        let c = &mut peer.canonical_envelope;
+        c.id = "ptell-abc".into();
+        c.from = "worker@alpha".into();
+        c.sender_kind = AgentMessageKind::Agent;
+        c.display_source = None;
+        c.delivery_mode = crate::agent_bus::delivery::AgentDeliveryMode::Passive;
+        c.trigger_turn = false;
+        c.external_action_id = None;
+        c.external_message_id = Some("ptell-abc".into());
+        c.created_at_epoch_secs = 1_760_000_000;
+        c.control_type = Some(crate::agent_bus::peer_tell::CONTROL_TYPE.into());
+        c.control_payload = Some(json!({"peerId":"ci-0123456789abcdef0123456789abcdef","host":"alpha","senderId":"cutex.remote","senderName":"worker","tellId":"ptl-1"}));
+        let meta = AgentBusMessageMeta {
+            recipient: Some(AgentParty { id: to.clone(), name: Some("Helper".into()), runtime: Some("codex".into()) }),
+            ..Default::default()
+        };
+        let remote = json!({"host": "alpha", "peerId": "ci-0123456789abcdef0123456789abcdef", "senderId": "cutex.remote"});
+        let sender = json!({"id": "worker@alpha", "name": "worker@alpha", "runtime": null});
+
+        let (queued, events) = capture_events(|| repository.record_queued_with_meta(peer, meta));
+        assert!(queued.unwrap());
+        assert_eq!(events.len(), 1, "one messageQueued to the recipient: {events:?}");
+        let (stream, method, params) = &events[0];
+        assert_eq!((stream.as_str(), method.as_str()), (to.as_str(), "cutex/agentBus/messageQueued"));
+        assert_eq!(params["fromCutexSessionId"], Value::Null);
+        assert_eq!(params["body"], "see /tmp/x on alpha");
+        assert_eq!(params["deliveryKind"], "note");
+        assert_eq!(params["sender"], sender);
+        assert_eq!(params["remote"], remote);
+        assert_eq!(params["recipient"]["name"], "Helper");
+        crate::management::v2::contract_validation::validate_cutex_event_message(
+            &json!({"method": method, "params": params}),
+        )
+        .unwrap();
+
+        let snapshot = repository.snapshot(&to).unwrap();
+        let entry = &snapshot[0];
+        assert_eq!(entry["state"], "pending");
+        assert_eq!(entry["body"], "see /tmp/x on alpha");
+        assert_eq!(entry["deliveryKind"], "note");
+        assert_eq!(entry["sender"], sender);
+        assert_eq!(entry["remote"], remote);
+        assert_eq!(entry["queuedAt"], "2025-10-09T08:53:20+00:00");
+        assert_eq!(repository.pending_note_count(&to).unwrap(), 1);
+
+        let (delivered, events) =
+            capture_events(|| repository.record_context_injected(&to, "ptell-abc", "turn-7"));
+        assert!(delivered.unwrap());
+        assert_eq!(events.len(), 1, "messageDelivered to the recipient only: {events:?}");
+        let (stream, method, params) = &events[0];
+        assert_eq!((stream.as_str(), method.as_str()), (to.as_str(), "cutex/agentBus/messageDelivered"));
+        assert_eq!(params["turnId"], "turn-7");
+        assert_eq!(params["remote"], remote);
+        crate::management::v2::contract_validation::validate_cutex_event_message(
+            &json!({"method": method, "params": params}),
+        )
+        .unwrap();
+        let entry = &repository.snapshot(&to).unwrap()[0];
+        assert_eq!((entry["state"].as_str(), entry["contextTurnId"].as_str()), (Some("delivered"), Some("turn-7")));
+        assert_eq!(repository.pending_note_count(&to).unwrap(), 0);
+    }
+
+    /// A cross-host wake (`cutex.peer.tell.v2`, after_turn) shows as
+    /// deliveryKind "wake" with the same `remote`; it is not a pending note.
+    /// A wake past the receiver's hourly cap is a note with wakeDowngraded.
+    #[test]
+    fn peer_wake_shows_as_a_wake_and_a_downgraded_one_as_a_note() {
+        use crate::agent_bus::model::AgentMessageKind;
+        let root = std::env::temp_dir().join(format!("cutex-bus-peer-wake-{}", uuid::Uuid::new_v4()));
+        let repository = AgentBusMessageRepository::open(&root).unwrap();
+        let facts = json!({"peerId":"ci-0123456789abcdef0123456789abcdef","host":"alpha","senderId":"cutex.remote","senderName":"worker","tellId":"ptl-1"});
+        let peer = |id: &str, wake: bool, facts: Value| {
+            let mut peer = system_queued_message("look at the build");
+            peer.message_id = id.into();
+            peer.delivery_mode = if wake { "after_turn" } else { "passive" }.into();
+            let c = &mut peer.canonical_envelope;
+            c.id = id.into();
+            c.from = "worker@alpha".into();
+            c.sender_kind = AgentMessageKind::Agent;
+            c.display_source = None;
+            c.delivery_mode = if wake {
+                crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn
+            } else {
+                crate::agent_bus::delivery::AgentDeliveryMode::Passive
+            };
+            c.trigger_turn = wake;
+            c.external_action_id = None;
+            c.external_message_id = Some(id.into());
+            c.control_type = Some(if wake { crate::agent_bus::peer_tell::CONTROL_TYPE_V2 } else { crate::agent_bus::peer_tell::CONTROL_TYPE }.into());
+            c.control_payload = Some(facts);
+            peer
+        };
+        let to = peer("x", true, facts.clone()).to_cutex_session_id;
+        let (queued, events) = capture_events(|| repository.record_queued_with_meta(peer("ptell-wake", true, facts.clone()), AgentBusMessageMeta::default()));
+        assert!(queued.unwrap());
+        let (_, method, params) = &events[0];
+        assert_eq!(params["deliveryKind"], "wake");
+        assert_eq!(params["remote"]["host"], "alpha");
+        assert_eq!(params["sender"]["id"], "worker@alpha");
+        assert!(params.get("wakeDowngraded").is_none());
+        crate::management::v2::contract_validation::validate_cutex_event_message(&json!({"method": method, "params": params})).unwrap();
+        assert_eq!(repository.pending_note_count(&to).unwrap(), 0, "a wake is not a pending note");
+
+        let mut downgraded_facts = facts;
+        downgraded_facts["wakeDowngraded"] = json!("rate_limited");
+        let (queued, events) = capture_events(|| repository.record_queued_with_meta(peer("ptell-note", false, downgraded_facts), AgentBusMessageMeta::default()));
+        assert!(queued.unwrap());
+        let (_, method, params) = &events[0];
+        assert_eq!(params["deliveryKind"], "note");
+        assert_eq!(params["wakeDowngraded"], true);
+        crate::management::v2::contract_validation::validate_cutex_event_message(&json!({"method": method, "params": params})).unwrap();
+        let snapshot = repository.snapshot(&to).unwrap();
+        let kinds: std::collections::BTreeMap<_, _> = snapshot.iter()
+            .map(|entry| (entry["messageId"].as_str().unwrap().to_string(), entry["deliveryKind"].clone())).collect();
+        assert_eq!(kinds["ptell-wake"], "wake");
+        assert_eq!(kinds["ptell-note"], "note");
+        assert_eq!(repository.pending_note_count(&to).unwrap(), 1);
     }
 }
 

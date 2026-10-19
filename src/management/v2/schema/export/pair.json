@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:cutex:management-v2:pair",
   "title": "PairResponse",
-  "description": "POST /v2/pairing-codes (root, loopback) → pairingCode; public POST /v2/pair pairRequest → pairResponse; GET /v2/client-tokens → clientTokenList; PATCH /v2/client-tokens/{tokenId} body clientTokenRename → clientTokenRenamed (owner; capability client-token-rename).",
+  "description": "POST /v2/pairing-codes (owner-local: loopback with the root credential or a CLI-issued owner token) body {label?, userId?, scope?} → pairingCode; public POST /v2/pair pairRequest → pairResponse; GET /v2/client-tokens → clientTokenList; PATCH /v2/client-tokens/{tokenId} body clientTokenRename → clientTokenRenamed (owner; capability client-token-rename; scope: capability device-scope).",
   "anyOf": [
     { "$ref": "#/$defs/pairingCode" },
     { "$ref": "#/$defs/pairRequest" },
@@ -13,6 +13,7 @@
   ],
   "$defs": {
     "platform": { "enum": ["android", "ios", "web", "other"] },
+    "deviceScope": { "enum": ["full", "chat", "read"], "description": "Device scope (capability device-scope): effective rights = the user's rights ∩ the scope." },
     "pairingCode": {
       "type": "object",
       "required": ["code", "expiresAt", "hostId", "urls", "qr"],
@@ -20,6 +21,10 @@
         "code": { "type": "string", "pattern": "^[A-Z2-9]{4}-[A-Z2-9]{4}$" },
         "expiresAt": { "$ref": "#/$defs/utcTimestamp" },
         "label": { "type": ["string", "null"] },
+        "userId": { "type": "string" },
+        "ttlSeconds": { "type": "integer", "description": "600; 300 for an owner code (capability owner-device-notice)" },
+        "ownerDevice": { "type": "boolean", "description": "The paired device gets the owner's rights, narrowed only by scope (capability owner-device-notice)." },
+        "scope": { "$ref": "#/$defs/deviceScope" },
         "hostId": { "type": "string" },
         "instanceId": { "type": "string", "description": "random per cutex home; key a daemon by it" },
         "urls": { "type": "array", "items": { "type": "string" } },
@@ -45,6 +50,7 @@
         "label": { "type": "string" },
         "deviceName": { "type": "string" },
         "platform": { "$ref": "#/$defs/platform" },
+        "scope": { "$ref": "#/$defs/deviceScope" },
         "createdAt": { "$ref": "#/$defs/utcTimestamp" }
       }
     },
@@ -69,6 +75,8 @@
         "deviceName": { "type": ["string", "null"] },
         "platform": { "type": ["string", "null"] },
         "ownerName": { "type": ["string", "null"], "maxLength": 60, "description": "Owner-given display name (capability client-token-rename); null = none. Independent of the device-reported deviceName." },
+        "scope": { "$ref": "#/$defs/deviceScope" },
+        "issuedVia": { "enum": ["hostCli", "pairing", "unknown"], "description": "Capability owner-local-only: hostCli = `cutex management client-token issue` on the host (an SSH-tunnelled desktop; only these owner tokens count as owner-local on loopback), pairing = POST /v2/pair; inferred from kind for tokens of older builds." },
         "createdAt": { "$ref": "#/$defs/utcTimestamp" },
         "lastUsedAt": { "anyOf": [{ "$ref": "#/$defs/utcTimestamp" }, { "type": "null" }] },
         "lastAddress": { "type": ["string", "null"] }
@@ -84,9 +92,10 @@
     },
     "clientTokenRename": {
       "type": "object",
-      "required": ["name"],
+      "description": "At least one of name and scope.",
       "properties": {
-        "name": { "type": ["string", "null"], "description": "Trimmed, 1..=60 characters, no control characters; null or a blank string clears the name." }
+        "name": { "type": ["string", "null"], "description": "Trimmed, 1..=60 characters, no control characters; null or a blank string clears the name." },
+        "scope": { "$ref": "#/$defs/deviceScope" }
       }
     },
     "clientTokenRenamed": {
@@ -94,7 +103,8 @@
       "required": ["tokenId", "ownerName"],
       "properties": {
         "tokenId": { "type": "string" },
-        "ownerName": { "type": ["string", "null"], "maxLength": 60 }
+        "ownerName": { "type": ["string", "null"], "maxLength": 60 },
+        "scope": { "$ref": "#/$defs/deviceScope" }
       }
     }
   }

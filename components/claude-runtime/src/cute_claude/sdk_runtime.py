@@ -8,6 +8,7 @@ awaits receipts. Never cancel the owner to implement a routine turn interrupt.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -22,12 +23,65 @@ from .provider import ProviderError
 from .subscription_auth import SubscriptionSetupError
 
 
+# A turn Claude Code starts by itself (a background task's notification) has no
+# adapter input. An input arriving while one streams waits for its Result, or for
+# this long without a frame of it, so that none of its frames or its Result count
+# for that input (docs/BUSY_DELIVERY.md, "Autonomous turns"). A notification
+# gets the longer start window: its turn's first frame follows the model's
+# first-token latency. The input never waits longer than the bound; it is then
+# submitted anyway.
+AUTONOMOUS_QUIET_SECONDS = 3.0
+AUTONOMOUS_START_SECONDS = 10.0
+AUTONOMOUS_WAIT_SECONDS = 120.0
+
+
 class TurnInterrupted(ProviderError):
     pass
 
 
 class OutcomeUncertain(ProviderError):
     pass
+
+
+# Thread property: digest of the `append` the thread's native session recorded.
+PROMPT_RECORD = 'systemPromptRecord'
+
+
+def prompt_digest(append: str) -> str:
+    return hashlib.sha256(append.encode('utf-8')).hexdigest()
+
+
+def note_recorded_prompt(store: Any, tid: str, digest: str | None) -> None:
+    """The native session now records the system prompt with this `append`."""
+    if digest is None:
+        return
+    props = store.thread_properties(tid)
+    if (props.get(PROMPT_RECORD) or {}).get('digest') != digest:
+        props[PROMPT_RECORD] = {'digest': digest}
+        store.set_thread_properties(tid, props)
+
+
+def system_prompt_option(store: Any, tid: str, append: str, resume: bool) -> tuple[dict, str]:
+    """The SDK `system_prompt` for a new Claude Code process, and its `append` digest.
+
+    Claude Code records a session's system prompt on its first request and sends
+    that record on every later request and resume (`snapshot`, default on), even
+    when a later launch passes another `--append-system-prompt`, until a
+    compaction re-records the launch's current prompt. A changed host prompt
+    (harness text, runtime limits, instructions, auto mode) would otherwise never
+    reach the model. So a resume whose `append` differs from the recorded one, or
+    whose record is unknown (sessions from before claude-r21's fix), runs with
+    `snapshot: false` (rendered fresh on every request; nothing is recorded); an
+    unchanged one keeps the record and its prompt-cache prefix. Forks (Side
+    chats, revert, session fork) copy the thread properties with the transcript,
+    so they inherit the parent's record."""
+    digest = prompt_digest(append)
+    option = {'type': 'preset', 'preset': 'claude_code', 'append': append}
+    if not resume:
+        note_recorded_prompt(store, tid, digest)  # The first request records this prompt.
+    elif (store.thread_properties(tid).get(PROMPT_RECORD) or {}).get('digest') != digest:
+        option['snapshot'] = False
+    return option, digest
 
 
 def field(obj: Any, key: str, default: Any = None) -> Any:
@@ -224,6 +278,11 @@ class RuntimeOwner:
         self.interrupt_waiters: list[asyncio.Future] = []
         self.cancelled_turns: set[str] = set()
         self.interrupt_deadline: float | None = None
+        # Loop-time end of an autonomous turn's quiet window (None: none seen),
+        # the inputs held behind it and when the first of them stops waiting.
+        self.autonomous_until: float | None = None
+        self.deferred: list[Run] = []
+        self.deferred_until: float | None = None
         self.client = self.bridge = self.reader = self.process = self.lease = None
         self.accepting = True
         self.state = 'starting'
@@ -380,9 +439,57 @@ class RuntimeOwner:
         if message_type(message) in {'ConversationResetMessage', 'conversation_reset'}:
             raise OutcomeUncertain('Native conversation reset is not supported; explicitly inspect/create another thread.')
 
+    def _observe_autonomous(self, message: Any, typ: str) -> None:
+        """Track a turn Claude Code runs with no adapter turn active.
+
+        Its stream frames, or a task notification (which starts one), open or
+        extend the quiet window; its Result closes it. Subagent frames and rate
+        limits never open it: they are routed by other means, not to an input.
+        """
+        if self.active is not None or field(message, 'parent_tool_use_id'):
+            return
+        if typ in {'ResultMessage', 'result'}:
+            self.autonomous_until = None
+            return
+        from .runtime_tasks import TYPES
+        if typ in {'StreamEvent', 'stream_event', 'AssistantMessage', 'assistant', 'UserMessage', 'user'}:
+            window = AUTONOMOUS_QUIET_SECONDS
+        elif TYPES.get(typ, field(message, 'subtype')) == 'task_notification':
+            window = AUTONOMOUS_START_SECONDS
+        elif self.autonomous_until is not None and typ not in {'RateLimitEvent', 'rate_limit_event'}:
+            window = AUTONOMOUS_QUIET_SECONDS
+        else:
+            return
+        until = asyncio.get_running_loop().time() + window
+        self.autonomous_until = max(until, self.autonomous_until or until)
+
+    def _due_deferred(self) -> Run | None:
+        """The next held input once the autonomous turn ended or the bound passed."""
+        if not self.deferred:
+            return None
+        now = asyncio.get_running_loop().time()
+        if self.autonomous_until is not None and now >= self.autonomous_until:
+            self.autonomous_until = None
+        if self.autonomous_until is not None:
+            if now < self.deferred_until:
+                return None
+            print(f'claude runtime {self.tid}: an autonomous Claude Code turn still streams after '
+                  f'{AUTONOMOUS_WAIT_SECONDS:g} s; submitting the waiting input anyway', file=sys.stderr)
+        run = self.deferred.pop(0)
+        self.deferred_until = (now + AUTONOMOUS_WAIT_SECONDS) if self.deferred else None
+        return run
+
+    def _fail_deferred(self, error: BaseException) -> None:
+        for run in self.deferred:
+            if not run.future.done():
+                run.future.set_exception(error)
+        self.deferred.clear()
+        self.deferred_until = None
+
     async def _event(self, message: Any) -> None:
         self._check_identity(message)
         typ = message_type(message)
+        self._observe_autonomous(message, typ)
         if await self.tasks.observe(message, self.active.turn_id if self.active else None):
             return
         # Subagent text and reasoning must never become the parent's reply.
@@ -402,6 +509,9 @@ class RuntimeOwner:
                 snapshot = self.engine.rate_limits.response()
                 await self.engine.emit(self.tid, 'account/rateLimits/updated', {'rateLimits': snapshot['rateLimits']})
             return
+        # Compaction re-records the system prompt this process was launched with.
+        if typ in {'SystemMessage', 'system'} and field(message, 'subtype') == 'compact_boundary':
+            note_recorded_prompt(self.engine.store, self.tid, getattr(self.bridge, 'prompt_digest', None))
         # A compaction boundary inside a running turn (/compact or auto-compact)
         # belongs to that turn's timeline.
         if (typ in {'SystemMessage', 'system'} and field(message, 'subtype') == 'compact_boundary'
@@ -453,7 +563,7 @@ class RuntimeOwner:
             if not future.done(): future.set_result(None)
         self.interrupt_waiters.clear()
 
-    async def _command(self, command: Run | Control) -> bool:
+    async def _command(self, command: Run | Control, released: bool = False) -> bool:
         if isinstance(command, Run):
             if command.turn_id in self.cancelled_turns:
                 self.cancelled_turns.discard(command.turn_id)
@@ -462,6 +572,14 @@ class RuntimeOwner:
             if self.active or not self.accepting:
                 command.future.set_exception(ProviderError('Runtime busy or closing; request was not submitted.'))
                 return True
+            # Hold, not reject: the owner loop submits it when the autonomous
+            # turn ends. Inputs already held keep their order.
+            if not released and (self.autonomous_until is not None or self.deferred):
+                if not self.deferred:
+                    self.deferred_until = asyncio.get_running_loop().time() + AUTONOMOUS_WAIT_SECONDS
+                self.deferred.append(command)
+                return True
+            self.autonomous_until = None
             self.engine.metrics.context.pop(self.tid, None)
             self.active = command
             self.bridge.begin_turn(command.turn_id)
@@ -561,6 +679,8 @@ class RuntimeOwner:
                     self.lease.record_process(self.process.pid)
                 self.native_connection_generation += 1
                 self.connected_at = int(time.time() * 1000)
+                # The replaced child's autonomous turn ended with it.
+                self.autonomous_until = None
                 self.reader = asyncio.create_task(self._read(), name=f'claude-sdk-reader:{self.tid}')
                 await self.status('waiting')
                 command.future.set_result(None)
@@ -602,6 +722,14 @@ class RuntimeOwner:
         if command.kind == 'close':
             return False
         if command.kind == 'interrupt':
+            held = next((run for run in self.deferred if run.turn_id == command.turn_id), None)
+            if held is not None:
+                self.deferred.remove(held)
+                if not self.deferred:
+                    self.deferred_until = None
+                held.future.set_exception(TurnInterrupted('Interrupted before query submission.'))
+                if command.future and not command.future.done(): command.future.set_result(None)
+                return True
             if not self.active:
                 # Race: Engine claimed a turn but run() is still waiting on
                 # connect. The queued command must not later submit that turn.
@@ -655,6 +783,8 @@ class RuntimeOwner:
             raise failure
         # Reader frames from the dead generation can never finish a new turn.
         # Inputs already queued in this mailbox are failed, never replayed.
+        self._fail_deferred(failure)
+        self.autonomous_until = None
         controls = []
         while not self.mailbox.empty():
             pending = self.mailbox.get_nowait()
@@ -729,13 +859,22 @@ class RuntimeOwner:
             self.ready.set_result(None)
             stage = 'stream'
             while True:
-                remaining = (max(0, self.interrupt_deadline - asyncio.get_running_loop().time())
-                             if self.interrupt_deadline is not None else None)
-                try:
-                    async with asyncio.timeout(remaining):
-                        command = await self.mailbox.get()
-                except TimeoutError:
-                    raise OutcomeUncertain('Interrupt result was not drained before deadline; connection closed, input not replayed.') from None
+                command = self._due_deferred()
+                released = command is not None
+                if command is None:
+                    now = asyncio.get_running_loop().time()
+                    deadlines = [self.interrupt_deadline] if self.interrupt_deadline is not None else []
+                    if self.deferred:
+                        deadlines += [d for d in (self.autonomous_until, self.deferred_until) if d is not None]
+                    remaining = max(0, min(deadlines) - now) if deadlines else None
+                    try:
+                        async with asyncio.timeout(remaining):
+                            command = await self.mailbox.get()
+                    except TimeoutError:
+                        if (self.interrupt_deadline is not None
+                                and asyncio.get_running_loop().time() >= self.interrupt_deadline):
+                            raise OutcomeUncertain('Interrupt result was not drained before deadline; connection closed, input not replayed.') from None
+                        continue
                 if isinstance(command, Event):
                     await self._event(command.message)
                 elif isinstance(command, End):
@@ -743,7 +882,7 @@ class RuntimeOwner:
                     await self._recover(OutcomeUncertain(f'{error}; input not replayed.'))
                 else:
                     try:
-                        if not await self._command(command):
+                        if not await self._command(command, released):
                             break
                     except OutcomeUncertain as exc:
                         if not isinstance(command, Run):
@@ -803,6 +942,7 @@ class RuntimeOwner:
             # Closing mid-turn without draining Result is NOT proof of a clean
             # interrupted result. Surface unknown outcome, never auto-resubmit.
             active, self.active = self.active, None
+            self._fail_deferred(failure or TurnInterrupted('Runtime closed before query submission.'))
             self.state = 'closed' if closed else 'close_unverified'
             if not closed and not self.last_error:
                 self.last_error = 'Child exit or host-tool cleanup could not be verified; another writer is blocked.'

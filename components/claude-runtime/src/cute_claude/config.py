@@ -67,8 +67,8 @@ def load_mcp_servers_config(path: Path) -> tuple[dict, dict]:
 # adapter input, so every tool is refused there and its reply is not shown
 # (docs/BUSY_DELIVERY.md "Autonomous turns").
 RUNTIME_LIMITS = (
-    "Runtime limits here: background subagents (Agent/Task with run_in_background) are refused, so run "
-    "subagents in the foreground. When a background shell command finishes, the turn that its notification "
+    "Runtime limits here: background subagents are refused, so run subagents in the foreground: every "
+    "Agent/Task call must pass run_in_background: false (leaving it out is refused too). When a background shell command finishes, the turn that its notification "
     "starts cannot use tools and the user does not see it; check its result in the next turn the user starts."
 )
 # Claude Code's own environment block names the OS shell ("Shell: PowerShell

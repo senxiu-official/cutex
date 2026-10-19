@@ -38,6 +38,7 @@ pub mod quota;
 pub mod quota_fields;
 pub mod settings_api;
 pub mod catalog_api;
+pub mod cc_switch;
 pub mod catalog_overlay;
 pub mod native_models;
 pub mod reviewer_catalog;

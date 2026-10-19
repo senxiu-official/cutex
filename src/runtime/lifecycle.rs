@@ -290,12 +290,62 @@ pub fn spawn_managed_agent_runtime_launch(
     log_path: &Path,
 ) -> anyhow::Result<Child> {
     let plan = managed_agent_launch_plan(cutex_session_id, launch.clone());
-    if let ManagedAgentProcessIsolation::Direct { reason } = plan.isolation {
-        eprintln!(
+    match &plan.isolation {
+        ManagedAgentProcessIsolation::Direct { reason } => eprintln!(
             "managed Agent process isolation fallback: cutex_session_id={cutex_session_id} mode=direct reason={reason}"
-        );
+        ),
+        ManagedAgentProcessIsolation::WindowsJobObject { job_name } => {
+            #[cfg(windows)]
+            return spawn_in_windows_job(job_name, &plan.launch, cwd, log_path);
+            #[cfg(not(windows))]
+            anyhow::bail!("Windows job object isolation requested off Windows: {job_name}");
+        }
+        ManagedAgentProcessIsolation::SystemdScope { .. } => {}
     }
     spawn_detached_session_launch(&plan.launch, cwd, log_path)
+}
+
+/// Create the Agent's job, start the runtime suspended, make it a job member
+/// holding the job's last long-lived handle, then resume it. The daemon's own
+/// handle closes on return, so a management restart leaves the runtime (and
+/// its job) running for adoption. Any failure kills the suspended child.
+#[cfg(windows)]
+fn spawn_in_windows_job(
+    job_name: &str,
+    launch: &LaunchCommand,
+    cwd: &str,
+    log_path: &Path,
+) -> anyhow::Result<Child> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+    use crate::platform::windows_job;
+
+    let job = windows_job::create_agent_job(job_name)?;
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("Failed to open session runtime log: {}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .context("Failed to clone session runtime log")?;
+    let mut command = launch.to_command();
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .creation_flags(CREATE_SUSPENDED);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("Failed to start session runtime: {}", launch.program))?;
+    if let Err(error) = windows_job::adopt_suspended_child(&job, &child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.context(format!("managed Agent job {job_name}")));
+    }
+    Ok(child)
 }
 
 #[cfg(test)]

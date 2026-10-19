@@ -41,7 +41,7 @@ fn management_client_token_commands_parse() {
         cli.command,
         Some(CommandKind::Management {
             command: ManagementCommand::ClientToken {
-                command: ManagementClientTokenCommand::Issue { label, user: None, pending: false }
+                command: ManagementClientTokenCommand::Issue { label, user: None, pending: false, scope: None }
             }
         }) if label == "desktop-winbox"
     ));

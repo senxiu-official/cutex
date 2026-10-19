@@ -145,6 +145,12 @@ pub struct Inbound {
     pub review: Review,
     pub max_open_asks: usize,
     pub asks_per_hour: usize,
+    /// Cross-host `agent_tell` with `wake:true` may start a turn of an agent
+    /// this peer can reach (default off; older configs read as off).
+    pub tell_wake: bool,
+    /// Wakes from this peer per hour (counted from tell receipts); beyond
+    /// it a wake is delivered as a note (`wakeDowngraded`, `rate_limited`).
+    pub tell_wakes_per_hour: usize,
 }
 impl Default for Inbound {
     fn default() -> Self {
@@ -159,6 +165,8 @@ impl Default for Inbound {
             },
             max_open_asks: 20,
             asks_per_hour: 60,
+            tell_wake: false,
+            tell_wakes_per_hour: 60,
         }
     }
 }
@@ -221,6 +229,8 @@ impl Policy {
                     "review",
                     "maxOpenAsks",
                     "asksPerHour",
+                    "tellWake",
+                    "tellWakesPerHour",
                 ][..]
             } else {
                 &["visibility"][..]
@@ -256,6 +266,8 @@ impl Policy {
             || next.inbound.max_open_asks > 10000
             || next.inbound.asks_per_hour == 0
             || next.inbound.asks_per_hour > 100000
+            || next.inbound.tell_wakes_per_hour == 0
+            || next.inbound.tell_wakes_per_hour > 100000
         {
             return Err(Error::new("invalid_request", 400));
         }

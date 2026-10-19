@@ -27,8 +27,9 @@ from .store import COMPACT_EVENT, Store, dump, identifier
 from .tools import ToolContext, ToolRegistry, ToolResult
 from .browser_content import BROWSER_TOOLS, journal_result
 from .subscription_auth import ApiAccount, resolve_config_dir
-from .sdk_runtime import RuntimeOwner, TurnInterrupted, OutcomeUncertain
+from .sdk_runtime import RuntimeOwner, TurnInterrupted, OutcomeUncertain, system_prompt_option
 from .inputs import sdk_user_message
+from .side_chats import BOUNDARY_BLOCKS as SIDE_BOUNDARY_BLOCKS
 from .model_config import ModelConfig
 from .model_observations import ModelObservations
 
@@ -36,6 +37,9 @@ from .subagent_transcripts import SubagentTranscripts
 from .native_tools import EDIT_TOOLS, OWNER_DECLINED, OWNER_STOPPED, UNANSWERED_PERMISSION, NativeTools, PlanState, exclusions, external_mcp_tool, interrupted_item
 from . import permission_rules
 from .approvals import is_allowed
+
+# Largest single message read from Claude Code (SDK `max_buffer_size`; its default is 1 MiB).
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 SDK_TARGET = '0.2.166'
 SERVER_NAME = 'cutex'
@@ -380,12 +384,17 @@ class OfficialSdkDriver:
             return {'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': notes}}
         thread = engine.store.thread(tid)
         connectors = engine.settings.claude_ai_connectors and self.api_account is None
+        system_prompt, bridge.prompt_digest = system_prompt_option(
+            engine.store, tid, engine.settings.preset_append(thread['instructions'], permission_mode(engine, tid)), resume)
         options = self.sdk.ClaudeAgentOptions(
             cli_path=str(self.cli), cwd=str(engine.settings.workspace), model=thread['model'],
             effort=engine.thread_effort(tid), thinking=ModelConfig(engine.settings).thinking(),
             tools={'type':'preset','preset':'claude_code'}, disallowed_tools=exclusions(engine.settings), allowed_tools=[f'mcp__{SERVER_NAME}__{tool.name}' for tool in engine.tools.tools.values() if tool.read_only],
             permission_mode=engine.permissions.effective_mode(tid),
             extra_args={'allow-dangerously-skip-permissions': None, 'replay-user-messages': None},
+            # One NDJSON message can carry a whole tool result: a screenshot or a large file read is easily
+            # over the SDK's 1 MiB default, which ended the turn with CLIJSONDecodeError (2026-10-19).
+            max_buffer_size=MAX_MESSAGE_BYTES,
             # Host-selected external servers (cutex's MCP layers) next to the in-process cutex server.
             # --strict-mcp-config keeps every other MCP source out; claude.ai connectors (subscription
             # logins only) are fetched by Claude Code only without it.
@@ -401,8 +410,8 @@ class OfficialSdkDriver:
                    'SubagentStop': [self.sdk.HookMatcher(hooks=[bridge.subagent_stop])]},
             # Claude Code's own prompt (environment, date, tool guidance) plus
             # the host's text; CLAUDE.md / settings only with setting_sources.
-            system_prompt={'type': 'preset', 'preset': 'claude_code',
-                           'append': engine.settings.preset_append(thread['instructions'], permission_mode(engine, tid))},
+            # `snapshot` off only when the recorded prompt is stale (system_prompt_option).
+            system_prompt=system_prompt,
             include_partial_messages=True, max_turns=None,
             enable_file_checkpointing=engine.settings.file_checkpointing,
             # Subagent text and thinking reach subagent_transcripts (never the parent's reply).
@@ -434,6 +443,8 @@ class SdkToolBridge:
         self.engine, self.tid, self.sid = engine, tid, sid
         self.binding: tuple[str, str] | None = None
         self.accepting = False
+        # Digest of this process's system prompt `append` (system_prompt_option).
+        self.prompt_digest: str | None = None
         self.native = NativeTools(self)
         self.native_questions: dict[str, tuple] = {}
         self.grants: dict[str, tuple[tuple[str, str], dict]] = {}
@@ -548,8 +559,10 @@ class SdkToolBridge:
             arguments = data.get('tool_input', {})
             if not isinstance(arguments, dict):
                 return self.denied('Invalid subagent arguments')
-            if arguments.get('run_in_background'):
-                return self.denied('Use foreground subagents. Autonomous background agent turns cannot be attributed to an adapter input.')
+            # Newer Claude Code runs a subagent in the background unless the call says otherwise, so
+            # only an explicit `run_in_background: false` is a foreground subagent.
+            if arguments.get('run_in_background') is not False:
+                return self.denied('Use foreground subagents: pass run_in_background: false. Autonomous background agent turns cannot be attributed to an adapter input.')
             if arguments.get('mode') not in (None, self.engine.permissions.effective_mode(self.tid)):
                 return self.denied('Subagents must inherit the parent permission mode')
         if agent_id and self.engine.permissions.planning(self.tid) and full_name not in {
@@ -1174,7 +1187,15 @@ class SubscriptionEngine(Engine):
             # run its slash commands. The user's own text keeps @path mentions, but
             # a leading "/" is literal; only thread/compact/start runs /compact.
             verbatim = payload['source']['kind'] != 'user' or (not compact and prompt.lstrip().startswith('/'))
-            message = sdk_user_message(prompt, payload.get('attachments') or [], verbatim=verbatim)
+            # Notes read in at an owner turn's start (Store.claim) go first, each its own
+            # text block: Claude Code expands @path mentions only in the last text block
+            # (the owner's text), never in these. An agent's turn has them in its prompt.
+            notes = self.store.turn_note_frames(turn_id) if payload['source']['kind'] == 'user' and not compact else []
+            # A Side chat's first message follows its instructions and boundary (cute-codex /side).
+            side = getattr(self, 'side_chats', None)
+            if side is not None and not compact and side.boundary_pending(tid):
+                notes = [*SIDE_BOUNDARY_BLOCKS, *notes]
+            message = sdk_user_message(prompt, payload.get('attachments') or [], verbatim=verbatim, preceding=notes)
             delays, attempt = refresh_retry_delays(), 0
             while True:
                 await self.driver.run(engine=self, tid=tid, turn_id=turn_id,

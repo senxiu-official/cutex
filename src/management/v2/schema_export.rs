@@ -164,6 +164,7 @@ pub const SCHEMAS: &[ExportedSchema] = &[
     super::runtime_restore_api::EXPORTED_SCHEMA,
     super::quota_continue::EXPORTED_SCHEMA,
     super::claude_runtime_api::EXPORTED_SCHEMA,
+    super::clients_api::EXPORTED_SCHEMA,
     ExportedSchema {
         name: "services",
         title: "Services, viewing tickets and leases",
@@ -178,7 +179,7 @@ pub const SCHEMAS: &[ExportedSchema] = &[
     },
     ExportedSchema {
         name: "users",
-        title: "Users, self-service profiles, avatars, own devices and person identity",
+        title: "Users, self-service profiles, avatars, own devices, home pages and person identity",
         routes: &[
             "GET /v2/users",
             "GET|PATCH /v2/users/me",
@@ -191,6 +192,8 @@ pub const SCHEMAS: &[ExportedSchema] = &[
             "DELETE /v2/users/token-persons/{tokenId}/previous",
             "GET /v2/users/me/devices",
             "DELETE /v2/users/me/devices/{tokenId}",
+            "GET|PUT /v2/users/me/home",
+            "GET|PUT|DELETE /v2/users/me/home/cover",
         ],
         text: include_str!("schema/export/users.json"),
     },

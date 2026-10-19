@@ -4,7 +4,7 @@ from cute_claude.subagent_transcripts import SubagentTranscripts, parse_referenc
 from test_persistent import ph, until  # noqa: F401  (fixture)
 from test_questions_plan import begin
 
-AGENT_INPUT = {'prompt': 'Read the docs and summarise them', 'description': 'Review docs', 'subagent_type': 'Explore'}
+AGENT_INPUT = {'prompt': 'Read the docs and summarise them', 'description': 'Review docs', 'subagent_type': 'Explore', 'run_in_background': False}
 
 
 async def spawn(bridge, call_id='agent-call', arguments=AGENT_INPUT):

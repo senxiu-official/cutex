@@ -284,6 +284,23 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
     }
     respond(stream, result, 200)
 }
+/// Root-identity peer actions (owner-local-only; cutex-desktop
+/// docs/research/host-ownership-20261019.md §5 limit 2): pairing with
+/// another host (invite / add) and enabling a peer. Only owner-local
+/// (`users::request_is_owner_local`: the local desktop, the CLI, an
+/// SSH-tunnelled desktop's CLI-issued owner token); a paired device's token
+/// on loopback gets 403 `owner_local_only`. Disabling, removing, labels,
+/// urls and policy stay as before (loopback).
+pub fn owner_local_action(method: &str, path: &str, data: &Value) -> Option<&'static str> {
+    match (method, path) {
+        ("POST", "/v2/peers/invites") | ("POST", "/v2/peers") => Some("peerPair"),
+        ("PATCH", path) if path.starts_with("/v2/peers/") && data.get("enabled") == Some(&Value::Bool(true)) => {
+            Some("peerEnable")
+        }
+        _ => None,
+    }
+}
+
 pub fn handle_v2(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
     let result = (|| {
         if request.method != "GET" && !crate::management::listeners::current_request_is_loopback() {
@@ -292,6 +309,13 @@ pub fn handle_v2(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow:
         let store = Store::open()?;
         let data = body(request)?;
         let path = request.path.split('?').next().unwrap_or("");
+        if let Some(action) = owner_local_action(&request.method, path, &data) {
+            if !crate::management::users::request_is_owner_local() {
+                let mut error = Error::new("owner_local_only", 403);
+                error.details = crate::management::users::owner_local_only(action).details;
+                return Err(error);
+            }
+        }
         match (request.method.as_str(), path) {
             ("POST", "/v2/peers/invites") => super::pair::invite(&data),
             ("POST", "/v2/peers") => super::pair::add(&store, &data),

@@ -152,6 +152,18 @@
               "default": true,
               "description": "Accept new asks from this peer when their target is exported."
             },
+            "tellWake": {
+              "type": "boolean",
+              "default": false,
+              "description": "Let this peer's agent_tell wake=true start a turn of an agent it can reach (capability cross-host-tell-wake). Refused (403 wake_not_allowed) when off, when the target is not enabled, or when review requires review for the target. Absent from older daemons (= false)."
+            },
+            "tellWakesPerHour": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000,
+              "default": 60,
+              "description": "Wakes from this peer per hour; beyond it a wake is delivered as a note (wakeDowngraded, reason rate_limited). Absent from older daemons (= 60)."
+            },
             "assumedCaps": {
               "$ref": "#/$defs/caps",
               "default": {

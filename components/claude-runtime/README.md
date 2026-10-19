@@ -177,6 +177,73 @@ the owner's decision, and gives those tools `approvalWaitSecs + 30` seconds inst
 `delegation_wait` always gets 150 s. Without `approvalWaitSecs` nothing is set and the façade answers
 `approval_required` at once (cutex `docs/agent-tool-security.md` §7.1).
 
+### Side chats and busy forks (features `sideChat`, `forkWhileBusy`, claude-r21)
+
+A Side chat (cute-codex `/side`; cutex `docs/SIDE-CHATS.md` "Claude agents") is a temporary
+conversation that sees the agent's context through a finished turn but never writes into it.
+`claude/side/open {threadId, anchorTurnId?, lastTurnId?, model?}` copies the agent's native transcript
+through that turn with the official SDK's `fork_session(up_to_message_id)` (read-only on the source:
+no session lease, the running runtime is neither closed nor interrupted, a running turn is left out)
+and binds the copy to a hidden thread (property `side`, not in `thread/list`) with the agent's model,
+effort, permission mode and instructions. Its turns run like any thread's, in their own Claude Code
+process. The Side inherits the agent's system prompt record (see "A changed system prompt reaches
+resumed sessions" below), so it sends the agent's system prompt (and shares its prompt cache); the Side instructions and boundary are two text
+blocks before the first Side message, not shown in the Side timeline. `claude/side/list|read|send|
+interrupt|respond|close {threadId, chatId, ...}` answer cutex's Side snapshot (`events`,
+`pendingRequests`, `revision`, long-poll `afterRevision` + `waitMs` up to 25 s); refusals carry the
+cutex code in `error.data.code`. The Side's notifications and approval requests go to a private
+in-process peer: never to the agent's subscribers, cutex's observer or `/v2/approvals`. `close`
+deletes the hidden thread and its native copy; `claude/runtime/close` of the agent and
+`claude/server/shutdown` close its Side chats first. State is in memory: a restart loses it and the
+next Side request deletes leftover hidden threads.
+
+`thread/fork` / `claude/thread/fork` of a busy thread (a running turn, queued inputs or notes) used to
+fail with "interrupt the active turn …" / "finish or explicitly clear queued inputs …". It is now made
+from the live transcript the same way (no close, no lease; the running turn and the queue are left
+out; `lastTurnId` of a running turn is refused with `data.code: turn_in_progress`), and the receipt has
+`sourceRuntime: null, sourceRuntimeUntouched: true`. An idle thread is forked as before (its runtime
+is closed and restarted around the copy). Both wait up to 3 s for the kept turn's last message to
+reach the transcript and refuse with `data.code: native_transcript_behind` (retry) rather than guess
+where a just-started turn begins. Opt-in real-CLI check against a loopback model:
+`CUTEX_SIDE_FORK_NATIVE_SMOKE=1 python -m pytest -q -s tests/test_side_fork_native.py`.
+
+### A changed system prompt reaches resumed sessions (claude-r21)
+
+Claude Code records a session's system prompt on its first request and sends that record on every
+later request and resume, even when a later launch passes another `--append-system-prompt`, until a
+compaction (`systemPromptSnapshot`, SDK `system_prompt.snapshot`, on by default; bundled CLI 2.1.299).
+So a new `# Cutex` harness, AGENTS.md / memory text, runtime-limits note, no-exec note, auto-mode note
+or thread instructions never reached an agent whose session had started before the change. The adapter
+now keeps the SHA-256 of the `append` the session recorded (thread property `systemPromptRecord`; set
+when a new session starts and after each compaction, which re-records the launch prompt). A resume
+with the same `append` keeps the snapshot (same prompt-cache prefix); a resume with another `append`,
+or of a session started before this change (no record), runs with `snapshot: false`: Claude Code
+renders the prompt fresh on every request, as before snapshots existed. The first request after a
+change therefore misses the prompt cache once; such a session stays without a snapshot until its next
+compaction (or until the text is back to the recorded one). Forks, reverts and Side chats copy the
+record with the thread properties. Opt-in real-CLI check against a loopback model:
+`CUTEX_SYSTEM_PROMPT_NATIVE_SMOKE=1 python -m pytest -q -s tests/test_system_prompt_native.py`.
+
+### Foreground subagents only (claude-r21)
+
+Every Agent / Task call must pass `run_in_background: false`; leaving it out is refused too, because newer
+Claude Code runs a subagent in the background by default. A background subagent's later turns have no
+adapter input, so they could not use tools once the parent turn ended.
+
+### Inputs wait for a turn Claude Code started by itself (claude-r21)
+
+When a background command finishes, Claude Code starts a turn by itself. A cutex input that arrived
+while that turn was still streaming used to be submitted at once and was then credited with the rest
+of that turn and its result (wrong reply, early completion). It now waits until that turn ends: its
+result, 3 s without a frame of it, or at most 120 s (docs/BUSY_DELIVERY.md, "Autonomous turns").
+Interrupting or closing does not wait.
+
+### Large tool results (claude-r20)
+
+A single message from Claude Code may be up to 64 MiB (the SDK's `max_buffer_size`; its default is 1 MiB). Before,
+a tool result over 1 MiB, typically a screenshot or a large file read, ended the turn with
+`SDK receive failed (CLIJSONDecodeError)`.
+
 ### Auto mode and cutex approvals (claude-r19)
 
 When a thread's Claude permission mode is `auto` (desktop 「自动」) as its Claude Code session starts,

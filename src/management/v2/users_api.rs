@@ -8,7 +8,22 @@
 //! - `DELETE /v2/users/{id}` → `{userId, deleted}`; 409 `user_in_use`
 //! - `PUT    /v2/users/token-bindings/{tokenId}` `{userId|null}`
 //! - `PUT    /v2/users/peer-bindings/{peerId}` `{userId}`
-//! - `PATCH  /v2/users/settings` `{ownerRequiresApproval}`
+//! - `PATCH  /v2/users/settings` `{ownerRequiresApproval}`; turning approval
+//!   off (`false`) is a root-identity action (owner-local-only: the local or
+//!   an SSH-tunnelled desktop, see `users::request_is_owner_local`), else 403 `owner_local_only`
+//!   `{action: "disableOwnerApproval"}`. Turning it on stays open to every
+//!   owner principal.
+//!
+//! New owner devices (capability `owner-device-notice`; cutex-desktop
+//! docs/research/host-ownership-20261019.md §5 limit 1; owner principals):
+//!
+//! - `GET  /v2/users/owner/new-devices` → `{devices: [<GET /v2/users tokens[]
+//!   item> + {at, via, current}]}`: tokens bound to the owner (pairing,
+//!   assignment, person-key auto-binding, the CLI = `ssh`) that no owner
+//!   principal acknowledged yet. Host event `cutex/access/ownerDeviceAdded
+//!   {tokenId, label, deviceName, platform, scope, at, via}`.
+//! - `POST /v2/users/owner/new-devices/{tokenId}/ack` → `{tokenId,
+//!   acknowledged}` (`false` = nothing to acknowledge; idempotent).
 //!
 //! Self service (capability `users-self-profile`; any assigned principal —
 //! owner or a bound user, never pending — for its own record only):
@@ -31,6 +46,22 @@
 //!   current}`; a token not bound to the caller (or unknown): 404
 //!   `client_token_not_found`. Revoking the current token signs this device
 //!   out (later requests with it get 401).
+//!
+//! Home page (capability `user-home`, `crate::management::user_home`; any
+//! assigned principal for its own record — owner or a bound user, never
+//! pending; device scope `read` may only read):
+//!
+//! - `GET    /v2/users/me/home` → `{revision, home: {...}|null, coverEtag,
+//!   updatedAt}` (`home.coverEtag` mirrors `coverEtag`)
+//! - `PUT    /v2/users/me/home` `{revision, home: {...}|null}` → the same;
+//!   409 `home_revision_conflict` `{revision}` when `revision` is not the
+//!   current one; 400 `invalid_home`, 413 `home_too_large`
+//! - `GET    /v2/users/me/home/cover` → the image (ETag, `If-None-Match` →
+//!   304; 404 `cover_not_found`)
+//! - `PUT    /v2/users/me/home/cover` `{contentType, data}` (base64 of a PNG /
+//!   JPEG / WebP ≤ 2 MiB, each side ≤ 4096 px) → the `GET` home answer;
+//!   400 `invalid_cover`, 413 `cover_too_large`
+//! - `DELETE /v2/users/me/home/cover` → the same with `coverEtag: null`
 //!
 //! `GET /v2/capabilities` `user.token` (capability `user-own-token`): the
 //! token of the request `{id, label, deviceName, ownerName, platform}`, null
@@ -61,6 +92,19 @@
 //!   `{tokenId, cleared, previousPublicKey: null, personsRevision}`
 //!   (`cleared` = a key was set; idempotent). 404 `client_token_not_found`.
 //!   The device's current key and its binding do not change.
+//!
+//! Owner person (capability `host-owner-person`; cutex-desktop
+//! docs/research/host-ownership-20261019.md §1):
+//!
+//! - `PUT /v2/users/owner-person` `{publicKey}` → `{owner}` (the `GET
+//!   /v2/host` `owner` object): the key must already be one of owner's
+//!   person keys (400 `not_an_owner_key`); source `local`.
+//! - `DELETE /v2/users/owner-person` → `{owner}` (unconfirmed).
+//! - Both only owner-local (`users::request_is_owner_local`: a loopback
+//!   listener with the root credential or an owner token issued by
+//!   `client-token issue` on the host, i.e. the local or an SSH-tunnelled
+//!   desktop): a paired device's token (owner-bound included) and any remote
+//!   listener get 403 `owner_person_local_only` `{clientToken, issuedVia}`.
 
 use std::net::TcpStream;
 
@@ -69,6 +113,7 @@ use serde_json::{json, Value};
 use crate::http::server::{write_json_response, SimpleHttpRequest};
 use crate::management::client_tokens::{ClientTokenStore, ClientTokenSummary, TOKEN_ID_PREFIX};
 use crate::management::persons;
+use crate::management::user_home::{self, HomeStore};
 use crate::management::user_profiles::{self, ProfilePatch, ProfileStore};
 use crate::management::users::{self, Grant, Principal, UserError, UserStore};
 
@@ -79,19 +124,35 @@ const SETTINGS: &str = "/v2/users/settings";
 pub const ME: &str = "/v2/users/me";
 pub const ME_DEVICES: &str = "/v2/users/me/devices";
 const ME_DEVICES_PREFIX: &str = "/v2/users/me/devices/";
+pub const ME_HOME: &str = "/v2/users/me/home";
+pub const ME_HOME_COVER: &str = "/v2/users/me/home/cover";
 const AVATAR_SUFFIX: &str = "/avatar";
 const PERSON_KEYS_SUFFIX: &str = "/person-keys";
 const TOKEN_PERSONS: &str = "/v2/users/token-persons/";
 const PREVIOUS_SUFFIX: &str = "/previous";
+pub const OWNER_PERSON: &str = "/v2/users/owner-person";
+pub const NEW_OWNER_DEVICES: &str = "/v2/users/owner/new-devices";
+const NEW_OWNER_DEVICES_PREFIX: &str = "/v2/users/owner/new-devices/";
+const ACK_SUFFIX: &str = "/ack";
 
 pub fn is_path(path: &str) -> bool {
     path == PATH || path.starts_with("/v2/users/")
 }
 
-/// `GET|PATCH /v2/users/me` and `GET /v2/users/{id}/avatar`: the routes a
-/// non-owner may use (the access gate classifies them).
+/// `GET|PATCH /v2/users/me`, `GET /v2/users/{id}/avatar`, own devices and
+/// the home page: the routes a non-owner may use (the access gate classifies
+/// them).
 pub fn is_self_service_path(path: &str) -> bool {
-    path == ME || avatar_user(path).is_some() || path == ME_DEVICES || me_device_id(path).is_some()
+    path == ME
+        || avatar_user(path).is_some()
+        || path == ME_DEVICES
+        || me_device_id(path).is_some()
+        || is_home_path(path)
+}
+
+/// `/v2/users/me/home` and `/v2/users/me/home/cover` (user-home).
+pub fn is_home_path(path: &str) -> bool {
+    path == ME_HOME || path == ME_HOME_COVER
 }
 
 /// `{tokenId}` of `/v2/users/me/devices/{tokenId}` (user-own-devices).
@@ -104,7 +165,7 @@ pub fn me_device_id(path: &str) -> Option<&str> {
 }
 
 /// `user.token` of `GET /v2/capabilities` (user-own-token): `{id, label,
-/// deviceName, ownerName, platform}` of a client / device token; `None` when
+/// deviceName, ownerName, platform, scope, issuedVia}` of a client / device token; `None` when
 /// the store cannot be read or the token no longer exists.
 pub fn own_token_view(token_id: &str) -> Option<Value> {
     let tokens = ClientTokenStore::open_default().and_then(|store| store.list()).ok()?;
@@ -115,6 +176,8 @@ pub fn own_token_view(token_id: &str) -> Option<Value> {
         "deviceName": token.device_name,
         "ownerName": token.owner_name,
         "platform": token.platform,
+        "scope": token.scope,
+        "issuedVia": token.issued_via,
     }))
 }
 
@@ -301,8 +364,31 @@ pub(crate) fn route(store: &UserStore, request: &SimpleHttpRequest) -> Result<(u
             .get("ownerRequiresApproval")
             .and_then(Value::as_bool)
             .ok_or_else(|| UserError::invalid("ownerRequiresApproval (boolean) is required"))?;
+        if !value && !users::request_is_owner_local() {
+            return Err(users::owner_local_only("disableOwnerApproval"));
+        }
         let settings = store.set_settings(value, &actor)?;
         return Ok((200, json!({ "settings": settings })));
+    }
+    if path == OWNER_PERSON {
+        return owner_person(store, request, method, &actor);
+    }
+    if path == NEW_OWNER_DEVICES {
+        if method != "GET" {
+            return Err(UserError::new(405, "method_not_allowed", "unsupported method for this route"));
+        }
+        return Ok((200, new_owner_devices(store)?));
+    }
+    if let Some(token_id) = path
+        .strip_prefix(NEW_OWNER_DEVICES_PREFIX)
+        .and_then(|rest| rest.strip_suffix(ACK_SUFFIX))
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+    {
+        if method != "POST" {
+            return Err(UserError::new(405, "method_not_allowed", "unsupported method for this route"));
+        }
+        let acknowledged = store.ack_owner_device(token_id, &actor)?;
+        return Ok((200, json!({ "tokenId": token_id, "acknowledged": acknowledged })));
     }
     if let Some(token_id) = path.strip_prefix(TOKEN_BINDINGS) {
         if method != "PUT" {
@@ -316,6 +402,7 @@ pub(crate) fn route(store: &UserStore, request: &SimpleHttpRequest) -> Result<(u
             _ => return Err(UserError::invalid("userId (string or null) is required")),
         };
         store.bind_token(token_id, user, &actor)?;
+        users::announce_owner_devices(store);
         return Ok((200, json!({ "tokenId": token_id, "userId": user, "pending": user.is_none() })));
     }
     if let Some(token_id) = path
@@ -400,10 +487,63 @@ pub(crate) fn route(store: &UserStore, request: &SimpleHttpRequest) -> Result<(u
             if let Ok(profiles) = ProfileStore::open_default() {
                 profiles.remove(id);
             }
+            if let Ok(homes) = HomeStore::open_default() {
+                homes.remove(id);
+            }
             Ok((200, json!({ "userId": id, "deleted": true })))
         }
         _ => Err(UserError::new(405, "method_not_allowed", "unsupported method for this route")),
     }
+}
+
+/// `PUT|DELETE /v2/users/owner-person`: owner-local only (the local or an
+/// SSH-tunnelled desktop; `users::request_is_owner_local`).
+fn owner_person(store: &UserStore, request: &SimpleHttpRequest, method: &str, actor: &str) -> Result<(u16, Value), UserError> {
+    if !matches!(method, "PUT" | "DELETE") {
+        return Err(UserError::new(405, "method_not_allowed", "unsupported method for this route"));
+    }
+    if !users::request_is_owner_local() {
+        let mut error = UserError::new(
+            403,
+            "owner_person_local_only",
+            "the owner person can only be set on this host or over SSH: the root credential or an owner token issued with `cutex management client-token issue`, on a loopback listener, or `cutex management owner`",
+        );
+        error.details = users::owner_local_details(json!({}));
+        return Err(error);
+    }
+    if method == "PUT" {
+        let object = body(request)?;
+        only(&object, &["publicKey"])?;
+        let key = object.get("publicKey").and_then(Value::as_str).ok_or_else(|| UserError::invalid("publicKey is required"))?;
+        store.set_owner_person(key, actor)?;
+    } else {
+        store.clear_owner_person(actor)?;
+    }
+    Ok((200, json!({ "owner": store.owner_view() })))
+}
+
+/// `GET /v2/users/owner/new-devices` (owner-device-notice).
+fn new_owner_devices(store: &UserStore) -> Result<Value, UserError> {
+    let state = store.snapshot().map_err(|e| UserError::new(503, "users_unavailable", format!("{e:#}")))?;
+    let tokens = store
+        .tokens()
+        .list()
+        .map_err(|e| UserError::new(503, "client_tokens_unavailable", format!("{e:#}")))?;
+    let persons = store.persons_snapshot().unwrap_or_default();
+    let current = crate::management::listeners::current_client_token().map(|token| token.token_id);
+    let devices: Vec<Value> = state
+        .new_owner_devices
+        .iter()
+        .filter_map(|notice| {
+            let token = tokens.iter().find(|token| token.token_id == notice.token_id)?;
+            let mut item = token_item(&state, &persons, token);
+            item["at"] = json!(notice.at);
+            item["via"] = json!(notice.via);
+            item["current"] = json!(current.as_deref() == Some(notice.token_id.as_str()));
+            Some(item)
+        })
+        .collect();
+    Ok(json!({ "devices": devices }))
 }
 
 fn bind_peer(store: &UserStore, peer_id: &str, user: &str, actor: &str) -> Result<(), UserError> {
@@ -439,6 +579,9 @@ fn bind_peer(store: &UserStore, peer_id: &str, user: &str, actor: &str) -> Resul
 pub fn handle_self_service(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
     let principal = users::current_principal();
+    if is_home_path(path) {
+        return handle_home(stream, request, principal.as_ref(), path);
+    }
     let stores = UserStore::open_default().and_then(|users| Ok((users, ProfileStore::open_default()?)));
     let (users_store, profiles) = match stores {
         Ok(stores) => stores,
@@ -576,6 +719,83 @@ pub(crate) fn own_devices(
     }
 }
 
+/// `/v2/users/me/home[/cover]` (user-home): the caller's own home page.
+fn handle_home(stream: &mut TcpStream, request: &SimpleHttpRequest, principal: Option<&Principal>, path: &str) -> anyhow::Result<()> {
+    let homes = match HomeStore::open_default() {
+        Ok(homes) => homes,
+        Err(e) => return error(stream, UserError::new(503, "users_unavailable", format!("{e:#}"))),
+    };
+    let Some(me) = user_profiles::me(principal) else {
+        return error(stream, UserError::new(403, "access_pending", "this device is waiting for the host owner to assign it to a user"));
+    };
+    if path == ME_HOME_COVER && request.method == "GET" {
+        return write_cover(stream, request, &homes, &me);
+    }
+    match own_home(&homes, &me, request, path == ME_HOME_COVER) {
+        Ok(value) => write_json_response(stream, 200, "OK", &value),
+        Err(failure) => error(stream, failure),
+    }
+}
+
+/// `GET|PUT /v2/users/me/home` and `PUT|DELETE /v2/users/me/home/cover` for
+/// user `me`; answers the home view.
+pub(crate) fn own_home(homes: &HomeStore, me: &str, request: &SimpleHttpRequest, cover: bool) -> Result<Value, UserError> {
+    let actor = users::current_actor();
+    let method_not_allowed = || UserError::new(405, "method_not_allowed", "unsupported method for this route");
+    let record = match (cover, request.method.as_str()) {
+        (false, "GET") => homes.get(me)?,
+        (false, "PUT") => {
+            let object = body(request)?;
+            only(&object, &["revision", "home"])?;
+            let revision = object
+                .get("revision")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| UserError::invalid("revision (a non-negative integer, 0 for no home page yet) is required"))?;
+            let home = match object.get("home") {
+                Some(home) => user_home::validate_home(home)?,
+                None => return Err(UserError::invalid("home (an object or null) is required")),
+            };
+            homes.put(me, revision, home, &actor)?
+        }
+        (true, "PUT") => {
+            let value: Value = serde_json::from_slice(&request.body)
+                .map_err(|_| UserError::new(400, "invalid_cover", "JSON object body {contentType, data} required"))?;
+            let upload = user_home::parse_cover_upload(&value)?;
+            homes.set_cover(me, Some(&upload), &actor)?
+        }
+        (true, "DELETE") => homes.set_cover(me, None, &actor)?,
+        _ => return Err(method_not_allowed()),
+    };
+    Ok(record.view())
+}
+
+fn write_cover(stream: &mut TcpStream, request: &SimpleHttpRequest, homes: &HomeStore, me: &str) -> anyhow::Result<()> {
+    let Some((cover, bytes)) = homes.cover(me) else {
+        return error(stream, UserError::new(404, "cover_not_found", "no home page cover for this user"));
+    };
+    write_image(stream, request, &cover, &bytes)
+}
+
+/// An image answer with its ETag (`If-None-Match` → 304).
+fn write_image(stream: &mut TcpStream, request: &SimpleHttpRequest, image: &user_profiles::Avatar, bytes: &[u8]) -> anyhow::Result<()> {
+    let etag = format!("\"{}\"", image.etag);
+    let matches = request
+        .headers
+        .get("if-none-match")
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim().trim_start_matches("W/") == etag));
+    let previous = crate::http::server::extra_response_headers();
+    crate::http::server::set_extra_response_headers(format!(
+        "{previous}ETag: {etag}\r\nCache-Control: private, no-cache\r\nX-Content-Type-Options: nosniff\r\n"
+    ));
+    let result = if matches {
+        crate::http::server::write_http_response(stream, 304, "Not Modified", &image.content_type, &[])
+    } else {
+        crate::http::server::write_http_response(stream, 200, "OK", &image.content_type, bytes)
+    };
+    crate::http::server::set_extra_response_headers(previous);
+    result
+}
+
 /// Whether `principal` may see `target`'s profile: the owner sees everyone;
 /// a user sees the owner, itself and every user that can see at least one
 /// agent it sees (it may meet them as "sent by" in a shared agent).
@@ -618,20 +838,5 @@ fn write_avatar(
     let Some((avatar, bytes)) = profiles.avatar(target) else {
         return not_found(stream);
     };
-    let etag = format!("\"{}\"", avatar.etag);
-    let matches = request
-        .headers
-        .get("if-none-match")
-        .is_some_and(|value| value.split(',').any(|tag| tag.trim().trim_start_matches("W/") == etag));
-    let previous = crate::http::server::extra_response_headers();
-    crate::http::server::set_extra_response_headers(format!(
-        "{previous}ETag: {etag}\r\nCache-Control: private, no-cache\r\nX-Content-Type-Options: nosniff\r\n"
-    ));
-    let result = if matches {
-        crate::http::server::write_http_response(stream, 304, "Not Modified", &avatar.content_type, &[])
-    } else {
-        crate::http::server::write_http_response(stream, 200, "OK", &avatar.content_type, &bytes)
-    };
-    crate::http::server::set_extra_response_headers(previous);
-    result
+    write_image(stream, request, &avatar, &bytes)
 }

@@ -478,8 +478,9 @@ fn human_agent_without_cwd_or_project_gets_a_private_scratch_workspace() {
     // An explicit cwd is used exactly as before.
     let explicit = create(json!({"requestId": "explicit", "name": "explicit-cwd", "profile": CLAUDE, "cwd": fixture.work()}))
         .expect("explicit cwd");
+    // The stored cwd is plain (no `\\?\` on Windows); compare canonical forms.
     assert_eq!(
-        std::path::PathBuf::from(session_record(&explicit).cwd),
+        std::path::PathBuf::from(session_record(&explicit).cwd).canonicalize().unwrap(),
         std::path::Path::new(&fixture.work()).canonicalize().unwrap()
     );
     assert_eq!(entries().len(), 1);

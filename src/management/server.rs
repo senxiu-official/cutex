@@ -519,8 +519,24 @@ pub fn handle_parsed_management_request(
         );
     }
     let principal = verified.as_ref().map(|token| token.principal.clone());
+    let device_scope = verified.as_ref().map(|token| token.scope);
     crate::management::listeners::set_current_client_token(verified);
     crate::management::users::set_current_principal(principal.clone());
+    if path == "/v2" || path.starts_with("/v2/") {
+        // owner-device-notice: owner devices the CLI added (or any binding
+        // not announced yet) are announced by the daemon's next request.
+        if let Ok(users) = crate::management::users::UserStore::open_default() {
+            crate::management::users::announce_owner_devices(&users);
+        }
+        // device-scope: a narrowed token passes the scope gate first
+        // (effective rights = the user's rights ∩ the device scope).
+        if let Some(scope) = device_scope.filter(|scope| !scope.is_full()) {
+            match crate::management::v2::access::device_scope_gate(stream, &request, scope) {
+                crate::management::v2::access::Gate::Handled(result) => return result,
+                crate::management::v2::access::Gate::Continue => {}
+            }
+        }
+    }
     // P1 users: a non-owner (or pending) token passes the access gate first;
     // every route not explicitly scoped for it is refused (default deny).
     if let Some(principal) = principal.filter(|principal| !principal.is_owner()) {
@@ -550,6 +566,14 @@ pub fn handle_parsed_management_request(
                 stream, 401, "Unauthorized", "unauthorized",
                 "the Management root credential or a client token is required", false,
                 serde_json::json!({}),
+            );
+        }
+        // owner-local-only: creating a pairing code hands out access; only
+        // the host itself or SSH (a paired device's token on loopback: no).
+        if !crate::management::users::request_is_owner_local() {
+            let error = crate::management::users::owner_local_only("pairingCode");
+            return crate::management::v2::server::write_v2_error(
+                stream, 403, "Forbidden", error.code, &error.message, false, error.details,
             );
         }
         return crate::management::v2::pairing::handle_issue(stream, &request);

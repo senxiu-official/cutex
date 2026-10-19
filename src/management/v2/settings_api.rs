@@ -1072,6 +1072,14 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
             if parsed.proxy.is_some() && !proxy_editable() {
                 return proxy_owner_required(stream);
             }
+            // owner-local-only: turning cross-host peers on is a root-identity
+            // action (turning them off stays open to owner principals).
+            if parsed.peers.as_ref().is_some_and(|peers| peers.get("enabled") == Some(&Value::Bool(true)))
+                && !crate::management::users::request_is_owner_local()
+            {
+                let error = crate::management::users::owner_local_only("peersEnable");
+                return super::server::write_v2_error(stream, 403, "Forbidden", error.code, &error.message, false, error.details);
+            }
             if !crate::management::listeners::current_request_is_loopback() {
                 // The daemon fetches usage.catalogUrl itself: only from this machine.
                 let catalog_url = parsed

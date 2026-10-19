@@ -53,7 +53,13 @@ pub(crate) fn envelope(
                 || (legacy["eventType"] == cutex::agent_bus::peer_tell::EVENT_TYPE
                     && legacy["source"]["kind"] == "service"
                     && legacy["source"]["id"] == cutex::agent_bus::peer_tell::SOURCE_ID
-                    && legacy["metadata"]["deliveryMode"] == "passive")
+                    // A note is passive; a cross-host wake (control type
+                    // cutex.peer.tell.v2, checked by peer_tell::model_text)
+                    // is after-turn, or soon when read at a busy step.
+                    && matches!(
+                        legacy["metadata"]["deliveryMode"].as_str(),
+                        Some("passive" | "after-turn" | "soon")
+                    ))
                 || (legacy["eventType"] == "alarm"
                     && legacy["source"]["kind"] == "service"
                     && legacy["source"]["id"] == cutex::agent_bus::alarms::ALARM_SYSTEM_SENDER
@@ -254,6 +260,23 @@ mod tests {
         let mut forged = payload;
         forged["source"]["kind"] = json!("agent");
         assert!(super::envelope("owner", "thread", 7, &forged).is_err());
+    }
+
+    /// A cross-host note is passive; a cross-host wake (cutex.peer.tell.v2)
+    /// is after-turn, or soon when read at a busy recipient's next step.
+    #[test]
+    fn peer_message_accepts_note_and_wake_deliveries() {
+        let payload = |mode: &str| json!({"threadId":"thread","messageId":"ptell-1",
+            "source":{"kind":"service","id":cutex::agent_bus::peer_tell::SOURCE_ID},
+            "eventType":cutex::agent_bus::peer_tell::EVENT_TYPE,"text":"Message Type: MESSAGE",
+            "metadata":{"sourceName":"worker@alpha","deliveryMode":mode},
+            "view":{"schema":cutex::agent_bus::peer_tell::VIEW_SCHEMA,"data":{"senderName":"worker@alpha"}}});
+        for (mode, delivery) in [("passive", Delivery::Passive), ("after-turn", Delivery::AfterTurn), ("soon", Delivery::Soon)] {
+            assert_eq!(envelope("owner", "thread", 7, &payload(mode)).unwrap().message.delivery, delivery);
+        }
+        let mut forged = payload("after-turn");
+        forged["source"]["kind"] = json!("agent");
+        assert!(envelope("owner", "thread", 7, &forged).is_err());
     }
 
     #[test]

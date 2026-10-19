@@ -15,7 +15,11 @@
 //!   install` layout (only those can `cutex upgrade`);
 //! - `runtimes` (owner only; null when the stores cannot be read): native /
 //!   Claude runtime selected for new agents + how many agents use each
-//!   (`runtimes_api::summary_from`).
+//!   (`runtimes_api::summary_from`);
+//! - `owner` `{displayName, fingerprint, confirmed, source}` (capability
+//!   `host-owner-person`; every authenticated principal, members and pending
+//!   devices included): who owns this host in person
+//!   (`UserStore::owner_view`); unconfirmed → `fingerprint` / `source` null.
 
 use serde_json::{json, Value};
 
@@ -38,7 +42,16 @@ pub fn host_resource() -> Value {
         } else {
             super::runtimes_api::summary().unwrap_or(Value::Null)
         },
+        "owner": owner_view(),
     })
+}
+
+/// `owner` (host-owner-person); unconfirmed with no name when the users
+/// store cannot be opened.
+fn owner_view() -> Value {
+    crate::management::users::UserStore::open_default()
+        .map(|store| store.owner_view())
+        .unwrap_or_else(|_| json!({ "displayName": null, "fingerprint": null, "confirmed": false, "source": null }))
 }
 
 pub const EXPORTED_SCHEMA: super::schema_export::ExportedSchema = super::schema_export::ExportedSchema {

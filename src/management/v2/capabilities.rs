@@ -322,8 +322,11 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // the newest native token_count of the session's current rollout
     // (revert-consistent) in the app-server `thread/tokenUsage/updated`
     // params shape {threadId, turnId, tokenUsage: {total, last,
-    // modelContextWindow}} plus updatedAt (RFC 3339) | null (Claude
-    // sessions, no usage yet). Live notifications supersede it.
+    // modelContextWindow}} plus updatedAt (RFC 3339) | null (no usage yet).
+    // Claude sessions (no rollout): the newest such notification the adapter
+    // sent for the bound thread, kept by the daemon across restarts
+    // (`claude_token_usage`; dropped when a revert removes its turn). Live
+    // notifications supersede it.
     ("bootstrap-token-usage", "bootstrapTokenUsage"),
     // GET /v2/sessions/{id}/bootstrap?turnLimit=N (1..=200): a connected
     // session's native.result.thread.turns holds only the newest N turns
@@ -628,6 +631,14 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // (POST /peer/v1/tells, optional hello feature tells.v1; notes only, no
     // wake / attachments / revisions; receipts runtime/peers/tell-receipts.json).
     ("cross-host-tell", "crossHostTell"),
+    // agent_tell to name@host with wake:true (hello feature tells.v2,
+    // schemaVersion 2): allowed only by the receiving peer's per-peer
+    // inbound.tellWake (default off; review required = refused) → 403
+    // wake_not_allowed, nothing delivered; inbound.tellWakesPerHour (60)
+    // beyond which a wake arrives as a note (wakeDowngraded, reason
+    // rate_limited); local bus control type cutex.peer.tell.v2, after_turn;
+    // agent_list otherHosts[].tellWake.
+    ("cross-host-tell-wake", "crossHostTellWake"),
     // P1 users and grants: /v2/users, token → user bindings, default-deny
     // access gate for non-owner tokens, `user` in /v2/capabilities.
     ("users", "users"),
@@ -1149,6 +1160,85 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // Keyed by profile id; removed with the profile. Images in
     // runtime/profile-avatars/ (never config.json / accounts.json).
     ("profile-avatar", "profileAvatar"),
+    // 2026-10-19: import Profiles from CC Switch (farion1231/cc-switch; owner
+    // only, crate::profiles::cc_switch, read-only). GET
+    // /v2/profile-imports/cc-switch -> {found, source {path, format
+    // sqlite|json, schemaVersion} | null, error {code, message} | null,
+    // providers [{id, app claude|codex, name, baseUrl, model, current, hasKey,
+    // supported, reason, existingProfile}]} (never a key; schema > 20 ->
+    // error unsupported_version). POST {items: [{id, app, name?}]} (1-50) ->
+    // {created [{id, app, profile}], failed [{id, app, code: provider_gone |
+    // unsupported | no_key | profile_exists | invalid | store_unavailable,
+    // message}]}; created through the POST /v2/profiles path (Codex -> apiKey
+    // profile; Claude -> Claude API account + claude profile).
+    ("profile-import-cc-switch", "profileImportCcSwitch"),
+    // Host owner in person (cutex-desktop docs/research/host-ownership-20261019.md
+    // §1): GET /v2/host `owner` {displayName, fingerprint, confirmed, source}
+    // for every principal (members and pending devices included);
+    // PUT /v2/users/owner-person {publicKey} and DELETE /v2/users/owner-person
+    // → {owner} (owner-local only, see owner-local-only: paired devices'
+    // tokens and remote listeners get 403 owner_person_local_only); persons-v1.json
+    // ownerPerson {publicKey, setAt, source}; audit ownerPersonSet; CLI
+    // `cutex management owner show|set-person|clear-person`.
+    ("host-owner-person", "hostOwnerPerson"),
+    // Owner's paired devices, limit 1 (cutex-desktop
+    // docs/research/host-ownership-20261019.md §5): a pairing code for the
+    // owner lives 5 minutes (others 10) and says `ownerDevice: true`; every
+    // token newly bound to the owner (pairing, assignment, person-key
+    // auto-binding, the CLI = via "ssh") is a new owner device: host event
+    // cutex/access/ownerDeviceAdded {tokenId, label, deviceName, platform,
+    // scope, at, via}; GET /v2/users/owner/new-devices → {devices[]} (owner
+    // principals) and POST /v2/users/owner/new-devices/{tokenId}/ack →
+    // {tokenId, acknowledged}; users-v1.json newOwnerDevices.
+    ("owner-device-notice", "ownerDeviceNotice"),
+    // Limit 2: root-identity actions only owner-local ("本机和 SSH 都算"): a
+    // loopback listener with the root credential or with an owner token
+    // issued by `cutex management client-token issue` on the host (token
+    // `issuedVia: "hostCli"`; an SSH-tunnelled desktop), or the CLI; never a
+    // paired device's token (`issuedVia: "pairing"`). Actions: setting the
+    // owner person (403 owner_person_local_only), turning
+    // ownerRequiresApproval off, creating pairing codes, pairing / enabling
+    // peers (POST /v2/peers, POST /v2/peers/invites, PATCH /v2/peers/{id}
+    // enabled true, PATCH /v2/settings peers.enabled true), reading
+    // config.json through /v2/fs/file; else 403 owner_local_only {action,
+    // clientToken, issuedVia}. /v2/capabilities user.ownerLocal says whether
+    // this connection counts; token items carry issuedVia.
+    ("owner-local-only", "ownerLocalOnly"),
+    // Limit 3: per-device scope "full" | "chat" | "read" on client / device
+    // tokens (pairing-code `scope`, `client-token issue --scope`, PATCH
+    // /v2/client-tokens/{id} {scope}); effective rights = user's rights ∩
+    // scope (access::device_scope_gate; 403 device_scope_denied {scope,
+    // required}); token items and /v2/capabilities user.token carry `scope`,
+    // user.scope = this connection's scope.
+    ("device-scope", "deviceScope"),
+    // Remote close of a desktop client (cutex-desktop
+    // docs/research/remote-close-desktop-20261019.md; clients_api.rs):
+    // POST /v2/clients/presence {installId, instanceId, appName, appVersion,
+    // deviceName, platform, allowRemoteClose} -> {instanceId,
+    // heartbeatSeconds: 60, state, closeRequest} (heartbeat; in memory,
+    // dropped after 3 missed heartbeats; any principal, pending included);
+    // GET /v2/clients -> {clients[]} (owner with scope full: all, others
+    // their own user's); POST /v2/clients/{instanceId}/close {graceSeconds?}
+    // -> 202 {instanceId, state} (owner or same user, scope full; 403
+    // client_close_forbidden, 404 client_not_found, 409
+    // remote_close_disabled; audited); POST /v2/clients/{instanceId}/closing
+    // {outcome: closing|cancelled} (the registering credential only); host
+    // events cutex/client/closeRequested {instanceId, requestedBy
+    // {deviceName, userId, local}, graceSeconds, at} and
+    // cutex/client/stateChanged {instanceId, state}.
+    ("client-remote-close", "clientRemoteClose"),
+    // 2026-10-20: per-user home page settings on the host (cutex-desktop
+    // docs/research/home-page-20261019.md §1; management::user_home):
+    // GET /v2/users/me/home -> {revision, home: {...}|null, coverEtag,
+    // updatedAt}; PUT {revision, home} (optimistic concurrency, 409
+    // home_revision_conflict {revision}; home <= 64 KiB JSON, known keys
+    // layout / blocks / bio / sidebarEntry / showWhenEmpty / homeHost / pins
+    // checked, unknown keys kept; 400 invalid_home, 413 home_too_large);
+    // GET|PUT|DELETE /v2/users/me/home/cover (PUT {contentType, data}: PNG /
+    // JPEG / WebP <= 2 MiB, each side <= 4096 px; GET with ETag). Own record
+    // only (owner or a bound user; pending 403 access_pending); device scope
+    // read may only read. Stored in runtime/users/home/.
+    ("user-home", "userHome"),
     #[cfg(target_os = "linux")]
     ("job-service", "jobService"),
 ];
@@ -1340,6 +1430,7 @@ mod tests {
             "peers",
             "crossHostAsks",
             "crossHostTell",
+            "crossHostTellWake",
             "peersV2",
             "browserRelayV1",
             "skillsArchive",
@@ -1357,6 +1448,13 @@ mod tests {
             "peerOwnerProfile",
             "sessionSandboxExtras",
             "profileAvatar",
+            "profileImportCcSwitch",
+            "hostOwnerPerson",
+            "ownerDeviceNotice",
+            "ownerLocalOnly",
+            "deviceScope",
+            "clientRemoteClose",
+            "userHome",
         ] {
             assert_eq!(value["features"][key], true, "{key}");
         }

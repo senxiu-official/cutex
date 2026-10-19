@@ -115,7 +115,28 @@ reused by its next runtime generation. An occurrence already running before
 this code is installed remains in its original cgroup until its next explicitly
 authorized launch or restart; installation does not migrate or restart it.
 
-Windows, non-Linux platforms, Linux not booted with systemd/cgroup v2, and
+On Windows every manager-owned app-server core (and every Claude adapter)
+starts in its own named Job object `Global\cutex-agent-<readable-id>-<identity>`
+(same label and identity digest as the Linux scope; current-user DACL;
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; no breakaway). The app-server is created
+suspended, assigned to the job and only then resumed, so no descendant can
+start outside it; the Claude adapter enters the job at creation
+(`PROC_THREAD_ATTRIBUTE_JOB_LIST`). The job's only long-lived handle is
+duplicated into the runtime root itself and the management daemon closes its
+own: the job lives exactly as long as the runtime root. A management restart
+or upgrade therefore leaves the runtime running for adoption (as a scope
+does), while the root's exit for any reason (PID stop, crash, Task Manager)
+kills every remaining descendant: Claude Code, shells, dev servers, builds.
+`offline`, `close`, failed-start cleanup and stale-runtime recovery call
+`TerminateJobObject` on the Agent's job before the exact-PID path; Windows has
+no graceful tree signal, so this is a hard stop after the turn interrupt and
+manager disconnect. A launch whose job name still exists (a previous runtime
+root of the Agent alive) fails closed like an active systemd unit; stop the
+Agent first. The runtime environment carries
+`CUTEX_MANAGED_AGENT_ISOLATION=windows_job_object:<job>`. Runtimes started
+before this change have no job until their next launch.
+
+Non-Linux, non-Windows platforms, Linux not booted with systemd/cgroup v2, and
 Linux without a reachable user manager or the required
 `systemd-run`/`systemctl` capabilities retain direct process launch. That
 supported fallback is explicit in

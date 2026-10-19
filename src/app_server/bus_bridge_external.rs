@@ -1335,9 +1335,22 @@ mod tests {
         let mut forged = m.clone();
         forged.from_cutex_session_id = Some("cutex.11111111-1111-4111-8111-111111111111".into());
         assert!(envelope(&forged, &binding()).is_err());
-        let mut renamed = m;
+        let mut renamed = m.clone();
         renamed.from = "someone@alpha".into();
         assert!(envelope(&renamed, &binding()).is_err());
+        // A cross-host wake (v2) is an after_turn service input and a busy-wake
+        // candidate; v1 with after_turn stays refused.
+        let mut wake = m.clone();
+        wake.control_type = Some(crate::agent_bus::peer_tell::CONTROL_TYPE_V2.into());
+        wake.delivery_mode = crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn;
+        let e = envelope(&wake, &binding()).unwrap();
+        assert_eq!(e.message.delivery, Delivery::AfterTurn);
+        assert_eq!(e.message.event_type, "peer_message");
+        assert!(e.message.text.contains("\nWake: worker@alpha, an agent on another host, started this turn"));
+        assert!(busy_wake_candidate(&wake, false));
+        let mut v1_wake = m;
+        v1_wake.delivery_mode = crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn;
+        assert!(envelope(&v1_wake, &binding()).is_err());
     }
     #[test]
     fn management_start_is_reserved_service_data_not_human_or_agent_authority() {

@@ -308,25 +308,18 @@ pub fn send_local_alarm(
 }
 
 /// Enqueue a cross-host tell (peers): a passive note with the reserved peer
-/// control record and no local sender identity (`agent_bus::peer_tell`).
+/// control record and no local sender identity (`agent_bus::peer_tell`); a
+/// permitted cross-host wake (`wake`) is `after_turn` with control type
+/// `cutex.peer.tell.v2`.
 pub fn send_peer_tell(
     config: &CodezConfig,
     target: &str,
     message: &str,
     facts: &crate::agent_bus::peer_tell::PeerTellFacts,
     message_id: &str,
+    wake: bool,
 ) -> anyhow::Result<Value> {
-    let mut request = agent_message_send_request(
-        target,
-        message,
-        AgentDeliveryMode::Passive,
-        true,
-        facts.sender_label(),
-        None,
-        Some(message_id.into()),
-    );
-    request.control_type = Some(crate::agent_bus::peer_tell::CONTROL_TYPE.into());
-    request.control_payload = Some(serde_json::to_value(facts)?);
+    let request = peer_tell_send_request(target, message, facts, message_id, wake)?;
     agent_bus_http_json(
         &agent_bus_base_url(agent_bus_port(config)),
         "POST",
@@ -334,6 +327,38 @@ pub fn send_peer_tell(
         config.agent_bus_token.as_deref(),
         Some(&serde_json::to_vec(&request)?),
     )
+}
+
+pub(crate) fn peer_tell_send_request(
+    target: &str,
+    message: &str,
+    facts: &crate::agent_bus::peer_tell::PeerTellFacts,
+    message_id: &str,
+    wake: bool,
+) -> anyhow::Result<AgentBusSendRequest> {
+    let mut request = agent_message_send_request(
+        target,
+        message,
+        if wake {
+            AgentDeliveryMode::AfterTurn
+        } else {
+            AgentDeliveryMode::Passive
+        },
+        true,
+        facts.sender_label(),
+        None,
+        Some(message_id.into()),
+    );
+    request.control_type = Some(
+        if wake {
+            crate::agent_bus::peer_tell::CONTROL_TYPE_V2
+        } else {
+            crate::agent_bus::peer_tell::CONTROL_TYPE
+        }
+        .into(),
+    );
+    request.control_payload = Some(serde_json::to_value(facts)?);
+    Ok(request)
 }
 
 pub fn agent_bus_update_agent_groups(

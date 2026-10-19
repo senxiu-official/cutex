@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::http::server::{write_json_response, SimpleHttpRequest};
 use crate::management::server::ManagementRequestContext;
+use crate::management::client_tokens::DeviceScope;
 use crate::management::users::{Grant, Principal, Scope};
 
 use super::server::write_v2_error;
@@ -65,6 +66,9 @@ pub enum Scoped {
     SelfProfile,
     /// `GET /v2/users/{id}/avatar`: checked against who the caller may see.
     UserAvatar,
+    /// `GET|PUT /v2/users/me/home`, `GET|PUT|DELETE /v2/users/me/home/cover`:
+    /// the caller's own home page (user-home).
+    UserHome,
     /// `GET {scope}/fs/dir|file|search|watch` and `{scope}/git/status|diff`
     /// with scope `/v2/projects/{id}` (a granted project) or
     /// `/v2/sessions/{id}` (a visible agent's cwd): read-only, read grant
@@ -92,6 +96,8 @@ struct Rule {
 const GET: &[&str] = &["GET"];
 const POST: &[&str] = &["POST"];
 const GET_PATCH: &[&str] = &["GET", "PATCH"];
+const GET_PUT: &[&str] = &["GET", "PUT"];
+const GET_PUT_DELETE: &[&str] = &["GET", "PUT", "DELETE"];
 const DELETE: &[&str] = &["DELETE"];
 const ANY: &[&str] = &[];
 
@@ -137,6 +143,12 @@ fn workspace_read_shape(path: &str) -> bool {
 fn attachment_shape(path: &str) -> bool {
     super::attachments::session_id_from_path(path).is_some()
 }
+fn client_close_shape(path: &str) -> bool {
+    super::clients_api::close_shape(path)
+}
+fn client_closing_shape(path: &str) -> bool {
+    super::clients_api::closing_shape(path)
+}
 fn project_read_shape(path: &str) -> bool {
     super::server::management_project_id_from_path(path).is_some()
 }
@@ -176,10 +188,23 @@ const SCOPED_RULES: &[Rule] = &[
     Rule { methods: GET, matcher: Matcher::Shape(ask_answer_shape), class: Class::Scoped(Scoped::AskAnswer) },
     Rule { methods: GET_PATCH, matcher: Matcher::Exact(super::users_api::ME), class: Class::Scoped(Scoped::SelfProfile) },
     Rule { methods: GET, matcher: Matcher::Shape(user_avatar_shape), class: Class::Scoped(Scoped::UserAvatar) },
+    // user-home: the handler answers for "me" only.
+    Rule { methods: GET_PUT, matcher: Matcher::Exact(super::users_api::ME_HOME), class: Class::Scoped(Scoped::UserHome) },
+    Rule { methods: GET_PUT_DELETE, matcher: Matcher::Exact(super::users_api::ME_HOME_COVER), class: Class::Scoped(Scoped::UserHome) },
     // user-own-devices: the handler lists / revokes only tokens bound to the
     // caller's user and refuses a pending device (403 user_pending).
     Rule { methods: GET, matcher: Matcher::Exact(super::users_api::ME_DEVICES), class: Class::AnyPrincipal },
     Rule { methods: DELETE, matcher: Matcher::Shape(own_device_shape), class: Class::AnyPrincipal },
+    // client-remote-close: every desktop reports its presence and its own
+    // close outcome (pending and narrowed devices included); the handler
+    // lists only what the caller may see and refuses close requests of
+    // pending devices, narrowed scopes and other users (403
+    // client_close_forbidden). Device scope: Read here, `full` checked by
+    // the handler.
+    Rule { methods: POST, matcher: Matcher::Exact(super::clients_api::PRESENCE_PATH), class: Class::AnyPrincipal },
+    Rule { methods: GET, matcher: Matcher::Exact(super::clients_api::CLIENTS_PATH), class: Class::AnyPrincipal },
+    Rule { methods: POST, matcher: Matcher::Shape(client_close_shape), class: Class::AnyPrincipal },
+    Rule { methods: POST, matcher: Matcher::Shape(client_closing_shape), class: Class::AnyPrincipal },
 ];
 
 /// Every other route family: owner only (explicitly listed so the
@@ -187,11 +212,11 @@ const SCOPED_RULES: &[Rule] = &[
 const OWNER_RULES: &[Rule] = owner_prefixes![
     "/v2/agent-bus", "/v2/agent-management", "/v2/alarms", "/v2/approvals",
     "/v2/artifact-store", "/v2/artifacts", "/v2/asks", "/v2/browser", "/v2/capabilities",
-    "/v2/claude", "/v2/client-tokens", "/v2/codex", "/v2/components", "/v2/director-rotations",
+    "/v2/claude", "/v2/client-tokens", "/v2/clients", "/v2/codex", "/v2/components", "/v2/director-rotations",
     "/v2/documents", "/v2/events", "/v2/fs", "/v2/health", "/v2/host", "/v2/human", "/v2/identity",
     "/v2/inbound-mail", "/v2/items", "/v2/job-service", "/v2/nci-verification", "/v2/notes",
     "/v2/notification-levels", "/v2/notifications", "/v2/owner-notifications", "/v2/pair",
-    "/v2/peers", "/v2/profile-presets", "/v2/profiles", "/v2/projects",
+    "/v2/peers", "/v2/profile-imports", "/v2/profile-presets", "/v2/profiles", "/v2/projects",
     "/v2/quota-auto-continue", "/v2/record-archive", "/v2/release", "/v2/runtime-packages", "/v2/safety-checks",
     "/v2/runtimes", "/v2/services", "/v2/sessions", "/v2/settings", "/v2/side-chats",
     "/v2/summary", "/v2/task-service", "/v2/tasks", "/v2/terminals", "/v2/upgrade", "/v2/usage",
@@ -556,18 +581,19 @@ fn scoped_gate(
                 Ok(query) => query,
                 Err(error) => return Ok(Gate::Handled(srv::write_replay_error(stream, error))),
             };
-            if let Some(id) = query.cutex_session_id.as_deref() {
+            if let Some(id) = query.cutex_session_id.as_deref().filter(|id| *id != HOST_EVENTS) {
                 if let Some(gate) = session_gate(stream, id) {
                     return Ok(gate);
                 }
             }
             let repository = super::repository::management_v2_repository()?;
             srv::materialize_active_stream_reset(repository, context)?;
+            let user = current_user_id();
             match repository.page(query) {
                 Ok(page) => {
                     let mut value = serde_json::to_value(page)?;
                     let asks = AskVisibility::default();
-                    retain_array(&mut value, "events", |event| event_visible_json(event, scope, &asks));
+                    retain_array(&mut value, "events", |event| event_visible_json(event, scope, &asks, user.as_deref()));
                     Gate::Handled(write_json_response(stream, 200, "OK", &value))
                 }
                 Err(error) => Gate::Handled(srv::write_replay_error(stream, error)),
@@ -578,13 +604,14 @@ fn scoped_gate(
                 Ok(query) => query,
                 Err(error) => return Ok(Gate::Handled(srv::write_replay_error(stream, error))),
             };
-            if let Some(id) = query.cutex_session_id.as_deref() {
+            if let Some(id) = query.cutex_session_id.as_deref().filter(|id| *id != HOST_EVENTS) {
                 if let Some(gate) = session_gate(stream, id) {
                     return Ok(gate);
                 }
             }
             let repository = super::repository::management_v2_repository()?;
             srv::materialize_active_stream_reset(repository, context)?;
+            let user = current_user_id();
             let subscription = match repository.page_and_subscribe(query.clone(), srv::SSE_SUBSCRIBER_CAPACITY) {
                 Ok(subscription) => subscription,
                 Err(error) => return Ok(Gate::Handled(srv::write_replay_error(stream, error))),
@@ -596,7 +623,7 @@ fn scoped_gate(
                 // Re-evaluated every few seconds (cached): agents join and
                 // leave projects while the stream is open.
                 let scope = Scope::cached(&grant);
-                event_visible(event, &scope, &asks)
+                event_visible(event, &scope, &asks, user.as_deref())
             };
             Gate::Handled(srv::stream_events_filtered(
                 stream,
@@ -660,7 +687,7 @@ fn scoped_gate(
             }
         }
         // The handler answers for "me" only and checks who may see whom.
-        Scoped::SelfProfile | Scoped::UserAvatar => Gate::Continue,
+        Scoped::SelfProfile | Scoped::UserAvatar | Scoped::UserHome => Gate::Continue,
         Scoped::AskRead | Scoped::AskAnswer => {
             let id = match super::asks::parse_path(path) {
                 Some(super::asks::Route::Ask(id) | super::asks::Route::Answer(id)) => id,
@@ -670,6 +697,169 @@ fn scoped_gate(
             if ask_visible(&state, &id, scope) { Gate::Continue } else { not_found(stream, "ask_not_found") }
         }
     })
+}
+
+// ------------------------------------------------------------ device scope
+
+/// What a device scope needs for a request (device-scope).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeNeed {
+    /// GET routes, event streams, read-only native / cutex methods, the
+    /// device's own identity claim, signing itself out.
+    Read,
+    /// Talking to agents: input, queue, interrupt / stop, attachments,
+    /// answering an agent's question (native `item/tool/requestUserInput`,
+    /// `mcpServer/elicitation/request`, `cutex/ask/respond`); editing the
+    /// caller's own home page (user-home).
+    Chat,
+    /// Everything else: approvals, settings, profiles, users, devices,
+    /// peers, pairing codes, agent create / archive, runtime operations,
+    /// terminals input, every other write.
+    Full,
+}
+
+/// Cutex methods a `chat` device may use beyond [`CUTEX_READ`]: the
+/// ordinary send methods plus answering an agent's question.
+pub const CUTEX_CHAT: &[&str] = &["cutex/ask/respond"];
+
+/// Native server requests that are questions, not approvals: a `chat`
+/// device may answer them.
+pub const NATIVE_QUESTIONS: &[&str] = &["item/tool/requestUserInput", "mcpServer/elicitation/request"];
+
+/// The scope a request needs. `pending_method` answers the method of the
+/// pending native server request a server response answers (`None` =
+/// unknown: treated as an approval).
+pub fn scope_need(
+    method: &str,
+    path: &str,
+    body: &Value,
+    current_token: Option<&str>,
+    pending_method: impl Fn(&str, &Value) -> Option<String>,
+) -> ScopeNeed {
+    use super::server as srv;
+    match classify(method, path) {
+        Some(Class::Public | Class::HostRead) => return ScopeNeed::Read,
+        // Its own identity (challenge / claim) and its own device list.
+        Some(Class::AnyPrincipal) if method != "DELETE" => return ScopeNeed::Read,
+        _ => {}
+    }
+    if method == "GET" || method == "HEAD" {
+        return ScopeNeed::Read;
+    }
+    // user-home: the own home page is a personal setting, not the host's.
+    if super::users_api::is_home_path(path) {
+        return ScopeNeed::Chat;
+    }
+    if method == "DELETE" {
+        // Signing itself out (revoking the current token) stays possible.
+        let own = super::users_api::me_device_id(path);
+        return if own.is_some() && own == current_token { ScopeNeed::Read } else { ScopeNeed::Full };
+    }
+    if method != "POST" {
+        return ScopeNeed::Full;
+    }
+    if srv::native_request_session_id_from_path(path).is_some() {
+        let native = body.pointer("/native/message/method").and_then(Value::as_str).unwrap_or("");
+        return if NATIVE_READ.contains(&native) {
+            ScopeNeed::Read
+        } else if NATIVE_SEND.contains(&native) {
+            ScopeNeed::Chat
+        } else {
+            ScopeNeed::Full
+        };
+    }
+    if srv::cutex_request_session_id_from_path(path).is_some() {
+        let cutex = body["method"].as_str().unwrap_or("");
+        return if CUTEX_READ.contains(&cutex) {
+            ScopeNeed::Read
+        } else if CUTEX_SEND.contains(&cutex) || CUTEX_CHAT.contains(&cutex) {
+            ScopeNeed::Chat
+        } else {
+            ScopeNeed::Full
+        };
+    }
+    if let Some(session) = srv::server_response_session_id_from_path(path) {
+        let id = body.pointer("/native/message/id").cloned().unwrap_or(Value::Null);
+        return match pending_method(&session, &id) {
+            Some(method) if NATIVE_QUESTIONS.contains(&method.as_str()) => ScopeNeed::Chat,
+            _ => ScopeNeed::Full,
+        };
+    }
+    if super::attachments::session_id_from_path(path).is_some() {
+        return ScopeNeed::Chat;
+    }
+    ScopeNeed::Full
+}
+
+/// The method of the pending native server request `id` of a session.
+fn pending_server_request_method(session: &str, id: &Value) -> Option<String> {
+    super::server_requests::pending_all()
+        .ok()?
+        .into_iter()
+        .find(|(owner, _, native, _)| owner == session && native.get("id") == Some(id))
+        .and_then(|(_, _, native, _)| native["method"].as_str().map(str::to_string))
+}
+
+fn scope_allows(scope: DeviceScope, need: ScopeNeed) -> bool {
+    match need {
+        ScopeNeed::Read => true,
+        ScopeNeed::Chat => scope >= DeviceScope::Chat,
+        ScopeNeed::Full => scope.is_full(),
+    }
+}
+
+/// The device-scope gate: one place for every narrowed client / device
+/// token (owner-bound or not; the user gate runs afterwards, so the
+/// effective rights are the user's rights ∩ the device scope). A `chat`
+/// device's input is limited like a member's: `text` and `localImage` of an
+/// attachment this token uploaded to the session.
+pub fn device_scope_gate(stream: &mut TcpStream, request: &SimpleHttpRequest, scope: DeviceScope) -> Gate {
+    if scope.is_full() {
+        return Gate::Continue;
+    }
+    let path = request.path.split('?').next().unwrap_or(&request.path);
+    let body: Value = if request.method == "POST" {
+        serde_json::from_slice(&request.body).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let token = crate::management::listeners::current_client_token().map(|token| token.token_id);
+    let need = scope_need(&request.method, path, &body, token.as_deref(), pending_server_request_method);
+    if !scope_allows(scope, need) {
+        let required = if need == ScopeNeed::Chat { "chat" } else { "full" };
+        return deny(
+            stream,
+            "device_scope_denied",
+            "this device's scope does not allow this request",
+            json!({ "scope": scope, "required": required }),
+        );
+    }
+    if need == ScopeNeed::Chat {
+        if let Some(session) = super::server::cutex_request_session_id_from_path(path) {
+            if CUTEX_SEND.contains(&body["method"].as_str().unwrap_or("")) {
+                match check_input_for(&body["params"], &session) {
+                    Ok(()) => {}
+                    Err(InputRefusal::Type) => {
+                        return deny(
+                            stream,
+                            "input_type_not_allowed",
+                            "only text and own attachment (localImage) input is allowed for this device",
+                            json!({ "scope": scope }),
+                        )
+                    }
+                    Err(InputRefusal::NotOwnAttachment) => {
+                        return deny(
+                            stream,
+                            "attachment_not_owned",
+                            "localImage must be an attachment this device uploaded to this session",
+                            json!({ "scope": scope }),
+                        )
+                    }
+                }
+            }
+        }
+    }
+    Gate::Continue
 }
 
 fn send_not_granted(stream: &mut TcpStream) -> Gate {
@@ -778,7 +968,28 @@ impl AskVisibility {
     }
 }
 
-fn event_visible(event: &super::model::EventEnvelope, scope: &Scope, asks: &AskVisibility) -> bool {
+const HOST_EVENTS: &str = super::services::HOST_EVENT_SESSION_ID;
+
+/// The user id of the current request's non-owner principal.
+fn current_user_id() -> Option<String> {
+    match crate::management::users::current_principal()? {
+        Principal::User { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
+/// `user` = the non-owner user of the stream: host events are the owner's,
+/// except `cutex/client/*` for that user's own desktop instances
+/// (client-remote-close).
+fn event_visible(event: &super::model::EventEnvelope, scope: &Scope, asks: &AskVisibility, user: Option<&str>) -> bool {
+    if event.cutex_session_id == HOST_EVENTS {
+        return match (&event.cutex, user) {
+            (Some(message), Some(user)) if message.method.starts_with("cutex/client/") => {
+                super::clients_api::event_for_user(&message.params, user)
+            }
+            _ => false,
+        };
+    }
     if event.cutex_session_id.is_empty() || !scope.sees_session(&event.cutex_session_id) {
         return false;
     }
@@ -797,9 +1008,9 @@ fn owner_only_event(method: &str) -> bool {
     method.starts_with("cutex/workflow")
 }
 
-fn event_visible_json(event: &Value, scope: &Scope, asks: &AskVisibility) -> bool {
+fn event_visible_json(event: &Value, scope: &Scope, asks: &AskVisibility, user: Option<&str>) -> bool {
     match serde_json::from_value::<super::model::EventEnvelope>(event.clone()) {
-        Ok(event) => event_visible(&event, scope, asks),
+        Ok(event) => event_visible(&event, scope, asks, user),
         Err(_) => false,
     }
 }
@@ -875,6 +1086,15 @@ pub fn capabilities_for(principal: &Principal) -> Value {
     value["user"]["token"] = crate::management::listeners::current_client_token()
         .and_then(|token| super::users_api::own_token_view(&token.token_id))
         .unwrap_or(Value::Null);
+    // device-scope: what this connection may do on top of the user's rights
+    // (the root credential: full).
+    let scope = crate::management::listeners::current_client_token().map_or(DeviceScope::Full, |token| token.scope);
+    value["user"]["scope"] = json!(scope);
+    // owner-local-only: whether this connection counts as the host itself
+    // (the root credential, or an owner token issued by `client-token issue`
+    // on the host, on a loopback listener: the local or an SSH-tunnelled
+    // desktop). Root-identity actions also need `scope` full.
+    value["user"]["ownerLocal"] = json!(crate::management::users::request_is_owner_local());
     value
 }
 

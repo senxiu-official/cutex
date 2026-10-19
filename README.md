@@ -6,10 +6,11 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.1.4**: Claude agents grow up (launch permission modes, the claude-r19 runtime, context windows
-and effort levels, repin, skills import, subagent transcripts, file rewind, permission rules),
-Profile looks on the host, clearer approvals, proxy modes and a safer rollback
-(0.1.x is "First Take"; 0.1.0 was the first public release). See [CHANGELOG.md](CHANGELOG.md).
+**0.1.5**: owner devices (new owner devices are announced, host-control actions only on the host or
+over SSH, per-device scope full / chat / read, the owner in person), Claude Side chats and busy forks
+(claude-r21), cross-host wake, home pages and remote close of a desktop on the host, CC Switch import,
+and a rollback that never widens a device's access (0.1.x is "First Take"; 0.1.0 was the first
+public release). See [CHANGELOG.md](CHANGELOG.md).
 
 > **Known gaps in 0.1.x** (being fixed; this note goes away when they are):
 > - **Phone push / pairing a phone**: there is no public phone app yet.

@@ -195,6 +195,18 @@ submission started from idle; reconnect restores delivery ownership only with th
 and a matching native turn receipt. Older records cannot prove this distinction and fall
 back to owner after daemon restart.
 
+Passive notes already in the runtime's inbox ride along with the **start** of the next turn of any
+kind (owner message, ask, delivery): they are in its first model request, and a running turn reads
+the ones that arrive later after its next tool call. Codex consumes passive ExternalInput at a
+turn's first input boundary (after the turn's own input). Claude reads them when the adapter claims
+the turn (`Store.claim`); before claude-r21 an owner-started turn skipped them, so they waited for
+its first tool call (PostToolUse) or the next turn, and a turn without tool calls never saw them
+(hachimi 2026-10-19). The owner's wake (`cutex/agentBus/wake`, the desktop's 唤醒 on pending notes)
+is an owner input, `strategy: auto` (`queue` while busy), so the turn it starts reads every pending
+note that has reached the inbox at its start; `pendingNotes` in its result is cutex's count. Each
+note is read into context once: Claude's turn-start items are its delivery receipt
+(`messageDelivered`), and a later PostToolUse finds nothing left.
+
 Each session's user-input store has an additive admission registry. Variable-length
 base-65536 fraction keys compare lexicographically, allowing repeated owner insertion
 between neighbours without renumbering asks. Initial ordering uses enqueue/create times

@@ -393,9 +393,13 @@ pub fn handle(
     );
     match result {
         Ok((created, resource)) => {
-            // A non-owner's upload is recorded for its token (P2 access).
+            // A non-owner's upload is recorded for its token (P2 access), so
+            // is a narrowed device's (device-scope: a chat device may only
+            // send its own uploads as localImage).
             let non_owner = crate::management::users::current_principal().is_some_and(|p| !p.is_owner());
-            if let Some(token) = crate::management::listeners::current_client_token().filter(|_| non_owner) {
+            if let Some(token) = crate::management::listeners::current_client_token()
+                .filter(|token| non_owner || !token.scope.is_full())
+            {
                 let path = resource["path"].as_str().unwrap_or_default();
                 if let Err(record_error) = record_uploader(Path::new(path), &token.token_id) {
                     return error(

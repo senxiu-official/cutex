@@ -27,6 +27,7 @@ pub fn ask_error(error: Error) -> AskError {
         "id_not_found" => "id_not_found",
         "idempotency_conflict" => "idempotency_conflict",
         "peer_rate_limited" => "peer_rate_limited",
+        "wake_not_allowed" => "wake_not_allowed",
         _ => "peer_unavailable",
     };
     AskError::new(code, error.code.clone()).with(error.details)
@@ -148,6 +149,17 @@ pub fn wire_snapshot(store: &AskStore, mut snapshot: Snapshot, label: &str) -> R
     }
     Ok(snapshot)
 }
+/// The peer policy as ask approval evidence binds it: the tell-wake fields
+/// do not affect ask admission, so adding them (upgrade) keeps the evidence
+/// of asks awaiting approval valid.
+fn ask_policy_value(policy: &super::policy::Policy) -> Value {
+    let mut value = serde_json::to_value(policy).unwrap_or_default();
+    if let Some(inbound) = value.get_mut("inbound").and_then(Value::as_object_mut) {
+        inbound.remove("tellWake");
+        inbound.remove("tellWakesPerHour");
+    }
+    value
+}
 pub fn validate_inbound(peer: &Peer, target: &str) -> Result<()> {
     if !peer.enabled || peer.pending_until.is_some() {
         return Err(Error::new("peer_unavailable", 409));
@@ -197,7 +209,7 @@ pub fn gate_inputs(
             approval_policy: None,
         });
         inputs.links_version = crate::approvals::request_digest(
-            &json!({"peerId":peer_id,"userId":peer.user_id,"policyRevision":peer.policy_revision,"policy":peer.policy,"claimedCaps":source.request.requester.caps,"assumedCaps":peer.policy.inbound.assumed_caps,"targetLinks":inputs.links_version}),
+            &json!({"peerId":peer_id,"userId":peer.user_id,"policyRevision":peer.policy_revision,"policy":ask_policy_value(&peer.policy),"claimedCaps":source.request.requester.caps,"assumedCaps":peer.policy.inbound.assumed_caps,"targetLinks":inputs.links_version}),
         );
         inputs.project_policy = if needs {
             "peer-review-required-v1"
@@ -578,7 +590,7 @@ pub fn other_hosts() -> Value {
         let cache=super::routes::cached(&store,p);
         let age=cache["fetchedAt"].as_str().and_then(crate::asks::parse_time).map(|at|(Utc::now()-at).num_seconds().max(0));
         let agents=cache["agents"].as_array().cloned().unwrap_or_default().into_iter().map(|mut a|{let name=a["name"].as_str().or_else(||a["cutexSessionId"].as_str()).unwrap_or("agent");a["address"]=json!(format!("{name}@{}",p.label));a}).collect::<Vec<_>>();
-        json!({"peerId":p.peer_id,"label":p.label,"status":p.status,"cacheAgeSecs":age,"tells":p.features.iter().any(|f|f==super::tells::FEATURE),"agents":agents})
+        json!({"peerId":p.peer_id,"label":p.label,"status":p.status,"cacheAgeSecs":age,"tells":p.features.iter().any(|f|f==super::tells::FEATURE),"tellWake":super::tells::supports_wake(p),"agents":agents})
     }).collect::<Vec<_>>())
 }
 pub fn resolve(target: &str) -> Result<(Peer, Value)> {

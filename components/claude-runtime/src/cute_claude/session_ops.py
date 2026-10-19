@@ -48,20 +48,26 @@ class NativeSessionApi:
         require(len(matches) <= 1, 'native session UUID is ambiguous in this account', -32009)
         return matches[0] if matches else None
 
-    def entries(self, sid: str) -> list[dict]:
+    def entries(self, sid: str, *, live: bool = False) -> list[dict]:
+        """Main-chain transcript entries. `live`: a running Claude Code may be
+        appending, so an unterminated last line is a record still being written
+        and is left out; any other unreadable record still fails."""
         path = self.transcript(sid)
         require(path is not None, 'native transcript is unavailable; no history was changed', -32004)
         entries = []
-        with path.open(encoding='utf-8') as source:
-            for line in source:
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except (ValueError, UnicodeError):
-                    raise RpcError(-32009, 'native transcript has an incomplete record; no history was changed') from None
-                if isinstance(entry, dict) and entry.get('uuid') and not entry.get('isSidechain'):
-                    entries.append(entry)
+        raw = path.read_bytes()
+        lines = raw.split(b'\n')
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line.decode('utf-8'))
+            except (ValueError, UnicodeError):
+                if live and index == len(lines) - 1:
+                    break
+                raise RpcError(-32009, 'native transcript has an incomplete record; no history was changed') from None
+            if isinstance(entry, dict) and entry.get('uuid') and not entry.get('isSidechain'):
+                entries.append(entry)
         return entries
 
     async def call(self, kind: str, sid: str, **arguments) -> dict:
@@ -184,11 +190,89 @@ class SessionOperations:
         self.store.db.execute('UPDATE session_operations SET state=?,data=? WHERE id=?', (state, dump(record), action_id))
         return record
 
-    @structural
-    async def fork(self, tid: str, params: dict | None = None) -> dict:
-        params = params or {}
-        self.idle(tid)
+    def busy(self, tid) -> bool:
+        """A running turn, or queued inputs / notes, in the source."""
+        return bool(self.store.pending(tid) or self.store.pending_notes(tid) or self.store.db.execute(
+            "SELECT 1 FROM turns WHERE thread_id=? AND reverted=0 AND state='inProgress'", (tid,)).fetchone())
+
+    @staticmethod
+    def boundary(turns: list[dict], last: str | None = None, before: str | None = None) -> int:
+        """How many visible turns a fork of a possibly busy source keeps: through
+        `last` (inclusive, must have ended), before `before`, or by default every
+        turn before the first running one. Same rule as Codex forks and Side."""
+        ids = [t['id'] for t in turns]
+        require(last is None or before is None, 'lastTurnId and beforeTurnId are mutually exclusive')
+        for name, value in (('lastTurnId', last), ('beforeTurnId', before)):
+            if value is not None and value not in ids:
+                raise RpcError(-32004, f'{name} is not a visible turn', {'code': 'turn_not_found', 'turnId': value})
+        if last is not None:
+            keep = ids.index(last) + 1
+            if turns[keep - 1]['state'] == 'inProgress':
+                raise RpcError(-32009, 'the turn is still running; fork after it completed or pick an earlier turn',
+                               {'code': 'turn_in_progress', 'turnId': last})
+            return keep
+        if before is not None:
+            keep = ids.index(before)
+        else:
+            keep = next((i for i, t in enumerate(turns) if t['state'] == 'inProgress'), len(turns))
+        running = next((t['id'] for t in turns[:keep] if t['state'] == 'inProgress'), None)
+        if running:
+            raise RpcError(-32009, 'the turn is still running; fork after it completed or pick an earlier turn',
+                           {'code': 'turn_in_progress', 'turnId': running})
+        return keep
+
+    @staticmethod
+    def prompt_entry(entry: dict) -> bool:
+        """A typed user prompt (not a tool result or meta record)."""
+        if entry.get('type') != 'user' or entry.get('isMeta'):
+            return False
+        content = entry.get('message', {}).get('content')
+        return isinstance(content, str) or (isinstance(content, list) and any(
+            isinstance(b, dict) and b.get('type') != 'tool_result' for b in content))
+
+    async def live_cutoff(self, tid: str, turns: list[dict], keep: int, sid: str) -> str | None:
+        """Native UUID ending `turns[:keep]` in a transcript the source's live
+        runtime may still append to (it is never closed or leased). None: keep
+        nothing. Refuses (retryable) rather than guess where a running turn starts."""
+        if not keep:
+            return None
         api = self.api()
+        observed = [r[0] for r in self.store.db.execute('SELECT native_uuid FROM sdk_turn_messages WHERE thread_id=? '
+                                                         'AND turn_id=? ORDER BY seq', (tid, turns[keep - 1]['id']))]
+        # Claude Code writes its transcript asynchronously: wait briefly until the
+        # kept turn's last observed message is on disk (or, after that, at least
+        # one of them: a streamed message need not be persisted).
+        for _ in range(30):
+            entries = api.entries(sid, live=True)
+            if not observed or observed[-1] in {e['uuid'] for e in entries}:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            if not set(observed) & {e['uuid'] for e in entries}:
+                raise RpcError(-32009, 'the native transcript has not caught up with the selected turn yet; retry in a moment',
+                               {'code': 'native_transcript_behind', 'retryable': True})
+        running = any(t['state'] == 'inProgress' for t in turns)
+        if keep < len(turns):
+            try:
+                return self.prefix(tid, turns, keep, entries)
+            except RpcError:
+                if turns[keep]['state'] != 'inProgress':
+                    raise
+            # The running turn's prompt is not identifiable (not yet written, or not
+            # yet observed): only safe when none of its messages are on disk.
+            later = {r[0] for r in self.store.db.execute(
+                'SELECT native_uuid FROM sdk_turn_messages WHERE thread_id=? AND turn_id=?', (tid, turns[keep]['id']))}
+            if any(e['uuid'] in later for e in entries):
+                raise RpcError(-32009, 'the running turn cannot be separated from the kept history yet; retry in a moment',
+                               {'code': 'native_transcript_behind', 'retryable': True})
+        require(bool(entries), 'native transcript has no messages to fork', -32009)
+        if running and self.prompt_entry(entries[-1]):
+            # A prompt after the last finished turn belongs to the running one.
+            raise RpcError(-32009, 'the running turn has just started; retry in a moment',
+                           {'code': 'native_transcript_behind', 'retryable': True})
+        return entries[-1]['uuid']
+
+    def fork_target(self, params: dict) -> tuple[str, Path | None]:
         target_id = params.get('targetThreadId') or identifier()
         try:
             valid_id = str(uuid.UUID(target_id)) == target_id
@@ -199,6 +283,67 @@ class SessionOperations:
         if target_path:
             require(target_path.is_absolute() and not target_path.is_symlink(), 'targetStateDir must be an absolute private directory')
             require(not target_path.exists() or not any(target_path.iterdir()), 'targetStateDir must be empty', -32009)
+        return target_id, target_path
+
+    def target_store(self, target_path: Path | None) -> Store:
+        if not target_path:
+            return self.store
+        target_store = Store(target_path)
+        target_store.bind_backend('subscription')
+        target_store.db.execute('''CREATE TABLE IF NOT EXISTS sdk_sessions(
+            thread_id TEXT PRIMARY KEY REFERENCES threads(id), session_id TEXT NOT NULL UNIQUE,
+            attempted INTEGER NOT NULL DEFAULT 0, last_status TEXT NOT NULL DEFAULT 'allocated')''')
+        return target_store
+
+    async def fork(self, tid: str, params: dict | None = None) -> dict:
+        """An idle source is forked offline (its runtime closed and restarted
+        around the native copy). A busy one (running turn, queued inputs or
+        notes) is forked live from its transcript: the running turn and the
+        queue are left out, and the source runtime is not touched (claude-r21)."""
+        params = params or {}
+        self.store.thread(tid)
+        if self.busy(tid):
+            return await self.live_fork(tid, params)
+        return await self.offline_fork(tid, params)
+
+    async def live_fork(self, tid: str, params: dict) -> dict:
+        api = self.api()
+        target_id, target_path = self.fork_target(params)
+        turns = self.visible_turns(tid)
+        keep = self.boundary(turns, params.get('lastTurnId'), params.get('beforeTurnId'))
+        ids = [t['id'] for t in turns]
+        name = text(params['name'], 'name', limit=512) if params.get('name') is not None else None
+        session = self.engine.session(tid)
+        action_id = self.journal(tid, 'fork', {'sourceSessionId': session['session_id'], 'targetThreadId': target_id, 'live': True})
+        result, target_store = None, self.store
+        try:
+            if keep:
+                cutoff = await self.live_cutoff(tid, turns, keep, session['session_id'])
+                # Read-only on the source transcript: no lease, the owner keeps writing.
+                result = await api.call('fork', session['session_id'], upToMessageId=cutoff, title=name)
+            else:
+                result = {'sessionId': identifier()}
+            target_store = self.target_store(target_path)
+            mapping = {e.get('forkedFrom', {}).get('messageUuid'): e['uuid'] for e in api.entries(result['sessionId'])} if keep else {}
+            self._copy_projection(target_store, tid, target_id, turns[:keep], result['sessionId'], bool(keep), params, mapping)
+            return self.audit(action_id, {'threadId': target_id, 'nativeSessionId': result['sessionId'],
+                'stateDir': str(target_store.directory), 'forkedThroughTurnId': ids[keep - 1] if keep else None,
+                'sourceThreadId': tid, 'sourceRuntime': None, 'sourceRuntimeUntouched': True,
+                'fileCheckpointsCopied': False})
+        except BaseException:
+            self.audit(action_id, {'sourceThreadId': tid, 'targetThreadId': target_id,
+                'stateDir': str(target_path or self.store.directory),
+                'nativeSessionId': result.get('sessionId') if result else None}, 'failed')
+            raise
+        finally:
+            if target_store is not self.store:
+                target_store.close()
+
+    @structural
+    async def offline_fork(self, tid: str, params: dict) -> dict:
+        self.idle(tid)
+        api = self.api()
+        target_id, target_path = self.fork_target(params)
         online, offline = self.was_online(tid), tid in getattr(self.engine, 'offline_threads', set())
         turns = self.visible_turns(tid)
         last = params.get('lastTurnId')
@@ -225,12 +370,7 @@ class SessionOperations:
                     result = {'sessionId': identifier()}
             finally:
                 with_lease.close()
-            if target_path:
-                target_store = Store(target_path)
-                target_store.bind_backend('subscription')
-                target_store.db.execute('''CREATE TABLE IF NOT EXISTS sdk_sessions(
-                    thread_id TEXT PRIMARY KEY REFERENCES threads(id), session_id TEXT NOT NULL UNIQUE,
-                    attempted INTEGER NOT NULL DEFAULT 0, last_status TEXT NOT NULL DEFAULT 'allocated')''')
+            target_store = self.target_store(target_path)
             mapping = {e.get('forkedFrom', {}).get('messageUuid'): e['uuid'] for e in api.entries(result['sessionId'])} if keep else {}
             self._copy_projection(target_store, tid, target_id, turns[:keep], result['sessionId'], bool(keep), params, mapping)
             source_runtime = await self.restore_runtime(tid, online, offline)

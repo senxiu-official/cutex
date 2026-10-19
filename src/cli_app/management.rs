@@ -5,7 +5,9 @@ use std::process::Stdio;
 
 use anyhow::Context;
 
-use cutex::cli::args::{ManagementClientTokenCommand, ManagementCommand, ManagementUsersCommand};
+use cutex::cli::args::{
+    ManagementClientTokenCommand, ManagementCommand, ManagementOwnerCommand, ManagementUsersCommand,
+};
 #[cfg(windows)]
 use cutex::config::env::{env_bool_override, CUTEX_WINDOWS_DESKTOP_LAUNCHER_ENV_VAR};
 use cutex::config::store::load_codez_config;
@@ -37,8 +39,8 @@ pub(crate) fn run_command(command: ManagementCommand) -> anyhow::Result<()> {
             arm_windows_hosted_launcher_guard()?;
             cmd_management_serve(port, &bind, token)
         }
-        ManagementCommand::Pair { label, port, json } => {
-            cmd_management_pair(label.as_deref(), port, json)
+        ManagementCommand::Pair { label, user, scope, port, json } => {
+            cmd_management_pair(label.as_deref(), user.as_deref(), scope.as_deref(), port, json)
         }
         ManagementCommand::Schema {
             command: cutex::cli::args::ManagementSchemaCommand::Export { out },
@@ -65,6 +67,7 @@ pub(crate) fn run_command(command: ManagementCommand) -> anyhow::Result<()> {
         ),
         ManagementCommand::ClientToken { command } => cmd_management_client_token(command),
         ManagementCommand::Users { command } => cmd_management_users(command),
+        ManagementCommand::Owner { command } => cmd_management_owner(command),
         ManagementCommand::AgentAuthority {
             request_file,
             port,
@@ -90,41 +93,23 @@ fn cmd_management_client_token(command: ManagementClientTokenCommand) -> anyhow:
     use cutex::management::client_tokens::ClientTokenStore;
     let store = ClientTokenStore::open_default()?;
     let output = match command {
-        ManagementClientTokenCommand::Issue { label, user, pending } => {
+        ManagementClientTokenCommand::Issue { label, user, pending, scope } => {
             if management_root_credential(&load_codez_config(), None).is_err() {
                 eprintln!(
                     "warning: no Management root credential (management_api_token) is configured; \
                      client tokens are refused until one is set"
                 );
             }
-            let users = cutex::management::users::UserStore::beside(&store);
-            // Decide the binding before issuing: the new token must not count
-            // as the host's first owner device.
-            let binding = match (user, pending) {
-                (_, true) => None,
-                (Some(user), false) => {
-                    let known = users.snapshot()?.user(&user).is_some();
-                    if !known {
-                        anyhow::bail!("no user with id {user}");
-                    }
-                    Some(user)
-                }
-                (None, false) => users
-                    .default_cli_binding()
-                    .map_err(|error| anyhow::anyhow!(error.message))?,
-            };
-            let issued = store.issue(&label)?;
-            if let Some(user) = &binding {
-                if let Err(error) = users.bind_token(&issued.token_id, Some(user), "cli") {
-                    let _ = store.revoke(&issued.token_id);
-                    anyhow::bail!("could not bind the new token: {}", error.message);
-                }
-            }
-            // Order: tokenId, label, token, createdAt, userId, pending.
-            let mut value = serde_json::to_value(&issued)?;
-            value["userId"] = serde_json::json!(binding);
-            value["pending"] = serde_json::json!(binding.is_none());
-            if binding.is_none() {
+            let scope = scope
+                .as_deref()
+                .map(|text| {
+                    cutex::management::client_tokens::DeviceScope::parse(text)
+                        .ok_or_else(|| anyhow::anyhow!("--scope must be full, chat or read"))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let value = issue_client_token(&store, &label, user, pending, scope)?;
+            if value["pending"] == true {
                 eprintln!(
                     "note: this token is pending: it connects but sees nothing until the host owner \
                      assigns it (Settings → Users on an owner device, or `cutex management users assign`)"
@@ -144,6 +129,154 @@ fn cmd_management_client_token(command: ManagementClientTokenCommand) -> anyhow:
     };
     println!("{output}");
     Ok(())
+}
+
+/// `cutex management client-token issue` without the warnings: issue,
+/// bind, and the printed JSON `{tokenId, label, token, createdAt, userId
+/// (string|null), pending, scope}`. A token bound to the owner is a new
+/// owner device (`via: "ssh"`, owner-device-notice): the daemon announces it
+/// on its next request.
+fn issue_client_token(
+    store: &cutex::management::client_tokens::ClientTokenStore,
+    label: &str,
+    user: Option<String>,
+    pending: bool,
+    scope: cutex::management::client_tokens::DeviceScope,
+) -> anyhow::Result<serde_json::Value> {
+    let users = cutex::management::users::UserStore::beside(store);
+    // Decide the binding before issuing: the new token must not count
+    // as the host's first owner device.
+    let binding = match (user, pending) {
+        (_, true) => None,
+        (Some(user), false) => {
+            let known = users.snapshot()?.user(&user).is_some();
+            if !known {
+                anyhow::bail!("no user with id {user}");
+            }
+            Some(user)
+        }
+        (None, false) => users
+            .default_cli_binding()
+            .map_err(|error| anyhow::anyhow!(error.message))?,
+    };
+    let issued = store.issue_scoped(label, scope)?;
+    if let Some(user) = &binding {
+        if let Err(error) = users.bind_token(&issued.token_id, Some(user), "cli") {
+            let _ = store.revoke(&issued.token_id);
+            anyhow::bail!("could not bind the new token: {}", error.message);
+        }
+    }
+    // Order: tokenId, label, token, createdAt, userId, pending, scope.
+    let mut value = serde_json::to_value(&issued)?;
+    value["userId"] = serde_json::json!(binding);
+    value["pending"] = serde_json::json!(binding.is_none());
+    value["scope"] = serde_json::json!(scope);
+    Ok(value)
+}
+
+/// `POST /v2/pairing-codes` body of `cutex management pair`.
+fn pair_request_body(label: Option<&str>, user: Option<&str>, scope: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({ "label": label });
+    if let Some(user) = user {
+        body["userId"] = serde_json::json!(user);
+    }
+    if let Some(scope) = scope {
+        body["scope"] = serde_json::json!(scope);
+    }
+    body
+}
+
+/// `cutex management owner show|set-person|clear-person`: edits the
+/// persons store directly (no daemon needed; local account access is the
+/// authority, as for `client-token issue`). Source `local`, actor `cli`.
+fn cmd_management_owner(command: ManagementOwnerCommand) -> anyhow::Result<()> {
+    use cutex::management::client_tokens::ClientTokenStore;
+    use cutex::management::users::UserStore;
+    let tokens = ClientTokenStore::open_default()?;
+    let users = UserStore::beside(&tokens);
+    let (value, json) = owner_command(&users, command)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print!("{}", owner_text(&value));
+    }
+    Ok(())
+}
+
+/// The work of `cutex management owner …` → (output, print as JSON).
+/// Output: `{owner: <GET /v2/host owner>, publicKey, ownerKeys: [{publicKey,
+/// fingerprint, addedAt, label, ownerPerson}]}`.
+fn owner_command(
+    users: &cutex::management::users::UserStore,
+    command: ManagementOwnerCommand,
+) -> anyhow::Result<(serde_json::Value, bool)> {
+    use cutex::management::persons;
+    let message = |error: cutex::management::users::UserError| anyhow::anyhow!(error.message);
+    let json = match command {
+        ManagementOwnerCommand::Show { json } => json,
+        ManagementOwnerCommand::SetPerson { key } => {
+            let state = users.persons_snapshot()?;
+            let Some(public_key) = persons::resolve_owner_key(&state, &key) else {
+                anyhow::bail!(
+                    "{key} is not one of the owner's person keys (see `cutex management owner show`)"
+                );
+            };
+            users.set_owner_person(&public_key, "cli").map_err(message)?;
+            false
+        }
+        ManagementOwnerCommand::ClearPerson => {
+            users.clear_owner_person("cli").map_err(message)?;
+            false
+        }
+    };
+    let state = users.persons_snapshot()?;
+    let person = users.owner_person().map(|(key, _)| key);
+    let keys: Vec<serde_json::Value> = state
+        .keys_of(cutex::management::users::OWNER)
+        .iter()
+        .map(|key| {
+            let mut view = key.view();
+            view["ownerPerson"] = serde_json::json!(person.as_deref() == Some(key.public_key.as_str()));
+            view
+        })
+        .collect();
+    Ok((
+        serde_json::json!({ "owner": users.owner_view(), "publicKey": person, "ownerKeys": keys }),
+        json,
+    ))
+}
+
+fn owner_text(value: &serde_json::Value) -> String {
+    let owner = &value["owner"];
+    let mut text = format!(
+        "Owner:        {}\n",
+        owner["displayName"].as_str().unwrap_or("(no name)")
+    );
+    if owner["confirmed"] == true {
+        text.push_str(&format!(
+            "Owner person: {} (source {})\n",
+            owner["fingerprint"].as_str().unwrap_or_default(),
+            owner["source"].as_str().unwrap_or_default()
+        ));
+    } else {
+        text.push_str("Owner person: unconfirmed\n");
+    }
+    let keys = value["ownerKeys"].as_array().cloned().unwrap_or_default();
+    if keys.is_empty() {
+        text.push_str("Owner keys:   none (a desktop adds its key when it connects)\n");
+    } else {
+        text.push_str("Owner keys:\n");
+        for key in keys {
+            text.push_str(&format!(
+                "  {} {}  added {}{}\n",
+                if key["ownerPerson"] == true { "*" } else { " " },
+                key["fingerprint"].as_str().unwrap_or_default(),
+                key["addedAt"].as_str().unwrap_or_default(),
+                key["label"].as_str().map(|label| format!("  {label}")).unwrap_or_default()
+            ));
+        }
+    }
+    text
 }
 
 /// `cutex management users list|assign|rollback-check`: edits the users
@@ -300,13 +433,19 @@ fn cmd_management_agent_authority(
 
 /// `cutex management pair`: ask the local daemon (loopback, root credential)
 /// for a pairing code and print it with a terminal QR code.
-fn cmd_management_pair(label: Option<&str>, port: Option<u16>, json: bool) -> anyhow::Result<()> {
+fn cmd_management_pair(
+    label: Option<&str>,
+    user: Option<&str>,
+    scope: Option<&str>,
+    port: Option<u16>,
+    json: bool,
+) -> anyhow::Result<()> {
     let config = load_codez_config();
     let port = port.unwrap_or_else(|| cutex::management::service::management_port(&load_codez_config()));
     validate_management_port(port)?;
     let root = management_root_credential(&config, None)
         .map_err(|error| anyhow::anyhow!("{error}; pairing needs management_api_token"))?;
-    let body = serde_json::to_vec(&serde_json::json!({ "label": label }))?;
+    let body = serde_json::to_vec(&pair_request_body(label, user, scope))?;
     let response = management_http_json(
         &management_base_url(port),
         "POST",
@@ -653,5 +792,149 @@ mod cli_tests {
             "authority.json",
         ])
         .is_ok());
+    }
+
+    fn temp_stores() -> (
+        std::path::PathBuf,
+        cutex::management::client_tokens::ClientTokenStore,
+        cutex::management::users::UserStore,
+    ) {
+        let root = std::env::temp_dir().join(format!("cutex-cli-owner-{}", uuid::Uuid::new_v4()));
+        let tokens =
+            cutex::management::client_tokens::ClientTokenStore::at(root.join("management-clients"));
+        let users = cutex::management::users::UserStore::beside(&tokens);
+        (root, tokens, users)
+    }
+
+    fn key(seed: u8) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([seed; 32])
+    }
+
+    fn root_claim(users: &cutex::management::users::UserStore, key: &str) {
+        let claim = cutex::management::persons::VerifiedClaim {
+            token_id: None,
+            public_key: key.to_string(),
+            display_name: None,
+        };
+        users.apply_claim(&claim, "root").unwrap();
+    }
+
+    #[test]
+    fn client_token_issue_prints_user_and_pending() {
+        let (root, tokens, _) = temp_stores();
+        // The host's first device: the owner's.
+        let first = super::issue_client_token(&tokens, "desktop-a", None, false, Default::default()).unwrap();
+        let fields: Vec<&String> = first.as_object().unwrap().keys().collect();
+        for field in ["tokenId", "label", "token", "createdAt", "userId", "pending"] {
+            assert!(fields.iter().any(|f| *f == field), "{field}: {first}");
+        }
+        assert_eq!(first["userId"], "owner");
+        assert_eq!(first["pending"], false);
+        assert_eq!(first["label"], "desktop-a");
+        assert!(first["token"].as_str().unwrap().starts_with("cxm1."));
+        // --pending: no user.
+        let pending = super::issue_client_token(&tokens, "ssh-b", None, true, Default::default()).unwrap();
+        assert_eq!(pending["userId"], serde_json::Value::Null);
+        assert_eq!(pending["pending"], true);
+        // Later device without --user: pending (owner approval required by default).
+        let later = super::issue_client_token(&tokens, "ssh-c", None, false, Default::default()).unwrap();
+        assert_eq!((later["userId"].clone(), later["pending"].clone()), (serde_json::Value::Null, serde_json::json!(true)));
+        // --user owner.
+        let owner = super::issue_client_token(
+            &tokens,
+            "ssh-d",
+            Some("owner".into()),
+            false,
+            cutex::management::client_tokens::DeviceScope::Chat,
+        )
+        .unwrap();
+        assert_eq!((owner["userId"].clone(), owner["pending"].clone()), (serde_json::json!("owner"), serde_json::json!(false)));
+        assert_eq!(owner["scope"], "chat");
+        assert_eq!(first["scope"], "full");
+        assert!(super::issue_client_token(&tokens, "ssh-e", Some("u-000000000000".into()), false, Default::default()).is_err());
+        // Owner tokens from the CLI are new owner devices (via ssh); the
+        // first device too (it was bound, not migrated).
+        let users = cutex::management::users::UserStore::beside(&tokens);
+        let notices = users.snapshot().unwrap().new_owner_devices.clone();
+        let ids: Vec<(&str, &str)> = notices.iter().map(|n| (n.token_id.as_str(), n.via.as_str())).collect();
+        assert!(ids.contains(&(owner["tokenId"].as_str().unwrap(), "ssh")), "{ids:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pair_passes_the_user() {
+        let cli = Cli::try_parse_from(["cutex", "management", "pair", "--user", "u-0123456789ab", "--json"]).unwrap();
+        let cutex::cli::args::CommandKind::Management {
+            command: cutex::cli::args::ManagementCommand::Pair { user, json, .. },
+        } = cli.command.unwrap()
+        else {
+            panic!("pair should parse");
+        };
+        assert_eq!((user.as_deref(), json), (Some("u-0123456789ab"), true));
+        assert_eq!(
+            super::pair_request_body(Some("phone"), Some("u-0123456789ab"), None),
+            serde_json::json!({ "label": "phone", "userId": "u-0123456789ab" })
+        );
+        assert_eq!(super::pair_request_body(None, None, None), serde_json::json!({ "label": null }));
+        assert_eq!(
+            super::pair_request_body(None, None, Some("read")),
+            serde_json::json!({ "label": null, "scope": "read" })
+        );
+        let cli = Cli::try_parse_from(["cutex", "management", "pair", "--scope", "chat"]).unwrap();
+        let cutex::cli::args::CommandKind::Management {
+            command: cutex::cli::args::ManagementCommand::Pair { scope, .. },
+        } = cli.command.unwrap()
+        else {
+            panic!("pair should parse");
+        };
+        assert_eq!(scope.as_deref(), Some("chat"));
+        assert!(Cli::try_parse_from(["cutex", "management", "pair", "--scope", "admin"]).is_err());
+    }
+
+    #[test]
+    fn owner_commands_show_set_and_clear_the_owner_person() {
+        use cutex::cli::args::ManagementOwnerCommand;
+        for args in [
+            &["cutex", "management", "owner", "show", "--json"][..],
+            &["cutex", "management", "owner", "set-person", "0123456789abcdef"][..],
+            &["cutex", "management", "owner", "clear-person"][..],
+            &["cutex", "human", "management", "owner", "show"][..],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
+        }
+        let (root, _, users) = temp_stores();
+        let (value, json) = super::owner_command(&users, ManagementOwnerCommand::Show { json: true }).unwrap();
+        assert!(json);
+        assert_eq!(value["owner"]["confirmed"], false);
+        assert_eq!(value["ownerKeys"], serde_json::json!([]));
+        root_claim(&users, &key(1));
+        root_claim(&users, &key(2));
+        let (value, _) = super::owner_command(&users, ManagementOwnerCommand::Show { json: false }).unwrap();
+        let first = cutex::management::persons::fingerprint(&key(1));
+        let second = cutex::management::persons::fingerprint(&key(2));
+        assert_eq!(value["owner"]["fingerprint"], first.as_str());
+        assert_eq!(value["owner"]["source"], "firstRootClaim");
+        assert_eq!(value["publicKey"], key(1).as_str());
+        assert_eq!(value["ownerKeys"][0]["ownerPerson"], true);
+        assert_eq!(value["ownerKeys"][1]["ownerPerson"], false);
+        assert!(super::owner_text(&value).contains(&first));
+        // set-person by fingerprint.
+        let (value, _) =
+            super::owner_command(&users, ManagementOwnerCommand::SetPerson { key: second.clone() }).unwrap();
+        assert_eq!(value["owner"]["fingerprint"], second.as_str());
+        assert_eq!(value["owner"]["source"], "local");
+        // Not an owner key.
+        assert!(super::owner_command(&users, ManagementOwnerCommand::SetPerson { key: key(9) }).is_err());
+        // clear-person, then set by public key.
+        let (value, _) = super::owner_command(&users, ManagementOwnerCommand::ClearPerson).unwrap();
+        assert_eq!(value["owner"]["confirmed"], false);
+        assert_eq!(value["owner"]["fingerprint"], serde_json::Value::Null);
+        assert!(super::owner_text(&value).contains("unconfirmed"));
+        let (value, _) = super::owner_command(&users, ManagementOwnerCommand::SetPerson { key: key(1) }).unwrap();
+        assert_eq!(value["owner"]["fingerprint"], first.as_str());
+        let audit = std::fs::read_to_string(users.dir().join("audit.jsonl")).unwrap();
+        assert!(audit.contains("\"ownerPersonSet\"") && audit.contains("\"actor\":\"cli\""), "{audit}");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

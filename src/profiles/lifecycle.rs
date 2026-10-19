@@ -742,6 +742,10 @@ pub(crate) mod tests {
             unsafe { std::env::set_var("HOME", &root) };
             Self { root, previous, _guard: guard }
         }
+
+        pub(crate) fn root(&self) -> &std::path::Path {
+            &self.root
+        }
     }
 
     impl Drop for TestHome {

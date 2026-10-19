@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "release": "claude-r19",
+  "release": "claude-r21",
   "comment": "Feature switches cutex reads before it starts or talks to this adapter (components/claude-runtime/README.md). Catalog entries do not confirm account access.",
   "features": {
     "turnStart": true,
@@ -35,6 +35,8 @@
     "history": true,
     "historyRevert": true,
     "fork": true,
+    "forkWhileBusy": true,
+    "sideChat": true,
     "backgroundTerminals": true,
     "subagents": true,
     "subagentTranscripts": true,

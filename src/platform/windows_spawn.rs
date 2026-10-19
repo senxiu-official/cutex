@@ -113,6 +113,25 @@ pub const DETACHED_CREATION_FLAGS: PROCESS_CREATION_FLAGS =
     CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
 
 pub fn spawn_detached(command: &Command, log: &File) -> anyhow::Result<DetachedChild> {
+    spawn_detached_with_job(command, log, None)
+}
+
+/// [`spawn_detached`] into `job` (atomically, `PROC_THREAD_ATTRIBUTE_JOB_LIST`),
+/// then hand the child its own job handle (`platform::windows_job`): with a
+/// kill-on-close job, the child's descendants end with the child and the
+/// job does not depend on the caller staying alive.
+pub fn spawn_detached_in_job(command: &Command, log: &File, job: &OwnedHandle) -> anyhow::Result<DetachedChild> {
+    let child = spawn_detached_with_job(command, log, Some(job))?;
+    if let Err(error) = crate::platform::windows_job::transfer_job_handle(job, child.process.as_raw_handle()) {
+        // Without the handle the job would close (and kill the child) as
+        // soon as the caller drops its own; fail visibly instead.
+        let _ = child.terminate();
+        return Err(error);
+    }
+    Ok(child)
+}
+
+fn spawn_detached_with_job(command: &Command, log: &File, job: Option<&OwnedHandle>) -> anyhow::Result<DetachedChild> {
     ensure!(std::path::Path::new(command.get_program()).is_absolute(), "detached executable must be absolute");
     let program = wide(command.get_program())?;
     let mut commandline = Vec::new();
@@ -142,8 +161,12 @@ pub fn spawn_detached(command: &Command, log: &File) -> anyhow::Result<DetachedC
     let null = inheritable(&OpenOptions::new().read(true).write(true).open("NUL")?)?;
     let log = inheritable(log)?;
     let mut handles = [null.as_raw_handle(), log.as_raw_handle()];
-    let mut attributes = Attributes::new(1)?;
+    let mut jobs = job.map(|job| [job.as_raw_handle()]);
+    let mut attributes = Attributes::new(if jobs.is_some() { 2 } else { 1 })?;
     attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, &mut handles)?;
+    if let Some(jobs) = jobs.as_mut() {
+        attributes.set(PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, jobs)?;
+    }
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     startup.StartupInfo.cb = std::mem::size_of_val(&startup) as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;

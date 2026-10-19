@@ -174,6 +174,8 @@ not yet admitted.
 | `inbound.assumedCaps` | `{sandbox:"read-only",networkAccess:false,unrestrictedServices:false}` |
 | `inbound.maxOpenAsks` | 20; 1–10000 |
 | `inbound.asksPerHour` | 60; 1–100000 |
+| `inbound.tellWake` | false; true lets this peer's `agent_tell wake:true` start a turn ("Cross-host wake") |
+| `inbound.tellWakesPerHour` | 60; 1–100000; beyond it a wake arrives as a note |
 | `outbound.visibility` | `none`; also `all` |
 
 `always` requires ordinary destination `ask_delivery` approval for every new
@@ -293,10 +295,11 @@ other tools except `agent_delegate` and `agent_tell` refuse `@` targets too.
 `agent_tell` with `to: "name@host"` leaves an FYI note for an agent the other
 host exports. The target resolves exactly as for `agent_delegate`
 (`peers::asks::resolve`: outbound visibility, global/peer enable, peer status,
-cached/refreshed directory) with the same error codes. Only `to` and inline
-`text` (1 byte to 16 KiB) cross hosts: `wake:true`, `delegation`/`supersedes`
+cached/refreshed directory) with the same error codes. Only `to`, inline
+`text` (1 byte to 16 KiB) and `wake` cross hosts: `delegation`/`supersedes`
 (revisions) and `attachments` are refused with `remote_unsupported` and a
-precise detail before anything is resolved, sent or written.
+precise detail before anything is resolved, sent or written. `wake:true` is
+described under "Cross-host wake".
 
 The send is synchronous: `POST /peer/v1/tells` with
 `{schemaVersion:1, tellId, requester:{cutexSessionId,name}, target, text}`.
@@ -334,11 +337,81 @@ it came from another host (paths refer to that host) and how to reply.
 Both sides audit the request (`route:/peer/v1/tells`, `tellId`); bodies are
 never logged. Capability `cross-host-tell` (`crossHostTell`).
 
+The recipient's owner sees a pending peer tell like any agent note. The
+bootstrap entry (`cutexState.agentBusMessages`) and the live
+`cutex/agentBus/messageQueued` event on the recipient's stream carry `body`,
+`deliveryKind: "note"`, `sender: {id, name}` = the `name@host` label (runtime
+null), `fromCutexSessionId: null` and `remote: {host, peerId, senderId}`
+(this host's label for the sender's host, its instance ID, the sender's session
+ID there). When it is read in, `messageDelivered` (or `messageFailed`) reaches
+the recipient's stream with the same `remote`, and the snapshot entry gains
+`contextTurnId` / `deliveredAt`. The owner's `cutex/agentBus/wake` reads it in
+like any passive note and counts it in `pendingNotes`. Before this, only
+agent-sent messages had these fields and events: a peer tell appeared in the
+snapshot as a sender-only entry without body, and no live event announced it.
+
+### Cross-host wake
+
+Capability `cross-host-tell-wake` (`crossHostTellWake`); decisions in
+cutex-desktop `docs/research/peer-tell-wake-20261019.md` §10. `agent_tell`
+with `to: "name@host"` and `wake: true` asks the other host to start a turn of
+its agent. The receiving host decides, per peer:
+
+- Allowed only if `validate_inbound` passes (as for a note), the peer's
+  `inbound.tellWake` is true (default false, so pairing or upgrading never
+  lets a host wake your agents), the target is an enabled agent, and the
+  peer's `inbound.review` does not require review for it (`always` refuses;
+  `ifTargetWider` refuses a target wider than `assumedCaps` or with unknown
+  capabilities; `never` passes). Otherwise 403 `wake_not_allowed`
+  `{details:{reason: "policy" | "review" | "agent_disabled"}}`: nothing is
+  delivered and no receipt is written. The sender's tool result is
+  `wake_not_allowed` (`status:"no_write"`, `reason`) and says a note
+  (`wake:false`) or `agent_delegate` is still possible.
+- No hop counting, loop control or per-agent cooldown. Wakes per peer and hour
+  are capped by `inbound.tellWakesPerHour` (default 60), counted from the
+  receipts of delivered wakes; past the cap the wake is delivered as a note and
+  the answer carries `wakeDowngraded: true, reason: "rate_limited"`. Wakes also
+  count against `inbound.asksPerHour` like any tell (429 beyond it).
+
+Wire: optional hello feature `tells.v2` (advertised with `tells.v1`, never
+required). A wake is `{schemaVersion:2, ..., wake:true}`; notes stay
+schemaVersion 1 without `wake`. The sender sends a wake only to a peer whose
+negotiated features include `tells.v2`, else `remote_unsupported` "the other
+host's version does not support cross-host wake"; an older receiver's 400
+`peer_protocol_error` for schemaVersion 2 maps to the same. The dedupe digest
+includes `wake` only when true (receipts of older notes still match), so a note
+and a wake with the same `tellId` are 409 `idempotency_conflict`; a replay
+answers from the receipt and never wakes twice. Response: `deliveryKind`
+`"wake"` | `"note"`, plus `wakeDowngraded` / `reason` when downgraded; the
+tool result carries the same fields and a detail that says what happened.
+`agent_list.otherHosts[].tellWake` says whether the peer negotiated `tells.v2`
+(its version supports wake, not that its policy allows it).
+
+Delivery: a permitted wake is enqueued with control type `cutex.peer.tell.v2`
+and `after_turn` delivery (the same facts as v1), so it takes the ordinary
+wake path, including the busy wait (`agentBus.wakeBusyWaitSecs`).
+`cutex.peer.tell.v1` stays passive-only and v2 after-turn-only, at the bus
+send gate and when read (Codex ExternalInput and Claude inbox). The model text
+gains `Wake: <name>@<host>, an agent on another host, started this turn with
+this message (...)`; a downgraded note gains a `Delivery:` line saying it
+was sent as a wake but arrived as a note, and its facts carry
+`wakeDowngraded: "rate_limited"`. The recipient owner's message entries and
+events show `deliveryKind: "wake"` for a wake and `wakeDowngraded: true` on a
+downgraded note; a wake is not counted in `pendingNotes`.
+
 Rollback: an older binary ignores `tell-receipts.json` and its hello lacks
 `tells.v1`. Queued peer-tell notes not yet delivered stay in the bus store;
 an older bridge cannot deliver their control record (Codex reports
 `management control ingress is not enabled`; Claude skips them), so let them
-deliver or clear them before switching back.
+deliver or clear them before switching back. Queued `cutex.peer.tell.v2`
+wakes not yet handed to a runtime are rewritten by the rollback itself
+(`src/upgrade/older_stores.rs`): each becomes the v1 note it would have been
+without `wake` (passive, digest recomputed, original kept in
+`displaced/older-stores/peer-wakes.json`), because an older binary would
+otherwise list it as an eligible next step forever (owner input held about
+30 s per message, new delegations to the agent held). Older binaries ignore `inbound.tellWake` /
+`tellWakesPerHour` and drop them on their next policy write; their hello
+lacks `tells.v2`, so senders refuse wakes to them.
 
 ## Owner profiles
 

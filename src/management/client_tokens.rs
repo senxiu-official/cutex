@@ -63,6 +63,150 @@ pub struct ClientTokenRecord {
     /// the field when reading and drop it on their next write of the store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_name: Option<String>,
+    /// Device scope (`"chat"` / `"read"`; absent = `"full"`, so stores of
+    /// older builds read as full). An unknown value reads as `"read"` (fail
+    /// closed). Older cutex builds ignore the field (the token is then full)
+    /// and drop it on their next write of the store; so a rollback first
+    /// holds every narrowed token ([`ROLLBACK_HOLD_PREFIX`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// How the token was issued: `"hostCli"` (`cutex management client-token
+    /// issue` on the host, i.e. by someone with the host's OS account; an
+    /// SSH-tunnelled desktop's token) or `"pairing"` (`POST /v2/pair`).
+    /// Absent (records of older builds) = inferred from `kind`, which is
+    /// exact: `/v2/pair` is the only path that ever created `"device"`
+    /// records and `client-token issue` the only one that created `"client"`
+    /// records. See [`IssuedVia::of`]. Older builds ignore the field and drop
+    /// it on their next write of the store (the inference then still holds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_via: Option<String>,
+}
+
+/// Where a client / device token was issued (owner-local rule:
+/// `management::users::request_is_owner_local`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IssuedVia {
+    /// `cutex management client-token issue` on the host (the CLI; an
+    /// SSH-tunnelled desktop runs it over SSH).
+    HostCli,
+    /// `POST /v2/pair` with a pairing code.
+    Pairing,
+    /// A stored value this build does not know (fail closed: never local).
+    Unknown,
+}
+
+impl IssuedVia {
+    pub const HOST_CLI: &'static str = "hostCli";
+    pub const PAIRING: &'static str = "pairing";
+
+    /// The stored origin, or for records without one (older builds) the
+    /// origin implied by `kind`.
+    pub fn of(record: &ClientTokenRecord) -> Self {
+        match record.issued_via.as_deref() {
+            Some(Self::HOST_CLI) => Self::HostCli,
+            Some(Self::PAIRING) => Self::Pairing,
+            Some(_) => Self::Unknown,
+            None => match record.kind.as_deref() {
+                None | Some(KIND_CLIENT) => Self::HostCli,
+                Some(KIND_DEVICE) => Self::Pairing,
+                Some(_) => Self::Unknown,
+            },
+        }
+    }
+}
+
+/// What a client / device token may do on top of its user's rights
+/// (cutex-desktop docs/research/host-ownership-20261019.md §5 limit 3):
+/// effective rights = the user's rights ∩ the device scope. Enforced in one
+/// place, `management::v2::access::device_scope_gate`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceScope {
+    /// Only reads (GET routes, event streams, read-only native / cutex methods).
+    Read,
+    /// Read plus talking to agents (input, queue, interrupt, answering questions).
+    Chat,
+    /// Everything the token's user may do.
+    #[default]
+    Full,
+}
+
+impl DeviceScope {
+    pub const ALL: [DeviceScope; 3] = [DeviceScope::Full, DeviceScope::Chat, DeviceScope::Read];
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "full" => Some(Self::Full),
+            "chat" => Some(Self::Chat),
+            "read" => Some(Self::Read),
+            _ => None,
+        }
+    }
+
+    /// The stored form: absent = full, unknown = read (fail closed).
+    pub fn from_stored(stored: Option<&str>) -> Self {
+        stored.map_or(Self::Full, |text| Self::parse(text).unwrap_or(Self::Read))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Chat => "chat",
+            Self::Read => "read",
+        }
+    }
+
+    pub fn is_full(self) -> bool {
+        self == Self::Full
+    }
+
+    fn stored(self) -> Option<String> {
+        (!self.is_full()).then(|| self.as_str().to_string())
+    }
+}
+
+/// Rollback hold of a narrowed token (`src/upgrade/older_stores.rs`): its
+/// `tokenSha256` is stored as `rollbackHeld.v1:<scope>:<hex hash>`. A release
+/// that ignores `scope` (0.1.4 and older) compares the presented token's hash
+/// with that string, never matches it and refuses the token, instead of
+/// giving it full rights; it keeps the string as it is when it rewrites the
+/// store (dropping `scope`). This build reads such a record as the plain hash
+/// with the narrower of the two scopes ([`release_rollback_hold`]), so the
+/// device works again, with its scope, after a roll-forward.
+pub const ROLLBACK_HOLD_PREFIX: &str = "rollbackHeld.v1:";
+
+/// A held record as this build reads it; any other record unchanged. A
+/// malformed hold stays as it is (it never matches a token: fail closed).
+fn release_rollback_hold(record: &mut ClientTokenRecord) {
+    let Some(rest) = record.token_sha256.strip_prefix(ROLLBACK_HOLD_PREFIX) else {
+        return;
+    };
+    let Some((scope, hash)) = rest.split_once(':') else {
+        return;
+    };
+    let Some(held) = DeviceScope::parse(scope) else {
+        return;
+    };
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return;
+    }
+    let scope = held.min(DeviceScope::from_stored(record.scope.as_deref()));
+    record.token_sha256 = hash.to_ascii_lowercase();
+    record.scope = scope.stored();
+}
+
+/// A token held for a rollback ([`ClientTokenStore::hold_narrowed_for_rollback`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackHeldToken {
+    pub token_id: String,
+    pub label: String,
+    pub kind: Option<String>,
+    pub device_name: Option<String>,
+    pub platform: Option<String>,
+    pub owner_name: Option<String>,
+    pub scope: DeviceScope,
 }
 
 pub const KIND_CLIENT: &str = "client";
@@ -79,6 +223,10 @@ pub struct ClientTokenSummary {
     pub platform: Option<String>,
     /// Owner-given display name (capability `client-token-rename`).
     pub owner_name: Option<String>,
+    /// Device scope (capability `device-scope`).
+    pub scope: DeviceScope,
+    /// `hostCli` | `pairing` | `unknown` (capability `owner-local-only`).
+    pub issued_via: IssuedVia,
     pub created_at: String,
     pub last_used_at: Option<String>,
     pub last_address: Option<String>,
@@ -93,6 +241,7 @@ pub struct PairedDevice {
     pub label: String,
     pub device_name: String,
     pub platform: String,
+    pub scope: DeviceScope,
     pub created_at: String,
 }
 
@@ -166,6 +315,16 @@ impl ClientTokenStore {
         &self,
         mutate: impl FnOnce(&mut StoreFile) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        self.with_store_as(true, mutate)
+    }
+
+    /// `release_holds`: read held records as this build does (every caller
+    /// but the rollback step, which sees the stored form).
+    fn with_store_as<T>(
+        &self,
+        release_holds: bool,
+        mutate: impl FnOnce(&mut StoreFile) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         self.ensure_dir()?;
         let lock = OpenOptions::new()
             .create(true)
@@ -175,7 +334,11 @@ impl ClientTokenStore {
             .open(self.dir.join("tokens.json.lock"))
             .context("open the client token store lock")?;
         lock.lock_exclusive().context("lock the client token store")?;
-        let mut store = read_store(&self.tokens_path())?;
+        let mut store = if release_holds {
+            read_store(&self.tokens_path())?
+        } else {
+            read_store_raw(&self.tokens_path())?
+        };
         let before = serde_json::to_vec(&store.tokens)?;
         let result = mutate(&mut store)?;
         if serde_json::to_vec(&store.tokens)? != before {
@@ -191,7 +354,12 @@ impl ClientTokenStore {
 
     /// Create a token. The returned secret is not stored anywhere.
     pub fn issue(&self, label: &str) -> anyhow::Result<IssuedClientToken> {
-        self.issue_record(label, None, None, None)
+        self.issue_record(label, None, None, None, DeviceScope::Full)
+    }
+
+    /// `issue` with a device scope (`client-token issue --scope`).
+    pub fn issue_scoped(&self, label: &str, scope: DeviceScope) -> anyhow::Result<IssuedClientToken> {
+        self.issue_record(label, None, None, None, scope)
     }
 
     /// Create a device token (pairing). Same format and rights as a client
@@ -202,12 +370,24 @@ impl ClientTokenStore {
         device_name: &str,
         platform: &str,
     ) -> anyhow::Result<(IssuedClientToken, PairedDevice)> {
+        self.issue_device_scoped(label, device_name, platform, DeviceScope::Full)
+    }
+
+    /// `issue_device` with a device scope (set on the pairing code).
+    pub fn issue_device_scoped(
+        &self,
+        label: &str,
+        device_name: &str,
+        platform: &str,
+        scope: DeviceScope,
+    ) -> anyhow::Result<(IssuedClientToken, PairedDevice)> {
         let device_name = validate_label(device_name)?;
         let issued = self.issue_record(
             label,
             Some(KIND_DEVICE),
             Some(device_name.clone()),
             Some(platform.to_string()),
+            scope,
         )?;
         let device = PairedDevice {
             token_id: issued.token_id.clone(),
@@ -215,6 +395,7 @@ impl ClientTokenStore {
             label: issued.label.clone(),
             device_name,
             platform: platform.to_string(),
+            scope,
             created_at: issued.created_at.clone(),
         };
         Ok((issued, device))
@@ -226,6 +407,7 @@ impl ClientTokenStore {
         kind: Option<&str>,
         device_name: Option<String>,
         platform: Option<String>,
+        scope: DeviceScope,
     ) -> anyhow::Result<IssuedClientToken> {
         let label = validate_label(label)?;
         let token = generate_token();
@@ -241,6 +423,10 @@ impl ClientTokenStore {
             device_name,
             platform,
             owner_name: None,
+            scope: scope.stored(),
+            issued_via: Some(
+                if kind == Some(KIND_DEVICE) { IssuedVia::PAIRING } else { IssuedVia::HOST_CLI }.to_string(),
+            ),
         };
         self.with_store(|store| {
             if store.tokens.len() >= MAX_TOKENS {
@@ -290,6 +476,63 @@ impl ClientTokenStore {
         })
     }
 
+    /// Rollback step (services stopped; `src/upgrade/older_stores.rs`): hold
+    /// every token whose device scope is not `full` ([`ROLLBACK_HOLD_PREFIX`]),
+    /// so a release that ignores scopes refuses it instead of giving it full
+    /// rights. Returns the tokens it held now (already held ones are not
+    /// listed again). A missing store holds nothing and creates nothing.
+    pub fn hold_narrowed_for_rollback(&self) -> anyhow::Result<Vec<RollbackHeldToken>> {
+        if !self.tokens_path().exists() {
+            return Ok(Vec::new());
+        }
+        self.with_store_as(false, |store| {
+            let mut held = Vec::new();
+            for record in &mut store.tokens {
+                let mut current = record.clone();
+                release_rollback_hold(&mut current);
+                let scope = DeviceScope::from_stored(current.scope.as_deref());
+                if scope.is_full() || current.token_sha256.starts_with(ROLLBACK_HOLD_PREFIX) {
+                    // Full, or a malformed hold (refused by every build already).
+                    continue;
+                }
+                let stored = format!("{ROLLBACK_HOLD_PREFIX}{}:{}", scope.as_str(), current.token_sha256);
+                if record.token_sha256 == stored && record.scope == current.scope {
+                    continue;
+                }
+                record.token_sha256 = stored;
+                record.scope = current.scope.clone();
+                held.push(RollbackHeldToken {
+                    token_id: record.token_id.clone(),
+                    label: record.label.clone(),
+                    kind: record.kind.clone(),
+                    device_name: record.device_name.clone(),
+                    platform: record.platform.clone(),
+                    owner_name: record.owner_name.clone(),
+                    scope,
+                });
+            }
+            Ok(held)
+        })
+    }
+
+    /// Set a token's device scope. `Ok(None)` when no such token exists;
+    /// otherwise `(before, after)`.
+    pub fn set_scope(
+        &self,
+        token_id: &str,
+        scope: DeviceScope,
+    ) -> anyhow::Result<Option<(DeviceScope, DeviceScope)>> {
+        self.with_store(|store| {
+            let Some(record) = store.tokens.iter_mut().find(|record| record.token_id == token_id)
+            else {
+                return Ok(None);
+            };
+            let before = DeviceScope::from_stored(record.scope.as_deref());
+            record.scope = scope.stored();
+            Ok(Some((before, scope)))
+        })
+    }
+
     pub fn list(&self) -> anyhow::Result<Vec<ClientTokenSummary>> {
         let store = read_store(&self.tokens_path())?;
         let usage = read_usage(&self.usage_path());
@@ -297,6 +540,7 @@ impl ClientTokenStore {
             .tokens
             .into_iter()
             .map(|record| ClientTokenSummary {
+                issued_via: IssuedVia::of(&record),
                 last_used_at: usage
                     .last_used
                     .get(&record.token_id)
@@ -306,6 +550,7 @@ impl ClientTokenStore {
                 device_name: record.device_name,
                 platform: record.platform,
                 owner_name: record.owner_name,
+                scope: DeviceScope::from_stored(record.scope.as_deref()),
                 token_id: record.token_id,
                 label: record.label,
                 created_at: crate::management::instance::normalize_utc(&record.created_at),
@@ -317,7 +562,7 @@ impl ClientTokenStore {
     /// Reads the store fresh (the daemon path caches by mtime and size).
     pub fn verify(&self, presented: &str) -> anyhow::Result<Option<String>> {
         let store = read_store(&self.tokens_path())?;
-        Ok(match_token(&store.tokens, presented))
+        Ok(match_token(&store.tokens, presented).map(|matched| matched.token_id))
     }
 
     /// Record a use of `token_id` (best effort, at most once a minute per
@@ -388,7 +633,7 @@ pub fn looks_like_client_token(presented: &str) -> bool {
 
 /// Verify against the store, re-reading it only when its modification time
 /// or length changed. Errors (unreadable or corrupt store) verify nothing.
-fn verify_cached_at(store: &ClientTokenStore, presented: &str) -> Option<String> {
+fn verify_cached_at(store: &ClientTokenStore, presented: &str) -> Option<Matched> {
     struct Cached {
         path: PathBuf,
         stamp: Option<(SystemTime, u64)>,
@@ -463,6 +708,10 @@ pub struct VerifiedClientToken {
     presented: String,
     /// The user the token acted as when it was verified (P1 users).
     pub principal: crate::management::users::Principal,
+    /// The token's device scope when it was verified.
+    pub scope: DeviceScope,
+    /// Where the token was issued (never changes).
+    pub issued_via: IssuedVia,
 }
 
 impl VerifiedClientToken {
@@ -472,17 +721,18 @@ impl VerifiedClientToken {
         ClientTokenStore::open_default().ok()
             .and_then(|store| read_store(&store.tokens_path()).ok())
             .and_then(|store| match_token(&store.tokens, &self.presented))
-            .is_some_and(|id| id == self.token_id)
+            .is_some_and(|matched| matched.token_id == self.token_id && matched.scope == self.scope)
             && self.same_access_in(None)
     }
     /// Still present in the (cached, at most 2 s old) default store, and
-    /// still acting as the same user with the same grant. A stream whose
-    /// token was rebound or whose grant changed ends (`cutex/access/changed`).
+    /// still acting as the same user with the same grant and device scope. A
+    /// stream whose token was rebound, whose grant or whose scope changed
+    /// ends (`cutex/access/changed`).
     pub fn still_valid(&self) -> bool {
         ClientTokenStore::open_default()
             .ok()
             .and_then(|store| verify_cached_at(&store, &self.presented))
-            .is_some_and(|id| id == self.token_id)
+            .is_some_and(|matched| matched.token_id == self.token_id && matched.scope == self.scope)
             && self.same_access_in(None)
     }
 
@@ -504,12 +754,15 @@ impl VerifiedClientToken {
             token_id: token_id.to_string(),
             presented: String::new(),
             principal: crate::management::users::Principal::Owner,
+            scope: DeviceScope::Full,
+            issued_via: IssuedVia::HostCli,
         }
     }
 
     #[cfg(test)]
     pub fn still_valid_in(&self, store: &ClientTokenStore) -> bool {
-        verify_cached_at(store, &self.presented).is_some_and(|id| id == self.token_id)
+        verify_cached_at(store, &self.presented)
+            .is_some_and(|matched| matched.token_id == self.token_id && matched.scope == self.scope)
             && self.same_access_in(Some(store))
     }
 }
@@ -547,7 +800,7 @@ pub fn authenticate_management_request_from(
         .and_then(|value| value.strip_prefix("Bearer ").map(str::to_string))
         .unwrap_or_default();
     let root = root.filter(|root| !root.trim().is_empty())?;
-    let token_id = verify_cached_at(store, &presented)?;
+    let Matched { token_id, scope, issued_via } = verify_cached_at(store, &presented)?;
     let principal = crate::management::users::UserStore::beside(store).principal_for_token(&token_id);
     request
         .headers
@@ -557,10 +810,20 @@ pub fn authenticate_management_request_from(
         token_id,
         presented,
         principal,
+        scope,
+        issued_via,
     })
 }
 
-fn match_token(tokens: &[ClientTokenRecord], presented: &str) -> Option<String> {
+/// A presented token that matched a record.
+#[derive(Debug, PartialEq, Eq)]
+struct Matched {
+    token_id: String,
+    scope: DeviceScope,
+    issued_via: IssuedVia,
+}
+
+fn match_token(tokens: &[ClientTokenRecord], presented: &str) -> Option<Matched> {
     if !looks_like_client_token(presented) {
         return None;
     }
@@ -569,7 +832,11 @@ fn match_token(tokens: &[ClientTokenRecord], presented: &str) -> Option<String> 
     // Compare against every record in constant time per record.
     for record in tokens {
         if constant_time_eq(presented_hash.as_bytes(), record.token_sha256.as_bytes()) {
-            found = Some(record.token_id.clone());
+            found = Some(Matched {
+                token_id: record.token_id.clone(),
+                scope: DeviceScope::from_stored(record.scope.as_deref()),
+                issued_via: IssuedVia::of(record),
+            });
         }
     }
     found
@@ -634,7 +901,14 @@ pub fn validate_owner_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+/// The store as this build reads it (rollback holds released).
 fn read_store(path: &Path) -> anyhow::Result<StoreFile> {
+    let mut store = read_store_raw(path)?;
+    store.tokens.iter_mut().for_each(release_rollback_hold);
+    Ok(store)
+}
+
+fn read_store_raw(path: &Path) -> anyhow::Result<StoreFile> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("client token store is corrupt: {}", path.display())),
@@ -726,11 +1000,11 @@ mod tests {
     fn cached_verification_sees_revocation_without_restart() {
         let store = temp_store();
         let issued = store.issue("cache").unwrap();
-        assert_eq!(verify_cached_at(&store, &issued.token), Some(issued.token_id.clone()));
+        assert_eq!(verify_cached_at(&store, &issued.token).map(|m| (m.token_id, m.scope)), Some((issued.token_id.clone(), DeviceScope::Full)));
         assert!(store.revoke(&issued.token_id).unwrap());
-        assert_eq!(verify_cached_at(&store, &issued.token), None);
+        assert!(verify_cached_at(&store, &issued.token).is_none());
         let again = store.issue("cache-2").unwrap();
-        assert_eq!(verify_cached_at(&store, &again.token), Some(again.token_id));
+        assert_eq!(verify_cached_at(&store, &again.token).map(|m| (m.token_id, m.scope)), Some((again.token_id, DeviceScope::Full)));
     }
 
     #[test]
@@ -768,6 +1042,156 @@ mod tests {
         let parsed: StoreFile = serde_json::from_str(old).unwrap();
         assert_eq!(parsed.tokens[0].owner_name, None);
         assert!(!serde_json::to_string(&parsed.tokens).unwrap().contains("ownerName"));
+    }
+
+    #[test]
+    fn issued_via_is_stored_and_inferred_for_older_records() {
+        let store = temp_store();
+        let cli = store.issue("desktop-over-ssh").unwrap();
+        let (paired, _) = store.issue_device("phone", "Pixel", "android").unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(store.tokens_path()).unwrap()).unwrap();
+        assert_eq!((&raw["tokens"][0]["issuedVia"], &raw["tokens"][1]["issuedVia"]), (&serde_json::json!("hostCli"), &serde_json::json!("pairing")));
+        let listed = store.list().unwrap();
+        assert_eq!((listed[0].issued_via, listed[1].issued_via), (IssuedVia::HostCli, IssuedVia::Pairing));
+        assert_eq!(serde_json::to_value(&listed[0]).unwrap()["issuedVia"], "hostCli");
+        assert_eq!(verify_cached_at(&store, &cli.token).unwrap().issued_via, IssuedVia::HostCli);
+        assert_eq!(verify_cached_at(&store, &paired.token).unwrap().issued_via, IssuedVia::Pairing);
+        // Records of older builds (no issuedVia): `client-token issue` only
+        // ever wrote kind-less records, `/v2/pair` only `device` ones.
+        let old = r#"{"schema":"cutex.management-client-tokens.v1","tokens":[
+            {"tokenId":"mct-1","label":"l","tokenSha256":"00","createdAt":"2026-10-15T00:00:00.000Z"},
+            {"tokenId":"mct-2","label":"p","tokenSha256":"01","createdAt":"2026-10-15T00:00:00.000Z","kind":"device","deviceName":"P","platform":"ios"},
+            {"tokenId":"mct-3","label":"x","tokenSha256":"02","createdAt":"2026-10-15T00:00:00.000Z","issuedVia":"invite"},
+            {"tokenId":"mct-4","label":"y","tokenSha256":"03","createdAt":"2026-10-15T00:00:00.000Z","kind":"other"}]}"#;
+        let parsed: StoreFile = serde_json::from_str(old).unwrap();
+        let vias: Vec<IssuedVia> = parsed.tokens.iter().map(IssuedVia::of).collect();
+        assert_eq!(vias, vec![IssuedVia::HostCli, IssuedVia::Pairing, IssuedVia::Unknown, IssuedVia::Unknown]);
+        assert!(!serde_json::to_string(&parsed.tokens[0]).unwrap().contains("issuedVia"), "not written back by inference");
+    }
+
+    #[test]
+    fn device_scope_is_stored_only_when_narrowed_and_reads_fail_closed() {
+        let store = temp_store();
+        let full = store.issue("full").unwrap();
+        let chat = store.issue_scoped("chat", DeviceScope::Chat).unwrap();
+        let (device, paired) = store.issue_device_scoped("phone", "Pixel", "android", DeviceScope::Read).unwrap();
+        assert_eq!(paired.scope, DeviceScope::Read);
+        let listed = store.list().unwrap();
+        assert_eq!(listed.iter().map(|t| t.scope).collect::<Vec<_>>(), vec![DeviceScope::Full, DeviceScope::Chat, DeviceScope::Read]);
+        assert_eq!(serde_json::to_value(&listed[1]).unwrap()["scope"], "chat");
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(store.tokens_path()).unwrap()).unwrap();
+        assert!(raw["tokens"][0].get("scope").is_none(), "full is not stored");
+        assert_eq!(raw["tokens"][1]["scope"], "chat");
+        // The verified token carries its scope; a change ends `still_valid`.
+        assert_eq!(verify_cached_at(&store, &chat.token).map(|m| (m.token_id, m.scope)), Some((chat.token_id.clone(), DeviceScope::Chat)));
+        assert_eq!(store.set_scope(&chat.token_id, DeviceScope::Full).unwrap(), Some((DeviceScope::Chat, DeviceScope::Full)));
+        assert_eq!(store.set_scope("mct-0000000000000000", DeviceScope::Read).unwrap(), None);
+        assert_eq!(verify_cached_at(&store, &chat.token).map(|m| (m.token_id, m.scope)), Some((chat.token_id.clone(), DeviceScope::Full)));
+        assert_eq!(store.verify(&device.token).unwrap(), Some(device.token_id.clone()));
+        let _ = full;
+        // Absent = full (older stores); unknown = read.
+        assert_eq!(DeviceScope::from_stored(None), DeviceScope::Full);
+        assert_eq!(DeviceScope::from_stored(Some("admin")), DeviceScope::Read);
+        assert!(DeviceScope::Read < DeviceScope::Chat && DeviceScope::Chat < DeviceScope::Full);
+    }
+
+    /// What 0.1.4 (no `scope`) does with a store: match the presented
+    /// token's hash against `tokenSha256` as stored.
+    fn older_build_accepts(store: &ClientTokenStore, presented: &str) -> bool {
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(store.tokens_path()).unwrap()).unwrap();
+        let hash = token_hash_hex(presented);
+        raw["tokens"].as_array().unwrap().iter().any(|record| record["tokenSha256"] == hash.as_str())
+    }
+
+    #[test]
+    fn rollback_holds_narrowed_tokens_older_builds_refuse_them_and_this_build_restores_them() {
+        let store = temp_store();
+        assert!(store.hold_narrowed_for_rollback().unwrap().is_empty(), "no store: nothing");
+        assert!(!store.tokens_path().exists(), "and nothing created");
+        let full = store.issue("full").unwrap();
+        let chat = store.issue_scoped("chat", DeviceScope::Chat).unwrap();
+        let (read, _) = store.issue_device_scoped("phone", "Pixel", "android", DeviceScope::Read).unwrap();
+        for token in [&full.token, &chat.token, &read.token] {
+            assert!(older_build_accepts(&store, token));
+        }
+
+        let held = store.hold_narrowed_for_rollback().unwrap();
+        assert_eq!(
+            held.iter().map(|t| (t.token_id.as_str(), t.scope)).collect::<Vec<_>>(),
+            vec![(chat.token_id.as_str(), DeviceScope::Chat), (read.token_id.as_str(), DeviceScope::Read)]
+        );
+        assert_eq!(held[1].device_name.as_deref(), Some("Pixel"));
+        // An older build refuses exactly the narrowed tokens (never full rights).
+        assert!(older_build_accepts(&store, &full.token));
+        assert!(!older_build_accepts(&store, &chat.token));
+        assert!(!older_build_accepts(&store, &read.token));
+        // Holding again changes nothing.
+        let bytes = std::fs::read(store.tokens_path()).unwrap();
+        assert!(store.hold_narrowed_for_rollback().unwrap().is_empty());
+        assert_eq!(std::fs::read(store.tokens_path()).unwrap(), bytes);
+
+        // The older build rewrites the store without the fields it does not know.
+        let mut raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for record in raw["tokens"].as_array_mut().unwrap() {
+            let record = record.as_object_mut().unwrap();
+            record.remove("scope");
+            record.remove("issuedVia");
+        }
+        std::fs::write(store.tokens_path(), serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        // Rolled forward: every token works again, the narrowed ones narrowed.
+        let scope_of = |token: &str| verify_cached_at(&store, token).map(|m| m.scope);
+        assert_eq!(scope_of(&full.token), Some(DeviceScope::Full));
+        assert_eq!(scope_of(&chat.token), Some(DeviceScope::Chat));
+        assert_eq!(scope_of(&read.token), Some(DeviceScope::Read));
+        assert_eq!(store.verify(&read.token).unwrap(), Some(read.token_id.clone()));
+        let listed = store.list().unwrap();
+        assert_eq!(listed.iter().map(|t| t.scope).collect::<Vec<_>>(), vec![DeviceScope::Full, DeviceScope::Chat, DeviceScope::Read]);
+        assert_eq!(listed[2].issued_via, IssuedVia::Pairing, "inferred from kind");
+        // The next write stores the plain form.
+        assert_eq!(store.set_scope(&chat.token_id, DeviceScope::Read).unwrap(), Some((DeviceScope::Chat, DeviceScope::Read)));
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(store.tokens_path()).unwrap()).unwrap();
+        assert!(raw["tokens"].as_array().unwrap().iter().all(|r| !r["tokenSha256"].as_str().unwrap().starts_with(ROLLBACK_HOLD_PREFIX)));
+        assert_eq!(raw["tokens"][1]["scope"], "read");
+        assert!(older_build_accepts(&store, &read.token));
+    }
+
+    #[test]
+    fn a_rollback_hold_reads_as_the_narrower_scope_and_a_malformed_one_never_matches() {
+        let token = generate_token();
+        let hash = token_hash_hex(&token);
+        let record = |sha: String, scope: Option<&str>| ClientTokenRecord {
+            token_id: "mct-1".into(),
+            label: "l".into(),
+            token_sha256: sha,
+            created_at: "2026-10-20T00:00:00.000Z".into(),
+            kind: None,
+            device_name: None,
+            platform: None,
+            owner_name: None,
+            scope: scope.map(str::to_string),
+            issued_via: None,
+        };
+        let released = |sha: String, scope: Option<&str>| {
+            let mut r = record(sha, scope);
+            release_rollback_hold(&mut r);
+            (r.token_sha256, DeviceScope::from_stored(r.scope.as_deref()))
+        };
+        assert_eq!(released(format!("{ROLLBACK_HOLD_PREFIX}chat:{hash}"), None), (hash.clone(), DeviceScope::Chat));
+        assert_eq!(released(format!("{ROLLBACK_HOLD_PREFIX}chat:{hash}"), Some("read")), (hash.clone(), DeviceScope::Read));
+        assert_eq!(released(format!("{ROLLBACK_HOLD_PREFIX}read:{hash}"), Some("chat")), (hash.clone(), DeviceScope::Read));
+        assert_eq!(released(hash.clone(), None), (hash.clone(), DeviceScope::Full), "plain records unchanged");
+        for bad in [
+            format!("{ROLLBACK_HOLD_PREFIX}full2:{hash}"),
+            format!("{ROLLBACK_HOLD_PREFIX}chat:{}", &hash[..10]),
+            format!("{ROLLBACK_HOLD_PREFIX}chat"),
+        ] {
+            let tokens = vec![record(bad.clone(), None)];
+            let mut released = tokens.clone();
+            released.iter_mut().for_each(release_rollback_hold);
+            assert_eq!(released, tokens, "{bad}");
+            assert!(match_token(&released, &token).is_none());
+        }
     }
 
     #[test]
