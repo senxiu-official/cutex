@@ -956,12 +956,17 @@ def components(host: Host, args: argparse.Namespace, versions: dict[str, str]) -
     names = [c.get("name") for c in (listed or {}).get("components") or []]
     check("claude-runtime" in names, f"component list names claude-runtime ({names})")
 
-    no_claude = {"CUTEX_CLAUDE_PYTHON": args.claude_python}
-    _, out, _ = host.cli("component", "install", "claude-runtime", extra=no_claude, path=ce.base_path(), show=True)
+    version = versions["claude-runtime"]
+    # Use the shipped payload metadata, including the supported CLI-free variant;
+    # a release label alone does not tell us whether a CLI/Python is bundled.
+    bundled_python, bundled_cli = ce.bundled_payload(args.components, version)
+    prepare_env = {} if bundled_python else {"CUTEX_CLAUDE_PYTHON": args.claude_python}
+    _, out, _ = host.cli("component", "install", "claude-runtime", extra=prepare_env, path=ce.base_path(), show=True)
     comp = ce.component_of(out)
     check(comp.get("state") == "needsUser", f"claude-runtime: needsUser (got {comp.get('state')})")
-    check(ce.needs_code(comp) == "claude_cli_missing", f"claude-runtime: needsUser claude_cli_missing (got {ce.needs_code(comp)})")
-    version = versions["claude-runtime"]
+    expected_code = "claude_login_required" if bundled_cli else "claude_cli_missing"
+    check(ce.needs_code(comp) == expected_code,
+          f"claude-runtime: needsUser {expected_code} from payload metadata (got {ce.needs_code(comp)})")
     check((host.base / "components" / "claude-runtime" / version / "receipt.json").is_file(),
           f"claude-runtime {version} unpacked from the new release's manifest with a receipt")
 
@@ -1882,7 +1887,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="the native the new release brings: none, stub, or a dir with a real native-<v>-<platform>.tar.gz")
     ap.add_argument("--service-name", default="e2e", help="drill label for CUTEX_SERVICE_TEST_NAME")
     ap.add_argument("--unit-dir", help="Linux: the user unit dir the drill units go to (default $XDG_RUNTIME_DIR/systemd/user)")
-    ap.add_argument("--claude-python", default=sys.executable, help="Python >= 3.11 for the Claude runtime venv")
+    ap.add_argument("--claude-python", default=sys.executable, help="fallback Python >= 3.11 for archives without bundled Python")
     ap.add_argument("--rustc", default="rustc")
     ap.add_argument("--generator", help="upgrade-manifest.py (default: next to this file)")
     ap.add_argument("--management-port", type=int, default=24770)
