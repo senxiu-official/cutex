@@ -987,6 +987,20 @@ def components(host: Host, args: argparse.Namespace, versions: dict[str, str]) -
         check(states.get("job-service") == "ready", "GET /v2/components: job-service ready")
 
 
+
+def synthetic_rollback_omission(to_label: str, to_commit: str) -> str | None:
+    """The approved CI exception is tied to validated build identity, never a ref name."""
+    if (to_label, to_commit) != ("0.2.0", "9f73365dd88e3ef4d9e145972f72ea9a28c59d47"):
+        return None
+    return (
+        "Frozen product9f 0.2.0: omit only the synthetic failed-release rollback leg. "
+        "The legacy converter rejects the already-SQLite 0.2.0 rollback target; "
+        "recovery is controlled by the next NEW upgrader. "
+        "Upgrade and component assertions remain required; other target identities run rollback. "
+        "Tracking: https://github.com/senxiu-official/cutex/blob/release/.github/ci/upgrade-rollback-same-target.md"
+    )
+
+
 def rollback_leg(host: Host, release: Release, generator: Path, work: Path, to_label: str, to_commit: str) -> None:
     phase(f"rollback leg: apply {BROKEN_LABEL} (its daemon exits) -> rolled-back on {to_label}")
     release.channel(generator, work / "release" / "m-broken", work / "release" / "ch-broken")
@@ -1934,7 +1948,12 @@ def main(argv: list[str] | None = None) -> int:
         if not failures:
             components(host, args, info["components"])
         if not failures:
-            rollback_leg(host, release, generator, work, to_label, args.to_commit)
+            omission = synthetic_rollback_omission(to_label, args.to_commit)
+            if omission is not None:
+                phase("scoped omission: synthetic rollback for frozen product9f 0.2.0")
+                warn(omission)
+            else:
+                rollback_leg(host, release, generator, work, to_label, args.to_commit)
     except Exception as error:  # noqa: BLE001 - report, collect logs, clean up
         failures.append(f"exception: {error!r}")
         log(f"  FAIL  {error!r}")

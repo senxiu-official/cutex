@@ -5,7 +5,7 @@
   "sourceCommit": null,
   "sourceCommitNote": "withheld: kept in the private export record next to the export directory",
   "license": "Apache-2.0",
-  "fileCount": 1314,
+  "fileCount": 1315,
   "files": [
     {
       "path": ".cargo/config.toml",
@@ -124,13 +124,18 @@
     },
     {
       "path": ".github/ci/upgrade-e2e.py",
-      "sha256": "107e04a9c0104b09efe7b2861b0fff36526c03ce44c3665f1d2d60c4f6c16fb9",
-      "size": 111297
+      "sha256": "834c34c52ee9dd36de25f3a76abff56a527a062ac0a0882c3ffe2d2d15513f9a",
+      "size": 112296
     },
     {
       "path": ".github/ci/upgrade-manifest.py",
       "sha256": "1f7cd4f12ad6b553825c3e74deb7e18cd5d4f4108fd46a59597e2f5bf282e9b8",
       "size": 22950
+    },
+    {
+      "path": ".github/ci/upgrade-rollback-same-target.md",
+      "sha256": "7ae55a442665412c5e2e8b78d1186a5a5f500dc1591fc1ce035276b96906b7f9",
+      "size": 2328
     },
     {
       "path": ".github/workflows/build-binaries.yml",
