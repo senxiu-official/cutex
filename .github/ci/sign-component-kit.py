@@ -100,7 +100,8 @@ def run(args, *, output=None):
 
 class GitHub:
     def api(self, endpoint):
-        return decode(run(["gh", "api", f"repos/{REPO}/{endpoint}"]))
+        route = f"repos/{REPO}" + (f"/{endpoint}" if endpoint else "")
+        return decode(run(["gh", "api", route]))
 
     def release(self, release_id):
         return self.api(f"releases/{release_id}")
