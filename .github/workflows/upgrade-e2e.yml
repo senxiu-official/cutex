@@ -160,10 +160,14 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then d="$(cygpath -u "$RUNNER_TEMP")/public-from"; fi
           mkdir -p "$d"
           base="https://github.com/$FROM_REPO/releases/download/cutex-$FROM_RELEASE"
-          for name in manifest.json capabilities.json SHA256SUMS "cutex-$FROM_RELEASE-$PLATFORM.tar.gz"; do
+          for name in manifest.json capabilities.json "cutex-$FROM_RELEASE-$PLATFORM.tar.gz"; do
             curl -fsSL --retry 3 -o "$d/$name" "$base/$name"
             curl -fsSL --retry 3 -o "$d/$name.minisig" "$base/$name.minisig"
           done
+          # The human/source release carries the signed combined sums.
+          base="https://github.com/$FROM_REPO/releases/download/v$FROM_RELEASE"
+          curl -fsSL --retry 3 -o "$d/SHA256SUMS" "$base/SHA256SUMS"
+          curl -fsSL --retry 3 -o "$d/SHA256SUMS.minisig" "$base/SHA256SUMS.minisig"
           if [ "$RUNNER_OS" = Windows ]; then d="$(cygpath -w "$d")"; fi
           "$E2E_PYTHON" ci/.github/ci/upgrade-e2e.py signed-asset-preflight \
             --assets "$d" --public-key ci/.github/ci/cutex-release.pub \
@@ -203,6 +207,9 @@ jobs:
           while read -r name version; do
             echo "== $name $version"
             PYTHON="$E2E_PYTHON" bash "to/components/$name/build.sh" "$PLATFORM" "$version" "$RUNNER_TEMP/archives"
+            if [ "$PLATFORM" = linux-x64 ] && [ "$name" = claude-runtime ] && [ "$version" = claude-r32 ]; then
+              "$E2E_PYTHON" ci/.github/ci/claude-r32-compat.py "$RUNNER_TEMP/archives" --source-commit "$(git -C to rev-parse HEAD)"
+            fi
           done < "$RUNNER_TEMP/component-rows"
           if [ "$RUNNER_OS" = Windows ]; then ls -la "$(cygpath -u "$RUNNER_TEMP")/archives"; else ls -la "$RUNNER_TEMP/archives"; fi
       - name: New native of the new release
@@ -337,6 +344,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUILD_RUN: ${{ inputs.build_run }}
           SIGN_RUN: ${{ inputs.sign_run }}
+          CI_WORKFLOW_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
           [[ "$BUILD_RUN" =~ ^[1-9][0-9]*$ && "$SIGN_RUN" =~ ^[1-9][0-9]*$ ]] || { echo 'Successful build_run and sign_run are required' >&2; exit 1; }
@@ -345,13 +353,17 @@ jobs:
           "$E2E_PYTHON" - <<'PY'
           import json, os, subprocess
           from pathlib import Path
-          commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          product_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          ci_commit = os.environ["CI_WORKFLOW_COMMIT"]
+          if len(ci_commit) != 40 or any(c not in "0123456789abcdef" for c in ci_commit):
+              raise SystemExit("Expected CI workflow commit is not a full SHA")
+          print("Reviewed CI workflow:", ci_commit, "Product source:", product_commit)
           root = Path(os.environ["RUNNER_TEMP"])
           for name, path in [("formal-build-run.json", ".github/workflows/build-binaries.yml"),
                              ("formal-sign-run.json", ".github/workflows/sign-release.yml")]:
               run = json.loads((root / name).read_text())
               if (run["status"] != "completed" or run["conclusion"] != "success" or
-                      run["head_sha"] != commit or run["path"] != path):
+                      run["head_sha"] != ci_commit or run["path"] != path):
                   raise SystemExit("Workflow run does not match successful candidate build/sign provenance")
           PY
       - name: Original build archives (no rebuild)
@@ -367,6 +379,31 @@ jobs:
           run-id: ${{ inputs.sign_run }}
           name: sign-release-${{ inputs.sign_run }}
           path: ${{ runner.temp }}/formal-sign
+      - name: Validate product BUILD-INFO independently of CI head
+        env:
+          TO_RELEASE: ${{ inputs.to_release }}
+        run: |
+          set -euo pipefail
+          "$E2E_PYTHON" - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          product_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          root = Path(os.environ["RUNNER_TEMP"]) / "formal-build"
+          records = sorted(root.rglob("BUILD-INFO-*.json"))
+          if not records:
+              raise SystemExit("Missing product BUILD-INFO")
+          core_platforms = set()
+          for path in records:
+              info = json.loads(path.read_text(encoding="utf-8"))
+              if info.get("commit") != product_commit:
+                  raise SystemExit("BUILD-INFO does not match product source: " + path.name)
+              if not path.name.startswith("BUILD-INFO-component-"):
+                  if info.get("release") != os.environ["TO_RELEASE"]:
+                      raise SystemExit("BUILD-INFO release label mismatch")
+                  core_platforms.add(info.get("platform"))
+          if core_platforms != {"linux-x64", "windows-x64"}:
+              raise SystemExit("Both product platform BUILD-INFO records are required")
+          PY
       - name: Original published 0.1.5 and native signed assets
         env:
           FROM_REPO: ${{ inputs.from_repo }}
@@ -382,10 +419,13 @@ jobs:
           tmp="$RUNNER_TEMP"; if [ "$RUNNER_OS" = Windows ]; then tmp="$(cygpath -u "$tmp")"; fi
           mkdir "$tmp/formal-old" "$tmp/formal-native"
           base="https://github.com/$FROM_REPO/releases/download/cutex-$FROM_RELEASE"
-          for name in manifest.json capabilities.json SHA256SUMS "cutex-$FROM_RELEASE-$PLATFORM.tar.gz"; do
+          for name in manifest.json capabilities.json "cutex-$FROM_RELEASE-$PLATFORM.tar.gz"; do
             curl -fsSL --retry 3 -o "$tmp/formal-old/$name" "$base/$name"
             curl -fsSL --retry 3 -o "$tmp/formal-old/$name.minisig" "$base/$name.minisig"
           done
+          base="https://github.com/$FROM_REPO/releases/download/v$FROM_RELEASE"
+          curl -fsSL --retry 3 -o "$tmp/formal-old/SHA256SUMS" "$base/SHA256SUMS"
+          curl -fsSL --retry 3 -o "$tmp/formal-old/SHA256SUMS.minisig" "$base/SHA256SUMS.minisig"
           base="https://github.com/senxiu-official/cute-codex/releases/download/$NATIVE_TAG"
           for name in SHA256SUMS "native-$NATIVE_VERSION-$PLATFORM.tar.gz"; do
             curl -fsSL --retry 3 -o "$tmp/formal-native/$name" "$base/$name"

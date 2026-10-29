@@ -18,6 +18,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: "Product source to build (0.2.0 repair: 9f73365d; empty = dispatched ref)"
+        required: false
+        default: ""
+        type: string
       release:
         description: "Release label baked into the binaries (cutex --version), e.g. 0.1.0; the manifest tag is cutex-<label>"
         required: true
@@ -54,6 +59,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           persist-credentials: false
       - name: Release label
         env:
@@ -92,6 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           persist-credentials: false
       - id: m
         name: Read components/*/component.json
@@ -125,7 +132,15 @@ jobs:
       # job-service/build.sh), so an unchanged component version rebuilds byte for byte in a later release.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Reviewed CI helpers (separate from product source)
+        if: matrix.name == 'claude-runtime' && matrix.version == 'claude-r32' && matrix.platform == 'linux-x64'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          path: ci
           persist-credentials: false
       - name: Neutral build directory (the binaries keep the source path in one place)
         run: |
@@ -145,6 +160,9 @@ jobs:
           VERSION: ${{ matrix.version }}
           PLATFORM: ${{ matrix.platform }}
         run: PYTHON="$E2E_PYTHON" bash "components/$NAME/build.sh" "$PLATFORM" "$VERSION" "$RUNNER_TEMP/out"
+      - name: Preserve the immutable claude-r32 Linux byte recipe
+        if: matrix.name == 'claude-runtime' && matrix.version == 'claude-r32' && matrix.platform == 'linux-x64'
+        run: '"$E2E_PYTHON" ci/.github/ci/claude-r32-compat.py "$RUNNER_TEMP/out" --source-commit "$(git rev-parse HEAD)"'
       - name: Check the output
         env:
           NAME: ${{ matrix.name }}
@@ -166,7 +184,7 @@ jobs:
             *) exit 1 ;;
           esac
           archive="$RUNNER_TEMP/out/component-claude-runtime-claude-r32-$PLATFORM.tar.gz"
-          got="$(sha256sum "$archive" | cut -d' ' -f1)"
+          got="$(sha256sum < "$archive" | cut -d' ' -f1)"
           [ "$got" = "$expected" ] || { echo "Claude r32 immutable archive mismatch: $got != $expected" >&2; exit 1; }
       - name: Compare unchanged Job Service with its immutable published archive
         if: matrix.name == 'job-service' && matrix.version == '0.1.1'
@@ -174,15 +192,22 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          sudo apt-get update -q
-          sudo apt-get install -y -q minisign
           name=component-job-service-0.1.1-linux-x64.tar.gz
           d="$RUNNER_TEMP/published-job-service"
           mkdir -p "$d"
+          # Upstream 0.12 release, independently verified with its published signing key.
+          tool_archive="$d/minisign-0.12-linux.tar.gz"
+          curl -fsSL --retry 3 -o "$tool_archive" https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz
+          expected=9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
+          got="$(sha256sum < "$tool_archive" | cut -d' ' -f1)"
+          [ "$got" = "$expected" ] || { echo 'Pinned minisign archive checksum mismatch' >&2; exit 1; }
+          tar -xzf "$tool_archive" -C "$d" minisign-linux/x86_64/minisign
+          minisign="$d/minisign-linux/x86_64/minisign"
+          "$minisign" -v
           base="https://github.com/$REPO/releases/download/component-job-service-0.1.1"
           curl -fsSL --retry 3 -o "$d/$name" "$base/$name"
           curl -fsSL --retry 3 -o "$d/$name.minisig" "$base/$name.minisig"
-          minisign -V -p .github/ci/cutex-release.pub -m "$d/$name"
+          "$minisign" -V -p .github/ci/cutex-release.pub -m "$d/$name"
           cmp "$RUNNER_TEMP/out/$name" "$d/$name"
           echo 'Job Service 0.1.1 is byte-identical to its verified published archive'
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

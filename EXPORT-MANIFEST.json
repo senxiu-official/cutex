@@ -5,7 +5,7 @@
   "sourceCommit": null,
   "sourceCommitNote": "withheld: kept in the private export record next to the export directory",
   "license": "Apache-2.0",
-  "fileCount": 1313,
+  "fileCount": 1314,
   "files": [
     {
       "path": ".cargo/config.toml",
@@ -21,6 +21,11 @@
       "path": ".github/ci/build-cutex.sh",
       "sha256": "28a235d7da654c478ebc51993e1eb0d4df6d3bb90a54fe73247e32445bd8b54e",
       "size": 8154
+    },
+    {
+      "path": ".github/ci/claude-r32-compat.py",
+      "sha256": "993a2472182059b5ef7f8bc78e9a4451dd992ea4ae987eea673b67436e22f61f",
+      "size": 10828
     },
     {
       "path": ".github/ci/component-e2e-pythons.sh",
@@ -129,13 +134,13 @@
     },
     {
       "path": ".github/workflows/build-binaries.yml",
-      "sha256": "31a6f3d6f1017cc465b23b2a2f6c1d481288e5f9fda65c9056e2c5b212039ec3",
-      "size": 10464
+      "sha256": "5607d69ecbd523173139c37245acaa65dcb82d331e0393125fc79c6b1cb2c137",
+      "size": 12080
     },
     {
       "path": ".github/workflows/component-e2e.yml",
-      "sha256": "cd70e6d799940fab8556feb10166a8f8c084a888be407228491a525bef7dfcce",
-      "size": 9725
+      "sha256": "fd2d8bb63d4886d00d4c5e48e223edee84b1b282c71bf042b538c75ec4c5d3b7",
+      "size": 10583
     },
     {
       "path": ".github/workflows/release.yml",
@@ -149,8 +154,8 @@
     },
     {
       "path": ".github/workflows/upgrade-e2e.yml",
-      "sha256": "47883aee716814a3e4602fe0768f9522ea7e013c2c4d490096fc94ea8bf2de6b",
-      "size": 21573
+      "sha256": "26d0bec16aa20802cf6b04f6146bf8bfa5bda2441e9894185624c532770516f8",
+      "size": 24049
     },
     {
       "path": ".gitignore",

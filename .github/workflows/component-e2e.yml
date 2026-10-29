@@ -21,6 +21,11 @@ name: Component e2e
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: "Product source to build (0.2.0 repair: 9f73365d; empty = dispatched ref)"
+        required: false
+        default: ""
+        type: string
       real_claude:
         description: "Also install the real Claude Code CLI from npm and check it is found (login required)"
         required: false
@@ -62,6 +67,14 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          persist-credentials: false
+      - name: Reviewed CI helpers (separate from product source)
+        if: matrix.platform == 'linux-x64' && matrix.bundle_cli == '1'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          path: ci
           persist-credentials: false
       - name: Bootstrap/test Python and old Python for the explicit override check
         run: bash .github/ci/component-e2e-pythons.sh
@@ -77,6 +90,9 @@ jobs:
           set -euo pipefail
           version="$("$E2E_PYTHON" -c 'import json; print(json.load(open("components/claude-runtime/component.json"))["version"])' | tr -d '\r')"
           PYTHON="$E2E_PYTHON" bash components/claude-runtime/build.sh "${{ matrix.platform }}" "$version" "$RUNNER_TEMP/archives"
+          if [ "$RUNNER_OS" = Linux ] && [ "$version" = claude-r32 ] && [ "$CUTEX_CLAUDE_BUNDLE_CLI" = 1 ]; then
+            "$E2E_PYTHON" ci/.github/ci/claude-r32-compat.py "$RUNNER_TEMP/archives" --source-commit "$(git rev-parse HEAD)"
+          fi
           "$E2E_PYTHON" .github/ci/components.py check claude-runtime "$version" "${{ matrix.platform }}" "$RUNNER_TEMP/archives" --commit "$(git rev-parse HEAD)"
       - name: Install the real Claude Code CLI from npm (path with a space)
         if: inputs.real_claude
@@ -135,6 +151,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           persist-credentials: false
       - name: Pythons from the runner's tool cache
         run: bash .github/ci/component-e2e-pythons.sh
