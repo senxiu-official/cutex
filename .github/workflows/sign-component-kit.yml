@@ -1,0 +1,101 @@
+# Sign approved private component inputs; keep every output in the same unpublished draft.
+name: Sign private component kit
+
+on:
+  workflow_dispatch:
+    inputs:
+      staging_release_id:
+        description: "ID of the unpublished sign-input-* draft targeting this CI commit"
+        required: true
+        type: string
+      input_manifest_sha256:
+        description: "Approved SHA256 of SIGNING-INPUTS.json in that draft"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sign-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sign:
+    if: github.repository == 'senxiu-official/cutex' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install minisign and check stdin passphrases
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q minisign
+          minisign -v
+          t="$RUNNER_TEMP/minisign-selftest"
+          mkdir -p "$t"
+          pw="selftest-$RANDOM$RANDOM$RANDOM"
+          printf '%s\n%s\n' "$pw" "$pw" | minisign -G -p "$t/t.pub" -s "$t/t.key" > /dev/null
+          echo selftest > "$t/f"
+          printf '%s\n' "$pw" | minisign -S -s "$t/t.key" -m "$t/f" > /dev/null
+          minisign -V -q -p "$t/t.pub" -m "$t/f"
+          rm -rf "$t"
+      - name: Verify the approved draft inputs before loading the key
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ inputs.staging_release_id }}
+          MANIFEST_SHA: ${{ inputs.input_manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 .github/ci/sign-component-kit.py prepare \
+            --release-id "$RELEASE_ID" --manifest-sha256 "$MANIFEST_SHA" \
+            --work "$RUNNER_TEMP/component-kit-signing" --public-key .github/ci/cutex-release.pub
+      - name: Write the signing key
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$MINISIGN_SECRET_KEY" ] || { echo "::error::secret MINISIGN_SECRET_KEY is not set"; exit 1; }
+          umask 077
+          key="$RUNNER_TEMP/minisign-component-kit.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          line=$(sed -n 2p "$key")
+          [ -n "$line" ] && echo "::add-mask::$line"
+          head -n 1 "$key" | grep -q '^untrusted comment: ' || { echo "::error::invalid minisign key file"; exit 1; }
+      - name: Sign the verified payloads
+        env:
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          password="$MINISIGN_PASSWORD"
+          [ -n "$password" ] || { echo "::error::signing passphrase missing"; exit 1; }
+          unset MINISIGN_PASSWORD
+          key="$RUNNER_TEMP/minisign-component-kit.key"
+          # Same stdin/SIGPIPE handling as the established release signer.
+          minisign_sign() {
+            ( trap '' PIPE; printf '%s\n' "$password" 2> /dev/null || true ) | minisign -S -s "$key" -m "$@"
+          }
+          cd "$RUNNER_TEMP/component-kit-signing/inputs"
+          mapfile -t files < ../payloads.txt
+          minisign_sign "${files[@]}"
+          unset password
+      - name: Verify signatures and store them only in the input draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 .github/ci/sign-component-kit.py store \
+            --work "$RUNNER_TEMP/component-kit-signing" --public-key .github/ci/cutex-release.pub
+      - name: Delete the signing key and private temporary payloads
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/minisign-component-kit.key"
+          rm -rf "$RUNNER_TEMP/component-kit-signing" "$RUNNER_TEMP/minisign-selftest"

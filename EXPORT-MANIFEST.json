@@ -5,7 +5,7 @@
   "sourceCommit": null,
   "sourceCommitNote": "withheld: kept in the private export record next to the export directory",
   "license": "Apache-2.0",
-  "fileCount": 1315,
+  "fileCount": 1317,
   "files": [
     {
       "path": ".cargo/config.toml",
@@ -118,6 +118,11 @@
       "size": 31059
     },
     {
+      "path": ".github/ci/sign-component-kit.py",
+      "sha256": "3cf9c0547d5b26729d6a5a3a03ac8feced582236dbfddffa5ee06ccd8eb84ad8",
+      "size": 21008
+    },
+    {
       "path": ".github/ci/third_party_notices.py",
       "sha256": "09ae49f38002702769cd2715b79d9fa526bc1bdf506f7d6a6818064154f32c16",
       "size": 10671
@@ -151,6 +156,11 @@
       "path": ".github/workflows/release.yml",
       "sha256": "7e35010167d0f638307e3dca45ae1c3fc6b5c2802df9ce0789960a6b141f3901",
       "size": 2869
+    },
+    {
+      "path": ".github/workflows/sign-component-kit.yml",
+      "sha256": "219cee4effd850df1b56fd47536aca0f2ee25b254c12fe32a44d9795542dcffb",
+      "size": 4024
     },
     {
       "path": ".github/workflows/sign-release.yml",
