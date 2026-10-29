@@ -1,15 +1,10 @@
 //! Host event `cutex/sessions/changed`: the agent list or project membership
 //! changed, whichever process wrote it.
 //!
-//! Each process publishes Management v2 events only to its own live
-//! subscribers (`EventRepository::publish`); events another process appends
-//! to the shared journal reach `/v2/events/stream` clients only when they
-//! page again (reconnect). Agent Management `agent_create` / `member_replace`
-//! / `agent_archive` run inside `cutex agent serve`, so their session-store
-//! and project writes, their `cutex/agentManagement/*` facts and the first
-//! events of the runtime that process launched never reached a connected
-//! desktop live: a new agent showed up in the sidebar only after some
-//! unrelated live event (often the Director's turn end) made it reload.
+//! `journal_watch` forwards events other processes append to the shared
+//! journal. This store watcher additionally emits a semantic invalidation
+//! when session / project state changes, including writes that emit no
+//! event of their own (Agent Management runs inside `cutex agent serve`).
 //!
 //! Management serve therefore watches the durable session store and the
 //! Agent Management store (like the alarms watcher) and publishes one host
@@ -49,6 +44,7 @@ struct Fingerprint {
     groups: Vec<String>,
     /// The pinned Claude runtime's release (Claude sessions only).
     claude_release: Option<String>,
+    created_by: Option<crate::session::model::SessionCreatedBy>,
 }
 
 impl Fingerprint {
@@ -61,6 +57,7 @@ impl Fingerprint {
             formal_agent_name: record.formal_agent_name.clone(),
             display_name_override: record.display_name_override.clone(),
             groups: record.agent_groups.clone(),
+            created_by: record.created_by.clone(),
             claude_release: record
                 .claude_session
                 .as_ref()
@@ -292,10 +289,13 @@ mod tests {
         assert!(step(&mut watch, first, None, ClaudeStamps::default()).is_empty(), "same snapshot");
 
         // agent_create in another process: the new session appears.
-        let worker = record("cutex.w", "worker");
+        let mut worker = record("cutex.w", "worker");
         let created = step(&mut watch, store(&[director.clone(), worker.clone()]), None, ClaudeStamps::default());
         assert_eq!(created.added, vec!["cutex.w".to_string()]);
         assert!(created.removed.is_empty() && created.changed.is_empty() && !created.projects_changed);
+        worker.stamp_created_by_at_creation(Some(&crate::session::model::SessionCreatedBy::Owner)).unwrap();
+        let provenance = step(&mut watch, store(&[director.clone(), worker.clone()]), None, ClaudeStamps::default());
+        assert_eq!(provenance.changed, vec!["cutex.w".to_string()], "creation-time stamp invalidates early observer materialization");
 
         // Runtime-only updates (timestamps, generation) are not reported.
         let mut busy = worker.clone();
@@ -413,18 +413,36 @@ mod tests {
         let mut after = before.clone();
         after.sessions.insert(worker.cutex_session_id.clone(), worker.clone());
         crate::session::store::save_cutex_session_store(&after).expect("adopt");
-        assert!(
-            subscription.receiver.recv_timeout(Duration::from_millis(50)).is_err(),
-            "appends of another process are not published live"
-        );
+        // Other background producers may publish to this process concurrently.
+        // The contract here is that the other repository's exact test append
+        // is not delivered, rather than that the whole host is silent.
+        let drain = |duration: Duration| {
+            let until = std::time::Instant::now() + duration;
+            let mut events = Vec::new();
+            while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+                match subscription.receiver.recv_timeout(left) {
+                    Ok(event) => events.push(event),
+                    Err(_) => break,
+                }
+            }
+            events
+        };
+        for event in drain(Duration::from_millis(50)) {
+            assert!(event.cutex.as_ref().is_none_or(|m|m.method != "cutex/test/otherProcess"),
+                "appends of another process are not published live");
+        }
 
         poll().expect("watch");
-        let event = subscription.receiver.recv_timeout(Duration::from_secs(1)).expect("live host event");
+        let event = drain(Duration::from_secs(1)).into_iter().find(|event|event.cutex.as_ref()
+            .is_some_and(|m|m.method == SESSIONS_CHANGED_EVENT && m.params["added"] == json!([worker.cutex_session_id])))
+            .expect("live host event for the newly adopted worker");
         assert_eq!(event.cutex_session_id, HOST_EVENT_SESSION_ID);
         let message = event.cutex.expect("cutex message");
         assert_eq!(message.method, SESSIONS_CHANGED_EVENT);
         assert_eq!(message.params["added"], json!([worker.cutex_session_id]));
         poll().expect("unchanged");
-        assert!(subscription.receiver.recv_timeout(Duration::from_millis(50)).is_err(), "nothing changed");
+        assert!(drain(Duration::from_millis(50)).iter().all(|event|event.cutex.as_ref()
+            .is_none_or(|m|m.method != SESSIONS_CHANGED_EVENT || m.params["added"] != json!([worker.cutex_session_id]))),
+            "unchanged worker must not be announced again");
     }
 }

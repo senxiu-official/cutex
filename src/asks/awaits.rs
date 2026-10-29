@@ -280,9 +280,7 @@ pub fn resume_now(state: &mut AskState, ask_id: &str, requester: Option<&str>, n
     let ask = state.asks.get(ask_id).ok_or_else(|| AskError::new("ask_not_found", "no such delegation"))?;
     if ask.remote.is_some() { return Err(AskError::new("remote_unsupported","remote resume is unavailable in P0")); }
     if let Some(requester) = requester {
-        if ask.requester.session() != Some(requester) {
-            return Err(AskError::new("ask_not_found", "no such delegation of yours"));
-        }
+        ask.require_controller(requester, "ask_not_found", "no such delegation of yours")?;
     }
     if !ask.is_open() {
         return Err(AskError::new("ask_closed", "it is already closed").with(json!({"closed": ask.closed})));
@@ -310,9 +308,7 @@ pub fn reopen(state: &mut AskState, ask_id: &str, requester: Option<&str>, note:
     let ask = state.asks.get(ask_id).ok_or_else(|| AskError::new("ask_not_found", "no such delegation"))?;
     if ask.remote.is_some() { return Err(AskError::new("remote_unsupported","remote reopen is unavailable in P0")); }
     if let Some(requester) = requester {
-        if ask.requester.session() != Some(requester) {
-            return Err(AskError::new("ask_not_found", "no such delegation of yours"));
-        }
+        ask.require_controller(requester, "ask_not_found", "no such delegation of yours")?;
     }
     let note = note_of(note)?.ok_or_else(|| AskError::new("invalid_arguments", "note: say what is missing or what to change"))?;
     let answered = matches!(ask.execution, ExecutionState::Answered | ExecutionState::Failed);
@@ -325,6 +321,13 @@ pub fn reopen(state: &mut AskState, ask_id: &str, requester: Option<&str>, note:
         )
         .with(json!({"execution": ask.execution, "review": ask.review, "closed": ask.closed})));
     }
+    if ask.closed.is_some() {
+        // Automatic completion closes the root without passing close_in_state.
+        // Reopening must not revive reviewer grants issued before that closure.
+        let reference=super::routing_policy::RoutingRef::new(super::routing_policy::integration::local_host_id(),ask_id)
+            .map_err(super::routing_policy::integration::error)?;
+        state.routing.close_root_grants(&reference,now).map_err(super::routing_policy::integration::error)?;
+    }
     let by = if requester.is_some() { ResumeBy::Requester } else { ResumeBy::Owner };
     state.update_ask(ask_id, now, |ask| {
         ask.execution = ExecutionState::Running;
@@ -333,11 +336,12 @@ pub fn reopen(state: &mut AskState, ask_id: &str, requester: Option<&str>, note:
         ask.closed_at = None;
         to_resume(ask, ResumeReason::Reopened, Some(by), Some(note.clone()), now);
     });
-    // The requester decided about the answer: pending items about it are
+    // The controller decided about the answer: pending items about it are
     // settled, never sent as an event afterwards.
-    if let Some(requester) = state.asks.get(ask_id).and_then(|ask| ask.requester.session().map(str::to_string)) {
+    if let Some(requester) = state.asks.get(ask_id).and_then(|ask| ask.controller().ok().flatten()) {
         super::delivery::settle_for_ask(state, &requester, ask_id, None, "reopened", now);
     }
+    super::lineage::explicit_reopen(state,&super::routing_policy::integration::local_host_id(),ask_id);
     Ok(json!({"ok": true, "ask_id": ask_id, "reopened": true,
         "detail": "Reopened: the handler continues this delegation in a new attempt with your note; the new result arrives as usual."}))
 }
@@ -373,6 +377,10 @@ pub fn register(state: &mut AskState, caller: &str, request: &AwaitRequest, now:
     let ask = state.asks.get(&running).cloned().ok_or_else(|| AskError::new("ask_not_found", "no such delegation"))?;
     if ask.remote.is_some() || ask.target_cutex_session_id != caller || !ask.is_open() {
         return Err(AskError::new("ask_not_running", "this delegation is not open on you"));
+    }
+    if let Some(context) = super::continuation::runtime::attempt_identity(&ask, attempt) {
+        ask.bounded_continuation.check_await_conflict(&context)
+            .map_err(super::continuation::runtime::ask_error)?;
     }
     if let Some(timeout) = request.timeout_s {
         if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&timeout) {

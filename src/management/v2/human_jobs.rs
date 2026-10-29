@@ -134,6 +134,42 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
     }
 }
 
+/// Unfinished Jobs per session (stop idle agents, design 031): the newest
+/// 500 Jobs are enough to see what still runs. None when the Job Service is
+/// unavailable (e.g. Windows hosts have none).
+pub(super) fn running_jobs_by_session() -> Option<std::collections::HashMap<String, usize>> {
+    let mut counts = std::collections::HashMap::new();
+    for job in running_jobs()? {
+        if let Some(session) = job.get("sessionId").and_then(Value::as_str) {
+            *counts.entry(session.to_string()).or_insert(0) += 1;
+        }
+    }
+    Some(counts)
+}
+
+/// Unfinished Jobs among the newest 500 (rows as `humanList` returns
+/// them). None when the Job Service is unavailable.
+pub(super) fn running_jobs() -> Option<Vec<Value>> {
+    let mut jobs = Vec::new();
+    let mut cursor = Value::Null;
+    for _ in 0..10 {
+        let page = call("humanList", json!({"query": "", "cursor": cursor, "limit": 50})).ok()?;
+        for job in page.get("data").and_then(Value::as_array).into_iter().flatten() {
+            if matches!(
+                job.get("state").and_then(Value::as_str),
+                Some("registered" | "queued" | "launch_pending" | "running")
+            ) {
+                jobs.push(job.clone());
+            }
+        }
+        match page.get("nextCursor").and_then(Value::as_str) {
+            Some(next) => cursor = Value::String(next.to_string()),
+            None => break,
+        }
+    }
+    Some(jobs)
+}
+
 /// `GET /v2/job-service/capabilities`: the service's `capabilities` result verbatim.
 pub(super) fn handle_capabilities(stream: &mut TcpStream) -> anyhow::Result<()> {
     match call("capabilities", json!({})) {

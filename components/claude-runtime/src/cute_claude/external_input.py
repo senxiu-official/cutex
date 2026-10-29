@@ -112,6 +112,13 @@ class ExternalInputService:
         if self.enabled:
             self.bind({'ownerId': self.settings.external_owner_id, 'runtimeGeneration': self.runtime_generation})
             self.compact_history()
+            # Notes a previous process read into a turn that then ended
+            # interrupted or failed (before this was settled at turn end).
+            for row in self.store.db.execute('''SELECT DISTINCT n.thread_id,n.turn_id FROM notes n
+                    JOIN external_inputs e ON e.thread_id=n.thread_id AND e.message_id=n.message_id
+                    JOIN turns t ON t.id=n.turn_id
+                    WHERE n.state='injected' AND e.receipt IS NULL AND t.state IN ('interrupted','failed','uncertain')''').fetchall():
+                self.settle_notes(row['thread_id'], row['turn_id'])
 
     def compact_history(self, *, now: float | None = None) -> int:
         """Bounded maintenance; never delete an identity or change its receipt.
@@ -269,6 +276,40 @@ class ExternalInputService:
             receipt = make_receipt(json.loads(row['envelope']), turn_id, ordinal)
             self.store.db.execute('UPDATE external_inputs SET receipt=? WHERE thread_id=? AND message_id=?', (dump(receipt), tid, mid))
 
+    # Timeline items of a turn's inputs; any other item is the model's own
+    # (its prompt, with the notes read at its start, reached the model).
+    _INPUT_ITEMS = ('userMessage', 'functionCallOutput')
+
+    def settle_notes(self, tid: str, turn_id: str) -> tuple[list[str], list[str]]:
+        """Native notes read into `turn_id`, which ended interrupted or failed
+        (on the subscription backend only a successful result acknowledges them).
+
+        If the model answered in that turn, the notes reached its context:
+        they get their receipt now. If it never answered, they go back to
+        pending (their items leave that turn) and the next turn or a wake
+        reads them. Either way none stays read but unconfirmed. Returns
+        (acknowledged, released) message ids."""
+        if not self.enabled or self.settings.backend != 'subscription':
+            return [], []
+        rows = self.store.db.execute('''SELECT n.seq,n.message_id FROM notes n
+            JOIN external_inputs e ON e.thread_id=n.thread_id AND e.message_id=n.message_id
+            WHERE n.thread_id=? AND n.turn_id=? AND n.state='injected' AND e.receipt IS NULL ORDER BY n.seq''',
+            (tid, turn_id)).fetchall()
+        if not rows:
+            return [], []
+        answered = self.store.db.execute(
+            "SELECT 1 FROM items WHERE turn_id=? AND json_extract(payload,'$.type') NOT IN (?,?) LIMIT 1",
+            (turn_id, *self._INPUT_ITEMS)).fetchone() is not None
+        if answered:
+            for row in rows:
+                self._persisted(tid, row['message_id'], turn_id)
+            return [row['message_id'] for row in rows], []
+        with self.store.transaction():
+            for row in rows:
+                self.store.db.execute("UPDATE notes SET state='pending',turn_id=NULL WHERE seq=?", (row['seq'],))
+                self.store.db.execute('DELETE FROM items WHERE turn_id=? AND id=?', (turn_id, row['message_id']))
+        return [], [row['message_id'] for row in rows]
+
     async def observe_event(self, tid: str, method: str, params: dict) -> None:
         """Parent calls this from Engine.emit; recursive native notifications are ignored."""
         watched = {'turn/started', 'turn/completed', 'claude/input/contextPersisted', 'claude/input/statusChanged',
@@ -281,6 +322,8 @@ class ExternalInputService:
             return
         turn = params.get('turn') or {}
         turn_id = params.get('turnId') or turn.get('id')
+        if method == 'turn/completed' and turn_id and turn.get('status') in {'interrupted', 'failed', 'uncertain'}:
+            self.settle_notes(tid, turn_id)
         # Resolve the small turn/message candidate set before probing the
         # permanent receipt ledger. Never scan it for each streamed token.
         candidates = '''SELECT message_id FROM inputs WHERE thread_id=? AND turn_id=?

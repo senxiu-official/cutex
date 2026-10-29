@@ -93,6 +93,14 @@ fn bad_request(message: impl Into<String>) -> RouteError {
 
 /// GET routes as pure JSON (testable without a socket).
 pub fn route_json(store: &AskStore, full_path: &str, route: &Route) -> Result<Value, RouteError> {
+    route_json_with_receipt_loader(store, full_path, route,
+        &crate::asks::receipt_uncertainty::read_context::load)
+}
+
+fn route_json_with_receipt_loader(
+    store: &AskStore, full_path: &str, route: &Route,
+    read_receipts: &dyn Fn(&[&crate::asks::model::AskRecord]) -> crate::asks::receipt_uncertainty::read_views::ReceiptReadContext,
+) -> Result<Value, RouteError> {
     let unavailable = |error: anyhow::Error| RouteError {
         status: 503,
         code: "asks_unavailable",
@@ -102,7 +110,7 @@ pub fn route_json(store: &AskStore, full_path: &str, route: &Route) -> Result<Va
     let query = |key: &str| crate::http::query::query_value(full_path, key);
     match route {
         Route::Collection => {
-            let state = store.snapshot().map_err(unavailable)?;
+            let state = store.history_snapshot().map_err(unavailable)?;
             let filter = AskFilter {
                 project: query("project"),
                 requester: query("requester"),
@@ -123,25 +131,29 @@ pub fn route_json(store: &AskStore, full_path: &str, route: &Route) -> Result<Va
             asks.sort_by_key(|ask| std::cmp::Reverse(ask.seq));
             let has_more = asks.len() > limit;
             asks.truncate(limit);
+            // history_snapshot returned owned data and released AskStore.
+            // Bus receipt + independent current session reads happen here.
+            let receipts = read_receipts(&asks);
             Ok(json!({
                 "hostId": crate::platform::host::current_host_name(),
                 "asks": asks
                     .into_iter()
-                    .map(|ask| crate::asks::view::summary(&state, ask))
+                    .map(|ask| crate::asks::view::summary_with_receipts(&state, ask, &receipts))
                     .collect::<Vec<_>>(),
                 "hasMore": has_more,
             }))
         }
         Route::Ask(ask_id) => {
-            let state = store.snapshot().map_err(unavailable)?;
+            let state = store.lookup_snapshot(&[ask_id]).map_err(unavailable)?;
             let ask = state
                 .asks
                 .get(ask_id)
                 .ok_or_else(|| not_found("ask_not_found", "no ask has this id", json!({"askId": ask_id})))?;
-            Ok(json!({ "ask": crate::asks::view::owner_view(&state, ask) }))
+            let receipts = read_receipts(&[ask]);
+            Ok(json!({ "ask": crate::asks::view::owner_view_with_receipts(&state, ask, &receipts) }))
         }
         Route::Answer(ask_id) => {
-            let state = store.snapshot().map_err(unavailable)?;
+            let state = store.lookup_snapshot(&[ask_id]).map_err(unavailable)?;
             let ask = state
                 .asks
                 .get(ask_id)
@@ -331,6 +343,8 @@ pub const REOPEN_METHOD: &str = "cutex/ask/reopen";
 pub const PAUSE_METHOD: &str = "cutex/asks/pause";
 /// `{}` → `{asksPaused: null, changed}`.
 pub const RESUME_METHOD: &str = "cutex/asks/resume";
+pub const AGENT_PAUSE_METHOD: &str = crate::asks::agent_pause::PAUSE_METHOD;
+pub const AGENT_RESUME_METHOD: &str = crate::asks::agent_pause::RESUME_METHOD;
 
 pub fn is_command(method: &str) -> bool {
     matches!(
@@ -344,6 +358,8 @@ pub fn is_command(method: &str) -> bool {
             | REOPEN_METHOD
             | PAUSE_METHOD
             | RESUME_METHOD
+            | AGENT_PAUSE_METHOD
+            | AGENT_RESUME_METHOD
     )
 }
 
@@ -380,7 +396,7 @@ pub fn execute_command(
     use crate::asks::store::AskError;
     let unavailable = |error: anyhow::Error| AskError::new("asks_unavailable", format!("{error:#}"));
     let ask_view = |ask_id: &str| -> Result<Value, AskError> {
-        let state = store.snapshot().map_err(unavailable)?;
+        let state = store.lookup_snapshot(&[ask_id]).map_err(unavailable)?;
         let ask = state.asks.get(ask_id).ok_or_else(|| AskError::new("ask_not_found", "no such ask"))?;
         Ok(crate::asks::view::owner_view(&state, ask))
     };
@@ -409,7 +425,8 @@ pub fn execute_command(
             if options.if_busy == IfBusy::Fail {
                 // Refuse at once like agent_ask (a retried actionId replays).
                 let state = store.snapshot().map_err(unavailable)?;
-                if state.find_by_action(&Requester::Owner, action_id).is_none() {
+                if state.find_by_action(&Requester::Owner, action_id).is_none()
+                    && store.archived_by_action(&Requester::Owner,action_id).map_err(unavailable)?.is_none() {
                     if let Some(refusal) = crate::asks::tools::busy_refusal(&state, &target, "ifBusy \"queue\"") {
                         return Err(refusal);
                     }
@@ -449,7 +466,7 @@ pub fn execute_command(
             if outcome == "changesRequested" {
                 let note = params.get("note").and_then(Value::as_str);
                 store
-                    .with_state(|state| crate::asks::awaits::reopen(state, ask_id, None, note, now))
+                    .with_records(&[ask_id],|state| crate::asks::awaits::reopen(state, ask_id, None, note, now))
                     .map_err(unavailable)??;
                 return Ok(json!({"ask": ask_view(ask_id)?}));
             }
@@ -466,7 +483,7 @@ pub fn execute_command(
             let ask_id = str_param(params, "askId")?;
             let note = params.get("note").and_then(Value::as_str);
             store
-                .with_state(|state| crate::asks::awaits::resume_now(state, ask_id, None, note, now))
+                .with_records(&[ask_id],|state| crate::asks::awaits::resume_now(state, ask_id, None, note, now))
                 .map_err(unavailable)??;
             Ok(json!({"ask": ask_view(ask_id)?}))
         }
@@ -474,14 +491,14 @@ pub fn execute_command(
             let ask_id = str_param(params, "askId")?;
             let note = params.get("note").and_then(Value::as_str);
             store
-                .with_state(|state| crate::asks::awaits::reopen(state, ask_id, None, note, now))
+                .with_records(&[ask_id],|state| crate::asks::awaits::reopen(state, ask_id, None, note, now))
                 .map_err(unavailable)??;
             Ok(json!({"ask": ask_view(ask_id)?}))
         }
         RETRY_METHOD => {
             let ask_id = str_param(params, "askId")?;
             store
-                .with_state(|state| crate::asks::lifecycle::retry(state, ask_id, None, now))
+                .with_records(&[ask_id],|state| crate::asks::lifecycle::retry(state, ask_id, None, now))
                 .map_err(unavailable)??;
             Ok(json!({"ask": ask_view(ask_id)?}))
         }
@@ -505,6 +522,16 @@ pub fn execute_command(
                 crate::asks::control::owner_pause_in_store(store, cutex_session_id, now).map_err(unavailable)
             } else {
                 crate::asks::control::owner_resume_in_store(store, cutex_session_id, now).map_err(unavailable)
+            }
+        }
+        AGENT_PAUSE_METHOD | AGENT_RESUME_METHOD => {
+            if !params.as_object().is_some_and(|params| params.is_empty()) {
+                return Err(AskError::new("invalid_arguments", "params must be an empty object"));
+            }
+            if method == AGENT_PAUSE_METHOD {
+                crate::asks::agent_pause::pause_in_store(store, cutex_session_id, "owner", None, now)
+            } else {
+                crate::asks::agent_pause::resume_in_store(store, cutex_session_id)
             }
         }
         other => Err(AskError::new("invalid_arguments", format!("unknown ask method {other}"))),
@@ -534,9 +561,16 @@ pub(super) fn dispatch_command(
     let world = crate::asks::scheduler::HostWorld::load();
     let result = execute_command(&store, &world, cutex_session_id, method, params, chrono::Utc::now())
         .map_err(operation_error);
+    if result.is_ok() && matches!(method, AGENT_PAUSE_METHOD | AGENT_RESUME_METHOD) {
+        super::admission::changed(cutex_session_id);
+    }
     publish_pending_notices(&store);
     result
 }
+
+#[cfg(test)]
+#[path = "asks_receipt_read_tests.rs"]
+mod receipt_read_tests;
 
 #[cfg(test)]
 mod tests {
@@ -643,6 +677,31 @@ mod tests {
     /// The owner as requester: create (never gated, deduplicated on
     /// actionId), stop a queued ask, answer a question, retry.
     #[test]
+    fn archived_owner_create_replays_even_when_target_is_busy() {
+        let (world,world_dir)=crate::asks::scheduler::tests::world("archived-create");
+        world.inputs.borrow_mut().target=crate::asks::gate::tests::party(
+            crate::asks::store::tests::TARGET,crate::agent_management::envelope::SandboxLevel::FullAccess,&[],"x");
+        let (store,dir)=temp_store("archived-create");
+        let old=crate::asks::parse_time("2026-10-23T00:00:00Z").unwrap();
+        let now=crate::asks::parse_time("2026-10-25T00:00:00Z").unwrap();
+        let target=crate::asks::store::tests::TARGET;
+        store.with_state(|state| {state.presence.insert(target.into(),crate::asks::store::Presence {online:true,..Default::default()});}).unwrap();
+        let params=json!({"text":"Review the parser","actionId":"closed-replay","ifBusy":"fail"});
+        let created=execute_command(&store,&world,target,CREATE_METHOD,&params,old).unwrap();
+        let id=created["ask"]["askId"].as_str().unwrap().to_owned();
+        execute_command(&store,&world,target,STOP_METHOD,&json!({"askId":id}),old).unwrap();
+        store.with_state(|state|state.notices.clear()).unwrap();
+        assert_eq!(store.archive_before(Some(now),now).unwrap().asks,1);
+        execute_command(&store,&world,target,CREATE_METHOD,&json!({"text":"Other queued work","actionId":"busy-now"}),now).unwrap();
+        let replay=execute_command(&store,&world,target,CREATE_METHOD,&params,now).unwrap();
+        assert_eq!(replay["created"],false);
+        assert_eq!(replay["ask"]["askId"],id);
+        assert_eq!(store.history_snapshot().unwrap().asks.len(),2);
+        std::fs::remove_dir_all(dir).unwrap();
+        if world_dir.exists() {std::fs::remove_dir_all(world_dir).unwrap();}
+    }
+
+    #[test]
     fn owner_commands() {
         let (world, dir) = crate::asks::scheduler::tests::world("v2cmd");
         world.inputs.borrow_mut().target = crate::asks::gate::tests::party(
@@ -703,6 +762,14 @@ mod tests {
         let resumed = execute_command(&store, &world, target, RESUME_METHOD, &json!({}), now).unwrap();
         assert_eq!(resumed, json!({"asksPaused": null, "changed": true}));
         assert!(store.snapshot().unwrap().pauses.is_empty());
+        // Whole-agent pause is independent and durable.
+        let agent = execute_command(&store, &world, target, AGENT_PAUSE_METHOD, &json!({}), now).unwrap();
+        assert_eq!(agent["changed"], true);
+        assert_eq!(agent["agentPause"]["phase"], "paused");
+        assert!(store.snapshot().unwrap().pauses.is_empty());
+        assert!(store.snapshot().unwrap().presence[target].agent_pause.is_some());
+        let resumed = execute_command(&store, &world, target, AGENT_RESUME_METHOD, &json!({}), now).unwrap();
+        assert_eq!(resumed, json!({"agentPause": null, "changed": true}));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(store_dir);
     }
@@ -720,7 +787,7 @@ mod tests {
         assert!(validate_cutex_request(&request(CLOSE_METHOD, json!({"askId": "a", "outcome": "stop"}))).is_err());
         validate_cutex_response(&json!({"contractVersion": 2, "requestId": "r-1", "cutexSessionId": "cutex.x",
             "cutex": {"method": CREATE_METHOD, "result": {"ask": {}, "created": true}}})).unwrap();
-        for method in [PAUSE_METHOD, RESUME_METHOD] {
+        for method in [PAUSE_METHOD, RESUME_METHOD, AGENT_PAUSE_METHOD, AGENT_RESUME_METHOD] {
             validate_cutex_request(&request(method, json!({}))).unwrap();
             assert!(validate_cutex_request(&request(method, json!({"x": 1}))).is_err());
         }
@@ -728,6 +795,13 @@ mod tests {
             "cutex": {"method": PAUSE_METHOD, "result": {"asksPaused": {"since": "2026-10-08T00:00:00.000Z", "by": "owner", "origin": "ownerPause"}, "changed": true}}})).unwrap();
         validate_cutex_response(&json!({"contractVersion": 2, "requestId": "r-1", "cutexSessionId": "cutex.x",
             "cutex": {"method": RESUME_METHOD, "result": {"asksPaused": null, "changed": false}}})).unwrap();
+        validate_cutex_response(&json!({"contractVersion": 2, "requestId": "r-1", "cutexSessionId": "cutex.x",
+            "cutex": {"method": AGENT_PAUSE_METHOD, "result": {"agentPause": {"cutexSessionId":"cutex.x",
+                "phase":"paused","requestedAt":"2026-10-25T00:00:00.000Z","pausedAt":"2026-10-25T00:00:00.000Z","by":"owner"}, "changed": true}}})).unwrap();
+        super::super::contract_validation::validate_cutex_event_message(&json!({
+            "method": crate::asks::agent_pause::CHANGED_EVENT,
+            "params": {"agentPause": null},
+        })).unwrap();
         super::super::contract_validation::validate_cutex_event_message(&json!({
             "method": crate::asks::control::PAUSE_CHANGED_EVENT,
             "params": {"asksPaused": null, "reason": "ownerMessage"},

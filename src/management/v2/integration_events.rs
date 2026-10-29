@@ -4,6 +4,7 @@ use anyhow::Context;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 
@@ -22,13 +23,98 @@ use super::model::{CutexMessage, EventCorrelation, EventEnvelope, EventSource, P
 use super::repository::management_v2_repository;
 use super::repository::{EventRepository, ReplayQuery};
 
+#[cfg(test)]
 const INTEGRATION_DEDUPE_STATE: &str = "integration-event-dedupe-v1.json";
 const INTEGRATION_DEDUPE_LOCK: &str = "integration-event-dedupe-v1.lock";
+
+#[path = "integration_event_ledger.rs"]
+mod ledger;
+
+/// Lightweight, read-only health probe. Uninitialized state is healthy;
+/// missing/corrupt migrated state and unresolved pending identities are errors.
+pub fn integration_dedupe_health(root: &std::path::Path) -> anyhow::Result<()> {
+    ledger::health(root)
+}
+
+/// Offline downgrade only. CLI must stop the daemon and require an explicit
+/// stopped acknowledgement before passing `daemon_stopped=true`. This is not
+/// a remote Management API. Export replaces the v2 marker atomically, streaming
+/// all committed identities; unresolved pending identities refuse downgrade.
+pub fn export_integration_dedupe_v1(
+    root: &std::path::Path,
+    output: &std::path::Path,
+    daemon_stopped: bool,
+) -> anyhow::Result<u64> {
+    anyhow::ensure!(
+        daemon_stopped,
+        "stop the daemon before exporting integration dedupe state"
+    );
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(INTEGRATION_DEDUPE_LOCK))?;
+    lock.try_lock_exclusive()
+        .context("integration dedupe writer is active; stop the daemon")?;
+    let result = ledger::export_v1(root, output);
+    let _ = FileExt::unlock(&lock);
+    result
+}
+
+#[cfg(test)]
+pub(super) fn prepare_synthetic_downgrade_ledger(root: &std::path::Path) -> anyhow::Result<u64> {
+    drop(ledger::Ledger::open(root)?);
+    export_integration_dedupe_v1(root, &root.join(INTEGRATION_DEDUPE_STATE), true)
+}
+
+#[cfg(test)]
+pub(super) fn reopen_synthetic_downgrade_ledger(root: &std::path::Path) -> anyhow::Result<()> {
+    let state = ledger::Ledger::open(root)?;
+    anyhow::ensure!(state.identity("synthetic-permanent-identity")? == Some(ledger::Identity::Committed),
+        "permanent synthetic identity was lost during downgrade");
+    integration_dedupe_health(root)
+}
 
 pub const AGENT_MANAGEMENT_PHASE_TRANSITION_METHOD: &str =
     "cutex/agentManagement/actionPhaseTransitionCommitted";
 pub const AGENT_MANAGEMENT_PHASE_TRANSITION_SCHEMA: &str =
     "cutex/agent-management-phase-transition/v1";
+pub const PROJECT_DIRECTOR_CHANGED_METHOD: &str = "cutex/project/directorChanged";
+
+pub fn append_project_director_changed(
+    owner: &str,
+    change_id: &str,
+    params: Value,
+) -> anyhow::Result<()> {
+    append_project_director_changed_at(management_v2_repository()?, owner, change_id, params)
+}
+fn append_project_director_changed_at(
+    repository: &EventRepository,
+    owner: &str,
+    change_id: &str,
+    params: Value,
+) -> anyhow::Result<()> {
+    CutexSessionId::new(owner)
+        .map_err(|error| anyhow::anyhow!("invalid Director event owner: {error:?}"))?;
+    anyhow::ensure!(
+        !change_id.is_empty(),
+        "Director change id must not be empty"
+    );
+    append_owner_event_once_with_repository_policy(
+        repository,
+        owner,
+        PROJECT_DIRECTOR_CHANGED_METHOD,
+        change_id,
+        params,
+        EventCorrelation {
+            management_request_id: Some(change_id.into()),
+            ..Default::default()
+        },
+        MissingCommittedEventPolicy::AcceptCommittedOutsideRetention,
+    )?;
+    Ok(())
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -113,6 +199,9 @@ pub fn append_agent_management_phase(
     )
 }
 
+// Committed identities never expire. These tombstones prevent recovery from
+// rematerializing owner events after envelopes leave the bounded journal.
+#[cfg(test)]
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct IntegrationEventDedupeState {
@@ -258,16 +347,29 @@ fn append_owner_event_once_with_repository_policy(
         .open(&lock_path)?;
     lock.lock_exclusive()?;
     let result = (|| -> anyhow::Result<Option<EventEnvelope>> {
-        let state_path = repository.root().join(INTEGRATION_DEDUPE_STATE);
-        let mut state = match fs::read(&state_path) {
-            Ok(bytes) => serde_json::from_slice::<IntegrationEventDedupeState>(&bytes)
-                .context("invalid integration event dedupe state")?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                IntegrationEventDedupeState::default()
+        let loaded = ledger::Ledger::open(repository.root())
+            .inspect_err(|_| ledger::record_warning(repository.root()));
+        let state = match loaded {
+            Ok(state) => state,
+            Err(error) => {
+                // Do not overwrite unreadable/future state or invent a second
+                // event when its original may already have expired. A job's
+                // terminal observation is optional presentation: skip that fact
+                // while allowing durable completion-message storage to continue.
+                eprintln!("health warning: integration event dedupe unavailable: {error:#}");
+                return match find_integration_event(repository, owner_cutex_session_id, method, action_id)? {
+                Some(event) => Ok(Some(event)),
+                None if missing_committed_event == MissingCommittedEventPolicy::AcceptCommittedOutsideRetention => Ok(None),
+                None => anyhow::bail!("integration event dedupe state is unreadable; prior commit cannot be determined"),
+            };
             }
-            Err(error) => return Err(error.into()),
         };
-        if state.committed.contains(&key) {
+        // The obsolete timestamp sidecar is advisory only and is deliberately
+        // neither read nor rewritten. Its corruption cannot block completion.
+        let identity = state
+            .identity(&key)
+            .inspect_err(|_| ledger::record_warning(repository.root()))?;
+        if identity == Some(ledger::Identity::Committed) {
             return match find_integration_event(
                 repository,
                 owner_cutex_session_id,
@@ -291,21 +393,26 @@ fn append_owner_event_once_with_repository_policy(
         if let Some(existing) =
             find_integration_event(repository, owner_cutex_session_id, method, action_id)?
         {
-            state.pending.remove(&key);
-            state.committed.insert(key);
-            crate::config::atomic::write_private_pretty_json_atomic(
-                &state_path,
-                &state,
-                "integration event dedupe state",
-            )?;
+            state
+                .commit(&key)
+                .inspect_err(|_| ledger::record_warning(repository.root()))?;
             return Ok(Some(existing));
         }
-        state.pending.insert(key.clone());
-        crate::config::atomic::write_private_pretty_json_atomic(
-            &state_path,
-            &state,
-            "integration event dedupe state",
-        )?;
+        if identity == Some(ledger::Identity::Pending) {
+            // The process may have died after the journal fsync, and its
+            // envelope may already have expired. Absence is not proof that
+            // append did not commit. Keep the identity for reconciliation.
+            eprintln!("health warning: integration event dedupe has unresolved pending identity; refusing to rematerialize owner fact");
+            return match missing_committed_event {
+                MissingCommittedEventPolicy::AcceptCommittedOutsideRetention => Ok(None),
+                MissingCommittedEventPolicy::RequireRetainedEvent => anyhow::bail!(
+                    "integration event pending identity is unresolved; prior commit cannot be determined"
+                ),
+            };
+        }
+        state
+            .pending(&key)
+            .inspect_err(|_| ledger::record_warning(repository.root()))?;
         let event = repository.append(PendingEvent {
             cutex_session_id: owner_cutex_session_id.to_string(),
             host_id: current_host_name(),
@@ -318,16 +425,15 @@ fn append_owner_event_once_with_repository_policy(
                 params,
             }),
         })?;
-        state.pending.remove(&key);
-        state.committed.insert(key);
-        crate::config::atomic::write_private_pretty_json_atomic(
-            &state_path,
-            &state,
-            "integration event dedupe state",
-        )?;
+        state
+            .commit(&key)
+            .inspect_err(|_| ledger::record_warning(repository.root()))?;
         Ok(Some(event))
     })();
     let _ = FileExt::unlock(&lock);
+    if let Err(error) = &result {
+        eprintln!("health warning: integration event dedupe unavailable; owner fact retained for retry: {error:#}");
+    }
     result
 }
 
@@ -367,7 +473,345 @@ fn find_integration_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_pending_never_reappends_and_blocks_unsafe_downgrade() {
+        let root =
+            std::env::temp_dir().join(format!("cutex-pending-unresolved-{}", uuid::Uuid::new_v4()));
+        let repository = EventRepository::open(&root, current_host_name()).unwrap();
+        let (owner, method, action) = ("cutex.owner", "cutex/test/uncertain", "uncertain-1");
+        let state = ledger::Ledger::open(&root).unwrap();
+        state
+            .pending(&format!("{owner}\u{0}{method}\u{0}{action}"))
+            .unwrap();
+        drop(state);
+        let before = repository.checkpoint().unwrap();
+        let strict = append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            action,
+            serde_json::json!({}),
+            EventCorrelation {
+                management_request_id: Some(action.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(strict
+            .to_string()
+            .contains("pending identity is unresolved"));
+        assert!(append_owner_event_once_with_repository_policy(
+            &repository,
+            owner,
+            method,
+            action,
+            serde_json::json!({}),
+            Default::default(),
+            MissingCommittedEventPolicy::AcceptCommittedOutsideRetention,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(repository.checkpoint().unwrap(), before);
+        assert!(integration_dedupe_health(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("pending"));
+        let output = root.join(INTEGRATION_DEDUPE_STATE);
+        assert!(export_integration_dedupe_v1(&root, &output, false)
+            .unwrap_err()
+            .to_string()
+            .contains("stop the daemon"));
+        assert!(export_integration_dedupe_v1(&root, &output, true)
+            .unwrap_err()
+            .to_string()
+            .contains("pending"));
+        drop(repository);
+        fs::remove_dir_all(root).unwrap();
+    }
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn director_change_retry_is_one_owner_scoped_fact_with_the_original_payload() {
+        let root = std::env::temp_dir().join(format!("director-event-{}", uuid::Uuid::new_v4()));
+        let repository = EventRepository::open(&root, current_host_name()).unwrap();
+        let owner = "cutex.11111111-1111-4111-8111-111111111111";
+        let params = serde_json::json!({"projectId":"project","newDirector":owner,"newEpoch":2});
+        for _ in 0..2 {
+            append_project_director_changed_at(&repository, owner, "change1", params.clone())
+                .unwrap();
+        }
+        let metadata = repository.stream_metadata().unwrap();
+        let page = repository
+            .page(ReplayQuery {
+                stream_id: Some(metadata.stream_id),
+                after: None,
+                limit: 1000,
+                cutex_session_id: Some(owner.into()),
+            })
+            .unwrap();
+        assert_eq!(page.events.len(), 1);
+        let event = &page.events[0];
+        assert_eq!(event.cutex_session_id, owner);
+        assert_eq!(
+            event.cutex.as_ref().unwrap().method,
+            PROJECT_DIRECTOR_CHANGED_METHOD
+        );
+        assert_eq!(event.cutex.as_ref().unwrap().params, params);
+        assert_eq!(
+            event.correlation.management_request_id.as_deref(),
+            Some("change1")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn committed_dedupe_outlives_old_timestamps_and_unrelated_activity() {
+        let root = std::env::temp_dir().join(format!("cutex-dedupe-old-{}", uuid::Uuid::new_v4()));
+        let repository = EventRepository::open(&root, current_host_name()).unwrap();
+        let owner = "cutex.owner";
+        let method = "cutex/test/oldDedupe";
+        let key = format!("{owner}\u{0}{method}\u{0}expired");
+        let state_path = root.join(INTEGRATION_DEDUPE_STATE);
+        crate::config::atomic::write_private_pretty_json_atomic(
+            &state_path,
+            &IntegrationEventDedupeState {
+                committed: BTreeSet::from([key.clone()]),
+                pending: BTreeSet::from(["unknown-pending".into()]),
+            },
+            "test dedupe",
+        )
+        .unwrap();
+        let seen_path = root.join("integration-event-dedupe-seen-v1.json");
+        let seen = serde_json::to_vec(&std::collections::BTreeMap::from([(
+            key.clone(),
+            chrono::Utc::now() - chrono::Duration::days(31),
+        )]))
+        .unwrap();
+        fs::write(&seen_path, &seen).unwrap();
+        append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            "fresh",
+            serde_json::json!({}),
+            EventCorrelation {
+                management_request_id: Some("fresh".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let state = ledger::Ledger::open(&root).unwrap();
+        assert_eq!(
+            state.identity(&key).unwrap(),
+            Some(ledger::Identity::Committed)
+        );
+        assert_eq!(
+            state.identity("unknown-pending").unwrap(),
+            Some(ledger::Identity::Pending)
+        );
+        drop(state);
+        assert_eq!(fs::read(&seen_path).unwrap(), seen);
+        let before = repository.checkpoint().unwrap();
+        assert!(append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            "expired",
+            serde_json::json!({}),
+            Default::default()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("no longer retained"));
+        assert!(append_owner_event_once_with_repository_policy(
+            &repository,
+            owner,
+            method,
+            "expired",
+            serde_json::json!({}),
+            Default::default(),
+            MissingCommittedEventPolicy::AcceptCommittedOutsideRetention
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(repository.checkpoint().unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_timestamp_sidecar_does_not_block_and_replay_changes_no_files() {
+        let root =
+            std::env::temp_dir().join(format!("cutex-dedupe-sidecar-{}", uuid::Uuid::new_v4()));
+        let repository = EventRepository::open(&root, current_host_name()).unwrap();
+        let seen_path = root.join("integration-event-dedupe-seen-v1.json");
+        fs::write(&seen_path, b"{corrupt timestamp sidecar").unwrap();
+        let owner = "cutex.owner";
+        let method = "cutex/test/sidecar";
+        let correlation = EventCorrelation {
+            management_request_id: Some("once".into()),
+            ..Default::default()
+        };
+        let first = append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            "once",
+            serde_json::json!({}),
+            correlation.clone(),
+        )
+        .unwrap();
+        let state_path = root.join(INTEGRATION_DEDUPE_STATE);
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        for path in [&state_path, &seen_path] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let before: Vec<_> = [&state_path, &seen_path]
+            .into_iter()
+            .map(|path| {
+                (
+                    fs::read(path).unwrap(),
+                    fs::metadata(path).unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        let replay = append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            "once",
+            serde_json::json!({}),
+            correlation,
+        )
+        .unwrap();
+        assert_eq!(first.event_id, replay.event_id);
+        let after: Vec<_> = [&state_path, &seen_path]
+            .into_iter()
+            .map(|path| {
+                (
+                    fs::read(path).unwrap(),
+                    fs::metadata(path).unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            before, after,
+            "replay must not rewrite/fsync unchanged ledgers"
+        );
+        // A sidecar that cannot even be read as a file is equally advisory.
+        fs::remove_file(&seen_path).unwrap();
+        fs::create_dir(&seen_path).unwrap();
+        append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            "new-after-unreadable-sidecar",
+            serde_json::json!({}),
+            EventCorrelation {
+                management_request_id: Some("new-after-unreadable-sidecar".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(seen_path.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_identity_ledger_skips_optional_fact_without_losing_state_or_duplicating() {
+        let root =
+            std::env::temp_dir().join(format!("cutex-dedupe-corrupt-{}", uuid::Uuid::new_v4()));
+        let repository = EventRepository::open(&root, current_host_name()).unwrap();
+        let owner = "cutex.owner";
+        let method = "cutex/test/corruptLedger";
+        let correlation = EventCorrelation {
+            management_request_id: Some("existing".into()),
+            ..Default::default()
+        };
+        let first = append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            "existing",
+            serde_json::json!({}),
+            correlation.clone(),
+        )
+        .unwrap();
+        let path = root.join(INTEGRATION_DEDUPE_STATE);
+        fs::write(&path, b"{corrupt identity ledger").unwrap();
+        let before = repository.checkpoint().unwrap();
+        let retained = append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            "existing",
+            serde_json::json!({}),
+            correlation,
+        )
+        .unwrap();
+        assert_eq!(first.event_id, retained.event_id);
+        assert!(append_owner_event_once_with_repository_policy(
+            &repository,
+            owner,
+            method,
+            "unknown",
+            serde_json::json!({}),
+            Default::default(),
+            MissingCommittedEventPolicy::AcceptCommittedOutsideRetention
+        )
+        .unwrap()
+        .is_none());
+        assert!(append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            "unknown",
+            serde_json::json!({}),
+            Default::default()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("prior commit cannot be determined"));
+        assert_eq!(repository.checkpoint().unwrap(), before);
+        assert_eq!(fs::read(&path).unwrap(), b"{corrupt identity ledger");
+        // Unknown future state must also survive without being rewritten as
+        // empty state. Lack of a readable ledger never authorizes a resend.
+        let future = br#"{"committed":[],"pending":["unknown"],"futureVersion":2}"#;
+        fs::write(&path, future).unwrap();
+        assert!(append_owner_event_once_with_repository_policy(
+            &repository,
+            owner,
+            method,
+            "unknown",
+            serde_json::json!({}),
+            Default::default(),
+            MissingCommittedEventPolicy::AcceptCommittedOutsideRetention
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(fs::read(&path).unwrap(), future);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(append_owner_event_once_with_repository_policy(
+            &repository,
+            owner,
+            method,
+            "unknown",
+            serde_json::json!({}),
+            Default::default(),
+            MissingCommittedEventPolicy::AcceptCommittedOutsideRetention
+        )
+        .unwrap()
+        .is_none());
+        assert!(path.is_dir());
+        assert_eq!(repository.checkpoint().unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn job_terminal_observation_retry_commits_one_owner_event() {
@@ -386,23 +830,39 @@ mod tests {
         let mut event_id = None;
         for _ in 0..2 {
             let event = append_owner_event_once_with_repository_policy(
-                &repository, owner, "cutex/jobService/terminalObserved", "job-terminal:job_123:3",
-                params.clone(), EventCorrelation {
+                &repository,
+                owner,
+                "cutex/jobService/terminalObserved",
+                "job-terminal:job_123:3",
+                params.clone(),
+                EventCorrelation {
                     management_request_id: Some("job-terminal:job_123:3".into()),
                     ..Default::default()
-                }, MissingCommittedEventPolicy::AcceptCommittedOutsideRetention,
-            ).unwrap().unwrap();
-            if let Some(id) = &event_id { assert_eq!(id, &event.event_id); }
+                },
+                MissingCommittedEventPolicy::AcceptCommittedOutsideRetention,
+            )
+            .unwrap()
+            .unwrap();
+            if let Some(id) = &event_id {
+                assert_eq!(id, &event.event_id);
+            }
             event_id = Some(event.event_id);
         }
-        let page = repository.page(ReplayQuery {
-            stream_id: None, after: None, limit: 100,
-            cutex_session_id: Some(owner.into()),
-        }).unwrap();
+        let page = repository
+            .page(ReplayQuery {
+                stream_id: None,
+                after: None,
+                limit: 100,
+                cutex_session_id: Some(owner.into()),
+            })
+            .unwrap();
         assert_eq!(page.events.len(), 1);
         assert!(crate::notify::outbound::map_event(
-            &page.events[0], crate::notify::session::Level::Normal, "worker"
-        ).is_some());
+            &page.events[0],
+            crate::notify::session::Level::Normal,
+            "worker"
+        )
+        .is_some());
         drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -498,6 +958,25 @@ mod tests {
             "test integration dedupe state",
         )
         .unwrap();
+        // Simulate the crash gap: journal append durable, ledger still pending.
+        // A pending identity without a retained envelope is deliberately NOT
+        // retried: the envelope might already have passed retention.
+        let crashed = EventRepository::open(&root, current_host_name()).unwrap();
+        crashed
+            .append(PendingEvent {
+                cutex_session_id: owner.into(),
+                host_id: current_host_name(),
+                source: EventSource::Cutex,
+                schema: None,
+                native: None,
+                correlation: correlation.clone(),
+                cutex: Some(CutexMessage {
+                    method: method.into(),
+                    params: params.clone(),
+                }),
+            })
+            .unwrap();
+        drop(crashed);
         let barrier = Arc::new(Barrier::new(2));
         let mut threads = Vec::new();
         for _ in 0..2 {
@@ -534,11 +1013,15 @@ mod tests {
                 .count(),
             1
         );
-        let state: IntegrationEventDedupeState =
-            serde_json::from_slice(&fs::read(root.join(INTEGRATION_DEDUPE_STATE)).unwrap())
-                .unwrap();
-        assert!(state.pending.is_empty());
-        assert_eq!(state.committed.len(), 1);
+        let state = ledger::Ledger::open(&root).unwrap();
+        assert_eq!(
+            state
+                .identity(&format!("{owner}\u{0}{method}\u{0}{action}"))
+                .unwrap(),
+            Some(ledger::Identity::Committed)
+        );
+        drop(state);
+        integration_dedupe_health(&root).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

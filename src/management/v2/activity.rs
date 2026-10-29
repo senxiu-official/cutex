@@ -31,6 +31,19 @@ const OUTPUT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 static ACTIVITY_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static ACTIVITY_RECORDER: OnceLock<ActivityRecorder> = OnceLock::new();
 
+/// Pure conversation projection shared by SessionResource and agent_list.
+/// observedAt is a read timestamp, never persisted as conversation activity.
+pub fn agent_projection(activity:Option<&SessionActivityState>,online:Option<bool>,busy:bool,generation:Option<u64>,now:chrono::DateTime<chrono::Utc>)->serde_json::Value {
+    let last=activity.and_then(SessionActivityState::conversation_at).filter(|s|DateTime::parse_from_rfc3339(s).is_ok());
+    let known=last.is_some();
+    let busy_since=activity.filter(|a|busy&&generation.is_some()&&a.runtime_generation==generation)
+        .and_then(|a|a.last_turn_started_at.as_deref());
+    serde_json::json!({"lastActivityAt":last,"activitySource":if known{"conversation"}else{"unknown"},
+        "observedAt":now.to_rfc3339(),"busySince":busy_since,
+        "activityStatus":match online{Some(false)=>"offline",Some(true) if busy=>"busy",Some(true) if known=>"idle",_=>"unknown"},
+        "idleThresholdSeconds":7200})
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionActivityState {
@@ -44,6 +57,10 @@ pub struct SessionActivityState {
     pub last_output_completed_at: Option<String>,
     #[serde(default)]
     pub last_turn_completed_at: Option<String>,
+    /// Generation of this completion, independent of later output/start events.
+    /// Legacy stores lack this evidence and cannot establish cache warmth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_completed_generation: Option<u64>,
     #[serde(default)]
     pub last_file_change_at: Option<String>,
     /// Last native `turn/started` (the owner's or an agent's input starting a turn).
@@ -65,6 +82,14 @@ pub struct SessionActivityState {
     pub(crate) last_output_order: Option<ActivityOrder>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_tool_call_order: Option<ActivityOrder>,
+    /// Turn of `last_output` / `last_tool_call` (the event's `params.turnId`),
+    /// so a history revert can drop a preview of a removed turn
+    /// ([`forget_reverted_turns`]). Absent in stores of older binaries and
+    /// for events without a turn id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_output_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_tool_call_turn_id: Option<String>,
 }
 
 impl SessionActivityState {
@@ -186,6 +211,8 @@ struct ActivityStore {
     version: u8,
     #[serde(default)]
     sessions: HashMap<String, SessionActivityState>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    deleted_sessions: std::collections::BTreeSet<String>,
 }
 
 impl Default for ActivityStore {
@@ -193,6 +220,7 @@ impl Default for ActivityStore {
         Self {
             version: activity_store_version(),
             sessions: HashMap::new(),
+            deleted_sessions: Default::default(),
         }
     }
 }
@@ -222,6 +250,48 @@ impl ActivityRecorder {
         }
     }
 
+    fn record_output_locked(
+        &self, root: &Path, session: &str, generation: u64, at: &str,
+        output: &mut HashMap<String, OutputCheckpoint>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(generation > 0 && generation <= MAX_SAFE_SEQUENCE,
+            "activity event requires a positive JSON-safe runtime generation");
+        parse_timestamp(at).context("invalid live activity timestamp")?;
+        let checkpoint = output.entry(session.to_string()).or_default();
+        match checkpoint.runtime_generation {
+            Some(current) if generation < current => return Ok(()),
+            Some(current) if generation > current => {
+                *checkpoint = OutputCheckpoint { runtime_generation: Some(generation), ..Default::default() };
+            }
+            None => checkpoint.runtime_generation = Some(generation),
+            Some(_) => {}
+        }
+        merge_timestamp(&mut checkpoint.latest_at, at)?;
+        let latest = checkpoint.latest_at.as_deref().context("output checkpoint missing timestamp")?;
+        if !checkpoint_due(checkpoint.last_attempt_at.as_deref(), latest, self.output_checkpoint_interval)? {
+            return Ok(());
+        }
+        checkpoint.last_attempt_at = Some(latest.to_string());
+        update_activity_at(root, session, generation, |state| {
+            let changed = merge_timestamp(&mut state.last_output_at, latest)?;
+            Ok(merge_timestamp(&mut state.last_conversation_at, latest)? | changed)
+        })?;
+        Ok(())
+    }
+
+    fn record_live_at(&self, root: &Path, pending: &super::model::PendingEvent, at: &str) -> anyhow::Result<()> {
+        if pending.source != EventSource::AppServer { return Ok(()); }
+        let Some(native) = &pending.native else { return Ok(()) };
+        if native.kind != NativeMessageKind::Notification
+            || native.message["method"] != "item/agentMessage/delta"
+            || !native.message.pointer("/params/delta").and_then(serde_json::Value::as_str).is_some_and(|s| !s.is_empty()) {
+            return Ok(());
+        }
+        let generation = pending.correlation.runtime_generation.context("live activity missing runtime generation")?;
+        let mut output = self.output.lock().map_err(|_| anyhow::anyhow!("session activity recorder lock was poisoned"))?;
+        self.record_output_locked(root, &pending.cutex_session_id, generation, at, &mut output)
+    }
+
     fn record_at(&self, root: &Path, envelope: &EventEnvelope) -> anyhow::Result<()> {
         let Some(event) = activity_event(envelope) else {
             return Ok(());
@@ -239,40 +309,8 @@ impl ActivityRecorder {
             .map_err(|_| anyhow::anyhow!("session activity recorder lock was poisoned"))?;
         match event {
             ActivityEvent::OutputDelta => {
-                let checkpoint = output.entry(envelope.cutex_session_id.clone()).or_default();
-                match checkpoint.runtime_generation {
-                    Some(current) if runtime_generation < current => return Ok(()),
-                    Some(current) if runtime_generation > current => {
-                        *checkpoint = OutputCheckpoint {
-                            runtime_generation: Some(runtime_generation),
-                            ..OutputCheckpoint::default()
-                        };
-                    }
-                    None => checkpoint.runtime_generation = Some(runtime_generation),
-                    Some(_) => {}
-                }
-                merge_timestamp(&mut checkpoint.latest_at, &envelope.received_at)?;
-                let latest_at = checkpoint
-                    .latest_at
-                    .as_deref()
-                    .context("output checkpoint is missing its latest timestamp")?;
-                if !checkpoint_due(
-                    checkpoint.last_attempt_at.as_deref(),
-                    latest_at,
-                    self.output_checkpoint_interval,
-                )? {
-                    return Ok(());
-                }
-                checkpoint.last_attempt_at = Some(latest_at.to_string());
-                update_activity_at(
-                    root,
-                    &envelope.cutex_session_id,
-                    runtime_generation,
-                    |state| {
-                        let changed = merge_timestamp(&mut state.last_output_at, latest_at)?;
-                        Ok(merge_timestamp(&mut state.last_conversation_at, latest_at)? | changed)
-                    },
-                )?;
+                self.record_output_locked(root, &envelope.cutex_session_id, runtime_generation,
+                    &envelope.received_at, &mut output)?;
             }
             ActivityEvent::OutputCompleted {
                 has_output,
@@ -351,6 +389,11 @@ impl ActivityRecorder {
                             &mut state.last_turn_completed_at,
                             &envelope.received_at,
                         )?;
+                        if state.last_turn_completed_at.as_deref() == Some(envelope.received_at.as_str())
+                            && state.last_turn_completed_generation != Some(runtime_generation) {
+                            state.last_turn_completed_generation = Some(runtime_generation);
+                            changed = true;
+                        }
                         // Output the turn produced is conversation; its end
                         // only when not interrupted: a resumed runtime
                         // interrupts a turn left in progress by the restart.
@@ -455,6 +498,14 @@ pub fn record_activity_event(envelope: &EventEnvelope) -> anyhow::Result<()> {
     ACTIVITY_RECORDER
         .get_or_init(|| ActivityRecorder::new(OUTPUT_CHECKPOINT_INTERVAL))
         .record_at(&root, envelope)
+}
+
+/// A passive output signal shares the existing one-second checkpoint cadence;
+/// it has no journal sequence/cursor and never creates an output preview.
+pub fn record_live_output_signal(pending: &super::model::PendingEvent) -> anyhow::Result<()> {
+    let root = runtime_dir()?.join("management-v2");
+    ACTIVITY_RECORDER.get_or_init(|| ActivityRecorder::new(OUTPUT_CHECKPOINT_INTERVAL))
+        .record_live_at(&root, pending, &chrono::Utc::now().to_rfc3339())
 }
 
 pub fn load_session_activity_states() -> anyhow::Result<HashMap<String, SessionActivityState>> {
@@ -654,6 +705,7 @@ fn update_last_output(
     order.validate()?;
     state.last_output = Some(projection);
     state.last_output_order = Some(order);
+    state.last_output_turn_id = event_turn_id(envelope);
     Ok(true)
 }
 
@@ -682,7 +734,63 @@ fn update_last_tool_call(
     order.validate()?;
     state.last_tool_call = Some(projection);
     state.last_tool_call_order = Some(order);
+    state.last_tool_call_turn_id = event_turn_id(envelope);
     Ok(true)
+}
+
+/// The native turn of an item event (correlation, else `params.turnId`), if any.
+fn event_turn_id(envelope: &EventEnvelope) -> Option<String> {
+    envelope
+        .correlation
+        .turn_id
+        .as_deref()
+        .or_else(|| envelope.native.as_ref()?.message.pointer("/params/turnId")?.as_str())
+        .filter(|turn| !turn.is_empty())
+        .map(str::to_string)
+}
+
+/// After a history revert removed `removed_turn_ids`: `lastOutput` /
+/// `lastToolCall` must not show what the agent no longer said or did. A
+/// preview of a removed turn, or of an unknown turn (stores written before
+/// turn ids were kept), is cleared; the next output / tool call of the
+/// remaining conversation sets it again. Timestamps (`lastOutputAt`,
+/// `lastConversationAt`, ...) stay: they describe when the agent was active,
+/// which a revert does not undo. History items carry no time of their own,
+/// so the previews are not recomputed from the remaining turns.
+pub fn forget_reverted_turns(cutex_session_id: &str, removed_turn_ids: &[&str]) -> anyhow::Result<()> {
+    forget_reverted_turns_at(&runtime_dir()?.join("management-v2"), cutex_session_id, removed_turn_ids)
+}
+
+fn forget_reverted_turns_at(root: &Path, id: &str, removed_turn_ids: &[&str]) -> anyhow::Result<()> {
+    if removed_turn_ids.is_empty() {
+        return Ok(());
+    }
+    let removed = |turn: &Option<String>| turn.as_deref().is_none_or(|turn| removed_turn_ids.contains(&turn));
+    with_activity_store_lock(root, |path| {
+        let mut store = load_activity_store(path)?;
+        let Some(state) = store.sessions.get_mut(id) else {
+            return Ok(());
+        };
+        let mut changed = false;
+        if state.last_output.is_some() && removed(&state.last_output_turn_id) {
+            (state.last_output, state.last_output_order, state.last_output_turn_id) = (None, None, None);
+            changed = true;
+        }
+        if state.last_tool_call.is_some() && removed(&state.last_tool_call_turn_id) {
+            (state.last_tool_call, state.last_tool_call_order, state.last_tool_call_turn_id) = (None, None, None);
+            changed = true;
+        }
+        if changed {
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .filter(|revision| *revision <= MAX_SAFE_SEQUENCE)
+                .context("session activity revision exhausted")?;
+            state.validate()?;
+            write_private_pretty_json_atomic(path, &store, "management v2 session activity")?;
+        }
+        Ok(())
+    })
 }
 
 fn observation_association(envelope: &EventEnvelope) -> ObservationAssociation {
@@ -755,6 +863,9 @@ fn update_activity_at(
     }
     with_activity_store_lock(root, |path| {
         let mut store = load_activity_store(path)?;
+        if store.deleted_sessions.contains(cutex_session_id) {
+            return Ok(());
+        }
         let state = store
             .sessions
             .entry(cutex_session_id.to_string())
@@ -776,6 +887,22 @@ fn update_activity_at(
                 .filter(|revision| *revision <= MAX_SAFE_SEQUENCE)
                 .context("session activity revision exhausted")?;
             state.validate()?;
+            write_private_pretty_json_atomic(path, &store, "management v2 session activity")?;
+        }
+        Ok(())
+    })
+}
+
+/// Remove a deleted session's rebuildable projection, never its history.
+pub fn forget_deleted_session(cutex_session_id: &str) -> anyhow::Result<()> {
+    forget_deleted_session_at(&runtime_dir()?.join("management-v2"), cutex_session_id)
+}
+
+fn forget_deleted_session_at(root: &Path, id: &str) -> anyhow::Result<()> {
+    with_activity_store_lock(root, |path| {
+        let mut store = load_activity_store(path)?;
+        let removed = store.sessions.remove(id).is_some();
+        if store.deleted_sessions.insert(id.to_string()) || removed {
             write_private_pretty_json_atomic(path, &store, "management v2 session activity")?;
         }
         Ok(())
@@ -931,6 +1058,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_output_checkpoints_once_per_interval_and_final_flushes_latest_signal() {
+        let root = test_root("live-output");
+        let recorder = ActivityRecorder::new(Duration::from_secs(1));
+        let pending = super::super::model::PendingEvent {
+            cutex_session_id: "cutex.session-a".into(), host_id: "test".into(), source: EventSource::AppServer,
+            schema: None, correlation: EventCorrelation {runtime_generation:Some(1),..Default::default()},
+            native: Some(NativeMessage {kind:NativeMessageKind::Notification,message:json!({"method":"item/agentMessage/delta","params":{"delta":"汉🙂"}})}),cutex:None,
+        };
+        recorder.record_live_at(&root, &pending, "2026-10-25T00:00:00.000Z").unwrap();
+        let first = fs::read(root.join(ACTIVITY_STATE_FILE)).unwrap();
+        for millis in 1..1000 {
+            recorder.record_live_at(&root, &pending, &format!("2026-10-25T00:00:00.{millis:03}Z")).unwrap();
+        }
+        assert_eq!(fs::read(root.join(ACTIVITY_STATE_FILE)).unwrap(), first,
+            "999 live fragments must not cause 999 durable writes");
+        recorder.record_at(&root, &envelope("2026-10-25T00:00:01.100Z", "item/completed",
+            json!({"threadId":"thread-1","item":{"id":"m","type":"agentMessage","text":"full 汉🙂"}}))).unwrap();
+        let state = load_session_activity_states_at(&root).unwrap().remove("cutex.session-a").unwrap();
+        assert_eq!(state.last_output_at.as_deref(), Some("2026-10-25T00:00:00.999Z"));
+        assert_eq!(state.last_output_completed_at.as_deref(), Some("2026-10-25T00:00:01.100Z"));
+        assert!(state.last_output.is_some(), "only the durable completion creates a preview");
+        let after_final = fs::read(root.join(ACTIVITY_STATE_FILE)).unwrap();
+        let mut reasoning = pending;
+        reasoning.native.as_mut().unwrap().message["method"] = json!("item/reasoning/textDelta");
+        recorder.record_live_at(&root, &reasoning, "2026-10-25T00:00:10Z").unwrap();
+        assert_eq!(fs::read(root.join(ACTIVITY_STATE_FILE)).unwrap(), after_final);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn correlated_envelope(
         received_at: &str,
         method: &str,
@@ -947,6 +1104,68 @@ mod tests {
         envelope.correlation.turn_id = Some(turn_id.to_string());
         envelope.correlation.item_id = Some(format!("item-{sequence}"));
         envelope
+    }
+
+    /// C-7 (r265): a history revert drops the previews of removed turns only.
+    #[test]
+    fn a_revert_clears_previews_of_removed_turns_and_keeps_the_rest() {
+        let root = test_root("revert");
+        let recorder = ActivityRecorder::new(Duration::from_secs(1));
+        let item = |at: &str, seq: u64, turn: &str, item: serde_json::Value| {
+            correlated_envelope(at, "item/completed", json!({"threadId": "thread-1", "turnId": turn, "item": item}), 1, "s", seq, turn)
+        };
+        recorder.record_at(&root, &item("2026-10-27T00:00:01Z", 1, "turn-1",
+            json!({"id": "c1", "type": "commandExecution", "status": "completed"}))).unwrap();
+        recorder.record_at(&root, &item("2026-10-27T00:00:02Z", 2, "turn-2",
+            json!({"id": "m2", "type": "agentMessage", "text": "second answer"}))).unwrap();
+        let state = |root: &Path| load_session_activity_states_at(root).unwrap().remove("cutex.session-a").unwrap();
+        let before = state(&root);
+        assert_eq!(before.last_output_turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(before.last_tool_call_turn_id.as_deref(), Some("turn-1"));
+        // Removing another turn changes nothing (no write either).
+        forget_reverted_turns_at(&root, "cutex.session-a", &["turn-9"]).unwrap();
+        assert_eq!(state(&root), before);
+        forget_reverted_turns_at(&root, "cutex.session-a", &[]).unwrap();
+        assert_eq!(state(&root), before);
+        // Reverting turn 2 clears the output preview; turn 1's tool call stays.
+        forget_reverted_turns_at(&root, "cutex.session-a", &["turn-2"]).unwrap();
+        let after = state(&root);
+        assert!(after.last_output.is_none() && after.last_output_order.is_none());
+        assert_eq!(after.last_tool_call, before.last_tool_call);
+        assert_eq!(after.last_output_at, before.last_output_at, "activity times stay");
+        assert_eq!(after.revision, before.revision + 1);
+        // The next output after the revert is shown again (the order fence was reset).
+        recorder.record_at(&root, &item("2026-10-27T00:00:03Z", 1, "turn-2b",
+            json!({"id": "m3", "type": "agentMessage", "text": "new answer"}))).unwrap();
+        assert_eq!(state(&root).last_output.unwrap().display_text, "new answer");
+        // A preview of an unknown turn (older store) is cleared by any revert.
+        let mut store = load_activity_store(&root.join(ACTIVITY_STATE_FILE)).unwrap();
+        store.sessions.get_mut("cutex.session-a").unwrap().last_tool_call_turn_id = None;
+        with_activity_store_lock(&root, |path| write_private_pretty_json_atomic(path, &store, "test")).unwrap();
+        forget_reverted_turns_at(&root, "cutex.session-a", &["turn-7"]).unwrap();
+        let last = state(&root);
+        assert!(last.last_tool_call.is_none());
+        assert_eq!(last.last_output.unwrap().display_text, "new answer");
+        // Unknown sessions are a no-op.
+        forget_reverted_turns_at(&root, "cutex.other", &["turn-1"]).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleted_session_projection_cleanup_keeps_other_sessions() {
+        let root = test_root("deleted-session");
+        let mut store = ActivityStore::default();
+        store.sessions.insert("gone".into(), SessionActivityState::default());
+        store.sessions.insert("keep".into(), SessionActivityState::default());
+        with_activity_store_lock(&root, |path| write_private_pretty_json_atomic(path, &store, "test")).unwrap();
+        forget_deleted_session_at(&root, "gone").unwrap();
+        let loaded = load_session_activity_states_at(&root).unwrap();
+        assert!(!loaded.contains_key("gone"));
+        assert!(loaded.contains_key("keep"));
+        forget_deleted_session_at(&root, "gone").unwrap();
+        update_activity_at(&root, "gone", 99, |_| panic!("late deleted-session activity reached mutation")).unwrap();
+        assert!(!load_session_activity_states_at(&root).unwrap().contains_key("gone"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -999,6 +1218,7 @@ mod tests {
             .expect("record restart interrupt");
         let restarted = state(&root);
         assert_eq!(restarted.last_turn_completed_at.as_deref(), Some("2026-10-18T03:00:00Z"));
+        assert_eq!(restarted.last_turn_completed_generation, Some(2));
         assert_eq!(restarted.conversation_at().as_deref(), Some("2026-10-18T01:00:00Z"));
         // Lifecycle-only events are not recorded at all.
         recorder
@@ -1022,6 +1242,22 @@ mod tests {
         let persisted = fs::read_to_string(root.join(ACTIVITY_STATE_FILE)).expect("read store");
         assert!(persisted.contains("lastConversationAt") && persisted.contains("lastTurnStartedAt"));
         fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn completion_clock_ignores_metadata_and_retains_its_own_generation() {
+        let root = test_root("completion-clock");
+        let recorder = ActivityRecorder::new(Duration::ZERO);
+        recorder.record_at(&root, &envelope_at_generation("2026-10-18T01:00:00Z", "turn/completed", json!({"threadId":"thread-1","turn":{"id":"t1","status":"completed"}}), 1)).unwrap();
+        recorder.record_at(&root, &envelope_at_generation("2026-10-18T01:01:00Z", "thread/name/updated", json!({"threadId":"thread-1","name":"changed"}), 1)).unwrap();
+        let state = load_session_activity_states_at(&root).unwrap().remove("cutex.session-a").unwrap();
+        assert_eq!(state.last_turn_completed_at.as_deref(), Some("2026-10-18T01:00:00Z"));
+        assert_eq!(state.last_turn_completed_generation, Some(1));
+        recorder.record_at(&root, &envelope_at_generation("2026-10-18T01:02:00Z", "turn/started", json!({"threadId":"thread-1","turn":{"id":"t2"}}), 2)).unwrap();
+        let restored = load_session_activity_states_at(&root).unwrap().remove("cutex.session-a").unwrap();
+        assert_eq!(restored.runtime_generation, Some(2));
+        assert_eq!(restored.last_turn_completed_generation, Some(1));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1676,7 +1912,8 @@ mod tests {
                 "runtimeGeneration": 1,
                 "lastOutputAt": null,
                 "lastOutputCompletedAt": null,
-                "lastTurnCompletedAt": "2026-08-13T05:00:00Z",
+                    "lastTurnCompletedAt": "2026-08-13T05:00:00Z",
+                    "lastTurnCompletedGeneration": 1,
                 "lastFileChangeAt": null,
                 "lastConversationAt": "2026-08-13T05:00:00Z",
                 "lastOutput": null,
@@ -1693,5 +1930,28 @@ mod tests {
         assert_eq!(output_class(Some("final_answer")), SafeOutputClass::FinalVisible);
         assert_eq!(output_class(Some("future_phase")), SafeOutputClass::Unclassified);
         assert_eq!(output_class(None), SafeOutputClass::Unclassified);
+    }
+}
+
+#[cfg(test)]
+mod agent_projection_tests {
+    use super::*;
+    use serde_json::{json,Value};
+    #[test]
+    fn reads_do_not_invent_activity_or_reuse_another_generations_busy_since(){
+        let now=chrono::Utc::now();
+        let unknown=agent_projection(None,Some(true),false,Some(2),now);
+        assert_eq!(unknown["lastActivityAt"],Value::Null);
+        assert_eq!(unknown["activityStatus"],"unknown");
+        assert_eq!(unknown["idleThresholdSeconds"],7200);
+        let activity=SessionActivityState{runtime_generation:Some(1),last_conversation_at:Some("2026-10-27T00:00:00Z".into()),last_turn_started_at:Some("2026-10-27T00:00:00Z".into()),..Default::default()};
+        let before=activity.clone();
+        let a=agent_projection(Some(&activity),Some(true),true,Some(2),now);
+        let b=agent_projection(Some(&activity),Some(true),true,Some(2),now+chrono::Duration::hours(3));
+        assert_eq!(a["lastActivityAt"],b["lastActivityAt"]);
+        assert_eq!(a["busySince"],Value::Null);
+        assert_eq!(a["activityStatus"],json!("busy"));
+        assert_eq!(activity,before);
+        assert_eq!(agent_projection(Some(&activity),Some(false),false,Some(1),now)["activityStatus"],"offline");
     }
 }

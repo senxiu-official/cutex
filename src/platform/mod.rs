@@ -4,6 +4,7 @@
 //! instead of scattering platform checks through domain logic.
 
 pub mod command;
+pub mod file_lock;
 pub mod file_stamp;
 pub mod heap;
 pub mod shared_assets;

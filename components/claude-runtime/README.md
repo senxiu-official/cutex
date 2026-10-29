@@ -13,16 +13,31 @@ want Claude Profiles / Claude agents; Codex-based agents work without it.
 
 | | |
 |---|---|
-| Python | 3.11 or newer (`python3` on Linux, the `py` launcher or `python` on Windows). On Debian / Ubuntu also the `python3-venv` package. |
-| Network | none for a release install: the archive carries its Python dependencies (wheels for CPython 3.11 to 3.14) |
-| Claude Code | the official `claude` CLI, **installed by you** (see below). cutex never ships or downloads it. |
+| Python | none for a release install: the archive carries CPython 3.13.17. `CUTEX_CLAUDE_PYTHON` remains an explicit override; a source build needs a bootstrap Python 3.11+. |
+| Network | none for a release install: the archive carries Python and its hash-locked dependencies |
+| Claude Code | claude-r30 release archives bundle the SDK-matched CLI; set `CUTEX_CLAUDE_BUNDLE_CLI=0` only for a CLI-free release build |
 | A Codex runtime | selected with `cutex human install-runtime` (install guide). Its `codex` binary is the optional foreground TUI. |
 | Disk | about 350 MB per installed version (mostly the Python dependencies) |
 
-### Install Claude Code yourself
+### Bundled or system Claude Code
 
-Claude Code is proprietary software of Anthropic (its license: all rights reserved, use subject to
-Anthropic's terms), so cutex does not bundle or redistribute it. Install it from Anthropic:
+The SDK wheel's MIT metadata does not declare the separately licensed Claude Code binary as MIT.
+Anthropic's legal/compliance documentation permits preinstalling the unmodified binary in products
+subject to its Commercial Terms and conditions (including keeping built-in authentication available
+and having users use their own credentials and pay Anthropic directly). The release owner confirmed
+those conditions for claude-r28 / r259 on 2026-10-25; claude-r29 / r260 and claude-r30 / r263 keep the same unmodified,
+SDK-matched packaging policy. Consequently the release build defaults
+`CUTEX_CLAUDE_BUNDLE_CLI` to `1`: it carries Anthropic's unmodified platform wheel, marks the bundled
+executable and needs no second download from claude.ai. Set the flag explicitly to `0` to make a
+CLI-free archive; that build requires a system CLI.
+
+Set the global Management setting `claudeCli` to `system` if you prefer a separately installed CLI:
+
+```json
+{"claudeCli":"system"}
+```
+
+Install that CLI from Anthropic, for example:
 
 ```sh
 # Linux (native installer, puts `claude` in ~/.local/bin)
@@ -37,11 +52,9 @@ irm https://claude.ai/install.ps1 | iex
 Other methods are documented by Anthropic (<https://docs.anthropic.com/en/docs/claude-code/setup>).
 Check with `claude --version`. cutex looks for `claude` on PATH and in the installers' default
 places (`~/.local/bin`, `~/.claude/local`, `/usr/local/bin`, `%USERPROFILE%\.local\bin`,
-`%APPDATA%\npm`); set `CUTEX_CLAUDE_CLI=<path>` for the cutex services when it lives elsewhere.
-
-The `claude-agent-sdk` wheels on PyPI also contain a copy of the CLI. The runtime archive does not
-carry them: it ships a CLI-free wheel built from the SDK's MIT-licensed source, and agents always run
-the `claude` you installed, so you decide its version and update it the way Anthropic documents.
+`%APPDATA%\npm`). `CUTEX_CLAUDE_CLI=<path>` for the cutex services always wins over the setting.
+Changing `claudeCli` reselects the deployment for new agents; existing agents keep their pinned
+deployment. Component status reports the selected source and both detected versions.
 
 ## Install
 
@@ -59,18 +72,22 @@ cutex release it runs, checks its sha256, unpacks it to
 every file's sha256), and then:
 
 1. checks every unpacked file against `receipt.json`;
-2. finds Python 3.11 or newer (`CUTEX_CLAUDE_PYTHON=<python>` overrides the search);
-3. creates `prepared/venv/` there and installs `requirements.lock` from the bundled `wheels/`
+2. uses `CUTEX_CLAUDE_PYTHON=<python>` when set, otherwise safely materialises the bundled
+   `python-runtime.tar.gz` into `prepared/python/`; archives older
+   than claude-r28 keep their host-Python fallback;
+3. creates `prepared/venv/` with copies from that interpreter and installs `requirements.lock` from the bundled `wheels/`
    (`pip install --no-index --require-hashes`; output in `prepared/install.log`);
 4. imports the adapter and the SDK once with the new venv;
-5. finds your `claude` CLI and the TUI binary, picks the Claude login home, writes
+5. probes the bundled CLI and any system CLI, chooses `bundled` by default (`system` when selected),
+   finds the TUI binary, picks the Claude login home, writes
    `prepared/deployment.json` (below) and selects it for **new** Claude agents.
 
-If step 5 cannot find `claude`, the component is installed but shows **needs you** with the steps;
-install Claude Code, then run the install again (it reuses the venv and only redoes step 5). The same
-state appears when no Claude account is logged in yet (next section).
+If the archive is CLI-free, or `claudeCli` is `system`, and step 5 cannot find that CLI, the setting
+update/install reports the missing system CLI. A marked bundled build has no separate CLI installation step. The component also shows
+**needs you** when no Claude account is logged in yet (next section).
 
-From a source checkout (install guide, path A), which vendors the wheels from PyPI first:
+From a source checkout (install guide, path A), which downloads the pinned standalone Python from
+GitHub and vendors the wheels from PyPI first (this build path needs a bootstrap Python 3.11+):
 
 ```sh
 cutex component install claude-runtime --from-source ~/src/cutex
@@ -116,9 +133,9 @@ a file and select it with `cutex human claude install <file>`:
 
 ```json
 {
-  "python": "/home/me/.local/share/cutex/components/claude-runtime/claude-r14/venv/bin/python",
-  "adapter_source": "/home/me/.local/share/cutex/components/claude-runtime/claude-r14",
-  "claude_cli": "/home/me/.local/bin/claude",
+  "python": "/home/me/.local/share/cutex/components/claude-runtime/claude-r30/prepared/venv/bin/python",
+  "adapter_source": "/home/me/.local/share/cutex/components/claude-runtime/claude-r30",
+  "claude_cli": "/home/me/.local/share/cutex/components/claude-runtime/claude-r30/prepared/venv/lib/python3.13/site-packages/claude_agent_sdk/_bundled/claude",
   "claude_home": "/home/me/.cutex/claude-home",
   "tui_binary": "/home/me/.local/share/cutex/natives/0.160.0-r52.2/codex"
 }
@@ -156,16 +173,43 @@ mock backend needs no Claude at all:
 python -m cute_claude --mock --workspace "$PWD/demo-workspace" --state-dir "$PWD/.state" --listen stdio://
 ```
 
-Release archive: `bash components/claude-runtime/build.sh <linux-x64|windows-x64|darwin-arm64> <rN> <out-dir>`
-writes `component-claude-runtime-<rN>-<platform>.tar.gz` (the shipped source, `wheels/` and
-`requirements.lock`, made by `scripts/vendor_wheels.py`), `SHA256SUMS-component-claude-runtime-<platform>`
+Release archive: `bash components/claude-runtime/build.sh <linux-x64|windows-x64|darwin-arm64> <rN> <out-dir>`.
+It defaults to the self-contained Python+CLI variant (`CUTEX_CLAUDE_BUNDLE_CLI=1`). Prefix the
+command with `CUTEX_CLAUDE_BUNDLE_CLI=0` only when a CLI-free archive is required. The command
+writes `component-claude-runtime-<rN>-<platform>.tar.gz` (the shipped source, pinned
+python-build-standalone `install_only_stripped` payload (safely extracted on the target), licence notices, `wheels/` and
+`requirements.lock`), `SHA256SUMS-component-claude-runtime-<platform>`
 and `BUILD-INFO-component-claude-runtime-<platform>.json`. The component version is `version` in
 `component.json` and must equal `release` in `src/cute_claude/features.json` (the build fails
 otherwise). A version is published once and never changes: bump both whenever a shipped file or a
-pin in `requirements-runtime.txt` changes. A new `claude-agent-sdk` pin also needs its sdist's sha256
-in `scripts/vendor_wheels.py`.
+pin in `requirements-runtime.txt` changes. A new `claude-agent-sdk` pin also needs every platform
+wheel's sha256 and the CLI-free sdist's sha256 in `scripts/vendor_wheels.py`. Standalone-Python assets, byte sizes and sha256 values are pinned in
+`python-build-standalone-assets.json`; `CUTEX_PBS_CACHE` can name a verified asset or cache directory.
+
+Release builds (`Build binaries`) package linux-x64 and windows-x64 only: there is no darwin cutex
+release whose signed manifest could name a darwin-arm64 archive. On macOS (Apple silicon) build and
+install it from a checkout: `cutex component install claude-runtime --from-source <checkout>`. A
+signed release without a package for the host's platform answers `component_no_platform_package`.
 
 Protocol notes: [docs/BUSY_DELIVERY.md](docs/BUSY_DELIVERY.md) (busy wakes and delegation results).
+
+### Model, effort and fast mode while a turn runs (features `liveModelEffort`, `compactionModels`, claude-r24)
+
+On Claude Code 2.1.295 or newer (`claude --version`, the model catalog's probe), `thread/settings/update`
+changes model, effort and fast mode on the running Claude Code, also while a turn runs. The adapter sends
+`set_model` and the `apply_flag_settings` control request (`effortLevel`, `fastMode`). Claude Code uses
+them from its next model request, which can be the next step of the same turn; no child restart, no new
+connection. On an older or unknown CLI, or while `CLAUDE_CODE_EFFORT_LEVEL` pins the effort, an effort
+or fast mode change still replaces the idle child and is refused while busy (-32009).
+
+Auto-compaction per model: cutex passes the profile's table (`claude-compaction-models.json`) in
+`CUTEX_CLAUDE_COMPACTION_MODELS` = `{"<model id>": {"window", "percent"}}`. A model's entry is set
+when Claude Code starts (`CLAUDE_CODE_AUTO_COMPACT_WINDOW` / `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`) and on
+every model switch: through `apply_flag_settings` `env` on a live CLI, or by replacing the idle
+child. Models without an entry use the profile-wide values; with none, Claude Code decides.
+
+Behaviour checked against the real CLIs and the evidence: `src/cute_claude/live_settings.py`, and
+`tests/test_live_settings_native.py` (opt-in, `CUTEX_TEST_CLAUDE_CLI`, fake loopback API).
 
 ### Cutex tools that hold for the owner (feature `approvalWait`, claude-r16)
 
@@ -176,6 +220,27 @@ cutex writes `approvalWaitSecs` into the cutex MCP descriptor for an adapter dec
 the owner's decision, and gives those tools `approvalWaitSecs + 30` seconds instead of `--tool-timeout`.
 `delegation_wait` always gets 150 s. Without `approvalWaitSecs` nothing is set and the façade answers
 `approval_required` at once (cutex `docs/agent-tool-security.md` §7.1).
+
+### Background subagents (feature `backgroundSubagents`, claude-r23)
+
+`Agent` / `Task` with `run_in_background: true` (or without the argument) now runs in the background
+past its turn, so the main agent stays free to read the owner's messages. The child's tools are
+admitted by its agent id; cutex tools, nested subagents, questions to the user and approvals are
+refused in it (under full access a safety check becomes a safety block on the origin turn). Its
+transcript stays open until the task ends; `claude/tasks/stop` stops it. A finished, failed, stopped
+or lost one (and a main-agent background shell command, at most one notice a minute) adds
+`notifyParent` to `claude/task/updated`, which cutex delivers as one "Claude Task" message to the
+agent. Its usage is added to the origin turn. Claude Code's own invisible notification turn stays
+without tools. Details: docs/BUSY_DELIVERY.md, "Background subagents" and "Claude Code's
+notification turn".
+
+### Context usage while a turn runs (claude-r22)
+
+`thread/tokenUsage/updated` follows each assistant message that brings new usage, not only the turn's
+terminal result, so the context ring moves during long turns. Claude Code reports the context window
+only with the result (`model_usage`) or the idle context read, so the mid-turn updates carry the
+thread's last known `modelContextWindow` instead of null (none before the thread's first report since
+the adapter started).
 
 ### Side chats and busy forks (features `sideChat`, `forkWhileBusy`, claude-r21)
 
@@ -224,11 +289,11 @@ compaction (or until the text is back to the recorded one). Forks, reverts and S
 record with the thread properties. Opt-in real-CLI check against a loopback model:
 `CUTEX_SYSTEM_PROMPT_NATIVE_SMOKE=1 python -m pytest -q -s tests/test_system_prompt_native.py`.
 
-### Foreground subagents only (claude-r21)
+### Foreground subagents only (claude-r21; replaced in claude-r23)
 
-Every Agent / Task call must pass `run_in_background: false`; leaving it out is refused too, because newer
-Claude Code runs a subagent in the background by default. A background subagent's later turns have no
-adapter input, so they could not use tools once the parent turn ended.
+Every Agent / Task call had to pass `run_in_background: false`; leaving it out was refused too, because newer
+Claude Code runs a subagent in the background by default. A background subagent's later turns had no
+adapter input, so they could not use tools once the parent turn ended. claude-r23 admits them (above).
 
 ### Inputs wait for a turn Claude Code started by itself (claude-r21)
 
@@ -317,6 +382,7 @@ cutex exposes the decision to the owner only (capability `claude-safety-grants`,
 ## License
 
 MIT, see [LICENSE](LICENSE). The vendored wheels are third-party packages under their own licenses
-(each wheel carries its license in its `.dist-info`); the `claude-agent-sdk` wheel is built from
-Anthropic's MIT-licensed SDK source without the bundled CLI, and Claude Code is not part of this
-package.
+(each wheel carries its license in its `.dist-info`). The default release build
+(`CUTEX_CLAUDE_BUNDLE_CLI=1`) carries the official platform SDK wheel and its unmodified Claude Code
+binary subject to Anthropic's separate Commercial Terms and documented product-preinstallation
+conditions. `CUTEX_CLAUDE_BUNDLE_CLI=0` instead builds the MIT SDK source without the bundled CLI.

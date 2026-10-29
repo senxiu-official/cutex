@@ -79,6 +79,18 @@ enum PublishScope {
 }
 
 fn native_event_context(context: &AppServerRuntimeEventContext) -> NativeEventContext {
+    if context.runtime_backend == "dsh" || context.runtime_backend == "kimi" {
+        let kimi = context.runtime_backend == "kimi";
+        return NativeEventContext {
+            cutex_session_id: context.cutex_session_id.clone(), thread_id: context.thread_id.clone(),
+            host_id: current_host_name(), runtime_generation: context.runtime_generation, runtime_backend: context.runtime_backend.clone(),
+            schema: AppServerSchema {
+                protocol: if kimi { "kimi-acp-subset".into() } else { "dsh-acp-subset".into() }, major_version: 1, version: context.schema.version.clone(), sha256: context.schema.sha256.clone(),
+                channel: AppServerSchemaChannel::Experimental,
+                capabilities: serde_json::json!({"sameTurnSteering":false,"fork":false,"revert":false,"delete":false,"contextOccupancy":true,"billingUsage":true}), extensions: vec![if kimi { "kimi-runtime-v1".into() } else { "dsh-runtime-spike-v1".into() }],
+            },
+        };
+    }
     NativeEventContext {
         cutex_session_id: context.cutex_session_id.clone(),
         thread_id: context.thread_id.clone(),
@@ -91,7 +103,8 @@ fn native_event_context(context: &AppServerRuntimeEventContext) -> NativeEventCo
             version: context.schema.version.clone(),
             sha256: context.schema.sha256.clone(),
             channel: AppServerSchemaChannel::Experimental,
-            capabilities: serde_json::json!({ "experimentalApi": true }),
+            capabilities: serde_json::json!({ "experimentalApi": true,
+                "features": {"fullTextItemTerminal":context.full_text_item_terminal} }),
             extensions: if cutex::launch::stock::schema_has_external_input(
                 &context.schema.version,
                 context.schema.sha256.as_str(),
@@ -236,6 +249,9 @@ fn publish_runtime_event(
     pending: cutex::management::v2::model::PendingEvent,
     scope: PublishScope,
 ) -> anyhow::Result<()> {
+    // Only the passive receive hook publishes live fragments. In particular a
+    // buffered lineage event or takeover replay cannot emit the fragment twice.
+    if context.full_text_item_terminal && cutex::management::v2::native_events::is_live_text_delta(event) { return Ok(()); }
     let synchronize_before_publish = matches!(
         event,
         cutex::app_server::client::AppServerEvent::ServerRequest(_)
@@ -257,7 +273,7 @@ fn publish_runtime_event(
     if synchronize_before_publish {
         app_server_state_sync::handle_runtime_event(context, event)?;
     }
-    let envelope = management_v2_repository()?.append(pending)?;
+    if let Some(envelope) = cutex::management::v2::native_events::append_observed_event(pending)? {
     if let Err(err) = record_activity_event(&envelope) {
         eprintln!("\x1b[33mwarning:\x1b[0m failed to update session activity: {err:#}");
     }
@@ -270,11 +286,16 @@ fn publish_runtime_event(
         eprintln!("\x1b[33mwarning:\x1b[0m failed to update session usage: {err:#}");
     }
     cutex::management::v2::profile_quota_native::ingest_runtime_event(&envelope, profile.key());
+    if context.runtime_backend == "dsh" || context.runtime_backend == "kimi" {
+        record_dsh_latest_state(&envelope, &context.thread_id);
+    }
+    }
     if !synchronize_before_publish {
         app_server_state_sync::handle_runtime_event(context, event)?;
     }
     // Asks (委托): attempt activity, answers and questions; before the owner
     // queue flush so a finished ask releases the admission lease first.
+    super::model_overload_retry::on_runtime_event(&context.cutex_session_id, &context.thread_id, context.runtime_generation, event);
     super::asks_runtime::on_runtime_event(&context.cutex_session_id, context.runtime_generation, event);
     if let cutex::app_server::client::AppServerEvent::Notification(notification) = event {
         if notification.method == "turn/completed" && notification.params.as_ref().and_then(|p| p.get("threadId")).and_then(serde_json::Value::as_str) == Some(context.thread_id.as_str()) {
@@ -283,12 +304,46 @@ fn publish_runtime_event(
             }
         }
     }
-    app_server_user_input::handle_runtime_event(&context.cutex_session_id, event)?;
+    app_server_user_input::handle_runtime_event_for_generation(&context.cutex_session_id, context.runtime_generation, event)?;
     Ok(())
+}
+
+/// DSH has no Codex rollout either: like Claude (`claude_runtime`), the
+/// daemon keeps the bound thread's newest checklist (`turn/plan/updated`,
+/// DSH `todo_write`) and token usage report for bootstrap / history
+/// `cutexState.latestPlan` / `latestTokenUsage`, so they survive a reconnect.
+fn record_dsh_latest_state(envelope: &cutex::management::v2::model::EventEnvelope, thread_id: &str) {
+    if let Err(error) = cutex::management::v2::claude_plan::record_event(envelope, thread_id) {
+        eprintln!("DSH latest plan for {} not kept: {error:#}", envelope.cutex_session_id);
+    }
+    if let Err(error) = cutex::management::v2::claude_token_usage::record_event(envelope, thread_id) {
+        eprintln!("DSH latest token usage for {} not kept: {error:#}", envelope.cutex_session_id);
+    }
 }
 
 struct ManagementEventSink;
 impl cutex::app_server::manager::AppServerRuntimeEventSink for ManagementEventSink {
+    fn handle_live_connection_boundary(&self, context: &AppServerRuntimeEventContext) -> anyhow::Result<()> {
+        management_v2_repository()?.invalidate_live(&context.cutex_session_id, context.runtime_generation);
+        Ok(())
+    }
+    fn handle_live_event_from_connection(
+        &self,
+        context: &AppServerRuntimeEventContext,
+        event: &cutex::app_server::client::AppServerEvent,
+        origin: &cutex::app_server::client::AppServerHandle,
+    ) -> anyhow::Result<()> {
+        if super::side_chats::claim_event(context, event, origin)
+            || super::thread_titles::claim_event(event) { return Ok(()); }
+        if let Some((pending, bound)) = cutex::management::v2::native_events::live_text_pending(
+            &native_event_context(context), event,
+            |thread| subagent_lineage::is_descendant(&context.cutex_session_id, &context.thread_id, thread),
+        )? {
+            management_v2_repository()?.publish_live(pending.clone());
+            if bound { cutex::management::v2::activity::record_live_output_signal(&pending)?; }
+        }
+        Ok(())
+    }
     fn should_defer_journal_event(
         &self,
         context: &AppServerRuntimeEventContext,
@@ -391,7 +446,7 @@ pub(crate) fn connect_runtime_with_model_provider(
     runtime_agent_id: &str,
     model_provider: Option<&str>,
 ) -> anyhow::Result<AppServerRuntimeConnectResult> {
-    if record.is_retired() {
+    if cutex::agent_management::agent_execution_blocked(&record) {
         anyhow::bail!(
             "cannot connect a runtime for retired cutex session {}",
             record.cutex_session_id
@@ -400,14 +455,17 @@ pub(crate) fn connect_runtime_with_model_provider(
     let manager = runtime_manager();
     let mut resume =
         thread_resume_params_for_session_with_model_provider(record, model_provider)?;
-    cutex::memory::attach_launch_augmentation_to_thread_resume(&mut resume, record);
+    if record.dsh_session.is_none() {
+        cutex::memory::attach_launch_augmentation_to_thread_resume(&mut resume, record);
+    }
     let runtime_backend = serde_json::to_value(record.runtime_backend)?
         .as_str()
         .context("runtime backend did not serialize as a string")?
         .to_string();
+    let usage_binding = dsh_connect_binding(record, binding);
     let connected = manager.connect_binding(
         &record.cutex_session_id,
-        binding,
+        usage_binding.as_ref(),
         resume,
         record.runtime_generation,
         &runtime_backend,
@@ -418,9 +476,11 @@ pub(crate) fn connect_runtime_with_model_provider(
         Arc::new(AgentBusHttpClient::from_config(config)),
         AppServerAgentBusBridgeOptions::new(
             registration,
-            record.codex_session_id.clone().unwrap_or_default(),
+            record.app_server_thread_id().unwrap_or_default().to_string(),
         )
-        .with_cutex_session_id(record.cutex_session_id.clone()),
+        .with_cutex_session_id(record.cutex_session_id.clone())
+        // DSH frames every inter-agent message itself (no ExternalInput owner).
+        .with_job_v2_model_text(record.dsh_session.is_some()),
     ) {
         let _ = manager.disconnect(&record.cutex_session_id);
         return Err(error);
@@ -432,6 +492,24 @@ pub(crate) fn connect_runtime_with_model_provider(
     Ok(connected)
 }
 
+/// The binding the event connection of a DSH runtime uses. A DSH runtime
+/// binding records no launched profile (its Bus registration reports "-" and
+/// must keep matching), so usage rows would carry no profile. The connection
+/// alone is told the agent's profile: the frozen launch binding's profile id
+/// (r265), else the recorded profile name. The stored binding is unchanged.
+fn dsh_connect_binding<'a>(
+    record: &CutexSessionRecord,
+    binding: &'a CutexAppServerRuntimeBinding,
+) -> std::borrow::Cow<'a, CutexAppServerRuntimeBinding> {
+    if record.dsh_session.is_none() || binding.launched_profile.is_some() || binding.launched_profile_id.is_some() {
+        return std::borrow::Cow::Borrowed(binding);
+    }
+    let mut connect = binding.clone();
+    connect.launched_profile_id = record.profile_binding.as_ref().map(|bound| bound.profile_id.clone());
+    connect.launched_profile = record.profile.clone();
+    std::borrow::Cow::Owned(connect)
+}
+
 pub(crate) fn start_connected_runtime_bridge(
     config: &CodezConfig,
     record: &CutexSessionRecord,
@@ -439,15 +517,15 @@ pub(crate) fn start_connected_runtime_bridge(
     runtime_agent_id: &str,
 ) -> anyhow::Result<()> {
     let thread_id = record
-        .codex_session_id
-        .clone()
+        .app_server_thread_id().map(str::to_owned)
         .context("new runtime record has no persisted thread id")?;
     let registration = runtime_agent_registration(record, binding, runtime_agent_id)?;
     runtime_manager().start_agent_bus_bridge(
         &record.cutex_session_id,
         Arc::new(AgentBusHttpClient::from_config(config)),
         AppServerAgentBusBridgeOptions::new(registration, thread_id)
-            .with_cutex_session_id(record.cutex_session_id.clone()),
+            .with_cutex_session_id(record.cutex_session_id.clone())
+            .with_job_v2_model_text(record.dsh_session.is_some()),
     )?;
     Ok(())
 }
@@ -581,7 +659,7 @@ fn verify_recovered_runtime_state(
         .context("reconnected runtime is absent from the manager")?;
     if !status.connected
         || status.runtime_generation != expected.runtime_generation
-        || expected.codex_session_id.as_deref() != Some(status.thread_id.as_str())
+        || expected.app_server_thread_id() != Some(status.thread_id.as_str())
     {
         anyhow::bail!("reconnected runtime identity/generation does not match the durable claim");
     }
@@ -1101,6 +1179,7 @@ fn runtime_ownership_snapshot_matches(
     current.host_id == expected.host_id
         && current.explicit_launch == expected.explicit_launch
         && current.runtime_backend == expected.runtime_backend
+        && current.dsh_session == expected.dsh_session
         && current.profile == expected.profile
         && current.pending_launch_id == expected.pending_launch_id
         && current.app_server_launch_claim_id == expected.app_server_launch_claim_id
@@ -1139,7 +1218,7 @@ fn classify_persisted_runtime_adoption(
     current_host: &str,
     process_is_live: impl Fn(u32) -> bool,
 ) -> PersistedRuntimeAdoptionAction {
-    if record.is_retired() {
+    if cutex::agent_management::agent_execution_blocked(&record) {
         return PersistedRuntimeAdoptionAction::Retired;
     }
     if !cutex_session_host_is_local(&record.host_id, current_host) {
@@ -1171,7 +1250,7 @@ pub(crate) fn clear_dead_runtimes_at_startup(
             .sessions
             .values()
             .filter(|record| {
-                !record.is_retired()
+                !cutex::agent_management::agent_execution_blocked(&record)
                     && record.claude_session.is_none()
                     && cutex_session_host_is_local(&record.host_id, current_host)
                     && (record.app_server_runtime.is_some()
@@ -1248,7 +1327,7 @@ pub(crate) fn adopt_persisted_runtimes(
         }
         if record.explicit_launch.is_some() {
             let mut record = record;
-            if !record.is_retired() && cutex_session_host_is_local(&record.host_id, current_host) {
+            if !cutex::agent_management::agent_execution_blocked(&record) && cutex_session_host_is_local(&record.host_id, current_host) {
                 // A launch interrupted by a daemon crash leaves its claim (and a
                 // Prepared intent) behind. Clear it when its owner is gone so
                 // task delivery and the next start are not blocked.
@@ -1265,11 +1344,11 @@ pub(crate) fn adopt_persisted_runtimes(
                 }
             }
             let exited = record.app_server_runtime.as_ref().is_some_and(|binding| {
-                !record.is_retired()
+                !cutex::agent_management::agent_execution_blocked(&record)
                     && cutex_session_host_is_local(&record.host_id, current_host)
                     && matches!(super::stock_lifecycle::stock_runtime_has_exited(&record, binding), Ok(true))
             });
-            if record.is_retired()
+            if cutex::agent_management::agent_execution_blocked(&record)
                 || !cutex_session_host_is_local(&record.host_id, current_host)
                 || record.app_server_runtime.is_none()
             {
@@ -1493,8 +1572,7 @@ pub(super) fn runtime_agent_registration(
         anyhow::bail!("runtime_agent_id must not be empty");
     }
     let thread_id = record
-        .codex_session_id
-        .as_deref()
+        .app_server_thread_id()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("cutex session has no Codex session id"))?;
@@ -1567,12 +1645,51 @@ mod tests {
         assert!(!runtime_ownership_snapshot_matches(&changed, &record));
     }
 
+    /// C-3 (r265 E2E): usage of a DSH variant agent is attributed to its
+    /// launch binding's profile; the stored runtime binding (and with it the
+    /// Bus registration's "-" profile) is unchanged.
+    #[test]
+    fn dsh_connections_carry_the_launch_binding_profile_for_usage() {
+        let mut record = CutexSessionRecord::new("cutex.dsh".into(), None, "h".into(), "/tmp".into(), Some("ds-e2e".into())).unwrap();
+        let binding: CutexAppServerRuntimeBinding = serde_json::from_value(serde_json::json!({
+            "transport":"loopback_web_socket","endpoint":"ws://127.0.0.1:1","pid":1,"runtime_dir":"/x",
+            "diagnostic_journal_path":"/x/d","schema_version":"dsh-acp-v1","schema_sha256":"s","started_at":"2026-10-27T00:00:00Z"
+        })).unwrap();
+        // Not a DSH agent: untouched.
+        assert!(matches!(dsh_connect_binding(&record, &binding), std::borrow::Cow::Borrowed(_)));
+        record.dsh_session = Some(serde_json::from_value(serde_json::json!({
+            "thread_id": "t", "state_dir": "/s", "node": "/n", "adapter": "/a", "dsh_cli": "/d",
+            "patch": "/s/profile.patch.yml", "install_root": "/i", "native_session_id": null, "spike": false,
+        })).unwrap());
+        // Legacy DSH agent (no binding): its recorded profile name.
+        let legacy = dsh_connect_binding(&record, &binding);
+        assert_eq!((legacy.launched_profile.as_deref(), legacy.launched_profile_id.as_deref()), (Some("ds-e2e"), None));
+        record.profile_binding = Some(serde_json::from_value(serde_json::json!({
+            "profileId": "006c550f", "variantId": "dsh", "runtime": "dsh", "credential": {"source": "stored", "version": 1},
+            "boundAt": "2026-10-27T00:00:00+00:00",
+        })).unwrap());
+        let bound = dsh_connect_binding(&record, &binding);
+        assert_eq!((bound.launched_profile.as_deref(), bound.launched_profile_id.as_deref()), (Some("ds-e2e"), Some("006c550f")));
+        assert_eq!(bound.current_launched_profile_ref().id.as_deref(), Some("006c550f"));
+        assert_eq!((binding.launched_profile.as_deref(), binding.launched_profile_id.as_deref()), (None, None), "stored binding unchanged");
+        assert_eq!((&bound.endpoint, &bound.schema_sha256), (&binding.endpoint, &binding.schema_sha256));
+    }
+
+    /// C-5 (r265 E2E): DSH reports token usage, so its event schema says so.
+    #[test]
+    fn dsh_event_schema_declares_billing_usage() {
+        let mut context = event_context();
+        context.runtime_backend = "dsh".into();
+        assert_eq!(native_event_context(&context).schema.capabilities["billingUsage"], true);
+    }
+
     fn event_context() -> AppServerRuntimeEventContext {
         AppServerRuntimeEventContext {
             cutex_session_id: "cutex-1".to_string(),
             thread_id: "root-thread".to_string(),
             runtime_generation: 1,
             runtime_backend: "cute_alden".to_string(),
+            full_text_item_terminal: false,
             launched_profile: None,
             launched_profile_id: None,
             usage: Default::default(),

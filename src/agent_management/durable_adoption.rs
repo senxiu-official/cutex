@@ -21,6 +21,10 @@ pub struct HumanCreationDefaults {
 pub struct HumanAdoptRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_only: bool,
+    /// Set by the owner create-native workflow, never by generic import/adopt.
+    /// This owner-authenticated claim can only record Owner, not an agent role.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_created_native: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_defaults: Option<HumanCreationDefaults>,
     pub action_id: AgentActionId,
@@ -79,6 +83,45 @@ impl AgentManagementProvider {
         host: &str,
         history_home: Option<&Path>,
         source_profile: Option<&str>,
+    ) -> anyhow::Result<HumanAdoptResult> {
+        self.adopt_saved_native_from_with_presentation(
+            principal, path, request, host, history_home, source_profile, None,
+        )
+    }
+
+    /// A verified fork supplies its presentation before the first durable
+    /// record and adoption receipt become visible. Replays keep the original
+    /// receipt rather than copying a subsequently edited source avatar.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt_saved_native_from_with_presentation(
+        &self,
+        principal: &HumanManagementPrincipal,
+        path: &Path,
+        request: &HumanAdoptRequest,
+        host: &str,
+        history_home: Option<&Path>,
+        source_profile: Option<&str>,
+        fork_source: Option<&crate::session::model::CutexSessionRecord>,
+    ) -> anyhow::Result<HumanAdoptResult> {
+        let creator = request.owner_created_native.then_some(crate::session::model::SessionCreatedBy::Owner);
+        self.adopt_saved_native_with_creation(
+            principal, path, request, host, history_home, source_profile, fork_source, creator.as_ref(),
+        )
+    }
+
+    /// Known create/fork context supplies immutable provenance before the first
+    /// session+receipt commit. Generic adoption retains unknown provenance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt_saved_native_with_creation(
+        &self,
+        principal: &HumanManagementPrincipal,
+        path: &Path,
+        request: &HumanAdoptRequest,
+        host: &str,
+        history_home: Option<&Path>,
+        source_profile: Option<&str>,
+        fork_source: Option<&crate::session::model::CutexSessionRecord>,
+        created_by: Option<&crate::session::model::SessionCreatedBy>,
     ) -> anyhow::Result<HumanAdoptResult> {
         anyhow::ensure!(
             !request.formal_name.trim().is_empty()
@@ -147,6 +190,8 @@ impl AgentManagementProvider {
                         crate::session::service::CutexSessionAdoptOptions {
                             display_name: Some(request.formal_name.as_str()),
                             managed_cwd: None, groups: Vec::new(), expose_to_im: false, pin: false,
+                            model_defaults: None,
+                            reasoning_defaults: None,
                         },
                         history_home,
                     )?.key
@@ -169,6 +214,10 @@ impl AgentManagementProvider {
                 if let Some(defaults) = &request.creation_defaults {
                     apply_creation_defaults(record, defaults)?;
                 }
+                if let Some(source) = fork_source {
+                    crate::session::fork::inherit_fork_avatar(source, record);
+                }
+                record.stamp_created_by_at_creation(created_by)?;
                 let mut candidate=record.clone();
                 if request.session_only {
                     crate::launch::local_deployment::LocalDeployment::selected()?
@@ -266,6 +315,81 @@ fn apply_creation_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn assert_adoption_creation_provenance(
+        owner_created_native: bool,
+        supplied_creator: Option<crate::session::model::SessionCreatedBy>,
+        expected: Option<crate::session::model::SessionCreatedBy>,
+    ) {
+        use crate::session::model::SessionCreatedBy;
+        let home = crate::profiles::lifecycle::tests::TestHome::new();
+        let root = home.root().join("provenance");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("sessions.json");
+        let provider = AgentManagementProvider::open(root.join("provider"))
+            .unwrap().with_current_names_path(path.clone());
+        let principal = HumanManagementPrincipal::authenticated();
+        let request = HumanAdoptRequest {
+            owner_created_native,
+            session_only: false,
+            creation_defaults: None,
+            action_id: AgentActionId::new("creator-adoption").unwrap(),
+            native_id: uuid::Uuid::new_v4().to_string(),
+            cwd: root.to_string_lossy().into_owned(),
+            formal_name: "Creator fixture".into(),
+        };
+        // A foreign host leaves import incomplete, exposing the first durable
+        // adoption record and its receipt without any native runtime launch.
+        let host = "unsupported-provenance-fixture";
+        let first = if let Some(creator) = supplied_creator.as_ref() {
+            provider.adopt_saved_native_with_creation(
+                &principal, &path, &request, host, None, None, None, Some(creator),
+            )
+        } else {
+            // Exercise the real owner_created_native mapping, not a seeded bypass.
+            provider.adopt_saved_native(&principal, &path, &request, host)
+        }.unwrap();
+        assert!(first.error.is_some());
+        assert_eq!(first.adopted.record.created_by, expected);
+        let stored = crate::session::store::load_cutex_session_store_from_path(&path).unwrap();
+        let key = &first.adopted.record.cutex_session_id;
+        assert_eq!(stored.sessions[key].created_by, expected);
+        assert_eq!(stored.human_adoption_receipts[request.action_id.as_str()].record.created_by, expected);
+        // Even an explicit different creation context cannot relabel a replay.
+        let replay_creator = if expected == Some(SessionCreatedBy::System) {
+            SessionCreatedBy::Owner
+        } else {
+            SessionCreatedBy::System
+        };
+        let replay = provider.adopt_saved_native_with_creation(
+            &principal, &path, &request, host, None, None, None, Some(&replay_creator),
+        ).unwrap();
+        assert_eq!(replay.adopted, first.adopted);
+        let generic_replay = provider.adopt_saved_native(&principal, &path, &request, host).unwrap();
+        assert_eq!(generic_replay.adopted, first.adopted);
+        let stored = crate::session::store::load_cutex_session_store_from_path(&path).unwrap();
+        assert_eq!(stored.sessions[key].created_by, expected);
+        assert_eq!(stored.human_adoption_receipts[request.action_id.as_str()].record.created_by, expected);
+        let mut changed_claim = request.clone();
+        changed_claim.owner_created_native = !owner_created_native;
+        assert!(provider.adopt_saved_native(&principal, &path, &changed_claim, host).is_err());
+    }
+
+    #[test]
+    fn owner_created_native_stamps_owner_in_first_record_and_receipt() {
+        assert_adoption_creation_provenance(true, None, Some(crate::session::model::SessionCreatedBy::Owner));
+    }
+
+    #[test]
+    fn generic_adoption_keeps_unknown_creator_through_replay() {
+        assert_adoption_creation_provenance(false, None, None);
+    }
+
+    #[test]
+    fn explicit_system_adoption_keeps_original_creator_through_replay() {
+        let creator = crate::session::model::SessionCreatedBy::System;
+        assert_adoption_creation_provenance(false, Some(creator.clone()), Some(creator));
+    }
+
     #[test]
     fn ui_contract_d10_adoption_partial_import_keeps_original_fence() {
         let root = std::env::temp_dir().join(format!("cutex-d2-partial-{}", uuid::Uuid::new_v4()));
@@ -276,6 +400,7 @@ mod tests {
             .with_current_names_path(path.clone());
         let principal = HumanManagementPrincipal::authenticated();
         let request = HumanAdoptRequest {
+            owner_created_native: false,
             session_only: false,
             creation_defaults: Some(HumanCreationDefaults { profile: "selected-profile".into(), model: "selected-model".into(), reasoning: Some("high".into()),
                 permissions: Some(crate::config::new_thread::LaunchPermissions {
@@ -288,14 +413,29 @@ mod tests {
             formal_name: "Explicit Name".into(),
         };
         // A foreign host is unsupported by the existing import contract.
+        let mut fork_source = crate::session::model::CutexSessionRecord::new(
+            "cutex.source".into(), None, "fixture-host".into(), request.cwd.clone(), None,
+        ).unwrap();
+        fork_source.avatar_mode = Some(crate::session::model::CutexSessionAvatarMode::Inherit);
+        fork_source.avatar = Some(crate::session::model::CutexSessionAvatar {
+            kind: crate::session::model::CutexSessionAvatarKind::Emoji,
+            value: "F".into(), color: None,
+        });
         let first = provider
-            .adopt_saved_native(
+            .adopt_saved_native_from_with_presentation(
                 &principal,
                 &path,
                 &request,
                 "unsupported-remote-fixture",
+                None, None, Some(&fork_source),
             )
             .unwrap();
+        assert_eq!(first.adopted.record.avatar_mode, fork_source.avatar_mode);
+        assert!(first.adopted.record.avatar.is_none());
+        let persisted = crate::session::store::load_cutex_session_store_from_path(&path).unwrap();
+        let original = &persisted.sessions[&first.adopted.record.cutex_session_id];
+        assert_eq!(original.avatar_mode, fork_source.avatar_mode, "intent is present in the first persisted adoption");
+        assert!(original.avatar.is_none());
         assert_eq!(first.adopted.record.profile.as_deref(), Some("selected-profile"));
         assert_eq!(first.adopted.record.model_defaults.as_deref(), Some("selected-model"));
         assert_eq!(first.adopted.record.reasoning_defaults.as_deref(), Some("high"));
@@ -372,6 +512,7 @@ mod tests {
             .with_current_names_path(path.clone());
         let principal = HumanManagementPrincipal::authenticated();
         let request = HumanAdoptRequest {
+            owner_created_native: false,
             session_only: false,
             creation_defaults: None,
             action_id: AgentActionId::new("adopt-test").unwrap(),
@@ -590,6 +731,7 @@ mod tests {
         let cwd = config_dir.join("work");
         std::fs::create_dir_all(&cwd).unwrap();
         let request = |label: &str, native: &str, defaults: bool| HumanAdoptRequest {
+            owner_created_native: false,
             session_only: false,
             creation_defaults: defaults.then(|| HumanCreationDefaults {
                 profile: "B".into(),
@@ -670,6 +812,21 @@ mod tests {
             "fork-session",
             provider.adopt_saved_native_from(&principal, &path, &session, &host, Some(&fork_home), Some("B")),
         );
+
+        // 5. A cross-profile fork adopts history from the source home while
+        // explicit target B overrides the source's profile A and its defaults.
+        let native = uuid::Uuid::new_v4().to_string();
+        write_rollout(&fork_home, &native);
+        let mut target_request = request("fork-target", &native, true);
+        target_request.creation_defaults.as_mut().unwrap().reasoning = Some("low".into());
+        let target_result = provider.adopt_saved_native_from(
+            &principal, &path, &target_request, &host, Some(&fork_home), Some("A"),
+        );
+        if let Ok(result) = &target_result {
+            assert_eq!(result.adopted.record.model_defaults.as_deref(), Some("gpt-test"));
+            assert_eq!(result.adopted.record.reasoning_defaults.as_deref(), Some("low"));
+        }
+        check("fork-target", target_result);
 
         // Without any requested profile, the default is still the fallback.
         let native = uuid::Uuid::new_v4().to_string();

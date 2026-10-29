@@ -79,6 +79,7 @@ fn context() -> ManagementRequestContext {
         adopt_saved_native: |_, _| unreachable!(),
         review_agent_archive: |_, _| unreachable!(),
         execute_agent_archive: |_, _| unreachable!(),
+        owner_archive_action: |_, _| unreachable!(),
         durable_agent_candidates: |_| unreachable!(),
         import_durable_agent: |_, _| unreachable!(),
         load_registry: || Ok(Default::default()),
@@ -154,6 +155,7 @@ fn context() -> ManagementRequestContext {
         bind_project_authority: |_| unreachable!(),
         import_legacy_director_ownership: |_| unreachable!(),
         reconcile_agent_reservation: |_| unreachable!(),
+        abandon_agent_create: |_| unreachable!(),
         list_management_projects: |_| unreachable!(),
         read_management_project: |_, _| unreachable!(),
         update_management_project_presentation: |_, _| unreachable!(),
@@ -185,6 +187,8 @@ fn synthetic_codex_claude_http_smoke() {
             None,
         )
         .unwrap();
+        // Match the synthetic manager occurrence returned by load_runtime_status.
+        record.runtime_generation = 1;
         record.registration_class = cutex::agent_bus::model::AgentRegistrationClass::LocalOnly;
         record.exposed_to_backend = false; // Hidden sessions must still be readable by root.
         if id == CLAUDE {

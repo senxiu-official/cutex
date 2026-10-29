@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:profile-link",
+  "title": "Owner profile account linking",
+  "description": "Capability profile-account-link. GET secret metadata requires owner full access. Nonlocal/paired owner-full PUT may initialize only a virgin absent secret; replacement, explicit re-enable and DELETE require owner-local access. DELETE durably disables linking and returns secretId:null,disabled:true. Desktop reconciliation must honor disabled:true and never automatically reseed. Owner-local PUT clears disabled intent. Changes audit profileLinkSecretSet with actor and before/after secret IDs. Profile link metadata is omitted for other callers. Automatic identifiers and API keys are never returned. Manual group values in owner detail permit exact undo.",
+  "anyOf": [
+    { "$ref": "#/$defs/secretStatus" },
+    { "$ref": "#/$defs/secretPut" },
+    { "$ref": "#/$defs/profileLink" },
+    { "$ref": "#/$defs/profileLinkPatch" },
+    { "$ref": "#/$defs/avatarStylePatch" },
+    { "$ref": "#/$defs/profileMetadata" }
+  ],
+  "$defs": {
+    "secretId": { "type": "string", "pattern": "^[0-9a-f]{8}$" },
+    "manualSetting": { "type": ["string", "null"], "pattern": "^(none|m-[A-Za-z0-9_-]{22})$" },
+    "secretStatus": {
+      "type": "object", "required": ["contractVersion", "secretId"],
+      "properties": { "contractVersion": { "const": 2 }, "secretId": { "anyOf": [{ "$ref": "#/$defs/secretId" }, { "type": "null" }] }, "disabled": { "type": "boolean", "description": "Persistent owner-local disable intent after DELETE. Absent means false for compatibility. Honor across desktop restarts; only owner-local PUT re-enables." } },
+      "additionalProperties": false
+    },
+    "secretPut": {
+      "type": "object", "required": ["secret"],
+      "properties": { "secret": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$", "description": "Canonical unpadded base64url encoding of exactly 32 random bytes; write-only. Obvious low-quality patterns are rejected; generate using the OS CSPRNG." } },
+      "additionalProperties": false
+    },
+    "profileLink": {
+      "type": "object", "required": ["accountKey", "basis", "source", "secretId"],
+      "properties": {
+        "accountKey": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22}$" },
+        "basis": { "enum": ["claude-account", "chatgpt-user", "api-key", "manual"] },
+        "source": { "enum": ["auto", "manual"] },
+        "secretId": { "$ref": "#/$defs/secretId" }
+      },
+      "additionalProperties": true
+    },
+    "profileLinkPatch": {
+      "description": "accountLink is last-write-wins, without If-Match. Duplicate/export/import do not inherit manual groups or appearance clocks.",
+      "type": "object", "required": ["accountLink"],
+      "properties": { "accountLink": { "$ref": "#/$defs/manualSetting" } },
+      "additionalProperties": true
+    },
+    "appearanceRevision": {
+      "type": "object", "required": ["etag", "updatedAt"],
+      "properties": { "etag": { "type": ["string", "null"] }, "updatedAt": { "type": ["string", "null"], "format": "date-time" } },
+      "additionalProperties": true
+    },
+    "avatarStyle": {
+      "description": "Capability profile-avatar-style. Null follows this desktop app's default. Independent of legacy avatarThemes; unavailable portrait packs never erase references.",
+      "oneOf": [
+        { "type": "null" },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "portraitThemes"], "properties": {
+          "kind": { "const": "portrait" },
+          "portraitThemes": { "type": "array", "minItems": 1, "maxItems": 128, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,19}/[a-z0-9][a-z0-9-]{0,19}$" } }
+        } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "emojiThemes"], "properties": {
+          "kind": { "const": "emoji" },
+          "emojiThemes": { "oneOf": [{ "type": "null" }, { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["animals", "sea", "gems", "plants", "food", "sky", "birds", "insects", "fantasy", "prehistoric", "desserts", "seasons", "transport", "music", "cats"] } }] }
+        } },
+        { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "letter" } } }
+      ]
+    },
+    "avatarStylePatch": {
+      "type": "object", "required": ["avatarStyle"], "additionalProperties": true,
+      "description": "Capability profile-avatar-style-import-if-unset permits atomic first import. With true, a prior value or any style clock causes 409 avatar_style_already_set without writes. Owner clear of default also claims a clock.",
+      "properties": { "avatarStyle": { "$ref": "#/$defs/avatarStyle" }, "avatarStyleImportIfUnset": { "type": "boolean" } }
+    },
+    "appearanceRevisions": {
+      "type": "object", "required": ["color", "avatarThemes", "introGreeting", "avatar", "introPortrait"],
+      "properties": {
+        "color": { "$ref": "#/$defs/appearanceRevision" }, "avatarThemes": { "$ref": "#/$defs/appearanceRevision" },
+        "avatarStyle": { "$ref": "#/$defs/appearanceRevision" },
+        "introGreeting": { "$ref": "#/$defs/appearanceRevision" }, "avatar": { "$ref": "#/$defs/appearanceRevision" },
+        "introPortrait": { "$ref": "#/$defs/appearanceRevision" }
+      },
+      "additionalProperties": true
+    },
+    "profileMetadata": {
+      "type": "object", "required": ["id", "appearanceRevisions"],
+      "properties": {
+        "id": { "type": "string" }, "link": { "$ref": "#/$defs/profileLink" },
+        "accountLink": { "$ref": "#/$defs/manualSetting" }, "accountLinkState": { "enum": ["auto", "disabled", "manual"] },
+        "appearanceRevisions": { "$ref": "#/$defs/appearanceRevisions" },
+        "appearance": { "type": "object", "properties": { "avatarStyle": { "$ref": "#/$defs/avatarStyle" } }, "additionalProperties": true }
+      },
+      "additionalProperties": true
+    }
+  }
+}

@@ -45,6 +45,10 @@ impl BootstrapExecutionPermit<'_> {
         self.intent.validate_evidence()?;
         self.intent
             .validate_authority(&self.provider.store().snapshot()?)?;
+        // The intent's Director is an authority witness, not necessarily the
+        // action actor (operators can create too). Use the original action seed.
+        let creator = self.provider.store().snapshot()?.actions
+            .get(&self.intent.request.action_id).and_then(|action| action.created_by.clone());
         let spec = self.intent.spec()?;
         let digest = super::store::request_sha256(self.intent)?;
         let key = format!("bootstrap-adopt:{}", digest.as_str());
@@ -71,7 +75,7 @@ impl BootstrapExecutionPermit<'_> {
                     .ok_or_else(|| anyhow::anyhow!("bootstrap adopted identity missing"))?;
                 anyhow::ensure!(
                     record.codex_session_id.as_deref() == Some(native)
-                        && !record.is_retired()
+                        && !crate::agent_management::agent_execution_blocked(&record)
                         && record.agent_enabled,
                     "bootstrap adopted binding changed"
                 );
@@ -98,12 +102,15 @@ impl BootstrapExecutionPermit<'_> {
                     groups: spec.groups.clone(),
                     expose_to_im: spec.expose_to_im,
                     pin: spec.pin,
+                    model_defaults: Some(spec.model.clone()),
+                    reasoning_defaults: Some(spec.reasoning.clone()),
                 },
             )?;
             let record = sessions
                 .sessions
                 .get_mut(&adopted.key)
                 .ok_or_else(|| anyhow::anyhow!("bootstrap adoption missing"))?;
+            record.stamp_created_by_at_creation(creator.as_ref())?;
             record.formal_agent_name = Some(spec.name.clone());
             // Existing Bus routing metadata, explicitly included in review;
             // this is not Cutex Project membership or an identity inference.
@@ -219,7 +226,7 @@ impl BootstrapExecutionPermit<'_> {
                     .remove(id.as_str())
                     .ok_or_else(|| anyhow::anyhow!("captured successor missing"))?;
                 anyhow::ensure!(
-                    !current.is_retired()
+                    !crate::agent_management::agent_execution_blocked(&current)
                         && current.agent_enabled
                         && current.app_server_launch_claim_id.is_none()
                         && current.app_server_runtime == receipt.binding

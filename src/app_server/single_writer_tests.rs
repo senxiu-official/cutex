@@ -76,6 +76,46 @@ fn approval(id: i64) -> AppServerEvent {
 
 /// The launchers' lease cache is at most `CACHE_TTL` old; real launchers
 /// handle an event emitted after the cut only once that much time passed.
+#[test]
+fn stale_entries_of_one_process_are_checked_once() {
+    let root = temp_root();
+    // The old Management (pid 2) owned three runtimes, then went away.
+    let old = Arc::new(Ledger::new(&root, identity(2), Role::Owner, |_: &ProcessIdentity| true));
+    for session in ["a", "b", "c"] {
+        let mut connection = old.open(session, 1);
+        connection.activate_at(1);
+        // The process dies: nothing closes the connection, its lease stays behind.
+        std::mem::forget(connection);
+    }
+    let checks = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let seen = checks.clone();
+    let new = Arc::new(Ledger::new(&root, identity(3), Role::Owner, move |process: &ProcessIdentity| {
+        seen.lock().unwrap().push(process.pid);
+        process.pid != 2
+    }));
+    let mut connection = new.open("d", 1);
+    connection.activate_at(2);
+    // Three stale leases of one gone process: one liveness check.
+    assert_eq!(*checks.lock().unwrap(), vec![2]);
+    let file = new.read();
+    assert_eq!(file.leases.keys().cloned().collect::<Vec<_>>(), vec!["d".to_string()]);
+    drop(connection);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_reused_pid_is_not_the_process_that_wrote_the_lease() {
+    let me = ProcessIdentity::current();
+    assert!(me.is_live());
+    if me.started_at.is_some() {
+        let reused = ProcessIdentity {
+            pid: me.pid,
+            started_at: Some("2000-01-01T00:00:00+00:00".to_string()),
+        };
+        assert!(!reused.is_live());
+    }
+}
+
 fn let_launchers_see_the_lease() {
     std::thread::sleep(CACHE_TTL + Duration::from_millis(20));
 }
@@ -203,6 +243,32 @@ fn replayed(connection: &mut ConnectionOwnership) -> Vec<i64> {
             _ => 0,
         })
         .collect()
+}
+
+#[test]
+fn live_text_deltas_keep_emission_time_without_takeover_payloads() {
+    let home = home();
+    let mut bus = home.bus.open("cutex.a", 1);
+    bus.activate();
+    bus.set_full_text_item_terminal(true);
+    let mut management = home.management.open("cutex.a", 1);
+    management.activate_at(10_000);
+    management.set_full_text_item_terminal(true);
+    let_launchers_see_the_lease();
+    for index in 0..2000 {
+        let event = delta(&"x".repeat(1024), 20_000 + index);
+        assert!(!bus.handles_at(&event, 20_000 + index));
+    }
+    assert!(bus.retained.is_empty());
+    assert_eq!(bus.retained_bytes, 0);
+    assert_eq!(bus.last_emitted, Some(21_999));
+    let request = approval(42); // Untimed: must inherit the last live emission.
+    assert!(!bus.handles_at(&request, 30_000));
+    assert_eq!(bus.retained.front().unwrap().key, 21_999);
+    drop(management);
+    let_launchers_see_the_lease();
+    bus.poll_at(31_000);
+    assert_eq!(replayed(&mut bus), vec![-42]);
 }
 
 #[test]

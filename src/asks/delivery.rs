@@ -38,11 +38,53 @@ fn push(state: &mut AskState, ask: &AskRecord, kind: DeliveryKind, ref_id: Strin
             event_id: None,
             passive,
             settled_by: None,
+            routed_to: None,
             created_at: now_rfc3339(now),
             updated_at: now_rfc3339(now),
         },
     );
     Some(delivery_id)
+}
+
+/// Who an item goes to (design 044): a pending item to the ask's current
+/// controller (a question to its question responder), resolved each time it
+/// is sent, so a handover reroutes it without a new item; `None` holds it
+/// (handover pending reconcile, or an unknown controller: fail closed). An
+/// item already claimed by a wait or carried by an event stays with the
+/// session it went to (`routed_to`, else the original
+/// `requester_cutex_session_id`): never resent to someone else.
+pub fn recipient(state: &AskState, delivery: &DeliveryRecord) -> Option<String> {
+    if delivery.state != DeliveryState::Pending {
+        if delivery.state == DeliveryState::QueuedAsEvent {
+            if let Some(event) = delivery.event_id.as_deref().and_then(|id| state.events.get(id)) {
+                return Some(event.cutex_session_id.clone());
+            }
+        }
+        return Some(delivery.routed_to.clone().unwrap_or_else(|| delivery.requester_cutex_session_id.clone()));
+    }
+    route::pending_recipient(state, delivery)
+}
+
+/// The item goes (or went) to `session`.
+pub fn is_for(state: &AskState, delivery: &DeliveryRecord, session: &str) -> bool {
+    recipient(state, delivery).as_deref() == Some(session)
+}
+
+/// Ids of `session`'s deliveries matching `keep` (read first, so callers
+/// can change the records afterwards).
+fn ids_for(state: &AskState, session: &str, keep: impl Fn(&DeliveryRecord) -> bool) -> Vec<String> {
+    state
+        .deliveries
+        .values()
+        .filter(|delivery| keep(delivery) && is_for(state, delivery, session))
+        .map(|delivery| delivery.delivery_id.clone())
+        .collect()
+}
+
+/// Record where an item leaving `pending` went, when not to its original
+/// requester.
+fn route(delivery: &mut DeliveryRecord, to: &str) {
+    delivery.routed_to = (delivery.requester_cutex_session_id != to).then(|| to.to_string());
 }
 
 /// An answer revision for the requester (none for owner asks: the desktop
@@ -65,6 +107,17 @@ pub fn record_state_delivery(state: &mut AskState, ask: &AskRecord, reason: &str
     let passive = !final_outcome || ask.options.notify == Notify::Passive;
     let ref_id = format!("{reason}@{}", ask.revision);
     push(state, ask, DeliveryKind::State, ref_id, passive, now)
+}
+
+/// The state name of a handover summary (design 044 §4.3).
+pub const HANDED_OVER: &str = "handedOver";
+
+/// A handover summary for the ask's new controller: one per controller
+/// revision (dedup key `handedOver@<revision>`), never a copy of an answer or
+/// question. Its recipient is resolved like any pending item, so it reaches
+/// the new controller; `passive` when nothing there needs a decision.
+pub fn record_handover_delivery(state: &mut AskState, ask: &AskRecord, controller_revision: u64, passive: bool, now: DateTime<Utc>) -> Option<String> {
+    push(state, ask, DeliveryKind::State, format!("{HANDED_OVER}@{controller_revision}"), passive, now)
 }
 
 /// The state name of a "needs the owner" delivery (r208).
@@ -98,6 +151,7 @@ pub fn record_owner_stopped_delivery(state: &mut AskState, ask: &AskRecord, now:
 /// which can only be left over from releases before r208.
 pub fn actionable(state: &AskState, delivery: &DeliveryRecord) -> bool {
     delivery.state == DeliveryState::Pending
+        && !super::lineage::stopped_parent(state,&super::routing_policy::integration::local_host_id(),&delivery.ask_id)
         && !state.asks.get(&delivery.ask_id).is_some_and(|ask| {
             matches!(ask.closed, Some(CloseOutcome::Accepted | CloseOutcome::Abandoned | CloseOutcome::Cancelled))
         })
@@ -139,13 +193,11 @@ pub fn settle_for_ask(
         .map(|answer| (answer.answer_id.clone(), answer.revision))
         .collect();
     let mut settled = 0;
-    for delivery in state.deliveries.values_mut() {
-        if delivery.ask_id != ask_id
-            || delivery.requester_cutex_session_id != requester
-            || delivery.state != DeliveryState::Pending
-        {
-            continue;
-        }
+    // Only the reader's own items: an original requester reading a handed-over
+    // ask does not settle the new controller's results (design 044 §4.2).
+    let mine = ids_for(state, requester, |delivery| delivery.ask_id == ask_id && delivery.state == DeliveryState::Pending);
+    for id in mine {
+        let Some(delivery) = state.deliveries.get_mut(&id) else { continue };
         let covered = match delivery.kind {
             DeliveryKind::Answer => match (max_revision, revisions.get(&delivery.ref_id)) {
                 (None, _) => true,
@@ -178,21 +230,19 @@ pub fn claim_for_wait(
     let duplicates: std::collections::HashSet<String> = state
         .deliveries
         .values()
-        .filter(|delivery| delivery.requester_cutex_session_id == requester && duplicate_answer(state, delivery))
+        .filter(|delivery| is_for(state, delivery, requester) && duplicate_answer(state, delivery))
         .map(|delivery| delivery.delivery_id.clone())
         .collect();
     let mut claimed = Vec::new();
-    for delivery in state.deliveries.values_mut() {
-        if delivery.requester_cutex_session_id != requester
-            || (!asks.is_empty() && !asks.contains(&delivery.ask_id))
-        {
-            continue;
-        }
+    let mine = ids_for(state, requester, |delivery| asks.is_empty() || asks.contains(&delivery.ask_id));
+    for id in mine {
+        let Some(delivery) = state.deliveries.get_mut(&id) else { continue };
         let mine_before = delivery.state == DeliveryState::ClaimedByWait
             && delivery.claimed_by.as_deref() == Some(action_id);
         if delivery.state == DeliveryState::Pending && !duplicates.contains(&delivery.delivery_id) {
             delivery.state = DeliveryState::ClaimedByWait;
             delivery.claimed_by = Some(action_id.to_string());
+            route(delivery, requester);
             delivery.updated_at = now_rfc3339(now);
             claimed.push(delivery.clone());
         } else if mine_before {
@@ -213,7 +263,7 @@ pub fn requesters_with_pending(state: &AskState) -> Vec<String> {
         .deliveries
         .values()
         .filter(|delivery| actionable(state, delivery) && !delivery.passive)
-        .map(|delivery| delivery.requester_cutex_session_id.clone())
+        .filter_map(|delivery| recipient(state, delivery))
         .collect();
     sessions.sort();
     sessions.dedup();
@@ -225,7 +275,7 @@ pub fn requesters_with_pending(state: &AskState) -> Vec<String> {
 /// Deliveries as they became pending (creation time, then id). The store map
 /// is keyed by random delivery ids, so its order put a later result before an
 /// earlier one (r243 acceptance: delegation-9be907 above delegation-e37ed4).
-fn in_creation_order(state: &AskState, mut ids: Vec<String>) -> Vec<String> {
+pub(crate) fn in_creation_order(state: &AskState, mut ids: Vec<String>) -> Vec<String> {
     let created = |id: &String| {
         state
             .deliveries
@@ -240,9 +290,7 @@ pub fn coalesce_into_event(state: &mut AskState, requester: &str, native_message
     let ids: Vec<String> = state
         .deliveries
         .values()
-        .filter(|delivery| {
-            delivery.requester_cutex_session_id == requester && actionable(state, delivery) && !delivery.passive
-        })
+        .filter(|delivery| actionable(state, delivery) && !delivery.passive && is_for(state, delivery, requester))
         .map(|delivery| delivery.delivery_id.clone())
         .collect();
     coalesce_selected_into_event(state, requester, native_message_id, ids, now)
@@ -252,7 +300,7 @@ pub fn coalesce_into_event(state: &mut AskState, requester: &str, native_message
 pub fn coalesce_selected_into_event(state: &mut AskState, requester: &str, native_message_id: &str, ids: Vec<String>, now: DateTime<Utc>) -> Option<String> {
     let ids: Vec<String> = ids.into_iter().filter(|id| {
         state.deliveries.get(id).is_some_and(|delivery| {
-            delivery.requester_cutex_session_id == requester && actionable(state, delivery) && !delivery.passive
+            actionable(state, delivery) && !delivery.passive && is_for(state, delivery, requester)
         })
     }).collect();
     if ids.is_empty() {
@@ -264,6 +312,7 @@ pub fn coalesce_selected_into_event(state: &mut AskState, requester: &str, nativ
         if let Some(delivery) = state.deliveries.get_mut(id) {
             delivery.state = DeliveryState::QueuedAsEvent;
             delivery.event_id = Some(event_id.clone());
+            route(delivery, requester);
             delivery.updated_at = now_rfc3339(now);
         }
     }
@@ -309,20 +358,53 @@ pub fn release_event(state: &mut AskState, event_id: &str, now: DateTime<Utc>) {
     for id in event.delivery_ids {
         if let Some(delivery) = state.deliveries.get_mut(&id) {
             if delivery.state == DeliveryState::QueuedAsEvent {
+                // Refused / absent (not unknown): pending again, resolved anew.
                 delivery.state = DeliveryState::Pending;
                 delivery.event_id = None;
+                delivery.routed_to = None;
                 delivery.updated_at = now_rfc3339(now);
             }
         }
     }
 }
 
+/// The event's native outcome is unknown (a volatile next-step admission lost
+/// with its runtime) and is put back as `release_event` does, EXCEPT items
+/// whose recipient a handover moved meanwhile (design 044 §4.3): the earlier
+/// controller may have read them, so they are never resent to the new one.
+/// They are settled `handoverUnknown` (still readable with delegation_read;
+/// the handover summary points there). Returns those ids.
+pub fn release_event_unknown(state: &mut AskState, event_id: &str, now: DateTime<Utc>) -> Vec<String> {
+    let Some(event) = state.events.get(event_id).cloned() else {
+        return Vec::new();
+    };
+    release_event(state, event_id, now);
+    let mut kept = Vec::new();
+    for id in event.delivery_ids {
+        let moved = state.deliveries.get(&id).is_some_and(|delivery| {
+            delivery.state == DeliveryState::Pending && recipient(state, delivery).as_deref() != Some(event.cutex_session_id.as_str())
+        });
+        if let (true, Some(delivery)) = (moved, state.deliveries.get_mut(&id)) {
+            delivery.state = DeliveryState::Acknowledged;
+            delivery.settled_by = Some(HANDOVER_UNKNOWN.to_string());
+            delivery.routed_to = (delivery.requester_cutex_session_id != event.cutex_session_id).then(|| event.cutex_session_id.clone());
+            delivery.updated_at = now_rfc3339(now);
+            kept.push(id);
+        }
+    }
+    kept
+}
+
+/// `settled_by` of an item whose delivery to an earlier controller is unknown.
+pub const HANDOVER_UNKNOWN: &str = "handoverUnknown";
+
 /// Over budget: degrade a requester's pending event deliveries to passive
 /// (§8.3); the owner is notified by the caller.
 pub fn degrade_to_passive(state: &mut AskState, requester: &str, now: DateTime<Utc>) -> usize {
     let mut count = 0;
-    for delivery in state.deliveries.values_mut() {
-        if delivery.requester_cutex_session_id == requester && delivery.state == DeliveryState::Pending && !delivery.passive {
+    let mine = ids_for(state, requester, |delivery| delivery.state == DeliveryState::Pending && !delivery.passive);
+    for id in mine {
+        if let Some(delivery) = state.deliveries.get_mut(&id) {
             delivery.passive = true;
             delivery.updated_at = now_rfc3339(now);
             count += 1;

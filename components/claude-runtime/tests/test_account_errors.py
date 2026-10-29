@@ -44,7 +44,7 @@ async def test_sdk_error_mapping_and_redaction(ph, api, code, subscription, api_
         assert "Claude API account 'ca-fixture' (example.test)" in message
         assert 'Official Claude' not in message and ph.logins == []
     else:
-        assert 'Official Claude' in message
+        assert message.startswith(f'Official Claude returned an error (') and 'Official Claude' in message
     completed = [e['params']['turn'] for e in ph.out if e.get('method') == 'turn/completed']
     assert completed[-1]['error'] == result['error']
 
@@ -79,3 +79,14 @@ def test_other_refresh_failures_stay_unauthorized():
                               'content': [{'text': 'Failed to refresh OAuth token: invalid_grant'}]}, None)
     assert error.codex_error_info == 'unauthorized' and not error.transient_refresh
     assert 'OAuth refresh failed' in str(error)
+
+
+@pytest.mark.parametrize('code', ['rate_limit', 'billing_error', 'server_error'])
+def test_error_text_keeps_the_quota_prefix_and_does_not_promise_no_retry(code):
+    # cutex quota detection matches the prefix; cutex may requeue a delegation at the reset, so
+    # the text must not say the input is never retried.
+    from cute_claude.subscription import SdkResponseError
+    text = str(SdkResponseError({'error': code, 'content': [{'text': 'private body'}]}, None))
+    assert text.startswith(f'Official Claude returned an error ({code}).')
+    assert 'not automatically retried' not in text
+    assert 'This runtime does not retry it itself; cutex may requeue delegations once the limit resets.' in text

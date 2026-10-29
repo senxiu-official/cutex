@@ -3,9 +3,11 @@
 //!
 //! Linux: two systemd `--user` units, `cutex-agent-bus.service` and
 //! `cutex-management-api.service` (the names `cutex human service` already
-//! controls), `ExecStart=<base>/current/cutex …`, `KillMode=process` on the
-//! Management API (native app-servers survive a restart: reload upgrades),
-//! `Restart=on-failure`. Run `loginctl enable-linger` to keep them after
+//! controls), `ExecStart=<base>/current/cutex …`, `KillMode=process` on both
+//! (the agent runtimes the Management API or the Agent Bus started survive a
+//! restart of either: reload upgrades re-adopt them; units written before r248
+//! had it on the Management API only and are patched before the next stop,
+//! [`keep_bus_children`]), `Restart=on-failure`. Run `loginctl enable-linger` to keep them after
 //! logout.
 //!
 //! Windows: no runtime-host for colleague installs (lead decision,
@@ -158,11 +160,56 @@ pub fn bus_unit_with(base: &Path, cutex_home: Option<&Path>) -> String {
     let exe = base.join("current").join(CUTEX_EXE);
     format!(
         "{UNIT_MARKER}\n[Unit]\nDescription=cutex Agent Bus\n\n[Service]\nType=simple\n\
-         {}ExecStart={} agent serve\nRestart=on-failure\nRestartSec=3\n\n\
+         {}ExecStart={} agent serve\nRestart=on-failure\nRestartSec=3\n\
+         {BUS_KEEP_CHILDREN}\n\
          [Install]\nWantedBy=default.target\n",
         unit_environment(base, cutex_home),
         systemd_quote(&exe.display().to_string()),
     )
+}
+
+/// The bus unit's `[Service]` lines that keep the agent runtimes the bus
+/// started (Claude adapters, Codex app-servers and their tools live in its
+/// cgroup) alive across a stop: without them `systemctl --user stop` kills
+/// every one (found on a Linux managed install, 2026-10-22).
+const BUS_KEEP_CHILDREN: &str = "# Agent runtimes the Agent Bus started live in its cgroup and must\n\
+# survive its restart (reload upgrades re-adopt them).\nKillMode=process\nTimeoutStopSec=30\n";
+
+/// Migration of a bus unit written before r248 (no `KillMode`): when `unit`
+/// in `unit_dir` carries the `cutex service install` marker and sets no
+/// `KillMode`, [`BUS_KEEP_CHILDREN`] is inserted at the end of its
+/// `[Service]` section (atomic write; nothing else changes). Returns whether
+/// the file changed (the caller then runs `systemctl --user daemon-reload`).
+/// A unit without the marker (the owner's own) or with any `KillMode` is
+/// left alone; a missing file is not an error.
+pub fn keep_bus_children(unit_dir: &Path, unit: &str) -> anyhow::Result<bool> {
+    let path = unit_dir.join(unit);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if !text.starts_with(UNIT_MARKER) || text.lines().any(|line| line.trim_start().starts_with("KillMode=")) {
+        return Ok(false);
+    }
+    let Some(service) = text.find("\n[Service]\n") else { return Ok(false) };
+    let end = text[service + 1..].find("\n[").map(|i| service + 1 + i + 1).unwrap_or(text.len());
+    let mut patched = text[..end].to_string();
+    if !patched.ends_with('\n') {
+        patched.push('\n');
+    }
+    // Keep the blank line that separated the sections.
+    let blank = patched.ends_with("\n\n");
+    if blank {
+        patched.pop();
+    }
+    patched.push_str(BUS_KEEP_CHILDREN);
+    if blank {
+        patched.push('\n');
+    }
+    patched.push_str(&text[end..]);
+    crate::config::atomic::write_bytes_atomic(&path, patched.as_bytes())?;
+    Ok(true)
 }
 
 pub fn management_unit(base: &Path) -> String {
@@ -685,10 +732,21 @@ pub trait ServiceControl {
 pub struct SystemdControl<'a> {
     pub exec: &'a dyn Exec,
     pub names: ServiceNames,
+    /// Where the units are (install record `unitDir`, else the default user
+    /// unit dir): an old bus unit there is patched before a stop
+    /// ([`keep_bus_children`]). None: not checked.
+    pub unit_dir: Option<PathBuf>,
 }
 
 impl ServiceControl for SystemdControl<'_> {
     fn stop_all(&self) -> anyhow::Result<()> {
+        // A bus unit written before r248 would kill the runtimes in its cgroup
+        // on this stop: patch it first so this very stop keeps them.
+        if let Some(dir) = &self.unit_dir {
+            if keep_bus_children(dir, &self.names.bus_unit)? {
+                self.exec.run("systemctl", &args(&["--user", "daemon-reload"]))?;
+            }
+        }
         // Management first (it talks to the bus), then the bus.
         self.exec.run("systemctl", &args(&["--user", "stop", &self.names.management_unit]))?;
         self.exec.run("systemctl", &args(&["--user", "stop", &self.names.bus_unit]))?;
@@ -802,7 +860,66 @@ mod tests {
         assert!(unit.contains("After=cutex-agent-bus.service"));
         let bus = bus_unit(Path::new("/srv/cutex"));
         assert!(bus.contains("ExecStart=/srv/cutex/current/cutex agent serve"));
-        assert!(!bus.contains("KillMode"));
+        // r248: the bus keeps the runtimes it started across a stop too.
+        assert!(bus.contains("\nKillMode=process\nTimeoutStopSec=30\n\n[Install]\n"), "{bus}");
+    }
+
+    /// The bus unit text `cutex service install` wrote before r248 (0.1.0 - 0.1.5, r247).
+    fn old_bus_unit(base: &str) -> String {
+        format!(
+            "{UNIT_MARKER}\n[Unit]\nDescription=cutex Agent Bus\n\n[Service]\nType=simple\n\
+             Environment=CUTEX_SERVICE_MANAGER=systemd\nEnvironment=CUTEX_INSTALL_BASE={base}\n\
+             ExecStart={base}/current/cutex agent serve\nRestart=on-failure\nRestartSec=3\n\n\
+             [Install]\nWantedBy=default.target\n"
+        )
+    }
+
+    #[test]
+    fn an_old_bus_unit_is_patched_to_keep_its_children_once() {
+        let dir = temp("units-migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(BUS_UNIT), old_bus_unit("/srv/cutex")).unwrap();
+        assert!(keep_bus_children(&dir, BUS_UNIT).unwrap());
+        let patched = std::fs::read_to_string(dir.join(BUS_UNIT)).unwrap();
+        // The same text a fresh install writes (environment lines included).
+        let mut fresh = bus_unit(Path::new("/srv/cutex"));
+        fresh = fresh.replace("Environment=\"CUTEX_INSTALL_BASE=/srv/cutex\"", "Environment=CUTEX_INSTALL_BASE=/srv/cutex");
+        assert_eq!(patched, fresh, "patched:\n{patched}\nfresh:\n{fresh}");
+        assert!(!keep_bus_children(&dir, BUS_UNIT).unwrap(), "idempotent");
+        // The owner's own unit (no marker) and a unit with any KillMode are never changed.
+        let own = "[Service]\nExecStart=/x\n";
+        std::fs::write(dir.join("own.service"), own).unwrap();
+        assert!(!keep_bus_children(&dir, "own.service").unwrap());
+        assert_eq!(std::fs::read_to_string(dir.join("own.service")).unwrap(), own);
+        let chosen = old_bus_unit("/srv/cutex").replace("RestartSec=3\n", "RestartSec=3\nKillMode=mixed\n");
+        std::fs::write(dir.join("chosen.service"), &chosen).unwrap();
+        assert!(!keep_bus_children(&dir, "chosen.service").unwrap());
+        assert_eq!(std::fs::read_to_string(dir.join("chosen.service")).unwrap(), chosen);
+        assert!(!keep_bus_children(&dir, "missing.service").unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn systemd_stop_patches_an_old_bus_unit_and_reloads_before_stopping() {
+        let dir = temp("units-stop");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(BUS_UNIT), old_bus_unit("/srv/cutex")).unwrap();
+        let exec = FakeExec::default();
+        let control = SystemdControl { exec: &exec, names: ServiceNames::default(), unit_dir: Some(dir.clone()) };
+        control.stop_all().unwrap();
+        control.stop_all().unwrap();
+        assert_eq!(
+            *exec.calls.lock().unwrap(),
+            vec![
+                "systemctl --user daemon-reload".to_string(),
+                format!("systemctl --user stop {MANAGEMENT_UNIT}"),
+                format!("systemctl --user stop {BUS_UNIT}"),
+                format!("systemctl --user stop {MANAGEMENT_UNIT}"),
+                format!("systemctl --user stop {BUS_UNIT}"),
+            ]
+        );
+        assert!(std::fs::read_to_string(dir.join(BUS_UNIT)).unwrap().contains("KillMode=process"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -896,7 +1013,7 @@ mod tests {
         let recorded = ServiceNames::of(&layout.read_install().unwrap());
         assert_eq!(recorded.bus_unit, names.bus_unit);
         assert_eq!(recorded.management_unit, names.management_unit);
-        let control = SystemdControl { exec: &exec, names: recorded };
+        let control = SystemdControl { exec: &exec, names: recorded, unit_dir: None };
         control.stop_all().unwrap();
         assert_eq!(
             *exec.calls.lock().unwrap(),
@@ -932,7 +1049,7 @@ mod tests {
     #[test]
     fn systemd_control_order() {
         let exec = FakeExec::default();
-        let control = SystemdControl { exec: &exec, names: ServiceNames::default() };
+        let control = SystemdControl { exec: &exec, names: ServiceNames::default(), unit_dir: None };
         control.stop_all().unwrap();
         control.start_all().unwrap();
         assert_eq!(

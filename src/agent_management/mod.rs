@@ -7,6 +7,7 @@
 
 mod archive;
 mod bootstrap_intent;
+mod create_abandon;
 mod durable_adoption;
 mod durable_import;
 /// Child ⊆ creator permission check for agent-initiated launches.
@@ -35,6 +36,7 @@ mod store;
 
 pub use archive::*;
 pub use bootstrap_intent::*;
+pub use create_abandon::*;
 pub use durable_adoption::*;
 pub use durable_import::*;
 pub use explicit_launch::*;

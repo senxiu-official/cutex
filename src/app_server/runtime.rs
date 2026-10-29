@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::io;
-#[cfg(windows)]
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -262,11 +261,13 @@ pub fn thread_resume_params_for_session_with_model_provider(
     model_provider: Option<&str>,
 ) -> anyhow::Result<ThreadResumeParams> {
     let thread_id = record
-        .codex_session_id
-        .as_deref()
+        .app_server_thread_id()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .context("cutex session has no Codex session id")?;
+    if record.dsh_session.is_some() {
+        return Ok(ThreadResumeParams { thread_id: thread_id.to_string(), ..Default::default() });
+    }
     let cwd = PathBuf::from(cutex_session_launch_cwd(record));
     if !cwd.is_absolute() {
         anyhow::bail!("app-server thread cwd must be absolute: {}", cwd.display());
@@ -536,7 +537,7 @@ fn create_private_dir(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let parent = path.parent().context("app-server token parent missing")?;
     let name = path.file_name().and_then(|name| name.to_str())
         .context("invalid app-server token name")?;
@@ -544,6 +545,21 @@ fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let mut file = crate::platform::private_fs::open_child(
         parent, identity, name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, false,
     ).with_context(|| format!("failed to create private app-server token file {}", path.display()))?;
+    file.write_all(contents)?;
+    file.flush()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to create private app-server token file {}", path.display()))?;
     file.write_all(contents)?;
     file.flush()?;
     Ok(())
@@ -585,6 +601,21 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), original);
         assert_eq!(layout.auth_token.as_ref().unwrap().as_bytes(), original);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_runtime_token_is_private_and_is_not_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = short_test_root("cas-token");
+        create_private_dir(&root).unwrap();
+        let path = root.join("rpc-token");
+        write_private_file(&path, b"original").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(write_private_file(&path, b"replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

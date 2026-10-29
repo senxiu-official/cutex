@@ -1,0 +1,392 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:storage-cleanup",
+  "title": "Owner desktop storage cleanup",
+  "description": "Explicit preview-bound manual cleanup. Capability storage-cleanup. All pairing tokens (including owner/full phones) fail closed with 403 storage_cleanup_desktop_only until a trusted desktop-specific credential exists. No scheduled deletion. Inventory remains host-storage.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/previewRequest"
+    },
+    {
+      "$ref": "#/$defs/preview"
+    },
+    {
+      "$ref": "#/$defs/executeRequest"
+    },
+    {
+      "$ref": "#/$defs/run"
+    },
+    {
+      "$ref": "#/$defs/history"
+    }
+  ],
+  "$defs": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "orphan-homes",
+        "retired-homes",
+        "old-backups",
+        "old-logs",
+        "vacuum"
+      ]
+    },
+    "actor": {
+      "type": "object",
+      "required": [
+        "principal",
+        "clientName",
+        "deviceId"
+      ],
+      "properties": {
+        "principal": {
+          "const": "owner"
+        },
+        "clientName": {
+          "enum": [
+            "desktop",
+            "hostCli"
+          ]
+        },
+        "deviceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "description": "Verified admission metadata, never credential contents. deviceId is a non-secret token record ID."
+    },
+    "previewRequest": {
+      "type": "object",
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "maxItems": 10000,
+          "uniqueItems": true,
+          "description": "Optional root-relative paths to preview. The server rejects traversal, absolute paths, links/reparse points, and anything outside action-specific allowlists."
+        },
+        "olderThanDays": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional age filter; server enforces action-specific minimums and the 7/30/90 log choices."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Read-only preview. Every action must be previewed, including vacuum. Retired-home cleanup preserves rollouts in place and removes only regenerable data."
+    },
+    "previewItem": {
+      "type": "object",
+      "required": [
+        "id",
+        "path",
+        "bytes",
+        "files",
+        "mtime",
+        "eligible",
+        "reason",
+        "code"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mtime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "eligible": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "description": "path is relative to the cutex root. Unreadable metadata can have null mtime; the item must then be ineligible."
+    },
+    "preview": {
+      "type": "object",
+      "required": [
+        "previewId",
+        "expiresAt",
+        "action",
+        "risk",
+        "items",
+        "freeableBytes"
+      ],
+      "properties": {
+        "previewId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Expires 600 seconds after creation; execute rechecks eligibility, binding and expiry."
+        },
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "risk": {
+          "enum": [
+            "high",
+            "medium"
+          ]
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/previewItem"
+          }
+        },
+        "freeableBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "complete": {
+          "type": "boolean",
+          "description": "False when only a bounded subset was fully inspected; freeableBytes is then a lower bound, never a complete total."
+        },
+        "partialReason": {
+          "enum": [
+            "time_budget",
+            "item_limit",
+            "entry_limit"
+          ]
+        },
+        "inspectedItems": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "elapsedMs": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "executeRequest": {
+      "type": "object",
+      "required": [
+        "requestId",
+        "previewId",
+        "confirmed"
+      ],
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "previewId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "maxItems": 10000,
+          "uniqueItems": true,
+          "description": "Optional item IDs from this exact preview; never paths. Omitted means the eligible preview selection."
+        },
+        "confirmed": {
+          "type": "boolean"
+        },
+        "confirmText": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Requires confirmed=true. High-risk preview requires exact confirmText 删除. requestId is idempotent; changing the bound preview/selection is rejected."
+    },
+    "runItem": {
+      "type": "object",
+      "required": [
+        "id",
+        "path",
+        "state",
+        "freedBytes",
+        "reason"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "queued",
+            "moving",
+            "deleting",
+            "deleted",
+            "skipped",
+            "failed",
+            "vacuumed"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "deleted",
+            "vacuumed",
+            "skipped",
+            "failed",
+            null
+          ]
+        },
+        "operation": {
+          "$ref": "#/$defs/action"
+        },
+        "freedBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retainedPath": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "outcome is null or absent while pending; terminal successful VACUUM uses vacuumed, not a claim that data was deleted. Paths are root-relative."
+    },
+    "run": {
+      "type": "object",
+      "required": [
+        "runId",
+        "state",
+        "freedBytes",
+        "items"
+      ],
+      "properties": {
+        "runId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "requestId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "previewId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "state": {
+          "enum": [
+            "running",
+            "completed",
+            "failed"
+          ]
+        },
+        "freedBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/runItem"
+          }
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "finishedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "error": {
+          "type": "string",
+          "description": "Durable worker pause reason; replay the same request to retry after resolving the cause."
+        }
+      },
+      "additionalProperties": false
+    },
+    "history": {
+      "type": "object",
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/run"
+          }
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

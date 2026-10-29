@@ -295,7 +295,7 @@ impl Entry {
 fn wants_running(record: &ServiceRecord) -> bool {
     match record.runtime {
         ServiceRuntime::External | ServiceRuntime::Static => false,
-        ServiceRuntime::Managed => !record.stopped,
+        ServiceRuntime::Managed => !record.stopped && !record.archived,
     }
 }
 
@@ -977,15 +977,19 @@ impl Supervisor {
             // session-store work at all. The snapshot's own locks never take the
             // supervisor or registry lock, so reading it here keeps the order.
             let archived_owners = owners_archived(registry.services.values());
+            let archived_projects = projects_archived(registry.services.values());
             let victims: Vec<_> = registry
                 .services
                 .values()
                 .filter_map(|record| {
                     let traffic = super::traffic::snapshot_for(record);
-                    let archived = record
-                        .owner_cutex_session_id
-                        .as_ref()
-                        .is_some_and(|owner| archived_owners.contains(owner.as_str()));
+                    let archived = if record.owner_scope.is_session() {
+                        record.owner_cutex_session_id.as_ref()
+                            .is_some_and(|owner| archived_owners.contains(owner.as_str()))
+                    } else {
+                        record.project_id.as_ref()
+                            .is_some_and(|project| archived_projects.contains(project.as_str()))
+                    };
                     self.lifecycle
                         .reason(
                             record,
@@ -1040,6 +1044,13 @@ impl Supervisor {
 
     fn require_supervised(&self, slug: &str) -> ServicesResult<ServiceRecord> {
         let record = self.store.get(slug)?;
+        if record.archived {
+            return Err(ServicesError::new(
+                409,
+                "service_archived",
+                format!("service `{slug}` is archived; restore it before starting it"),
+            ));
+        }
         if !record.runtime.supervised() {
             return Err(ServicesError::new(
                 409,
@@ -1141,6 +1152,13 @@ impl Supervisor {
 
     pub fn open_service(self: &Arc<Self>, slug: &str) -> ServicesResult<Value> {
         let record = self.store.get(slug)?;
+        if record.archived {
+            return Err(ServicesError::new(
+                409,
+                "service_archived",
+                format!("service `{slug}` is archived; restore it before opening it"),
+            ));
+        }
         if record.runtime == ServiceRuntime::Managed {
             let running = {
                 let inner = self.inner.lock().expect("services supervisor");
@@ -1243,15 +1261,25 @@ impl Supervisor {
                     &json!({"text": replay, "replay": true}),
                 )?;
             }
+            let mut last_write = Instant::now();
+            let mut watch = crate::management::listeners::RevocationWatch::for_stream(stream)?;
             loop {
-                match receiver.recv_timeout(SSE_KEEPALIVE) {
+                if watch.disconnected()? { return Ok(()); }
+                match receiver.recv_timeout(crate::management::listeners::STREAM_TICK) {
                     Ok(LogEvent::Output(end, text)) => {
-                        write_sse(stream, "log", Some(end), &json!({"text": text.as_str()}))?
+                        write_sse(stream, "log", Some(end), &json!({"text": text.as_str()}))?;
+                        last_write = Instant::now();
                     }
-                    Ok(LogEvent::State(value)) => write_sse(stream, "state", None, &value)?,
+                    Ok(LogEvent::State(value)) => {
+                        write_sse(stream, "state", None, &value)?;
+                        last_write = Instant::now();
+                    },
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        stream.write_all(b": keepalive\n\n")?;
-                        stream.flush()?;
+                        if last_write.elapsed() >= SSE_KEEPALIVE {
+                            stream.write_all(b": keepalive\n\n")?;
+                            stream.flush()?;
+                            last_write = Instant::now();
+                        }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                 }
@@ -1328,16 +1356,15 @@ fn spawn_reader(mut reader: impl Read + Send + 'static, ring: Arc<LogRing>, slug
         });
 }
 
-/// Unix: a previous daemon's service process groups survive it; kill the ones
-/// whose recorded pid still belongs to the same process. (Windows job objects
-/// already took them down when the old daemon exited.)
 /// The owners (of `records`) whose Agent is gone or archived. Reads the shared
 /// session-store snapshot only when some record has an owner; an unreadable
 /// store counts as "not archived" (nothing is reclaimed for it this tick).
 fn owners_archived<'a>(
     records: impl Iterator<Item = &'a ServiceRecord>,
 ) -> std::collections::BTreeSet<String> {
+    // Project services are not reclaimed with their registrant.
     let owners: std::collections::BTreeSet<&str> = records
+        .filter(|record| record.owner_scope.is_session())
         .filter_map(|record| record.owner_cutex_session_id.as_deref())
         .collect();
     if owners.is_empty() {
@@ -1353,6 +1380,32 @@ fn owners_archived<'a>(
     .unwrap_or_default()
 }
 
+/// Project services follow project archive/removal, never registrant archive.
+/// Missing legacy project-state records and unreadable snapshots fail closed:
+/// neither is positive evidence that the project was archived.
+fn projects_archived<'a>(
+    records: impl Iterator<Item = &'a ServiceRecord>,
+) -> std::collections::BTreeSet<String> {
+    let projects: std::collections::BTreeSet<&str> = records
+        .filter(|record| !record.owner_scope.is_session())
+        .filter_map(|record| record.project_id.as_deref())
+        .collect();
+    if projects.is_empty() {
+        return Default::default();
+    }
+    crate::memory::load_agent_management_snapshot()
+        .map(|snapshot| {
+            snapshot.project_states.values()
+                .filter(|state| projects.contains(state.project_id.as_str()))
+                .filter(|state| state.lifecycle != crate::agent_management::ProjectLifecycle::Active)
+                .map(|state| state.project_id.as_str().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Unix: kill surviving process groups only when the recorded process matches.
+/// Windows job objects already took them down when the old daemon exited.
 fn reap_previous_processes(store: &ServiceStore) {
     #[cfg(unix)]
     for snapshot in store.load_state().values() {
@@ -1548,6 +1601,50 @@ mod tests {
                 store.get_tombstone(slug).unwrap().unwrap().reason,
                 "owner_archived",
                 "{slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_reclaim_follows_project_lifecycle_not_registrant() {
+        use crate::agent_management::{AgentManagementStore, ProjectId, ProjectStateRecord};
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let projects = AgentManagementStore::open_default().unwrap();
+        projects.with_state(true, |mut snapshot| {
+            for (project, lifecycle) in [("active", "active"), ("archived", "archived"), ("removed", "removed")] {
+                let state: ProjectStateRecord = serde_json::from_value(json!({
+                    "project_id": project, "lifecycle": lifecycle, "revision": 1,
+                    "created_at": "2026-10-28T00:00:00Z", "updated_at": "2026-10-28T00:00:00Z"
+                })).unwrap();
+                snapshot.project_states.insert(ProjectId::new(project).unwrap(), state);
+            }
+            Ok((snapshot, (), true))
+        }).unwrap();
+        let store = temp_store();
+        store.mutate(|registry| {
+            for project in ["active", "archived", "removed", "legacy"] {
+                let record: ServiceRecord = serde_json::from_value(json!({
+                    "slug": project, "displayName": project, "host": "testhost", "port": 1,
+                    "runtime": "external", "lifetime": "ephemeral", "pinned": true,
+                    "ownerScope": "project", "projectId": project,
+                    "ownerCutexSessionId": "cutex.missing",
+                    "createdAt": chrono::Utc::now().to_rfc3339(),
+                    "updatedAt": chrono::Utc::now().to_rfc3339()
+                })).unwrap();
+                registry.services.insert(project.into(), record);
+            }
+            Ok(())
+        }).unwrap();
+        let (supervisor, _) = recording_supervisor_unlocked(store.clone());
+        supervisor.reclaim();
+        for project in ["active", "legacy"] {
+            assert!(store.get(project).is_ok(), "missing registrant is not the project's archive");
+        }
+        for project in ["archived", "removed"] {
+            let tombstone = store.get_tombstone(project).unwrap().unwrap();
+            assert_eq!(tombstone.reason, "project_archived");
+            crate::management::v2::schema_export::assert_valid(
+                "services", "tombstone", &serde_json::to_value(&tombstone).unwrap(),
             );
         }
     }

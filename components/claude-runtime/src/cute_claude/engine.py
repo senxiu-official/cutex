@@ -201,18 +201,57 @@ class Engine:
                 "reasoningOutputTokens": 0}
 
     async def _emit_usage(self, tid: str, turn_id: str, calls: list[dict], *,
-                          last: dict | None = None, window: int | None = None) -> None:
+                          last: dict | None = None, window: int | None = None, keep_last: bool = False) -> None:
         """`last` is the context occupancy (clients draw `last.inputTokens` against
         `modelContextWindow`), so it is the final model request of the turn, not the
-        turn's billing sum; `total` stays the thread's billing-style sum."""
+        turn's billing sum; `total` stays the thread's billing-style sum. `keep_last`
+        repeats the thread's last reported occupancy (usage added after a turn)."""
         all_calls: list[dict] = []
         for row in self.store.db.execute("SELECT usage FROM turns WHERE thread_id=?", (tid,)):
             all_calls.extend(json.loads(row[0]).get("modelRequests", []))
-        current = self._totals([{"usage": last}] if last else calls[-1:])
+        occupancy = self.__dict__.setdefault('_last_occupancy', {})
+        if keep_last:
+            current = occupancy.get(tid) or self._totals([])
+        else:
+            current = self._totals([{"usage": last}] if last else calls[-1:])
+            occupancy[tid] = current
         context = getattr(getattr(self, 'metrics', None), 'context', {}).get(tid)
         if context:
             # Session billing totals remain separate from current context occupancy.
             current = {**self._totals([]), 'totalTokens':context['used'], 'inputTokens':context['used']}
+        window = context['maximum'] if context else window
+        # The window is only reported at a turn's end (result `modelUsage`, the
+        # idle context read); mid-turn updates reuse the last one known for the
+        # thread so clients never see it drop to null between steps.
+        windows = self.__dict__.setdefault('_context_windows', {})
+        if type(window) is int and window > 0:
+            windows[tid] = window
+        else:
+            window = windows.get(tid)
+        token_usage = {"total": self._totals(all_calls), "last": current, "modelContextWindow": window}
+        # Runtime-local evidence, never inferred from an account label or copied
+        # history. Background subagents cannot change the parent's cache policy.
+        ttls = self.__dict__.setdefault('_cache_ttls', {})
+        for call in reversed(calls):
+            if call.get('kind') == 'background-task':
+                continue
+            usage = call.get('usage')
+            if not isinstance(usage, dict):
+                continue
+            five = usage.get('cache_creation_ephemeral_5m_input_tokens')
+            hour = usage.get('cache_creation_ephemeral_1h_input_tokens')
+            if type(five) is int and five > 0:
+                ttls[tid] = 300
+                break
+            if type(hour) is int and hour > 0:
+                ttls[tid] = 3600
+                break
+        if tid in ttls:
+            token_usage['cacheTtlSeconds'] = ttls[tid]
+        # The turn's model requests (SDK steps): cutex counts tokens per step
+        # with them (token audit 2026-10-22). Only when the SDK reported them.
+        steps = sum(c.get("sdkNumTurns") or 0 for c in calls) if not keep_last else 0
+        if steps > 0:
+            token_usage["modelRequests"] = steps
         await self.emit(tid, "thread/tokenUsage/updated", {"threadId": tid, "turnId": turn_id,
-                "tokenUsage": {"total": self._totals(all_calls), "last": current,
-                               "modelContextWindow": context['maximum'] if context else window}})
+                "tokenUsage": token_usage})

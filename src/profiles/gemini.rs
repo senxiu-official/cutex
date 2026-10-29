@@ -37,11 +37,8 @@ pub const GEMINI_DEFAULT_MODEL: &str = "gemini-3.8-flash-tiered";
 const RECOMMENDED_PRIORITY: i64 = -1;
 /// Native `WebSearchMode` written by the preset.
 pub const GEMINI_WEB_SEARCH: &str = "disabled";
-/// Native `ToolSchemaCompat` written by the preset (`preset_spec`): Google
-/// function declarations refuse mixed, typeless or nullable enums ("Google
-/// does not support this JSON Schema enum"), which MCP tool schemas often
-/// carry.
-pub const GEMINI_TOOL_SCHEMA_COMPAT: &str = "strict";
+// ToolSchemaCompat remains opt-in. A schema rejection can prompt the owner
+// to enable strict mode; creating a preset never changes existing profiles.
 
 pub fn is_gemini_provider(provider: &str) -> bool {
     provider.trim().eq_ignore_ascii_case(GEMINI_PROVIDER_ID)

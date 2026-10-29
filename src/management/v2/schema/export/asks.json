@@ -12,6 +12,15 @@
     }
   ],
   "$defs": {
+    "reviewReference": {
+      "type": "object",
+      "required": ["kind", "approvalId", "projectId"],
+      "properties": {
+        "kind": {"enum": ["routing", "capability"]},
+        "approvalId": {"type": "string", "minLength": 1},
+        "projectId": {"type": ["string", "null"]}
+      }
+    },
     "requester": {
       "type": "object",
       "required": [
@@ -97,6 +106,19 @@
         "requester": {
           "$ref": "#/$defs/requester"
         },
+        "controller": {
+          "type": ["string", "null"],
+          "description": "Current scoped controller after handover; null while review or reconciliation prevents control. Omitted for ordinary r253 ownership."
+        },
+        "originallyRequestedBy": {
+          "type": ["string", "null"],
+          "description": "Immutable original local requester; it is not rewritten when control moves."
+        },
+        "controlError": {
+          "type": "string",
+          "description": "Why handover control is currently unavailable; no control is granted when present."
+        },
+        "controlHistorical": {"type":"boolean","description":"Terminal work shows historical attribution only; this does not grant current control."},
         "target": {
           "type": "string",
           "description": "target cutexSessionId"
@@ -148,6 +170,15 @@
           ],
           "description": "awaitingAcceptance | accepted | changesRequested | abandoned"
         },
+        "reviewRef": {
+          "anyOf": [{"type": "null"}, {"$ref": "#/$defs/reviewReference"}],
+          "description": "Typed approval reference; routing takes precedence. The existing review acceptance state is unchanged."
+        },
+        "reviewRefs": {
+          "type": "array", "items": {"$ref": "#/$defs/reviewReference"},
+          "description": "Independent routing and capability reviews; deciding one never bypasses the other."
+        },
+        "reviewDenialReason": {"type": ["string", "null"]},
         "closed": {
           "type": [
             "string",
@@ -386,7 +417,13 @@
       ],
       "properties": {
         "ask": {
-          "type": "object"
+          "type": "object",
+          "properties": {
+            "controller": { "type": ["string", "null"] },
+            "originallyRequestedBy": { "type": ["string", "null"] },
+            "controlError": { "type": "string" },
+            "controlHistorical": {"type":"boolean"}
+          }
         }
       }
     },

@@ -39,6 +39,7 @@ pub enum WakeBusyWait {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AgentBusSettings {
     pub wake_busy_wait: WakeBusyWait,
+    pub result_coalescing: super::result_coalescing::ResultCoalescing,
 }
 
 const WAKE_BUSY_WAIT_KEY: &str = "wake_busy_wait_secs";
@@ -105,6 +106,7 @@ impl AgentBusSettings {
         let mut next = *self;
         for (key, value) in object {
             match key.as_str() {
+                "resultCoalescing" => next.result_coalescing = next.result_coalescing.patched(value)?,
                 "wakeBusyWaitSecs" => {
                     next.wake_busy_wait = match value {
                         Value::Null => WakeBusyWait::AfterTurn,
@@ -133,9 +135,9 @@ impl AgentBusSettings {
     /// `/v2/settings` fields: `agentBus`, `agentBusDefault`, `agentBusRange`.
     pub fn view(&self) -> Value {
         json!({
-            "agentBus": { "wakeBusyWaitSecs": self.wake_busy_wait.view() },
-            "agentBusDefault": { "wakeBusyWaitSecs": DEFAULT_WAKE_BUSY_WAIT_SECS },
-            "agentBusRange": { "wakeBusyWaitSecs": [0, MAX_WAKE_BUSY_WAIT_SECS] },
+            "agentBus": { "wakeBusyWaitSecs": self.wake_busy_wait.view(), "resultCoalescing": self.result_coalescing },
+            "agentBusDefault": { "wakeBusyWaitSecs": DEFAULT_WAKE_BUSY_WAIT_SECS, "resultCoalescing": super::result_coalescing::ResultCoalescing::default() },
+            "agentBusRange": { "wakeBusyWaitSecs": [0, MAX_WAKE_BUSY_WAIT_SECS], "resultCoalescing": {"quietSecs":[0,3600],"maxWaitSecs":[0,3600],"coldQuietSecs":[0,3600],"coldMaxWaitSecs":[0,3600]} },
         })
     }
 }
@@ -143,6 +145,9 @@ impl AgentBusSettings {
 impl Serialize for AgentBusSettings {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut object = serde_json::Map::new();
+        if self.result_coalescing != super::result_coalescing::ResultCoalescing::default() {
+            object.insert("result_coalescing".into(), serde_json::to_value(self.result_coalescing).map_err(serde::ser::Error::custom)?);
+        }
         match self.wake_busy_wait {
             WakeBusyWait::Default => {}
             WakeBusyWait::AfterTurn => {
@@ -162,6 +167,7 @@ impl<'de> Deserialize<'de> for AgentBusSettings {
         let value = Value::deserialize(deserializer)?;
         Ok(Self {
             wake_busy_wait: WakeBusyWait::from_raw(value.get(WAKE_BUSY_WAIT_KEY)),
+            result_coalescing: value.get("result_coalescing").map(super::result_coalescing::ResultCoalescing::from_raw).unwrap_or_default(),
         })
     }
 }
@@ -228,9 +234,14 @@ mod tests {
     fn settings_patch_and_view() {
         let settings = AgentBusSettings::default();
         let view = settings.view();
-        assert_eq!(view["agentBus"], json!({"wakeBusyWaitSecs": 120}));
-        assert_eq!(view["agentBusDefault"], json!({"wakeBusyWaitSecs": 120}));
-        assert_eq!(view["agentBusRange"], json!({"wakeBusyWaitSecs": [0, 86400]}));
+        assert_eq!(view["agentBus"]["wakeBusyWaitSecs"], 120);
+        assert_eq!(view["agentBusDefault"]["wakeBusyWaitSecs"], 120);
+        assert_eq!(view["agentBus"]["resultCoalescing"]["claudeSubscription"]["quietSecs"], 120);
+        let patched = settings.patched(&json!({"resultCoalescing":{"codex":{"enabled":false}}})).unwrap();
+        assert!(!patched.result_coalescing.codex.enabled);
+        let roundtrip: AgentBusSettings = serde_json::from_value(serde_json::to_value(patched).unwrap()).unwrap();
+        assert_eq!(roundtrip, patched);
+        assert_eq!(view["agentBusRange"]["wakeBusyWaitSecs"], json!([0, 86400]));
         let zero = settings.patched(&json!({"wakeBusyWaitSecs": 0})).unwrap();
         assert_eq!(zero.wake_busy_wait(), Some(Duration::ZERO));
         assert_eq!(zero.view()["agentBus"]["wakeBusyWaitSecs"], 0);

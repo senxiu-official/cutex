@@ -76,6 +76,13 @@
         }
       }
     },
+    "badge": {
+      "type": "object", "required": ["text"], "additionalProperties": false,
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 8, "description": "Display width 1..4; at most 32 UTF-8 bytes; no controls, whitespace, zero-width or format/default-ignorable scalars"},
+        "tint": {"enum": [null, "blue", "green", "amber", "pink", "violet"]}
+      }
+    },
     "avatar": {
       "type": "object",
       "required": ["kind", "value"],
@@ -85,6 +92,16 @@
         "color": { "type": "string", "pattern": "^#[0-9a-f]{6}$", "description": "Capability agent-avatar-color: circle colour of an emoji / icon avatar (a color avatar keeps its colour in value)." }
       }
     },
+    "sessionCreatedBy": {
+      "description": "Immutable creation-time provenance, never inferred for historical sessions. Not an authorization grant.",
+      "oneOf": [
+        { "type": "null" },
+        { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "enum": ["owner", "system"] } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "cutexSessionId"], "properties": {
+          "kind": { "const": "agent" }, "cutexSessionId": { "type": "string", "minLength": 1 }, "role": { "enum": ["director", "member"] }
+        } }
+      ]
+    },
     "session": {
       "type": "object",
       "required": ["contractVersion", "cutexSessionId", "revision", "lifecycle", "hostId", "displayName", "runtime"],
@@ -93,13 +110,20 @@
         "cutexSessionId": { "type": "string" },
         "revision": { "type": "integer" },
         "lifecycle": { "enum": ["active", "retired"] },
+        "archiveKind": { "enum": ["active", "soft", "permanent", "unknown"] },
+        "restorable": { "type": "boolean" },
+        "restoreBlockers": { "type": "array", "items": { "type": "string" } },
+        "allowedActions": { "type": "array", "items": { "enum": ["archive", "restore", "permanentRetire", "start", "send"] } },
         "retiredAt": { "type": ["string", "null"] },
         "hostId": { "type": "string" },
         "displayName": { "type": "string" },
         "formalAgentName": { "type": ["string", "null"] },
         "displayNameOverride": { "type": ["string", "null"] },
         "note": { "type": ["string", "null"] },
+        "badge": {"anyOf": [{"$ref": "#/$defs/badge"}, {"type": "null"}]},
         "avatar": { "anyOf": [{ "$ref": "#/$defs/avatar" }, { "type": "null" }] },
+        "avatarMode": { "enum": ["fixed", "inherit", null] },
+        "createdBy": { "$ref": "#/$defs/sessionCreatedBy" },
         "claudeAccount": {
           "type": "object",
           "description": "Claude sessions only (capability claude-accounts): the account the session was created on (claude-accounts.json#/$defs/sessionAccount).",
@@ -109,6 +133,17 @@
             "label": { "type": ["string", "null"] },
             "kind": { "enum": ["subscription", "api", "removed"] },
             "isDefault": { "type": "boolean" }
+          }
+        },
+        "launchBinding": {
+          "type": "object",
+          "description": "Capability profile-runtime-variants: profile, runtime variant and credential reference frozen at creation (profile-runtime-variants.json#/$defs/launchBinding). Absent on older sessions. No secret.",
+          "required": ["profileId", "variantId", "runtime", "credential"],
+          "properties": {
+            "profileId": { "type": "string" },
+            "variantId": { "type": "string" },
+            "runtime": { "type": "string" },
+            "credential": { "type": "object" }
           }
         },
         "threadName": { "type": ["string", "null"] },

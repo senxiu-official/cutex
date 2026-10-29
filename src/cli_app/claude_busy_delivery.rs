@@ -10,8 +10,9 @@ pub(super) fn timing(age: Duration, wait: Option<Duration>, busy: Option<bool>, 
 }
 
 /// Whether a bus message may be held for / read at a busy recipient's next
-/// step. System alarms are always after-turn (their Claude ingress envelope
-/// requires it), as on Codex.
+/// step. System alarms are always after-turn, as on Codex, except approval
+/// decision notices (023: next step, no wait). Without `soon` in the adapter's
+/// capabilities (older adapters) everything stays after-turn.
 pub(super) fn candidate(message: &cutex::agent_bus::model::AgentBusMessage, offers_soon: bool) -> bool {
     offers_soon
         && message.delivery_mode == cutex::agent_bus::delivery::AgentDeliveryMode::AfterTurn
@@ -100,5 +101,30 @@ mod tests {
             assert_ne!(young(&alarm), WakeTiming::Hold);
         }
         assert!(!candidate(&wake, false));
+    }
+
+    /// 023: an approval decision notice is read at a busy Claude agent's next
+    /// step with no wait (adapter with `soon`); the agent's own reminders stay
+    /// after-turn; an adapter without `soon` gets it after the turn.
+    #[test]
+    fn approval_notices_are_next_step_on_busy_claude_agents() {
+        use cutex::agent_bus::model::{AgentBusMessage, AgentMessageKind};
+        let mut reminder: AgentBusMessage = serde_json::from_value(json!({"id":"m","from":"x","to":"runtime",
+            "toCutexSessionId":"cutex.22222222-2222-4222-8222-222222222222",
+            "content":"approved","deliveryMode":"after_turn","triggerTurn":true,"createdAtEpochSecs":1,
+            "externalMessageId":"alarm-0b5e"})).unwrap();
+        reminder.sender_kind = AgentMessageKind::AlarmSystem;
+        reminder.from = cutex::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
+        let mut approval = reminder.clone();
+        approval.external_message_id = Some(format!("{}0b5e", cutex::agent_bus::alarms::APPROVAL_NOTICE_MESSAGE_PREFIX));
+        let wait = cutex::agent_bus::delivery::busy_wait_for(&approval);
+        assert_eq!(wait, Some(Duration::ZERO));
+        // Just queued, recipient busy: next step at once, never held.
+        assert_eq!(timing(Duration::ZERO, wait, Some(true), candidate(&approval, true)), WakeTiming::NextStep);
+        assert_eq!(timing(Duration::ZERO, wait, Some(false), candidate(&approval, true)), WakeTiming::NextStep);
+        let reminder_wait = cutex::agent_bus::delivery::busy_wait_for(&reminder);
+        assert_eq!(timing(Duration::from_secs(600), reminder_wait, Some(true), candidate(&reminder, true)), WakeTiming::AfterTurn);
+        // Older adapter (no `soon`): after the turn, as before.
+        assert_eq!(timing(Duration::ZERO, wait, Some(true), candidate(&approval, false)), WakeTiming::AfterTurn);
     }
 }

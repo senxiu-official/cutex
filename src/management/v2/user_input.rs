@@ -20,25 +20,19 @@ use crate::config::paths::runtime_dir;
 use crate::management::v2::model::MAX_SAFE_SEQUENCE;
 use crate::management::v2::native_requests::canonical_request_sha256;
 
+pub mod image_steering;
+
 const USER_INPUT_STATE_FILE: &str = "user-input-state.json";
 const USER_INPUT_LOCK_FILE: &str = "user-input-state.lock";
 
 static USER_INPUT_REPOSITORY: super::process_repository::ProcessRepository<UserInputRepository> =
     super::process_repository::ProcessRepository::new();
 
-/// Shared by native submit/flush and Management queue mutations. Keep the
-/// reservation, native send and queue completion in one session critical section.
-pub fn session_input_lock(session: &str) -> anyhow::Result<std::sync::Arc<Mutex<()>>> {
-    static LOCKS: std::sync::OnceLock<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>> =
-        std::sync::OnceLock::new();
-    let mut locks = LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| anyhow::anyhow!("app-server session input lock registry was poisoned"))?;
-    Ok(locks
-        .entry(session.to_string())
-        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
-        .clone())
+/// Shared by native submit/flush, ingress, asks, revert and queue mutations.
+/// The exclusive reservation spans durable/native settlement; its metadata
+/// mutex is held only during admission/completion, never during callers' IO.
+pub fn session_input_lock(session: &str) -> anyhow::Result<std::sync::Arc<super::session_coordination::OperationLane>> {
+    super::session_coordination::session_lane(session)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +100,26 @@ pub enum UserInputStrategy {
     Interrupt,
 }
 
+/// Explicit owner consent for this exact delegation turn. Never persisted on a queue item.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnerJoinDelegation {
+    pub ask_id: String,
+    pub attempt: u32,
+    pub expected_turn_id: String,
+    pub runtime_generation: u64,
+}
+
+pub fn parse_owner_join(value: &Value) -> Result<OwnerJoinDelegation, String> {
+    let join: OwnerJoinDelegation = serde_json::from_value(value.clone())
+        .map_err(|_| "joinDelegation requires askId, attempt, expectedTurnId and runtimeGeneration".to_string())?;
+    if join.ask_id.is_empty() || join.expected_turn_id.is_empty() || join.attempt == 0
+        || join.runtime_generation == 0 || join.runtime_generation > MAX_SAFE_SEQUENCE {
+        return Err("joinDelegation requires non-empty ids and positive safe integers".into());
+    }
+    Ok(join)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserInputSubmitParams {
     pub client_user_message_id: String,
@@ -113,6 +127,7 @@ pub struct UserInputSubmitParams {
     pub strategy: UserInputStrategy,
     pub input: Vec<Value>,
     pub expected_turn_id: Option<String>,
+    pub join_delegation: Option<OwnerJoinDelegation>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +159,8 @@ pub struct UserInputSubmitExecution {
     /// only after `cutex/userInput/queue/resume` or an explicit flush.
     /// Result field `paused` (with `queue`).
     pub queue_paused: bool,
+    /// Refused explicit join retained as ordinary queued owner input.
+    pub join_refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -231,6 +248,8 @@ struct StoredQueueItem {
     thread_id: String,
     item: UserInputQueueItem,
 }
+
+pub const IDENTITY_RETENTION_DAYS: i64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -351,6 +370,7 @@ pub fn parse_user_input_submit_params(value: &Value) -> Result<UserInputSubmitPa
         "strategy",
         "input",
         "expectedTurnId",
+        "joinDelegation",
     ];
     if object.keys().any(|key| !allowed.contains(&key.as_str()))
         || !["clientUserMessageId", "origin", "strategy", "input"]
@@ -406,7 +426,15 @@ pub fn parse_user_input_submit_params(value: &Value) -> Result<UserInputSubmitPa
             return Err("expectedTurnId must be a non-empty string or null".to_string());
         }
     };
+    let join_delegation = object.get("joinDelegation").map(parse_owner_join).transpose()?;
+    if join_delegation.is_some() && strategy != UserInputStrategy::Auto {
+        return Err("joinDelegation requires strategy auto".into());
+    }
+    if let (Some(join), Some(expected)) = (&join_delegation, &expected_turn_id) {
+        if &join.expected_turn_id != expected { return Err("joinDelegation expectedTurnId differs".into()); }
+    }
     Ok(UserInputSubmitParams {
+        join_delegation,
         client_user_message_id,
         origin,
         strategy,
@@ -638,7 +666,7 @@ impl UserInputRepository {
     }
 
     pub fn owner_may_start(&self, session: &str, queue_id: Option<&str>) -> anyhow::Result<bool> {
-        self.ask_store().inspect(|state| {
+        crate::asks::pause_admission::with_state_or(&self.ask_store(), Ok(false), |state, _| {
             let mut admission = self.admission_with_state(session, state)?;
             if super::admission::owner_priority(session) {
                 admission.next_step.clear();
@@ -652,7 +680,14 @@ impl UserInputRepository {
     }
 
     pub fn list_admission(&self, session: &str) -> anyhow::Result<(u64, Vec<UserInputQueueItem>, Option<UserInputQueuePause>, super::admission::AdmissionSnapshot)> {
-        self.ask_store().inspect(|asks| self.with_lock(|path| {
+        match crate::asks::pause_admission::try_with_authority(|_| self.ask_store().inspect(|asks| self.list_admission_in(session,asks))?)? {
+            crate::asks::pause_admission::Admission::Ready(result)=>Ok(result),
+            crate::asks::pause_admission::Admission::Deferred=>Err(crate::asks::pause_admission::Deferred.into()),
+        }
+    }
+
+    fn list_admission_in(&self, session:&str, asks:&crate::asks::store::AskState)->anyhow::Result<(u64,Vec<UserInputQueueItem>,Option<UserInputQueuePause>,super::admission::AdmissionSnapshot)> {
+        self.with_lock(|path| {
             let before = cached_store(path)?;
             let prior = before.sessions.get(session);
             // Admission synchronization never reads identities. In the usual
@@ -673,7 +708,7 @@ impl UserInputRepository {
                 super::admission::changed(session);
             }
             Ok((projection.queue_revision, prior.map(positioned_items).unwrap_or_default(), projection.pause, admission))
-        }))?
+        })
     }
 
     pub fn admission(&self, session: &str) -> anyhow::Result<super::admission::AdmissionSnapshot> {
@@ -780,6 +815,16 @@ impl UserInputRepository {
         let mut next_step = super::admission::ask_next_step(asks, session);
         if self.host_queue {
             next_step.extend(super::agent_bus_state::agent_bus_message_repository()?.pending_admission_messages(session, asks)?);
+            if next_step.iter().any(|row| row.delivery_kind == "answer" && row.eligible && row.wait_reason.is_none()) {
+                if let Some(context) = crate::asks::result_coalescing::context_for_session(session) {
+                    super::admission::project_result_window(
+                        &mut next_step, asks, session, context,
+                        crate::config::store::load_codez_config().agent_bus.result_coalescing,
+                        Utc::now(), state.admission.snapshot.items.iter()
+                            .any(|item| item.state == "waiting" && item.hold.is_none()),
+                    );
+                }
+            }
         }
         next_step.sort_by(|a, b| a.enqueued_at.cmp(&b.enqueued_at).then(a.id.cmp(&b.id)));
         let current_turn = if self.host_queue { super::admission::current_turn(session, asks) } else { None };
@@ -1069,6 +1114,7 @@ impl UserInputRepository {
             let mut store = (*cached_store(path)?).clone();
             let before = serde_json::to_vec(&store)?;
             let previous: BTreeMap<_, _> = store.sessions.iter().map(|(id, state)| (id.clone(), serde_json::to_vec(state).unwrap_or_default())).collect();
+            prune_identities(&mut store, Utc::now());
             let result = action(&mut store)?;
             if serde_json::to_vec(&store)? != before {
                 write_private_pretty_json_atomic(path, &store, "management v2 user-input state")?;
@@ -1116,6 +1162,25 @@ fn cached_store(path: &Path) -> anyhow::Result<std::sync::Arc<UserInputStateStor
     if cache.len() > 32 { cache.clear(); }
     cache.insert(path.into(), (stamp, store.clone()));
     Ok(store)
+}
+
+/// Only expired bookkeeping is discarded. Queued inputs and unresolved native
+/// sends keep their identities until delivery is settled.
+fn prune_identities(store: &mut UserInputStateStore, now: chrono::DateTime<Utc>) {
+    let cutoff = now - chrono::Duration::days(IDENTITY_RETENTION_DAYS);
+    for state in store.sessions.values_mut() {
+        let queued: std::collections::HashSet<_> = state.items.iter()
+            .map(|stored| stored.item.client_user_message_id.as_str()).collect();
+        state.identities.retain(|id, identity| {
+            if queued.contains(id.as_str()) { return true; }
+            let at = match &identity.delivery {
+                Some(InputDelivery::Sending { .. } | InputDelivery::Unknown { .. }) => return true,
+                Some(InputDelivery::Accepted { accepted_at, .. }) => accepted_at,
+                None => &identity.first_seen_at,
+            };
+            chrono::DateTime::parse_from_rfc3339(at).map_or(true, |at| at >= cutoff)
+        });
+    }
 }
 
 /// Scratch state for admission calculations. Neither sync_numbered nor
@@ -1239,6 +1304,41 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn explicit_join_parser_requires_complete_identity_and_auto_strategy() {
+        let mut params = serde_json::json!({"clientUserMessageId":"owner", "origin":{"kind":"other","clientId":"desktop"}, "strategy":"auto", "input":[{"type":"text","text":"shared"}],
+            "joinDelegation":{"askId":"ask-a","attempt":1,"expectedTurnId":"turn-a","runtimeGeneration":7}});
+        assert!(parse_user_input_submit_params(&params).unwrap().join_delegation.is_some());
+        params["strategy"] = serde_json::json!("queue");
+        assert!(parse_user_input_submit_params(&params).is_err());
+        params["strategy"] = serde_json::json!("auto");
+        params["expectedTurnId"] = serde_json::json!("other-turn");
+        assert!(parse_user_input_submit_params(&params).is_err());
+        params.as_object_mut().unwrap().remove("expectedTurnId");
+        for bad in [serde_json::json!(null), serde_json::json!({}), serde_json::json!({"askId":"ask-a","attempt":0,"expectedTurnId":"turn-a","runtimeGeneration":7}), serde_json::json!({"askId":"ask-a","attempt":1,"expectedTurnId":"turn-a","runtimeGeneration":9007199254740992_u64})] {
+            params["joinDelegation"] = bad;
+            assert!(parse_user_input_submit_params(&params).is_err());
+        }
+    }
+
+    #[test]
+    fn identities_expire_only_after_thirty_days_and_resolved_delivery() {
+        let now = Utc::now();
+        let mut store = UserInputStateStore::default();
+        let state = store.sessions.entry("s".into()).or_default();
+        for (id, days, delivery) in [
+            ("old", 31, None), ("recent", 29, None),
+            ("unknown", 40, Some(InputDelivery::Unknown { thread_id: "t".into(), since: now.to_rfc3339() })),
+            ("accepted", 40, Some(InputDelivery::Accepted { thread_id: "t".into(), turn_id: None, accepted_at: now.to_rfc3339() })),
+        ] {
+            state.identities.insert(id.into(), ClientInputIdentity { canonical_sha256: "hash".into(), first_seen_at: (now - chrono::Duration::days(days)).to_rfc3339(), delivery });
+        }
+        prune_identities(&mut store, now);
+        let identities = &store.sessions["s"].identities;
+        assert!(!identities.contains_key("old"));
+        for id in ["recent", "unknown", "accepted"] { assert!(identities.contains_key(id)); }
+    }
 
     fn params(text: &str) -> UserInputSubmitParams {
         parse_user_input_submit_params(&json!({

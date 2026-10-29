@@ -303,30 +303,56 @@ pub fn cors_preflight_headers(origin: Option<&str>) -> String {
     )
 }
 
-static OPEN_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+struct ConnectionPool {
+    open: AtomicUsize,
+    bulk: AtomicUsize,
+}
+static CONNECTIONS: ConnectionPool = ConnectionPool {
+    open: AtomicUsize::new(0),
+    bulk: AtomicUsize::new(0),
+};
 
 /// Holds one connection slot; released on drop.
-pub struct ConnectionSlot(());
+pub struct ConnectionSlot { bulk: bool, pool: &'static ConnectionPool }
 
 impl ConnectionSlot {
     pub fn acquire() -> Option<Self> {
-        let previous = OPEN_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+        Self::acquire_from(&CONNECTIONS)
+    }
+
+    fn acquire_from(pool: &'static ConnectionPool) -> Option<Self> {
+        let previous = pool.open.fetch_add(1, Ordering::SeqCst);
         if previous >= MAX_CONNECTIONS {
-            OPEN_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+            pool.open.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
-        Some(Self(()))
+        Some(Self { bulk: false, pool })
+    }
+
+    /// Bulk keep-alive connections retain their bulk slot while idle. This
+    /// leaves capacity for new control connections, not just active requests.
+    pub fn restrict_to_bulk(&mut self) -> bool {
+        if self.bulk { return true; }
+        let limit = MAX_CONNECTIONS - crate::management::v2::control_capacity::CONTROL_CONNECTION_RESERVE;
+        if self.pool.bulk.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < limit).then_some(n + 1)).is_err() { return false; }
+        self.bulk = true;
+        true
     }
 }
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        OPEN_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        if self.bulk { self.pool.bulk.fetch_sub(1, Ordering::AcqRel); }
+        self.pool.open.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 pub fn open_connections() -> usize {
-    OPEN_CONNECTIONS.load(Ordering::SeqCst)
+    CONNECTIONS.open.load(Ordering::SeqCst)
+}
+
+pub fn bulk_connections() -> usize {
+    CONNECTIONS.bulk.load(Ordering::Relaxed)
 }
 
 /// Accept loop for one bound listener. `serve` handles one connection on its
@@ -638,6 +664,28 @@ fn tailscale_dns_name() -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bulk_keepalive_connections_cannot_take_reserved_control_slots() {
+        let pool = Box::leak(Box::new(ConnectionPool {
+            open: AtomicUsize::new(0), bulk: AtomicUsize::new(0),
+        }));
+        let reserve = crate::management::v2::control_capacity::CONTROL_CONNECTION_RESERVE;
+        let bulk: Vec<_> = (0..MAX_CONNECTIONS - reserve).map(|_| {
+            let mut slot = ConnectionSlot::acquire_from(pool).unwrap();
+            assert!(slot.restrict_to_bulk());
+            assert!(slot.restrict_to_bulk(), "keepalive reuse does not double charge");
+            slot
+        }).collect();
+        let mut extra = ConnectionSlot::acquire_from(pool).unwrap();
+        assert!(!extra.restrict_to_bulk(), "bulk cannot consume the control reserve");
+        drop(extra);
+        let controls: Vec<_> = (0..reserve).map(|_| ConnectionSlot::acquire_from(pool).unwrap()).collect();
+        assert!(ConnectionSlot::acquire_from(pool).is_none());
+        drop((bulk, controls));
+        assert_eq!(pool.open.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.bulk.load(Ordering::SeqCst), 0);
+    }
+
     fn answer_ok(mut stream: TcpStream, _info: ConnectionInfo, _slot: ConnectionSlot) {
         use std::io::Write;
         let _ = stream.write_all(b"ok");
@@ -777,6 +825,8 @@ mod tests {
 /// Lets a long-lived stream notice that the client / device token that
 /// opened it was revoked (in process: at once; by the CLI: within ~2 s).
 pub struct RevocationWatch {
+    stream: Option<TcpStream>,
+    last_peer_check: Option<std::time::Instant>,
     token: Option<VerifiedClientToken>,
     generation: u64,
     last_check: std::time::Instant,
@@ -792,6 +842,25 @@ impl RevocationWatch {
         Self::new(current_client_token())
     }
 
+    /// Real HTTP streams attach their socket; in-memory writers use `new`.
+    /// The clone never performs concurrent I/O with the response thread.
+    pub fn for_stream(stream: &TcpStream) -> std::io::Result<Self> {
+        let mut watch = Self::for_current_request();
+        watch.stream = Some(stream.try_clone()?);
+        Ok(watch)
+    }
+
+    pub fn disconnected(&mut self) -> std::io::Result<bool> {
+        let Some(stream) = self.stream.as_ref() else { return Ok(false); };
+        // Busy event streams already discover failures on writes. Do not add
+        // socket syscalls per event/delta; idle loops still check every tick.
+        if self.last_peer_check.is_some_and(|at| at.elapsed() < STREAM_TICK) {
+            return Ok(false);
+        }
+        self.last_peer_check = Some(std::time::Instant::now());
+        crate::http::server::stream_disconnected(stream)
+    }
+
     pub fn new(token: Option<VerifiedClientToken>) -> Self {
         Self::with_validator(token, VerifiedClientToken::still_valid)
     }
@@ -803,6 +872,8 @@ impl RevocationWatch {
         validator: impl Fn(&VerifiedClientToken) -> bool + Send + 'static,
     ) -> Self {
         Self {
+            stream: None,
+            last_peer_check: None,
             token,
             generation: crate::management::client_tokens::revocation_generation(),
             last_check: std::time::Instant::now(),

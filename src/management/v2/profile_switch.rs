@@ -129,11 +129,29 @@ pub(super) fn gate(
             json!({ "profile": target.name }),
         ));
     }
+    compatibility_gate(current, target)?;
+    for (side, profile) in [("current", current), ("target", target)] {
+        if !profile.allow_switch {
+            return Err(error(
+                "profile_switch_disallowed",
+                format!("profile {} does not allow mid-conversation switching", profile.name),
+                json!({ "side": side, "profile": profile.name }),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn compatibility_gate(current: &GateProfile, target: &GateProfile) -> Result<(), UserInputExecutionError> {
+    compatibility_gate_for(current,target,"switch")
+}
+
+fn compatibility_gate_for(current: &GateProfile, target: &GateProfile, operation: &str) -> Result<(), UserInputExecutionError> {
     if current.cli_kind != target.cli_kind {
         return Err(error(
             "profile_switch_cli_mismatch",
             format!(
-                "cannot switch a {} agent to a {} profile",
+                "cannot {operation} a {} agent to a {} profile",
                 current.cli_kind, target.cli_kind
             ),
             json!({ "from": current.name, "to": target.name,
@@ -146,7 +164,7 @@ pub(super) fn gate(
         return Err(error(
             "provider_family_mismatch",
             format!(
-                "cannot switch from {} ({}) to {} ({}): different provider families",
+                "cannot {operation} from {} ({}) to {} ({}): different provider families",
                 current.name, current.family, target.name, target.family
             ),
             json!({ "from": current.name, "to": target.name,
@@ -155,14 +173,98 @@ pub(super) fn gate(
                     "toFamilyLabel": crate::profiles::providers::family_label(&target.family) }),
         ));
     }
-    for (side, profile) in [("current", current), ("target", target)] {
-        if !profile.allow_switch {
-            return Err(error(
-                "profile_switch_disallowed",
-                format!("profile {} does not allow mid-conversation switching", profile.name),
-                json!({ "side": side, "profile": profile.name }),
-            ));
-        }
+    Ok(())
+}
+
+/// Provider-family guard shared by direct profile/set and profile forks.
+/// This does not grant an in-place Claude account change.
+pub fn family_gate(
+    current: &crate::profiles::model::StoredAccount,
+    target: &crate::profiles::model::StoredAccount,
+) -> Result<(), UserInputExecutionError> {
+    family_gate_using(current,target,"switch")
+}
+
+fn family_gate_using(current: &crate::profiles::model::StoredAccount, target: &crate::profiles::model::StoredAccount, operation: &str) -> Result<(), UserInputExecutionError> {
+    let from = GateProfile {
+        name: current.name.clone(),
+        cli_kind: current.cli_kind.clone(),
+        allow_switch: true,
+        family: crate::profiles::providers::provider_family(current).0,
+    };
+    let to = GateProfile {
+        name: target.name.clone(),
+        cli_kind: target.cli_kind.clone(),
+        allow_switch: true,
+        family: crate::profiles::providers::provider_family(target).0,
+    };
+    compatibility_gate_for(&from, &to, operation)
+}
+
+/// A cleared profile retains this already-verified conversation boundary.
+pub fn conversation_family_gate(name: &str, family: &str, target: &crate::profiles::model::StoredAccount) -> Result<(), UserInputExecutionError> {
+    let from=GateProfile{name:name.into(),cli_kind:CliKind::Codex,allow_switch:true,family:family.into()};
+    let to=GateProfile{name:target.name.clone(),cli_kind:target.cli_kind.clone(),allow_switch:true,family:crate::profiles::providers::provider_family(target).0};
+    compatibility_gate(&from,&to)
+}
+
+/// Resolve an explicitly selected fork profile. Only the target's switch opt-in
+/// is required; the source may disallow in-place switching. Account equality
+/// is deliberately not required for a new fork.
+pub fn fork_target(
+    record: &crate::session::model::CutexSessionRecord,
+    requested: &str,
+) -> Result<crate::profiles::model::StoredAccount, UserInputExecutionError> {
+    let store = settings_api::load_store().map_err(store_unavailable)?;
+    let current = record
+        .profile
+        .as_deref()
+        .and_then(|name| settings_api::find(&store, name))
+        .ok_or_else(|| {
+            error(
+                "profile_fork_disallowed",
+                "the source has no resolvable profile; cannot verify provider compatibility",
+                json!({}),
+            )
+        })?;
+    let target = settings_api::find(&store, requested).ok_or_else(|| {
+        error(
+            "profile_not_found",
+            "the requested fork profile does not exist",
+            json!({"profile":requested}),
+        )
+    })?;
+    let runtime_kind = if record.claude_session.is_some() {
+        CliKind::Claude
+    } else {
+        CliKind::Codex
+    };
+    if current.cli_kind != runtime_kind {
+        return Err(error(
+            "profile_fork_disallowed",
+            "the source profile no longer matches its runtime kind",
+            json!({}),
+        ));
+    }
+    // A Claude profile may have been rebound since this session was created.
+    // Compare the frozen source account, never its profile's new account.
+    let mut actual = current.clone();
+    if record.claude_session.is_some() {
+        let registry = crate::runtime::claude_accounts::load().map_err(store_unavailable)?;
+        actual.claude_account =
+            crate::runtime::claude_accounts::session_account_id(&registry, record);
+    }
+    fork_gate(&actual, target)?;
+    Ok(target.clone())
+}
+
+pub fn fork_gate(
+    current: &crate::profiles::model::StoredAccount,
+    target: &crate::profiles::model::StoredAccount,
+) -> Result<(), UserInputExecutionError> {
+    family_gate_using(current,target,"fork")?;
+    if !settings_api::allow_session_switch(target) {
+        return Err(error("profile_fork_disallowed",format!("profile {} does not allow receiving a fork; enable profile session switching first",target.name),json!({"profile":target.name,"side":"target"})));
     }
     Ok(())
 }
@@ -610,6 +712,52 @@ mod tests {
 
     fn family_profile(name: &str, cli_kind: CliKind, allow_switch: bool, family: &str) -> GateProfile {
         GateProfile { name: name.into(), cli_kind, allow_switch, family: family.into() }
+    }
+
+    #[test]
+    fn fork_gate_requires_target_opt_in_and_same_cli_but_not_source_opt_in() {
+        let mut source = crate::profiles::lifecycle::new_claude_account("source");
+        let mut target = crate::profiles::lifecycle::new_claude_account("target");
+        source.options.allow_session_switch = Some(false);
+        target.options.allow_session_switch = Some(true);
+        assert!(fork_gate(&source, &target).is_ok());
+        target.options.allow_session_switch = Some(false);
+        assert_eq!(
+            fork_gate(&source, &target).unwrap_err().code,
+            "profile_fork_disallowed"
+        );
+        target.options.allow_session_switch = Some(true);
+        target.cli_kind = CliKind::Codex;
+        assert_eq!(
+            fork_gate(&source, &target).unwrap_err().code,
+            "profile_switch_cli_mismatch"
+        );
+        assert!(account_gate(Some("a"), Some("b"), "target").is_err());
+    }
+
+    #[test]
+    fn fork_refusal_preserves_profile_names_containing_switch() {
+        let source=crate::profiles::lifecycle::new_claude_account("switch-source");
+        let mut target=crate::profiles::lifecycle::new_claude_account("switch-target");
+        target.cli_kind=CliKind::Codex;
+        let error=fork_gate(&source,&target).unwrap_err();
+        assert!(error.message.starts_with("cannot fork"));
+        // CLI refusal has no names, but family/target opt-in refusals must not
+        // rewrite arbitrary profile-name substrings either.
+        target.cli_kind=CliKind::Claude;
+        target.claude_account=Some("ca-unresolved".into());
+        target.options.allow_session_switch=Some(true);
+        let error=fork_gate(&source,&target).unwrap_err();
+        assert_eq!(error.code,"provider_family_mismatch");
+        assert!(error.message.contains("switch-source"));
+        assert!(error.message.contains("switch-target"));
+    }
+
+    #[test]
+    fn rebound_profile_name_cannot_bypass_frozen_source_family() {
+        let source = family_profile("same", CliKind::Claude, true, "anthropic");
+        let target = family_profile("same", CliKind::Claude, true, "custom:relay.example");
+        assert_eq!(compatibility_gate(&source, &target).unwrap_err().code, "provider_family_mismatch");
     }
 
     #[test]

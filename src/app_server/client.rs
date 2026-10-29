@@ -18,6 +18,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::TrySendError;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -60,6 +61,143 @@ const DEFAULT_COMMAND_CAPACITY: usize = 128;
 const DEFAULT_EVENT_CAPACITY: usize = 512;
 const MAX_COMMANDS_PER_TICK: usize = 64;
 
+/// Counts event ownership, not payload bytes. Independent atomics make a
+/// concurrent snapshot approximate; after quiescence the lifecycle balances.
+#[derive(Default)]
+struct EventQueueMetrics {
+    outstanding: AtomicU64,
+    peak_outstanding: AtomicU64,
+    pending_sends: AtomicU64,
+    received: AtomicU64,
+    discarded: AtomicU64,
+    sends_ok: AtomicU64,
+    sends_failed: AtomicU64,
+    blocking_calls: AtomicU64,
+    blocking_total_ns: AtomicU64,
+    blocking_max_ns: AtomicU64,
+}
+
+impl EventQueueMetrics {
+    fn snapshot(&self) -> Value {
+        json!({
+            "schema": 1, "scope": "process", "approximate": true,
+            "bytesMeasured": false,
+            "countDefinition": "outstanding_includes_send_attempts_buffered_events_and_receive_handoff_not_buffered_depth_pending_calls_may_overlap_received_events",
+            "outstandingEvents": self.outstanding.load(Ordering::Relaxed),
+            "peakOutstandingEvents": self.peak_outstanding.load(Ordering::Relaxed),
+            "pendingSendCalls": self.pending_sends.load(Ordering::Relaxed),
+            "receivedEvents": self.received.load(Ordering::Relaxed),
+            "discardedEvents": self.discarded.load(Ordering::Relaxed),
+            "successfulSends": self.sends_ok.load(Ordering::Relaxed),
+            "failedSends": self.sends_failed.load(Ordering::Relaxed),
+            "blockingSendCalls": self.blocking_calls.load(Ordering::Relaxed),
+            "blockingSendTotalNs": self.blocking_total_ns.load(Ordering::Relaxed),
+            "blockingSendMaxNs": self.blocking_max_ns.load(Ordering::Relaxed),
+        })
+    }
+}
+
+fn native_event_metrics() -> Arc<EventQueueMetrics> {
+    static METRICS: std::sync::OnceLock<Arc<EventQueueMetrics>> = std::sync::OnceLock::new();
+    METRICS.get_or_init(|| Arc::new(EventQueueMetrics::default())).clone()
+}
+
+/// Outstanding includes a send attempt's event, buffered events, and the tiny
+/// receive handoff until extraction. Pending calls include send/try_send until
+/// return, even if their event was already received. Do NOT subtract the two
+/// to infer buffered depth. Discarded includes rejected sends and receiver-drop
+/// cleanup. Blocking elapsed is the entire synchronous send call, not a claim
+/// that every call waited on a full queue. No event data or byte estimates.
+pub(crate) fn event_queue_diagnostics() -> Value {
+    native_event_metrics().snapshot()
+}
+
+struct QueuedEvent {
+    event: Option<AppServerEvent>,
+    metrics: Arc<EventQueueMetrics>,
+}
+impl QueuedEvent {
+    fn new(event: AppServerEvent, metrics: &Arc<EventQueueMetrics>) -> Self {
+        let outstanding = metrics.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics.peak_outstanding.fetch_max(outstanding, Ordering::Relaxed);
+        Self { event: Some(event), metrics: metrics.clone() }
+    }
+    fn receive(mut self) -> AppServerEvent {
+        self.event.take().expect("queued event is extracted once")
+    }
+}
+impl Drop for QueuedEvent {
+    fn drop(&mut self) {
+        if self.event.is_some() {
+            self.metrics.discarded.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics.received.fetch_add(1, Ordering::Relaxed);
+        }
+        self.metrics.outstanding.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct EventSender {
+    sender: SyncSender<QueuedEvent>,
+    metrics: Arc<EventQueueMetrics>,
+}
+struct EventReceiver(Receiver<QueuedEvent>);
+
+struct PendingEventSend<'a>(&'a EventQueueMetrics);
+impl Drop for PendingEventSend<'_> {
+    fn drop(&mut self) {
+        self.0.pending_sends.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn event_channel(capacity: usize, metrics: Arc<EventQueueMetrics>) -> (EventSender, EventReceiver) {
+    let (sender, receiver) = mpsc::sync_channel(capacity);
+    (EventSender { sender, metrics }, EventReceiver(receiver))
+}
+
+impl EventSender {
+    fn send(&self, event: AppServerEvent) -> Result<(), ()> {
+        self.send_inner(event, false)
+    }
+    fn try_send(&self, event: AppServerEvent) -> Result<(), ()> {
+        self.send_inner(event, true)
+    }
+    fn send_inner(&self, event: AppServerEvent, nonblocking: bool) -> Result<(), ()> {
+        let event = QueuedEvent::new(event, &self.metrics);
+        self.metrics.pending_sends.fetch_add(1, Ordering::Relaxed);
+        let _pending = PendingEventSend(&self.metrics);
+        let result = if nonblocking {
+            self.sender.try_send(event).map_err(|_| ())
+        } else {
+            let mut timing = crate::management::v2::control_timing::Trace::metrics_only(
+                crate::management::v2::control_timing::Path::NativeEventSend);
+            timing.stage(crate::management::v2::control_timing::Stage::QueueWait);
+            self.metrics.blocking_calls.fetch_add(1, Ordering::Relaxed);
+            let started = Instant::now();
+            let result = self.sender.send(event);
+            let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            self.metrics.blocking_total_ns.fetch_add(elapsed, Ordering::Relaxed);
+            self.metrics.blocking_max_ns.fetch_max(elapsed, Ordering::Relaxed);
+            timing.status(if result.is_ok() { 200 } else { 503 });
+            result.map_err(|_| ())
+        };
+        if result.is_ok() {
+            self.metrics.sends_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics.sends_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+}
+impl EventReceiver {
+    fn recv(&self) -> Result<AppServerEvent, mpsc::RecvError> {
+        self.0.recv().map(QueuedEvent::receive)
+    }
+    fn recv_timeout(&self, timeout: Duration) -> Result<AppServerEvent, RecvTimeoutError> {
+        self.0.recv_timeout(timeout).map(QueuedEvent::receive)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppServerEndpoint {
     #[cfg(unix)]
@@ -84,6 +222,9 @@ pub struct AppServerClientOptions {
     /// Additional `initialize` capabilities (e.g. `claudeInteractiveApprovals`
     /// for the Claude adapter). The two standard keys always win.
     pub extra_capabilities: serde_json::Map<String, Value>,
+    /// `optOutNotificationMethods`: notifications the server should not send
+    /// this connection (the Claude observer's high-volume `claude/*` frames).
+    pub opt_out_notification_methods: Vec<String>,
 }
 
 impl AppServerClientOptions {
@@ -99,6 +240,7 @@ impl AppServerClientOptions {
             command_capacity: DEFAULT_COMMAND_CAPACITY,
             event_capacity: DEFAULT_EVENT_CAPACITY,
             extra_capabilities: serde_json::Map::new(),
+            opt_out_notification_methods: Vec::new(),
         }
     }
 }
@@ -177,9 +319,16 @@ pub struct AppServerHandle {
     command_tx: SyncSender<ActorCommand>,
     next_id: Arc<AtomicU64>,
     default_timeout: Duration,
+    disconnect_reason: Arc<Mutex<Option<String>>>,
 }
 
 impl AppServerHandle {
+    /// Transport health is independent of draining the lossless event queue.
+    /// A disconnected event may be delayed (or the bounded queue may be full).
+    pub fn disconnect_reason(&self) -> Option<String> {
+        self.disconnect_reason.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Clones of one actor share this identity; a reconnect in the same runtime
     /// generation is still a different connection.
     pub fn same_connection(&self, other: &Self) -> bool {
@@ -425,13 +574,41 @@ fn request_identity(message: &Value) -> Result<(Value, String), AppServerClientE
 
 pub struct AppServerClient {
     handle: AppServerHandle,
-    event_rx: Option<Receiver<AppServerEvent>>,
+    event_rx: Option<EventReceiver>,
+    control_drain: Option<ControlEventDrain>,
     actor: Option<JoinHandle<()>>,
     initialize_response: Value,
 }
 
+/// A control-only connection has no event owner. Consume its duplicate events
+/// independently of RPC calls, including while the caller keeps it idle.
+/// Runtime owners must retain the normal lossless receiver instead.
+struct ControlEventDrain {
+    stop: SyncSender<()>,
+    worker: JoinHandle<()>,
+}
+
+impl ControlEventDrain {
+    fn stop(self) {
+        let _ = self.stop.try_send(());
+        // The worker owns the receiver. Drop it before shutting down the actor:
+        // an actor blocked on event send cannot process a shutdown command.
+        let _ = self.worker.join();
+    }
+}
+
 impl AppServerClient {
     pub fn connect(options: AppServerClientOptions) -> Result<Self, AppServerClientError> {
+        Self::connect_with_control_drain(options, false)
+    }
+
+    /// Secondary RPC connection only: start consuming before JSON-RPC initialize.
+    /// The WebSocket transport handshake still precedes actor creation.
+    pub(crate) fn connect_rpc_only(options: AppServerClientOptions) -> Result<Self, AppServerClientError> {
+        Self::connect_with_control_drain(options, true)
+    }
+
+    fn connect_with_control_drain(options: AppServerClientOptions, control: bool) -> Result<Self, AppServerClientError> {
         if options.command_capacity == 0 || options.event_capacity == 0 {
             return Err(AppServerClientError::InvalidOptions(
                 "app-server channel capacities must be positive".to_string(),
@@ -444,20 +621,38 @@ impl AppServerClient {
         }
         let socket = connect_websocket(&options.endpoint, options.connect_timeout)?;
         let (command_tx, command_rx) = mpsc::sync_channel(options.command_capacity);
-        let (event_tx, event_rx) = mpsc::sync_channel(options.event_capacity);
-        let actor = thread::spawn(move || run_actor(socket, command_rx, event_tx));
+        let (event_tx, event_rx) = event_channel(options.event_capacity, native_event_metrics());
+        let disconnect_reason = Arc::new(Mutex::new(None));
+        let actor_disconnect_reason = disconnect_reason.clone();
+        let actor = thread::spawn(move || run_actor(socket, command_rx, event_tx, actor_disconnect_reason));
         let handle = AppServerHandle {
             command_tx,
             next_id: Arc::new(AtomicU64::new(1)),
             default_timeout: options.request_timeout,
+            disconnect_reason,
         };
+        // Own both threads before any fallible initialization. Error cleanup uses
+        // the same receiver-before-actor Drop ordering as an established client.
+        let mut client = Self {
+            handle,
+            event_rx: Some(event_rx),
+            control_drain: None,
+            actor: Some(actor),
+            initialize_response: Value::Null,
+        };
+        if control {
+            client.drain_control_events()?;
+        }
         let mut capabilities = options.extra_capabilities.clone();
         capabilities.insert(
             "experimentalApi".to_string(),
             Value::Bool(options.experimental_api),
         );
-        capabilities.insert("optOutNotificationMethods".to_string(), json!([]));
-        let initialize_response = match handle.request(
+        capabilities.insert(
+            "optOutNotificationMethods".to_string(),
+            json!(options.opt_out_notification_methods),
+        );
+        client.initialize_response = client.handle.request(
             "initialize",
             json!({
                 "clientInfo": {
@@ -467,27 +662,9 @@ impl AppServerClient {
                 },
                 "capabilities": capabilities,
             }),
-        ) {
-            Ok(response) => response,
-            Err(error) => {
-                drop(event_rx);
-                let _ = handle.shutdown();
-                let _ = actor.join();
-                return Err(error);
-            }
-        };
-        if let Err(error) = handle.notify("initialized", None) {
-            drop(event_rx);
-            let _ = handle.shutdown();
-            let _ = actor.join();
-            return Err(error);
-        }
-        Ok(Self {
-            handle,
-            event_rx: Some(event_rx),
-            actor: Some(actor),
-            initialize_response,
-        })
+        )?;
+        client.handle.notify("initialized", None)?;
+        Ok(client)
     }
 
     pub fn handle(&self) -> AppServerHandle {
@@ -498,7 +675,34 @@ impl AppServerClient {
         &self.initialize_response
     }
 
-    fn event_receiver(&self) -> Result<&Receiver<AppServerEvent>, AppServerClientError> {
+    /// Only for a secondary RPC connection whose owner handles events and
+    /// approvals on another connection. This never answers server requests or
+    /// persists duplicate notifications. Event observation is unavailable after
+    /// this transfer; callers needing hints must keep the normal receiver.
+    pub(crate) fn drain_control_events(&mut self) -> Result<(), AppServerClientError> {
+        let receiver = self.event_rx.take().ok_or_else(|| {
+            AppServerClientError::InvalidOptions("app-server event receiver already transferred".into())
+        })?;
+        let (stop, stopped) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("cutex-control-events".into())
+            .spawn(move || loop {
+                match stopped.try_recv() {
+                    Ok(()) | Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => {}
+                }
+                match receiver.recv_timeout(ACTOR_POLL_INTERVAL) {
+                    Ok(AppServerEvent::Disconnected { .. })
+                    | Err(RecvTimeoutError::Disconnected) => break,
+                    Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                }
+            })
+            .map_err(|error| AppServerClientError::Connect(format!("control event worker: {error}")))?;
+        self.control_drain = Some(ControlEventDrain { stop, worker });
+        Ok(())
+    }
+
+    fn event_receiver(&self) -> Result<&EventReceiver, AppServerClientError> {
         self.event_rx.as_ref().ok_or_else(|| {
             AppServerClientError::Disconnected("app-server event stream closed".to_string())
         })
@@ -531,6 +735,9 @@ impl Drop for AppServerClient {
         // The actor may be blocked applying lossless event backpressure. Drop
         // its receiver before joining so shutdown can always unblock the send.
         drop(self.event_rx.take());
+        if let Some(drain) = self.control_drain.take() {
+            drain.stop();
+        }
         let _ = self.handle.shutdown();
         #[cfg(feature = "stock-launch-test-hook")]
         super::private_restart_phase("client.drop.actor_join.begin");
@@ -549,8 +756,9 @@ pub(crate) fn saturated_event_client_for_test() -> (AppServerClient, Receiver<()
         command_tx,
         next_id: Arc::new(AtomicU64::new(1)),
         default_timeout: Duration::from_secs(1),
+        disconnect_reason: Arc::new(Mutex::new(None)),
     };
-    let (event_tx, event_rx) = mpsc::sync_channel(1);
+    let (event_tx, event_rx) = event_channel(1, Arc::new(EventQueueMetrics::default()));
     event_tx
         .send(AppServerEvent::ProtocolViolation {
             message: "queued event".to_string(),
@@ -573,6 +781,7 @@ pub(crate) fn saturated_event_client_for_test() -> (AppServerClient, Receiver<()
         AppServerClient {
             handle,
             event_rx: Some(event_rx),
+            control_drain: None,
             actor: Some(actor),
             initialize_response: json!({}),
         },
@@ -929,7 +1138,8 @@ fn non_loopback_endpoint_error() -> AppServerClientError {
 fn run_actor(
     mut socket: WebSocket<ConnectionStream>,
     command_rx: Receiver<ActorCommand>,
-    event_tx: SyncSender<AppServerEvent>,
+    event_tx: EventSender,
+    connection_failure: Arc<Mutex<Option<String>>>,
 ) {
     let mut pending = HashMap::<RpcRequestIdKey, PendingRequest>::new();
     let mut queued_command = None;
@@ -1141,6 +1351,9 @@ fn run_actor(
         }
     };
 
+    // Publish before waking RPC callers or notifying the event consumer, so
+    // recovery never depends on that consumer reaching the tail of its queue.
+    *connection_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(disconnect_reason.clone());
     for (_, request) in pending.drain() {
         let _ = request
             .response_tx
@@ -1187,7 +1400,7 @@ fn expire_pending_requests(pending: &mut HashMap<RpcRequestIdKey, PendingRequest
     }
 }
 
-fn emit_event(event_tx: &SyncSender<AppServerEvent>, event: AppServerEvent) -> bool {
+fn emit_event(event_tx: &EventSender, event: AppServerEvent) -> bool {
     // Native output deltas can arrive faster than the management projection can
     // durably append them. Block the socket reader to apply transport
     // backpressure instead of treating a full local queue as a disconnection.
@@ -1197,6 +1410,428 @@ fn emit_event(event_tx: &SyncSender<AppServerEvent>, event: AppServerEvent) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Synthetic peer: r52.4 normally queues initialize's response before its
+    // initial notifications. Deliberately permit the opposite order here to
+    // prove the control constructor does not depend on that server ordering.
+    fn initialize_burst_peer(count: usize, before_response: bool, reject: bool)
+        -> (AppServerClientOptions, Receiver<()>, JoinHandle<()>)
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (closed, done) = mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let Message::Text(request) = socket.read().unwrap() else { panic!("initialize") };
+            let request: Value = serde_json::from_str(request.as_ref()).unwrap();
+            assert_eq!(request["method"], "initialize");
+            let response = if reject {
+                json!({"id":request["id"],"error":{"code":-32600,"message":"fixture rejects initialize"}})
+            } else {
+                json!({"id":request["id"],"result":{"fixture":true}})
+            };
+            if !before_response {
+                socket.send(Message::Text(response.to_string().into())).unwrap();
+            }
+            for sequence in 0..count {
+                socket.send(Message::Text(json!({"method":"test/initial","params":{"sequence":sequence}}).to_string().into())).unwrap();
+            }
+            socket.send(Message::Text(json!({"id":"initial-approval","method":"test/approval","params":{}}).to_string().into())).unwrap();
+            if before_response {
+                socket.send(Message::Text(response.to_string().into())).unwrap();
+            }
+            loop {
+                match socket.read() {
+                    Ok(Message::Text(text)) => {
+                        let message: Value = serde_json::from_str(text.as_ref()).unwrap();
+                        match message["method"].as_str() {
+                            Some("initialized") => assert!(!reject),
+                            Some("test/after-init") => {
+                                socket.send(Message::Text(json!({"id":message["id"],"result":{"ok":true}}).to_string().into())).unwrap();
+                            }
+                            _ => panic!("unexpected response or request: {message}"),
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed)
+                    | Err(tungstenite::Error::Protocol(_)) => break,
+                    Err(tungstenite::Error::Io(error)) => {
+                        assert!(!matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock));
+                        break;
+                    }
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+            closed.send(()).unwrap();
+        });
+        let mut options = AppServerClientOptions::new(AppServerEndpoint::LoopbackWebSocket {
+            url: format!("ws://127.0.0.1:{port}/"), bearer_token: None,
+        });
+        options.request_timeout = Duration::from_secs(2);
+        (options, done, peer)
+    }
+
+    #[test]
+    fn control_initialize_drains_notifications_before_response() {
+        let (options, done, peer) = initialize_burst_peer(DEFAULT_EVENT_CAPACITY * 2, true, false);
+        let client = AppServerClient::connect_rpc_only(options).unwrap();
+        assert_eq!(client.initialize_response(), &json!({"fixture":true}));
+        assert_eq!(client.handle().request("test/after-init", json!({})).unwrap(), json!({"ok":true}));
+        drop(client);
+        done.recv_timeout(Duration::from_secs(5)).expect("control initialization threads stopped");
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn control_initialize_late_drainer_baseline_times_out() {
+        let (mut options, done, peer) = initialize_burst_peer(DEFAULT_EVENT_CAPACITY * 2, true, false);
+        options.request_timeout = Duration::from_millis(200);
+        // Exact old control order: the drainer cannot start until connect returns.
+        let result = AppServerClient::connect(options).and_then(|mut client| {
+            client.drain_control_events()?;
+            Ok(client)
+        });
+        assert!(matches!(result, Err(AppServerClientError::Timeout { .. })));
+        done.recv_timeout(Duration::from_secs(5)).expect("failed initialization closed transport");
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn control_initialize_rejection_stops_early_drainer() {
+        let (options, done, peer) = initialize_burst_peer(DEFAULT_EVENT_CAPACITY * 2, true, true);
+        assert!(matches!(AppServerClient::connect_rpc_only(options), Err(AppServerClientError::Rpc(_))));
+        done.recv_timeout(Duration::from_secs(5)).expect("rejected initialize closed transport");
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn control_initialize_response_first_burst_keeps_rpc_live() {
+        let (options, done, peer) = initialize_burst_peer(DEFAULT_EVENT_CAPACITY * 2, false, false);
+        let client = AppServerClient::connect_rpc_only(options).unwrap();
+        assert_eq!(client.handle().request("test/after-init", json!({})).unwrap(), json!({"ok":true}));
+        drop(client);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn control_initialize_does_not_change_owner_initial_events() {
+        let (options, done, peer) = initialize_burst_peer(8, true, false);
+        let client = AppServerClient::connect(options).unwrap();
+        for sequence in 0..8 {
+            let Some(AppServerEvent::Notification(event)) = client.recv_event_timeout(Duration::from_secs(2)).unwrap() else { panic!("initial owner notification") };
+            assert_eq!(event.params.unwrap()["sequence"], sequence);
+        }
+        let Some(AppServerEvent::ServerRequest(request)) = client.recv_event_timeout(Duration::from_secs(2)).unwrap() else { panic!("initial owner request") };
+        assert_eq!(request.id, json!("initial-approval"));
+        drop(client);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        peer.join().unwrap();
+    }
+
+    /// The peer sends more than a full event queue *before* replying to each
+    /// RPC, as a busy runtime can do on a cached control subscription.
+    fn notification_burst_peer(rounds: usize) -> (AppServerClientOptions, JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let mut read_json = || -> Value {
+                loop {
+                    if let Message::Text(text) = socket.read().unwrap() {
+                        break serde_json::from_str(text.as_ref()).unwrap();
+                    }
+                }
+            };
+            let initialize = read_json();
+            socket.send(Message::Text(json!({"id":initialize["id"],"result":{}}).to_string().into())).unwrap();
+            let Message::Text(initialized) = socket.read().unwrap() else { panic!("initialized") };
+            assert_eq!(serde_json::from_str::<Value>(initialized.as_ref()).unwrap()["method"], "initialized");
+            for round in 0..rounds {
+                let Message::Text(request) = socket.read().unwrap() else { panic!("request") };
+                let request: Value = serde_json::from_str(request.as_ref()).unwrap();
+                // No approval response may be sent by this secondary consumer.
+                assert_eq!(request["method"], "test/control");
+                for sequence in 0..DEFAULT_EVENT_CAPACITY * 2 {
+                    socket.send(Message::Text(json!({"method":"test/delta","params":{"sequence":sequence}}).to_string().into())).unwrap();
+                }
+                socket.send(Message::Text(json!({"id":format!("approval-{round}"),"method":"test/approval","params":{}}).to_string().into())).unwrap();
+                socket.send(Message::Text(json!({"id":request["id"],"result":{"round":round}}).to_string().into())).unwrap();
+            }
+            // Drop must terminate both local threads and close the transport.
+            match socket.read() {
+                Ok(Message::Close(_)) | Err(tungstenite::Error::Protocol(_))
+                | Err(tungstenite::Error::ConnectionClosed) => {}
+                Err(tungstenite::Error::Io(error)) => assert!(!matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)),
+                result => panic!("expected transport close, got {result:?}"),
+            }
+        });
+        let mut options = AppServerClientOptions::new(AppServerEndpoint::LoopbackWebSocket {
+            url: format!("ws://127.0.0.1:{port}/"), bearer_token: None,
+        });
+        options.request_timeout = Duration::from_secs(5);
+        (options, worker)
+    }
+
+    #[test]
+    fn rpc_only_control_drain_keeps_replies_live_past_full_event_queue() {
+        let (options, peer) = notification_burst_peer(2);
+        let mut client = AppServerClient::connect(options).unwrap();
+        client.drain_control_events().unwrap();
+        assert!(client.recv_event_timeout(Duration::ZERO).is_err());
+        for round in 0..2 {
+            assert_eq!(client.handle().request("test/control", json!({})).unwrap(), json!({"round":round}));
+        }
+        drop(client);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn owner_receiver_still_backpressures_and_preserves_all_events() {
+        let (options, peer) = notification_burst_peer(1);
+        let client = AppServerClient::connect(options).unwrap();
+        // One timed-out call: its eventual late response can legitimately
+        // produce an unknown-response diagnostic after these preserved events.
+        {
+            assert!(matches!(client.handle().request_with_timeout("test/control", json!({}), Duration::from_millis(200)), Err(AppServerClientError::Timeout { .. })));
+            for sequence in 0..DEFAULT_EVENT_CAPACITY * 2 {
+                let Some(AppServerEvent::Notification(notification)) = client.recv_event_timeout(Duration::from_secs(5)).unwrap() else { panic!("notification") };
+                assert_eq!(notification.params.unwrap()["sequence"], sequence);
+            }
+            assert!(matches!(client.recv_event_timeout(Duration::from_secs(5)).unwrap(), Some(AppServerEvent::ServerRequest(_))));
+        }
+        drop(client);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn control_drain_drop_releases_saturated_receiver_and_actor() {
+        let (command_tx, _command_rx) = mpsc::sync_channel(1);
+        let metrics = Arc::new(EventQueueMetrics::default());
+        let (events, receiver) = event_channel(1, metrics.clone());
+        events.send(diagnostic_event("fill")).unwrap();
+        let actor = thread::spawn(move || {
+            while events.send(diagnostic_event("continual producer")).is_ok() {}
+        });
+        wait_for_pending_send(&metrics);
+        let mut client = AppServerClient {
+            handle: AppServerHandle {
+                command_tx, next_id: Arc::new(AtomicU64::new(1)),
+                default_timeout: Duration::from_secs(1),
+                disconnect_reason: Arc::new(Mutex::new(None)),
+            },
+            event_rx: Some(receiver), control_drain: None,
+            actor: Some(actor), initialize_response: json!({}),
+        };
+        client.drain_control_events().unwrap();
+        let (done, completed) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || { drop(client); done.send(()).unwrap(); });
+        completed.recv_timeout(Duration::from_secs(5)).expect("control receiver and actor stop");
+        dropper.join().unwrap();
+        assert_eq!(metrics.pending_sends.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.outstanding.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn control_drain_drop_with_full_command_queue_and_retained_handle() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        command_tx.send(ActorCommand::Send(json!({}))).unwrap();
+        let (events, receiver) = event_channel(1, Arc::new(EventQueueMetrics::default()));
+        let (resume, paused) = mpsc::sync_channel(1);
+        let actor = thread::spawn(move || {
+            let _events = events;
+            paused.recv().unwrap();
+            assert!(matches!(command_rx.recv().unwrap(), ActorCommand::Send(_)));
+            assert!(matches!(command_rx.recv().unwrap(), ActorCommand::Shutdown));
+        });
+        let mut client = AppServerClient {
+            handle: AppServerHandle {
+                command_tx, next_id: Arc::new(AtomicU64::new(1)),
+                default_timeout: Duration::from_secs(1),
+                disconnect_reason: Arc::new(Mutex::new(None)),
+            },
+            event_rx: Some(receiver), control_drain: None,
+            actor: Some(actor), initialize_response: json!({}),
+        };
+        client.drain_control_events().unwrap();
+        let retained = client.handle();
+        let (done, completed) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || { drop(client); done.send(()).unwrap(); });
+        resume.send(()).unwrap();
+        completed.recv_timeout(Duration::from_secs(5)).expect("shutdown despite retained handle");
+        dropper.join().unwrap();
+        drop(retained);
+    }
+
+    #[test]
+    fn control_drain_does_not_consume_or_answer_owner_events() {
+        fn initialize(stream: TcpStream) -> WebSocket<TcpStream> {
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let Message::Text(request) = socket.read().unwrap() else { panic!("initialize") };
+            let request: Value = serde_json::from_str(request.as_ref()).unwrap();
+            socket.send(Message::Text(json!({"id":request["id"],"result":{}}).to_string().into())).unwrap();
+            let Message::Text(initialized) = socket.read().unwrap() else { panic!("initialized") };
+            assert_eq!(serde_json::from_str::<Value>(initialized.as_ref()).unwrap()["method"], "initialized");
+            socket
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = thread::spawn(move || {
+            let mut owner = initialize(listener.accept().unwrap().0);
+            let mut control = initialize(listener.accept().unwrap().0);
+            owner.send(Message::Text(json!({"method":"test/durable","params":{"sequence":1}}).to_string().into())).unwrap();
+            owner.send(Message::Text(json!({"id":"owner-approval","method":"test/approval","params":{}}).to_string().into())).unwrap();
+            for _ in 0..DEFAULT_EVENT_CAPACITY * 2 {
+                control.send(Message::Text(json!({"method":"test/hint","params":{}}).to_string().into())).unwrap();
+            }
+            control.send(Message::Text(json!({"id":"control-copy","method":"test/approval","params":{}}).to_string().into())).unwrap();
+            let Message::Text(request) = control.read().unwrap() else { panic!("control RPC") };
+            let request: Value = serde_json::from_str(request.as_ref()).unwrap();
+            assert_eq!(request["method"], "test/control");
+            control.send(Message::Text(json!({"id":request["id"],"result":{}}).to_string().into())).unwrap();
+            let Message::Text(reply) = owner.read().unwrap() else { panic!("owner reply") };
+            let reply: Value = serde_json::from_str(reply.as_ref()).unwrap();
+            assert_eq!(reply, json!({"id":"owner-approval","result":{"approved":true}}));
+        });
+        let options = || AppServerClientOptions::new(AppServerEndpoint::LoopbackWebSocket {
+            url: format!("ws://127.0.0.1:{port}/"), bearer_token: None,
+        });
+        let owner = AppServerClient::connect(options()).unwrap();
+        let mut control = AppServerClient::connect(options()).unwrap();
+        control.drain_control_events().unwrap();
+        control.handle().request_with_timeout("test/control", json!({}), Duration::from_secs(5)).unwrap();
+        let Some(AppServerEvent::Notification(event)) = owner.recv_event_timeout(Duration::from_secs(5)).unwrap() else { panic!("owner durable event") };
+        assert_eq!(event.method, "test/durable");
+        let Some(AppServerEvent::ServerRequest(request)) = owner.recv_event_timeout(Duration::from_secs(5)).unwrap() else { panic!("owner approval") };
+        owner.handle().respond_result(request.id, json!({"approved":true})).unwrap();
+        peer.join().unwrap();
+        drop(control);
+        drop(owner);
+    }
+
+    fn diagnostic_event(message: &str) -> AppServerEvent {
+        AppServerEvent::ProtocolViolation { message: message.to_owned() }
+    }
+
+    fn wait_for_pending_send(metrics: &EventQueueMetrics) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while metrics.pending_sends.load(Ordering::Relaxed) != 1 {
+            assert!(Instant::now() < deadline, "sender must reach saturated channel");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn event_queue_metrics_guards_release_on_unwind() {
+        let metrics = Arc::new(EventQueueMetrics::default());
+        let result = std::panic::catch_unwind(|| {
+            let _event = QueuedEvent::new(diagnostic_event("unwinding"), &metrics);
+            metrics.pending_sends.fetch_add(1, Ordering::Relaxed);
+            let _pending = PendingEventSend(&metrics);
+            panic!("simulate unwind while owning send diagnostics");
+        });
+        assert!(result.is_err());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["outstandingEvents"], 0);
+        assert_eq!(snapshot["pendingSendCalls"], 0);
+        assert_eq!(snapshot["discardedEvents"], 1);
+    }
+
+    #[test]
+    fn event_queue_metrics_receive_timeout_and_sender_disconnect() {
+        let metrics = Arc::new(EventQueueMetrics::default());
+        let (tx, rx) = event_channel(2, metrics.clone());
+        assert!(matches!(rx.recv_timeout(Duration::ZERO), Err(RecvTimeoutError::Timeout)));
+        tx.send(diagnostic_event("private-first")).unwrap();
+        tx.try_send(diagnostic_event("private-second")).unwrap();
+        assert_eq!(metrics.snapshot()["outstandingEvents"], 2);
+        assert_eq!(metrics.snapshot()["pendingSendCalls"], 0);
+        drop(tx);
+        assert!(matches!(rx.recv().unwrap(), AppServerEvent::ProtocolViolation { message } if message == "private-first"));
+        assert_eq!(metrics.snapshot()["outstandingEvents"], 1);
+        assert!(matches!(rx.recv_timeout(Duration::ZERO).unwrap(), AppServerEvent::ProtocolViolation { message } if message == "private-second"));
+        assert!(rx.recv().is_err());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["outstandingEvents"], 0);
+        assert_eq!(snapshot["receivedEvents"], 2);
+        assert_eq!(snapshot["discardedEvents"], 0);
+        assert_eq!(snapshot["successfulSends"], 2);
+        assert_eq!(snapshot["blockingSendCalls"], 1);
+        assert_eq!(snapshot["bytesMeasured"], false);
+        assert_eq!(snapshot["countDefinition"], "outstanding_includes_send_attempts_buffered_events_and_receive_handoff_not_buffered_depth_pending_calls_may_overlap_received_events");
+        assert!(!snapshot.to_string().contains("private"));
+    }
+
+    #[test]
+    fn event_queue_metrics_full_try_send_and_receiver_drop_release_events() {
+        let metrics = Arc::new(EventQueueMetrics::default());
+        let (tx, rx) = event_channel(1, metrics.clone());
+        tx.send(diagnostic_event("buffered")).unwrap();
+        assert!(tx.try_send(diagnostic_event("full")).is_err());
+        assert_eq!(metrics.snapshot()["outstandingEvents"], 1);
+        assert_eq!(metrics.snapshot()["discardedEvents"], 1);
+        drop(rx);
+        assert!(tx.send(diagnostic_event("disconnected")).is_err());
+        assert!(tx.try_send(diagnostic_event("terminal-disconnected")).is_err());
+        drop(tx);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["outstandingEvents"], 0);
+        assert_eq!(snapshot["pendingSendCalls"], 0);
+        assert_eq!(snapshot["receivedEvents"], 0);
+        assert_eq!(snapshot["discardedEvents"], 4);
+        assert_eq!(snapshot["successfulSends"], 1);
+        assert_eq!(snapshot["failedSends"], 3);
+    }
+
+    #[test]
+    fn event_queue_metrics_saturated_send_unblocks_on_receiver_drop() {
+        let metrics = Arc::new(EventQueueMetrics::default());
+        let (tx, rx) = event_channel(1, metrics.clone());
+        tx.send(diagnostic_event("buffered")).unwrap();
+        let sender = thread::spawn(move || tx.send(diagnostic_event("pending")));
+        wait_for_pending_send(&metrics);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["outstandingEvents"], 2);
+        assert_eq!(snapshot["pendingSendCalls"], 1);
+        assert_eq!(snapshot["successfulSends"], 1);
+        drop(rx);
+        assert!(sender.join().unwrap().is_err());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["outstandingEvents"], 0);
+        assert_eq!(snapshot["pendingSendCalls"], 0);
+        assert_eq!(snapshot["discardedEvents"], 2);
+        assert_eq!(snapshot["failedSends"], 1);
+        assert_eq!(snapshot["blockingSendCalls"], 2);
+        assert!(snapshot["blockingSendTotalNs"].as_u64().unwrap()
+            >= snapshot["blockingSendMaxNs"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn event_queue_metrics_saturated_send_resumes_in_order_on_receive() {
+        let metrics = Arc::new(EventQueueMetrics::default());
+        let (tx, rx) = event_channel(1, metrics.clone());
+        tx.send(diagnostic_event("first")).unwrap();
+        let sender = thread::spawn(move || tx.send(diagnostic_event("second")));
+        wait_for_pending_send(&metrics);
+        assert!(matches!(rx.recv().unwrap(), AppServerEvent::ProtocolViolation { message } if message == "first"));
+        assert!(sender.join().unwrap().is_ok());
+        assert_eq!(metrics.snapshot()["outstandingEvents"], 1);
+        assert!(matches!(rx.recv().unwrap(), AppServerEvent::ProtocolViolation { message } if message == "second"));
+        assert!(rx.recv().is_err());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["outstandingEvents"], 0);
+        assert_eq!(snapshot["pendingSendCalls"], 0);
+        assert_eq!(snapshot["receivedEvents"], 2);
+        assert_eq!(snapshot["discardedEvents"], 0);
+        assert_eq!(snapshot["successfulSends"], 2);
+    }
 
     #[cfg(windows)]
     fn windows_test_socket_pair() -> (WebSocket<ConnectionStream>, WebSocket<TcpStream>) {
@@ -1370,6 +2005,7 @@ mod tests {
             command_tx,
             next_id: Arc::new(AtomicU64::new(u64::MAX)),
             default_timeout: Duration::from_secs(1),
+            disconnect_reason: Arc::new(Mutex::new(None)),
         };
 
         assert!(matches!(

@@ -2,6 +2,60 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "cutex management v2 method registry",
   "$defs": {
+    "projectDirectorChanged": {
+      "type": "object",
+      "required": ["projectId"],
+      "properties": {
+        "schema": {"const": "cutex/project-director-changed/v1"},
+        "changeId": {"type": "string"},
+        "projectId": {"type": "string"},
+        "projectServiceCount": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "delegationResourceChanged": {
+      "type": "object", "additionalProperties": false,
+      "required": ["projectId", "resourceId", "revision"],
+      "properties": {
+        "projectId": {"type": ["string", "null"]},
+        "resourceId": {"$ref": "#/$defs/nonEmptyString"},
+        "revision": {"$ref": "#/$defs/safeInteger"}
+      }
+    },
+    "projectRunControlChanged": {
+      "type": "object", "additionalProperties": false,
+      "required": ["projectId"],
+      "properties": {
+        "projectId": {"$ref": "#/$defs/nonEmptyString"},
+        "epoch": {"$ref": "#/$defs/safeInteger"}
+      }
+    },
+    "delegationOperationReceipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "actionId", "operationId", "operation", "requestDigest", "status", "effectState", "outcomeUnknown", "revision", "updatedAt"],
+      "properties": {
+        "schema": {"const": "cutex.delegation-operation.v1"},
+        "actionId": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9_.:-]+$"},
+        "operationId": {"$ref": "#/$defs/nonEmptyString"},
+        "operation": {"$ref": "#/$defs/nonEmptyString"},
+        "requestDigest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "status": {"enum": ["pending", "completed"]},
+        "effectState": {"enum": ["none", "partial", "committed", "unknown"]},
+        "outcomeUnknown": {"type": "boolean"},
+        "revision": {"$ref": "#/$defs/positiveSafeInteger"},
+        "updatedAt": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "storageWalkChanged": {
+      "type": "object", "required": ["state", "finishedAt"],
+      "properties": {"state": {"enum": ["running", "idle"]}, "finishedAt": {"type": ["string", "null"]}}
+    },
+    "sessionBadge": {
+      "type": "object", "additionalProperties": false, "required": ["text"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 8, "description": "Display width 1..4; at most 32 UTF-8 bytes; no controls, whitespace, zero-width or format/default-ignorable scalars"},
+        "tint": {"enum": [null, "blue", "green", "amber", "pink", "violet"]}
+      }
+    },
     "safeInteger": {
       "type": "integer",
       "minimum": 0,
@@ -40,7 +94,7 @@
       "maxProperties": 0
     },
     "runtimeBackend": {
-      "enum": ["host", "host_foreground", "docker", "cute_alden", "claude_subscription", "future"]
+      "enum": ["host", "host_foreground", "docker", "cute_alden", "claude_subscription", "dsh", "kimi", "future"]
     },
     "origin": {
       "type": "object",
@@ -110,6 +164,55 @@
       "minItems": 1,
       "items": { "$ref": "#/$defs/userInput" }
     },
+    "eventBlob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "blobId", "sha256", "mime", "size", "url"],
+      "properties": {
+        "type": { "const": "cutexBlob" },
+        "blobId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "mime": { "type": "string", "minLength": 1, "maxLength": 127 },
+        "size": { "type": "integer", "minimum": 0, "maximum": 33554432 },
+        "url": { "type": "string", "pattern": "^cutex-blob:" },
+        "width": { "$ref": "#/$defs/positiveSafeInteger" },
+        "height": { "$ref": "#/$defs/positiveSafeInteger" }
+      }
+    },
+    "eventMediaUnavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "truncated", "reason"],
+      "properties": {
+        "type": { "const": "imageNotLoaded" },
+        "truncated": { "const": true },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "eventUserInput": {
+      "oneOf": [
+        { "$ref": "#/$defs/userInput" },
+        {
+          "type": "object",
+          "required": ["type", "url"],
+          "properties": {
+            "type": { "const": "image" },
+            "url": {
+              "oneOf": [
+                { "$ref": "#/$defs/eventBlob" },
+                { "$ref": "#/$defs/eventMediaUnavailable" }
+              ]
+            },
+            "detail": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "eventUserInputArray": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/eventUserInput" }
+    },
     "runtimeDefaults": {
       "type": "object",
       "additionalProperties": false,
@@ -173,8 +276,11 @@
     "sessionMetadataUpdate": {
       "type": "object",
       "additionalProperties": false,
-      "anyOf": [{ "required": ["displayName"] }, { "required": ["note"] }, { "required": ["avatar"] }],
+      "anyOf": [{ "required": ["displayName"] }, { "required": ["note"] }, { "required": ["avatar"] }, { "required": ["avatarMode"] }, { "required": ["badge"] }],
+      "allOf": [{ "if": { "required": ["avatarMode"] }, "then": { "required": ["expectedRevision"] } }],
       "properties": {
+        "avatarMode": { "enum": ["fixed", "inherit", null] },
+        "badge": {"oneOf": [{"$ref": "#/$defs/sessionBadge"}, {"type": "null"}]},
         "expectedRevision": { "$ref": "#/$defs/safeInteger" },
         "displayName": {
           "oneOf": [{ "type": "string", "minLength": 1, "maxLength": 64 }, { "type": "null" }]
@@ -192,6 +298,8 @@
       "additionalProperties": false,
       "required": ["cutexSessionId", "revision", "displayName", "displayNameOverride", "note", "avatar"],
       "properties": {
+        "avatarMode": { "enum": ["fixed", "inherit", null] },
+        "badge": {"oneOf": [{"$ref": "#/$defs/sessionBadge"}, {"type": "null"}]},
         "cutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
         "revision": { "$ref": "#/$defs/positiveSafeInteger" },
         "displayName": { "$ref": "#/$defs/nonEmptyString" },
@@ -343,7 +451,7 @@
     },
     "sessionHistoryRevertResult": {
       "type": "object",
-      "description": "Codex (native thread/revert, thread/rollback) keeps its runtime: runtimeRestarted is false, no runtimeState / warnings. Claude (claude/thread/revert) restarts an online runtime: runtimeRestarted is the actual outcome, runtimeState the adapter runtime state afterwards, backupPath null when no native transcript existed.",
+      "description": "Codex (native thread/revert, thread/rollback) keeps its runtime: runtimeRestarted is false, no runtimeState / warnings. Claude (claude/thread/revert) restarts an online runtime: runtimeRestarted is the actual outcome, runtimeState the adapter runtime state afterwards, backupPath null when no native transcript existed. DSH (dsh/thread/revert) behaves like Claude (an online runtime is restarted); it reverts the conversation only: workspace files are never restored (DSH keeps no file checkpoints, rewindFiles is refused), native.result.filesRestored is false.",
       "additionalProperties": false,
       "required": ["cutexSessionId", "threadId", "revertedBeforeTurnId", "removedTurns", "removedTurnIds", "live", "runtimeRestarted", "runtimePid", "runtimeGeneration", "actionId", "backupPath", "receiptPath", "native"],
       "properties": {
@@ -366,12 +474,12 @@
           "additionalProperties": false,
           "required": ["method", "result"],
           "properties": {
-            "method": { "enum": ["thread/revert", "thread/rollback", "claude/thread/revert"] },
+            "method": { "enum": ["thread/revert", "thread/rollback", "claude/thread/revert", "dsh/thread/revert"] },
             "result": { "type": "object" }
           }
         }
       },
-      "if": { "properties": { "native": { "properties": { "method": { "const": "claude/thread/revert" } } } } },
+      "if": { "properties": { "native": { "properties": { "method": { "enum": ["claude/thread/revert", "dsh/thread/revert"] } } } } },
       "then": { "required": ["runtimeState", "warnings"] },
       "else": {
         "properties": {
@@ -411,7 +519,7 @@
         "cutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
         "deleted": { "const": true },
         "threadId": { "type": ["string", "null"] },
-        "nativeDelete": { "enum": ["thread/delete", "storageMove", "claudeState", "none"] },
+        "nativeDelete": { "enum": ["thread/delete", "storageMove", "claudeState", "dshState", "none"] },
         "runtimeStopped": { "type": "boolean" },
         "backupPath": { "$ref": "#/$defs/nonEmptyString" },
         "deletedAt": { "$ref": "#/$defs/timestamp" }
@@ -529,6 +637,39 @@
         "reason": { "enum": ["paused", "ownerStop", "runtimeGate", "runtimeRestart", "turnStarted", "resumed", "ownerMessage"] }
       }
     },
+    "agentPause": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cutexSessionId", "phase", "requestedAt", "by"],
+          "properties": {
+            "cutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "phase": { "enum": ["pausing", "paused"] },
+            "requestedAt": { "$ref": "#/$defs/timestamp" },
+            "pausedAt": { "$ref": "#/$defs/timestamp" },
+            "by": { "enum": ["owner", "director"] },
+            "byCutexSessionId": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "agentPauseResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agentPause", "changed"],
+      "properties": {
+        "agentPause": { "$ref": "#/$defs/agentPause" },
+        "changed": { "type": "boolean" }
+      }
+    },
+    "agentPauseChangedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agentPause"],
+      "properties": { "agentPause": { "$ref": "#/$defs/agentPause" } }
+    },
     "ownerNotifyRef": {
       "type": "object",
       "additionalProperties": false,
@@ -583,6 +724,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "profile": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
         "afterTurnId": { "type": ["string", "null"], "minLength": 1 },
         "name": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 }
       }
@@ -592,6 +734,11 @@
       "additionalProperties": false,
       "required": ["sourceCutexSessionId", "newCutexSessionId", "sourceThreadId", "threadId", "forkedThroughTurnId", "name", "session"],
       "properties": {
+        "profile": {"type": ["string", "null"]},
+        "sourceProfile": {"type": ["string", "null"]},
+        "historyBytes": {"type": ["integer", "null"], "minimum": 0},
+        "coldCache": {"type": "boolean"},
+        "forkBoundaryNote": {"type": "string"},
         "sourceCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
         "newCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
         "sourceThreadId": { "$ref": "#/$defs/nonEmptyString" },
@@ -620,6 +767,8 @@
       "additionalProperties": false,
       "required": ["sessionRevision", "displayName", "displayNameOverride", "note", "avatar", "updatedAt"],
       "properties": {
+        "avatarMode": { "enum": ["fixed", "inherit", null] },
+        "badge": {"oneOf": [{"$ref": "#/$defs/sessionBadge"}, {"type": "null"}]},
         "sessionRevision": { "$ref": "#/$defs/positiveSafeInteger" },
         "displayName": { "$ref": "#/$defs/nonEmptyString" },
         "displayNameOverride": { "type": ["string", "null"] },
@@ -698,6 +847,16 @@
         "source": { "$ref": "#/$defs/nonEmptyString" }
       }
     },
+    "ownerJoinDelegation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["askId", "attempt", "expectedTurnId", "runtimeGeneration"],
+      "properties": {
+        "askId": { "$ref": "#/$defs/nonEmptyString" },
+        "attempt": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "expectedTurnId": { "$ref": "#/$defs/nonEmptyString" },
+        "runtimeGeneration": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
     "userInputSubmit": {
       "type": "object",
       "additionalProperties": false,
@@ -708,6 +867,7 @@
         "strategy": { "enum": ["auto", "queue", "interrupt"] },
         "input": { "$ref": "#/$defs/userInputArray" },
         "expectedTurnId": { "type": ["string", "null"] },
+        "joinDelegation": { "$ref": "#/$defs/ownerJoinDelegation" },
         "startIfOffline": { "type": "boolean" }
       }
     },
@@ -865,6 +1025,9 @@
             "null"
           ]
         },
+        "waitReason": {
+          "enum": ["resultCoalescing", "nativeReceipt"]
+        },
         "held": {
           "enum": [
             "ownerStop",
@@ -879,6 +1042,10 @@
         },
         "fromHost": {
           "type": ["string", "null"]
+        },
+        "fromCutexSessionId": {
+          "type": ["string", "null"],
+          "description": "The sender's cutex session id when it is an agent on this host (local delegate, same-host tell); never another host's session"
         },
         "preview": {
           "type": ["string", "null"],
@@ -909,6 +1076,29 @@
             "null"
           ]
         }
+      }
+    },
+    "imageDelivery": {
+      "enum": ["pathText", "nativeImage"],
+      "description": "Native acceptance mode for this image input, not proof the model has inspected it. Absent for queued, unconfirmed or receipt-less deduplicated input."
+    },
+    "imageInputSettings": {
+      "type": "object", "additionalProperties": false, "required": ["busyBehavior"],
+      "properties": { "busyBehavior": { "enum": ["queue", "steer"], "default": "queue" } }
+    },
+    "imageInputSettingsPatch": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "busyBehavior": { "enum": ["queue", "steer"] } },
+      "description": "imageInput group in PATCH /v2/settings; an empty object is a no-op."
+    },
+    "imageInputSteeringCapability": {
+      "type": "object", "additionalProperties": false,
+      "description": "native.schema.capabilities.features.imageInputSteering; additive, preserves the existing imageInput boolean.",
+      "required": ["busyBehaviorDefault", "steering", "requiresTargetHostPath"],
+      "properties": {
+        "busyBehaviorDefault": { "const": "queue" },
+        "steering": { "enum": ["pathText", "nativeImage", "unsupported"] },
+        "requiresTargetHostPath": { "type": "boolean" }
       }
     },
     "queueSettings": {
@@ -1007,6 +1197,7 @@
         "expectedTurnId": {
           "$ref": "#/$defs/nonEmptyString"
         },
+        "joinDelegation": { "$ref": "#/$defs/ownerJoinDelegation" },
         "ifIdle": {
           "enum": [
             "start",
@@ -1026,6 +1217,7 @@
         "queueRevision"
       ],
       "properties": {
+        "imageDelivery": { "$ref": "#/$defs/imageDelivery" },
         "disposition": {
           "enum": [
             "steered",
@@ -1119,7 +1311,7 @@
           "$ref": "#/$defs/origin"
         },
         "input": {
-          "$ref": "#/$defs/userInputArray"
+          "$ref": "#/$defs/eventUserInputArray"
         },
         "position": {
           "$ref": "#/$defs/safeInteger"
@@ -1416,7 +1608,7 @@
         "managementRequestId": { "$ref": "#/$defs/requestId" },
         "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
         "origin": { "$ref": "#/$defs/origin" },
-        "input": { "$ref": "#/$defs/userInputArray" },
+        "input": { "$ref": "#/$defs/eventUserInputArray" },
         "strategy": { "enum": ["auto", "queue", "interrupt"] },
         "state": { "const": "routed_to_cutex" },
         "acceptedAt": { "$ref": "#/$defs/timestamp" },
@@ -1451,6 +1643,7 @@
       "additionalProperties": false,
       "required": ["queueId", "clientUserMessageId", "revision", "reason", "removedAt"],
       "properties": {
+        "imageDelivery": { "$ref": "#/$defs/imageDelivery" },
         "queueId": { "$ref": "#/$defs/nonEmptyString" },
         "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
         "revision": { "$ref": "#/$defs/positiveSafeInteger" },
@@ -1474,10 +1667,11 @@
         "submittedAt"
       ],
       "properties": {
+        "imageDelivery": { "$ref": "#/$defs/imageDelivery" },
         "managementRequestId": { "$ref": "#/$defs/requestId" },
         "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
         "origin": { "$ref": "#/$defs/origin" },
-        "input": { "$ref": "#/$defs/userInputArray" },
+        "input": { "$ref": "#/$defs/eventUserInputArray" },
         "disposition": { "enum": ["started", "steered"] },
         "nativeRequestId": { "$ref": "#/$defs/nativeRequestId" },
         "nativeMethod": { "enum": ["turn/start", "turn/steer"] },
@@ -1502,7 +1696,7 @@
         "managementRequestId": { "$ref": "#/$defs/requestId" },
         "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
         "origin": { "$ref": "#/$defs/origin" },
-        "input": { "$ref": "#/$defs/userInputArray" },
+        "input": { "$ref": "#/$defs/eventUserInputArray" },
         "stage": {
           "enum": ["route", "queue", "interrupt", "native_request", "materialization_timeout"]
         },
@@ -1529,7 +1723,7 @@
       "properties": {
         "id": { "$ref": "#/$defs/nonEmptyString" },
         "name": { "type": ["string", "null"], "maxLength": 160 },
-        "runtime": { "enum": ["codex", "claude", null] }
+        "runtime": { "enum": ["codex", "claude", "dsh", "kimi", null] }
       }
     },
     "agentBusIdentity": {
@@ -1613,6 +1807,55 @@
         "deliveryMode": { "enum": ["after_turn", "soon", "passive"] },
         "content": { "type": "string" },
         "sentAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "agentBusSettlement": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "canClose", "evidenceToken", "evidence", "closure"],
+      "properties": {
+        "state": {"enum": ["outcome_unknown", "closed"]},
+        "canClose": {"type": "boolean"},
+        "evidenceToken": {"type": "string", "minLength": 1, "maxLength": 256},
+        "evidence": {
+          "type": "object", "additionalProperties": false,
+          "required": ["runtime", "runtimeGeneration", "threadId", "actualTurnId", "terminalStatus", "observedAt"],
+          "properties": {
+            "runtime": {"const": "claude"},
+            "runtimeGeneration": {"$ref": "#/$defs/safeInteger"},
+            "threadId": {"$ref": "#/$defs/nonEmptyString"},
+            "actualTurnId": {"$ref": "#/$defs/nonEmptyString"},
+            "terminalStatus": {"enum": ["interrupted", "failed", "completed"]},
+            "observedAt": {"$ref": "#/$defs/timestamp"}
+          }
+        },
+        "closure": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["actor", "closedAt", "reason", "requestId"],
+              "properties": {
+                "actor": {"$ref": "#/$defs/nonEmptyString"},
+                "closedAt": {"$ref": "#/$defs/timestamp"},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "requestId": {"type": "string", "minLength": 1, "maxLength": 128}
+              }
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {"if": {"properties": {"state": {"const": "closed"}}}, "then": {"properties": {"canClose": {"const": false}, "closure": {"type": "object"}}}},
+        {"if": {"properties": {"state": {"const": "outcome_unknown"}}}, "then": {"properties": {"closure": {"type": "null"}}}}
+      ]
+    },
+    "agentBusSettlementUpdated": {
+      "type": "object", "additionalProperties": false,
+      "required": ["messageId", "requestId", "settlement"],
+      "properties": {
+        "messageId": {"$ref": "#/$defs/nonEmptyString"},
+        "requestId": {"type": "string", "minLength": 1, "maxLength": 128},
+        "settlement": {"anyOf": [{"$ref": "#/$defs/agentBusSettlement"}, {"type": "null"}]}
       }
     },
     "agentBusOutcome": {
@@ -1838,6 +2081,7 @@
     "servicesRevealRequested": { "type": "object", "required": ["slug", "hostId", "ownerCutexSessionId", "path", "requestedAt"], "properties": { "slug": { "type": "string" }, "hostId": { "type": "string" }, "ownerCutexSessionId": { "type": ["string", "null"] }, "path": { "type": "string" }, "requestedAt": { "type": "string" } } },
     "peersChanged": {"type":"object","required":["peerId","reason"],"properties":{"peerId":{"type":"string"},"reason":{"type":"string"}}},
     "usersChanged": {"type":"object","required":["userId","reason"],"description":"Capability peer-owner-profile: a user's displayName / avatar changed without an owner action (reason peerProfile: pulled from paired peer peerId). Re-read GET /v2/users.","properties":{"userId":{"type":"string"},"reason":{"type":"string"},"peerId":{"type":"string"}}},
+    "profilesChanged": {"type":"object","additionalProperties":false,"required":["profileId","fields","updatedAt"],"properties":{"profileId":{"$ref":"#/$defs/nonEmptyString"},"fields":{"type":"array","minItems":1,"uniqueItems":true,"items":{"enum":["avatarStyle"]}},"updatedAt":{"type":"string","format":"date-time"}}},
     "peerAsk": {"type":"object","additionalProperties":true,"properties":{"remote":{"type":["object","null"],"additionalProperties":true,"properties":{"peerId":{"type":"string"},"label":{"type":"string"},"targetName":{"type":"string"},"syncState":{"type":"string"},"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."},"interruptReason":{"type":["string","null"]},"remoteState":{"type":["object","null"],"properties":{"text":false,"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."}},"description":"Portable peer snapshot metadata; answer text is omitted. Unknown state strings are retained."},"lateAnswer":{"type":["object","null"],"properties":{"text":false,"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."},"artifactId":{"type":["string","null"]},"preview":{"type":["string","null"]}},"description":"Late answer metadata with local artifactId and bounded preview; no inline text and no new delivery."}}},"requester":{"type":"object","required":["kind"],"properties":{"kind":{"enum":["agent","owner","peer"]},"peer":{"type":"object","required":["peerId","label"],"properties":{"peerId":{"type":"string"},"label":{"type":"string"}}},"cutexSessionId":{"type":"string"},"name":{"type":["string","null"]},"peerId":{"type":"string"},"label":{"type":"string","description":"Single-line sanitized display label."},"claimedCaps":{"type":"object","additionalProperties":true,"properties":{"sandbox":{"type":["string","null"]},"networkAccess":{"type":"boolean"},"unrestrictedServices":{"type":"boolean"}},"description":"Capabilities claimed by the remote requester; display only, never approval authority."}}},"hold":{"type":["object","null"],"properties":{"reason":{"type":"string","description":"Includes peerUnreachable, peerIdentityChanged, peerVersionMismatch and peerUnknown. Unknown peer state is display-only and never drives local scheduling."},"raw":{"type":"string"}}},"hops":{"type":"integer","minimum":0},"lateAnswer":{"type":["object","null"],"properties":{"text":false,"lastError":{"type":["string","null"],"maxLength":512,"description":"Sanitized single-line diagnostic, at most 512 UTF-8 bytes."},"artifactId":{"type":["string","null"]},"preview":{"type":["string","null"]}},"description":"Late answer metadata with local artifactId and bounded preview; no inline text and no new delivery."},"resultUndeliverable":{"type":"boolean"},"interruptReason":{"type":["string","null"]}}},
     "servicesChanged": {
       "type": "object",
@@ -2235,6 +2479,7 @@
         "queue"
       ],
       "properties": {
+        "imageDelivery": { "$ref": "#/$defs/imageDelivery" },
         "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
         "disposition": { "enum": ["started", "steered", "queued", "deduplicated"] },
         "appServerAccepted": { "type": "boolean" },
@@ -2246,6 +2491,7 @@
           "oneOf": [{ "$ref": "#/$defs/queueItem" }, { "type": "null" }]
         },
         "runtimeStarting": { "type": "boolean" },
+        "joinRefusal": { "enum": ["joinChanged", "agentPaused", "runtimeNoSteer", "runtimeRefused", "sessionOffline", "turnConflict", "imagePathRequired", "imageUnavailable"] },
         "paused": { "type": "boolean" }
       }
     },
@@ -2301,6 +2547,7 @@
         { "if": { "properties": { "method": { "const": "cutex/session/restored" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionRestored" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/defaultsUpdated" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionDefaultsUpdated" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/groupsUpdated" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/groupsUpdated" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/storage/walkChanged" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/storageWalkChanged" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/metadataUpdated" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionMetadataUpdated" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/profileSwitched" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionProfileSwitched" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/profileSwitchFailed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionProfileSwitchFailed" } } } },
@@ -2327,6 +2574,7 @@
         { "if": { "properties": { "method": { "const": "cutex/userInput/queuePaused" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/queuePausedEvent" } } } },
         { "if": { "properties": { "method": { "const": "cutex/userInput/queueResumed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/queueResumedEvent" } } } },
         { "if": { "properties": { "method": { "const": "cutex/asks/pauseChanged" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/asksPauseChangedEvent" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/agent/pauseChanged" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentPauseChangedEvent" } } } },
         { "if": { "properties": { "method": { "const": "cutex/userInput/submitted" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/userInputSubmitted" } } } },
         { "if": { "properties": { "method": { "const": "cutex/userInput/failed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/userInputFailed" } } } },
         { "if": { "properties": { "method": { "const": "cutex/userInput/startFailed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/userInputStartFailed" } } } }
@@ -2341,9 +2589,14 @@
         { "if": { "properties": { "method": { "const": "cutex/agentBus/messageQueued" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentBusQueued" } } } },
         { "if": { "properties": { "method": { "const": "cutex/agentBus/messageDelivered" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentBusOutcome" } } } },
         { "if": { "properties": { "method": { "const": "cutex/agentBus/messageFailed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentBusFailed" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/agentBus/messageSettlementUpdated" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentBusSettlementUpdated" } } } },
+        { "if": { "properties": { "method": { "enum": ["cutex/delegation/routingApprovalChanged", "cutex/delegation/lineageChanged", "cutex/delegation/continuationChanged"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/delegationResourceChanged" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/project/runControlChanged" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/projectRunControlChanged" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/project/directorChanged" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/projectDirectorChanged" } } } },
         { "if": { "properties": { "method": { "const": "cutex/services/changed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/servicesChanged" } } } },
         { "if": { "properties": { "method": { "const": "cutex/peers/changed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/peersChanged" } } } },
         { "if": { "properties": { "method": { "const": "cutex/users/changed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/usersChanged" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/profiles/changed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/profilesChanged" } } } },
         { "if": { "properties": { "method": { "const": "cutex/services/revealRequested" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/servicesRevealRequested" } } } },
         { "if": { "properties": { "method": { "const": "cutex/alarms/changed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/alarmsChanged" } } } },
         { "if": { "properties": { "method": { "const": "cutex/sessions/changed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionsChanged" } } } },
@@ -2404,13 +2657,13 @@
             "cutex/userInput/queue/flush",
             "cutex/userInput/queue/pause",
             "cutex/userInput/queue/resume",
-            "cutex/turn/stop", "cutex/ask/create", "cutex/ask/stop", "cutex/ask/close", "cutex/ask/retry", "cutex/ask/respond", "cutex/ask/resume", "cutex/ask/reopen", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume", "cutex/ownerNotify/ack", "cutex/ownerNotify/reply", "cutex/ownerNotify/dismiss", "cutex/ownerNotify/delete", "cutex/safetyCheck/grant", "cutex/safetyCheck/dismiss"
+            "cutex/turn/stop", "cutex/ask/create", "cutex/ask/stop", "cutex/ask/close", "cutex/ask/retry", "cutex/ask/respond", "cutex/ask/resume", "cutex/ask/reopen", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume", "cutex/agent/pause", "cutex/agent/resume", "cutex/ownerNotify/ack", "cutex/ownerNotify/reply", "cutex/ownerNotify/dismiss", "cutex/ownerNotify/delete", "cutex/safetyCheck/grant", "cutex/safetyCheck/dismiss"
           ]
         },
         "params": { "type": "object" }
       },
       "allOf": [
-        { "if": { "properties": { "method": { "enum": ["cutex/session/get", "cutex/session/groups/get", "cutex/focus/get", "cutex/userInput/queue/list", "cutex/userInput/queue/yield", "cutex/userInput/queue/pause", "cutex/userInput/queue/resume", "cutex/turn/stop", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/empty" } } } },
+        { "if": { "properties": { "method": { "enum": ["cutex/session/get", "cutex/session/groups/get", "cutex/focus/get", "cutex/userInput/queue/list", "cutex/userInput/queue/yield", "cutex/userInput/queue/pause", "cutex/userInput/queue/resume", "cutex/turn/stop", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume", "cutex/agent/pause", "cutex/agent/resume"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/empty" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/defaults/update" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionDefaultsUpdate" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/profile/set" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionProfileSet" } } } },
         { "if": { "properties": { "method": { "const": "cutex/session/profile/clear" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/expectedRevision" } } } },
@@ -2494,7 +2747,7 @@
                 "cutex/userInput/queue/flush",
                 "cutex/userInput/queue/pause",
                 "cutex/userInput/queue/resume",
-                "cutex/turn/stop", "cutex/ask/create", "cutex/ask/stop", "cutex/ask/close", "cutex/ask/retry", "cutex/ask/respond", "cutex/ask/resume", "cutex/ask/reopen", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume", "cutex/ownerNotify/ack", "cutex/ownerNotify/reply", "cutex/ownerNotify/dismiss", "cutex/ownerNotify/delete", "cutex/safetyCheck/grant", "cutex/safetyCheck/dismiss"
+                "cutex/turn/stop", "cutex/ask/create", "cutex/ask/stop", "cutex/ask/close", "cutex/ask/retry", "cutex/ask/respond", "cutex/ask/resume", "cutex/ask/reopen", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume", "cutex/agent/pause", "cutex/agent/resume", "cutex/ownerNotify/ack", "cutex/ownerNotify/reply", "cutex/ownerNotify/dismiss", "cutex/ownerNotify/delete", "cutex/safetyCheck/grant", "cutex/safetyCheck/dismiss"
               ]
             },
             "result": true
@@ -2527,6 +2780,7 @@
             { "if": { "properties": { "method": { "enum": ["cutex/ask/create", "cutex/ask/stop", "cutex/ask/close", "cutex/ask/retry", "cutex/ask/respond", "cutex/ask/resume", "cutex/ask/reopen"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/askCommandResult" } } } },
             { "if": { "properties": { "method": { "const": "cutex/agentBus/wake" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/agentBusWakeResult" } } } },
             { "if": { "properties": { "method": { "enum": ["cutex/asks/pause", "cutex/asks/resume"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/asksPauseResult" } } } },
+            { "if": { "properties": { "method": { "enum": ["cutex/agent/pause", "cutex/agent/resume"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/agentPauseResult" } } } },
             { "if": { "properties": { "method": { "enum": ["cutex/ownerNotify/ack", "cutex/ownerNotify/dismiss", "cutex/ownerNotify/reply", "cutex/ownerNotify/delete"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/ownerNotifyResult" } } } },
             { "if": { "properties": { "method": { "enum": ["cutex/safetyCheck/grant", "cutex/safetyCheck/dismiss"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/safetyCheckResult" } } } }
           ]

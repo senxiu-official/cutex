@@ -3300,6 +3300,7 @@ mod tests {
             assert!(denied.durable_candidates().is_err());
             assert!(denied
                 .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+                    owner_created_native: false,
             session_only: false,
             creation_defaults: None,
                     action_id: cutex::agent_management::AgentActionId::new("denied-adopt").unwrap(),
@@ -3882,6 +3883,7 @@ mod tests {
         // The real root HTTP route must replay an already committed adoption
         // without launching a native process, and retain its exact snapshot.
         let adoption = cutex::agent_management::HumanAdoptRequest {
+            owner_created_native: false,
             session_only: false,
             creation_defaults: None,
             action_id: cutex::agent_management::AgentActionId::new("http-adopt-replay").unwrap(),

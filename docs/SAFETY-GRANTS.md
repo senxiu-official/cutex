@@ -23,7 +23,8 @@ model what to do instead, and let a human allow the exact action later.
    the owner as a 需要你 item. The turn never waits for it.
 3. **The owner grants one exact retry.** 批准一次 stores a grant in the adapter for exactly that thread,
    tool and input, used once, valid 30 minutes, and cutex tells the agent
-   「主人已批准一次：<command>（30 分钟内有效，仅此一次）」 as the owner's next message.
+   「主人已批准一次：<command>（30 分钟内有效，仅此一次）」 as an owner input: idle, a turn now; busy, it
+   joins the running turn at its next step (never held until the turn ends).
    不批准 closes the item without a grant.
 
 This applies to every turn of a full-access Claude agent, whoever started it (the owner, another agent,
@@ -109,8 +110,9 @@ delegation command can grant.
 
 `grant` result: `{notification, block, submit}`. cutex forwards the decision to the agent's running
 adapter (`thread/safetyCheck/grant`, `decidedBy: {kind: "owner"}`), closes the notice, then submits one
-owner input to the agent (`clientUserMessageId` `safety-grant-<blockId>`; after the current turn when the
-agent is busy). If that submit fails the grant stands and the result carries `submitError` instead of
+owner input to the agent (`clientUserMessageId` `safety-grant-<blockId>`, strategy `auto`: a busy agent
+reads it at its running turn's next step (`turn/steer`; a Claude runtime without same-turn steering keeps
+it in the Management queue for the next turn), an idle one starts a turn, an offline one is started). If that submit fails the grant stands and the result carries `submitError` instead of
 `submit`.
 
 `dismiss` result: `{notification, block}`. When the adapter is not running, the notice closes anyway

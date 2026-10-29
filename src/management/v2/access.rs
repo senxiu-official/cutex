@@ -50,6 +50,7 @@ pub enum Scoped {
     SessionBootstrap,
     SessionHistory,
     SessionHistoryTurn,
+    SessionBlob,
     NativeRequest,
     ServerResponse,
     CutexRequest,
@@ -57,6 +58,10 @@ pub enum Scoped {
     EventStream,
     Summary,
     SummaryEvents,
+    /// `GET /v2/projects/{id}/events[/stream]` and `/background`
+    /// (project-events): a granted
+    /// project; rows of visible agents (asks: visible asks; workflows: owner).
+    ProjectEvents,
     ProjectList,
     ProjectRead,
     AskList,
@@ -122,6 +127,9 @@ fn history_turn_shape(path: &str) -> bool {
 fn native_shape(path: &str) -> bool {
     super::server::native_request_session_id_from_path(path).is_some()
 }
+fn session_blob_shape(path: &str) -> bool {
+    super::event_blobs::parse_path(path).is_some()
+}
 fn server_response_shape(path: &str) -> bool {
     super::server::server_response_session_id_from_path(path).is_some()
 }
@@ -152,6 +160,9 @@ fn client_closing_shape(path: &str) -> bool {
 fn project_read_shape(path: &str) -> bool {
     super::server::management_project_id_from_path(path).is_some()
 }
+fn project_events_shape(path: &str) -> bool {
+    super::project_events::parse_route(path).is_some()
+}
 
 macro_rules! owner_prefixes {
     ($($prefix:literal),* $(,)?) => {
@@ -162,6 +173,7 @@ macro_rules! owner_prefixes {
 /// Ordered: the first matching rule wins. Scoped rules use the exact path
 /// parsers of the handlers they guard; `OwnerOnly` prefix rules follow.
 const SCOPED_RULES: &[Rule] = &[
+    Rule { methods: ANY, matcher: Matcher::Shape(|path| super::delegations::parse_path(path).is_some()), class: Class::OwnerOnly },
     Rule { methods: POST, matcher: Matcher::Exact(super::pairing::PAIR_PATH), class: Class::Public },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/capabilities"), class: Class::HostRead },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/host"), class: Class::HostRead },
@@ -173,6 +185,7 @@ const SCOPED_RULES: &[Rule] = &[
     Rule { methods: GET, matcher: Matcher::Shape(bootstrap_shape), class: Class::Scoped(Scoped::SessionBootstrap) },
     Rule { methods: GET, matcher: Matcher::Shape(history_shape), class: Class::Scoped(Scoped::SessionHistory) },
     Rule { methods: GET, matcher: Matcher::Shape(history_turn_shape), class: Class::Scoped(Scoped::SessionHistoryTurn) },
+    Rule { methods: GET, matcher: Matcher::Shape(session_blob_shape), class: Class::Scoped(Scoped::SessionBlob) },
     Rule { methods: GET, matcher: Matcher::Shape(session_read_shape), class: Class::Scoped(Scoped::SessionRead) },
     Rule { methods: POST, matcher: Matcher::Shape(native_shape), class: Class::Scoped(Scoped::NativeRequest) },
     Rule { methods: POST, matcher: Matcher::Shape(server_response_shape), class: Class::Scoped(Scoped::ServerResponse) },
@@ -181,6 +194,7 @@ const SCOPED_RULES: &[Rule] = &[
     Rule { methods: GET, matcher: Matcher::Exact("/v2/events/stream"), class: Class::Scoped(Scoped::EventStream) },
     Rule { methods: GET, matcher: Matcher::Exact(super::summary::SUMMARY_PATH), class: Class::Scoped(Scoped::Summary) },
     Rule { methods: GET, matcher: Matcher::Exact(super::summary::SUMMARY_EVENTS_PATH), class: Class::Scoped(Scoped::SummaryEvents) },
+    Rule { methods: GET, matcher: Matcher::Shape(project_events_shape), class: Class::Scoped(Scoped::ProjectEvents) },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/agent-management/projects"), class: Class::Scoped(Scoped::ProjectList) },
     Rule { methods: GET, matcher: Matcher::Shape(project_read_shape), class: Class::Scoped(Scoped::ProjectRead) },
     Rule { methods: GET, matcher: Matcher::Exact(super::asks::ASKS_PATH), class: Class::Scoped(Scoped::AskList) },
@@ -210,16 +224,16 @@ const SCOPED_RULES: &[Rule] = &[
 /// Every other route family: owner only (explicitly listed so the
 /// enumeration test proves each one was considered).
 const OWNER_RULES: &[Rule] = owner_prefixes![
-    "/v2/agent-bus", "/v2/agent-management", "/v2/alarms", "/v2/approvals",
+    "/v2/agent-bus", "/v2/agent-management", "/v2/alarms", "/v2/approval-rules", "/v2/approvals",
     "/v2/artifact-store", "/v2/artifacts", "/v2/asks", "/v2/browser", "/v2/capabilities",
     "/v2/claude", "/v2/client-tokens", "/v2/clients", "/v2/codex", "/v2/components", "/v2/director-rotations",
-    "/v2/documents", "/v2/events", "/v2/fs", "/v2/health", "/v2/host", "/v2/human", "/v2/identity",
-    "/v2/inbound-mail", "/v2/items", "/v2/job-service", "/v2/nci-verification", "/v2/notes",
+    "/v2/diagnostics", "/v2/documents", "/v2/events", "/v2/experimental", "/v2/fs", "/v2/health", "/v2/host", "/v2/human", "/v2/identity",
+    "/v2/inbound-mail", "/v2/items", "/v2/job-service", "/v2/kimi", "/v2/nci-verification", "/v2/notes",
     "/v2/notification-levels", "/v2/notifications", "/v2/owner-notifications", "/v2/pair",
-    "/v2/peers", "/v2/profile-imports", "/v2/profile-presets", "/v2/profiles", "/v2/projects",
-    "/v2/quota-auto-continue", "/v2/record-archive", "/v2/release", "/v2/runtime-packages", "/v2/safety-checks",
+    "/v2/peers", "/v2/profile-auto-pick", "/v2/profile-imports", "/v2/profile-link", "/v2/profile-presets", "/v2/profiles", "/v2/projects",
+    "/v2/model-overload-retry", "/v2/quota-auto-continue", "/v2/record-archive", "/v2/release", "/v2/runtime-packages", "/v2/safety-checks",
     "/v2/runtimes", "/v2/services", "/v2/sessions", "/v2/settings", "/v2/side-chats",
-    "/v2/summary", "/v2/task-service", "/v2/tasks", "/v2/terminals", "/v2/upgrade", "/v2/usage",
+    "/v2/storage", "/v2/summary", "/v2/task-service", "/v2/tasks", "/v2/terminals", "/v2/upgrade", "/v2/usage",
     "/v2/user-instructions", "/v2/users", "/v2/workflows",
 ];
 
@@ -501,6 +515,10 @@ fn scoped_gate(
             let (id, _) = srv::history_turn_path(path).unwrap_or_default();
             session_gate(stream, &id).unwrap_or(Gate::Continue)
         }
+        Scoped::SessionBlob => {
+            let (id,_) = super::event_blobs::parse_path(path).unwrap_or_default();
+            session_gate(stream,&id).unwrap_or(Gate::Continue)
+        }
         Scoped::NativeRequest => {
             let id = srv::native_request_session_id_from_path(path).unwrap_or_default();
             if let Some(gate) = session_gate(stream, &id) {
@@ -529,6 +547,14 @@ fn scoped_gate(
             }
             let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
             let method = body["method"].as_str().unwrap_or("");
+            // Joining an active delegation is reserved to the host owner;
+            // ordinary send grants never confer authority over its ask lease.
+            // Owner principals already bypass this non-owner gate above.
+            if matches!(method, "cutex/userInput/submit" | "cutex/userInput/queue/steer")
+                && body["params"].as_object().is_some_and(|params| params.contains_key("joinDelegation"))
+            {
+                return Ok(owner_required(stream));
+            }
             match cutex_need(method) {
                 Need::Read => Gate::Continue,
                 Need::Send | Need::Ask if !scope.grant.send => send_not_granted(stream),
@@ -548,7 +574,8 @@ fn scoped_gate(
                     ),
                 },
                 Need::Ask => {
-                    let state = crate::asks::store::AskStore::open_default()?.snapshot()?;
+                    let inputs:Vec<&str>=["askId","questionId"].iter().filter_map(|key|body["params"][*key].as_str()).collect();
+                    let state = crate::asks::store::AskStore::open_default()?.lookup_snapshot(&inputs)?;
                     match ask_command_target(&state, &body["params"], &id, scope) {
                         AskTarget::Allowed => Gate::Continue,
                         AskTarget::Invalid => Gate::Continue, // the handler answers invalid_arguments
@@ -612,25 +639,34 @@ fn scoped_gate(
             let repository = super::repository::management_v2_repository()?;
             srv::materialize_active_stream_reset(repository, context)?;
             let user = current_user_id();
-            let subscription = match repository.page_and_subscribe(query.clone(), srv::SSE_SUBSCRIBER_CAPACITY) {
+            let mut subscription = match repository.page_and_subscribe(query.clone(), srv::SSE_SUBSCRIBER_CAPACITY) {
                 Ok(subscription) => subscription,
                 Err(error) => return Ok(Gate::Handled(srv::write_replay_error(stream, error))),
             };
+            if srv::enable_live_deltas(repository, request, &query, &mut subscription).is_err() {
+                return Ok(Gate::Handled(srv::write_live_capacity_error(stream)));
+            }
             srv::write_sse_headers(stream)?;
             let grant = scope.grant.clone();
             let asks = AskVisibility::default();
+            let live_grant = grant.clone();
+            let mut live_visible = move |session: &str| {
+                !session.is_empty() && session != HOST_EVENTS && Scope::cached(&live_grant).sees_session(session)
+            };
             let mut visible = move |event: &super::model::EventEnvelope| {
                 // Re-evaluated every few seconds (cached): agents join and
                 // leave projects while the stream is open.
                 let scope = Scope::cached(&grant);
                 event_visible(event, &scope, &asks, user.as_deref())
             };
+            let watch = crate::management::listeners::RevocationWatch::for_stream(stream)?;
             Gate::Handled(srv::stream_events_filtered(
                 stream,
                 subscription,
                 &query,
-                crate::management::listeners::RevocationWatch::for_current_request(),
+                watch,
                 &mut visible,
+                &mut live_visible,
             ))
         }
         Scoped::Summary => {
@@ -646,6 +682,26 @@ fn scoped_gate(
                 summary_event_visible(&event.name, &event.data, &Scope::cached(&grant))
             };
             Gate::Handled(super::summary::handle_events_filtered(stream, request, &mut visible))
+        }
+        Scoped::ProjectEvents => {
+            let Some(route) = super::project_events::parse_route(path) else {
+                return Ok(not_found(stream, "project_not_found"));
+            };
+            if !scope.sees_project(route.project_id()) {
+                return Ok(not_found(stream, "project_not_found"));
+            }
+            let grant = scope.grant.clone();
+            if let super::project_events::Route::Background(project) = &route {
+                let mut sees = |session: &str| scope.sees_session(session);
+                return Ok(Gate::Handled(super::project_events::handle_background(stream, context, project, &mut sees, false)));
+            }
+            let asks = AskVisibility::default();
+            let mut visible = move |row: &super::project_events::ProjectEvent| {
+                // Re-evaluated (cached) while a stream is open: agents join
+                // and leave projects.
+                project_event_visible(row, &Scope::cached(&grant), &asks)
+            };
+            Gate::Handled(super::project_events::handle(stream, request, &route, &mut visible))
         }
         Scoped::ProjectList => {
             let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
@@ -693,7 +749,7 @@ fn scoped_gate(
                 Some(super::asks::Route::Ask(id) | super::asks::Route::Answer(id)) => id,
                 _ => String::new(),
             };
-            let state = crate::asks::store::AskStore::open_default()?.snapshot()?;
+            let state = crate::asks::store::AskStore::open_default()?.lookup_snapshot(&[&id])?;
             if ask_visible(&state, &id, scope) { Gate::Continue } else { not_found(stream, "ask_not_found") }
         }
     })
@@ -737,6 +793,9 @@ pub fn scope_need(
     pending_method: impl Fn(&str, &Value) -> Option<String>,
 ) -> ScopeNeed {
     use super::server as srv;
+    if path == super::profile_link::SECRET_PATH {
+        return ScopeNeed::Full;
+    }
     match classify(method, path) {
         Some(Class::Public | Class::HostRead) => return ScopeNeed::Read,
         // Its own identity (challenge / claim) and its own device list.
@@ -959,7 +1018,7 @@ impl AskVisibility {
             at.elapsed() > std::time::Duration::from_secs(2) || !state.asks.contains_key(ask_id)
         });
         if stale {
-            match crate::asks::store::AskStore::open_default().and_then(|store| store.snapshot()) {
+            match crate::asks::store::AskStore::open_default().and_then(|store| store.lookup_snapshot(&[ask_id])) {
                 Ok(state) => *cell = Some((std::time::Instant::now(), state)),
                 Err(_) => return false,
             }
@@ -987,6 +1046,9 @@ fn event_visible(event: &super::model::EventEnvelope, scope: &Scope, asks: &AskV
             (Some(message), Some(user)) if message.method.starts_with("cutex/client/") => {
                 super::clients_api::event_for_user(&message.params, user)
             }
+            (Some(message), _) if message.method == super::project_events::APPENDED_EVENT => {
+                message.params["projectId"].as_str().is_some_and(|project| scope.sees_project(project))
+            }
             _ => false,
         };
     }
@@ -1013,6 +1075,20 @@ fn event_visible_json(event: &Value, scope: &Scope, asks: &AskVisibility, user: 
         Ok(event) => event_visible(&event, scope, asks, user),
         Err(_) => false,
     }
+}
+
+/// Project-log rows a non-owner may see (the route already checked the
+/// project): rows of its agents and the project's own rows (membership,
+/// gaps, agent-less artifacts / approvals); delegations only when the ask is
+/// visible; workflow runs are the owner's.
+fn project_event_visible(row: &super::project_events::ProjectEvent, scope: &Scope, asks: &AskVisibility) -> bool {
+    if !scope.sees_project(&row.project_id) || row.kind.starts_with("workflow.") {
+        return false;
+    }
+    if let Some(ask) = row.refs.ask_id.as_deref().filter(|_| row.kind.starts_with("ask.")) {
+        return asks.visible(ask, scope);
+    }
+    row.cutex_session_id.as_deref().is_none_or(|session| scope.sees_session(session))
 }
 
 /// Summary journal events a non-owner may see: its agents' rows and turn

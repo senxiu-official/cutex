@@ -104,10 +104,9 @@ pub const KNOWN_MODELS: &[KnownModel] = &[
     KnownModel { context_window: Some(ONE_M), efforts: LOW_HIGH_MAX, default_effort: Some("max"),
         supports_parallel_tool_calls: Some(true), template: VendorTemplate::Glm,
         ..model("glm-5.3", "GLM-5.3") },
-    // glm-5.3-flash: 1M, image (+ video / file) input. Only `max` is stated;
-    // the full level list is unverified, so no list is offered and `max` is
-    // the default.
-    KnownModel { context_window: Some(ONE_M), image: true, default_effort: Some("max"),
+    // glm-5.3-flash: 1M, image (+ video / file) input, low/high/max → max
+    // (docs.z.ai GLM-5.3-Flash, docs/research/zai-bigmodel-api-20261022.md).
+    KnownModel { context_window: Some(ONE_M), image: true, efforts: LOW_HIGH_MAX, default_effort: Some("max"),
         supports_parallel_tool_calls: Some(true), template: VendorTemplate::Glm,
         ..model("glm-5.3-flash", "GLM-5.3-Flash") },
     // glm-5.3-flashx: 1M multimodal (not on the Coding Plan); efforts unverified.
@@ -197,6 +196,86 @@ pub fn effort_description(effort: &str) -> &'static str {
         "max" => "Maximum reasoning depth for the hardest problems",
         _ => "Reasoning effort",
     }
+}
+
+/// A provider-owned field of a catalog row changed by a rediscovery refresh.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldChange {
+    pub model: String,
+    pub field: &'static str,
+    pub from: Value,
+    pub to: Value,
+}
+
+/// The level a known GLM model takes for `effort` (docs: glm-5.3 / -flash
+/// accept low / high / max only; `xhigh` / `ultra` answer HTTP 400):
+/// none / minimal / low → low, medium / high → high, xhigh / max / ultra → max.
+pub fn glm_effort(effort: &str) -> Option<&'static str> {
+    match effort {
+        "none" | "minimal" | "low" => Some("low"),
+        "medium" | "high" => Some("high"),
+        "xhigh" | "max" | "ultra" => Some("max"),
+        _ => None,
+    }
+}
+
+fn efforts_of(row: &Value) -> Vec<String> {
+    row["supported_reasoning_levels"]
+        .as_array()
+        .map(|levels| levels.iter().filter_map(|l| l["effort"].as_str().map(str::to_owned)).collect())
+        .unwrap_or_default()
+}
+
+/// Rediscovery refresh of an EXISTING row from the known metadata
+/// (docs/design/028 (a)). Provider-owned fields only (context windows,
+/// input types, effort levels and default); never a field in `pinned` (the
+/// owner edited it). `tracked == false`: the row predates owner-edit
+/// tracking, so only values the provider rejects are corrected (effort
+/// levels it does not offer, a default outside the offered levels); the
+/// rest stays as it is (the row's 重置 rebuilds it).
+pub fn refresh_row(row: &mut Value, pinned: &[String], tracked: bool) -> Vec<FieldChange> {
+    let mut changes = Vec::new();
+    let Some(slug) = row.get("slug").and_then(Value::as_str).map(str::to_owned) else { return changes };
+    let Some(model) = known_model(&slug) else { return changes };
+    if !row.is_object() {
+        return changes;
+    }
+    let free = |field: &str| !pinned.iter().any(|p| p == field);
+    let mut set = |row: &mut Value, field: &'static str, to: Value, changes: &mut Vec<FieldChange>| {
+        if row[field] != to {
+            changes.push(FieldChange { model: slug.clone(), field, from: row[field].clone(), to: to.clone() });
+            row[field] = to;
+        }
+    };
+    if tracked {
+        if let (Some(window), true) = (model.context_window, free("context_window")) {
+            set(row, "context_window", json!(window), &mut changes);
+        }
+        if let (Some(window), true) = (model.max_context_window, free("max_context_window")) {
+            set(row, "max_context_window", json!(window), &mut changes);
+        }
+        if free("input_modalities") {
+            set(row, "input_modalities", input_modalities(model.image), &mut changes);
+        }
+    }
+    if !model.efforts.is_empty() && free("supported_reasoning_levels") {
+        let current = efforts_of(row);
+        let rejected = current.iter().any(|e| !model.efforts.contains(&e.as_str()));
+        let differs = current.len() != model.efforts.len() || rejected;
+        if (tracked && differs) || rejected {
+            set(row, "supported_reasoning_levels", effort_levels(model.efforts), &mut changes);
+        }
+    }
+    if let (Some(default), true) = (model.default_effort, free("default_reasoning_level")) {
+        let offered = efforts_of(row);
+        let current = row["default_reasoning_level"].as_str().map(str::to_owned);
+        let invalid = current.as_deref().is_some_and(|d| !offered.is_empty() && !offered.iter().any(|e| e == d));
+        if (tracked && current.as_deref() != Some(default)) || invalid {
+            set(row, "default_reasoning_level", json!(default), &mut changes);
+        }
+    }
+    changes
 }
 
 pub fn effort_levels(efforts: &[&str]) -> Value {
@@ -446,5 +525,48 @@ pub(crate) mod tests {
         assert_eq!(turbo["supported_reasoning_levels"], json!([]));
         assert_eq!(turbo["default_reasoning_level"], "max");
         assert_eq!(turbo["context_window"], 204_800);
+    }
+
+    /// Zooey (10-22): a glm-5.3 row written before the documented metadata
+    /// (low/medium/high, 500000, default high).
+    fn stale_glm() -> Value {
+        json!({"slug":"glm-5.3","context_window":500000,"input_modalities":["text"],
+            "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}],
+            "default_reasoning_level":"high"})
+    }
+
+    #[test]
+    fn legacy_rows_only_get_rejected_values_corrected() {
+        let mut row = stale_glm();
+        let changes = refresh_row(&mut row, &[], false);
+        assert_eq!(row["supported_reasoning_levels"], effort_levels(&["low", "high", "max"]));
+        // `high` is still offered: a legacy default stays.
+        assert_eq!(row["default_reasoning_level"], "high");
+        assert_eq!(row["context_window"], 500000, "legacy context untouched");
+        assert_eq!(changes.iter().map(|c| c.field).collect::<Vec<_>>(), ["supported_reasoning_levels"]);
+        assert!(refresh_row(&mut row, &[], false).is_empty(), "idempotent");
+    }
+
+    #[test]
+    fn tracked_rows_follow_the_provider_except_owner_edits() {
+        let mut row = stale_glm();
+        let changes = refresh_row(&mut row, &["context_window".to_string()], true);
+        assert_eq!(row["context_window"], 500000, "owner-edited");
+        assert_eq!(row["default_reasoning_level"], "max");
+        assert_eq!(row["supported_reasoning_levels"], effort_levels(&["low", "high", "max"]));
+        assert!(changes.iter().any(|c| c.field == "default_reasoning_level" && c.from == json!("high") && c.to == json!("max")));
+        let mut fresh = stale_glm();
+        refresh_row(&mut fresh, &[], true);
+        assert_eq!(fresh["context_window"], ONE_M);
+        let mut unknown = json!({"slug":"glm-9","context_window":1});
+        assert!(refresh_row(&mut unknown, &[], true).is_empty());
+    }
+
+    #[test]
+    fn glm_efforts_map_to_the_three_documented_levels() {
+        for (from, to) in [("none","low"),("minimal","low"),("low","low"),("medium","high"),("high","high"),("xhigh","max"),("max","max"),("ultra","max")] {
+            assert_eq!(glm_effort(from), Some(to), "{from}");
+        }
+        assert_eq!(glm_effort("persistent"), None);
     }
 }

@@ -15,6 +15,7 @@ pub mod launch;
 pub mod mcp;
 pub mod mcp_browser;
 pub mod peer_tell;
+pub mod claude_task;
 pub mod model;
 pub mod projection;
 pub mod queue;

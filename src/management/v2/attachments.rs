@@ -12,14 +12,17 @@
 //! - Limits: `attachments.maxBytes` (settings, default 8 MiB; the HTTP layer
 //!   refuses bodies above 16 MiB). The bytes must match the declared type.
 //! - Cleanup: a session's directory is removed when the session is deleted
-//!   (`cutex/session/delete`, delete-empty retire); files older than
-//!   `attachments.retentionDays` (default 30, 0 = keep) are pruned at most
-//!   once an hour, on upload.
+//!   (`cutex/session/delete`, delete-empty retire). Nothing is removed on a
+//!   timer (owner decision 2026-10-23): the session's transcript keeps
+//!   referring to the host path of every image it sent, so an attachment
+//!   lives as long as its session. `attachments.retentionDays` is still read
+//!   and written (releases before r252 prune by it) but not applied here; a
+//!   reference-aware cleanup belongs to the storage page.
 //!
 //! Non-owner users (P2 access, capability `users-p2-access`): a user with
 //! `send` on a visible agent may upload too. Each such upload leaves an
 //! empty marker `<sha256>.<ext>.by-<32 hex of sha256(tokenId)>` beside the
-//! file (pruned and removed with it); that user's `localImage` inputs are
+//! file (removed with it); that user's `localImage` inputs are
 //! accepted only for the exact canonical `path` of a file the same token
 //! uploaded to the same session ([`uploaded_by`]).
 //!
@@ -30,8 +33,7 @@
 
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -46,7 +48,6 @@ pub const SUPPORTED_TYPES: &[(&str, &str)] = &[
     ("image/gif", "gif"),
     ("image/webp", "webp"),
 ];
-const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
 pub fn attachments_root() -> anyhow::Result<PathBuf> {
     Ok(crate::config::paths::runtime_dir()?.join("attachments"))
@@ -212,7 +213,7 @@ pub fn store_upload(
     let path = dir.join(format!("{digest}.{ext}"));
     let created = match std::fs::metadata(&path) {
         Ok(meta) if meta.is_file() && meta.len() == body.len() as u64 => {
-            // Refresh the age so retention counts from the latest upload.
+            // Refresh the age (releases before r252 prune by mtime).
             let _ = std::fs::File::options()
                 .write(true)
                 .open(&path)
@@ -254,7 +255,41 @@ fn is_attachment_file_name(name: &str) -> bool {
 fn record_uploader(path: &Path, token_id: &str) -> anyhow::Result<()> {
     let mut marker = path.as_os_str().to_owned();
     marker.push(uploader_marker_suffix(token_id));
+    // The public attachment path is display-normalized (without \\?\).
+    // Keep an API path internally through both temp creation and atomic rename.
+    #[cfg(windows)]
+    let marker = uploader_write_path(Path::new(&marker))?;
     crate::config::atomic::write_private_bytes_atomic(Path::new(&marker), b"")
+}
+
+/// Convert the filesystem argument, not the public attachment identity. This
+/// is lexical: do not canonicalize/follow a reparse point to obtain an API path.
+#[cfg(windows)]
+fn uploader_write_path(path: &Path) -> std::io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+    if path.as_os_str().encode_wide().any(|c| c == 0) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in attachment marker path"));
+    }
+    let absolute = std::path::absolute(path)?;
+    let prefix = match absolute.components().next() {
+        Some(Component::Prefix(prefix)) => prefix.kind(),
+        _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "attachment marker requires an absolute file path")),
+    };
+    let mut result = match prefix {
+        Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) => return Ok(absolute),
+        Prefix::Disk(_) => OsString::from(r"\\?\"),
+        Prefix::UNC(_, _) => OsString::from(r"\\?\UNC\"),
+        _ => return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "unsupported attachment marker namespace")),
+    };
+    if matches!(prefix, Prefix::UNC(_, _)) {
+        let units: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+        result.push(OsString::from_wide(&units[2..]));
+    } else {
+        result.push(absolute.as_os_str());
+    }
+    Ok(PathBuf::from(result))
 }
 
 /// Whether `path` is exactly the canonical path of an attachment that
@@ -295,59 +330,6 @@ fn remove_session_attachments_in(root: &Path, cutex_session_id: &str) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => eprintln!("attachments: could not remove {}: {error}", dir.display()),
-    }
-}
-
-/// Remove files older than `retention_days` (0 keeps everything) and empty
-/// session directories. Returns the number of files removed.
-pub fn prune_expired(root: &Path, retention_days: u32, now: SystemTime) -> usize {
-    if retention_days == 0 {
-        return 0;
-    }
-    let Some(cutoff) = now.checked_sub(Duration::from_secs(u64::from(retention_days) * 86_400))
-    else {
-        return 0;
-    };
-    let mut removed = 0;
-    let Ok(sessions) = std::fs::read_dir(root) else {
-        return 0;
-    };
-    for session in sessions.flatten() {
-        if !session.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(session.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let expired = file
-                .metadata()
-                .ok()
-                .filter(|meta| meta.is_file())
-                .and_then(|meta| meta.modified().ok())
-                .is_some_and(|modified| modified < cutoff);
-            if expired && std::fs::remove_file(file.path()).is_ok() {
-                removed += 1;
-            }
-        }
-        // Only succeeds when empty.
-        let _ = std::fs::remove_dir(session.path());
-    }
-    removed
-}
-
-fn maybe_prune(root: &Path, retention_days: u32) {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    {
-        let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.is_some_and(|at| at.elapsed() < PRUNE_INTERVAL) {
-            return;
-        }
-        *last = Some(Instant::now());
-    }
-    let removed = prune_expired(root, retention_days, SystemTime::now());
-    if removed > 0 {
-        eprintln!("attachments: pruned {removed} file(s) older than {retention_days} days");
     }
 }
 
@@ -413,7 +395,6 @@ pub fn handle(
                     );
                 }
             }
-            maybe_prune(&root, settings.effective().retention_days);
             if created {
                 write_json_response(stream, 201, "Created", &resource)
             } else {
@@ -481,6 +462,59 @@ mod tests {
         std::env::temp_dir()
             .join(format!("cutex-attachments-{}", uuid::Uuid::new_v4()))
             .join("attachments")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uploader_api_paths_preserve_disk_unc_verbatim_and_reject_devices() {
+        for (input, expected) in [
+            (r"C:\temp\短 file.png", r"\\?\C:\temp\短 file.png"),
+            (r"\\server\share\file.png", r"\\?\UNC\server\share\file.png"),
+            (r"\\?\C:\temp\file.png", r"\\?\C:\temp\file.png"),
+            (r"\\?\UNC\server\share\file.png", r"\\?\UNC\server\share\file.png"),
+            // Lexical normalization must not dereference a junction named link.
+            (r"C:\temp\link\file.png", r"\\?\C:\temp\link\file.png"),
+        ] {
+            assert_eq!(uploader_write_path(Path::new(input)).unwrap(), PathBuf::from(expected));
+        }
+        assert_eq!(uploader_write_path(Path::new("C:\0bad")).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(uploader_write_path(Path::new(r"\\.\pipe\marker")).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uploader_short_and_long_paths_keep_acl_identity_and_readonly_failure() {
+        use std::os::windows::ffi::OsStrExt;
+        for long in [false, true] {
+            let root = temp_root();
+            let root = if long { root.join("long-".repeat(20)).join("deep-".repeat(20)) } else { root };
+            let directory = root.join("cutex.s1");
+            std::fs::create_dir_all(&directory).unwrap();
+            let canonical_dir = std::fs::canonicalize(&directory).unwrap();
+            crate::platform::private_fs::secure_directory(&canonical_dir).unwrap();
+            let path = directory.join(format!("{}.png", "a".repeat(64)));
+            std::fs::write(&path, PNG).unwrap();
+            if long { assert!(path.as_os_str().encode_wide().count() > 260); }
+            record_uploader(&path, "mct-a").unwrap();
+            record_uploader(&path, "mct-a").unwrap(); // atomic replacement remains idempotent
+            let mut marker = path.as_os_str().to_owned();
+            marker.push(uploader_marker_suffix("mct-a"));
+            let marker = PathBuf::from(marker);
+            let file = std::fs::File::open(&marker).unwrap();
+            crate::platform::private_fs::validate_private_file(&file).unwrap();
+            drop(file);
+            assert!(uploaded_by_in(&root, "cutex.s1", "mct-a", &path.to_string_lossy()));
+            assert!(!uploaded_by_in(&root, "cutex.s1", "mct-b", &path.to_string_lossy()));
+            let mut permissions = std::fs::metadata(&marker).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&marker, permissions).unwrap();
+            assert!(record_uploader(&path, "mct-a").is_err(), "readonly target must not be silently replaced");
+            assert_eq!(std::fs::read(&path).unwrap(), PNG);
+            let mut permissions = std::fs::metadata(&marker).unwrap().permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&marker, permissions).unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     fn settings(max_bytes: u64) -> AttachmentSettings {
@@ -593,24 +627,29 @@ mod tests {
         assert!(!uploaded_by_in(&root, "cutex.s1", "mct-a", &marker));
         assert!(!uploaded_by_in(&root, "cutex.s1", "mct-a", "/etc/passwd"));
         assert!(!uploaded_by_in(&root, "cutex.s1", "mct-a", "relative.png"));
-        // Pruning and session deletion take the marker with the file.
-        assert_eq!(prune_expired(&root, 30, SystemTime::now() + Duration::from_secs(31 * 86_400)), 3);
+        // Session deletion takes the marker with the file.
+        remove_session_attachments_in(&root, "cutex.s1");
         assert!(!Path::new(&marker).exists());
         assert!(!uploaded_by_in(&root, "cutex.s1", "mct-a", &path));
     }
 
+    /// Owner decision 2026-10-23: an attachment a transcript may still
+    /// reference is never removed on a timer, whatever `retentionDays` says.
     #[test]
-    fn prune_removes_only_expired_files() {
+    fn old_attachments_survive_later_uploads_past_the_old_retention() {
         let root = temp_root();
         let (_, resource) =
-            store_upload(&root, "old", Some("image/png"), PNG, settings(1 << 20)).unwrap();
-        let path = PathBuf::from(resource["path"].as_str().unwrap());
-        let now = SystemTime::now();
-        assert_eq!(prune_expired(&root, 0, now + Duration::from_secs(400 * 86_400)), 0);
-        assert_eq!(prune_expired(&root, 30, now), 0);
-        assert!(path.exists());
-        assert_eq!(prune_expired(&root, 30, now + Duration::from_secs(31 * 86_400)), 1);
-        assert!(!path.exists());
-        assert!(!root.join("old").exists());
+            store_upload(&root, "cutex.s1", Some("image/png"), PNG, settings(1 << 20)).unwrap();
+        let old = PathBuf::from(resource["path"].as_str().unwrap());
+        let long_ago = SystemTime::now() - std::time::Duration::from_secs(400 * 86_400);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(long_ago).unwrap();
+        let mut other = PNG.to_vec();
+        other.extend_from_slice(b"-second");
+        let configured = AttachmentSettings { max_bytes: 1 << 20, retention_days: 1 };
+        store_upload(&root, "cutex.s1", Some("image/png"), &other, configured).unwrap();
+        store_upload(&root, "cutex.s2", Some("image/png"), &other, configured).unwrap();
+        assert!(old.is_file(), "a 400-day-old attachment of a live session is kept");
+        assert_eq!(std::fs::read(&old).unwrap(), PNG);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }

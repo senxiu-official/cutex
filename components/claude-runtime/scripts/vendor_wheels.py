@@ -11,11 +11,9 @@ Writes DIR/wheels/*.whl and DIR/requirements.lock, which cutex installs with
 - Wheels only, for every supported CPython (SUPPORTED_PYTHONS) of the platform: a package with
   per-version wheels gets one hash per wheel, and a package only some versions need gets a
   `python_version` marker.
-- claude-agent-sdk: Anthropic's PyPI wheels contain a copy of the proprietary Claude Code CLI,
-  which must not be redistributed (the adapter always runs the user's own `claude`). The SDK's own
-  code is MIT-licensed, so its sdist is built here into a CLI-free py3-none-any wheel with a pinned
-  build backend and SOURCE_DATE_EPOCH, which makes the wheel reproducible. The sdist's sha256 is
-  pinned in SDK_SDIST_SHA256.
+- claude-agent-sdk: default builds use the MIT SDK sdist and refuse bundled binaries. With the
+  explicit `--bundle-claude-cli` legal-review flag, use Anthropic's platform wheel unchanged;
+  it contains the version-matched official Claude Code CLI and its exact sha256 is pinned.
 - The other wheels are third-party packages redistributed under their own licenses (each wheel
   carries its license in its .dist-info).
 """
@@ -23,7 +21,9 @@ Writes DIR/wheels/*.whl and DIR/requirements.lock, which cutex installs with
 from __future__ import annotations
 
 import argparse
+import email.parser
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -41,8 +41,12 @@ PLATFORM_TAGS = {
     # Apple silicon, macOS 11+ (pip also accepts the older and universal2 macOS tags these imply).
     "darwin-arm64": ["macosx_14_0_arm64"],
 }
+TARGET_ONLY = {
+    # pip evaluates environment markers against the build host even with --platform. Keep the
+    # platform split explicit and download a complete, pinned closure with --no-deps.
+    "pywin32": {"windows-x64"},
+}
 SDK = "claude-agent-sdk"
-# Build backend of the SDK sdist (hatchling) and its dependencies, pinned for a reproducible wheel.
 SDK_BUILD_CONSTRAINTS = """hatchling==1.32.4
 packaging==26.3
 pathspec==1.1.1
@@ -50,12 +54,16 @@ pluggy==1.7.0
 tomlkit==0.15.1
 trove-classifiers==2026.9.21.13
 """
-# sha256 of the SDK sdist on PyPI per pinned version: a new SDK pin needs its sdist reviewed and added here.
 SDK_SDIST_SHA256 = {
     "0.2.166": "6dbd129cf8bdae065e5504f3619176aa23c2d864afffc14464df387c72edde30",
 }
-# 2025-01-01T00:00:00Z: a fixed timestamp for the files inside the built SDK wheel.
 SOURCE_DATE_EPOCH = "1735689600"
+# sha256 of Anthropic's platform wheels on PyPI. A new SDK pin needs all three wheels reviewed.
+SDK_WHEEL_SHA256 = {
+    ("0.2.166", "windows-x64"): "d53ba0e8152c88b2e9eaf61d684b2ed8621e3785cdc9f4be5378a6d0f86304be",
+    ("0.2.166", "linux-x64"): "81d34634ef4fb4c0782fd7d5354de1b558b776e399a9be3aca771cc528c7ad2e",
+    ("0.2.166", "darwin-arm64"): "35f2082ba76d851af76954e8a19c0bd9d5b81a49a3efc7864e2d9e6ff393e743",
+}
 REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*==\s*([^\s;#]+)")
 
 
@@ -92,9 +100,10 @@ def build_sdk_wheel(version: str, sdist_sha256: str, out: Path, work: Path) -> P
     pip("download", "--no-deps", "--no-binary", SDK, f"{SDK}=={version}", "-d", str(sdist_dir))
     sdists = list(sdist_dir.iterdir())
     if len(sdists) != 1:
-        raise SystemExit(f"expected one {SDK} sdist, got {[p.name for p in sdists]}")
-    if sha256(sdists[0]) != sdist_sha256:
-        raise SystemExit(f"{sdists[0].name}: sha256 {sha256(sdists[0])} is not the pinned {sdist_sha256}")
+        raise SystemExit(f"expected one {SDK} sdist, got {[path.name for path in sdists]}")
+    actual = sha256(sdists[0])
+    if actual != sdist_sha256:
+        raise SystemExit(f"{sdists[0].name}: sha256 {actual} is not the pinned {sdist_sha256}")
     constraints = work / "build-constraints.txt"
     constraints.write_text(SDK_BUILD_CONSTRAINTS, encoding="utf-8")
     env = dict(os.environ, PIP_CONSTRAINT=str(constraints), SOURCE_DATE_EPOCH=SOURCE_DATE_EPOCH)
@@ -102,9 +111,9 @@ def build_sdk_wheel(version: str, sdist_sha256: str, out: Path, work: Path) -> P
     pip("wheel", "--no-deps", "-w", str(built), str(sdists[0]), env=env)
     wheels = list(built.glob("*.whl"))
     if len(wheels) != 1 or not wheels[0].name.endswith("-py3-none-any.whl"):
-        raise SystemExit(f"unexpected SDK build output {[p.name for p in wheels]}")
-    with zipfile.ZipFile(wheels[0]) as z:
-        bundled = [n for n in z.namelist() if "/_bundled/" in n and not n.endswith((".gitignore", "/"))]
+        raise SystemExit(f"unexpected SDK build output {[path.name for path in wheels]}")
+    with zipfile.ZipFile(wheels[0]) as bundle:
+        bundled = [name for name in bundle.namelist() if "/_bundled/" in name and not name.endswith((".gitignore", "/"))]
     if bundled:
         raise SystemExit(f"the built SDK wheel contains bundled files {bundled}; refusing to vendor them")
     target = out / wheels[0].name
@@ -112,10 +121,82 @@ def build_sdk_wheel(version: str, sdist_sha256: str, out: Path, work: Path) -> P
     return target
 
 
+def download_sdk_wheel(platform: str, version: str, expected_sha256: str, out: Path, work: Path) -> Path:
+    downloaded = work / "sdk-wheel"
+    platform_args = [arg for tag in PLATFORM_TAGS[platform] for arg in ("--platform", tag)]
+    pip("download", "--no-deps", "--only-binary=:all:", "--implementation", "cp",
+        "--python-version", "3.13", "--abi", "none", *platform_args,
+        f"{SDK}=={version}", "-d", str(downloaded))
+    wheels = list(downloaded.glob("*.whl"))
+    if len(wheels) != 1:
+        raise SystemExit(f"expected one {SDK} wheel, got {[path.name for path in wheels]}")
+    wheel = wheels[0]
+    actual = sha256(wheel)
+    if actual != expected_sha256:
+        raise SystemExit(f"{wheel.name}: sha256 {actual} is not the pinned {expected_sha256}")
+    expected_cli = "claude_agent_sdk/_bundled/claude.exe" if platform == "windows-x64" else "claude_agent_sdk/_bundled/claude"
+    with zipfile.ZipFile(wheel) as bundle:
+        bundled = [name for name in bundle.namelist() if "/_bundled/" in name and not name.endswith((".gitignore", "/"))]
+        if bundled != [expected_cli]:
+            raise SystemExit(f"{wheel.name}: expected only {expected_cli}, got {bundled}")
+        if bundle.getinfo(expected_cli).file_size < 1_000_000:
+            raise SystemExit(f"{wheel.name}: bundled Claude CLI is unexpectedly small")
+        licenses = [name for name in bundle.namelist() if ".dist-info/licenses/" in name and not name.endswith("/")]
+        if not licenses:
+            raise SystemExit(f"{wheel.name}: the SDK wheel has no packaged license")
+    target = out / wheel.name
+    shutil.copyfile(wheel, target)
+    return target
+
+
+def validate_wheel_closure(platform: str, wheels: Path, pinned: dict[str, tuple[str, str]]) -> None:
+    """Prove every active Requires-Dist is present and satisfies the exact pin."""
+    from pip._vendor.packaging.markers import default_environment
+    from pip._vendor.packaging.requirements import Requirement
+
+    metadata: dict[str, list[str]] = {}
+    for wheel in sorted(wheels.glob("*.whl")):
+        name, _ = wheel_name_version(wheel)
+        if name in metadata:
+            continue
+        with zipfile.ZipFile(wheel) as bundle:
+            candidates = [entry for entry in bundle.namelist() if entry.endswith(".dist-info/METADATA")]
+            if len(candidates) != 1:
+                raise SystemExit(f"{wheel.name}: expected one METADATA file, got {candidates}")
+            message = email.parser.BytesParser().parsebytes(bundle.read(candidates[0]))
+            metadata[name] = message.get_all("Requires-Dist", [])
+
+    target = {
+        "windows-x64": {"sys_platform": "win32", "os_name": "nt", "platform_system": "Windows", "platform_machine": "AMD64"},
+        "linux-x64": {"sys_platform": "linux", "os_name": "posix", "platform_system": "Linux", "platform_machine": "x86_64"},
+        "darwin-arm64": {"sys_platform": "darwin", "os_name": "posix", "platform_system": "Darwin", "platform_machine": "arm64"},
+    }[platform]
+    for py in SUPPORTED_PYTHONS:
+        env = default_environment()
+        env.update(target)
+        env.update({"python_version": py, "python_full_version": f"{py}.0", "extra": ""})
+        for parent, requirements in metadata.items():
+            for text in requirements:
+                requirement = Requirement(text)
+                if requirement.marker is not None and not requirement.marker.evaluate(env):
+                    continue
+                child = canonical(requirement.name)
+                if child not in pinned:
+                    raise SystemExit(f"{parent}: active dependency {text!r} for {platform} Python {py} is not pinned")
+                version = pinned[child][1]
+                if requirement.specifier and not requirement.specifier.contains(version, prereleases=True):
+                    raise SystemExit(f"{parent}: {text!r} rejects pinned {child}=={version}")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--platform", required=True, choices=sorted(PLATFORM_TAGS))
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument(
+        "--bundle-claude-cli",
+        action="store_true",
+        help="include Anthropic's unmodified platform wheel and Claude Code binary after legal review",
+    )
     here = Path(__file__).resolve().parents[1]
     ap.add_argument("--requirements", type=Path, default=here / "requirements-runtime.txt")
     args = ap.parse_args(argv)
@@ -124,7 +205,11 @@ def main(argv: list[str] | None = None) -> int:
     if canonical(SDK) not in pinned:
         raise SystemExit(f"{args.requirements} does not pin {SDK}")
     sdk_version = pinned[canonical(SDK)][1]
-    if sdk_version not in SDK_SDIST_SHA256:
+    if args.bundle_claude_cli:
+        sdk_hash = SDK_WHEEL_SHA256.get((sdk_version, args.platform))
+        if sdk_hash is None:
+            raise SystemExit(f"no reviewed wheel sha256 for {SDK} {sdk_version} on {args.platform}: add it to SDK_WHEEL_SHA256")
+    elif sdk_version not in SDK_SDIST_SHA256:
         raise SystemExit(f"no reviewed sdist sha256 for {SDK} {sdk_version}: add it to SDK_SDIST_SHA256")
     wheels = args.out / "wheels"
     if wheels.exists():
@@ -133,8 +218,14 @@ def main(argv: list[str] | None = None) -> int:
     with tempfile.TemporaryDirectory(prefix="claude-runtime-wheels-") as tmp:
         work = Path(tmp)
         others = work / "requirements-without-sdk.txt"
-        others.write_text("".join(f"{name}=={version}\n" for key, (name, version) in sorted(pinned.items()) if key != canonical(SDK)),
-                          encoding="utf-8")
+        others.write_text(
+            "".join(
+                f"{name}=={version}\n"
+                for key, (name, version) in sorted(pinned.items())
+                if key != canonical(SDK) and args.platform in TARGET_ONLY.get(key, {args.platform})
+            ),
+            encoding="utf-8",
+        )
         # Per Python version: which packages that version needs (pip resolves markers like
         # `pywin32; sys_platform == 'win32'` for the target platform).
         needed: dict[str, set[str]] = {}
@@ -142,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             dest = work / f"py{py}"
             abi = "cp" + py.replace(".", "")
             platform_args = [a for tag in PLATFORM_TAGS[args.platform] for a in ("--platform", tag)]
-            pip("download", "--only-binary=:all:", "--implementation", "cp", "--python-version", py,
+            pip("download", "--no-deps", "--only-binary=:all:", "--implementation", "cp", "--python-version", py,
                 "--abi", abi, "--abi", "abi3", "--abi", "none", *platform_args,
                 "-r", str(others), "-d", str(dest))
             for wheel in dest.glob("*.whl"):
@@ -152,7 +243,15 @@ def main(argv: list[str] | None = None) -> int:
                 needed.setdefault(py, set()).add(f"{name}=={version}")
                 if not (wheels / wheel.name).exists():
                     shutil.copyfile(wheel, wheels / wheel.name)
-        build_sdk_wheel(sdk_version, SDK_SDIST_SHA256[sdk_version], wheels, work)
+        if args.bundle_claude_cli:
+            download_sdk_wheel(args.platform, sdk_version, sdk_hash, wheels, work)
+            (args.out / "claude-cli-runtime.json").write_text(
+                json.dumps({"schema": "cutex/claude-cli-runtime/v1", "sdk": sdk_version, "bundled": True}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            build_sdk_wheel(sdk_version, SDK_SDIST_SHA256[sdk_version], wheels, work)
+            (args.out / "claude-cli-runtime.json").unlink(missing_ok=True)
 
     hashes: dict[str, list[str]] = {}
     versions: dict[str, str] = {}
@@ -161,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
         if versions.setdefault(name, version) != version:
             raise SystemExit(f"two versions of {name} vendored")
         hashes.setdefault(name, []).append(sha256(wheel))
+    validate_wheel_closure(args.platform, wheels, pinned)
     lines = [
         "# Generated by scripts/vendor_wheels.py: the Claude runtime's dependencies for "
         f"{args.platform}, vendored in wheels/.",

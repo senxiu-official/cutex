@@ -90,7 +90,7 @@ fn assert_metadata_views(store: &AskStore, ask_id: &str) {
 
 #[test]
 fn remote_errors_never_become_delivery_identifiers_or_requester_state() {
-    let (root, store, ask, peer) = fixture();
+    let (_root, store, ask, peer) = fixture();
     let mut snapshot = asks::snapshot(&store.snapshot().unwrap(), &ask);
     snapshot.revision = 2;
     snapshot.execution = ExecutionState::Failed;
@@ -113,8 +113,7 @@ fn remote_errors_never_become_delivery_identifiers_or_requester_state() {
         crate::asks::returns::item_json(&returned)["state"],
         "peerState"
     );
-    let persisted: Value =
-        serde_json::from_slice(&std::fs::read(root.join("asks-v1.json")).unwrap()).unwrap();
+    let persisted = serde_json::to_value(store.snapshot().unwrap()).unwrap();
     let saved = &persisted["asks"][&ask.ask_id]["remote"];
     assert_eq!(saved["sync"]["lastError"], diagnostic);
     assert_eq!(saved["remoteState"]["lastError"], diagnostic);
@@ -123,7 +122,7 @@ fn remote_errors_never_become_delivery_identifiers_or_requester_state() {
 
 #[test]
 fn unchanged_reconciliation_and_all_sync_writers_bound_diagnostics() {
-    let (root, store, ask, peer) = fixture();
+    let (_root, store, ask, peer) = fixture();
     let mut snapshot = asks::snapshot(&store.snapshot().unwrap(), &ask);
     snapshot.revision = 3;
     snapshot.execution = ExecutionState::Running;
@@ -159,8 +158,7 @@ fn unchanged_reconciliation_and_all_sync_writers_bound_diagnostics() {
                 .last_error = Some(hostile_error());
         })
         .unwrap();
-    let saved: Value =
-        serde_json::from_slice(&std::fs::read(root.join("asks-v1.json")).unwrap()).unwrap();
+    let saved = serde_json::to_value(store.snapshot().unwrap()).unwrap();
     assert_diagnostic(
         saved["asks"][&ask.ask_id]["remote"]["sync"]["lastError"]
             .as_str()
@@ -174,7 +172,7 @@ fn unchanged_reconciliation_and_all_sync_writers_bound_diagnostics() {
 #[test]
 fn ordinary_unknown_and_late_snapshots_never_persist_or_display_answer_bodies() {
     for case in ["ordinary", "unknown", "late"] {
-        let (root, store, ask, peer) = fixture();
+        let (_root, store, ask, peer) = fixture();
         if case == "late" {
             store
                 .with_state(|s| {
@@ -206,7 +204,7 @@ fn ordinary_unknown_and_late_snapshots_never_persist_or_display_answer_bodies() 
                 .1,
             text.as_bytes()
         );
-        let persisted = std::fs::read_to_string(root.join("asks-v1.json")).unwrap();
+        let persisted = serde_json::to_string(&store.snapshot().unwrap()).unwrap();
         assert!(
             !persisted.contains("REMOTE_FULL_TEXT_ONLY_IN_ARTIFACT"),
             "{case}"
@@ -266,12 +264,25 @@ fn legacy_inline_late_answer_recovers_the_existing_artifact_and_rewrites_without
     remote["remoteState"] = legacy.clone();
     remote["lateAnswer"] = legacy;
     remote["sync"]["lastError"] = json!(hostile_error());
+    let database = root.join(crate::management::v2::hot_store::DATABASE_FILE);
+    for candidate in [
+        database.clone(),
+        database.with_extension("sqlite3-wal"),
+        database.with_extension("sqlite3-shm"),
+    ] {
+        match std::fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove migrated test database: {error}"),
+        }
+    }
     std::fs::write(
         root.join("asks-v1.json"),
         serde_json::to_vec_pretty(&state).unwrap(),
     )
     .unwrap();
-    let loaded = store.snapshot().unwrap();
+    let migrated = AskStore::at(&root);
+    let loaded = migrated.snapshot().unwrap();
     let late = loaded.asks[&ask.ask_id]
         .remote
         .as_ref()
@@ -281,16 +292,16 @@ fn legacy_inline_late_answer_recovers_the_existing_artifact_and_rewrites_without
         .unwrap();
     assert_eq!(late.artifact_id.as_deref(), Some(artifact.as_str()));
     assert_eq!(
-        store.read_artifact(&artifact, None).unwrap().unwrap().1,
+        migrated.read_artifact(&artifact, None).unwrap().unwrap().1,
         text.as_bytes()
     );
-    assert_metadata_views(&store, &ask.ask_id);
-    store
+    assert_metadata_views(&migrated, &ask.ask_id);
+    migrated
         .with_state(|s| {
             s.asks.get_mut(&ask.ask_id).unwrap().title = "force a persisted revision".into()
         })
         .unwrap();
-    let rewritten = std::fs::read_to_string(root.join("asks-v1.json")).unwrap();
+    let rewritten = serde_json::to_string(&migrated.snapshot().unwrap()).unwrap();
     assert!(!rewritten.contains("REMOTE_FULL_TEXT_ONLY_IN_ARTIFACT"));
     let rewritten: Value = serde_json::from_str(&rewritten).unwrap();
     let late = &rewritten["asks"][&ask.ask_id]["remote"]["lateAnswer"];

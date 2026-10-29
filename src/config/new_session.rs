@@ -32,7 +32,28 @@ pub fn resolve_profile_name(profile: &str) -> anyhow::Result<String> {
 pub fn inherited(profile: &str) -> anyhow::Result<NewSessionDefaults> {
     let accounts: AccountsStore = serde_json::from_slice(&std::fs::read(super::paths::accounts_path()?)?)?;
     let account = find_profile(&accounts, profile)?;
-    if account.cli_kind==crate::profiles::model::CliKind::Claude {return Ok(NewSessionDefaults{model:Some(account.options.claude.model.clone()),reasoning:None});}
+    match account.cli_kind {
+        crate::profiles::model::CliKind::Dsh => {
+            account.options.dsh.validate()?;
+            return Ok(NewSessionDefaults {
+                model: Some(account.options.dsh.model.clone()),
+                reasoning: account.options.dsh.reasoning_effort.clone(),
+            });
+        }
+        crate::profiles::model::CliKind::Claude => return Ok(NewSessionDefaults {
+            model: Some(account.options.claude.model.clone()), reasoning: None,
+        }),
+        crate::profiles::model::CliKind::Kimi => {
+            // r266: a Kimi-kind profile's defaults, else its account's default model.
+            let catalog = crate::profiles::kimi::profile_catalog(account);
+            let defaults = account.variants.kimi_defaults.clone().unwrap_or_default();
+            return Ok(NewSessionDefaults {
+                model: crate::profiles::kimi::profile_selected_model(account, &catalog),
+                reasoning: defaults.reasoning_effort,
+            });
+        }
+        crate::profiles::model::CliKind::Codex => {}
+    }
     let files = crate::profiles::materialize::materialized_account_files(account)?;
     let profile: toml::Value = toml::from_str(&std::fs::read_to_string(files.config_path)?)?;
     let deployment = crate::launch::local_deployment::LocalDeployment::selected()?.context("No local runtime installed")?;
@@ -47,6 +68,27 @@ fn from_tables(profile: &toml::Value, shared: &toml::Value) -> NewSessionDefault
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dsh_inherited_defaults_need_no_codex_home_or_runtime() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let mut account = crate::profiles::lifecycle::create_profile(&crate::profiles::lifecycle::NewProfile {
+            name:"DSH defaults".into(), kind:crate::profiles::lifecycle::NewProfileKind::Dsh,
+            preset:None, base_url:None, model:Some("deepseek-custom".into()), api_key:None,
+        }).unwrap();
+        account.options.dsh.reasoning_effort = Some("max".into());
+        crate::profiles::store::save_store(&crate::profiles::model::AccountsStore {
+            accounts:vec![account.clone()], ..Default::default()
+        }).unwrap();
+        for profile in [&account.id, &account.name] {
+            let defaults = super::inherited(profile).unwrap();
+            assert_eq!(defaults.model.as_deref(), Some("deepseek-custom"));
+            assert_eq!(defaults.reasoning.as_deref(), Some("max"));
+        }
+        let files = crate::profiles::materialize::materialized_account_files(&account).unwrap();
+        assert!(!files.config_path.exists());
+        assert!(!files.auth_path.exists());
+    }
+
     #[test]
     fn profiles_resolve_by_name_or_stable_id() {
         let accounts: crate::profiles::model::AccountsStore = serde_json::from_value(serde_json::json!({

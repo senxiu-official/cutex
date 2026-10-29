@@ -307,6 +307,17 @@ pub fn send_local_alarm(
     serde_json::from_value(response).context("Failed to parse alarm send response")
 }
 
+/// Enqueue a "Claude Task" notice (`agent_bus::claude_task::send_request`).
+pub fn send_claude_task_notice(config: &CodezConfig, request: &AgentBusSendRequest) -> anyhow::Result<Value> {
+    agent_bus_http_json(
+        &agent_bus_base_url(agent_bus_port(config)),
+        "POST",
+        "/api/messages/send",
+        config.agent_bus_token.as_deref(),
+        Some(&serde_json::to_vec(request)?),
+    )
+}
+
 /// Enqueue a cross-host tell (peers): a passive note with the reserved peer
 /// control record and no local sender identity (`agent_bus::peer_tell`); a
 /// permitted cross-host wake (`wake`) is `after_turn` with control type
@@ -533,7 +544,10 @@ fn mcp_response_timeout(path: &str, wait: Option<&ApprovalWaitRequest>) -> Durat
     hold + if path == "/api/agent-management/v1/actions" {
         // Fixed native Management wrapper budget; timeout is uncertain,
         // never permission to issue a replacement action identity.
-        Duration::from_secs(30)
+        AGENT_MANAGEMENT_ACTION_TIMEOUT
+    } else if path == crate::asks::short_ids::PATH {
+        // Bound read-only preflight separately from action execution.
+        Duration::from_secs(10)
     } else if path == crate::agent_bus::web_search::PATH {
         // One provider request (its own timeout) plus slack.
         crate::agent_bus::web_search::BUS_TIMEOUT
@@ -559,6 +573,12 @@ pub fn submit_mcp_control_with_wait(
     if !crate::agent_bus::agent_auth::MCP_ROUTE_PATHS.contains(&path) {
         anyhow::bail!("unsupported MCP route");
     }
+    let mut headers = wait.map(ApprovalWaitRequest::headers).unwrap_or_default();
+    if (path == "/api/agent-management/v1/actions" && body["operation"] == "create")
+        || (path == crate::asks::tools::PATH && body["tool"] == "agent_delegate") {
+        // Old daemons ignore this header and retain their synchronous receipt.
+        headers.push_str("x-cutex-action-receipt: async-v1\r\n");
+    }
     let body = serde_json::to_vec(body)?;
     if body.len() > 262144 || token.trim().is_empty() || token.contains(['\r', '\n']) {
         anyhow::bail!("invalid MCP request configuration");
@@ -572,7 +592,7 @@ pub fn submit_mcp_control_with_wait(
         "MCP",
         mcp_response_timeout(path, wait),
         Some(fence),
-        &wait.map(ApprovalWaitRequest::headers).unwrap_or_default(),
+        &headers,
     ) {
         Ok(response) => response,
         Err(error) if error.downcast_ref::<BusUnreachable>().is_some() => return Err(error),
@@ -625,7 +645,7 @@ fn submit_authenticated_agent_control_with_headers(
         format!(
             "X-Cutex-Mcp-Thread-Id: {thread}\r\nX-Cutex-Mcp-Generation: {}\r\nX-Cutex-Facade: delegations={}, {}\r\n{fenced_headers}",
             fence.generation,
-            crate::asks::tools::FACADE_DELEGATIONS,
+            crate::asks::tools::FACADE_AGENT_PAUSE,
             crate::approvals::FACADE_APPROVAL_NOTE
         )
     } else {
@@ -917,8 +937,8 @@ mod tests {
         );
         // The read timeout grows by the hold; a turn id with a line break is dropped.
         let path = "/api/agent-management/v1/actions";
-        assert_eq!(mcp_response_timeout(path, None), Duration::from_secs(30));
-        assert_eq!(mcp_response_timeout(path, Some(&wait)), Duration::from_secs(150));
+        assert_eq!(mcp_response_timeout(path, None), Duration::from_secs(120));
+        assert_eq!(mcp_response_timeout(path, Some(&wait)), Duration::from_secs(240));
         assert_eq!(mcp_response_timeout("/api/services/v1", Some(&wait)), AGENT_MANAGEMENT_ACTION_TIMEOUT + Duration::from_secs(120));
         let injected = ApprovalWaitRequest { secs: 5, turn_id: Some("t\r\nX-Evil: 1".into()) };
         assert_eq!(injected.headers(), "X-Cutex-Approval-Wait: 5\r\n");

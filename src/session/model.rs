@@ -95,7 +95,18 @@ pub enum CutexSessionRuntimeBackend {
     Docker,
     CuteAlden,
     ClaudeSubscription,
+    Dsh,
+    /// r266: Kimi Code (`kimi acp`) through cutex's ACP adapter; the record's
+    /// `dsh_session` (flavor `kimi`) holds its binding.
+    Kimi,
     Future,
+}
+
+impl CutexSessionRuntimeBackend {
+    /// The runtimes driven through cutex's ACP adapter protocol (DSH, Kimi Code).
+    pub fn is_acp(self) -> bool {
+        matches!(self, Self::Dsh | Self::Kimi)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +208,8 @@ pub fn parse_cutex_session_runtime_backend(
         }
         "claude-subscription" => Ok(CutexSessionRuntimeBackend::ClaudeSubscription),
         "future" => Ok(CutexSessionRuntimeBackend::Future),
+        "dsh" => Ok(CutexSessionRuntimeBackend::Dsh),
+        "kimi" => Ok(CutexSessionRuntimeBackend::Kimi),
         other => anyhow::bail!("unsupported runtime_backend: {other}"),
     }
 }
@@ -296,6 +309,153 @@ pub fn is_avatar_hex_color(value: &str) -> bool {
     bytes.len() == 7 && bytes[0] == b'#' && bytes[1..].iter().all(u8::is_ascii_hexdigit)
 }
 
+/// Immutable actor observed by the authorized creation path, never inferred
+/// from today's project authority or from an imported/restored session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum SessionCreatedBy {
+    Owner,
+    System,
+    Agent {
+        #[serde(rename = "cutexSessionId")]
+        cutex_session_id: crate::role_revision::CutexSessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<SessionCreatorRole>,
+    },
+}
+
+impl<'de> Deserialize<'de> for SessionCreatedBy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Empty struct variants reject extra keys; serde unit variants ignore them.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+        enum Wire {
+            Owner {},
+            System {},
+            Agent {
+                #[serde(rename = "cutexSessionId")]
+                cutex_session_id: crate::role_revision::CutexSessionId,
+                #[serde(default)]
+                role: Option<SessionCreatorRole>,
+            },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Owner {} => Self::Owner,
+            Wire::System {} => Self::System,
+            Wire::Agent { cutex_session_id, role } => Self::Agent { cutex_session_id, role },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionCreatorRole {
+    Director,
+    Member,
+}
+
+/// Explicit presentation intent. None/missing is legacy fixed assignment, not
+/// dynamic follow. Stored fixed avatars are never rewritten by Profile styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CutexSessionAvatarMode {
+    Fixed,
+    Inherit,
+}
+
+/// Durable revisions at which the presentation metadata last changed. Every
+/// change at a revision `>= since` is recorded; a field left `None` has not
+/// changed since `since`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CutexSessionMetadataChanges {
+    pub since: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Shared CAS domain for the avatar value AND avatar mode.
+    pub avatar: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<u64>,
+}
+
+impl CutexSessionMetadataChanges {
+    pub fn since(revision: u64) -> Self {
+        Self { since: revision, ..Self::default() }
+    }
+}
+
+/// Presentation-only badge with a bounded display width.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CutexSessionBadge {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tint: Option<String>,
+}
+
+pub fn validate_session_badge(badge: &CutexSessionBadge) -> Result<(), &'static str> {
+    if !valid_badge_text(&badge.text) {
+        return Err("badge.text must fit 1..4 display cells, 8 characters and 32 bytes, without whitespace, controls or invisible formatting");
+    }
+    if badge.tint.as_deref().is_some_and(|t| !["blue", "green", "amber", "pink", "violet"].contains(&t)) {
+        return Err("badge.tint must be blue, green, amber, pink or violet");
+    }
+    Ok(())
+}
+
+/// Shared session/project badge limits. Measure the whole string so combining
+/// scripts, emoji presentation selectors and emoji ZWJ sequences keep their
+/// rendered width (unicode-width), rather than summing individual scalar widths.
+/// Unicode 17 Cf/default-ignorable controls stay forbidden except contextual
+/// joiners/variation selectors needed to shape visible text.
+pub fn valid_badge_text(text: &str) -> bool {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    if text.len() > 32 || text.chars().count() > 8
+        || !(1..=4).contains(&UnicodeWidthStr::width(text))
+    {
+        return false;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut has_base = false;
+    for (index, &c) in chars.iter().enumerate() {
+        let joiner = matches!(c, '\u{200c}' | '\u{200d}');
+        let selector = matches!(c as u32,
+            0x180B..=0x180D | 0x180F | 0xFE00..=0xFE0F | 0xE0100..=0xE01EF);
+        if c.is_control() || c.is_whitespace()
+            || (!joiner && !selector && matches!(c as u32,
+                0x00AD | 0x034F | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F
+                | 0x0890..=0x0891 | 0x08E2 | 0x115F..=0x1160 | 0x17B4..=0x17B5
+                | 0x180B..=0x180F | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F
+                | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFFB
+                | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF))
+        {
+            return false;
+        }
+        let visible = UnicodeWidthChar::width(c).is_some_and(|width| width > 0);
+        // A mark/selector cannot make an invisible-only or leading-mark badge.
+        if !visible && !has_base {
+            return false;
+        }
+        if selector && index > 0 && matches!(chars[index - 1], '\u{200c}' | '\u{200d}') {
+            return false;
+        }
+        // Joiners must connect visible content, never trail a badge or form an
+        // invisible chain. Script combining marks may occur before the next base.
+        if joiner && !chars[index + 1..].iter()
+            .take_while(|&&next| !matches!(next, '\u{200c}' | '\u{200d}'))
+            .any(|&next| UnicodeWidthChar::width(next).is_some_and(|width| width > 0))
+        {
+            return false;
+        }
+        has_base |= visible;
+    }
+    has_base
+}
+
 /// Shared avatar contract check (Management validation and the store patch).
 pub fn validate_session_avatar(avatar: &CutexSessionAvatar) -> Result<(), &'static str> {
     if avatar.value.trim().is_empty()
@@ -322,6 +482,13 @@ pub struct CutexSessionRecord {
     /// Claude identity is not a Codex rollout ID or a selected OpenAI profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session: Option<crate::runtime::claude::ClaudeSession>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_session: Option<crate::runtime::dsh::DshSession>,
+    /// r265: profile + runtime variant + credential reference frozen at
+    /// creation (`profiles::runtime_variants`). Absent on older sessions,
+    /// which stay bound to their profile's primary runtime. No secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_binding: Option<crate::profiles::runtime_variants::ProfileLaunchBinding>,
     pub cutex_session_id: String,
     /// Durable specification/lifecycle revision.  Runtime occurrence changes
     /// are fenced separately by `runtime_generation`.
@@ -361,12 +528,34 @@ pub struct CutexSessionRecord {
     /// Human-chosen avatar. Presentation only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<CutexSessionAvatar>,
+    /// Explicit dynamic follow; None preserves the legacy fixed behavior.
+    /// Inherit stores no avatar and automatic avatar-only assignments refuse it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_mode: Option<CutexSessionAvatarMode>,
+    /// Creation-time provenance. Missing/null means unknown, including legacy
+    /// sessions and imports; it must never be backfilled from current roles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<SessionCreatedBy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<CutexSessionBadge>,
+    /// When `display_name_override` / `note` / `avatar` last changed (r252),
+    /// so a fenced `cutex/session/metadata/update` is refused only when a
+    /// field it writes changed after the client's revision, not for every
+    /// unrelated (often internal) write that moved the session revision.
+    /// Absent (records from older cutex, which drop it on save): unknown,
+    /// and the fence stays an exact revision match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_changes: Option<CutexSessionMetadataChanges>,
     pub host_id: String,
     pub cwd: String,
     #[serde(default)]
     pub managed_cwd: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
+    /// Last verified Codex conversation family. Clearing its profile must not
+    /// erase the compatibility boundary and permit a cross-provider rebind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_family: Option<String>,
     #[serde(default)]
     pub runtime_backend: CutexSessionRuntimeBackend,
     #[serde(default)]
@@ -437,14 +626,29 @@ pub struct CutexSessionRecord {
 }
 
 impl CutexSessionRecord {
+    /// Creation-only seed, before this new record's FIRST durable publication.
+    /// A None seed leaves unknown provenance unchanged; retries may only repeat
+    /// the exact captured actor. Do not call this to enrich a restored/imported
+    /// identity, or pass a source session's creator when making a new fork.
+    pub fn stamp_created_by_at_creation(&mut self, creator: Option<&SessionCreatedBy>) -> anyhow::Result<()> {
+        let Some(creator) = creator else { return Ok(()) };
+        if let Some(existing) = &self.created_by {
+            anyhow::ensure!(existing == creator, "session creator is immutable");
+        } else {
+            self.created_by = Some(creator.clone());
+        }
+        Ok(())
+    }
+
     /// The app-server conversation ID is distinct from the backend's native history ID.
     pub fn app_server_thread_id(&self) -> Option<&str> {
         self.claude_session.as_ref().map(|session| session.thread_id.as_str())
+            .or_else(|| self.dsh_session.as_ref().map(|session| session.thread_id.as_str()))
             .or(self.codex_session_id.as_deref())
     }
     /// Runtime ownership does not grant managed Agent identity or Project authority.
     pub fn is_owned_session(&self) -> bool {
-        (self.explicit_launch.is_some() || self.runtime_backend == CutexSessionRuntimeBackend::ClaudeSubscription) && !self.agent_enabled
+        (self.explicit_launch.is_some() || matches!(self.runtime_backend, CutexSessionRuntimeBackend::ClaudeSubscription | CutexSessionRuntimeBackend::Dsh | CutexSessionRuntimeBackend::Kimi)) && !self.agent_enabled
             && self.registration_class == crate::agent_bus::model::AgentRegistrationClass::LocalOnly
             && self.formal_agent_name.is_none()
     }
@@ -483,6 +687,9 @@ impl CutexSessionRecord {
         Ok(Self {
             explicit_launch: None,
             claude_session: None,
+            dsh_session: None,
+            profile_binding: None,
+            provider_family: None,
             cutex_session_id,
             revision: default_durable_session_revision(),
             archive_state: CutexSessionArchiveState::Active,
@@ -496,6 +703,12 @@ impl CutexSessionRecord {
             display_name_override: None,
             note: None,
             avatar: None,
+            avatar_mode: None,
+            created_by: None,
+            badge: None,
+            metadata_changes: Some(CutexSessionMetadataChanges::since(
+                default_durable_session_revision(),
+            )),
             host_id,
             cwd: crate::session::metadata::normalize_session_cwd(&cwd),
             managed_cwd: None,
@@ -862,5 +1075,115 @@ impl Serialize for StoreRevisionCell {
 impl<'de> Deserialize<'de> for StoreRevisionCell {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         u64::deserialize(deserializer).map(Self::new)
+    }
+}
+
+#[cfg(test)]
+mod badge_text_tests {
+    use super::*;
+
+    #[test]
+    fn badges_accept_emoji_presentation_joiners_and_combining_scripts() {
+        for text in ["ABCD", "中文", "🙂", "❤️", "🏳️‍🌈", "👩🏽‍💻", "👨‍👩‍👧‍👦",
+            "A\u{0301}", "a\u{0301}b\u{0301}c\u{0301}d\u{0301}", "क\u{093f}", "ن\u{064e}",
+            "क\u{094d}\u{200c}ष", "漢\u{e0100}"]
+        {
+            assert!(validate_session_badge(&CutexSessionBadge { text: text.into(), tint: None }).is_ok(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn badges_reject_bidi_hidden_only_controls_and_unbounded_text() {
+        for text in [format!("A{}", "\u{200b}".repeat(100_000)), "A\u{200d}".into(),
+            "A\u{202e}".into(), "A\u{2066}".into(), "A\u{061c}".into(), "A\u{0600}".into(),
+            "A\u{3164}".into(), "A\u{e0001}".into(), "A\u{034f}".into(), "\u{0301}".into(),
+            "\u{200d}".into(), "\u{fe0f}".into(), "\u{200d}🙂".into(), "\u{0301}A".into(),
+            "A\u{200d}\u{200d}B".into(), "A\u{200d}\u{fe0f}B".into(), "A B".into(), "A\n".into()]
+        {
+            assert!(!valid_badge_text(&text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn badge_width_is_measured_as_a_string_but_scalar_and_byte_caps_still_apply() {
+        assert!(!valid_badge_text("ABCDE"));
+        assert!(!valid_badge_text("中文A"));
+        assert!(!valid_badge_text("❤️❤️❤️"));
+        assert!(!valid_badge_text(&format!("A{}", "\u{0301}".repeat(8))));
+        assert!(!valid_badge_text("👨‍👩‍👧‍👦A\u{0301}")); // nine scalars
+        assert!(valid_badge_text("❤️❤️")); // four cells, four scalars
+        assert!(valid_badge_text("👨‍👩‍👧‍👦A")); // eight scalars, three cells
+    }
+}
+
+#[cfg(test)]
+mod created_by_tests {
+    use super::*;
+    use serde_json::{json,Value};
+
+    fn record()->CutexSessionRecord {
+        CutexSessionRecord::from_codex_session_id("018a0000-0000-7000-8000-00000000c258").unwrap()
+    }
+    fn director()->SessionCreatedBy {
+        SessionCreatedBy::Agent {cutex_session_id:crate::role_revision::CutexSessionId::new("cutex.original-director").unwrap(),role:Some(SessionCreatorRole::Director)}
+    }
+    #[test]
+    fn session_creator_old_missing_null_and_new_constructor_are_unknown() {
+        let r=record();assert!(r.created_by.is_none());
+        let mut stored=serde_json::to_value(&r).unwrap();assert!(stored.get("created_by").is_none());
+        stored["created_by"]=Value::Null;
+        let restored:CutexSessionRecord=serde_json::from_value(stored).unwrap();
+        assert!(restored.created_by.is_none());
+    }
+    #[test]
+    fn session_creator_wire_shapes_are_strict_and_capture_actual_id_and_role() {
+        for creator in [SessionCreatedBy::Owner,SessionCreatedBy::System,director(),SessionCreatedBy::Agent {
+            cutex_session_id:crate::role_revision::CutexSessionId::new("cutex.member").unwrap(),role:None,
+        }] {
+            let wire=serde_json::to_value(&creator).unwrap();
+            let loaded:SessionCreatedBy=serde_json::from_value(wire.clone()).unwrap();assert_eq!(loaded,creator);
+            if wire["kind"]=="agent" {assert!(wire["cutexSessionId"].as_str().is_some());}
+            else {assert_eq!(wire.as_object().unwrap().len(),1);}
+        }
+        assert_eq!(serde_json::to_value(director()).unwrap(),json!({"kind":"agent","cutexSessionId":"cutex.original-director","role":"director"}));
+        for bad in [json!({"kind":"owner","role":"director"}),json!({"kind":"system","cutexSessionId":"cutex.agent"}),
+            json!({"kind":"agent"}),json!({"kind":"agent","cutexSessionId":"cutex.agent","role":"operator"}),json!({"kind":"unknown"})] {
+            assert!(serde_json::from_value::<SessionCreatedBy>(bad).is_err());
+        }
+    }
+    #[test]
+    fn session_creator_is_immutable_and_ordinary_metadata_never_relabels_it() {
+        let mut r=record();let actor=director();
+        r.stamp_created_by_at_creation(Some(&actor)).unwrap();r.stamp_created_by_at_creation(Some(&actor)).unwrap();
+        r.stamp_created_by_at_creation(None).unwrap();
+        assert!(r.stamp_created_by_at_creation(Some(&SessionCreatedBy::Owner)).is_err());
+        crate::session::metadata::apply_session_metadata_patch(&mut r,&json!({"note":"updated later","createdBy":{"kind":"owner"}})).unwrap();
+        assert_eq!(r.created_by,Some(actor));
+    }
+    #[test]
+    fn session_creator_explicit_path_store_roundtrip_keeps_unknown_and_captured_origins() {
+        let root=std::env::temp_dir().join(format!("session-created-by-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();let path=root.join("cutex-sessions.json");
+        let mut store=crate::session::store::load_cutex_session_store_from_path(&path).unwrap();
+        let creators=[None,Some(SessionCreatedBy::Owner),Some(SessionCreatedBy::System),Some(director())];
+        for (n,creator) in creators.iter().enumerate() {
+            let mut r=CutexSessionRecord::new(format!("cutex.creator-{n}"),None,"host".into(),root.to_string_lossy().into(),None).unwrap();
+            r.stamp_created_by_at_creation(creator.as_ref()).unwrap();store.sessions.insert(r.cutex_session_id.clone(),r);
+        }
+        crate::session::store::save_cutex_session_store_to_path(&path,&store).unwrap();
+        let restored=crate::session::store::load_cutex_session_store_from_path(&path).unwrap();
+        for (n,creator) in creators.iter().enumerate() {assert_eq!(&restored.sessions[&format!("cutex.creator-{n}")].created_by,creator);}
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_creator_restore_roundtrip_preserves_original_role_and_fork_uses_new_actor() {
+        let mut source=record();source.stamp_created_by_at_creation(Some(&director())).unwrap();
+        let restored:CutexSessionRecord=serde_json::from_value(serde_json::to_value(&source).unwrap()).unwrap();
+        assert_eq!(restored.created_by,source.created_by);
+        let mut fork=CutexSessionRecord::from_codex_session_id("018a0000-0000-7000-8000-00000000c259").unwrap();fork.stamp_created_by_at_creation(Some(&SessionCreatedBy::Owner)).unwrap();
+        crate::session::fork::inherit_fork_avatar(&source,&mut fork);
+        assert_eq!(fork.created_by,Some(SessionCreatedBy::Owner),"new fork's creator is the action actor, never its source's creator");
+        assert_eq!(source.created_by,Some(director()));
     }
 }

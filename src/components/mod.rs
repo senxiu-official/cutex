@@ -17,6 +17,8 @@
 //! other through `upgrade.lock`.
 
 pub mod claude_runtime;
+pub mod dsh_runtime;
+pub mod kimi_runtime;
 pub mod job_service;
 
 use std::collections::BTreeMap;
@@ -116,6 +118,11 @@ pub trait Handler: Send + Sync {
     fn probe(&self, layout: &Layout, entry: &Entry) -> Value;
     /// Version -> how many sessions / selections / processes pin it.
     fn pins(&self, layout: &Layout) -> BTreeMap<String, usize>;
+    /// Destructive cleanup must not mistake an unreadable pin store for no pins.
+    /// Status-only callers may still use the best-effort `pins` view.
+    fn pins_checked(&self, layout: &Layout) -> anyhow::Result<BTreeMap<String, usize>> {
+        Ok(self.pins(layout))
+    }
     /// `Ok` when a restart / replacement is harmless now, else the reason.
     fn restart_gate(&self, layout: &Layout) -> Result<(), String>;
 }
@@ -124,7 +131,7 @@ pub trait Handler: Send + Sync {
 pub fn handlers() -> Vec<Box<dyn Handler>> {
     #[allow(unused_mut)]
     let mut list: Vec<Box<dyn Handler>> =
-        vec![Box::new(job_service::JobService::default()), Box::new(claude_runtime::ClaudeRuntime::default())];
+        vec![Box::new(job_service::JobService::default()), Box::new(claude_runtime::ClaudeRuntime::default()), Box::new(dsh_runtime::DshRuntime::default()), Box::new(kimi_runtime::KimiRuntime::default())];
     #[cfg(test)]
     TEST_HANDLER.with(|extra| list.extend(extra.borrow().map(|make| make())));
     list
@@ -267,7 +274,7 @@ fn installed_versions(layout: &Layout, name: &str) -> Vec<String> {
         .flatten()
         .filter(|e| e.path().join(RECEIPT_FILE).is_file())
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .filter(|v| valid_label(v))
+        .filter(|v| valid_label(v) && !v.contains(INCOMPLETE_MARK))
         .collect();
     versions.sort_by(|a, b| crate::upgrade::manifest::compare_releases(a, b));
     versions
@@ -415,8 +422,62 @@ fn place(handler: &dyn Handler, files: &Path, target: &Path, origin: &str, versi
     std::fs::rename(files, target).with_context(|| format!("move {} to {}", files.display(), target.display()))
 }
 
+/// A version dir moved aside by [`repair_incomplete`] is renamed to
+/// `<version>.incomplete-<UTC timestamp>` (never listed, pruned or reused).
+pub const INCOMPLETE_MARK: &str = ".incomplete-";
+
+/// Why an existing version dir is not a complete unpacked version, `None` when
+/// it is: no `receipt.json` (the unpack never finished, or only a `prepared/`
+/// marker was written into a dir that did not exist yet), or a file the
+/// handler requires or the receipt lists is missing. Contents are not hashed
+/// here (`verify_file` does that before any start).
+pub fn incomplete_reason(handler: &dyn Handler, dir: &Path) -> Option<String> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let Some(receipt) = read_receipt(dir) else {
+        return Some(format!("{} has no {RECEIPT_FILE} (it was never completely unpacked)", dir.display()));
+    };
+    let missing = handler
+        .required_files()
+        .iter()
+        .map(|file| file.to_string())
+        .chain(receipt.files.keys().cloned())
+        .find(|file| !dir.join(file).is_file())?;
+    Some(format!("{} lacks {missing}", dir.display()))
+}
+
+/// Where [`repair_incomplete`] moves `dir`: a dated sibling that is not taken yet.
+fn incomplete_path(dir: &Path) -> PathBuf {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let base = format!("{}{INCOMPLETE_MARK}{stamp}", dir.file_name().and_then(|n| n.to_str()).unwrap_or("version"));
+    let mut path = dir.with_file_name(&base);
+    let mut n = 2;
+    while path.exists() {
+        path = dir.with_file_name(format!("{base}-{n}"));
+        n += 1;
+    }
+    path
+}
+
+/// An incomplete version dir ([`incomplete_reason`]) is moved aside to
+/// `<version>.incomplete-<ts>` (kept for inspection, never deleted) so that the
+/// version can be downloaded and unpacked again. Returns `{movedAside, reason}`
+/// when it moved one; `dry_run` only reports where it would go.
+pub fn repair_incomplete(handler: &dyn Handler, dir: &Path, dry_run: bool) -> anyhow::Result<Option<Value>> {
+    let Some(reason) = incomplete_reason(handler, dir) else { return Ok(None) };
+    let aside = incomplete_path(dir);
+    if !dry_run {
+        progress("repair");
+        std::fs::rename(dir, &aside).with_context(|| format!("move the incomplete {} aside to {} ({reason})", dir.display(), aside.display()))?;
+    }
+    Ok(Some(json!({ "movedAside": aside, "reason": reason, "dryRun": dry_run })))
+}
+
 /// `<base>/components/<name>/<version>/` for a signed offer: present (same
-/// archive) or downloaded from the configured source and unpacked.
+/// archive) or downloaded from the configured source and unpacked. An
+/// incomplete dir in the way is moved aside first ([`repair_incomplete`]); a
+/// complete one from another archive is refused.
 pub fn fetch(layout: &Layout, handler: &dyn Handler, offer: &Offer) -> anyhow::Result<PathBuf> {
     fetch_with(layout, handler, offer, None)
 }
@@ -425,6 +486,7 @@ pub fn fetch(layout: &Layout, handler: &dyn Handler, offer: &Offer) -> anyhow::R
 pub fn fetch_with(layout: &Layout, handler: &dyn Handler, offer: &Offer, source: Option<&crate::upgrade::source::Source>) -> anyhow::Result<PathBuf> {
     let name = &handler.metadata().name;
     let target = version_dir(layout, name, &offer.version);
+    repair_incomplete(handler, &target, false)?;
     if target.exists() {
         let receipt = read_receipt(&target);
         ensure!(
@@ -472,6 +534,7 @@ fn fetch_source(layout: &Layout, handler: &dyn Handler, checkout: &Path) -> anyh
         }
         let version = format!("{}-source-{}", handler.metadata().version, &crate::upgrade::manifest::sha256_hex(digest.as_bytes())[..12]);
         let target = version_dir(layout, &name, &version);
+        repair_incomplete(handler, &target, false)?;
         if !target.exists() {
             place(handler, &files, &target, ORIGIN_SOURCE, &version, None)?;
         }
@@ -518,6 +581,7 @@ pub fn install_with(
             json!({ "name": name }),
         ));
     }
+    let mut repaired = None;
     let (version, dir, origin) = match &request.from_source {
         Some(checkout) => {
             ensure!(!request.dry_run, "--from-source has no dry run (it builds)");
@@ -530,11 +594,9 @@ pub fn install_with(
                     "this cutex release has no signed manifest (source install): use `cutex component install {name} --from-source <checkout>`"
                 ), json!({ "name": name }))
             })?;
-            let offer = offer(&manifest, &name).ok_or_else(|| {
-                UpgradeError::boxed(409, "component_not_in_release", format!(
-                    "cutex release {} does not ship {name} for {}; update cutex", manifest.cutex.release, platform_key()
-                ), json!({ "name": name }))
-            })?;
+            let offer = offer(&manifest, &name).ok_or_else(|| not_offered(&manifest, &name))?;
+            // Before the fetch, so the result says what was moved aside (fetch repairs too).
+            repaired = repair_incomplete(handler, &version_dir(layout, &name, &offer.version), request.dry_run)?;
             let dir = if request.dry_run { version_dir(layout, &name, &offer.version) } else { fetch(layout, handler, &offer)? };
             (offer.version, dir, ORIGIN_SIGNED)
         }
@@ -549,7 +611,11 @@ pub fn install_with(
             progress("select");
         }
         let selected = handler.select(&ctx)?;
-        Ok(json!({ "version": version, "origin": origin, "prepare": prepared, "select": selected }))
+        let mut out = json!({ "version": version, "origin": origin, "prepare": prepared, "select": selected });
+        if let Some(repaired) = &repaired {
+            out["repaired"] = repaired.clone();
+        }
+        Ok(out)
     })();
     if !request.dry_run {
         match &result {
@@ -569,6 +635,38 @@ pub fn install_with(
     }
     let result = result?;
     Ok(json!({ "component": status_of(Some(layout), keys, handler, None), "result": result }))
+}
+
+/// Why the release manifest offers no `name` archive for this platform:
+/// `component_no_platform_package` when the release ships the component for
+/// other platforms only (component.json may list a platform the release
+/// builds do not package, e.g. darwin-arm64: source installs only), else
+/// `component_not_in_release`.
+fn not_offered(manifest: &ReleaseManifest, name: &str) -> anyhow::Error {
+    let release = &manifest.cutex.release;
+    let platform = platform_key();
+    match manifest.components.get(name) {
+        Some(part) => {
+            let packaged: Vec<&String> = part.artifacts.keys().collect();
+            UpgradeError::boxed(
+                409,
+                "component_no_platform_package",
+                format!(
+                    "cutex release {release} has no {name} {} package for {platform} (this platform; packages: {}). \
+                     Install it from a cutex checkout instead: `cutex component install {name} --from-source <checkout>`",
+                    part.version,
+                    if packaged.is_empty() { "none".to_string() } else { packaged.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", ") },
+                ),
+                json!({ "name": name, "version": part.version, "platform": platform, "packaged": packaged }),
+            )
+        }
+        None => UpgradeError::boxed(
+            409,
+            "component_not_in_release",
+            format!("cutex release {release} does not ship {name} for {platform}; update cutex"),
+            json!({ "name": name }),
+        ),
+    }
 }
 
 /// Remove `name`: deselect (stop, unregister, unselect for new agents).
@@ -619,7 +717,7 @@ pub fn prune(layout: Option<&Layout>, keys: &[PublicKey], name: &str, dry_run: b
     let layout = managed(layout)?;
     let _lock = if dry_run { None } else { acquire(layout, &Lock::Acquire)? };
     let selected = installed(layout, name).map(|e| e.selected);
-    let pins = handler.pins(layout);
+    let pins = handler.pins_checked(layout)?;
     let mut named = std::collections::BTreeSet::new();
     let record = layout.read_install().ok();
     for release in [layout.active_release().ok(), record.and_then(|r| r.previous_release)].into_iter().flatten() {
@@ -714,8 +812,19 @@ pub fn status_of(layout: Option<&Layout>, keys: &[PublicKey], handler: &dyn Hand
         "detail": probe,
         "error": entry.as_ref().and_then(|e| e.last_error.clone()),
     });
+    if meta.name == dsh_runtime::NAME {
+        view["dsh"] = view.pointer("/detail/dsh").cloned().unwrap_or_else(dsh_runtime::status_requirements);
+    }
+    if meta.name == kimi_runtime::NAME {
+        view["kimi"] = view.pointer("/detail/kimi").cloned().unwrap_or_else(kimi_runtime::requirements);
+    }
     if state == states::NEEDS_USER {
         view["steps"] = probe.get("steps").cloned().unwrap_or_else(|| json!([]));
+    }
+    if meta.name == claude_runtime::NAME {
+        view["claudeCli"] = probe
+            .get("claudeCli")
+            .map_or(Value::Null, claude_runtime::cli_choice_wire);
     }
     view
 }

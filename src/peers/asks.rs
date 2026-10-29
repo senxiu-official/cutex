@@ -178,7 +178,11 @@ pub fn gate_inputs(
     world: &dyn SchedulerWorld,
     ask: &AskRecord,
 ) -> std::result::Result<crate::asks::gate::GateInputs, AskError> {
-    let mut inputs = world.gate_inputs(ask.requester.session(), &ask.target_cutex_session_id)?;
+    // A local ask is gated with who stands behind it now (design 044): the
+    // handover controller's caps and reach, else the original requester; an
+    // unknown handover is an error (the scheduler keeps the ask queued).
+    let controller = ask.controller()?;
+    let mut inputs = world.gate_inputs(controller.as_deref(), &ask.target_cutex_session_id)?;
     if let Requester::Peer {
         peer_id,
         cutex_session_id,
@@ -248,7 +252,7 @@ pub fn receive(store: &AskStore, peer: &Peer, id: &str, request: Create) -> Resu
     ) {
         return Err(Error::new("remote_unsupported", 400));
     }
-    let state = store.snapshot()?;
+    let state = store.lookup_snapshot(&[id])?;
     if let Some((owner, _)) = state.peer_cancellations.get(id) {
         return Err(Error::new(
             if owner == &peer.peer_id {
@@ -327,7 +331,10 @@ pub fn receive(store: &AskStore, peer: &Peer, id: &str, request: Create) -> Resu
         &crate::asks::gate::ask_facts(&provisional),
         &inputs,
     ));
-    store.with_state(|state| -> Result<()> {
+    crate::asks::routing_policy::integration::with_authority(|authority| {
+    let controllers=crate::asks::routing_policy::integration::ControllerView::load(authority)?;
+    let routing_host=crate::asks::routing_policy::integration::local_host_id();
+    store.with_records(&[id],|state| -> Result<()> {
         if state.peer_cancellations.contains_key(id) {
             return Err(Error::new("ask_gone", 410));
         }
@@ -366,13 +373,18 @@ pub fn receive(store: &AskStore, peer: &Peer, id: &str, request: Create) -> Resu
                 return Err(from_ask(e));
             }
         }
-        let (mut ask, _) = state.create_ask(new, now).map_err(from_ask)?;
+        let mut next = state.clone();
+        let (mut ask, _) = next.create_ask(new, now).map_err(from_ask)?;
         ask.hops = inbound.request.hops;
         ask.peer_inbound = Some(inbound);
-        state.asks.insert(id.into(), ask);
+        crate::asks::routing_policy::integration::register_created(&mut next, authority, &mut ask,
+            &routing_host, Some(&peer.host_id), now,&controllers).map_err(from_ask)?;
+        next.asks.insert(id.into(), ask);
+        *state = next;
         Ok(())
-    })??;
-    let state = store.snapshot()?;
+    }).map_err(|e| AskError::new("persistence_unavailable",format!("{e:#}")))?.map_err(ask_error)
+    }).map_err(from_ask)?;
+    let state = store.lookup_snapshot(&[id])?;
     Ok(serde_json::to_value(super::wire::WireSnapshotV1::from(
         &snapshot(&state, &state.asks[id]),
     ))?)
@@ -452,14 +464,14 @@ pub fn apply(store: &AskStore, peer: &Peer, mut snapshot: Snapshot) -> Result<()
             .as_deref()
             .map(super::model::sanitize_diagnostic);
     }
-    let state = store.snapshot()?;
+    let state = store.lookup_snapshot(&[&snapshot.ask_id])?;
     let ask = state
         .asks
         .get(&snapshot.ask_id)
         .filter(|a| a.remote.as_ref().is_some_and(|r| r.peer_id == peer.peer_id))
         .ok_or_else(|| Error::new("ask_not_found", 404))?;
     if snapshot.revision <= ask.remote.as_ref().unwrap().sync.last_remote_revision {
-        return store.with_state(|state| acknowledge_unchanged_snapshot(state, peer, &snapshot))?;
+        return store.with_records(&[&snapshot.ask_id],|state| acknowledge_unchanged_snapshot(state, peer, &snapshot))?;
     }
     let readers: Vec<_> = ask
         .requester
@@ -479,7 +491,7 @@ pub fn apply(store: &AskStore, peer: &Peer, mut snapshot: Snapshot) -> Result<()
             )
         })
         .transpose()?;
-    store.with_state(|state| -> Result<()> {
+    store.with_records(&[&snapshot.ask_id],|state| -> Result<()> {
         let Some(ask) = state.asks.get(&snapshot.ask_id).cloned() else {
             return Err(Error::new("ask_not_found", 404));
         };
@@ -662,6 +674,23 @@ pub fn delegate(
     options: AskOptions,
     action_id: &str,
 ) -> std::result::Result<Value, AskError> {
+    delegate_fenced(ctx,target,text,title,options,action_id,None)
+}
+
+/// A role-addressed tool already holds the authority fence. Ordinary peer
+/// enqueue tries the fence once and reports no write while lifecycle is busy;
+/// it must not block a worker lifecycle may be joining. Outbox enqueue remains
+/// inside the same scope/role ordering, with no transport under a nested fence.
+pub fn delegate_fenced(
+    ctx: &crate::asks::tools::ToolContext<'_>, target: &str, text: &str,
+    title: Option<String>, options: AskOptions, action_id: &str,
+    authority: Option<&crate::agent_management::AgentManagementSnapshot>,
+) -> std::result::Result<Value, AskError> {
+    let Some(authority)=authority else {
+        return crate::asks::routing_policy::integration::try_with_authority_for_world(ctx.world,|snapshot|
+            delegate_fenced(ctx,target,text,title,options,action_id,Some(snapshot)))?
+            .ok_or_else(||AskError::new("routing_authority_busy","Lifecycle transition in progress; no peer delegation was enqueued. Retry the same action ID."));
+    };
     let result = (|| -> Result<Value> {
         if text.trim().is_empty() || text.len() > crate::asks::INLINE_BRIEF_MAX_BYTES {
             return Err(Error::new("remote_unsupported", 400));
@@ -729,7 +758,7 @@ pub fn delegate(
             parent_ask: parent,
             gate: None,
         };
-        let (ask, created) = ctx.store.with_state(|s| -> Result<(AskRecord, bool)> {
+        let (ask, created) = ctx.store.with_new_ask_state(&new,|s| -> Result<(AskRecord, bool)> {
             if s.asks
                 .values()
                 .filter(|a| {
@@ -752,7 +781,10 @@ pub fn delegate(
                 }
                 return Ok((a.clone(), false));
             }
-            let (mut a, created) = s.create_ask(new, ctx.now).map_err(from_ask)?;
+            crate::asks::routing_policy::integration::configure_test_world(s,ctx.world,ctx.now).map_err(from_ask)?;
+            crate::asks::routing_policy::integration::check_peer_source(authority,s,&directory,ctx.caller,
+                &crate::asks::routing_policy::integration::local_host_id()).map_err(from_ask)?;
+            let (mut a, created) = s.create_ask(new.clone(), ctx.now).map_err(from_ask)?;
             a.hops = hops;
             a.hold = Some(Hold::PeerUnreachable);
             a.remote = Some(Remote {
@@ -872,7 +904,7 @@ pub fn receive_op(store: &AskStore, peer: &Peer, id: &str, op: Op) -> Result<()>
     {
         return Err(Error::new("remote_unsupported", 400));
     }
-    store.with_state(|s| -> Result<()> {
+    store.with_records(&[id],|s| -> Result<()> {
         if !s.asks.contains_key(id) && op.op == "close" && op.outcome.as_deref() != Some("accepted")
         {
             if let Some((owner, old)) = s.peer_cancellations.get(id) {

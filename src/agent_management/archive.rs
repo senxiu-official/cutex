@@ -6,11 +6,22 @@ use crate::session::{archive::record_has_runtime_claim, model::CutexSessionRecor
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+#[path = "archive_policy.rs"]
+mod policy;
+pub use policy::*;
+#[path = "permanent_archive.rs"]
+mod permanent;
+pub use permanent::*;
+#[path = "archive_transaction.rs"]
+mod transaction;
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentArchiveOperation {
     Archive,
     Restore,
+    /// Accepted only by the dedicated owner confirmation entry.
+    PermanentRetire,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -23,6 +34,7 @@ pub struct AgentArchiveReviewRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("archive_r264_tests.rs");
     use crate::session::store::{
         load_cutex_session_store_from_path, save_cutex_session_store_to_path,
     };
@@ -719,6 +731,7 @@ pub enum AgentArchiveStage {
     Committed,
     StoppedNotArchived,
     Uncertain,
+    PermanentRetirementCommitted,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -730,11 +743,30 @@ pub struct AgentArchiveReceipt {
     pub result: Option<CutexSessionRecord>,
     pub error: Option<String>,
     pub committed_at: crate::role_revision::Rfc3339,
+    #[serde(default, rename = "archiveKind", skip_serializing_if = "Option::is_none")]
+    pub archive_kind: Option<AgentArchiveKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restorable: Option<bool>,
 }
 
 /// Runtime hooks around the durable transition. Callers normally stop the
 /// runtime before archiving; `stop_and_verify`/`verify_offline` then only
 /// confirm that nothing is left running for this agent.
+// Internal occurrence proof; never accepted from the archive wire request.
+pub(super) struct ReviewedArchiveOccurrence { generation: u64, thread: Option<String> }
+impl ReviewedArchiveOccurrence {
+    fn validate(&self, record: &CutexSessionRecord) -> anyhow::Result<()> {
+        anyhow::ensure!(record.runtime_generation == self.generation
+            && record.app_server_thread_id() == self.thread.as_deref(),
+            "archive_confirmation_occurrence_changed");
+        Ok(())
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static AFTER_ARCHIVE_AUTHORIZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+}
+
 pub trait AgentArchiveRuntime {
     fn prepare(&mut self, record: &CutexSessionRecord, restoring: bool) -> anyhow::Result<()>;
     fn stop_and_verify(&mut self, record: &CutexSessionRecord) -> anyhow::Result<()>;
@@ -764,6 +796,16 @@ impl AgentArchiveBlockers {
 
 fn conflict(code: &'static str) -> AgentManagementError {
     AgentManagementError::Conflict(code)
+}
+
+/// Replaying an old archive after Restore must not stop the new delegations.
+pub(super) fn settle_archive_if_current(path: &Path, receipt: &AgentArchiveReceipt) {
+    let Some(saved) = receipt.result.as_ref() else { return };
+    let Ok(sessions) = crate::session::store::load_cutex_session_store_from_path(path) else { return };
+    if sessions.sessions.get(&saved.cutex_session_id).is_some_and(|current|
+        current.is_retired() && current.durable_revision() == saved.durable_revision()) {
+        crate::asks::lifecycle::settle_retired_target_default(&saved.cutex_session_id);
+    }
 }
 
 fn project_is_active(state: &AgentManagementSnapshot, project: &ProjectId) -> bool {
@@ -813,7 +855,7 @@ pub(super) fn runtime_guard(
     id: &CutexSessionId,
 ) -> Result<Option<ProjectId>, AgentManagementError> {
     let agent = state.agents.get(id);
-    if agent.is_some_and(|a| a.retired_at.is_some()) {
+    if is_permanently_retired(state, id) {
         return Err(conflict("permanent_retirement_is_not_runnable"));
     }
     Ok(agent
@@ -842,7 +884,7 @@ pub(super) fn guard(
         return Err(conflict("archive_requires_explicit_operator_revoke"));
     }
     let agent = state.agents.get(id);
-    if agent.is_some_and(|a| a.retired_at.is_some()) {
+    if is_permanently_retired(state, id) {
         return Err(conflict("permanent_retirement_is_not_restorable"));
     }
     let project = agent.and_then(|a| current_project_id(state, a));
@@ -900,6 +942,9 @@ impl AgentManagementProvider {
         id: &CutexSessionId,
         operation: AgentArchiveOperation,
     ) -> Result<AgentArchiveReview, AgentManagementError> {
+        if operation == AgentArchiveOperation::PermanentRetire {
+            return Err(conflict("permanent_retirement_requires_owner_confirmation"));
+        }
         let state = self.store().snapshot()?;
         let sessions = crate::session::store::load_cutex_session_store_from_path(path)
             .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
@@ -913,10 +958,11 @@ impl AgentManagementProvider {
         {
             return Err(conflict("requires_exact_persistent_durable_agent"));
         }
-        if operation == AgentArchiveOperation::Restore
-            && state.agents.get(id).is_some_and(|a| a.retired_at.is_some())
-        {
+        if is_permanently_retired(&state, id) {
             return Err(conflict("permanent_retirement_is_not_restorable"));
+        }
+        if operation == AgentArchiveOperation::Restore && policy::legacy_archive_ambiguous(&state, record) {
+            return Err(conflict("legacy_close_requires_owner_review"));
         }
         if record.is_retired() != (operation == AgentArchiveOperation::Restore) {
             return Err(conflict("archive_state_conflict"));
@@ -981,28 +1027,56 @@ impl AgentManagementProvider {
         request: &AgentArchiveRequest,
         runtime: &mut dyn AgentArchiveRuntime,
     ) -> Result<AgentArchiveReceipt, AgentManagementError> {
-        let receipt = self.execute_agent_archive_guarded(principal, path, request, runtime)?;
-        if request.review.operation == AgentArchiveOperation::Archive
+        let _ = principal;
+        self.execute_authorized_agent_archive(path, request, runtime, |_, _, _| Ok(()))
+    }
+
+    /// Authenticate and authorize the caller under execution/mutation locks,
+    /// before receipt disclosure or effects. Agents never manufacture an owner.
+    pub(crate) fn execute_authorized_agent_archive(
+        &self, path: &Path, request: &AgentArchiveRequest,
+        runtime: &mut dyn AgentArchiveRuntime,
+        authorize: impl FnOnce(&AgentManagementSnapshot, &CutexSessionId, AgentArchiveOperation) -> Result<(), AgentManagementError>,
+    ) -> Result<AgentArchiveReceipt, AgentManagementError> {
+        if request.review.operation == AgentArchiveOperation::PermanentRetire {
+            return Err(AgentManagementError::Unauthorized);
+        }
+        let receipt = self.execute_agent_archive_guarded(path, request, runtime, None, authorize)?;
+        if receipt.request.review.operation == AgentArchiveOperation::Archive
             && receipt.stage == AgentArchiveStage::Committed
         {
-            crate::asks::lifecycle::settle_retired_target_default(
-                request.review.cutex_session_id.as_str(),
-            );
+            settle_archive_if_current(path, &receipt);
         }
         Ok(receipt)
     }
 
     fn execute_agent_archive_guarded(
         &self,
-        _principal: &HumanManagementPrincipal,
         path: &Path,
         request: &AgentArchiveRequest,
         runtime: &mut dyn AgentArchiveRuntime,
+        occurrence: Option<&ReviewedArchiveOccurrence>,
+        authorize: impl FnOnce(&AgentManagementSnapshot, &CutexSessionId, AgentArchiveOperation) -> Result<(), AgentManagementError>,
     ) -> Result<AgentArchiveReceipt, AgentManagementError> {
         let _execution = super::provider::provider_execution_lock()
             .lock()
             .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
         let _mutation = self.store().lock_mutations()?;
+        authorize(&self.store().snapshot()?, &request.review.cutex_session_id, request.review.operation)?;
+        #[cfg(test)]
+        AFTER_ARCHIVE_AUTHORIZE.with(|hook| { if let Some(run) = hook.borrow_mut().take() { run(); } });
+        self.execute_agent_archive_under_locks(path, request, runtime, occurrence)
+    }
+
+    /// Caller holds execution/mutation locks. Settle asks only after releasing them.
+    pub(super) fn execute_agent_archive_under_locks(
+        &self, path: &Path, request: &AgentArchiveRequest,
+        runtime: &mut dyn AgentArchiveRuntime,
+        occurrence: Option<&ReviewedArchiveOccurrence>,
+    ) -> Result<AgentArchiveReceipt, AgentManagementError> {
+        if let Some(receipt) = self.store().snapshot()?.agent_archive_actions.get(&request.action_id) {
+            validate_archive_replay_target(request, receipt)?;
+        }
         if let Some(receipt) = self
             .store()
             .snapshot()?
@@ -1031,160 +1105,22 @@ impl AgentManagementProvider {
             })
             .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
         if let Some(receipt) = committed {
+            validate_archive_replay_target(request, &receipt)?;
             self.save_agent_archive_receipt(&receipt)?;
             return Ok(receipt);
         }
         if launch_claimed {
             return Err(conflict("archive_runtime_launch_in_progress"));
         }
-        self.execute_agent_archive_locked(path, request, runtime)
+        self.execute_agent_archive_locked(path, request, runtime, occurrence)
     }
 
-    fn execute_agent_archive_locked(
-        &self,
-        path: &Path,
-        request: &AgentArchiveRequest,
-        runtime: &mut dyn AgentArchiveRuntime,
-    ) -> Result<AgentArchiveReceipt, AgentManagementError> {
-        let state = self.store().snapshot()?;
-        let digest = super::store::request_sha256(request)?;
-        if let Some(receipt) = state.agent_archive_actions.get(&request.action_id) {
-            if matches!(
-                receipt.stage,
-                AgentArchiveStage::Committed | AgentArchiveStage::StoppedNotArchived
-            ) {
-                return Ok(receipt.clone());
-            }
-        }
-        let id = &request.review.cutex_session_id;
-        let restoring = request.review.operation == AgentArchiveOperation::Restore;
-        if restoring {
-            if state.agents.get(id).is_some_and(|a| a.retired_at.is_some()) {
-                return Err(conflict("permanent_retirement_is_not_restorable"));
-            }
-        } else if let Some(blocked) = archive_blockers_in(&state, id).conflict() {
-            return Err(blocked);
-        }
-        let outcome = crate::session::store::with_locked_session_store(path, |sessions| {
-            // Final receipt and durable transition are one atomic file write.
-            if let Some(committed) = sessions
-                .agent_archive_receipts
-                .get(request.action_id.as_str())
-            {
-                self.save_agent_archive_receipt(committed)?;
-                return Ok(committed.clone());
-            }
-            let before = sessions
-                .sessions
-                .get(id.as_str())
-                .ok_or_else(|| anyhow::anyhow!("durable_agent_missing"))?
-                .clone();
-            anyhow::ensure!(
-                before.agent_enabled
-                    && before.registration_class
-                        == crate::agent_bus::model::AgentRegistrationClass::Persistent,
-                "requires_exact_persistent_durable_agent"
-            );
-            anyhow::ensure!(
-                before.app_server_launch_claim_id.is_none(),
-                "archive_runtime_launch_in_progress"
-            );
-            let revision = before.durable_revision();
-            if restoring {
-                crate::session::archive::validate_restore_preconditions(&before, revision)?;
-                if let Some(holder) =
-                    crate::session::metadata::live_formal_name_holder(sessions, &before)
-                {
-                    return Err(crate::session::archive::CutexSessionArchiveError::AgentNameTaken {
-                        name: before.formal_agent_name.clone().unwrap_or_default(),
-                        holder: holder.cutex_session_id.clone(),
-                    }
-                    .into());
-                }
-            } else {
-                crate::session::archive::validate_retire_preconditions(
-                    &before,
-                    revision,
-                    before.runtime_generation,
-                )?;
-            }
-            runtime.prepare(&before, restoring)?;
-            let mut receipt = AgentArchiveReceipt {
-                request: request.clone(),
-                request_sha256: digest,
-                stage: AgentArchiveStage::Prepared,
-                result: None,
-                error: None,
-                committed_at: super::store::now(),
-            };
-            self.save_agent_archive_receipt(&receipt)?;
-            if !restoring {
-                if let Err(error) = runtime.stop_and_verify(&before) {
-                    receipt.stage = AgentArchiveStage::Uncertain;
-                    receipt.error = Some(format!("stop_not_proven: {error:#}"));
-                    self.save_agent_archive_receipt(&receipt)?;
-                    return Ok(receipt);
-                }
-                receipt.stage = AgentArchiveStage::Stopped;
-                receipt.result = Some(before.clone());
-                self.save_agent_archive_receipt(&receipt)?;
-            }
-            if let Err(error) = runtime.verify_offline(&before) {
-                receipt.stage = AgentArchiveStage::StoppedNotArchived;
-                receipt.error = Some(format!("stopped_not_archived: {error:#}"));
-                self.save_agent_archive_receipt(&receipt)?;
-                return Ok(receipt);
-            }
-            crate::session::runtime_reconciliation::clear_cutex_session_runtime_record(
-                sessions,
-                id.as_str(),
-                true,
-            )?;
-            let record = sessions
-                .sessions
-                .get_mut(id.as_str())
-                .expect("locked exact record");
-            if restoring {
-                crate::session::archive::commit_restore(
-                    record,
-                    revision,
-                    receipt.committed_at.as_str().to_string(),
-                )?;
-            } else {
-                crate::session::archive::commit_retire(
-                    record,
-                    revision,
-                    before.runtime_generation,
-                    true,
-                    receipt.committed_at.as_str().to_string(),
-                )?;
-            }
-            anyhow::ensure!(
-                !record_has_runtime_claim(record),
-                "archive_runtime_claim_remaining"
-            );
-            receipt.stage = AgentArchiveStage::Committed;
-            receipt.result = Some(record.clone());
-            sessions
-                .agent_archive_receipts
-                .insert(request.action_id.to_string(), receipt.clone());
-            if let Err(error) = crate::session::store::save_locked_session_store(path, sessions) {
-                receipt.stage = AgentArchiveStage::Uncertain;
-                receipt.error = Some(format!(
-                    "durable_commit_uncertain_replay_same_action: {error:#}"
-                ));
-            }
-            self.save_agent_archive_receipt(&receipt)?;
-            Ok(receipt)
-        });
-        outcome.map_err(|error| AgentManagementError::OwnerActionRequired(error.to_string()))
-    }
-
-    fn save_agent_archive_receipt(
+    pub(super) fn save_agent_archive_receipt(
         &self,
         receipt: &AgentArchiveReceipt,
     ) -> Result<(), AgentManagementError> {
         self.store().with_state(true, |mut state| {
+            policy::mark_archive_reader_requirement(&mut state);
             let key = format!("{}/{:?}", receipt.request.action_id, receipt.stage);
             state
                 .agent_archive_audit
@@ -1197,3 +1133,7 @@ impl AgentManagementProvider {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "archive_r263_compat_tests.rs"]
+mod r263_compat_tests;

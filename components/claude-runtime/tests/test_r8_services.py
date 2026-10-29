@@ -339,3 +339,78 @@ async def test_native_view_stays_display_only_and_event_type_remains_exact(h):
     turn_id = h.store.input_status(tid, 'message')['turnId']
     item = next(item for item in h.store.items(turn_id) if item['id'] == 'message')
     assert json.loads(item['output'])['type'] == 'agent_message'
+
+
+async def interrupted_turn_with_note(h, service, tid, *, answered):
+    """A passive note read into a subscription turn that ends interrupted."""
+    note = envelope(tid, 'note', passive=True)
+    await invoke(service, h, 'submit', note, after=False)
+    await invoke(service, h, 'submit', envelope(tid, 'wake'), after=False)
+    record = h.store.claim(tid)
+    assert h.store.pending_notes(tid) == 0
+    assert any(item['id'] == 'note' for item in h.store.items(record['turn_id']))
+    if answered:
+        h.store.put_item(record['turn_id'], {'type': 'agentMessage', 'id': 'answer', 'text': 'partial'})
+    h.store.finish(tid, record['turn_id'], 'interrupted')
+    return note, record['turn_id']
+
+
+async def test_native_subscription_note_in_an_unanswered_interrupted_turn_is_released(h):
+    tid = await h.thread()
+    service = install(h, subscription=True)
+    note, turn = await interrupted_turn_with_note(h, service, tid, answered=False)
+    await service.observe_event(tid, 'turn/completed', {'threadId': tid, 'turn': h.store.turn(turn)})
+    status = service._status(tid, 'note', note['semanticSha256'])
+    assert status['deliveryState'] == 'pending' and status['receipt'] is None
+    # Deliverable again: the next turn (a wake) reads it, once.
+    assert h.store.pending_notes(tid) == 1
+    assert not any(item['id'] == 'note' for item in h.store.items(turn))
+    h.store.db.execute('UPDATE threads SET halted=0 WHERE id=?', (tid,))
+    await invoke(service, h, 'submit', envelope(tid, 'wake-2'), after=False)
+    again = h.store.claim(tid)
+    assert again['turn_id'] != turn and h.store.pending_notes(tid) == 0
+    assert any(item['id'] == 'note' for item in h.store.items(again['turn_id']))
+    await service.observe_event(tid, 'claude/input/contextPersisted', {'threadId': tid, 'turnId': again['turn_id'], 'messageId': 'wake-2'})
+    persisted = service._status(tid, 'note', note['semanticSha256'])
+    assert persisted['deliveryState'] == 'context_persisted' and persisted['receipt']['turnId'] == again['turn_id']
+    h.store.finish(tid, again['turn_id'], 'completed')
+
+
+async def test_native_subscription_note_in_an_answered_interrupted_turn_is_acknowledged(h):
+    tid = await h.thread()
+    service = install(h, subscription=True)
+    note, turn = await interrupted_turn_with_note(h, service, tid, answered=True)
+    await service.observe_event(tid, 'turn/completed', {'threadId': tid, 'turn': h.store.turn(turn)})
+    status = service._status(tid, 'note', note['semanticSha256'])
+    assert status['deliveryState'] == 'context_persisted' and status['receipt']['turnId'] == turn
+    assert h.store.pending_notes(tid) == 0
+    # The interrupted wake itself keeps its own (unacknowledged) state.
+    wake = envelope(tid, 'wake')
+    assert service._status(tid, 'wake', wake['semanticSha256'])['deliveryState'] == 'pending'
+    # An ended turn takes no more notes (they would never be settled).
+    await invoke(service, h, 'submit', envelope(tid, 'late', passive=True), after=False)
+    assert h.store.take_notes(tid, turn) == [] and h.store.pending_notes(tid) == 1
+
+
+async def test_native_subscription_notes_stuck_by_an_older_adapter_settle_at_start(h):
+    tid = await h.thread()
+    service = install(h, subscription=True)
+    # Ended before this fix: no turn/completed settlement happened.
+    note, turn = await interrupted_turn_with_note(h, service, tid, answered=False)
+    restarted = ExternalInputService(h.server)
+    assert restarted._status(tid, 'note', note['semanticSha256'])['deliveryState'] == 'pending'
+    assert h.store.pending_notes(tid) == 1
+
+
+async def test_api_backend_notes_keep_their_immediate_receipt(h):
+    tid = await h.thread()
+    service = install(h)
+    note = envelope(tid, 'note', passive=True)
+    await invoke(service, h, 'submit', note, after=False)
+    await invoke(service, h, 'submit', envelope(tid, 'wake'), after=False)
+    record = h.store.claim(tid)
+    await service.observe_event(tid, 'turn/started', {'threadId': tid, 'turn': h.store.turn(record['turn_id'])})
+    h.store.finish(tid, record['turn_id'], 'interrupted')
+    await service.observe_event(tid, 'turn/completed', {'threadId': tid, 'turn': h.store.turn(record['turn_id'])})
+    assert service._status(tid, 'note', note['semanticSha256'])['deliveryState'] == 'context_persisted'
+    assert h.store.pending_notes(tid) == 0

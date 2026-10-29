@@ -771,9 +771,10 @@ pub fn watch_stream(stream: &mut TcpStream, root: &ResolvedRoot) -> anyhow::Resu
             "ready",
             &json!({"scope": scope, "rootId": root_id, "root": root.display}),
         )?;
-        let mut watch = crate::management::listeners::RevocationWatch::for_current_request();
+        let mut watch = crate::management::listeners::RevocationWatch::for_stream(stream)?;
         let mut last_write = std::time::Instant::now();
         loop {
+            if watch.disconnected()? { return Ok(()); }
             if let Some(token_id) = watch.revoked() {
                 crate::management::listeners::write_revoked_frame(stream, &token_id)?;
                 return Ok(());

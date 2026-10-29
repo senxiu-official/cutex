@@ -178,12 +178,17 @@ impl ToolInput {
 }
 
 fn sanitize_response(input: &Expect<'_>, digest: &str, value: Value) -> Value {
+    if value["schema"] == super::action_receipts::SCHEMA {
+        return if input.operation == "create" && super::action_receipts::valid_response(&value, "agent_create", input.action_id) {
+            value
+        } else { uncertain(input.action_id) };
+    }
     let response: ProviderResponse = match serde_json::from_value::<ProviderResponse>(value.clone())
     {
         Ok(response) if response.schema == CONTRACT && response.action_id == input.action_id => {
             response
         }
-        _ => return no_write(input.action_id, "invalid_provider_response"),
+        _ => return uncertain(input.action_id),
     };
     // The approved-after-wait note rides only on a complete receipt.
     let note_ok = match (&response.approval, &response.detail) {
@@ -196,7 +201,7 @@ fn sanitize_response(input: &Expect<'_>, digest: &str, value: Value) -> Value {
         _ => false,
     };
     if !note_ok {
-        return no_write(input.action_id, "invalid_provider_response");
+        return uncertain(input.action_id);
     }
     let valid = match response.outcome {
         ProviderOutcome::Complete { receipt }
@@ -219,7 +224,7 @@ fn sanitize_response(input: &Expect<'_>, digest: &str, value: Value) -> Value {
     if valid {
         value
     } else {
-        no_write(input.action_id, "invalid_provider_response")
+        uncertain(input.action_id)
     }
 }
 
@@ -419,6 +424,8 @@ fn invalid(action_id: &str, code: &str, reason: &str) -> Value {
 
 fn uncertain(action_id: &str) -> Value {
     let mut failure = no_write(action_id, "response_uncertain");
+    failure["outcome"]["status"] = json!("response_uncertain");
+    failure["outcomeUnknown"] = json!(true);
     failure["outcome"]["detail"] = json!(
         "Outcome unknown; retry the exact action_id and payload, never a replacement action."
     );
@@ -443,6 +450,8 @@ const AGENT_FIELDS: &[&str] = &[
     // replay keeps its digest).
     "expose_to_im",
     "pin",
+    // r265: runtime variant of the profile (e.g. "dsh").
+    "variant",
 ];
 
 /// Legacy full-spec fields that the sparse arguments dropped, with what to
@@ -484,6 +493,8 @@ fn transport(
             uncertain(expect.action_id)
         }
         Ok(value) => sanitize_response(expect, digest, value),
+        Err(error) if error.downcast_ref::<crate::agent_bus::client::BusUnreachable>().is_some() =>
+            invalid(expect.action_id, "bus_unavailable", "The local Agent Bus is not reachable."),
         Err(_) => uncertain(expect.action_id),
     }
 }
@@ -708,13 +719,14 @@ fn agent_fields(name: &str) -> serde_json::Map<String, Value> {
     let string = |description: &str| json!({"type":"string","description":description});
     let mut fields = serde_json::Map::new();
     fields.insert("name".into(), string(name));
-    fields.insert("profile".into(), string("Profile (name or id) it runs on. Default: yours."));
+    fields.insert("profile".into(), string("Profile (name or id) it runs on, or \"auto:<provider>\" (e.g. auto:anthropic) to pick the opted-in profile of that provider with the most quota left. Default: yours."));
     fields.insert("model".into(), string("Model. Default: the profile's default model."));
     fields.insert("reasoning".into(), string("Reasoning effort. Default: the profile's default. An effort the model does not support is refused with the allowed list."));
     fields.insert("sandbox".into(), json!({"type":"string","enum":["read-only","workspace-write","danger-full-access"],"description":"Default: yours; never more than yours."}));
     fields.insert("approval_policy".into(), json!({"type":"string","enum":["untrusted","on-request","never"],"description":"Default: yours; never less strict than yours."}));
     fields.insert("cwd".into(), string("Absolute working directory. Default: the project's workspace root (else yours); agents may share it."));
     fields.insert("pin".into(), json!({"type":"boolean","description":"Pin it in the owner's agent list. Default false."}));
+    fields.insert("variant".into(), string("Runtime variant of the profile (e.g. \"dsh\" for DSH on a DeepSeek profile). Default: the profile's default variant; the runtime is fixed at creation."));
     fields
 }
 
@@ -733,6 +745,8 @@ pub(super) fn tools() -> Vec<Value> {
     const AUTHORITY: &str = "Your authority comes from your runtime, never from arguments. After response_uncertain, repeat the identical call (pass the action_id from the reply in a later turn).";
     const LIMITS: &str = "A new agent never gets more than you have: a sandbox, approval policy, network access or writable roots beyond yours answers permission_exceeds_creator with the offending fields. A profile the owner marked as needing approval waits up to 2 minutes for the owner's decision; if none came it answers approval_required (approval_id): repeat the same call with the same action_id after the owner approves; do not poll.";
     const DEFAULTS: &str = "Leave the other fields empty unless needed: profile, model, reasoning, sandbox and approval policy default to yours, cwd to the project's workspace.";
+    let create_limits = LIMITS.replace("waits up to 2 minutes for the owner's decision; if none came it answers", "answers");
+    let create_authority = "Your authority comes from your runtime, never from arguments. After response_uncertain, query action_status first; any explicit retry must keep the identical action_id and payload.";
     let mut create = agent_fields(name);
     create.insert("task".into(), task.clone());
     create.insert("task_mode".into(), task_mode.clone());
@@ -743,10 +757,10 @@ pub(super) fn tools() -> Vec<Value> {
         "required":["name"],"additionalProperties":false,
         "description":"The new agent: name, plus any field to change from your defaults (as in agent_create)."});
     vec![
-        tool(AGENT_CREATE, format!("Example: {{\"name\":\"quokka\",\"task\":\"Review src/parser and report bugs\"}}. {DEFAULTS} (Director or operator) Create and start a persistent cutex agent in your project. It has its own conversation the owner can use. The profile, model and reasoning fields select its runtime configuration; omitted fields use the documented defaults. {LIMITS} {AUTHORITY}"),
+        tool(AGENT_CREATE, format!("Example: {{\"name\":\"quokka\",\"task\":\"Review src/parser and report bugs\"}}. {DEFAULTS} (Director or operator) Create and start a persistent cutex agent in your project. A running receipt means this call is still being handled: read action_status with tool=agent_create and the returned action_id; never submit a replacement action. It has its own conversation the owner can use. The profile, model and reasoning fields select its runtime configuration; omitted fields use the documented defaults. {create_limits} {create_authority}"),
             Value::Object(create),
             &["name"]),
-        tool(AGENT_ARCHIVE, format!("(Director or operator) Archive a member of your project: it stops and is retired for good (agents cannot undo this). {AUTHORITY}"),
+        tool(AGENT_ARCHIVE, format!("(Director or operator) Soft archive a member of your project; agent_restore restores the same session and native thread offline. {AUTHORITY}"),
             json!({"action_id":action_id,"project_id":project_id,"cutex_session_id":target("archive")}),
             &["cutex_session_id"]),
         tool(MEMBER_RUNTIME, format!("(Director or operator) Bring a member of your project online, take it offline, or restart it; cutex resolves its launch contract (profile, model, permissions). {AUTHORITY}"),
@@ -837,7 +851,7 @@ mod tests {
             Ok(json!({"schema":CONTRACT,"action_id":"noted","approval":note,"detail":detail,
                 "outcome":{"status":"no_write","code":"x","detail":"y"}}))
         });
-        assert_eq!(refused["outcome"]["code"], "invalid_provider_response", "{refused}");
+        assert_eq!(refused["outcome"]["code"], "response_uncertain", "{refused}");
     }
 
     #[test]
@@ -995,6 +1009,9 @@ mod tests {
         let args = json!({"action_id":"check","project_id":"private","cutex_session_id":"cutex.target"});
         let uncertain = call(AGENT_ARCHIVE, args.clone(), |_| anyhow::bail!("secret transport detail"));
         assert_eq!(uncertain["outcome"]["code"], "response_uncertain");
+        assert_eq!(uncertain["outcome"]["status"], "response_uncertain");
+        assert_eq!(uncertain["action_id"], "check");
+        assert_eq!(uncertain["outcomeUnknown"], true);
         assert!(!uncertain.to_string().contains("secret"));
         for status in [408, 500, 503] {
             let value = call(AGENT_ARCHIVE, args.clone(), |_| {
@@ -1014,7 +1031,7 @@ mod tests {
             wrong["outcome"]["failure"][field] = json!("foreign");
             assert_eq!(
                 call(AGENT_ARCHIVE, args.clone(), |_| Ok(wrong.clone()))["outcome"]["code"],
-                "invalid_provider_response"
+                "response_uncertain"
             );
         }
     }
@@ -1051,7 +1068,7 @@ mod tests {
         assert!(description.starts_with("Example: {\"name\":\"quokka\",\"task\":"), "{description}");
         assert!(description.contains("Leave the other fields empty unless needed"), "{description}");
         // Prompt revision A2: what it creates, not which work it is for.
-        assert!(description.contains("Create and start a persistent cutex agent in your project. It has its own conversation the owner can use."), "{description}");
+        assert!(description.contains("Create and start a persistent cutex agent in your project. A running receipt means this call is still being handled: read action_status with tool=agent_create and the returned action_id; never submit a replacement action. It has its own conversation the owner can use."), "{description}");
         for preference in ["long-lived work", "prefer your native", "short parallel subtasks"] {
             assert!(!description.contains(preference), "{preference}");
         }
@@ -1116,7 +1133,7 @@ mod tests {
             receipt["outcome"]["receipt"]["request_sha256"] = json!("0".repeat(64));
             Ok(receipt)
         });
-        assert_eq!(foreign["outcome"]["code"], "invalid_provider_response");
+        assert_eq!(foreign["outcome"]["code"], "response_uncertain");
     }
 
     /// agent-create-task-delegation: task_mode is forwarded (and bound to

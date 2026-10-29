@@ -141,6 +141,9 @@ class ToolRegistry:
         if errors:
             # Validation messages may include caller data; keep result structural.
             return ToolResult("Invalid tool arguments: schema validation failed", False)
+        if tool.mcp_server == 'cutex':
+            from .cutex_tools import receipt_arguments
+            arguments = receipt_arguments(name, arguments, context)
         try:
             async with asyncio.timeout(tool.timeout or self.settings.tool_timeout):
                 value = await tool.handler(arguments, context)
@@ -148,8 +151,15 @@ class ToolRegistry:
         except asyncio.CancelledError:
             raise
         except TimeoutError:
+            if tool.mcp_server == 'cutex' and name in {'agent_create', 'agent_delegate'}:
+                return ToolResult(dump({'status': 'response_uncertain', 'code': 'tool_timeout',
+                    'action_id': arguments['action_id'], 'tool': name, 'outcomeUnknown': True,
+                    'detail': 'Query this action_id before retrying; timeout does not cancel the action.'}), False)
             return ToolResult("Tool timeout: side effects may be uncertain; do not retry automatically.", False)
         except Exception as exc:
+            if tool.mcp_server == 'cutex' and name in {'agent_create', 'agent_delegate'}:
+                from .cutex_tools import uncertain_result
+                return uncertain_result(name, arguments, 'tool_failed')
             # User data, API tokens, and request headers must not become diagnostic output.
             return ToolResult(f"Tool failed ({type(exc).__name__}). Check server-side configuration or arguments.", False)
         raw = result.text.encode("utf-8")

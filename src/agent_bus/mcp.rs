@@ -9,6 +9,10 @@ pub(crate) mod list;
 mod management;
 #[path = "mcp_services.rs"]
 mod services;
+#[path = "action_receipts.rs"]
+pub mod action_receipts;
+#[path = "archive_mcp.rs"]
+pub mod archive_mcp;
 
 pub const THREAD_HEADER: &str = "x-cutex-mcp-thread-id";
 pub const GENERATION_HEADER: &str = "x-cutex-mcp-generation";
@@ -60,6 +64,20 @@ fn call_failure(error: &anyhow::Error) -> Value {
         .take(600)
         .collect();
     json!({"ok":false,"status":"no_write","code":"invalid_arguments","detail":detail})
+}
+
+fn action_reply(action_id: &str, result: anyhow::Result<Value>) -> Value {
+    let mut value = match result {
+        Ok(value) => normalize_bus_rejection(value),
+        Err(error) => call_failure(&error),
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.entry("action_id").or_insert_with(|| json!(action_id));
+        if object.get("status").and_then(Value::as_str) == Some("response_uncertain") {
+            object.insert("outcomeUnknown".into(), json!(true));
+        }
+    }
+    value
 }
 
 /// Turn a raw Bus HTTP rejection (`{http_status, error}`) into the same
@@ -145,7 +163,8 @@ const ALARM_CANCEL: &str = "alarm_cancel";
 
 pub fn tools() -> Value {
     let mut tools = crate::agent_bus::alarms::tools();
-    tools.extend(management::tools());
+    tools.extend(management::tools().into_iter().filter(|t| t["name"] != "agent_archive"));
+    tools.extend(archive_mcp::definitions());
     tools.extend(services::tools());
     // Delegations (委托): agent_list / agent_delegate / delegation_* (asks design §6).
     tools.extend(crate::asks::tools::definitions());
@@ -301,6 +320,18 @@ fn rpc_call_key(process: &str, request_id: &Value) -> String {
     format!("{process}:{request_id}")
 }
 
+/// A call's identity is independent of its payload. Changed arguments on an
+/// explicit replay must conflict, rather than silently create another action.
+fn receipt_action_id(params: &Value, call: &str, runtime: &RuntimeAgentId,
+    generation: u64, thread: &str, tool: &str) -> String {
+    let meta=&params["_meta"];
+    let occurrence=meta["callId"].as_str().or_else(||meta["claudecode/toolUseId"].as_str())
+        .filter(|s|!s.is_empty()).unwrap_or(call);
+    let digest=crate::approvals::request_digest(&json!({"runtime":runtime.as_str(),
+        "generation":generation,"thread":thread,"turn":call_turn_id(params),"call":occurrence,"tool":tool}));
+    format!("call-{}",&digest[..48])
+}
+
 /// The turn of a tool call from cute-codex's per-call metadata, if any.
 fn call_turn_id(params: &Value) -> Option<String> {
     params["_meta"]
@@ -402,6 +433,13 @@ pub fn run() -> anyhow::Result<()> {
             let (token, runtime, bound_thread, output, process, env_turn) = (token.clone(), runtime.clone(), bound_thread.clone(), output.clone(), process.clone(), env_turn.clone());
             move || -> anyhow::Result<()> {
         let id = &id;
+        let mut timing = (message["method"] == "tools/call").then(|| {
+            let mut trace = crate::management::v2::control_timing::Trace::new(
+                crate::management::v2::control_timing::Path::from_tool(message["params"]["name"].as_str().unwrap_or("")),
+            );
+            trace.stage(crate::management::v2::control_timing::Stage::Validation);
+            trace
+        });
         let result = match message["method"].as_str() {
             Some("initialize") => Ok(
                 json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"cutex-outbound-prototype","version":"1"}}),
@@ -420,15 +458,24 @@ pub fn run() -> anyhow::Result<()> {
                     generation,
                 };
                 let (name, mut args) = legacy_call(name, args).map_err(anyhow::Error::msg)?;
+                if matches!(name, "agent_create" | "agent_delegate") && args.get("action_id").is_none_or(Value::is_null) {
+                    let key = receipt_action_id(&message["params"], &rpc_call_key(&process, id),
+                        &runtime, generation, &fence.thread_id, name);
+                    // Explicit key prevents the Bus from re-keying it with Claude's
+                    // current turn after a timeout or turn transition.
+                    if let Some(object) = args.as_object_mut() { object.insert("action_id".into(), json!(key)); }
+                }
                 let wait = approval_wait.map(|secs| crate::agent_bus::client::ApprovalWaitRequest {
                     secs,
                     turn_id: call_turn_id(&message["params"]).or_else(|| env_turn.clone()),
                 });
                 if super::mcp_browser::is_tool(name) {
+                    if let Some(trace) = timing.as_mut() { trace.stage(crate::management::v2::control_timing::Stage::Dispatch); }
                     let request = super::mcp_browser::request_id(&process, id)?;
                     return Ok(super::mcp_browser::invoke(&token, &runtime, &fence, &request, name, &args));
                 }
-                if crate::asks::tools::is_tool(name) || management::is_tool(name) || name == ALARM_SET {
+                if (crate::asks::tools::is_tool(name) && name != action_receipts::TOOL) || management::is_tool(name) || archive_mcp::is_tool(name) || name == ALARM_SET {
+                    if let Some(trace) = timing.as_mut() { trace.stage(crate::management::v2::control_timing::Stage::ContextRead); }
                     let resolved = crate::agent_bus::client::submit_mcp_control(
                         port, &token, &runtime, &fence, crate::asks::short_ids::PATH,
                         &json!({"tool":name,"arguments":args}),
@@ -438,12 +485,14 @@ pub fn run() -> anyhow::Result<()> {
                     }
                     args = resolved["arguments"].clone();
                 }
+                if let Some(trace) = timing.as_mut() { trace.stage(crate::management::v2::control_timing::Stage::Dispatch); }
                 let mut result = if crate::asks::tools::is_tool(name) || name == crate::owner_notify::tool::OWNER_NOTIFY || crate::workflows::tools::is_tool(name) {
-                    let action_id = derive_action_id(&message["params"], &rpc_call_key(&process, id), &runtime, generation, &fence.thread_id, name, &args);
-                    crate::agent_bus::client::submit_mcp_control(
+                    let action_id = args["action_id"].as_str().map(str::to_owned).unwrap_or_else(||
+                        derive_action_id(&message["params"], &rpc_call_key(&process, id), &runtime, generation, &fence.thread_id, name, &args));
+                    action_reply(&action_id, crate::agent_bus::client::submit_mcp_control(
                         port, &token, &runtime, &fence, crate::asks::tools::PATH,
                         &json!({"tool": name, "arguments": args, "action_id": action_id}),
-                    )?
+                    ))
                 } else if crate::artifacts::tools::is_tool(name) {
                     // Artifacts also carry the call's turn (provenance).
                     let action_id = derive_action_id(&message["params"], &rpc_call_key(&process, id), &runtime, generation, &fence.thread_id, name, &args);
@@ -452,6 +501,13 @@ pub fn run() -> anyhow::Result<()> {
                         body["turn_id"] = json!(turn);
                     }
                     crate::agent_bus::client::submit_mcp_control(port, &token, &runtime, &fence, crate::asks::tools::PATH, &body)?
+                } else if archive_mcp::is_tool(name) {
+                    if args.get("action_id").is_none_or(Value::is_null) {
+                        let id = receipt_action_id(&message["params"], &rpc_call_key(&process,id), &runtime,generation,&fence.thread_id,name);
+                        if let Some(object)=args.as_object_mut() { object.insert("action_id".into(),json!(id)); }
+                    }
+                    archive_mcp::invoke(name,args,|body| crate::agent_bus::client::submit_mcp_control(
+                        port,&token,&runtime,&fence,archive_mcp::PATH,body))
                 } else if management::is_tool(name) {
                     // action_id is optional: the same call in the same turn
                     // derives the same id (exact replay); a model-supplied one wins.
@@ -498,6 +554,9 @@ pub fn run() -> anyhow::Result<()> {
                         match name {
                             ALARM_SET => {
                                 let a: crate::agent_bus::alarms::SetArgs=serde_json::from_value(args)?;
+                                if a.to.eq_ignore_ascii_case("director") {
+                                    return crate::agent_bus::alarms::set_director(&owner,a);
+                                }
                                 if crate::agent_bus::routing::is_full_durable_cutex_session_id(&a.to) {
                                     let listed = roster["agents"].as_array().is_some_and(|rows| rows.iter().any(|r| r["cutex_session_id"].as_str()==Some(&a.to)));
                                     anyhow::ensure!(listed || reply_alarm_allowed(&owner, &a.to), "Target not visible to caller");
@@ -540,24 +599,35 @@ pub fn run() -> anyhow::Result<()> {
                 let failed = result.get("http_status").is_some()
                     || result["outcome"]["status"] == "no_write"
                     || result["outcome"]["status"] == "owner_action_required"
+                    || result["outcome"]["status"] == "response_uncertain"
                     || matches!(
                         result["status"].as_str(),
-                        Some("no_write" | "conflict" | "response_uncertain" | "approval_required")
+                        Some("no_write" | "conflict" | "response_uncertain" | "approval_required" | "failed" | "unknown")
                     )
                     || result["ok"] == false;
                 json!({"isError":failed,"content":[{"type":"text","text":result.to_string()}]})
             }),
             _ => Err(anyhow::Error::new(UnsupportedMethod)),
         };
+        let timing_status = match &result { Ok(value) if value["isError"] == true => 400, Ok(_) => 200, Err(_) => 500 };
+        if let Some(trace) = timing.as_mut() {
+            trace.stage(crate::management::v2::control_timing::Stage::Fanout);
+            // Until the response is fully written, an output failure is an
+            // adapter error rather than a successful tool response.
+            trace.status(500);
+        }
         // Never echo transport errors/credentials into model-visible output.
         let response = match result {
             Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
             Err(error) => rpc_error(id, &error),
         };
+        if let Some(trace) = timing.as_mut() { trace.stage(crate::management::v2::control_timing::Stage::LockWait); }
         let mut output = output.lock().map_err(|_| anyhow::anyhow!("MCP output lock poisoned"))?;
+        if let Some(trace) = timing.as_mut() { trace.stage(crate::management::v2::control_timing::Stage::ResponseWrite); }
         serde_json::to_writer(&mut *output, &response)?;
         output.write_all(b"\n")?;
         output.flush()?;
+        if let Some(trace) = timing.as_mut() { trace.status(timing_status); }
         Ok(())
             }
         };
@@ -705,6 +775,19 @@ mod tests {
     /// action_id comes from the outer JSON-RPC call, so an online, offline,
     /// online round trip with the same arguments gets three ids, while a
     /// retransmit of one request keeps its id. Metadata, when present, wins.
+    #[test]
+    fn receipt_identity_binds_occurrence_not_changed_arguments() {
+        let runtime=RuntimeAgentId::new("receipt-runtime").unwrap();
+        let mut params=json!({"_meta":{"callId":"c","x-codex-turn-metadata":{"turn_id":"t"}},"arguments":{"name":"one"}});
+        let id=|p:&Value,call:&str| receipt_action_id(p,call,&runtime,1,"thread","agent_create");
+        let first=id(&params,"process:1");
+        params["arguments"]["name"]=json!("two");
+        assert_eq!(first,id(&params,"process:2"));
+        params["_meta"]["callId"]=json!("next");
+        assert_ne!(first,id(&params,"process:2"));
+        assert_ne!(id(&json!({}),"process:1"),id(&json!({}),"process:2"));
+    }
+
     #[test]
     fn derived_action_ids_fall_back_to_the_json_rpc_call() {
         let runtime = RuntimeAgentId::new("r3-fixture").unwrap();
@@ -903,6 +986,13 @@ mod tests {
         let unreachable = anyhow::Error::new(refused).context(BusUnreachable("connect".into()));
         assert_eq!(call_failure(&unreachable)["status"], "no_write");
         assert_eq!(call_failure(&unreachable)["code"], "bus_unavailable");
+        let reply = action_reply("call-stable", Err(anyhow::anyhow!("secret").context(ResponseUncertain)));
+        assert_eq!(reply["action_id"], "call-stable");
+        assert_eq!(reply["outcomeUnknown"], true);
+        assert!(!reply.to_string().contains("secret"));
+        let reply = action_reply("call-stable", Ok(json!({"http_status":503})));
+        assert_eq!(reply["action_id"], "call-stable");
+        assert_eq!(reply["outcomeUnknown"], true);
         let lost = anyhow::anyhow!("read timed out with token-ish detail").context(ResponseUncertain);
         let lost = call_failure(&lost);
         assert_eq!(lost["status"], "response_uncertain");

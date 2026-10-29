@@ -38,6 +38,9 @@ use cutex::agent_management::{
     AGENT_MANAGEMENT_SYSTEM_SENDER,
 };
 use cutex::config::paths::runtime_dir;
+use cutex::director_address::management::{
+    DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE, START_ADOPTED_CONTROL_TYPE as DIRECTOR_START_ADOPTED_CONTROL_TYPE,
+};
 use cutex::config::store::load_codez_config;
 use cutex::http::server::write_http_response;
 use cutex::management::v2::agent_bus_state::agent_bus_message_repository;
@@ -132,7 +135,7 @@ fn classify_completion_target(
     {
         return Ok(CompletionTargetClass::PermanentlyRetired);
     }
-    if record.is_retired() {
+    if cutex::agent_management::agent_execution_blocked(&record) {
         return Ok(CompletionTargetClass::Archived);
     }
     Ok(CompletionTargetClass::Active)
@@ -366,6 +369,7 @@ mod job_service_completion_lane_tests {
             &serde_json::json!({"schema": JOB_SERVICE_COMPLETION_SCHEMA, "eventId": "event-http-1"}),
         );
         assert_eq!(query["disposition"], "pending");
+        let target = submit["targetCutexSessionId"].as_str().unwrap().to_owned();
         let mut changed = submit;
         changed["resultSha256"] = serde_json::json!("b".repeat(64));
         let conflict = post_json(
@@ -376,19 +380,20 @@ mod job_service_completion_lane_tests {
         );
         assert_eq!(conflict["status"], "no_write");
         assert_eq!(conflict["errorCode"], "event_conflict");
-        let persisted: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join(".cutex/runtime/management-v2/agent-bus-message-state.json"))
-                .unwrap(),
+        let repository = cutex::management::v2::agent_bus_state::AgentBusMessageRepository::open(
+            root.join(".cutex/runtime/management-v2"),
         )
         .unwrap();
-        assert_eq!(persisted["messages"].as_object().unwrap().len(), 1);
-        assert!(persisted["messages"]
-            .as_object()
+        assert_eq!(repository.snapshot(&target).unwrap().len(), 1);
+        assert!(repository
+            .snapshot_by_message_id(first["messageId"].as_str().unwrap())
             .unwrap()
-            .values()
-            .next()
-            .unwrap()["snapshot"]["fromCutexSessionId"]
-            .is_null());
+            .unwrap()
+            .from_cutex_session_id
+            .is_none());
+        let legacy_id = first["messageId"].as_str().unwrap();
+        let legacy_before = serde_json::to_value(repository.canonical_message(legacy_id).unwrap())
+            .unwrap();
         let v2 = serde_json::json!({
             "schema":cutex::agent_bus::job_completion::SCHEMA_V2,
             "eventId":"event-http-v2", "jobId":"job-http-v2", "jobRevision":3,
@@ -430,15 +435,11 @@ mod job_service_completion_lane_tests {
             &changed_v2,
         );
         assert_eq!(conflict_v2["errorCode"], "event_conflict");
-        let after: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join(".cutex/runtime/management-v2/agent-bus-message-state.json"))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(after["version"], 6);
-        assert_eq!(after["messages"].as_object().unwrap().len(), 2);
-        let stored = &after["messages"][first_v2["messageId"].as_str().unwrap()];
-        let frozen = &stored["canonicalEnvelope"]["controlPayload"];
+        assert_eq!(repository.snapshot(&target).unwrap().len(), 2);
+        let stored = repository
+            .canonical_message(first_v2["messageId"].as_str().unwrap())
+            .unwrap();
+        let frozen = &stored.control_payload.unwrap();
         assert_eq!(frozen["request"], v2);
         assert_eq!(frozen["nativeVersion"], 2);
         assert_eq!(
@@ -450,12 +451,16 @@ mod job_service_completion_lane_tests {
             2
         );
         assert_eq!(frozen["view"]["data"]["stdout"]["observedBytes"], 9);
-        assert!(stored["snapshot"].get("presentation").is_none());
+        assert!(repository
+            .snapshot_by_message_id(first_v2["messageId"].as_str().unwrap())
+            .unwrap()
+            .unwrap()
+            .presentation
+            .is_none());
         // Inserting v2 did not rewrite any persisted v1 fact.
-        let legacy_id = first["messageId"].as_str().unwrap();
         assert_eq!(
-            after["messages"][legacy_id],
-            persisted["messages"][legacy_id]
+            serde_json::to_value(repository.canonical_message(legacy_id).unwrap()).unwrap(),
+            legacy_before
         );
         child.0.kill().unwrap();
         child.0.wait().unwrap();
@@ -504,6 +509,7 @@ pub(crate) fn request_handlers() -> AgentBusRequestHandlers {
         redrive_ordinary_messages,
         send_payload_response,
         agent_management: super::agent_management::handle_agent_management,
+        managed_archive: super::management_context::execute_managed_agent_archive,
         job_service_completion: dispatch_job_service_completion,
         job_service_completion_query: query_job_service_completion,
         management_start_acked: super::agent_start_message::management_start_acked,
@@ -1241,6 +1247,144 @@ pub(crate) fn send_agent_management_notice_response(
     send_payload_response_with_projection(state, payload, Some(message.metadata))
 }
 
+/// r254 (design 044): an adopted start (after turn) or a passive
+/// Director-change notice, through the same in-process principal.
+fn send_director_address_response(
+    state: &Arc<Mutex<AgentBusState>>,
+    system: &cutex::agent_bus::identity::AgentManagementSystemPrincipal,
+    message: AgentManagementSystemMessage<'_>,
+    control_type: &'static str,
+    delivery_mode: AgentDeliveryMode,
+) -> anyhow::Result<Value> {
+    if !system.authenticate() {
+        anyhow::bail!("Agent Management system principal authentication failed");
+    }
+    let payload = AgentBusSendRequest {
+        to: message.target_runtime_agent_id.to_string(),
+        all_groups: true,
+        kind: AgentBusEnvelopeKind::Message,
+        from: Some(message.metadata.requested_by_director.as_str().to_string()),
+        from_agent_id: message.from_agent_id,
+        from_session_id: message.from_session_id,
+        to_session_id: Some(message.target_cutex_session_id.as_str().to_string()),
+        content: message.exact_message.to_string(),
+        delivery_mode: Some(delivery_mode),
+        queue_only: None,
+        trigger_turn: None,
+        sender_kind: Some(cutex::agent_bus::model::AgentMessageKind::Agent),
+        display_source: None,
+        submit_mode: None,
+        control_type: Some(control_type.to_string()),
+        control_payload: None,
+        external_action_id: None,
+        external_message_id: Some(message.external_message_id.to_string()),
+        sender_facts: None,
+    };
+    send_payload_response_with_projection(state, payload, Some(message.metadata))
+}
+
+const DIRECTOR_ADDRESS_DISPATCH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// r254 (design 044): bus-process startup recovery of the Director-address
+/// sidecar (prepared intents, bypassed changes, the one-time scan of
+/// quarantined starts), then the dispatch loop for approved adoptions and
+/// passive notices. A failure is logged and retried on the next tick.
+fn spawn_director_address_dispatch(state: Arc<Mutex<AgentBusState>>) {
+    let spawned = thread::Builder::new()
+        .name("cutex-director-address".to_string())
+        .spawn(move || {
+            let mut started = false;
+            loop {
+                // Startup (recovery + quarantined-start scan) until it
+                // succeeds once; afterwards recovery on every pass.
+                if !started {
+                    match cutex::director_address::management::startup() {
+                        Ok(opened) => {
+                            started = true;
+                            if opened > 0 {
+                                println!("opened {opened} Director-change start review(s)");
+                            }
+                        }
+                        Err(error) => eprintln!(
+                            "{YELLOW}warning:{RESET} director-address startup recovery failed (retrying): {error:#}"
+                        ),
+                    }
+                } else if let Err(error) = cutex::director_address::management::recover_now() {
+                    eprintln!("{YELLOW}warning:{RESET} director-address recovery failed: {error:#}");
+                }
+                if let Err(error) = dispatch_director_address_once(&state) {
+                    eprintln!("{YELLOW}warning:{RESET} director-address dispatch failed: {error:#}");
+                }
+                thread::sleep(DIRECTOR_ADDRESS_DISPATCH_INTERVAL);
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("{YELLOW}warning:{RESET} director-address dispatcher not started: {error}");
+    }
+}
+
+/// Sends every due dispatch once. An offline target waits for the next tick;
+/// the Director's own runtime need not be online for a service message. Any
+/// send error on an adoption is recorded as unknown, never resent.
+fn dispatch_director_address_once(state: &Arc<Mutex<AgentBusState>>) -> anyhow::Result<()> {
+    use cutex::director_address::management as da;
+    let due = da::pending_dispatches()?;
+    if due.is_empty() {
+        return Ok(());
+    }
+    let sessions = load_cutex_session_store()?;
+    let record = |id: &str| sessions.sessions.values().find(|record| record.cutex_session_id == id);
+    for dispatch in due {
+        let Some(target) = record(dispatch.target.as_str()) else { continue };
+        let Some(target_runtime) = target.current_runtime_agent_id.clone() else { continue };
+        let director = dispatch.metadata.requested_by_director.as_str();
+        let director_runtime = record(director).and_then(|record| record.current_runtime_agent_id.clone());
+        let from_session_id = director_runtime.as_ref().map(|_| director.to_string());
+        // This protected lane renders as a service on both runtimes. The
+        // Director may be offline: its durable receipt/authority, rather than
+        // a live sender endpoint, authenticates the message.
+        let (control_type, delivery_mode) = match dispatch.kind {
+            da::DispatchKind::AdoptedStart { .. } => (DIRECTOR_START_ADOPTED_CONTROL_TYPE, AgentDeliveryMode::AfterTurn),
+            da::DispatchKind::Notice { .. } => (DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE, AgentDeliveryMode::Passive),
+        };
+        let sent = send_director_address_response(
+            state,
+            &dispatch.principal,
+            AgentManagementSystemMessage {
+                metadata: &dispatch.metadata,
+                from_agent_id: director_runtime,
+                from_session_id,
+                target_runtime_agent_id: &target_runtime,
+                target_cutex_session_id: &dispatch.target,
+                exact_message: &dispatch.text,
+                external_message_id: &dispatch.external_message_id,
+            },
+            control_type,
+            delivery_mode,
+        );
+        let outcome = match sent.and_then(|value| {
+            serde_json::from_value::<cutex::agent_bus::model::AgentBusSendResponse>(value).map_err(Into::into)
+        }) {
+            Ok(response)
+                if response.to_runtime_agent_id.as_deref() == Some(target_runtime.as_str())
+                    && response.external_message_id.as_deref() == Some(dispatch.external_message_id.as_str()) =>
+            {
+                da::DispatchOutcome::Sent
+            }
+            Ok(_) => da::DispatchOutcome::Unknown,
+            Err(error) => {
+                eprintln!(
+                    "{YELLOW}warning:{RESET} director-address dispatch {} outcome unknown: {error:#}",
+                    dispatch.external_message_id
+                );
+                da::DispatchOutcome::Unknown
+            }
+        };
+        da::record_dispatch(&dispatch.kind, outcome)?;
+    }
+    Ok(())
+}
+
 fn send_payload_response_with_projection(
     state: &Arc<Mutex<AgentBusState>>,
     payload: AgentBusSendRequest,
@@ -1267,7 +1411,12 @@ fn send_payload_response_with_projection(
     if agent_management_projection.is_none()
         && matches!(
             payload.control_type.as_deref(),
-            Some(AGENT_MANAGEMENT_START_CONTROL_TYPE | AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE)
+            Some(
+                AGENT_MANAGEMENT_START_CONTROL_TYPE
+                    | AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE
+                    | DIRECTOR_START_ADOPTED_CONTROL_TYPE
+                    | DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE
+            )
         )
     {
         anyhow::bail!(
@@ -1299,6 +1448,12 @@ fn send_payload_response_with_projection(
     let peer_tell = cutex::agent_bus::peer_tell::is_peer_tell_request(&payload);
     if peer_tell {
         cutex::agent_bus::peer_tell::validate_request(&payload, &sender)?;
+    }
+    // A Claude agent's background task ended (claude-r23): a service notice
+    // with a stable per-notice id, no local sender identity.
+    let claude_task = cutex::agent_bus::claude_task::is_claude_task_request(&payload);
+    if claude_task {
+        cutex::agent_bus::claude_task::validate_request(&payload, &sender)?;
     }
     if agent_management_projection.is_none() && sender == AGENT_MANAGEMENT_SYSTEM_SENDER {
         anyhow::bail!(
@@ -1343,7 +1498,12 @@ fn send_payload_response_with_projection(
         registered_sender_session_id.as_deref(),
         registered_target_session_id.as_deref(),
     )?;
-    let party_sessions = load_cutex_session_store_shared().ok();
+    let party_sessions = Some(load_cutex_session_store_shared()?);
+    for id in from_cutex_session_id.iter().chain(to_cutex_session_id.iter()) {
+        let record = party_sessions.as_ref().and_then(|s| s.sessions.get(id))
+            .ok_or_else(|| anyhow::anyhow!("archive_state_unavailable"))?;
+        anyhow::ensure!(!cutex::agent_management::agent_execution_blocked(record), "archived_or_permanently_retired_agent");
+    }
     let target_is_claude = to_cutex_session_id
         .as_ref()
         .and_then(|id| {
@@ -1388,12 +1548,13 @@ fn send_payload_response_with_projection(
         .map(|_| AGENT_MANAGEMENT_SYSTEM_SENDER)
         .unwrap_or(sender.as_str());
     let control_type = agent_management_projection
-        .map(|_| {
-            if payload.control_type.as_deref() == Some(AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE) {
-                AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE.to_string()
-            } else {
-                AGENT_MANAGEMENT_START_CONTROL_TYPE.to_string()
-            }
+        .map(|_| match payload.control_type.as_deref() {
+            Some(
+                kind @ (AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE
+                | DIRECTOR_START_ADOPTED_CONTROL_TYPE
+                | DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE),
+            ) => kind.to_string(),
+            _ => AGENT_MANAGEMENT_START_CONTROL_TYPE.to_string(),
         })
         .or_else(|| payload.control_type.clone());
     let control_payload = agent_management_projection
@@ -1406,9 +1567,11 @@ fn send_payload_response_with_projection(
     let durable_alarm = durable_ordinary && sender_kind.is_alarm_system();
     // Alarm IDs are already globally unique durable scheduler identities. Keep
     // that ID across Bus restarts, ACK loss, and recipient runtime replacement.
-    let previous_alarm = if durable_alarm {
+    // A Claude task notice id (`ctask-…`) is stable the same way.
+    let stable_id = durable_alarm || (durable_ordinary && claude_task);
+    let previous_alarm = if stable_id {
         anyhow::ensure!(
-            alarm_service,
+            alarm_service || !durable_alarm,
             "alarm requires the local system sender and alarm message ID"
         );
         agent_bus_message_repository()?.snapshot_by_message_id(
@@ -1420,7 +1583,7 @@ fn send_payload_response_with_projection(
     } else {
         None
     };
-    let stable_reservation = if durable_alarm {
+    let stable_reservation = if stable_id {
         let id = payload
             .external_message_id
             .clone()
@@ -1472,7 +1635,7 @@ fn send_payload_response_with_projection(
             .as_ref()
             .is_some_and(|reservation| reservation.already_enqueued)
     }) {
-        let from_cutex_session_id = if alarm_service || peer_tell {
+        let from_cutex_session_id = if alarm_service || peer_tell || claude_task {
             None
         } else {
             Some(
@@ -1582,7 +1745,7 @@ fn send_payload_response_with_projection(
         )?
     };
     let notify_waiters = !outcome.deduplicated;
-    let deduplicated = outcome.deduplicated || (durable_alarm && durable_deduplicated);
+    let deduplicated = outcome.deduplicated || (stable_id && durable_deduplicated);
     let send_record = outcome.record;
     if let Err(err) = append_agent_bus_audit_record(serde_json::json!({
         "event": "sent",
@@ -1611,6 +1774,7 @@ fn send_payload_response_with_projection(
         && send_record.sender_kind.is_agent()
         && !alarm_service
         && !peer_tell
+        && !claude_task
     {
         let from_cutex_session_id = from_cutex_session_id
             .clone()
@@ -1875,6 +2039,7 @@ fn run_agent_bus_with_service_root(
         );
     }
     cutex::agent_bus::alarms::spawn()?;
+    spawn_director_address_dispatch(Arc::clone(&state));
     let active_requests = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
@@ -2110,6 +2275,56 @@ mod tests {
         }
     }
 
+    // A registered bus endpoint is not a durable session. Routing now checks
+    // the persisted party records before enqueueing; fixtures need both layers.
+    fn persist_route_sessions(parties: &[(&str, &str)]) {
+        let mut store = load_cutex_session_store().unwrap();
+        for &(runtime, id) in parties {
+            let mut record = cutex::session::model::CutexSessionRecord::new(
+                id.into(), Some(id.trim_start_matches("cutex.").into()),
+                cutex::platform::host::current_host_name(), "/tmp".into(), None,
+            ).unwrap();
+            record.registration_class = AgentRegistrationClass::LocalOnly;
+            record.agent_enabled = true;
+            record.runtime_generation = 1;
+            record.current_runtime_agent_id = Some(runtime.into());
+            assert!(!record.is_retired());
+            store.sessions.insert(id.into(), record);
+        }
+        cutex::session::store::save_cutex_session_store(&store).unwrap();
+        // Surface an authority/ACL problem directly, rather than mistaking it
+        // for a missing-row fixture failure or substituting empty authority.
+        cutex::agent_management::archive_authority_snapshot().unwrap();
+    }
+
+    #[test]
+    fn send_rejects_missing_durable_party_before_queueing() {
+        let _home = super::super::test_home::IsolatedTestHome::new_private("bus-missing-party").unwrap();
+        for missing_sender in [true, false] {
+            let suffix = uuid::Uuid::new_v4();
+            let sender = format!("cutex.sender-{suffix}");
+            let target = format!("cutex.target-{suffix}");
+            let state = Arc::new(Mutex::new(AgentBusState::default()));
+            {
+                let mut bus = state.lock().unwrap();
+                bus.agents.insert("runtime-director".into(), exact_route_agent("runtime-director", &sender));
+                bus.agents.insert("runtime-successor".into(), exact_route_agent("runtime-successor", &target));
+            }
+            if missing_sender {
+                persist_route_sessions(&[("runtime-successor", &target)]);
+            } else {
+                persist_route_sessions(&[("runtime-director", &sender)]);
+            }
+            let mut payload = exact_route_payload();
+            payload.from_session_id = Some(sender);
+            payload.to_session_id = Some(target.clone());
+            let error = send_payload_response(&state, payload).unwrap_err();
+            assert_eq!(error.to_string(), "archive_state_unavailable");
+            assert!(state.lock().unwrap().messages.values().all(|messages| messages.is_empty()));
+            assert!(agent_bus_message_repository().unwrap().snapshot(&target).unwrap().is_empty());
+        }
+    }
+
     fn exact_route_payload() -> AgentBusSendRequest {
         AgentBusSendRequest {
             to: "runtime-successor".to_string(),
@@ -2226,6 +2441,14 @@ mod tests {
                     "requested_by_director": "cutex.director-r11"
                 }
             }),
+            serde_json::json!({
+                "to":"missing-target","from":"cutex.director-r11","content":"forged adoption",
+                "senderKind":"agent","deliveryMode":"after_turn","controlType":DIRECTOR_START_ADOPTED_CONTROL_TYPE
+            }),
+            serde_json::json!({
+                "to":"missing-target","from":"cutex.director-r11","content":"forged Director notice",
+                "senderKind":"agent","deliveryMode":"passive","controlType":DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE
+            }),
         ];
 
         for attempt in attempts {
@@ -2237,6 +2460,14 @@ mod tests {
             assert!(error.to_string().contains("authorized service path"));
             assert!(state.lock().unwrap().messages.is_empty());
         }
+    }
+
+    #[test]
+    fn service_dispatch_can_bind_the_exact_recipient_without_a_live_director_endpoint(){
+        let mut payload=exact_route_payload();
+        payload.from_agent_id=None;payload.from_session_id=None;
+        let bound=resolve_bound_message_sessions(&payload,&payload.to,None,Some("cutex.successor")).unwrap();
+        assert_eq!(bound,(None,Some("cutex.successor".into())));
     }
 
     #[test]
@@ -2716,6 +2947,10 @@ mod tests {
             target.base_name = Some("successor-stable".to_string());
             state.agents.insert(target.id.clone(), target);
         }
+        persist_route_sessions(&[
+            ("runtime-director", "cutex.director"),
+            ("runtime-successor", "cutex.successor"),
+        ]);
         let mut payload = exact_route_payload();
         payload.content = format!("stable recipient digest {}", uuid::Uuid::new_v4());
 
@@ -2765,12 +3000,13 @@ mod tests {
             return;
         }
         use cutex::http::server::{read_simple_http_request, write_json_response};
-        let _home = super::super::test_home::IsolatedTestHome::new("alarm-delivery").unwrap();
+        let _home = super::super::test_home::IsolatedTestHome::new_private("alarm-delivery").unwrap();
         let state = Arc::new(Mutex::new(AgentBusState::default()));
         let sid = "cutex.00000000-0000-0000-0000-000000000001";
         let mut agent = exact_route_agent("runtime-successor", sid);
         agent.cutex_session_id = Some(sid.into());
         state.lock().unwrap().agents.insert(agent.id.clone(), agent);
+        persist_route_sessions(&[("runtime-successor", sid)]);
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let config = cutex::profiles::model::CodezConfig {
             agent_bus_port: Some(listener.local_addr().unwrap().port()),
@@ -2825,7 +3061,7 @@ mod tests {
         ) {
             return;
         }
-        let _home = super::super::test_home::IsolatedTestHome::new("alarm-retry-restart").unwrap();
+        let _home = super::super::test_home::IsolatedTestHome::new_private("alarm-retry-restart").unwrap();
         let state = Arc::new(Mutex::new(AgentBusState::default()));
         let sid = "cutex.00000000-0000-0000-0000-000000000001";
         let register = |runtime: &str| {
@@ -2834,6 +3070,8 @@ mod tests {
             let mut bus = state.lock().unwrap();
             bus.agents.clear();
             bus.agents.insert(runtime.into(), agent);
+            drop(bus);
+            persist_route_sessions(&[(runtime, sid)]);
         };
         register("first-runtime");
         let payload: AgentBusSendRequest = serde_json::from_value(serde_json::json!({
@@ -2874,6 +3112,71 @@ mod tests {
         assert_eq!(repo.snapshot(sid).unwrap()[0]["state"], "inbox_accepted");
     }
 
+    /// A "Claude Task" notice (claude-r23 background task ended): queued once under
+    /// its stable `ctask-` id, without a sender session; a repeat (a resume replay,
+    /// a second observer) is deduplicated, also after the inbox accepted it; a forged
+    /// shape is refused.
+    #[test]
+    fn claude_task_notice_is_queued_once_under_its_stable_id() {
+        if alarm_test_subprocess("claude_task_notice_is_queued_once_under_its_stable_id") {
+            return;
+        }
+        let _home = super::super::test_home::IsolatedTestHome::new_private("claude-task-notice").unwrap();
+        let state = Arc::new(Mutex::new(AgentBusState::default()));
+        let sid = "cutex.00000000-0000-0000-0000-000000000002";
+        let mut agent = exact_route_agent("claude-runtime", sid);
+        agent.cutex_session_id = Some(sid.into());
+        state.lock().unwrap().agents.insert("claude-runtime".into(), agent);
+        persist_route_sessions(&[("claude-runtime", sid)]);
+        let notice: cutex::agent_bus::claude_task::ClaudeTaskNotice = serde_json::from_value(serde_json::json!({
+            "noticeId":"task-a","taskId":"task-a","taskType":"local_agent","status":"completed",
+            "description":"Review docs","summary":"All good."
+        }))
+        .unwrap();
+        let payload = cutex::agent_bus::claude_task::send_request(sid, &notice).unwrap();
+        let stable = cutex::agent_bus::claude_task::message_id(sid, "task-a");
+        let first = send_payload_response(&state, payload.clone()).unwrap();
+        assert_eq!(first["id"], stable.as_str());
+        assert_eq!(first["deduplicated"], false);
+        let repo = agent_bus_message_repository().unwrap();
+        let records = repo.snapshot(sid).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0]["fromCutexSessionId"].is_null());
+        let queued = state.lock().unwrap().messages["claude-runtime"][0].clone();
+        assert!(cutex::agent_bus::claude_task::is_claude_task(&queued));
+        cutex::agent_bus::claude_task::model_text(&queued).unwrap();
+        {
+            let mut bus = state.lock().unwrap();
+            bus.messages.clear();
+            bus.recent_sends.clear();
+        }
+        let again = send_payload_response(&state, payload.clone()).unwrap();
+        assert_eq!(again["id"], stable.as_str());
+        assert_eq!(again["deduplicated"], true);
+        assert_eq!(repo.snapshot(sid).unwrap().len(), 1);
+        repo.record_local_inbox(sid, &stable, &serde_json::json!({
+            "threadId":"claude-thread","messageId":stable,"durable":true,"receiptScope":"local-inbox","state":"queued"
+        })).unwrap();
+        {
+            let mut bus = state.lock().unwrap();
+            bus.messages.clear();
+            bus.recent_sends.clear();
+        }
+        let accepted = send_payload_response(&state, payload.clone()).unwrap();
+        assert_eq!(accepted["deduplicated"], true);
+        assert!(state.lock().unwrap().messages.is_empty());
+        // Forged shapes: another sender name, a sender identity, a foreign stable id.
+        let mut renamed = payload.clone();
+        renamed.from = Some("someone".into());
+        assert!(send_payload_response(&state, renamed).is_err());
+        let mut with_sender = payload.clone();
+        with_sender.from_agent_id = Some("claude-runtime".into());
+        assert!(send_payload_response(&state, with_sender).is_err());
+        let mut retargeted = payload;
+        retargeted.external_message_id = Some(cutex::agent_bus::claude_task::message_id("cutex.other", "task-a"));
+        assert!(send_payload_response(&state, retargeted).is_err());
+    }
+
     // The repository singleton retains its first HOME. Environment mutexes
     // alone cannot isolate two tests which initialize it in different homes.
     fn alarm_test_subprocess(name: &str) -> bool {
@@ -2881,7 +3184,9 @@ mod tests {
         if std::env::var(CHILD).as_deref() == Ok(name) {
             return false;
         }
-        let root = std::env::temp_dir().join(format!("cutex-alarm-bus-{}", uuid::Uuid::new_v4()));
+        let parent = std::path::PathBuf::from(std::env::var_os("CUTEX_TEST_PRIVATE_HOME").expect("private home"));
+        assert!(parent.join(".cutex-test-private-home").is_file());
+        let root = parent.join(format!("cutex-alarm-bus-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".cutex-test-private-home"), b"alarm test").unwrap();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
@@ -2917,6 +3222,10 @@ mod tests {
                 exact_route_agent("runtime-successor", "cutex.successor"),
             );
         }
+        persist_route_sessions(&[
+            ("runtime-director", "cutex.director"),
+            ("runtime-successor", "cutex.successor"),
+        ]);
         let mut payload = exact_route_payload();
         payload.content = format!("durable ordinary {}", uuid::Uuid::new_v4());
 

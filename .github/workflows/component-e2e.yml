@@ -8,10 +8,10 @@
 # (CUTEX_TEST_PRIVATE_HOME) under a work dir whose path contains a space, and runs
 # install / status / list / remove / prune --dry-run, asserting states and needsUser steps.
 #
-# - claude-runtime (linux-x64, windows-x64): Python too old -> no Claude Code CLI -> no Codex runtime ->
-#   login required (stub `claude`; Windows: a stub claude.exe) -> optionally the real Claude Code CLI
-#   from npm (`claude.cmd` on Windows, in a path with a space) -> remove = deselect -> prune --dry-run.
-#   Windows: when the `py` launcher finds Python 3.11+, the venv must come from `py -3`.
+# - claude-runtime (linux-x64, windows-x64; bundled CLI and CLI-free archives): empty PATH proves
+#   standalone Python/default bundled CLI work without system tools. Also exercise explicit missing
+#   CLI, stub CLI, optional npm CLI, old-Python override, remove and prune. Legacy archives retain
+#   the system Python / Windows py-launcher assertions.
 # - job-service (linux-x64): no Codex runtime -> install with a stub Codex runtime: the systemd user
 #   unit (drill name cutex-e2e-job-service, user manager via loginctl linger) starts and the socket
 #   answers -> remove stops it -> prune --dry-run.
@@ -39,12 +39,14 @@ env:
 
 jobs:
   claude-runtime:
-    name: claude-runtime ${{ matrix.platform }}
+    name: claude-runtime ${{ matrix.platform }} bundle-cli=${{ matrix.bundle_cli }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
+        bundle_cli: ["1", "0"]
+        platform: [linux-x64, windows-x64]
         include:
           - platform: linux-x64
             runner: ubuntu-22.04
@@ -61,7 +63,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Pythons from the runner's tool cache (3.12 for building and the venv; an old one for the too-old check)
+      - name: Bootstrap/test Python and old Python for the explicit override check
         run: bash .github/ci/component-e2e-pythons.sh
       - name: Rust 1.95.0
         run: rustup toolchain install 1.95.0 --profile minimal && rustc +1.95.0 --version
@@ -70,10 +72,12 @@ jobs:
       - name: Build the claude-runtime archive
         env:
           LEAK_POLICY: ${{ matrix.leak_policy }}
+          CUTEX_CLAUDE_BUNDLE_CLI: ${{ matrix.bundle_cli }}
         run: |
           set -euo pipefail
           version="$("$E2E_PYTHON" -c 'import json; print(json.load(open("components/claude-runtime/component.json"))["version"])' | tr -d '\r')"
           PYTHON="$E2E_PYTHON" bash components/claude-runtime/build.sh "${{ matrix.platform }}" "$version" "$RUNNER_TEMP/archives"
+          "$E2E_PYTHON" .github/ci/components.py check claude-runtime "$version" "${{ matrix.platform }}" "$RUNNER_TEMP/archives" --commit "$(git rev-parse HEAD)"
       - name: Install the real Claude Code CLI from npm (path with a space)
         if: inputs.real_claude
         run: |
@@ -114,7 +118,7 @@ jobs:
       - if: failure()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: component-e2e-claude-runtime-${{ matrix.platform }}-logs
+          name: component-e2e-claude-runtime-${{ matrix.platform }}-cli-${{ matrix.bundle_cli }}-logs
           path: ${{ runner.temp }}/e2e-logs/
           if-no-files-found: ignore
           retention-days: 7
@@ -147,6 +151,7 @@ jobs:
           set -euo pipefail
           version="$("$E2E_PYTHON" -c 'import json; print(json.load(open("components/job-service/component.json"))["version"])' | tr -d '\r')"
           bash components/job-service/build.sh linux-x64 "$version" "$RUNNER_TEMP/archives"
+          "$E2E_PYTHON" .github/ci/components.py check job-service "$version" linux-x64 "$RUNNER_TEMP/archives" --commit "$(git rev-parse HEAD)"
       - name: systemd user manager (linger) and a drill unit directory
         run: |
           set -euo pipefail

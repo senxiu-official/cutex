@@ -543,7 +543,7 @@ fn cmd_session_resume_foreground_inner(
         validate_managed_launch_overrides(record, cwd_override, launch_profile)?;
         return super::stock_lifecycle::attach(&record.cutex_session_id);
     }
-    if record.is_retired() {
+    if cutex::agent_management::agent_execution_blocked(&record) {
         anyhow::bail!(
             "cannot resume retired cutex session {}; restore it first",
             record.cutex_session_id

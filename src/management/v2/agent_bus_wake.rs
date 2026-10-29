@@ -1,7 +1,8 @@
 //! `cutex/agentBus/wake` (agent messaging v2): the owner wakes a session so
-//! it reads and handles the notes other agents left it. It queues one owner
-//! input: an idle session starts a turn now, a busy one after its current
-//! turn, an offline one is brought online first (as `startIfOffline`). Every
+//! it reads and handles the notes other agents left it. It submits one owner
+//! input (`auto`, 023 Q2): an idle session starts a turn now, a busy one reads
+//! it at its next step like typed input (older Claude adapters: after the
+//! turn), an offline one is brought online first (as `startIfOffline`). Every
 //! pending note is read into that turn's context.
 
 use serde_json::json;
@@ -44,7 +45,7 @@ pub(super) fn dispatch(
 
 pub(super) fn dispatch_with(
     root: bool,
-    session: &Value,
+    _session: &Value,
     request: &ValidatedCutexRequest,
     pending: impl FnOnce() -> Result<usize, UserInputExecutionError>,
     submit: impl FnOnce(&ValidatedCutexRequest) -> Result<Value, UserInputExecutionError>,
@@ -63,15 +64,16 @@ pub(super) fn dispatch_with(
         return Err(super::server::invalid_user_input_error("cutex/agentBus/wake params must be {}"));
     }
     let pending_notes = pending()?;
-    // Busy: after the current turn (never steered into it). Idle: now.
-    let busy = session.pointer("/runtime/activeTurnId").is_some_and(|turn| !turn.is_null());
+    // The owner's own words: `auto` like typed input (023 Q2). Busy: read at
+    // the next step (Codex steer; Claude same-turn steering, else after the
+    // turn on older adapters). Idle: now.
     let input = ValidatedCutexRequest {
         request_id: request.request_id.clone(),
         method: "cutex/userInput/submit".into(),
         params: json!({
             "clientUserMessageId": format!("agent-bus-wake-{}", request.request_id),
             "origin": {"kind": "other", "clientId": CLIENT_ID},
-            "strategy": if busy { "queue" } else { "auto" },
+            "strategy": "auto",
             "input": [{"type": "text", "text": WAKE_TEXT, "text_elements": []}],
             "startIfOffline": true,
         }),
@@ -115,12 +117,12 @@ mod tests {
         assert_eq!(seen.params["startIfOffline"], true);
         assert_eq!(seen.params["input"][0]["text"], WAKE_TEXT);
         assert_eq!(seen.params["clientUserMessageId"], "agent-bus-wake-req-1");
-        // Busy: queued after the current turn, never steered.
+        // Busy: `auto` too (023 Q2): steered into the running turn's next step.
         let result = dispatch_with(true, &session(Some("turn-1")), &request(Value::Null), || Ok(0), |submit| {
-            assert_eq!(submit.params["strategy"], "queue");
-            Ok(json!({"disposition": "queued"}))
+            assert_eq!(submit.params["strategy"], "auto");
+            Ok(json!({"disposition": "steered"}))
         })
         .unwrap();
-        assert_eq!((result["pendingNotes"].as_u64(), result["started"].as_bool()), (Some(0), Some(false)));
+        assert_eq!((result["pendingNotes"].as_u64(), result["started"].as_bool()), (Some(0), Some(true)));
     }
 }

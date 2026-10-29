@@ -8,6 +8,10 @@ use crate::role_revision::{CutexSessionId, Rfc3339, Sha256};
 use super::store::{now, request_sha256, AgentManagementSnapshot};
 use super::*;
 
+#[path = "provider_archive.rs"]
+mod archive_operations;
+pub use archive_operations::ManagedAgentArchiveRequest;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LifecycleFailure {
     pub code: String,
@@ -137,6 +141,12 @@ pub trait AgentLifecycle: Send + Sync {
     }
     fn prepare_private_cwd(&self, spec: &ManagedAgentSpec) -> Result<(), LifecycleFailure>;
     fn bootstrap_native(&self, spec: &ManagedAgentSpec) -> Result<String, LifecycleFailure>;
+    /// A durable implementation must apply this frozen actor before its first
+    /// Cutex record publication (Claude publishes during bootstrap itself).
+    fn bootstrap_native_with_creator(&self, spec: &ManagedAgentSpec, _creator: Option<&crate::session::model::SessionCreatedBy>) -> Result<String, LifecycleFailure> {
+        self.bootstrap_native(spec)
+    }
+
     fn reconcile_pre_sid_bootstrap(
         &self,
         _spec: &ManagedAgentSpec,
@@ -205,6 +215,11 @@ pub trait AgentLifecycle: Send + Sync {
         native_session_id: &str,
         spec: &ManagedAgentSpec,
     ) -> Result<CutexSessionId, LifecycleFailure>;
+    /// Native adoption receives the creation actor separately from the model's
+    /// request. It must not infer one from the target Profile or project seat.
+    fn adopt_native_with_creator(&self, native_session_id: &str, spec: &ManagedAgentSpec, _creator: Option<&crate::session::model::SessionCreatedBy>) -> Result<CutexSessionId, LifecycleFailure> {
+        self.adopt_native(native_session_id, spec)
+    }
     fn configure(
         &self,
         cutex_session_id: &CutexSessionId,
@@ -275,6 +290,11 @@ pub trait AgentLifecycle: Send + Sync {
         ))
     }
     fn retire(&self, cutex_session_id: &CutexSessionId) -> Result<(), LifecycleFailure>;
+    /// Optional isolated durable store supplied by a lifecycle adapter. The
+    /// production provider uses its configured session store instead.
+    fn archive_session_store_path(&self) -> Option<std::path::PathBuf> { None }
+    /// Optional cache invalidation after the durable archive transaction.
+    fn archive_committed(&self, _record: &crate::session::model::CutexSessionRecord) {}
     fn observe(
         &self,
         cutex_session_id: &CutexSessionId,
@@ -309,10 +329,60 @@ impl AgentManagementPhaseObserver for NoopPhaseObserver {
     fn phase_committed(&self, _event: &AgentManagementPhaseEvent) {}
 }
 
+/// r254 (design 044 §6): one Project authority transition, as the provider
+/// is about to commit it. `previous` is the authority the CAS replaces
+/// (`None` for the first bind of a project).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityTransitionIntent {
+    pub action_id: AgentActionId,
+    pub request_sha256: Sha256,
+    pub project_id: ProjectId,
+    pub previous: Option<ProjectAuthority>,
+    /// `None`: the owner cleared the seat (`clear_director`).
+    pub next: Option<ProjectAuthority>,
+}
+
+/// r254: the Director-address extension around the authority CAS. The two
+/// stores are separate persistence domains: `prepare` durably records the
+/// intent BEFORE the CAS is written (an error refuses the bind, nothing is
+/// committed); `finalize` runs after the authority receipt is persisted, and
+/// again on every same-action replay, so a crash between the two is completed
+/// idempotently from the real receipt. `prepare` runs under the roster
+/// mutation lock (lock order: roster, then the extension store) and must not
+/// do native I/O.
+pub trait AuthorityTransitionHook: Send + Sync {
+    fn prepare(
+        &self,
+        intent: &AuthorityTransitionIntent,
+        snapshot: &AgentManagementSnapshot,
+    ) -> Result<(), AgentManagementError>;
+    fn finalize(
+        &self,
+        receipt: &ProjectAuthorityReceipt,
+        snapshot: &AgentManagementSnapshot,
+    ) -> Result<(), AgentManagementError>;
+    /// After an owner project mutation (create with a Director / assign /
+    /// rotate / clear) committed, and on its replay: the witness is the
+    /// durable `human_management_project_mutations[action_id]` record.
+    fn finalize_owner_change(
+        &self,
+        _action_id: &AgentActionId,
+        _snapshot: &AgentManagementSnapshot,
+    ) -> Result<(), AgentManagementError> {
+        Ok(())
+    }
+    /// Startup: settle prepared intents from real receipts and account
+    /// authority changes that bypassed the hook.
+    fn recover(&self, _snapshot: &AgentManagementSnapshot) -> Result<(), AgentManagementError> {
+        Ok(())
+    }
+}
+
 pub struct AgentManagementProvider {
     store: AgentManagementStore,
     current_names_path: Option<std::path::PathBuf>,
     phase_observer: Arc<dyn AgentManagementPhaseObserver>,
+    authority_hook: Option<Arc<dyn AuthorityTransitionHook>>,
     #[cfg(test)]
     fail_after_predecessor_close_once: Arc<AtomicBool>,
 }
@@ -329,6 +399,7 @@ impl AgentManagementProvider {
             store: AgentManagementStore::open(&root)?,
             current_names_path: None,
             phase_observer: Arc::new(NoopPhaseObserver),
+            authority_hook: None,
             #[cfg(test)]
             fail_after_predecessor_close_once: Arc::new(AtomicBool::new(false)),
         })
@@ -339,9 +410,31 @@ impl AgentManagementProvider {
             store: AgentManagementStore::open_default()?,
             current_names_path: Some(crate::session::store::cutex_sessions_path()?),
             phase_observer: Arc::new(NoopPhaseObserver),
+            authority_hook: crate::director_address::management::default_authority_hook(),
             #[cfg(test)]
             fail_after_predecessor_close_once: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub(in crate::agent_management) fn authority_hook(&self) -> Option<Arc<dyn AuthorityTransitionHook>> {
+        self.authority_hook.clone()
+    }
+
+    /// Runs the authority hook's startup recovery under the provider
+    /// execution lock, so no bind can interleave with it.
+    pub fn recover_authority_hook(&self) -> Result<(), AgentManagementError> {
+        let Some(hook) = self.authority_hook.clone() else { return Ok(()) };
+        let _execution = provider_execution_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Same fence as a bind: no other process can bind meanwhile.
+        let _mutation = self.store.lock_mutations()?;
+        hook.recover(&self.store.snapshot()?)
+    }
+
+    pub fn with_authority_hook(mut self, hook: Arc<dyn AuthorityTransitionHook>) -> Self {
+        self.authority_hook = Some(hook);
+        self
     }
 
     pub fn with_phase_observer(mut self, observer: Arc<dyn AgentManagementPhaseObserver>) -> Self {
@@ -374,10 +467,22 @@ impl AgentManagementProvider {
         Ok(())
     }
 
-    pub(super) fn current_name_snapshot(
+    pub(crate) fn current_name_snapshot(
         &self,
     ) -> Result<AgentManagementSnapshot, AgentManagementError> {
         let mut snapshot = self.store.snapshot()?;
+        // Custom lifecycle adapters may use an isolated store. Their committed
+        // archive receipts still suppress ordinary lifecycle/name reservations.
+        if self.current_names_path.is_none() {
+            let mut receipts = snapshot.agent_archive_actions.values()
+                .filter(|r| r.stage == AgentArchiveStage::Committed)
+                .collect::<Vec<_>>();
+            receipts.sort_by_key(|r| r.result.as_ref().map(|v| v.durable_revision()).unwrap_or(0));
+            let projection = receipts.into_iter().filter_map(|r| r.result.as_ref())
+                .filter_map(|r| CutexSessionId::new(r.cutex_session_id.clone()).ok().map(|id| (id, r.is_retired())))
+                .collect();
+            snapshot.reversible_archive_projection = projection;
+        }
         if let Some(path) = &self.current_names_path {
             let sessions = crate::session::store::load_cutex_session_store_from_path(path)
                 .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
@@ -468,7 +573,7 @@ impl AgentManagementProvider {
         &self.store
     }
 
-    fn notify_phase(&self, event: &AgentManagementPhaseEvent) {
+    pub(super) fn notify_phase(&self, event: &AgentManagementPhaseEvent) {
         self.phase_observer.phase_committed(event);
     }
 
@@ -489,9 +594,10 @@ impl AgentManagementProvider {
             ));
         }
         let digest = request_sha256(request)?;
+        let hook = self.authority_hook.clone();
         // r219: the Agent Management authority is the only Director record;
         // there is no Task Service seat copy to transfer.
-        self.store.with_state(true, |mut state| {
+        let receipt = self.store.with_state(true, |mut state| {
             if state
                 .durable_import_actions
                 .contains_key(&request.action_id)
@@ -562,12 +668,38 @@ impl AgentManagementProvider {
                 request_sha256: digest.clone(),
                 authority: authority.clone(),
             };
+            if let Some(hook) = &hook {
+                // Prepared sidecar intent before the CAS write (design 044 §6.1).
+                hook.prepare(
+                    &AuthorityTransitionIntent {
+                        action_id: request.action_id.clone(),
+                        request_sha256: digest.clone(),
+                        project_id: request.project_id.clone(),
+                        previous: state.projects.get(&request.project_id).cloned(),
+                        next: Some(authority.clone()),
+                    },
+                    &state,
+                )?;
+            }
             state.projects.insert(request.project_id.clone(), authority);
             state
                 .authority_receipts
                 .insert(request.action_id.clone(), receipt.clone());
             Ok((state, receipt, true))
-        })
+        })?;
+        if let Some(hook) = &hook {
+            // The receipt is the commit witness; a finalize failure leaves the
+            // prepared intent for recovery (same-action replay or startup).
+            match self.store.snapshot() {
+                Ok(snapshot) => {
+                    if let Err(error) = hook.finalize(&receipt, &snapshot) {
+                        eprintln!("director-address finalize of {} deferred to recovery: {error:?}", receipt.action_id.as_str());
+                    }
+                }
+                Err(error) => eprintln!("director-address finalize: roster snapshot unavailable: {error:?}"),
+            }
+        }
+        Ok(receipt)
     }
 
     /// Atomically imports the one missing ownership record for an exact legacy
@@ -920,6 +1052,18 @@ impl AgentManagementProvider {
     }
 
     pub fn execute(
+        &self,
+        invocation: &AgentManagementInvocation,
+        request: &AgentManagementRequest,
+        lifecycle: &dyn AgentLifecycle,
+    ) -> AgentManagementResponse {
+        let response = self.execute_with_lifecycle_locks(invocation, request, lifecycle);
+        // Provider/session locks are gone before asks settlement.
+        self.settle_soft_archive_for_request(request, lifecycle);
+        response
+    }
+
+    fn execute_with_lifecycle_locks(
         &self,
         invocation: &AgentManagementInvocation,
         request: &AgentManagementRequest,
@@ -1540,6 +1684,8 @@ impl AgentManagementProvider {
                     operation: request.operation.kind(),
                     project_id: request.project_id.clone(),
                     caller_cutex_session: invocation.caller_cutex_session.clone(),
+                    created_by: matches!(request.operation.kind(), AgentOperationKind::Create | AgentOperationKind::Replace)
+                        .then(|| captured_creator(&invocation.caller_cutex_session, role)).flatten(),
                     phase: AgentActionPhase::Prepared,
                     phase_sequence: 0,
                     reserved_agent_name: reservation.map(|spec| spec.name.clone()),
@@ -1924,7 +2070,7 @@ impl AgentManagementProvider {
             match if let Some(permit) = &permit {
                 lifecycle.bootstrap_reviewed(permit)
             } else {
-                lifecycle.bootstrap_native(spec)
+                lifecycle.bootstrap_native_with_creator(spec, action.created_by.as_ref())
             } {
                 Ok(native_session_id) => {
                     action = self.capture_native_session(request, &native_session_id)?;
@@ -1971,7 +2117,7 @@ impl AgentManagementProvider {
                 }
                 lifecycle.adopt_reviewed(permit, &native_session_id)
             } else {
-                lifecycle.adopt_native(&native_session_id, spec)
+                lifecycle.adopt_native_with_creator(&native_session_id, spec, action.created_by.as_ref())
             }
             .map_err(lifecycle_error)?;
             action = self.capture_adopted_agent(
@@ -2248,68 +2394,8 @@ impl AgentManagementProvider {
         occurrence_fence: Option<&RuntimeOccurrenceFence>,
         lifecycle: &dyn AgentLifecycle,
     ) -> Result<(ManagedAgentRecord, AgentRuntimeObservation), AgentManagementError> {
-        let (agent, _) =
-            self.offline_existing(request, cutex_session_id, occurrence_fence, lifecycle)?;
-        lifecycle
-            .retire(cutex_session_id)
-            .map_err(lifecycle_error)?;
-        let observation = lifecycle
-            .observe(cutex_session_id)
-            .map_err(lifecycle_error)?;
-        if observation.active
-            || observation.app_server_runtime
-            || !observation.runtime_agent_ids.is_empty()
-            || !observation.agent_bus_endpoint_ids.is_empty()
-        {
-            return Err(AgentManagementError::OwnerActionRequired(
-                "close did not retire the Agent and remove its endpoint".to_string(),
-            ));
-        }
-        let retired = self.store.with_state(true, |mut state| {
-            let record = state.agents.get_mut(cutex_session_id).ok_or(
-                AgentManagementError::OwnerActionRequired(
-                    "managed Agent ownership disappeared during close".to_string(),
-                ),
-            )?;
-            if record.retired_at.is_none() {
-                record.retired_at = Some(now());
-            }
-            let retired = record.clone();
-            if request.role == AgentManagementRole::PrimaryDirector
-                && state
-                    .operator_grants
-                    .get_mut(&request.project_id)
-                    .and_then(|grants| grants.remove(cutex_session_id))
-                    .is_some()
-            {
-                let current_revision = operator_grant_revision(&state, &request.project_id);
-                let revision = next_operator_grant_revision(current_revision)?;
-                let primary = state
-                    .projects
-                    .get(&request.project_id)
-                    .map(|authority| authority.authorized_director_session.clone())
-                    .ok_or(AgentManagementError::InvalidStore)?;
-                let committed_at = now();
-                state
-                    .operator_grant_revisions
-                    .insert(request.project_id.clone(), revision);
-                insert_operator_audit_event(
-                    &mut state,
-                    request,
-                    cutex_session_id,
-                    AgentOperatorAuditKind::RemovedForPrimaryDirector,
-                    current_revision,
-                    revision,
-                    &primary,
-                    committed_at,
-                )?;
-            }
-            Ok((state, retired, true))
-        })?;
-        debug_assert_eq!(retired.project_id, agent.project_id);
-        Ok((retired, observation))
+        self.soft_archive_existing(request, cutex_session_id, occurrence_fence, lifecycle)
     }
-
     /// Completes one predecessor close owned by the exact durable action. The
     /// `PredecessorClosing` intent is committed before this seam is entered.
     /// On replay, an exact already-retired predecessor may be adopted as the
@@ -2362,39 +2448,18 @@ impl AgentManagementProvider {
                 ))
             };
         }
-        if externally_closed {
-            self.mark_expected_predecessor_retired(request, &expected)?;
-            return Ok(None);
+        // A session-only legacy close without our durable soft intent cannot
+        // be reclassified as reversible, nor may an agent finish a permanent
+        // tombstone. Leave the ambiguous historical action for the owner.
+        if externally_closed && !self.has_soft_archive_intent(request, cutex_session_id)? {
+            return Err(AgentManagementError::Conflict("legacy_close_requires_owner_review"));
         }
-        if !observation.active {
-            return Err(AgentManagementError::OwnerActionRequired(
-                "predecessor close outcome is partial or ambiguous".to_string(),
-            ));
-        }
-        let (agent, _) = self.offline_existing(request, cutex_session_id, None, lifecycle)?;
-        lifecycle
-            .retire(cutex_session_id)
-            .map_err(lifecycle_error)?;
-        let after = lifecycle
-            .observe(cutex_session_id)
-            .map_err(lifecycle_error)?;
-        self.validate_current_managed_observation(&agent, &after)?;
-        if after.active
-            || after.app_server_runtime
-            || !after.runtime_agent_ids.is_empty()
-            || !after.agent_bus_endpoint_ids.is_empty()
-        {
-            return Err(AgentManagementError::OwnerActionRequired(
-                "close did not retire the expected predecessor and remove its endpoint".to_string(),
-            ));
-        }
+        self.soft_archive_existing(request, cutex_session_id, None, lifecycle)?;
         if let Some(response) = self.inject_process_loss_after_predecessor_close(request) {
             return Ok(Some(response));
         }
-        self.mark_expected_predecessor_retired(request, &expected)?;
         Ok(None)
     }
-
     fn validate_current_managed_observation(
         &self,
         agent: &ManagedAgentRecord,
@@ -2416,70 +2481,6 @@ impl AgentManagementProvider {
         }
     }
 
-    fn mark_expected_predecessor_retired(
-        &self,
-        request: &AuthorizedAgentManagementRequest<'_>,
-        expected: &ManagedAgentRecord,
-    ) -> Result<(), AgentManagementError> {
-        self.store.with_state(true, |mut state| {
-            let action = state
-                .actions
-                .get(&request.action_id)
-                .ok_or(AgentManagementError::InvalidStore)?;
-            if action.phase != AgentActionPhase::PredecessorClosing
-                || action.project_id != request.project_id
-                || !operation_closes_expected_predecessor(request, &expected.cutex_session_id)
-            {
-                return Err(AgentManagementError::InvalidStore);
-            }
-            if super::projects::current_project_id(&state, expected).as_ref()
-                != Some(&request.project_id)
-            {
-                return Err(AgentManagementError::Unauthorized);
-            }
-            let record = state
-                .agents
-                .get_mut(&expected.cutex_session_id)
-                .ok_or(AgentManagementError::InvalidStore)?;
-            if record != expected || record.retired_at.is_some() {
-                return Err(AgentManagementError::OwnerActionRequired(
-                    "predecessor ownership changed during close reconciliation".to_string(),
-                ));
-            }
-            record.retired_at = Some(now());
-            if request.role == AgentManagementRole::PrimaryDirector
-                && state
-                    .operator_grants
-                    .get_mut(&request.project_id)
-                    .and_then(|grants| grants.remove(&expected.cutex_session_id))
-                    .is_some()
-            {
-                let current_revision = operator_grant_revision(&state, &request.project_id);
-                let revision = next_operator_grant_revision(current_revision)?;
-                let primary = state
-                    .projects
-                    .get(&request.project_id)
-                    .map(|authority| authority.authorized_director_session.clone())
-                    .ok_or(AgentManagementError::InvalidStore)?;
-                let committed_at = now();
-                state
-                    .operator_grant_revisions
-                    .insert(request.project_id.clone(), revision);
-                insert_operator_audit_event(
-                    &mut state,
-                    request,
-                    &expected.cutex_session_id,
-                    AgentOperatorAuditKind::RemovedForPrimaryDirector,
-                    current_revision,
-                    revision,
-                    &primary,
-                    committed_at,
-                )?;
-            }
-            Ok((state, (), true))
-        })
-    }
-
     fn reject_active_collision(
         &self,
         spec: &ManagedAgentSpec,
@@ -2498,9 +2499,10 @@ impl AgentManagementProvider {
         allowed_predecessor: Option<&CutexSessionId>,
         caller: &CutexSessionId,
     ) -> Result<(), AgentManagementError> {
-        let snapshot = self.store.snapshot()?;
+        let snapshot = self.current_name_snapshot()?;
         let holder = snapshot.agents.values().find(|agent| {
             agent.retired_at.is_none()
+                && snapshot.reversible_archive_projection.get(&agent.cutex_session_id) != Some(&true)
                 && allowed_predecessor != Some(&agent.cutex_session_id)
                 && agent.spec.name == spec.name
         });
@@ -2821,6 +2823,7 @@ impl AgentManagementProvider {
         digest: &Sha256,
         result: AgentManagementResult,
     ) -> Result<AgentManagementResponse, AgentManagementError> {
+        let archive_kind = self.completed_archive_disposition(request.request)?;
         let receipt = AgentManagementReceipt {
             schema: AgentManagementReceiptSchema::V1,
             action_id: request.action_id.clone(),
@@ -2828,6 +2831,8 @@ impl AgentManagementProvider {
             operation: request.operation.kind(),
             project_id: request.project_id.clone(),
             completed_at: now(),
+            archive_kind,
+            restorable: archive_kind.map(|kind| kind == AgentArchiveKind::Soft),
             result,
         };
         let response = AgentManagementResponse {
@@ -2881,6 +2886,7 @@ impl AgentManagementProvider {
                     super::projects::current_project_id(&state, agent).as_ref()
                         == Some(&request.project_id)
                         && agent.retired_at.is_none()
+                        && !archive_operations::archived_caller(&state, &agent.cutex_session_id)
                 })
                 .ok_or(AgentManagementError::Conflict(
                     "operator_must_be_active_managed_agent",
@@ -3114,6 +3120,16 @@ enum AgentManagementRole {
     ReceiptReplay,
 }
 
+fn captured_creator(caller: &CutexSessionId, role: AgentManagementRole) -> Option<crate::session::model::SessionCreatedBy> {
+    use crate::session::model::{SessionCreatedBy, SessionCreatorRole};
+    let role = match role {
+        AgentManagementRole::PrimaryDirector => SessionCreatorRole::Director,
+        AgentManagementRole::Operator => SessionCreatorRole::Member,
+        AgentManagementRole::ReceiptReplay => return None,
+    };
+    Some(SessionCreatedBy::Agent { cutex_session_id: caller.clone(), role: Some(role) })
+}
+
 fn authorize_operation(
     snapshot: &AgentManagementSnapshot,
     caller: &CutexSessionId,
@@ -3242,6 +3258,9 @@ fn project_management_role(
     caller: &CutexSessionId,
     project_id: &ProjectId,
 ) -> Result<AgentManagementRole, AgentManagementError> {
+    if archive_operations::archived_caller(snapshot, caller) {
+        return Err(AgentManagementError::ProjectNotAuthorized);
+    }
     let authority = snapshot
         .projects
         .get(project_id)
@@ -4322,6 +4341,8 @@ fn complete_response(
         operation: request.operation.kind(),
         project_id: request.project_id.clone(),
         completed_at: now(),
+        archive_kind: None,
+        restorable: None,
         result,
     };
     AgentManagementResponse {
@@ -4600,6 +4621,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use super::*;
+    include!("provider_archive_tests.rs");
 
     const REAL_LEGACY_NO_SID_DETAIL: &str =
         "owner_action_required: native_session_unknown: native exec exited exit status: 1 without one captured SID";
@@ -4624,7 +4646,9 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        archive_path: Option<std::path::PathBuf>,
         resolved_backend: Option<String>,
+        creator_calls: Vec<(String, Option<crate::session::model::SessionCreatedBy>)>,
         log: Vec<String>,
         scope_timeout_path: Option<std::path::PathBuf>,
         scope_timeout_child: Option<std::process::Child>,
@@ -4860,6 +4884,36 @@ mod tests {
     }
 
     impl AgentLifecycle for FakeLifecycle {
+        fn archive_session_store_path(&self) -> Option<std::path::PathBuf> {
+            let mut state = self.state.lock().unwrap();
+            let path = state.archive_path.get_or_insert_with(|| root("archive-fixture").join("sessions.json")).clone();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut sessions = crate::session::store::load_cutex_session_store_from_path(&path).unwrap();
+            for observation in state.agents.values() {
+                if !sessions.sessions.contains_key(observation.cutex_session_id.as_str()) {
+                    let mut record = crate::session::model::CutexSessionRecord::new_at(
+                        observation.cutex_session_id.as_str().to_string(), Some(observation.native_session_id.clone()),
+                        crate::platform::host::current_host_name(), observation.cwd.clone(),
+                        Some(observation.profile.clone()), now().as_str().to_string()).unwrap();
+                    record.agent_enabled = true;
+                    record.registration_class = crate::agent_bus::model::AgentRegistrationClass::Persistent;
+                    record.formal_agent_name = Some(observation.cutex_session_id.as_str().to_string());
+                    record.runtime_generation = observation.runtime_generation;
+                    sessions.sessions.insert(record.cutex_session_id.clone(), record);
+                }
+            }
+            crate::session::store::save_cutex_session_store_to_path(&path, &sessions).unwrap();
+            Some(path)
+        }
+
+        fn archive_committed(&self, record: &crate::session::model::CutexSessionRecord) {
+            let mut state = self.state.lock().unwrap();
+            let id = CutexSessionId::new(record.cutex_session_id.clone()).unwrap();
+            if state.agents.get(&id).is_some_and(|a| a.active != record.is_active()) {
+                state.log.push(format!("archive:{}", id.as_str()));
+            }
+            state.agents.get_mut(&id).unwrap().active = record.is_active();
+        }
         fn migration_required(&self, id: &CutexSessionId) -> Option<String> {
             (self.state.lock().unwrap().legacy_unmigrated.as_ref() == Some(id))
                 .then(|| "migration_required: worker uses the legacy cute-alden backend.".to_string())
@@ -4955,6 +5009,15 @@ mod tests {
                 .log
                 .push(format!("prepare:{}", spec.name));
             Ok(())
+        }
+
+        fn bootstrap_native_with_creator(&self, spec: &ManagedAgentSpec, creator: Option<&crate::session::model::SessionCreatedBy>) -> Result<String, LifecycleFailure> {
+            self.state.lock().unwrap().creator_calls.push(("bootstrap".into(),creator.cloned()));
+            self.bootstrap_native(spec)
+        }
+        fn adopt_native_with_creator(&self, native: &str, spec: &ManagedAgentSpec, creator: Option<&crate::session::model::SessionCreatedBy>) -> Result<CutexSessionId, LifecycleFailure> {
+            self.state.lock().unwrap().creator_calls.push(("adopt".into(),creator.cloned()));
+            self.adopt_native(native,spec)
         }
 
         fn bootstrap_native(&self, _spec: &ManagedAgentSpec) -> Result<String, LifecycleFailure> {
@@ -5659,6 +5722,7 @@ mod tests {
                         operation: request.operation.kind(),
                         project_id: project(),
                         caller_cutex_session: session("cutex.director"),
+                        created_by: None,
                         phase: AgentActionPhase::OwnerActionRequired,
                         phase_sequence: 2,
                         reserved_agent_name: Some(reserved_name.clone()),
@@ -6025,6 +6089,7 @@ mod tests {
                         operation: AgentOperationKind::Create,
                         project_id: project(),
                         caller_cutex_session: session("cutex.director"),
+                        created_by: None,
                         phase: AgentActionPhase::OwnerActionRequired,
                         phase_sequence: 4,
                         reserved_agent_name: Some(spec.name.clone()),
@@ -6086,6 +6151,7 @@ mod tests {
                         operation: request.operation.kind(),
                         project_id: project(),
                         caller_cutex_session: session("cutex.director"),
+                        created_by: None,
                         phase: AgentActionPhase::OwnerActionRequired,
                         phase_sequence: 2,
                         reserved_agent_name: None,
@@ -6585,6 +6651,44 @@ mod tests {
     }
 
     #[test]
+    fn creator_is_captured_before_bootstrap_and_exact_replay_survives_director_handover() {
+        use crate::session::model::{SessionCreatedBy,SessionCreatorRole};
+        let root=root("created-by-director");
+        let provider=AgentManagementProvider::open(&root).unwrap();
+        bind(&provider,"bind","cutex.director",None);
+        let lifecycle=FakeLifecycle::default();
+        let request=create_request("create-actor","actor-worker",AgentStartMode::BootstrapOnly);
+        let receipt=completed(provider.execute(&invocation("cutex.director"),&request,&lifecycle));
+        let expected=Some(SessionCreatedBy::Agent {cutex_session_id:session("cutex.director"),role:Some(SessionCreatorRole::Director)});
+        assert_eq!(provider.store().snapshot().unwrap().actions[&request.action_id].created_by,expected);
+        assert_eq!(lifecycle.state.lock().unwrap().creator_calls,vec![("bootstrap".into(),expected.clone()),("adopt".into(),expected.clone())]);
+        bind(&provider,"handover","cutex.next-director",Some(("cutex.director",1)));
+        let replay=completed(provider.execute(&invocation("cutex.director"),&request,&lifecycle));
+        assert_eq!(created_agent(&replay).cutex_session_id,created_agent(&receipt).cutex_session_id);
+        assert_eq!(lifecycle.state.lock().unwrap().creator_calls.len(),2,"replay never creates or restamps");
+        let action=provider.store().snapshot().unwrap().actions[&request.action_id].clone();
+        assert_eq!(action.created_by,expected,"captured role does not follow current Director");
+        let mut legacy=serde_json::to_value(&action).unwrap();legacy.as_object_mut().unwrap().remove("created_by");
+        let legacy:AgentActionRecord=serde_json::from_value(legacy).unwrap();
+        assert!(legacy.created_by.is_none(),"old action provenance stays unknown");
+        assert!(serde_json::to_value(&legacy).unwrap().get("created_by").is_none(),"old digest bytes gain no null field");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creator_role_capture_never_substitutes_the_primary_director_for_an_operator() {
+        use crate::session::model::{SessionCreatedBy,SessionCreatorRole};
+        let caller=session("cutex.actual-operator");
+        assert_eq!(captured_creator(&caller,AgentManagementRole::Operator),Some(SessionCreatedBy::Agent {
+            cutex_session_id:caller.clone(),role:Some(SessionCreatorRole::Member),
+        }));
+        assert_eq!(captured_creator(&caller,AgentManagementRole::PrimaryDirector),Some(SessionCreatedBy::Agent {
+            cutex_session_id:caller.clone(),role:Some(SessionCreatorRole::Director),
+        }));
+        assert!(captured_creator(&caller,AgentManagementRole::ReceiptReplay).is_none());
+    }
+
+    #[test]
     fn profile_backend_resolution_keeps_exact_request_replay() {
         let root = root("profile-backend");
         let provider = AgentManagementProvider::open(&root).unwrap();
@@ -6863,7 +6967,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_preserves_durable_and_native_identity_and_close_retires() {
+    fn lifecycle_preserves_durable_and_native_identity_and_close_soft_archives() {
         let root = root("lifecycle");
         let provider = AgentManagementProvider::open(&root).unwrap();
         bind(&provider, "bind", "cutex.director", None);
@@ -6902,7 +7006,7 @@ mod tests {
         let closed = completed(provider.execute(&invocation("cutex.director"), &close, &lifecycle));
         match closed.result {
             AgentManagementResult::Lifecycle { agent, observation } => {
-                assert!(agent.retired_at.is_some());
+                assert!(agent.retired_at.is_none());
                 assert!(!observation.active);
                 assert!(observation.agent_bus_endpoint_ids.is_empty());
             }
@@ -7011,7 +7115,7 @@ mod tests {
         }
         assert!(provider.store().snapshot().unwrap().agents[&id]
             .retired_at
-            .is_some());
+            .is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -8175,7 +8279,7 @@ mod tests {
         let log = lifecycle.log();
         let steps = &log[before..];
         assert!(steps[0].starts_with("offline:"));
-        assert!(steps[1].starts_with("retire:"));
+        assert!(steps[1].starts_with("archive:"));
         assert_eq!(steps[2], "prepare:worker-new");
         let snapshot = provider.store().snapshot().unwrap();
         assert_eq!(
@@ -8254,7 +8358,7 @@ mod tests {
             let externally_retired = lifecycle.observe(&predecessor.cutex_session_id).unwrap();
             assert!(!externally_retired.active);
             assert!(externally_retired.agent_bus_endpoint_ids.is_empty());
-            assert_eq!(lifecycle.retire_count(&predecessor.cutex_session_id), 1);
+            assert_eq!(lifecycle.retire_count(&predecessor.cutex_session_id), 0);
 
             let bypass =
                 create_request("fresh-bypass", "worker-new", AgentStartMode::BootstrapOnly);
@@ -8287,7 +8391,7 @@ mod tests {
             assert_eq!(successor.spec, spec("worker-new"));
             assert_eq!(lifecycle.bootstrap_count(), 2);
             assert_eq!(lifecycle.message_count(), 1);
-            assert_eq!(lifecycle.retire_count(&predecessor.cutex_session_id), 1);
+            assert_eq!(lifecycle.retire_count(&predecessor.cutex_session_id), 0);
             let final_state = reopened.store().snapshot().unwrap();
             assert_eq!(
                 final_state.actions[&request.action_id].phase,
@@ -8295,14 +8399,14 @@ mod tests {
             );
             assert!(final_state.agents[&predecessor.cutex_session_id]
                 .retired_at
-                .is_some());
+                .is_none());
             assert_eq!(
                 final_state
                     .agents
                     .values()
                     .filter(|agent| agent.retired_at.is_none())
                     .count(),
-                1
+                2
             );
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -9645,6 +9749,7 @@ mod tests {
                         operation: AgentOperationKind::Create,
                         project_id: project(),
                         caller_cutex_session: session("cutex.director"),
+                        created_by: None,
                         phase: AgentActionPhase::NativeSessionCaptured,
                         phase_sequence: 0,
                         reserved_agent_name: Some("worker".to_string()),
@@ -9681,6 +9786,7 @@ mod tests {
                         operation: AgentOperationKind::Create,
                         project_id: project(),
                         caller_cutex_session: session("cutex.director"),
+                        created_by: None,
                         phase: AgentActionPhase::NativeBootstrapPending,
                         phase_sequence: 0,
                         reserved_agent_name: Some("worker-unknown".to_string()),
@@ -10123,6 +10229,7 @@ mod tests {
                         operation: AgentOperationKind::DirectorRotate,
                         project_id: project(),
                         caller_cutex_session: session("cutex.director"),
+                        created_by: None,
                         phase: *phases.last().unwrap(),
                         phase_sequence: phases.len() as u64,
                         reserved_agent_name: Some(successor.name.clone()),
@@ -10337,6 +10444,11 @@ mod tests {
             managed.created_by_operator_session,
             Some(operator.cutex_session_id.clone())
         );
+        let creator=Some(crate::session::model::SessionCreatedBy::Agent {
+            cutex_session_id:operator.cutex_session_id.clone(),role:Some(crate::session::model::SessionCreatorRole::Member),
+        });
+        assert_eq!(provider.store().snapshot().unwrap().actions[&action("operator-create")].created_by,creator);
+        assert!(lifecycle.state.lock().unwrap().creator_calls.iter().any(|(stage,saved)|stage=="adopt"&&saved==&creator));
         for (action_id, operation) in [
             (
                 "operator-offline",
@@ -10610,6 +10722,7 @@ mod tests {
                         operation: AgentOperationKind::Create,
                         project_id: project(),
                         caller_cutex_session: operator.cutex_session_id.clone(),
+                        created_by: None,
                         phase: AgentActionPhase::Prepared,
                         phase_sequence: 0,
                         reserved_agent_name: Some("never-started".to_string()),
@@ -10732,15 +10845,11 @@ mod tests {
                 .outcome,
             AgentManagementOutcome::NoWrite { ref code, .. } if code == "operator_must_be_active_managed_agent"
         ));
-        assert_eq!(
-            provider
-                .store()
-                .snapshot()
-                .unwrap()
-                .operator_audit_events
-                .len(),
-            2
-        );
+        let snapshot = provider.store().snapshot().unwrap();
+        // Soft archive preserves grants for restoration, but removes current authority.
+        assert_eq!(snapshot.operator_audit_events.len(), 1);
+        assert!(snapshot.operator_grants[&project()].contains_key(&candidate.cutex_session_id));
+        assert!(project_management_role(&snapshot, &candidate.cutex_session_id, &project()).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

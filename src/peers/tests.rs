@@ -227,10 +227,9 @@ fn normalized_peer_diagnostic_noop_preserves_store_revision_and_file_stamp() {
     initial.asks.get_mut(&ask.ask_id).unwrap().remote.as_mut().unwrap().sync.last_error =
         Some("  temporary\n  failure  ".into());
     store.with_state(|state| *state = initial).unwrap();
-    let path = dir.join("asks-v1.json");
+    let path = dir.join(crate::management::v2::hot_store::DATABASE_FILE);
     let before = store.snapshot().unwrap();
-    let before_stamp = crate::platform::file_stamp::FileStamp::of(&path).unwrap();
-    let before_bytes = std::fs::read(&path).unwrap();
+    let before_generation = crate::management::v2::hot_store::generation(&path, "asks").unwrap();
     assert_eq!(
         before.asks[&ask.ask_id].remote.as_ref().unwrap().sync.last_error.as_deref(),
         Some("temporary failure")
@@ -242,8 +241,7 @@ fn normalized_peer_diagnostic_noop_preserves_store_revision_and_file_stamp() {
         state.asks.get_mut(&ask.ask_id).unwrap().remote.as_mut().unwrap().sync.last_error =
             Some("\ttemporary   failure\r\n".into());
     }).unwrap();
-    assert_eq!(crate::platform::file_stamp::FileStamp::of(&path).unwrap(), before_stamp);
-    assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+    assert_eq!(crate::management::v2::hot_store::generation(&path, "asks").unwrap(), before_generation);
     let after = store.snapshot().unwrap();
     assert_eq!(after.revision, before.revision);
     assert_eq!(

@@ -210,7 +210,9 @@ pub(super) fn handle(
                 return error(stream, 400, "catalog_unsupported", "this profile does not use a custom model catalog");
             }
             match catalog_api::discover(&account, apply) {
-                Ok(()) => respond(stream, json!({ "applied": apply })),
+                // `refreshed`: provider-owned fields of existing rows that the
+                // rediscovery corrected ({model, field, from, to}).
+                Ok(refreshed) => respond(stream, json!({ "applied": apply, "refreshed": refreshed })),
                 // Discovery errors are already secret-free (see model_discovery::fetch).
                 Err(e) => error(stream, 502, "model_discovery_failed", &format!("{e:#}")),
             }

@@ -42,6 +42,10 @@ pub struct HumanCreateSessionRequest {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// r265 (`profile-runtime-variants`): a runtime variant of the profile;
+    /// absent = the profile's default variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
     /// Sets `displayNameOverride`; the chat then no longer follows the native
     /// thread title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +71,11 @@ impl HumanCreateSessionRequest {
         if let Some(profile) = &self.profile {
             if profile.trim().is_empty() || profile.chars().any(char::is_control) {
                 return Err(validation_error("profile must be a non-empty string"));
+            }
+        }
+        if let Some(variant) = &self.variant_id {
+            if crate::profiles::runtime_variants::validate_variant_id(variant).is_err() {
+                return Err(validation_error("variantId must be 1-32 characters of a-z, 0-9 and -"));
             }
         }
         if let Some(cwd) = &self.cwd {

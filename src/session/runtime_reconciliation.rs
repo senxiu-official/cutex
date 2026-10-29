@@ -26,7 +26,7 @@ pub fn reconcile_cutex_session_store_for_registration(
     let target = registration_store_target(store, agent)?;
     let store_fence_required = !matches!(target, RegistrationStoreTarget::Unmanaged);
     let outcome = match target {
-        RegistrationStoreTarget::NativeSession => {
+        RegistrationStoreTarget::NativeSession(_) => {
             reconcile_cutex_session_store_from_agent(store, agent, host_id, timestamp)?
         }
         RegistrationStoreTarget::RuntimeIdentity(key) => {
@@ -147,16 +147,45 @@ pub fn registration_is_recent_heartbeat(
     (0..REGISTRATION_HEARTBEAT_PERSIST_INTERVAL_SECS).contains(&age)
 }
 
+#[derive(Debug)]
 enum RegistrationStoreTarget {
-    NativeSession,
+    NativeSession(String),
     RuntimeIdentity(String),
     Unmanaged,
+}
+
+/// Resolve the one durable lane whose runtime identity this registration may
+/// change. This is read-only and uses the same retired/ambiguity/stale checks
+/// as the eventual reconciliation.
+pub fn registration_cutex_session_id(
+    store: &CutexSessionStore,
+    agent: &AgentBusAgent,
+) -> anyhow::Result<Option<String>> {
+    Ok(match registration_store_target(store, agent)? {
+        RegistrationStoreTarget::NativeSession(key) => Some(key),
+        RegistrationStoreTarget::RuntimeIdentity(key) => Some(
+            store
+                .sessions
+                .get(&key)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "registration session disappeared during target resolution: {key}"
+                    )
+                })?
+                .cutex_session_id
+                .clone(),
+        ),
+        RegistrationStoreTarget::Unmanaged => None,
+    })
 }
 
 fn registration_store_target(
     store: &CutexSessionStore,
     agent: &AgentBusAgent,
 ) -> anyhow::Result<RegistrationStoreTarget> {
+    if let Some(key) = dsh_registration_target(store, agent)? {
+        return Ok(RegistrationStoreTarget::RuntimeIdentity(key));
+    }
     let codex_session_id = agent
         .session_id
         .as_deref()
@@ -165,37 +194,73 @@ fn registration_store_target(
 
     if let Some(codex_session_id) = codex_session_id.as_deref() {
         if let Some(record) = store.sessions.values().find(|record| {
-            record.is_retired() && record.codex_session_id.as_deref() == Some(codex_session_id)
+            record.codex_session_id.as_deref() == Some(codex_session_id) && crate::agent_management::agent_execution_blocked(&record)
         }) {
             anyhow::bail!(
                 "agent registration targets retired cutex session: {}",
                 record.cutex_session_id
             );
         }
-        return Ok(RegistrationStoreTarget::NativeSession);
+        let key = cutex_session_key_for_codex_session(store, codex_session_id);
+        if let Some(record) = store.sessions.get(&key) {
+            if record.current_runtime_agent_id.as_deref() != Some(agent.id.as_str())
+                && record.last_runtime_agent_id.as_deref() == Some(agent.id.as_str())
+            {
+                anyhow::bail!(
+                    "known stale native registration cannot replace the current endpoint for cutex session: {}",
+                    record.cutex_session_id
+                );
+            }
+            return Ok(RegistrationStoreTarget::NativeSession(
+                record.cutex_session_id.clone(),
+            ));
+        }
+        return Ok(RegistrationStoreTarget::NativeSession(key));
     }
 
     let mut active_runtime_match = None;
+    let mut stale_runtime_match = None;
     for (key, record) in store.sessions.iter().filter(|(_, record)| {
         record.current_runtime_agent_id.as_deref() == Some(agent.id.as_str())
             || record.last_runtime_agent_id.as_deref() == Some(agent.id.as_str())
     }) {
-        if record.is_retired() {
+        if crate::agent_management::agent_execution_blocked(&record) {
             anyhow::bail!(
                 "agent registration targets retired cutex session: {}",
                 record.cutex_session_id
             );
         }
-        if active_runtime_match.replace(key.clone()).is_some() {
+        let current = record.current_runtime_agent_id.as_deref();
+        let current_match = current == Some(agent.id.as_str());
+        let reclaimable_last = current.is_none()
+            && record.last_runtime_agent_id.as_deref() == Some(agent.id.as_str());
+        let target = if current_match || reclaimable_last {
+            &mut active_runtime_match
+        } else {
+            &mut stale_runtime_match
+        };
+        if target.replace(key.clone()).is_some() {
             anyhow::bail!(
                 "agent registration runtime identity is ambiguous across cutex sessions: {}",
                 agent.id
             );
         }
     }
-    Ok(active_runtime_match
-        .map(RegistrationStoreTarget::RuntimeIdentity)
-        .unwrap_or(RegistrationStoreTarget::Unmanaged))
+    if active_runtime_match.is_some() && stale_runtime_match.is_some() {
+        anyhow::bail!(
+            "agent registration runtime identity is ambiguous across cutex sessions: {}",
+            agent.id
+        );
+    }
+    if let Some(key) = active_runtime_match {
+        return Ok(RegistrationStoreTarget::RuntimeIdentity(key));
+    }
+    if let Some(key) = stale_runtime_match {
+        anyhow::bail!(
+            "stale runtime registration cannot replace the current endpoint for cutex session: {key}"
+        );
+    }
+    Ok(RegistrationStoreTarget::Unmanaged)
 }
 
 pub fn reconcile_cutex_session_store_from_agent(
@@ -204,6 +269,12 @@ pub fn reconcile_cutex_session_store_from_agent(
     host_id: &str,
     timestamp: &str,
 ) -> anyhow::Result<Option<CutexSessionReconcileOutcome>> {
+    if let Some(key) = dsh_registration_target(store, agent)? {
+        let record = store.sessions.get_mut(&key).expect("validated DSH binding");
+        record.last_seen_at = Some(timestamp.to_string());
+        record.updated_at = timestamp.to_string();
+        return Ok(None);
+    }
     let Some(codex_session_id) = agent.session_id.as_deref() else {
         return Ok(None);
     };
@@ -214,7 +285,7 @@ pub fn reconcile_cutex_session_store_from_agent(
         if store
             .sessions
             .get(&key)
-            .is_some_and(|record| record.is_retired())
+            .is_some_and(|record| crate::agent_management::agent_execution_blocked(&record))
         {
             return Ok(None);
         }
@@ -227,7 +298,7 @@ pub fn reconcile_cutex_session_store_from_agent(
         .iter()
         .filter_map(|(key, record)| {
             (key != &session_key
-                && record.is_active()
+                && !crate::agent_management::agent_execution_blocked(&record)
                 && record.current_runtime_agent_id.as_deref() == Some(agent.id.as_str()))
             .then(|| key.clone())
         })
@@ -361,6 +432,27 @@ pub fn reconcile_cutex_session_store_from_agent(
     }))
 }
 
+/// A DSH native id must never be imported as a new Codex rollout. Only the
+/// exact already-claimed adapter occurrence may refresh this binding.
+fn dsh_registration_target(store: &CutexSessionStore, agent: &AgentBusAgent) -> anyhow::Result<Option<String>> {
+    let candidates: Vec<_> = store.sessions.iter().filter(|(_, record)| {
+        record.dsh_session.as_ref().is_some_and(|dsh| {
+            agent.session_id.as_deref() == Some(dsh.thread_id.as_str())
+                || record.current_runtime_agent_id.as_deref() == Some(agent.id.as_str())
+                || record.last_runtime_agent_id.as_deref() == Some(agent.id.as_str())
+        })
+    }).collect();
+    anyhow::ensure!(candidates.len() <= 1, "DSH registration identity is ambiguous");
+    let Some((key, record)) = candidates.first() else { return Ok(None); };
+    anyhow::ensure!(!crate::agent_management::agent_execution_blocked(&record)
+        && record.current_runtime_agent_id.as_deref() == Some(agent.id.as_str())
+        && record.app_server_thread_id() == agent.session_id.as_deref()
+        && record.runtime_generation > 0 && record.runtime_pid == Some(agent.pid)
+        && record.app_server_runtime.as_ref().is_some_and(|binding| binding.pid == agent.pid),
+        "DSH registration does not match current native/runtime occurrence");
+    Ok(Some((*key).clone()))
+}
+
 fn replace_if_changed<T: PartialEq>(slot: &mut T, value: T) -> bool {
     if *slot == value {
         false
@@ -388,7 +480,7 @@ pub fn apply_session_online_runtime_observation(
     let record = store.sessions.get_mut(key).ok_or_else(|| {
         anyhow::anyhow!("cutex session disappeared while recording runtime: {key}")
     })?;
-    if record.is_retired() {
+    if crate::agent_management::agent_execution_blocked(&record) {
         anyhow::bail!("cutex session is retired: {key}");
     }
     record.runtime_backend = backend;
@@ -423,6 +515,12 @@ pub fn clear_runtime_fields(record: &mut CutexSessionRecord, preserve_alden_name
     record.app_server_launch_claim_id = None;
     record.alden_pid = None;
     record.runtime_pid = None;
+    // Preserve legacy launch evidence before the runtime binding is cleared.
+    if record.provider_family.is_none() && record.claude_session.is_none() && record.app_server_runtime.is_some() {
+        if let Ok(profiles) = crate::profiles::settings_api::load_store() {
+            record.provider_family = crate::launch::stock::conversation_family_for_record(record, &profiles);
+        }
+    }
     record.app_server_runtime = None;
     record.current_runtime_agent_id = None;
     record.updated_at = chrono::Utc::now().to_rfc3339();
@@ -547,6 +645,49 @@ mod tests {
         assert!(
             !registration_is_recent_heartbeat(&store, &moved, "host", "2026-09-09T00:01:00Z"),
             "an endpoint change must be written and announced"
+        );
+        let key = store.sessions.keys().next().unwrap().clone();
+        store.sessions.get_mut(&key).unwrap().runtime_pid = Some(u32::MAX);
+        assert!(
+            !crate::session::boot_fence::occurrence_pid_is_live(
+                store.sessions.get(&key).unwrap(),
+                u32::MAX,
+            ),
+            "legacy replacement fixture must represent a dead prior occurrence"
+        );
+        let target = registration_store_target(&store, &moved)
+            .expect("a fresh endpoint may replace a proven-dead legacy occurrence");
+        assert!(matches!(target, RegistrationStoreTarget::NativeSession(_)));
+        reconcile_cutex_session_store_for_registration(
+            &mut store,
+            &moved,
+            "host",
+            "2026-09-09T00:01:00Z",
+        )
+        .expect("an admitted fresh endpoint may replace a dead legacy occurrence");
+        let rebound = store.sessions.values().next().unwrap();
+        assert_eq!(
+            rebound.current_runtime_agent_id.as_deref(),
+            Some(moved.id.as_str())
+        );
+        assert_eq!(
+            rebound.last_runtime_agent_id.as_deref(),
+            Some(agent.id.as_str())
+        );
+        assert_eq!(rebound.runtime_generation, 2);
+
+        let before_stale = store.clone();
+        let error = reconcile_cutex_session_store_for_registration(
+            &mut store,
+            &agent,
+            "host",
+            "2026-09-09T00:02:00Z",
+        )
+        .expect_err("the known previous endpoint cannot reclaim its successor");
+        assert!(error.to_string().contains("known stale native registration"));
+        assert_eq!(
+            store.sessions, before_stale.sessions,
+            "stale native registration neither rebinds nor increments generation"
         );
 
         let mut unmanaged = agent.clone();
@@ -813,6 +954,27 @@ mod tests {
             Some("runtime-sessionless-registration")
         );
         assert_eq!(claimed.runtime_generation, 1);
+
+        let claimed = store
+            .sessions
+            .get_mut("cutex.sessionless-registration")
+            .expect("claimed sessionless record");
+        claimed.last_runtime_agent_id = Some("runtime-sessionless-registration".to_string());
+        claimed.current_runtime_agent_id = Some("runtime-successor".to_string());
+        claimed.runtime_generation = 2;
+        let before = claimed.clone();
+        let error = reconcile_cutex_session_store_for_registration(
+            &mut store,
+            &agent,
+            "host",
+            "2026-08-10T00:02:30Z",
+        )
+        .expect_err("stale endpoint must not reclaim a newer generation");
+        assert!(error.to_string().contains("stale runtime registration"));
+        assert_eq!(
+            store.sessions["cutex.sessionless-registration"], before,
+            "stale registration neither rebinds nor increments generation"
+        );
 
         agent.id = "unmanaged-sessionless-registration".to_string();
         let unmatched = reconcile_cutex_session_store_for_registration(

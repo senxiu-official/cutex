@@ -138,9 +138,15 @@ pub fn item_json(item: &ReturnItem) -> Value {
 /// requester's next step (native `soon`). The runtime builds the `soon`
 /// envelope from it, so submit and status rebuild the same key.
 pub const NEXT_STEP_EVENT_PREFIX: &str = "cutex-ask-soon";
+/// A frozen passive native result consumed by the owner's next turn.
+pub const OWNER_NOTE_PREFIX: &str = "cutex-ask-owner";
+
+pub fn is_owner_note(id: &str) -> bool {
+    id.strip_prefix(OWNER_NOTE_PREFIX).is_some_and(|rest| rest.starts_with('-'))
+}
 
 pub fn is_next_step_event(native_message_id: &str) -> bool {
-    native_message_id
+    is_owner_note(native_message_id) || native_message_id
         .strip_prefix(NEXT_STEP_EVENT_PREFIX)
         .is_some_and(|rest| rest.starts_with('-'))
 }
@@ -152,11 +158,28 @@ pub(crate) fn oldest_pending(state: &AskState, requester: &str) -> Option<DateTi
         .deliveries
         .values()
         .filter(|delivery| {
-            delivery.requester_cutex_session_id == requester && !delivery.passive && super::delivery::actionable(state, delivery)
+            !delivery.passive && super::delivery::actionable(state, delivery) && super::delivery::is_for(state, delivery, requester)
         })
         .filter_map(|delivery| super::parse_time(&delivery.created_at))
         .min()
 }
+
+/// Whether `requester` has an actionable "rejected" state item: a delegation
+/// the owner refused in review (scheduler `GateVerdict::Rejected`). Such a
+/// result skips the busy wait (023 Q3) and is read at the next step.
+pub(crate) fn pending_review_refusal(state: &AskState, requester: &str) -> bool {
+    state.deliveries.values().any(|delivery| {
+        !delivery.passive
+            && delivery.kind == DeliveryKind::State
+            && delivery.ref_id.starts_with(REVIEW_REFUSAL_REF_PREFIX)
+            && super::delivery::actionable(state, delivery)
+            && super::delivery::is_for(state, delivery, requester)
+    })
+}
+
+/// `ref_id` prefix of the state item a review refusal records
+/// (`record_state_delivery(.., "rejected", ..)` -> `rejected@<revision>`).
+pub(crate) const REVIEW_REFUSAL_REF_PREFIX: &str = "rejected@";
 
 /// In-memory facts for the result read log only (never for decisions).
 #[derive(Default)]
@@ -324,6 +347,10 @@ pub fn promote_next_step_leases(state: &mut AskState) {
         });
         if !live {
             state.next_step_leases.remove(&session);
+        } else if state.next_step_leases.get(&session).is_some_and(|lease| is_owner_note(&lease.native_message_id)) {
+            // Passive owner context never owns a turn slot, even while its
+            // durable context receipt is still pending or indeterminate.
+            continue;
         } else if !state.leases.contains_key(&session) {
             if let Some(lease) = state.next_step_leases.remove(&session) {
                 state.leases.insert(session, lease);
@@ -339,7 +366,9 @@ pub fn promote_next_step_leases(state: &mut AskState) {
 /// active). A lease without a turn (a submit not yet bound, a next-step event
 /// not read yet) still waits.
 pub(crate) fn results_admissible(state: &AskState, requester: &str) -> Option<Option<String>> {
-    if state.pauses.contains_key(requester) || waiting(state, requester) || state.next_step_leases.contains_key(requester) {
+    if state.pauses.contains_key(requester)
+        || super::agent_pause::is_paused(state, requester)
+        || waiting(state, requester) || state.next_step_leases.contains_key(requester) {
         return None;
     }
     match state.leases.get(requester) {
@@ -399,13 +428,14 @@ pub fn fit_returns(
     let source = super::scheduler::submission_source(None);
     let limit = Some(budget.notice_limit());
     let is_answer = |item: &ReturnItem| matches!(item, ReturnItem::Answer { .. });
-    let fits = |has_answer: bool, pieces: &[String], later: usize| {
-        let (event_type, text) = render::assemble_return(has_answer, pieces, later);
+    let fits = |has_answer: bool, pieces: &[String], overlength: &[String], later: usize| {
+        let (event_type, text) = render::assemble_return(has_answer, pieces, overlength, later);
         let item_bytes = canonical_item_bytes(message_id, &source, event_type, &text);
         (budget.fits(item_bytes, text.len()), event_type, text, item_bytes)
     };
     let mut fitted = FittedReturns::default();
     let mut pieces: Vec<String> = Vec::new();
+    let mut overlength: Vec<String> = Vec::new();
     let mut has_answer = false;
     for (index, item) in items.iter().enumerate() {
         // Once one item needs the next turn, later results cannot pass it.
@@ -417,9 +447,12 @@ pub fn fit_returns(
         for level in 0..render::RETURN_LEVELS {
             let mut trial = pieces.clone();
             trial.push(render::return_piece(item, level, preview_bytes, limit));
+            let mut trial_overlength = overlength.clone();
+            trial_overlength.extend(render::return_overlength_label(item, level, preview_bytes));
             // Conservative: the marker for results that may still follow.
-            if fits(has_answer || is_answer(item), &trial, items.len()).0 {
+            if fits(has_answer || is_answer(item), &trial, &trial_overlength, items.len()).0 {
                 pieces = trial;
+                overlength = trial_overlength;
                 has_answer |= is_answer(item);
                 fitted.included.push(index);
                 placed = true;
@@ -428,14 +461,15 @@ pub fn fit_returns(
         }
         if !placed {
             let alone = [render::return_piece(item, render::RETURN_LEVELS - 1, preview_bytes, limit)];
-            if fits(is_answer(item), &alone, items.len()).0 {
+            let alone_overlength = render::return_overlength_label(item, render::RETURN_LEVELS - 1, preview_bytes).into_iter().collect::<Vec<_>>();
+            if fits(is_answer(item), &alone, &alone_overlength, items.len()).0 {
                 fitted.deferred.push(index);
             } else {
                 fitted.unfit.push(index);
             }
         }
     }
-    let (_, event_type, text, item_bytes) = fits(has_answer, &pieces, fitted.deferred.len());
+    let (_, event_type, text, item_bytes) = fits(has_answer, &pieces, &overlength, fitted.deferred.len());
     fitted.event_type = event_type;
     fitted.text = text;
     fitted.item_bytes = item_bytes;
@@ -532,6 +566,109 @@ fn detach_from_event(state: &mut AskState, event_id: &str, delivery_ids: &[Strin
     }
 }
 
+/// Stage the idle owner's results as one passive native input. The caller holds
+/// the session input lane through staging and owner turn/start. Reserving the
+/// original deliveries before sending prevents the scheduler racing a second
+/// exclusive result turn. Acceptance is not acknowledgement: the ordinary event
+/// reconciler waits for the native consuming-turn receipt.
+pub fn stage_owner_results(
+    store: &AskStore, session: &str, generation: u64,
+    settings: crate::config::documents::DocumentSettings,
+    now: DateTime<Utc>, submit: impl FnOnce(&Submission) -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    let state = store.shared()?;
+    if state.leases.contains_key(session) || state.next_step_leases.contains_key(session)
+        || state.pauses.contains_key(session) || super::agent_pause::is_paused(&state, session)
+        || super::control::stop_held(&state, session) || waiting(&state, session) { return Ok(false); }
+    let ids = super::delivery::in_creation_order(&state, state.deliveries.values()
+        .filter(|d| !d.passive && super::delivery::actionable(&state, d) && super::delivery::is_for(&state, d, session))
+        .map(|d| d.delivery_id.clone()).collect());
+    let pairs: Vec<_> = ids.iter().filter_map(|id| state.deliveries.get(id))
+        .filter_map(|d| return_item(store, &state, d).map(|item| (d.delivery_id.clone(), item))).collect();
+    if pairs.is_empty() { return Ok(false); }
+    let message_id = new_id(OWNER_NOTE_PREFIX);
+    let items: Vec<_> = pairs.iter().map(|(_, item)| item.clone()).collect();
+    let budget = crate::app_server::external_input::size::ReceiverLimit::RawText(
+        crate::app_server::external_input::size::TRANSPORT_TEXT_MAX as u64).budget(settings.margin_percent);
+    let fitted = fit_returns(&items, &budget, &message_id, settings.preview_bytes as usize);
+    // Preserve overflow policy and FIFO rather than silently dropping rows.
+    if !fitted.deferred.is_empty() || !fitted.unfit.is_empty() { return Ok(false); }
+    let view = super::views::results_view(&items,
+        &|id| state.asks.get(id).map(|a| (a.target_cutex_session_id.clone(), a.target_name.clone())).unwrap_or_default(),
+        &|id| state.answers.get(id).and_then(|a| a.preview.clone()));
+    let artifact = store.put_artifact(fitted.text.as_bytes(), "text/plain; charset=utf-8", &[], None, now)?;
+    let reserved = super::pause_admission::with_state_or(store, None, |state, _| {
+        if state.leases.contains_key(session) || state.next_step_leases.contains_key(session)
+            || state.pauses.contains_key(session) || super::agent_pause::is_paused(state, session)
+            || super::control::stop_held(state, session) || waiting(state, session) { return None; }
+        if !pairs.iter().all(|(id, _)| state.deliveries.get(id).is_some_and(|d|
+            !d.passive && super::delivery::actionable(state, d) && super::delivery::is_for(state, d, session))) {
+            return None;
+        }
+        let event_id = super::delivery::coalesce_selected_into_event(state, session, &message_id,
+            pairs.iter().map(|(id, _)| id.clone()).collect(), now)?;
+        let event = state.events.get_mut(&event_id).expect("reserved event");
+        event.event_artifact = Some(artifact);
+        event.view = Some(view.clone());
+        let asks = event_asks(state, &state.events[&event_id]);
+        state.next_step_leases.insert(session.into(), AdmissionLease {
+              cutex_session_id: session.into(), holder: LeaseHolder::Event { event_id: event_id.clone() },
+            native_message_id: message_id.clone(), runtime_generation: generation,
+            turn_id: None, since: now_rfc3339(now),
+        });
+          Some((asks,event_id))
+    })?;
+      let Some((asks,event_id)) = reserved else { return Ok(false); };
+      if !unsent_event_open(store,session,&event_id)? {
+          store.with_state(|state|{super::delivery::release_event(state,&event_id,now);remove_event_lease(state,session,&event_id);})?;
+          return Ok(false);
+      }
+    // Even an indeterminate RPC retains this exact identity, never replays.
+    submit(&Submission { message_id, source_agent: None, event_type: fitted.event_type,
+        text: fitted.text, asks, attempt: None, view: Some(view) })?;
+    Ok(true)
+}
+
+// Same existing aggregate budget and degradation policy, applied inside the
+// final result reservation rather than opening a nested AskStore transaction.
+fn reserve_result_turn(state:&mut AskState,key:&str,requester:&str,limit:usize,now:DateTime<Utc>)->bool {
+    if super::budget::auto_turns_last_hour(state,key,now)>=limit {
+        let degraded=super::delivery::degrade_to_passive(state,requester,now);
+        if degraded>0 {state.notice("cutex/ask/budgetExceeded",vec![crate::management::v2::services::HOST_EVENT_SESSION_ID.into(),requester.into()],json!({"budget":"autoTurnsPerHour","key":key,"limit":limit,"requester":requester,"degradedToPassive":degraded}));}
+        return false;
+    }
+    let times=state.auto_turns.entry(key.into()).or_default();
+    let since=now-chrono::Duration::hours(1);
+    times.retain(|t|super::parse_time(t).is_some_and(|t|t>=since));
+    times.push(now_rfc3339(now));true
+}
+
+fn refund_result_turn(state:&mut AskState,key:&str,now:DateTime<Utc>) {
+    // Aggregate multiset: remove exactly one charge at this reservation's
+    // timestamp. Equal timestamps are interchangeable; never clear the key.
+    if let Some(times)=state.auto_turns.get_mut(key) {
+        if let Some(i)=times.iter().rposition(|t|*t==now_rfc3339(now)){times.remove(i);}
+        if times.is_empty(){state.auto_turns.remove(key);}
+    }
+}
+
+fn unsent_event_open(store:&AskStore,session:&str,event_id:&str)->anyhow::Result<bool> {
+    // This is used only before the first native submit, never to release an
+    // event whose native outcome is unknown. Receipt recovery remains ungated.
+    let host=super::routing_policy::integration::local_host_id();
+    Ok(match super::pause_admission::try_with_authority(|roster|store.inspect(|state| {
+        !super::pause_admission::is_paused_in(state,roster,session)
+            && !state.pauses.contains_key(session)
+            && state.leases.get(session).into_iter().chain(state.next_step_leases.get(session))
+                .any(|lease|matches!(&lease.holder,LeaseHolder::Event{event_id:id} if id==event_id))
+            && state.events.get(event_id).is_some_and(|e|e.delivery_ids.iter().all(|id|
+                state.deliveries.get(id).is_some_and(|d|!d.passive&&d.state==DeliveryState::QueuedAsEvent
+                    &&d.event_id.as_deref()==Some(event_id)
+                    &&!super::lineage::stopped_parent(state,&host,&d.ask_id)
+                    && {let mut pending=d.clone();pending.state=DeliveryState::Pending;super::delivery::actionable(state,&pending)})))
+    }))? {super::pause_admission::Admission::Ready(open)=>open,super::pause_admission::Admission::Deferred=>false})
+}
+
 /// Admit coalesced ANSWER/QUESTION events for idle requesters (§5.7).
 pub fn admit_events(
     world: &dyn SchedulerWorld,
@@ -576,12 +713,13 @@ pub fn admit_events(
             // Claude inboxes reconcile the existing key on the new generation.
             let target = runtime.target_status(&lease.cutex_session_id);
             if target.online && target.runtime_generation != lease.runtime_generation {
-                if runtime.durable_next_step(&lease.cutex_session_id) {
+                if is_owner_note(&event.native_message_id) || runtime.durable_next_step(&lease.cutex_session_id) {
                     reconcile_generation = target.runtime_generation;
                 } else {
                     let (session, event_id) = (lease.cutex_session_id.clone(), event_id.clone());
                     let freed = store.with_state(|state| {
-                        super::delivery::release_event(state, &event_id, now);
+                        // Unknown at native: never resent to a new controller (044).
+                        super::delivery::release_event_unknown(state, &event_id, now);
                         remove_event_lease(state, &session, &event_id);
                         !state.leases.contains_key(&session)
                     })?;
@@ -674,8 +812,22 @@ pub fn admit_events(
     }
     let state = store.shared()?;
     for requester in super::delivery::requesters_with_pending(&state) {
+        // Reserve before freezing an outbox event, not only at native submit.
+        // Owner submit uses this same reentrant lane through staging/start.
+        // A queued owner must not see a half-reserved result-only turn.
+        let lane = runtime.result_admission_lane(&requester)?;
+        let _reservation = match lane.as_ref().map(|lane| lane.try_lock()) {
+            Some(Ok(reservation)) => Some(reservation),
+            Some(Err(_)) => {
+                report.result_waits.insert(requester.clone(), "admissionLaneBusy".into());
+                continue;
+            }
+            None => None,
+        };
+        let state = store.shared()?;
         // `held_turn`: the running turn whose lease the results go beside.
         let Some(held_turn) = results_admissible(&state, &requester) else {
+            report.result_waits.insert(requester.clone(), "admissionHeld".into());
             continue;
         };
         let status = runtime.target_status(&requester);
@@ -688,6 +840,8 @@ pub fn admit_events(
             continue;
         }
         if !status.online || status.plan_mode || !status.exclusive_admission {
+            report.result_waits.insert(requester.clone(), if !status.online { "runtimeDown" }
+                else if status.plan_mode { "planMode" } else { "runtimeUnsupported" }.into());
             continue;
         }
         // A leased requester only beside the very turn its lease holds (a
@@ -702,18 +856,35 @@ pub fn admit_events(
         // not hold them back (they start no turn of their own).
         let next_step = if status.active_turn_id.is_some() {
             note_waited_busy(&requester);
-            let due = busy_wait().is_some_and(|wait| {
-                oldest_pending(&state, &requester)
-                    .is_some_and(|since| (now - since).to_std().unwrap_or_default() >= wait)
-            });
+            // A delegation the owner refused in review is due at once (023
+            // Q3): the requester only learns its request will not run.
+            let due = pending_review_refusal(&state, &requester)
+                || busy_wait().is_some_and(|wait| {
+                    oldest_pending(&state, &requester)
+                        .is_some_and(|since| (now - since).to_std().unwrap_or_default() >= wait)
+                });
             if !due || !runtime.takes_next_step(&requester, status.runtime_generation) {
+                report.result_waits.insert(requester.clone(), if !due { "busyWait" } else { "nextStepUnsupported" }.into());
                 continue;
             }
             true
         } else {
+            // Owner input must never queue behind a result quiet window.
+            // Existing numbered work flushes this batch before its own turn.
+            let would_hold = runtime.result_window_context(&requester).is_some_and(|context| {
+                super::result_coalescing::hold(&state, &requester, context, world.result_coalescing(), now)
+            });
+            if super::result_coalescing::hold_unless_numbered_input(would_hold, || {
+                let admission = store.queue_repository()?.numbered_admission_with_state(&requester, &state)?;
+                Ok(admission.items.iter().any(|item| item.state == "waiting" && item.hold.is_none()))
+            })? {
+                report.result_waits.insert(requester.clone(), "resultCoalescing".into());
+                continue;
+            }
             if crate::management::v2::admission::owner_priority(&requester) {
                 let admission = store.queue_repository()?.admission_with_state(&requester, &state)?;
                 if admission.items.iter().any(|item| item.kind == "owner" && item.state == "waiting") {
+                    report.result_waits.insert(requester.clone(), "ownerPriority".into());
                     continue;
                 }
                 crate::management::v2::admission::owner_started(&requester);
@@ -724,24 +895,13 @@ pub fn admit_events(
             .as_ref()
             .map(|directory| super::directory::domain_label(&directory.domain(&requester)))
             .unwrap_or_else(|| format!("agent:{requester}"));
-        if !super::budget::take_auto_turn(store, &key, &requester, limits.auto_turns_per_hour, now)? {
-            report.degraded.push(requester.clone());
-            continue;
-        }
         let message_id = new_id(if next_step { NEXT_STEP_EVENT_PREFIX } else { "cutex-ask-event" });
-        let Some(event_id) = store.with_state(|state| -> anyhow::Result<_> {
-            if results_admissible(state, &requester).as_ref() != Some(&held_turn) {
-                return Ok(None);
-            }
-            Ok(super::delivery::coalesce_into_event(state, &requester, &message_id, now))
-        })??
-        else {
-            continue;
-        };
-        let state = store.snapshot()?;
-        let mut event = state.events.get(&event_id).cloned().expect("just created");
-        let pairs: Vec<(String, ReturnItem)> = event
-            .delivery_ids
+        // Fit from a read snapshot. Freeze, budget and lease are one final
+        // transaction; a Deferred preflight cannot consume any of them.
+        let ids=super::delivery::in_creation_order(&state,state.deliveries.values()
+            .filter(|d|super::delivery::actionable(&state,d)&&!d.passive&&super::delivery::is_for(&state,d,&requester))
+            .map(|d|d.delivery_id.clone()).collect());
+        let pairs: Vec<(String, ReturnItem)> = ids
             .iter()
             .filter_map(|id| state.deliveries.get(id))
             .filter_map(|delivery| return_item(store, &state, delivery).map(|item| (delivery.delivery_id.clone(), item)))
@@ -751,31 +911,7 @@ pub fn admit_events(
         let budget = status.receiver_limit.budget(settings.margin_percent);
         let fitted = fit_returns(&all_items, &budget, &message_id, settings.preview_bytes as usize);
         let ids_of = |indexes: &[usize]| -> Vec<String> { indexes.iter().map(|index| pairs[*index].0.clone()).collect() };
-        let (deferred, unfit) = (ids_of(&fitted.deferred), ids_of(&fitted.unfit));
-        if !deferred.is_empty() || !unfit.is_empty() {
-            let unfit_asks: Vec<String> = fitted.unfit.iter().map(|index| return_ask_id(&pairs[*index].1).to_string()).collect();
-            let limit = budget.limit.describe();
-            store.with_state(|state| {
-                detach_from_event(state, &event_id, &deferred, now);
-                if !unfit.is_empty() {
-                    detach_from_event(state, &event_id, &unfit, now);
-                    let detail = format!(
-                        "{}: {} delegation result(s) for {requester} are larger than it accepts ({limit}) even as a short preview with a delegation_read pointer; they were not sent as a message and stay readable with delegation_wait / agent_list",
-                        super::EVENT_TOO_LARGE,
-                        unfit.len()
-                    );
-                    make_passive(state, &requester, &unfit, unfit_asks.clone(), detail, now);
-                }
-            })?;
-            if !unfit.is_empty() {
-                report.degraded.push(requester.clone());
-            }
-            if fitted.included.is_empty() {
-                store.with_state(|state| super::delivery::release_event(state, &event_id, now))?;
-                continue;
-            }
-            event.delivery_ids.retain(|id| !deferred.contains(id) && !unfit.contains(id));
-        }
+        let unfit=ids_of(&fitted.unfit);
         let items: Vec<ReturnItem> = fitted.included.iter().map(|index| all_items[*index].clone()).collect();
         let (event_type, text) = (fitted.event_type, fitted.text);
         let results_view = super::views::results_view(
@@ -790,21 +926,31 @@ pub fn admit_events(
             &|answer_id| state.answers.get(answer_id).and_then(|answer| answer.preview.clone()),
         );
         let artifact = store.put_artifact(text.as_bytes(), "text/plain; charset=utf-8", &[], None, now)?;
-        let taken = store.with_state(|state| {
-            if state.pauses.contains_key(&requester)
-                || state.next_step_leases.contains_key(&requester)
-                || state.leases.get(&requester).map(|lease| lease.turn_id.clone()) != held_turn.clone().map(Some)
+        let selected=ids_of(&fitted.included);
+        let expected=&state;
+        let mut budget_held=false;
+        let mut degraded=false;
+        let taken = super::pause_admission::with_state_or(store,None, |state, _| {
+            if results_admissible(state,&requester).as_ref()!=Some(&held_turn)
+                || !pairs.iter().all(|(id,_)| state.deliveries.get(id)==expected.deliveries.get(id)
+                    && state.deliveries.get(id).is_some_and(|d|super::delivery::actionable(state,d)&&!d.passive&&super::delivery::is_for(state,d,&requester)))
             {
-                super::delivery::release_event(state, &event_id, now);
-                return false;
+                return None;
             }
-            if let Some(event) = state.events.get_mut(&event_id) {
-                event.event_artifact = Some(artifact.clone());
-                event.view = Some(results_view.clone());
+            if !unfit.is_empty() {
+                let unfit_asks=fitted.unfit.iter().map(|i|return_ask_id(&pairs[*i].1).to_string()).collect();
+                make_passive(state,&requester,&unfit,unfit_asks,format!("{}: {} delegation results exceed receiver limit {}; they remain readable with delegation_wait / agent_list",super::EVENT_TOO_LARGE,unfit.len(),budget.limit.describe()),now);
+                degraded=true;
             }
+            if selected.is_empty(){return None;}
+            if !reserve_result_turn(state,&key,&requester,limits.auto_turns_per_hour,now){budget_held=true;return None;}
+            let Some(event_id)=super::delivery::coalesce_selected_into_event(state,&requester,&message_id,selected.clone(),now) else {refund_result_turn(state,&key,now);return None;};
+            let event=state.events.get_mut(&event_id).expect("reserved event");
+            event.event_artifact=Some(artifact.clone());event.view=Some(results_view.clone());
+            let event=event.clone();
             let lease = AdmissionLease {
                 cutex_session_id: requester.clone(),
-                holder: LeaseHolder::Event { event_id: event_id.clone() },
+                holder: LeaseHolder::Event { event_id },
                 native_message_id: message_id.clone(),
                 runtime_generation: status.runtime_generation,
                 turn_id: None,
@@ -813,9 +959,14 @@ pub fn admit_events(
             // Beside the running turn's lease, which stays untouched.
             let slot = if held_turn.is_some() { &mut state.next_step_leases } else { &mut state.leases };
             slot.insert(requester.clone(), lease);
-            true
+            Some(event)
         })?;
-        if !taken {
+        if budget_held {report.result_waits.insert(requester.clone(),"autoTurnBudgetPassive".into());report.degraded.push(requester.clone());}
+        if degraded {report.degraded.push(requester.clone());}
+        let Some(event)=taken else {continue;};
+        let event_id=event.event_id.clone();
+        if !unsent_event_open(store,&requester,&event_id)? {
+            store.with_state(|state|{super::delivery::release_event(state,&event_id,now);remove_event_lease(state,&requester,&event_id);refund_result_turn(state,&key,now);})?;
             continue;
         }
         let submission = Submission {
@@ -858,6 +1009,7 @@ pub fn admit_events(
             }
             SubmitOutcome::Uncertain(_) => None,
             SubmitOutcome::Busy { reason } => {
+                if reason=="authority_busy"||reason=="agent_paused" {refund_result_turn(state,&key,now);}
                 super::delivery::release_event(state, &event_id, now);
                 remove_event_lease(state, &requester, &event_id);
                 if reason == super::control::NATIVE_GATE_CLOSED {
@@ -899,6 +1051,89 @@ mod tests {
     use crate::asks::scheduler::tests::{finish_turn, world, FakeRuntime};
     use crate::asks::store::tests::{new_ask, temp_store, REQUESTER, TARGET};
 
+    #[test]
+    fn final_result_reservation_deferred_keeps_budget_deliveries_and_events_unchanged() {
+        let (world,world_dir)=world("results-deferred-budget");
+        let (store,dir)=temp_store("results-deferred-budget");
+        let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);let now=Utc::now();
+        answered(&world,&runtime,&store,now);
+        let before=store.snapshot().unwrap();let submitted=runtime.submitted.borrow().len();
+        let roster=crate::agent_management::AgentManagementStore::open_default().unwrap();
+        let fence=roster.lock_mutations().unwrap();
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        drop(fence);
+        let after=store.snapshot().unwrap();
+        assert_eq!(after.auto_turns,before.auto_turns);assert_eq!(after.deliveries,before.deliveries);
+        assert_eq!(after.events,before.events);assert_eq!(after.leases,before.leases);
+        assert_eq!(runtime.submitted.borrow().len(),submitted);
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        assert_eq!(runtime.submitted.borrow().len(),submitted+1);
+        assert_eq!(store.snapshot().unwrap().auto_turns.values().map(Vec::len).sum::<usize>(),1);
+        let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(world_dir);
+    }
+
+    #[test]
+    fn runtime_deferred_after_result_claim_refunds_only_its_budget_charge() {
+        let (world,world_dir)=world("results-late-deferred-budget");let (store,dir)=temp_store("results-late-deferred-budget");
+        let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);let now=Utc::now();answered(&world,&runtime,&store,now);
+        let before=store.snapshot().unwrap();
+        runtime.outcomes.borrow_mut().push(SubmitOutcome::Busy{reason:"authority_busy".into()});
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        let after=store.snapshot().unwrap();assert_eq!(after.auto_turns,before.auto_turns);
+        assert!(after.events.is_empty());assert!(!after.leases.contains_key(REQUESTER));
+        assert_eq!(after.deliveries.keys().collect::<Vec<_>>(),before.deliveries.keys().collect::<Vec<_>>());
+        assert!(after.deliveries.values().all(|d|d.state==DeliveryState::Pending));
+        let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(world_dir);
+    }
+
+    fn fence_parent(store:&AskStore,ask:&str,now:DateTime<Utc>) {
+        use crate::asks::lineage::*;
+        let host=crate::asks::routing_policy::integration::local_host_id();
+        let child=DelegationRef::new(&host,ask).unwrap();
+        let parent=DelegationRef::new(&host,"authenticated-parent").unwrap();
+        store.with_state(|s|{
+            s.lineage.records.insert(reference_key(&child),LineageRecord{reference:child,parent:ParentFact::Verified(ParentOccurrence{
+                reference:parent.clone(),attempt_id:"authenticated-parent#1".into(),owner_session_id:REQUESTER.into(),runtime_generation:1,turn_id:"parent-turn".into(),source_event_id:"parent-spawn".into(),
+            }),root:Some(parent.clone()),follow_up:None});
+            s.lineage.stop_fences.insert(reference_key(&parent),StopFence{root:parent,action_id:"parent-stop".into(),requested_by:"owner".into(),descendants:true,created_at:now});
+        }).unwrap();
+    }
+
+    #[test]
+    fn late_parent_fence_before_final_result_claim_preserves_pending_identity_and_budget() {
+        let (world,world_dir)=world("results-final-parent-fence");let (store,dir)=temp_store("results-final-parent-fence");
+        let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);let now=Utc::now();let ask=answered(&world,&runtime,&store,now);
+        let before=store.snapshot().unwrap();let count=runtime.submitted.borrow().len();
+        let other=store.clone();
+        *runtime.status_hook.borrow_mut()=Some(Box::new(move||fence_parent(&other,&ask,now)));
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        let after=store.snapshot().unwrap();
+        assert_eq!(after.deliveries,before.deliveries);assert_eq!(after.auto_turns,before.auto_turns);
+        assert!(after.events.is_empty());assert_eq!(runtime.submitted.borrow().len(),count);
+        let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(world_dir);
+    }
+
+    #[test]
+    fn already_frozen_proven_absent_event_after_parent_stop_is_not_resubmitted() {
+        let (world,world_dir)=world("results-frozen-parent-fence");let (store,dir)=temp_store("results-frozen-parent-fence");
+        let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);let now=Utc::now();let ask=answered(&world,&runtime,&store,now);
+        let artifact=store.put_artifact(b"## Answer\ndone", "text/plain",&[],None,now).unwrap();
+        let (event_id,ids)=store.with_state(|s|{
+            let event_id=crate::asks::delivery::coalesce_into_event(s,REQUESTER,"original-frozen-id",now).unwrap();
+            let event=s.events.get_mut(&event_id).unwrap();event.event_artifact=Some(artifact);let ids=event.delivery_ids.clone();
+            s.leases.insert(REQUESTER.into(),AdmissionLease{cutex_session_id:REQUESTER.into(),holder:LeaseHolder::Event{event_id:event_id.clone()},native_message_id:"original-frozen-id".into(),runtime_generation:1,turn_id:None,since:now_rfc3339(now)});
+            (event_id,ids)
+        }).unwrap();
+        fence_parent(&store,&ask,now);assert!(!unsent_event_open(&store,REQUESTER,&event_id).unwrap());
+        let count=runtime.submitted.borrow().len();
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        let after=store.snapshot().unwrap();
+        assert_eq!(runtime.submitted.borrow().len(),count);
+        for id in ids {assert_eq!(after.deliveries[&id].state,DeliveryState::Pending);}
+        assert!(!after.leases.contains_key(REQUESTER));assert!(after.auto_turns.is_empty());
+        let _=std::fs::remove_dir_all(dir);let _=std::fs::remove_dir_all(world_dir);
+    }
+
     /// Input overflow §A2: results are fitted to the requester's budget in
     /// order, each at the first level that still fits next to the earlier
     /// ones (preview + delegation_read pointer); the rest waits for the next
@@ -931,12 +1166,13 @@ mod tests {
         let measured = canonical_item_bytes("cutex-ask-event-1", &source, fitted.event_type, &fitted.text);
         assert_eq!(measured, fitted.item_bytes);
         assert!(measured <= 9_000, "{measured}");
+        assert!(fitted.text.contains("[overlength in this batch:"), "{}", fitted.text);
         assert!(fitted.text.contains("delegation_read (cutex server) with delegation=\"delegation-0\""), "{}", fitted.text);
         assert!(fitted.text.contains("they follow in the next one"));
         // One short result fits whole at level 0.
         let short = fit_returns(&[answer(9, "done: 42".into())], &budget, "m", 800);
         assert_eq!(short.included, vec![0]);
-        assert!(short.text.contains("done: 42") && !short.text.contains("continues"));
+        assert!(short.text.contains("done: 42") && !short.text.contains("continues") && !short.text.contains("overlength in this batch"));
         // A receiver too small for even a pointer: never an event.
         let tiny = ReceiverLimit::Item(400).budget(0);
         let none = fit_returns(&items[..1], &tiny, "m", 800);
@@ -1008,7 +1244,11 @@ mod tests {
 
     /// A target answered an ask of REQUESTER at `now` (one pending answer).
     fn answered(world: &crate::asks::scheduler::tests::FakeWorld, runtime: &FakeRuntime, store: &AskStore, now: DateTime<Utc>) -> String {
-        let ask = store.with_state(|state| state.create_ask(new_ask("a", "x"), now).unwrap().0.ask_id).unwrap();
+        answered_named(world, runtime, store, now, "a")
+    }
+
+    fn answered_named(world: &crate::asks::scheduler::tests::FakeWorld, runtime: &FakeRuntime, store: &AskStore, now: DateTime<Utc>, action: &str) -> String {
+        let ask = store.with_state(|state| state.create_ask(new_ask(action, "x"), now).unwrap().0.ask_id).unwrap();
         crate::asks::scheduler::tick(world, runtime, store, now).unwrap();
         let turn = store.snapshot().unwrap().leases[TARGET].turn_id.clone().unwrap();
         crate::asks::observe::observe(
@@ -1021,8 +1261,198 @@ mod tests {
         .unwrap();
         crate::asks::observe::observe(store, TARGET, "turn/completed", &json!({"turn": {"id": turn, "status": "completed"}}), now).unwrap();
         finish_turn(runtime, store, TARGET);
-        assert_eq!(store.snapshot().unwrap().deliveries.len(), 1);
+        assert!(store.snapshot().unwrap().deliveries.values().any(|d| d.ask_id == ask));
         ask
+    }
+
+    #[test]
+    fn owner_results_are_passive_context_not_a_turn_or_an_ack() {
+        for uncertain in [false, true] {
+            let (world, dir) = world("owner-result-note");
+            let (store, store_dir) = temp_store("owner-result-note");
+            let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+            let now = Utc::now();
+            let ask = answered(&world, &runtime, &store, now);
+            let queue = store.queue_repository().unwrap();
+            assert!(!queue.owner_may_start(REQUESTER, None).unwrap(), "old result-first route blocks the owner");
+            let message = std::cell::RefCell::new(String::new());
+            let result = stage_owner_results(&store, REQUESTER, 1, world.documents(), now, |submission| {
+                assert_eq!(submission.asks, [ask.clone()]);
+                assert!(submission.view.is_some());
+                let envelope = submission.envelope(&crate::launch::stock::ExternalInputBinding {
+                    version: 1, owner_id: REQUESTER.into(), thread_id: "owner-thread".into(),
+                    runtime_generation: 1, canonical_byte_limit: Default::default(),
+                }, true).unwrap();
+                assert_eq!(envelope.message.delivery, crate::app_server::external_input::Delivery::Passive);
+                assert_eq!(envelope.message.source.id, "cutex-asks");
+                assert!(envelope.view.is_some());
+                *message.borrow_mut() = submission.message_id.clone();
+                runtime.native.borrow_mut().insert(submission.message_id.clone(), NativeMessageStatus::Pending);
+                if uncertain { anyhow::bail!("injected lost acceptance response"); }
+                Ok(())
+            });
+            assert_eq!(result.is_err(), uncertain);
+            assert!(queue.owner_may_start(REQUESTER, None).unwrap(), "owner starts directly even after uncertain passive acceptance");
+            let state = store.snapshot().unwrap();
+            assert!(!state.leases.contains_key(REQUESTER));
+            assert!(state.next_step_leases.contains_key(REQUESTER));
+            assert!(state.deliveries.values().all(|d| d.state == DeliveryState::QueuedAsEvent));
+            assert!(!stage_owner_results(&store, REQUESTER, 1, world.documents(), now,
+                |_| panic!("same note must not be resent")).unwrap());
+            runtime.set(REQUESTER, |status| {
+                status.active_turn_id = Some("owner-turn".into());
+                status.runtime_generation = 2;
+            });
+            assert!(crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap().events.is_empty());
+            assert!(runtime.steered.borrow().is_empty(), "staging starts no result turn");
+            runtime.native.borrow_mut().insert(message.borrow().clone(), NativeMessageStatus::Persisted { turn_id: "owner-turn".into() });
+            crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap();
+            let state = store.snapshot().unwrap();
+            assert!(!state.next_step_leases.contains_key(REQUESTER));
+            assert!(state.deliveries.values().all(|d| d.state == DeliveryState::Acknowledged));
+            assert!(state.events.values().any(|event| event.turn_id.as_deref() == Some("owner-turn")));
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_dir_all(store_dir);
+        }
+    }
+
+    #[test]
+    fn idle_five_second_cap_batches_ids_once_after_reopen() {
+        use crate::asks::result_coalescing::Context;
+        use crate::config::result_coalescing::ResultClass;
+        let (world, dir) = world("returns-quiet-batch");
+        let (store, store_dir) = temp_store("returns-quiet-batch");
+        let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+        let now = Utc::now();
+        runtime.result_context.borrow_mut().insert(REQUESTER.into(), Context { class: ResultClass::ClaudeSubscription, last_activity: Some(now - chrono::Duration::seconds(1)) });
+        let first = answered_named(&world, &runtime, &store, now, "first");
+        assert!(crate::asks::scheduler::tick(&world, &runtime, &store, now + chrono::Duration::seconds(2)).unwrap().events.is_empty());
+        let second = answered_named(&world, &runtime, &store, now + chrono::Duration::seconds(3), "second");
+        // Reopening the store must preserve the original delivery clocks.
+        drop(store);
+        let store = AskStore::at(&store_dir);
+        assert!(crate::asks::scheduler::tick(&world, &runtime, &store, now + chrono::Duration::seconds(4)).unwrap().events.is_empty());
+        let report = crate::asks::scheduler::tick(&world, &runtime, &store, now + chrono::Duration::seconds(5)).unwrap();
+        assert_eq!(report.events.len(), 1);
+        let event = runtime.submitted.borrow().last().unwrap().1.clone();
+        assert!(event.text.contains(&first.replacen("ask-", "delegation-", 1)) && event.text.contains(&second.replacen("ask-", "delegation-", 1)), "{}", event.text);
+        assert_eq!(event.asks, vec![first, second]);
+        assert!(store.snapshot().unwrap().deliveries.values().all(|d| d.state == DeliveryState::Acknowledged));
+        assert!(crate::asks::scheduler::tick(&world, &runtime, &store, now + chrono::Duration::seconds(6)).unwrap().events.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[test]
+    fn idle_window_does_not_delay_failed_or_stopped_results_or_busy_completion() {
+        use crate::asks::result_coalescing::Context;
+        use crate::config::result_coalescing::ResultClass;
+        for mode in ["failed", "interrupted", "state", "question", "busy-ended", "owner-queued"] {
+            let (world, dir) = world(&format!("returns-quiet-bypass-{mode}"));
+            let (store, store_dir) = temp_store(&format!("returns-quiet-bypass-{mode}"));
+            let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+            let now = Utc::now();
+            runtime.result_context.borrow_mut().insert(REQUESTER.into(), Context { class: ResultClass::ClaudeSubscription, last_activity: Some(now - chrono::Duration::seconds(1)) });
+            answered(&world, &runtime, &store, now);
+            assert!(crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap().events.is_empty());
+            store.with_state(|state| {
+                match mode {
+                    "failed" => state.answers.values_mut().for_each(|a| a.status = AnswerStatus::Failed),
+                    "interrupted" => state.answers.values_mut().for_each(|a| a.status = AnswerStatus::Interrupted),
+                    "state" => state.deliveries.values_mut().for_each(|d| { d.kind = DeliveryKind::State; d.ref_id = "stopped".into(); }),
+                    "question" => state.deliveries.values_mut().for_each(|d| d.kind = DeliveryKind::Question),
+                    _ => (),
+                }
+            }).unwrap();
+            if mode == "question" {
+                let state = store.snapshot().unwrap();
+                assert!(!crate::asks::result_coalescing::hold(&state, REQUESTER, runtime.result_context.borrow()[REQUESTER], crate::config::result_coalescing::ResultCoalescing::default(), now));
+                let _ = std::fs::remove_dir_all(dir);
+                let _ = std::fs::remove_dir_all(store_dir);
+                continue;
+            }
+            if mode == "owner-queued" {
+                let params = crate::management::v2::user_input::parse_user_input_submit_params(&json!({
+                    "clientUserMessageId":"owner-during-quiet", "origin":{"kind":"other","clientId":"test"},
+                    "strategy":"queue", "input":[{"type":"text","text":"owner"}]
+                })).unwrap();
+                store.queue_repository().unwrap().enqueue(REQUESTER, "thread", "owner-request", &params).unwrap();
+            }
+            if mode == "busy-ended" {
+                runtime.result_context.borrow_mut().get_mut(REQUESTER).unwrap().last_activity = Some(now);
+            }
+            assert_eq!(crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap().events.len(), 1, "{mode}");
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_dir_all(store_dir);
+        }
+    }
+
+    #[test]
+    fn wait_claims_a_result_inside_the_idle_quiet_window() {
+        use crate::asks::result_coalescing::Context;
+        use crate::config::result_coalescing::ResultClass;
+        let (world, dir) = world("returns-quiet-wait");
+        let (store, store_dir) = temp_store("returns-quiet-wait");
+        let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+        let now = Utc::now();
+        runtime.result_context.borrow_mut().insert(REQUESTER.into(), Context { class: ResultClass::Codex, last_activity: Some(now - chrono::Duration::seconds(1)) });
+        let ask = answered(&world, &runtime, &store, now);
+        assert!(crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap().events.is_empty());
+        let claimed = store.with_state(|state| crate::asks::delivery::claim_for_wait(state, REQUESTER, &[ask], "wait", now)).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(crate::asks::scheduler::tick(&world, &runtime, &store, now + chrono::Duration::seconds(31)).unwrap().events.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[test]
+    fn busy_urgent_batch_keeps_old_wait_with_windows_on_or_off() {
+        use crate::asks::result_coalescing::Context;
+        use crate::config::result_coalescing::ResultClass;
+        for enabled in [true, false] {
+            let (mut world, dir) = world(&format!("busy-urgent-{enabled}"));
+            world.result_settings.claude_subscription.enabled = enabled;
+            let (store, store_dir) = temp_store("busy-urgent");
+            let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+            runtime.next_step.set(true);
+            runtime.set(REQUESTER, |s| s.active_turn_id = Some("busy".into()));
+            let now = Utc::now();
+            runtime.result_context.borrow_mut().insert(REQUESTER.into(), Context { class: ResultClass::ClaudeSubscription, last_activity: Some(now - chrono::Duration::seconds(1)) });
+            let completed = answered_named(&world, &runtime, &store, now, "completed");
+            let failed = answered_named(&world, &runtime, &store, now + chrono::Duration::seconds(1), "failed");
+            store.with_state(|state| state.answers.values_mut().filter(|a| a.ask_id == failed).for_each(|a| a.status = AnswerStatus::Failed)).unwrap();
+            for secs in [2, 119] {
+                let mut report = TickReport::default();
+                admit_events(&world, &runtime, &store, &mut report, now + chrono::Duration::seconds(secs)).unwrap();
+                assert!(report.events.is_empty() && runtime.steered.borrow().is_empty(), "enabled={enabled}");
+            }
+            let mut report = TickReport::default();
+            admit_events(&world, &runtime, &store, &mut report, now + chrono::Duration::seconds(120)).unwrap();
+            let steered = runtime.steered.borrow();
+            assert_eq!(steered.len(), 1);
+            assert_eq!(steered[0].1.asks, vec![completed, failed]);
+            drop(steered);
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_dir_all(store_dir);
+        }
+    }
+
+    #[test]
+    fn disabled_idle_window_delivers_success_at_once() {
+        use crate::asks::result_coalescing::Context;
+        use crate::config::result_coalescing::ResultClass;
+        let (mut world, dir) = world("disabled-idle-window");
+        world.result_settings.codex.enabled = false;
+        let (store, store_dir) = temp_store("disabled-idle-window");
+        let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+        let now = Utc::now();
+        runtime.result_context.borrow_mut().insert(REQUESTER.into(), Context { class: ResultClass::Codex, last_activity: Some(now - chrono::Duration::seconds(1)) });
+        answered(&world, &runtime, &store, now);
+        let mut report = TickReport::default();
+        admit_events(&world, &runtime, &store, &mut report, now).unwrap();
+        assert_eq!(report.events.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store_dir);
     }
 
     /// r217h2: results for a busy requester wait for its turn to end; once
@@ -1099,6 +1529,51 @@ mod tests {
         let state = store.snapshot().unwrap();
         assert!(state.deliveries.values().filter(|d| d.ask_id == ask).all(|d| d.state == DeliveryState::Acknowledged));
         for dir in [dir, store_dir, store2_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// 023 Q3: a delegation the owner refused in review reaches a busy
+    /// requester at its next step at once (no busy wait), once; the admission
+    /// snapshot says so too. Without `soon` it still waits for the turn end.
+    #[test]
+    fn review_refusal_reaches_a_busy_requester_at_its_next_step_at_once() {
+        let (world, dir) = world("returns-refusal");
+        let (store, store_dir) = temp_store("returns-refusal");
+        let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+        let now = Utc::now();
+        let at = |secs: i64| now + chrono::Duration::seconds(secs);
+        runtime.set(REQUESTER, |status| status.active_turn_id = Some("turn-busy".into()));
+        // What the scheduler does on GateVerdict::Rejected.
+        let ask_id = store.with_state(|state| {
+            let ask = state.create_ask(new_ask("refused", "please"), now).unwrap().0;
+            state.update_ask(&ask.ask_id, now, |ask| {
+                ask.execution = ExecutionState::Rejected;
+                ask.closed = Some(CloseOutcome::Completed);
+                ask.closed_at = Some(now_rfc3339(now));
+            });
+            let ask = state.asks[&ask.ask_id].clone();
+            super::super::delivery::record_state_delivery(state, &ask, "rejected", now);
+            ask.ask_id
+        }).unwrap();
+        let state = store.snapshot().unwrap();
+        assert!(pending_review_refusal(&state, REQUESTER));
+        assert!(!pending_review_refusal(&state, TARGET));
+        assert!(snapshot_timing(&store).iter().all(|(timing, _)| timing == "nextStep"), "{:?}", snapshot_timing(&store));
+        // No `soon`: waits for the turn to end, as before.
+        assert!(crate::asks::scheduler::tick(&world, &runtime, &store, at(1)).unwrap().events.is_empty());
+        // Takes `soon`: read at the next step one second later, not after 120 s.
+        runtime.next_step.set(true);
+        let report = crate::asks::scheduler::tick(&world, &runtime, &store, at(1)).unwrap();
+        assert_eq!(report.events.len(), 1);
+        let (session, event) = runtime.steered.borrow().last().cloned().unwrap();
+        assert_eq!(session, REQUESTER);
+        assert!(is_next_step_event(&event.message_id), "{}", event.message_id);
+        assert!(event.asks.iter().any(|ask| ask == &ask_id) || event.text.contains(&ask_id), "{event:?}");
+        // Once: not resent while unread.
+        crate::asks::scheduler::tick(&world, &runtime, &store, at(2)).unwrap();
+        assert_eq!(runtime.steered.borrow().len(), 1);
+        for dir in [dir, store_dir] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -1361,7 +1836,7 @@ mod tests {
         // A volatile runtime restarted (the store, read back from disk, still
         // has the record): back to pending, the old lease untouched.
         let (store, store_dir, lease, _) = setup("returns-leased-restart");
-        let reread: AskState = serde_json::from_slice(&std::fs::read(store_dir.join("asks-v1.json")).unwrap()).unwrap();
+        let reread = AskStore::at(&store_dir).snapshot().unwrap();
         assert!(reread.next_step_leases.contains_key(REQUESTER));
         runtime.set(REQUESTER, |status| {
             status.runtime_generation = 2;
@@ -1425,6 +1900,8 @@ mod tests {
         assert_eq!(value["from"], "Kimi");
         assert_eq!(value["preview"], "done: 42");
         assert!(value.get("fromHost").is_none());
+        // A local delegate: its session (the desktop shows its avatar).
+        assert_eq!(value["fromCutexSessionId"], TARGET);
         let mut bus = rows[0].clone();
         bus.ask_id = None;
         assert!(serde_json::to_value(&bus).unwrap().get("askId").is_none());

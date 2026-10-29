@@ -47,6 +47,12 @@ pub(crate) fn envelope(
     generation: u64,
     legacy: &Value,
 ) -> anyhow::Result<Envelope> {
+    // An Agent Management start / notice: the Codex native envelope's v1
+    // shape (service source, no view).
+    let management = matches!(legacy["eventType"].as_str(), Some("management_start" | "management_notice"))
+        && legacy["source"]["kind"] == "service"
+        && legacy["source"]["id"] == cutex::agent_management::AGENT_MANAGEMENT_SYSTEM_SENDER
+        && legacy.get("view").is_none();
     ensure!(
         legacy["threadId"] == thread
             && (legacy["eventType"] == "agent_message"
@@ -60,14 +66,28 @@ pub(crate) fn envelope(
                         legacy["metadata"]["deliveryMode"].as_str(),
                         Some("passive" | "after-turn" | "soon")
                     ))
+                || (legacy["eventType"] == cutex::agent_bus::claude_task::EVENT_TYPE
+                    && legacy["source"]["kind"] == "service"
+                    && legacy["source"]["id"] == cutex::agent_bus::claude_task::SOURCE_ID
+                    // A wake: after-turn, or soon when read at a busy step.
+                    && matches!(
+                        legacy["metadata"]["deliveryMode"].as_str(),
+                        Some("after-turn" | "soon")
+                    ))
                 || (legacy["eventType"] == "alarm"
                     && legacy["source"]["kind"] == "service"
                     && legacy["source"]["id"] == cutex::agent_bus::alarms::ALARM_SYSTEM_SENDER
-                    && legacy["metadata"]["deliveryMode"] == "after-turn")),
-        "not a Claude agent-message, peer-message or alarm projection"
+                    // After-turn; `soon` only for an approval decision notice
+                    // read at a busy step (023; claude_runtime checks the kind).
+                    && matches!(
+                        legacy["metadata"]["deliveryMode"].as_str(),
+                        Some("after-turn" | "soon")
+                    ))
+                || management),
+        "not a Claude agent-message, peer-message, Claude task, alarm or Agent Management projection"
     );
     let mut value = Envelope {
-        version: 2,
+        version: if management { 1 } else { 2 },
         owner_id: owner.into(),
         thread_id: thread.into(),
         runtime_generation: generation,
@@ -95,12 +115,16 @@ pub(crate) fn envelope(
                 .context("message text missing")?
                 .into(),
         },
-        view: Some(serde_json::from_value(
-            legacy
-                .get("view")
-                .context("agent message view missing")?
-                .clone(),
-        )?),
+        view: if management {
+            None
+        } else {
+            Some(serde_json::from_value(
+                legacy
+                    .get("view")
+                    .context("agent message view missing")?
+                    .clone(),
+            )?)
+        },
         semantic_sha256: String::new(),
     };
     value.semantic_sha256 = value.digest();
@@ -257,9 +281,17 @@ mod tests {
         }, &envelope, 7).unwrap();
         assert_eq!(receipt["state"], "queued");
         assert!(receipt.get("receipt").is_none());
-        let mut forged = payload;
+        let mut forged = payload.clone();
         forged["source"]["kind"] = json!("agent");
         assert!(super::envelope("owner", "thread", 7, &forged).is_err());
+        // 023: an approval notice read at a busy step is frozen `soon`; no other mode.
+        let mut soon = payload.clone();
+        soon["metadata"]["deliveryMode"] = json!("soon");
+        assert_eq!(super::envelope("owner", "thread", 7, &soon).unwrap().message.delivery,
+            cutex::app_server::external_input::Delivery::Soon);
+        let mut passive = payload;
+        passive["metadata"]["deliveryMode"] = json!("passive");
+        assert!(super::envelope("owner", "thread", 7, &passive).is_err());
     }
 
     /// A cross-host note is passive; a cross-host wake (cutex.peer.tell.v2)
@@ -277,6 +309,31 @@ mod tests {
         let mut forged = payload("after-turn");
         forged["source"]["kind"] = json!("agent");
         assert!(envelope("owner", "thread", 7, &forged).is_err());
+    }
+
+    #[test]
+    fn agent_management_input_is_a_v1_service_envelope_without_a_view() {
+        let sender = cutex::agent_management::AGENT_MANAGEMENT_SYSTEM_SENDER;
+        let payload = |event: &str, mode: &str| json!({"threadId":"thread","messageId":"bus-start-1",
+            "source":{"kind":"service","id":sender},"eventType":event,
+            "text":"Requested by Director: cutex.d\nAction: follow the explicit start instructions.\nInstructions:\nGo",
+            "metadata":{"sourceName":"Cutex Agent Management","deliveryMode":mode}});
+        for (event, mode, delivery) in [("management_start", "after-turn", Delivery::AfterTurn),
+            ("management_notice", "passive", Delivery::Passive)] {
+            let value = envelope("owner", "thread", 7, &payload(event, mode)).unwrap();
+            assert_eq!((value.version, value.view.is_none()), (1, true));
+            assert_eq!(value.message.delivery, delivery);
+            assert_eq!(value.message.source.id, sender);
+            assert_eq!(value.message.event_type, event);
+        }
+        // Another source, an agent source, or another event type is refused.
+        let mut forged = payload("management_start", "after-turn");
+        forged["source"]["id"] = json!("someone");
+        assert!(envelope("owner", "thread", 7, &forged).is_err());
+        let mut agent = payload("management_start", "after-turn");
+        agent["source"]["kind"] = json!("agent");
+        assert!(envelope("owner", "thread", 7, &agent).is_err());
+        assert!(envelope("owner", "thread", 7, &payload("management_other", "after-turn")).is_err());
     }
 
     #[test]

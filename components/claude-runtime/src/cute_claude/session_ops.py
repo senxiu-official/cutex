@@ -393,7 +393,7 @@ class SessionOperations:
         with target.transaction():
             require(target.db.execute('SELECT 1 FROM threads WHERE id=?', (new_id,)).fetchone() is None, 'target thread already exists', -32009)
             target.db.execute('INSERT INTO threads(id,model,cwd,created,updated,instructions,name) VALUES(?,?,?,?,?,?,?)',
-                (new_id, params.get('model') or source['model'], source['cwd'], now, now,
+                (new_id, params.get('launchDefaults', {}).get('model') or params.get('model') or source['model'], source['cwd'], now, now,
                  params.get('instructions', source['instructions']), params.get('name') or source['name']))
             props = self.store.thread_properties(tid)
             props.update(forkedFromId=tid)
@@ -419,12 +419,22 @@ class SessionOperations:
                         (new_id, original['message_id'], original['semantic_hash'], original['payload'], copied_id, original['created']))
             # Copy durable preferences only, never per-session approval grants.
             for table in ('thread_efforts', 'thread_tool_approvals', 'thread_launch_models', 'thread_plan_mode', 'thread_fast_mode'):
+                if 'launchDefaults' in params and table in ('thread_efforts', 'thread_launch_models'):
+                    continue
                 schema = self.store.db.execute('SELECT sql FROM sqlite_master WHERE type=\'table\' AND name=?', (table,)).fetchone()
                 if schema:
                     target.db.execute(schema[0].replace('CREATE TABLE ', 'CREATE TABLE IF NOT EXISTS ', 1))
                     row = self.store.db.execute(f'SELECT * FROM {table} WHERE thread_id=?', (tid,)).fetchone()
                     if row:
                         target.db.execute(f'INSERT INTO {table} VALUES({",".join("?" for _ in row)})', (new_id, *tuple(row)[1:]))
+
+            if 'launchDefaults' in params:
+                launch = params['launchDefaults']
+                target.db.execute('CREATE TABLE IF NOT EXISTS thread_efforts(thread_id TEXT PRIMARY KEY REFERENCES threads(id), effort TEXT)')
+                target.db.execute('CREATE TABLE IF NOT EXISTS thread_launch_models(thread_id TEXT PRIMARY KEY REFERENCES threads(id), model TEXT NOT NULL)')
+                target.db.execute('INSERT OR REPLACE INTO thread_launch_models VALUES(?,?)', (new_id, launch['model']))
+                if launch['effort'] is not None:
+                    target.db.execute('INSERT OR REPLACE INTO thread_efforts VALUES(?,?)', (new_id, launch['effort']))
 
     @structural
     async def revert(self, tid: str, before_turn_id: str, *, rewind_files=False) -> dict:

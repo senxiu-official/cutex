@@ -94,9 +94,49 @@ pub struct ServiceRecord {
     pub owner_cutex_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Who manages it (capability `services-project-scope`): `session`
+    /// (default; also every record written before the field existed) or
+    /// `project`. Not written while `session`, so such records stay
+    /// byte-identical for older daemons.
+    #[serde(default, skip_serializing_if = "ServiceOwnerScope::is_session")]
+    pub owner_scope: ServiceOwnerScope,
     pub runtime: ServiceRuntime,
     #[serde(default)]
     pub lifetime: ServiceLifetime,
+    /// Persistent-service purpose. Kept as a string so future host values do
+    /// not break older clients; this host currently accepts foreground/background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// An owner edit wins over an agent's later re-register hint.
+    #[serde(default)]
+    pub purpose_owner_set: bool,
+    /// Per-service idle TTL override. `None` follows the host default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_ttl_minutes: Option<u32>,
+    /// Owner-only: suppresses idle and absolute TTL reclaim, but not owner
+    /// archive reclaim. This is deliberately distinct from `persistent`.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Owner-only organisation. These fields survive an owning agent
+    /// re-registering the same slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
+    #[serde(default)]
+    pub starred: bool,
+    #[serde(default)]
+    pub sort_order: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    /// Lifecycle anchor reset when an archived ephemeral service is restored,
+    /// so time spent archived does not make it disappear immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,8 +170,63 @@ pub struct ServiceRecord {
     /// Who registered it, and the ask (委托) whose turn it was registered in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<ServiceProvenance>,
+    /// Home page tile: a static template (already validated, see
+    /// [`super::tile::validate_tile`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile: Option<Value>,
+    /// Home page tile: a path inside the service the daemon fetches the
+    /// template from (unset: `/.well-known/cutex-tile.json` unless `tile` is set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Who may manage a service (update / restart / unregister / re-register the
+/// slug) besides the owner (capability `services-project-scope`).
+///
+/// - `session`: only the registering session (`ownerCutexSessionId`).
+/// - `project`: the current Director of `projectId` (resolved live on every
+///   call, never stored) and the registrant while it is still in that
+///   project. A project service always carries a `projectId`.
+///
+/// Approvals still follow the caller's own permission envelope. An unknown
+/// stored value reads as `session` (never widens who may manage it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceOwnerScope {
+    #[default]
+    Session,
+    Project,
+}
+impl ServiceOwnerScope {
+    pub fn parse(value: &str) -> ServicesResult<Self> {
+        match value {
+            "session" => Ok(Self::Session),
+            "project" => Ok(Self::Project),
+            _ => Err(ServicesError::bad_request(
+                "ownerScope must be session or project",
+            )),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Project => "project",
+        }
+    }
+    pub fn is_session(&self) -> bool {
+        *self == Self::Session
+    }
+}
+impl<'de> Deserialize<'de> for ServiceOwnerScope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Fail safe for values a newer daemon may add: no wider management.
+        Ok(match Option::<String>::deserialize(deserializer)?.as_deref() {
+            Some("project") => Self::Project,
+            _ => Self::Session,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,6 +457,16 @@ pub struct RegisterRequest {
     pub runtime: Option<String>,
     #[serde(default)]
     pub lifetime: Option<String>,
+    /// Hint for a persistent service: foreground or background.
+    #[serde(default)]
+    pub purpose: Option<String>,
+    /// Optional idle TTL for an ephemeral service. Agents may request one up
+    /// to the host's configured ephemeral maximum.
+    #[serde(default)]
+    pub idle_ttl_minutes: Option<u32>,
+    /// Owner only. Agents cannot make an ephemeral service indefinite.
+    #[serde(default)]
+    pub pinned: Option<bool>,
     #[serde(default)]
     pub root: Option<String>,
     #[serde(default)]
@@ -378,6 +483,18 @@ pub struct RegisterRequest {
     pub owner_cutex_session_id: Option<String>,
     #[serde(default)]
     pub project_id: Option<String>,
+    /// `session` or `project` (see [`ServiceOwnerScope`]). Agents: `project`
+    /// needs a current project; omitted keeps an existing record's scope
+    /// (new records: `session`; the agent API defaults a sole-project
+    /// Director to `project`). Owner: `project` needs `projectId`.
+    #[serde(default)]
+    pub owner_scope: Option<String>,
+    /// Static home page tile template (capability `service-tiles`).
+    #[serde(default)]
+    pub tile: Option<Value>,
+    /// Path inside the service serving the tile template.
+    #[serde(default)]
+    pub tile_path: Option<String>,
     /// Set by the agent API after the owner approved a static root outside
     /// the caller's cwd / project workspace; never part of the wire format.
     #[serde(skip)]
@@ -410,6 +527,27 @@ pub struct UpdateRequest {
     pub runtime: Option<String>,
     #[serde(default)]
     pub lifetime: Option<String>,
+    /// Owner-only; `null` leaves a persistent service uncategorised.
+    #[serde(default, deserialize_with = "nullable")]
+    pub purpose: Option<Option<String>>,
+    /// `null` restores the host default.
+    #[serde(default, deserialize_with = "nullable")]
+    pub idle_ttl_minutes: Option<Option<u32>>,
+    /// Owner only.
+    #[serde(default)]
+    pub pinned: Option<bool>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub group_name: Option<Option<String>>,
+    #[serde(default)]
+    pub starred: Option<bool>,
+    #[serde(default)]
+    pub sort_order: Option<i32>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub note: Option<Option<String>>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub archived: Option<bool>,
     #[serde(default)]
     pub root: Option<String>,
     #[serde(default, deserialize_with = "nullable")]
@@ -426,6 +564,17 @@ pub struct UpdateRequest {
     pub owner_cutex_session_id: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
     pub project_id: Option<Option<String>>,
+    /// `session` | `project`. Agents may only turn a service they manage
+    /// into a project service (of their current project); turning a project
+    /// service back into a session service is owner only.
+    #[serde(default)]
+    pub owner_scope: Option<String>,
+    /// `null` clears the static tile.
+    #[serde(default, deserialize_with = "nullable")]
+    pub tile: Option<Option<Value>>,
+    /// `null` restores the default tile path.
+    #[serde(default, deserialize_with = "nullable")]
+    pub tile_path: Option<Option<String>>,
     /// See `RegisterRequest::static_root_approved`.
     #[serde(skip)]
     pub static_root_approved: bool,
@@ -666,26 +815,71 @@ pub fn os_port_free(port: u16) -> bool {
     TcpListener::bind(loopback).is_ok()
 }
 
-fn ensure_owns(record: &ServiceRecord, caller: &Caller) -> ServicesResult<()> {
-    match caller {
-        Caller::Owner => Ok(()),
-        Caller::Agent {
-            cutex_session_id, ..
-        } => {
-            if record.owner_cutex_session_id.as_deref() == Some(cutex_session_id.as_str()) {
-                Ok(())
-            } else {
-                Err(ServicesError::new(
-                    403,
-                    "not_service_owner",
-                    format!(
-                        "service `{}` belongs to another agent or the owner",
-                        record.slug
-                    ),
-                ))
-            }
+/// The current Director of `project` from the live authority (the fenced
+/// request-local projection when the caller holds one), if any.
+fn project_director(project: &str) -> Option<String> {
+    crate::director_address::authority_for_project(project)
+        .ok()
+        .map(|(_, director, _)| director)
+}
+
+/// Whether `caller` may manage `record` (update / restart / unregister /
+/// re-register its slug; see [`ServiceOwnerScope`]). Resolves the project's
+/// Director on every call: a Director replaced a moment ago no longer
+/// manages, its successor does. An agent's project is the one resolved for
+/// this request (`Caller::Agent::project_id`).
+pub fn may_manage(record: &ServiceRecord, caller: &Caller) -> bool {
+    let Caller::Agent {
+        cutex_session_id,
+        project_id,
+    } = caller
+    else {
+        return true;
+    };
+    let registrant = record.owner_cutex_session_id.as_deref() == Some(cutex_session_id.as_str());
+    match (record.owner_scope, record.project_id.as_deref()) {
+        (ServiceOwnerScope::Project, Some(project)) => {
+            (registrant && project_id.as_deref() == Some(project))
+                || project_director(project).as_deref() == Some(cutex_session_id.as_str())
         }
+        _ => registrant,
     }
+}
+
+fn ensure_owns(record: &ServiceRecord, caller: &Caller) -> ServicesResult<()> {
+    if may_manage(record, caller) {
+        return Ok(());
+    }
+    let message = if record.owner_scope == ServiceOwnerScope::Project {
+        format!(
+            "project service `{}` is managed by the current Director of its project, its registrant while in the project, and the owner",
+            record.slug
+        )
+    } else {
+        format!(
+            "service `{}` belongs to another agent or the owner",
+            record.slug
+        )
+    };
+    Err(ServicesError::new(403, "not_service_owner", message))
+}
+
+fn project_scope_unavailable(message: &str) -> ServicesError {
+    ServicesError::new(409, "project_scope_unavailable", message.to_string())
+}
+
+fn ensure_unchanged(
+    actual: Option<&ServiceRecord>,
+    expected: Option<Option<&ServiceRecord>>,
+) -> ServicesResult<()> {
+    if expected.is_some_and(|expected| actual != expected) {
+        return Err(ServicesError::new(
+            409,
+            "service_changed",
+            "service changed while confirmation was pending; inspect it and retry",
+        ));
+    }
+    Ok(())
 }
 
 fn port_conflict(registry: &Registry, slug: &str, host: &str, port: u16) -> ServicesResult<()> {
@@ -764,6 +958,27 @@ impl ServiceStore {
         read_registry(&self.registry_path()).map_err(ServicesError::unavailable)
     }
 
+    /// New retention and owner-organisation intent that r257 would ignore
+    /// and then discard on its next registry write.
+    pub fn has_previous_build_rollback_blockers(&self) -> ServicesResult<bool> {
+        let registry = self.load()?;
+        Ok(registry.settings.ephemeral_idle_minutes == 0
+            || registry.services.values().any(|record| {
+                record.purpose.is_some()
+                    || record.purpose_owner_set
+                    || record.idle_ttl_minutes.is_some()
+                    || record.pinned
+                    || record.group_name.is_some()
+                    || record.starred
+                    || record.sort_order != 0
+                    || record.note.is_some()
+                    || record.hidden
+                    || record.archived
+                    || record.archived_at.is_some()
+                    || record.retention_started_at.is_some()
+            }))
+    }
+
     pub fn get(&self, slug: &str) -> ServicesResult<ServiceRecord> {
         let mut registry = self.load()?;
         registry.services.remove(slug).ok_or_else(|| {
@@ -790,8 +1005,9 @@ impl ServiceStore {
     /// Run `f` on a copy of the registry and discard the result: the
     /// validate-only path (nothing is written, no lock file is created).
     fn dry_run<T>(&self, f: impl FnOnce(&mut Registry) -> ServicesResult<T>) -> ServicesResult<T> {
-        let mut registry = read_registry(&self.registry_path()).map_err(ServicesError::unavailable)?;
-        registry.schema_version = registry.schema_version.max(1);
+        let mut registry =
+            read_registry(&self.registry_path()).map_err(ServicesError::unavailable)?;
+        registry.schema_version = registry.schema_version.max(3);
         f(&mut registry)
     }
 
@@ -822,8 +1038,8 @@ impl ServiceStore {
                         .map_err(ServicesError::unavailable)?;
                 }
             }
-            registry.schema_version = 1;
         }
+        registry.schema_version = registry.schema_version.max(3);
         let result = f(&mut registry)?;
         if registry != before {
             registry.revision = before.revision + 1;
@@ -845,7 +1061,17 @@ impl ServiceStore {
         request: RegisterRequest,
         caller: &Caller,
     ) -> ServicesResult<(ServiceRecord, bool)> {
-        self.register_inner(request, caller, true)
+        self.register_inner(request, caller, true, None)
+            .map(|(record, created, _)| (record, created))
+    }
+
+    pub fn register_if_unchanged(
+        &self,
+        request: RegisterRequest,
+        caller: &Caller,
+        expected: Option<&ServiceRecord>,
+    ) -> ServicesResult<(ServiceRecord, bool)> {
+        self.register_inner(request, caller, true, Some(expected))
             .map(|(record, created, _)| (record, created))
     }
 
@@ -857,7 +1083,17 @@ impl ServiceStore {
         request: RegisterRequest,
         caller: &Caller,
     ) -> ServicesResult<MutationCheck> {
-        self.register_inner(request, caller, false)
+        self.register_inner(request, caller, false, None)
+            .map(|(_, _, check)| check)
+    }
+
+    pub fn validate_register_if_unchanged(
+        &self,
+        request: RegisterRequest,
+        caller: &Caller,
+        expected: Option<&ServiceRecord>,
+    ) -> ServicesResult<MutationCheck> {
+        self.register_inner(request, caller, false, Some(expected))
             .map(|(_, _, check)| check)
     }
 
@@ -866,6 +1102,7 @@ impl ServiceStore {
         request: RegisterRequest,
         caller: &Caller,
         commit: bool,
+        expected: Option<Option<&ServiceRecord>>,
     ) -> ServicesResult<(ServiceRecord, bool, MutationCheck)> {
         validate_slug(&request.slug)?;
         let runtime = match request.runtime.as_deref() {
@@ -895,9 +1132,23 @@ impl ServiceStore {
             .as_deref()
             .map(ServiceLifetime::parse)
             .transpose()?;
+        if matches!(caller, Caller::Agent { .. }) && request.pinned.is_some() {
+            return Err(ServicesError::bad_request("pinned is owner only"));
+        }
         let display_name =
             validate_display_name(request.display_name.as_deref().unwrap_or(&request.slug))?;
         let path = request.path.as_deref().map(validate_path).transpose()?;
+        let tile = request
+            .tile
+            .as_ref()
+            .filter(|tile| !tile.is_null())
+            .map(super::tile::validate_tile_request)
+            .transpose()?;
+        let tile_path = request
+            .tile_path
+            .as_deref()
+            .map(super::tile::validate_tile_path_request)
+            .transpose()?;
         let cwd = request.cwd.as_deref().map(validate_cwd).transpose()?;
         if let Some(command) = &request.command {
             validate_command(command)?;
@@ -916,6 +1167,11 @@ impl ServiceStore {
         if request.port == Some(0) {
             return Err(ServicesError::bad_request("port must be 1-65535"));
         }
+        let requested_scope = request
+            .owner_scope
+            .as_deref()
+            .map(ServiceOwnerScope::parse)
+            .transpose()?;
         let (owner, project) = match caller {
             Caller::Owner => (
                 request
@@ -941,10 +1197,18 @@ impl ServiceStore {
                 (Some(cutex_session_id.clone()), project_id.clone())
             }
         };
+        if requested_scope == Some(ServiceOwnerScope::Project) && project.is_none() {
+            return Err(project_scope_unavailable(match caller {
+                Caller::Owner => "a project service needs a projectId",
+                Caller::Agent { .. } => "scope project needs a current project; you are not in one",
+            }));
+        }
         let host = self.host.clone();
         let probe = self.port_probe;
         let apply = |registry: &mut Registry| {
             let existing = registry.services.get(&request.slug).cloned();
+            ensure_unchanged(existing.as_ref(), expected)?;
+            validate_idle_ttl(request.idle_ttl_minutes, &registry.settings)?;
             if let Some(existing) = &existing {
                 match caller {
                     Caller::Agent { .. } => ensure_owns(existing, caller).map_err(|_| {
@@ -1004,6 +1268,41 @@ impl ServiceStore {
                 }
             };
             port_conflict(registry, &request.slug, &host, port)?;
+            let owner_scope = match (requested_scope, &existing) {
+                (Some(ServiceOwnerScope::Session), Some(existing))
+                    if existing.owner_scope == ServiceOwnerScope::Project =>
+                {
+                    return Err(ServicesError::new(
+                        403,
+                        "not_service_owner",
+                        format!(
+                            "only the owner can turn project service `{}` back into a session service",
+                            request.slug
+                        ),
+                    ));
+                }
+                (Some(scope), _) => scope,
+                (None, Some(existing)) => existing.owner_scope,
+                (None, None) => ServiceOwnerScope::Session,
+            };
+            // A project service re-registered by an agent that manages it
+            // (e.g. its Director) keeps its registrant and its project.
+            let (owner, project) = match &existing {
+                Some(existing)
+                    if owner_scope == ServiceOwnerScope::Project
+                        && existing.owner_scope == ServiceOwnerScope::Project
+                        && matches!(caller, Caller::Agent { .. }) =>
+                {
+                    (
+                        existing.owner_cutex_session_id.clone(),
+                        existing.project_id.clone().or_else(|| project.clone()),
+                    )
+                }
+                _ => (owner.clone(), project.clone()),
+            };
+            if owner_scope == ServiceOwnerScope::Project && project.is_none() {
+                return Err(project_scope_unavailable("a project service needs a projectId"));
+            }
             let check = MutationCheck {
                 static_root_approval: root_review(
                     checked_root.as_ref(),
@@ -1016,6 +1315,45 @@ impl ServiceStore {
                 }
             }
             let now = now_rfc3339();
+            let lifetime = requested_lifetime.unwrap_or_else(|| {
+                existing.as_ref().map(|r| r.lifetime).unwrap_or(
+                    if matches!(caller, Caller::Owner) {
+                        ServiceLifetime::Persistent
+                    } else if runtime == ServiceRuntime::External {
+                        registry.settings.agent_external_default_lifetime
+                    } else {
+                        ServiceLifetime::Ephemeral
+                    },
+                )
+            });
+            let requested_purpose = request
+                .purpose
+                .as_deref()
+                .map(validate_purpose)
+                .transpose()?;
+            if lifetime != ServiceLifetime::Persistent && requested_purpose.is_some() {
+                return Err(ServicesError::bad_request(
+                    "purpose is only valid for persistent services",
+                ));
+            }
+            let purpose_owner_set = existing
+                .as_ref()
+                .is_some_and(|record| record.purpose_owner_set)
+                || (matches!(caller, Caller::Owner) && request.purpose.is_some());
+            let purpose = if lifetime == ServiceLifetime::Persistent {
+                if existing
+                    .as_ref()
+                    .is_some_and(|record| record.purpose_owner_set)
+                    && matches!(caller, Caller::Agent { .. })
+                {
+                    existing.as_ref().and_then(|record| record.purpose.clone())
+                } else {
+                    requested_purpose
+                        .or_else(|| existing.as_ref().and_then(|record| record.purpose.clone()))
+                }
+            } else {
+                None
+            };
             let record = ServiceRecord {
                 proxy_host_header: validate_proxy_host_header(
                     request.proxy_host_header.as_deref().unwrap_or("preserve"),
@@ -1027,30 +1365,41 @@ impl ServiceStore {
                 path: path.clone(),
                 owner_cutex_session_id: owner.clone(),
                 project_id: project.clone(),
+                owner_scope,
                 runtime,
-                lifetime: requested_lifetime.unwrap_or_else(|| {
-                    existing.as_ref().map(|r| r.lifetime).unwrap_or(
-                        if matches!(caller, Caller::Owner) {
-                            ServiceLifetime::Persistent
-                        } else if runtime == ServiceRuntime::External {
-                            registry.settings.agent_external_default_lifetime
-                        } else {
-                            ServiceLifetime::Ephemeral
-                        },
-                    )
-                }),
+                lifetime,
+                purpose,
+                purpose_owner_set: lifetime == ServiceLifetime::Persistent && purpose_owner_set,
+                idle_ttl_minutes: request
+                    .idle_ttl_minutes
+                    .or_else(|| existing.as_ref().and_then(|r| r.idle_ttl_minutes)),
+                pinned: request
+                    .pinned
+                    .unwrap_or_else(|| existing.as_ref().is_some_and(|r| r.pinned)),
+                group_name: existing.as_ref().and_then(|r| r.group_name.clone()),
+                starred: existing.as_ref().is_some_and(|r| r.starred),
+                sort_order: existing.as_ref().map_or(0, |r| r.sort_order),
+                note: existing.as_ref().and_then(|r| r.note.clone()),
+                hidden: existing.as_ref().is_some_and(|r| r.hidden),
+                archived: existing.as_ref().is_some_and(|r| r.archived),
+                archived_at: existing.as_ref().and_then(|r| r.archived_at.clone()),
+                retention_started_at: existing
+                    .as_ref()
+                    .and_then(|r| r.retention_started_at.clone()),
                 root: root.clone(),
                 command: request.command.clone(),
                 cwd: cwd.clone(),
                 env: env.clone(),
                 login_link_command: request.login_link_command.clone(),
-                stopped: false,
+                stopped: existing.as_ref().is_some_and(|r| r.archived),
                 restart_requested_at: existing
                     .as_ref()
                     .and_then(|record| record.restart_requested_at.clone()),
                 port_allocated,
                 ceiling: ceiling_for(runtime),
                 provenance: Some(provenance_for(caller)),
+                tile: tile.clone(),
+                tile_path: tile_path.clone(),
                 created_at: existing
                     .as_ref()
                     .map(|record| record.created_at.clone())
@@ -1089,7 +1438,18 @@ impl ServiceStore {
         request: UpdateRequest,
         caller: &Caller,
     ) -> ServicesResult<ServiceRecord> {
-        self.update_inner(slug, request, caller, true)
+        self.update_inner(slug, request, caller, true, None)
+            .map(|(record, _)| record)
+    }
+
+    pub fn update_if_unchanged(
+        &self,
+        slug: &str,
+        request: UpdateRequest,
+        caller: &Caller,
+        expected: &ServiceRecord,
+    ) -> ServicesResult<ServiceRecord> {
+        self.update_inner(slug, request, caller, true, Some(expected))
             .map(|(record, _)| record)
     }
 
@@ -1113,7 +1473,17 @@ impl ServiceStore {
         request: UpdateRequest,
         caller: &Caller,
     ) -> ServicesResult<(ServiceRecord, MutationCheck)> {
-        self.update_inner(slug, request, caller, false)
+        self.update_inner(slug, request, caller, false, None)
+    }
+
+    pub fn preview_update_if_unchanged(
+        &self,
+        slug: &str,
+        request: UpdateRequest,
+        caller: &Caller,
+        expected: &ServiceRecord,
+    ) -> ServicesResult<(ServiceRecord, MutationCheck)> {
+        self.update_inner(slug, request, caller, false, Some(expected))
     }
 
     fn update_inner(
@@ -1122,14 +1492,29 @@ impl ServiceStore {
         request: UpdateRequest,
         caller: &Caller,
         commit: bool,
+        expected: Option<&ServiceRecord>,
     ) -> ServicesResult<(ServiceRecord, MutationCheck)> {
         if matches!(caller, Caller::Agent { .. })
-            && (request.owner_cutex_session_id.is_some() || request.project_id.is_some())
+            && (request.owner_cutex_session_id.is_some()
+                || request.project_id.is_some()
+                || request.pinned.is_some()
+                || request.purpose.is_some()
+                || request.group_name.is_some()
+                || request.starred.is_some()
+                || request.sort_order.is_some()
+                || request.note.is_some()
+                || request.hidden.is_some()
+                || request.archived.is_some())
         {
             return Err(ServicesError::bad_request(
-                "owner and project come from the calling agent",
+                "owner, project, retention pin and organisation are owner only",
             ));
         }
+        let requested_scope = request
+            .owner_scope
+            .as_deref()
+            .map(ServiceOwnerScope::parse)
+            .transpose()?;
         let host = self.host.clone();
         let apply = |registry: &mut Registry| {
             let mut check = MutationCheck::default();
@@ -1139,12 +1524,92 @@ impl ServiceStore {
                 .cloned()
                 .ok_or_else(|| ServicesError::not_found(slug))?;
             ensure_owns(&record, caller)?;
+            ensure_unchanged(Some(&record), expected.map(Some))?;
             let before = record.clone();
+            if let Some(scope) = requested_scope {
+                if let Caller::Agent { project_id, .. } = caller {
+                    if scope == ServiceOwnerScope::Session
+                        && record.owner_scope == ServiceOwnerScope::Project
+                    {
+                        return Err(ServicesError::new(
+                            403,
+                            "not_service_owner",
+                            format!(
+                                "only the owner can turn project service `{slug}` back into a session service"
+                            ),
+                        ));
+                    }
+                    if scope == ServiceOwnerScope::Project
+                        && record.owner_scope == ServiceOwnerScope::Session
+                        && (record.project_id.is_none() || record.project_id != *project_id)
+                    {
+                        return Err(project_scope_unavailable(
+                            "only a service of your current project can become a project service",
+                        ));
+                    }
+                }
+                record.owner_scope = scope;
+            }
             if let Some(value) = &request.proxy_host_header {
                 record.proxy_host_header = validate_proxy_host_header(value)?;
             }
             if let Some(lifetime) = &request.lifetime {
                 record.lifetime = ServiceLifetime::parse(lifetime)?;
+                if record.lifetime == ServiceLifetime::Ephemeral {
+                    record.purpose = None;
+                    record.purpose_owner_set = false;
+                }
+            }
+            if let Some(purpose) = &request.purpose {
+                if record.lifetime != ServiceLifetime::Persistent {
+                    return Err(ServicesError::bad_request(
+                        "purpose is only valid for persistent services",
+                    ));
+                }
+                record.purpose = purpose.as_deref().map(validate_purpose).transpose()?;
+                record.purpose_owner_set = true;
+            }
+            if let Some(minutes) = request.idle_ttl_minutes {
+                validate_idle_ttl(minutes, &registry.settings)?;
+                record.idle_ttl_minutes = minutes;
+            }
+            if let Some(pinned) = request.pinned {
+                record.pinned = pinned;
+            }
+            if let Some(group) = &request.group_name {
+                record.group_name = group
+                    .as_deref()
+                    .map(|value| validate_owner_text(value, 80, "groupName"))
+                    .transpose()?;
+            }
+            if let Some(starred) = request.starred {
+                record.starred = starred;
+            }
+            if let Some(sort_order) = request.sort_order {
+                record.sort_order = sort_order;
+            }
+            if let Some(note) = &request.note {
+                record.note = note
+                    .as_deref()
+                    .map(|value| validate_owner_text(value, 1000, "note"))
+                    .transpose()?;
+            }
+            if let Some(hidden) = request.hidden {
+                record.hidden = hidden;
+            }
+            if let Some(archived) = request.archived {
+                let was_archived = record.archived;
+                record.archived = archived;
+                if archived {
+                    record.hidden = true;
+                    record.stopped = true;
+                    record.archived_at = Some(now_rfc3339());
+                } else {
+                    record.archived_at = None;
+                    if was_archived && record.lifetime == ServiceLifetime::Ephemeral {
+                        record.retention_started_at = Some(now_rfc3339());
+                    }
+                }
             }
             if let Some(root) = &request.root {
                 let checked = super::static_files::check_root(root, &self.dir, caller)?;
@@ -1214,6 +1679,19 @@ impl ServiceStore {
             if let Some(project) = &request.project_id {
                 record.project_id = project.as_deref().map(validate_project_id).transpose()?;
             }
+            if let Some(tile) = &request.tile {
+                record.tile = tile
+                    .as_ref()
+                    .filter(|tile| !tile.is_null())
+                    .map(super::tile::validate_tile_request)
+                    .transpose()?;
+            }
+            if let Some(tile_path) = &request.tile_path {
+                record.tile_path = tile_path
+                    .as_deref()
+                    .map(super::tile::validate_tile_path_request)
+                    .transpose()?;
+            }
             if record.runtime != ServiceRuntime::External
                 && before.runtime == ServiceRuntime::External
             {
@@ -1225,6 +1703,12 @@ impl ServiceStore {
                 }
                 record.port = 0;
                 record.port_allocated = false;
+            }
+            if record.archived {
+                record.stopped = true;
+            }
+            if record.owner_scope == ServiceOwnerScope::Project && record.project_id.is_none() {
+                return Err(project_scope_unavailable("a project service needs a projectId"));
             }
             validate_runtime_fields(&record)?;
             record.ceiling = ceiling_for(record.runtime);
@@ -1242,6 +1726,26 @@ impl ServiceStore {
     }
 
     pub fn remove(&self, slug: &str, caller: &Caller) -> ServicesResult<ServiceRecord> {
+        self.remove_inner(slug, caller, None)
+    }
+
+    /// Approval applies to the exact record shown to the owner. Never delete
+    /// a replacement or a record changed while the approval was outstanding.
+    pub fn remove_if_unchanged(
+        &self,
+        slug: &str,
+        caller: &Caller,
+        expected: &ServiceRecord,
+    ) -> ServicesResult<ServiceRecord> {
+        self.remove_inner(slug, caller, Some(expected))
+    }
+
+    fn remove_inner(
+        &self,
+        slug: &str,
+        caller: &Caller,
+        expected: Option<&ServiceRecord>,
+    ) -> ServicesResult<ServiceRecord> {
         self.mutate(|registry| {
             let record = registry
                 .services
@@ -1249,9 +1753,43 @@ impl ServiceStore {
                 .cloned()
                 .ok_or_else(|| ServicesError::not_found(slug))?;
             ensure_owns(&record, caller)?;
+            if expected.is_some_and(|expected| expected != &record) {
+                return Err(ServicesError::new(
+                    409,
+                    "service_changed",
+                    "service changed while confirmation was pending; inspect it and retry",
+                ));
+            }
+            if record.archived && matches!(caller, Caller::Agent { .. }) {
+                return Err(ServicesError::new(
+                    409,
+                    "service_archived",
+                    "the owner archived this service; only the owner can restore or remove it",
+                ));
+            }
             registry.services.remove(slug);
             super::lifecycle::for_store(self).forget(slug);
             Ok(record)
+        })
+    }
+
+    /// A deleted session no longer registers its project services: they stay
+    /// (managed by the project's Director and the owner) with the registrant
+    /// cleared. Session services are untouched (they block the delete).
+    /// Returns the affected slugs.
+    pub fn forget_registrant(&self, cutex_session_id: &str) -> ServicesResult<Vec<String>> {
+        self.mutate(|registry| {
+            let mut slugs = Vec::new();
+            for record in registry.services.values_mut() {
+                if record.owner_scope == ServiceOwnerScope::Project
+                    && record.owner_cutex_session_id.as_deref() == Some(cutex_session_id)
+                {
+                    record.owner_cutex_session_id = None;
+                    record.updated_at = now_rfc3339();
+                    slugs.push(record.slug.clone());
+                }
+            }
+            Ok(slugs)
         })
     }
 
@@ -1275,6 +1813,13 @@ impl ServiceStore {
                         "service `{slug}` is {}: only managed services are run (and restarted) by cutex",
                         record.runtime.label()
                     ),
+                ));
+            }
+            if record.archived {
+                return Err(ServicesError::new(
+                    409,
+                    "service_archived",
+                    format!("service `{slug}` is archived; only the owner can restore it"),
                 ));
             }
             if record.stopped {
@@ -1354,7 +1899,8 @@ impl ServiceStore {
             if let Some(v) = patch.ephemeral_max_restarts {
                 settings.ephemeral_max_restarts = v;
             }
-            if !(5..=1440).contains(&settings.ephemeral_idle_minutes)
+            if !(settings.ephemeral_idle_minutes == 0
+                || (5..=1440).contains(&settings.ephemeral_idle_minutes))
                 || !(1..=720).contains(&settings.ephemeral_ttl_hours)
                 || settings.tombstone_days > 90
                 || settings.ephemeral_max_restarts > 10
@@ -1385,6 +1931,38 @@ impl ServiceStore {
     }
 }
 
+fn validate_idle_ttl(minutes: Option<u32>, settings: &ServicesSettings) -> ServicesResult<()> {
+    let Some(minutes) = minutes else {
+        return Ok(());
+    };
+    let max = settings.ephemeral_ttl_hours.saturating_mul(60);
+    if !(5..=max).contains(&minutes) {
+        return Err(ServicesError::bad_request(format!(
+            "idleTtlMinutes must be 5-{max} for this host"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_purpose(value: &str) -> ServicesResult<String> {
+    match value {
+        "foreground" | "background" => Ok(value.to_owned()),
+        _ => Err(ServicesError::bad_request(
+            "purpose must be foreground or background",
+        )),
+    }
+}
+
+fn validate_owner_text(value: &str, max: usize, field: &str) -> ServicesResult<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > max || value.chars().any(char::is_control) {
+        return Err(ServicesError::bad_request(format!(
+            "{field} must be 1-{max} printable characters"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
 fn read_registry(path: &Path) -> anyhow::Result<Registry> {
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -1399,11 +1977,17 @@ fn read_registry(path: &Path) -> anyhow::Result<Registry> {
     }
 }
 
-/// Upgrade records written before the services simplification in place:
-/// `pinned` and `settings.idleTimeoutMinutes` are dropped, and the retired
+/// Upgrade records written before the services simplification in place. A
+/// pre-v2 `pinned` belonged to the retired on-demand model, so it is dropped;
+/// v2 uses `pinned` for the explicit owner keep-until-archive control.
+/// `settings.idleTimeoutMinutes` is dropped, and the retired
 /// `onDemand` runtime becomes `managed` with `stopped: true` (no autostart;
 /// `open` / `start` bring it up). Persisted on the next registry write.
 fn migrate_legacy_registry(value: &mut Value) {
+    let schema_version = value
+        .get("schemaVersion")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     if let Some(settings) = value.get_mut("settings").and_then(Value::as_object_mut) {
         settings.remove("idleTimeoutMinutes");
     }
@@ -1414,7 +1998,9 @@ fn migrate_legacy_registry(value: &mut Value) {
         let Some(record) = record.as_object_mut() else {
             continue;
         };
-        record.remove("pinned");
+        if schema_version < 2 {
+            record.remove("pinned");
+        }
         let legacy_on_demand = record
             .get("runtime")
             .and_then(Value::as_str)
@@ -1450,6 +2036,7 @@ pub fn service_view(record: &ServiceRecord, state: Option<&RuntimeSnapshot>) -> 
         "path": record.path,
         "ownerCutexSessionId": record.owner_cutex_session_id,
         "projectId": record.project_id,
+        "ownerScope": record.owner_scope.label(),
         "runtime": record.runtime.label(),
         "portAllocated": record.port_allocated,
         "createdAt": record.created_at,
@@ -1496,7 +2083,23 @@ pub fn service_view(record: &ServiceRecord, state: Option<&RuntimeSnapshot>) -> 
         }
     }
     view["lifetime"] = json!(record.lifetime);
+    view["purpose"] = json!(record.purpose);
+    view["idleTtlMinutes"] = json!(record.idle_ttl_minutes);
+    view["pinned"] = json!(record.pinned);
+    view["groupName"] = json!(record.group_name);
+    view["starred"] = json!(record.starred);
+    view["sortOrder"] = json!(record.sort_order);
+    view["note"] = json!(record.note);
+    view["hidden"] = json!(record.hidden);
+    view["archived"] = json!(record.archived);
+    view["archivedAt"] = json!(record.archived_at);
     view["link"] = json!(service_link(record));
+    if record.tile.is_some() {
+        view["tile"] = json!(record.tile);
+    }
+    if record.tile_path.is_some() {
+        view["tilePath"] = json!(record.tile_path);
+    }
     view
 }
 
@@ -1521,6 +2124,9 @@ pub struct ListFilter {
     pub project: Option<String>,
     pub owner: Option<String>,
     pub health: Option<ServiceHealth>,
+    /// Owner details clients can opt into hidden/archived records. The
+    /// default keeps older desktops' main list aligned with owner visibility.
+    pub include_inactive: bool,
 }
 
 /// Records matching `filter`, by display name.
@@ -1532,6 +2138,7 @@ pub fn list_views(
     let mut records: Vec<&ServiceRecord> = registry
         .services
         .values()
+        .filter(|record| filter.include_inactive || (!record.hidden && !record.archived))
         .filter(|record| {
             filter
                 .project
@@ -1740,7 +2347,7 @@ mod tests {
         let legacy = br#"{"revision":7,"settings":{"portRangeStart":26180,"portRangeEnd":26199},"services":{"old":{"slug":"old","displayName":"Old","host":"host","port":26180,"runtime":"external","createdAt":"2026-10-11T00:00:00Z","updatedAt":"2026-10-11T00:00:00Z"}}}"#;
         std::fs::write(store.registry_path(), legacy).unwrap();
         store.mutate(|_| Ok(())).unwrap();
-        assert_eq!(store.load().unwrap().schema_version, 1);
+        assert_eq!(store.load().unwrap().schema_version, 3);
         assert_eq!(
             store.get("old").unwrap().lifetime,
             ServiceLifetime::Persistent
@@ -1752,6 +2359,26 @@ mod tests {
         assert_eq!(std::fs::read(store.registry_path()).unwrap(), migrated);
         store.register(register("new"), &Caller::Owner).unwrap();
         assert_eq!(std::fs::read(backup).unwrap(), legacy);
+        std::fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn previous_build_rollback_blockers_track_r258_service_intent() {
+        let store = temp_store();
+        assert!(!store.has_previous_build_rollback_blockers().unwrap());
+        store.register(register("plain"), &Caller::Owner).unwrap();
+        assert!(!store.has_previous_build_rollback_blockers().unwrap());
+        store.update(
+            "plain",
+            serde_json::from_value(json!({"groupName":"Work","starred":true})).unwrap(),
+            &Caller::Owner,
+        ).unwrap();
+        assert!(store.has_previous_build_rollback_blockers().unwrap());
+        std::fs::remove_dir_all(store.dir()).unwrap();
+
+        let store = temp_store();
+        store.update_settings(SettingsPatch { ephemeral_idle_minutes: Some(0), ..Default::default() }).unwrap();
+        assert!(store.has_previous_build_rollback_blockers().unwrap());
         std::fs::remove_dir_all(store.dir()).unwrap();
     }
 
@@ -2039,7 +2666,7 @@ mod tests {
         let views = list_views(&registry, &BTreeMap::new(), &ListFilter::default());
         assert_eq!(views[0]["slug"], "a");
         assert_eq!(views[1]["slug"], "b");
-        assert!(views[0].get("pinned").is_none());
+        assert_eq!(views[0]["pinned"], false);
         let owned = list_views(
             &registry,
             &BTreeMap::new(),
@@ -2111,9 +2738,8 @@ mod tests {
             )
             .unwrap();
         let raw = std::fs::read_to_string(store.registry_path()).unwrap();
-        assert!(
-            !raw.contains("pinned") && !raw.contains("onDemand") && !raw.contains("idleTimeout")
-        );
+        assert!(!raw.contains("onDemand") && !raw.contains("idleTimeout"));
+        assert!(!store.get("web").unwrap().pinned);
         // The retired runtime is no longer accepted on input.
         let mut on_demand = register("od");
         on_demand.runtime = Some("onDemand".into());
@@ -2122,7 +2748,293 @@ mod tests {
             store.register(on_demand, &Caller::Owner).unwrap_err().code,
             "invalid_request"
         );
-        assert!(serde_json::from_value::<UpdateRequest>(json!({"pinned": true})).is_err());
+        assert!(serde_json::from_value::<UpdateRequest>(json!({"pinned": true})).is_ok());
+        let _ = std::fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn owner_can_pin_and_agent_idle_ttl_is_bounded_by_host_maximum() {
+        let store = temp_store();
+        let mut request = register("preview");
+        request.idle_ttl_minutes = Some(120);
+        let (record, _) = store.register(request, &agent(S1)).unwrap();
+        assert_eq!(record.idle_ttl_minutes, Some(120));
+
+        let mut too_long = register("too-long");
+        too_long.idle_ttl_minutes = Some(24 * 60 + 1);
+        assert_eq!(
+            store.register(too_long, &agent(S1)).unwrap_err().code,
+            "invalid_request"
+        );
+        assert_eq!(
+            store
+                .update(
+                    "preview",
+                    UpdateRequest {
+                        pinned: Some(true),
+                        ..Default::default()
+                    },
+                    &agent(S1),
+                )
+                .unwrap_err()
+                .code,
+            "invalid_request"
+        );
+        let pinned = store
+            .update(
+                "preview",
+                UpdateRequest {
+                    pinned: Some(true),
+                    ..Default::default()
+                },
+                &Caller::Owner,
+            )
+            .unwrap();
+        assert!(pinned.pinned);
+
+        store
+            .update(
+                "preview",
+                UpdateRequest {
+                    archived: Some(true),
+                    ..Default::default()
+                },
+                &Caller::Owner,
+            )
+            .unwrap();
+        let restored = store
+            .update(
+                "preview",
+                UpdateRequest {
+                    archived: Some(false),
+                    ..Default::default()
+                },
+                &Caller::Owner,
+            )
+            .unwrap();
+        assert!(restored.retention_started_at.is_some());
+
+        let settings = store
+            .update_settings(SettingsPatch {
+                ephemeral_idle_minutes: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(settings.ephemeral_idle_minutes, 0);
+        let _ = std::fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn persistent_purpose_and_owner_organisation_survive_agent_reregister() {
+        let store = temp_store();
+        let mut request = register("dashboard");
+        request.lifetime = Some("persistent".into());
+        request.purpose = Some("foreground".into());
+        store.register(request.clone(), &agent(S1)).unwrap();
+
+        let organised = store
+            .update(
+                "dashboard",
+                UpdateRequest {
+                    purpose: Some(Some("background".into())),
+                    group_name: Some(Some("Waveline".into())),
+                    starred: Some(true),
+                    sort_order: Some(-10),
+                    note: Some(Some("local news backend".into())),
+                    hidden: Some(true),
+                    ..Default::default()
+                },
+                &Caller::Owner,
+            )
+            .unwrap();
+        assert_eq!(organised.purpose.as_deref(), Some("background"));
+
+        request.purpose = Some("foreground".into());
+        let (reregistered, created) = store.register(request, &agent(S1)).unwrap();
+        assert!(!created);
+        assert_eq!(reregistered.purpose.as_deref(), Some("background"));
+        assert_eq!(reregistered.group_name.as_deref(), Some("Waveline"));
+        assert!(reregistered.starred && reregistered.hidden);
+        assert_eq!(reregistered.sort_order, -10);
+        assert_eq!(reregistered.note.as_deref(), Some("local news backend"));
+
+        let registry = store.load().unwrap();
+        assert!(list_views(&registry, &BTreeMap::new(), &ListFilter::default()).is_empty());
+        assert_eq!(
+            list_views(
+                &registry,
+                &BTreeMap::new(),
+                &ListFilter {
+                    include_inactive: true,
+                    ..Default::default()
+                }
+            )
+            .len(),
+            1
+        );
+        assert!(store
+            .update(
+                "dashboard",
+                UpdateRequest {
+                    group_name: Some(Some("agent-change".into())),
+                    ..Default::default()
+                },
+                &agent(S1)
+            )
+            .is_err());
+
+        let archived = store
+            .update(
+                "dashboard",
+                UpdateRequest {
+                    archived: Some(true),
+                    ..Default::default()
+                },
+                &Caller::Owner,
+            )
+            .unwrap();
+        assert!(archived.archived && archived.hidden && archived.stopped);
+        assert_eq!(
+            store.remove("dashboard", &agent(S1)).unwrap_err().code,
+            "service_archived"
+        );
+        let restored = store
+            .update(
+                "dashboard",
+                UpdateRequest {
+                    archived: Some(false),
+                    hidden: Some(false),
+                    ..Default::default()
+                },
+                &Caller::Owner,
+            )
+            .unwrap();
+        assert!(!restored.archived && !restored.hidden);
+        let _ = std::fs::remove_dir_all(store.dir());
+    }
+
+    /// services-project-scope: records without the field (older daemons,
+    /// rollbacks) and unknown values are session services; a session
+    /// record is written without the field.
+    #[test]
+    fn owner_scope_defaults_to_session_and_never_widens() {
+        let base = json!({"slug":"web","displayName":"Web","host":"h","port":1,"runtime":"external",
+            "ownerCutexSessionId":S1,"projectId":"project-a",
+            "createdAt":"2026-10-28T00:00:00.000Z","updatedAt":"2026-10-28T00:00:00.000Z"});
+        let legacy: ServiceRecord = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(legacy.owner_scope, ServiceOwnerScope::Session);
+        assert!(serde_json::to_value(&legacy).unwrap().get("ownerScope").is_none());
+        let mut future = base.clone();
+        future["ownerScope"] = json!("team");
+        let future: ServiceRecord = serde_json::from_value(future).unwrap();
+        assert_eq!(future.owner_scope, ServiceOwnerScope::Session);
+        let mut project = base;
+        project["ownerScope"] = json!("project");
+        let project: ServiceRecord = serde_json::from_value(project).unwrap();
+        assert_eq!(project.owner_scope, ServiceOwnerScope::Project);
+        assert_eq!(serde_json::to_value(&project).unwrap()["ownerScope"], "project");
+        assert_eq!(service_view(&legacy, None)["ownerScope"], "session");
+        assert_eq!(service_view(&project, None)["ownerScope"], "project");
+
+        // A session service is managed only by its registrant, whatever the project.
+        let member = agent(S2);
+        assert!(may_manage(&legacy, &agent(S1)));
+        assert!(!may_manage(&legacy, &member));
+        // A project service: the registrant while in its project.
+        assert!(may_manage(&project, &agent(S1)));
+        assert!(!may_manage(
+            &project,
+            &Caller::Agent { cutex_session_id: S1.into(), project_id: None }
+        ));
+        assert!(!may_manage(
+            &project,
+            &Caller::Agent { cutex_session_id: S1.into(), project_id: Some("project-b".into()) }
+        ));
+        assert!(may_manage(&project, &Caller::Owner));
+        // Without a projectId a project record falls back to its registrant.
+        let mut orphan = project.clone();
+        orphan.project_id = None;
+        assert!(may_manage(&orphan, &agent(S1)));
+        assert!(!may_manage(&orphan, &member));
+    }
+
+    #[test]
+    fn removal_confirmation_never_deletes_a_changed_record() {
+        let store = temp_store();
+        let (original, _) = store.register(register("confirmed"), &agent(S1)).unwrap();
+        store.update("confirmed", UpdateRequest {
+            display_name: Some("Changed".into()),
+            ..Default::default()
+        }, &agent(S1)).unwrap();
+        assert_eq!(store.remove_if_unchanged("confirmed", &agent(S1), &original).unwrap_err().code,
+            "service_changed");
+        let changed = store.get("confirmed").unwrap();
+        assert_eq!(changed.display_name, "Changed");
+        assert_eq!(store.remove_if_unchanged("confirmed", &agent(S1), &changed).unwrap(), changed);
+    }
+
+    #[test]
+    fn owner_scope_register_update_and_registrant_delete() {
+        let store = temp_store();
+        // New agent services stay session unless asked.
+        let (plain, _) = store.register(register("plain"), &agent(S1)).unwrap();
+        assert_eq!(plain.owner_scope, ServiceOwnerScope::Session);
+        let scoped = |slug: &str, scope: &str| RegisterRequest {
+            owner_scope: Some(scope.into()),
+            ..register(slug)
+        };
+        let (board, _) = store.register(scoped("board", "project"), &agent(S1)).unwrap();
+        assert_eq!(board.owner_scope, ServiceOwnerScope::Project);
+        assert_eq!(board.project_id.as_deref(), Some("project-a"));
+        let solo = Caller::Agent { cutex_session_id: S2.into(), project_id: None };
+        assert_eq!(
+            store.register(scoped("solo", "project"), &solo).unwrap_err().code,
+            "project_scope_unavailable"
+        );
+        assert_eq!(store.register(scoped("bad", "team"), &agent(S1)).unwrap_err().code, "invalid_request");
+        // Re-register keeps the scope; going back to session is owner only.
+        assert_eq!(store.register(register("board"), &agent(S1)).unwrap().0.owner_scope, ServiceOwnerScope::Project);
+        assert_eq!(
+            store.register(scoped("board", "session"), &agent(S1)).unwrap_err().code,
+            "not_service_owner"
+        );
+        let to_session: UpdateRequest = serde_json::from_value(json!({"ownerScope":"session"})).unwrap();
+        assert_eq!(store.update("board", to_session.clone(), &agent(S1)).unwrap_err().code, "not_service_owner");
+        // An agent promotes its own service of its current project.
+        let to_project: UpdateRequest = serde_json::from_value(json!({"ownerScope":"project"})).unwrap();
+        let moved = Caller::Agent { cutex_session_id: S1.into(), project_id: Some("project-b".into()) };
+        assert_eq!(store.update("plain", to_project.clone(), &moved).unwrap_err().code, "project_scope_unavailable");
+        assert_eq!(store.update("plain", to_project.clone(), &agent(S1)).unwrap().owner_scope, ServiceOwnerScope::Project);
+        // Owner: project needs a projectId; may demote.
+        assert_eq!(
+            store
+                .register(RegisterRequest { owner_scope: Some("project".into()), ..register("owned") }, &Caller::Owner)
+                .unwrap_err()
+                .code,
+            "project_scope_unavailable"
+        );
+        let (owned, _) = store
+            .register(
+                RegisterRequest {
+                    owner_scope: Some("project".into()),
+                    project_id: Some("project-a".into()),
+                    ..register("owned")
+                },
+                &Caller::Owner,
+            )
+            .unwrap();
+        assert_eq!(owned.owner_scope, ServiceOwnerScope::Project);
+        assert_eq!(owned.owner_cutex_session_id, None);
+        // Only the project's Director (none here) and the owner manage it.
+        assert!(!may_manage(&owned, &agent(S1)));
+        assert_eq!(store.update("board", to_session, &Caller::Owner).unwrap().owner_scope, ServiceOwnerScope::Session);
+
+        // Deleting the registrant clears it from project services only.
+        assert_eq!(store.forget_registrant(S1).unwrap(), vec!["plain".to_string()]);
+        let plain = store.get("plain").unwrap();
+        assert_eq!(plain.owner_cutex_session_id, None);
+        assert_eq!(plain.project_id.as_deref(), Some("project-a"));
+        assert_eq!(store.get("board").unwrap().owner_cutex_session_id.as_deref(), Some(S1));
         let _ = std::fs::remove_dir_all(store.dir());
     }
 }

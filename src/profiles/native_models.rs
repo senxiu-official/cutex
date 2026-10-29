@@ -56,6 +56,8 @@ pub fn for_profile(account: &StoredAccount, selected: Option<&str>) -> Result<Na
     match account.cli_kind {
         CliKind::Claude => Ok(super::claude_models::for_profile(account, selected)),
         CliKind::Codex => codex_models(Rows::Picker(selected)),
+        CliKind::Dsh => Ok(super::dsh::models(account)),
+        CliKind::Kimi => Ok(super::kimi::native_models(account)),
     }
 }
 
@@ -75,6 +77,8 @@ pub fn upstream_for_profile(account: &StoredAccount) -> Result<NativeModels, Str
     match account.cli_kind {
         CliKind::Claude => Ok(super::claude_models::for_profile(account, None)),
         CliKind::Codex => codex_models(Rows::All),
+        CliKind::Dsh => Ok(super::dsh::models(account)),
+        CliKind::Kimi => Ok(super::kimi::native_models(account)),
     }
 }
 
@@ -171,11 +175,14 @@ fn select_rows(rows: Vec<Value>, which: Rows<'_>) -> Vec<Value> {
     rows
 }
 
-/// Slugs of `rows` that the bundled catalog does not contain.
+/// Slugs of `rows` that the bundled catalog does not contain. Rows the native
+/// hides (`visibility: hide`, server-side entries such as `gpt-reserve`) are
+/// not offered to anyone, so a missing one is no reason to update the native.
 pub fn not_in_bundled(rows: &[Value], bundled: &[Value]) -> Vec<String> {
     let bundled: std::collections::HashSet<&str> =
         bundled.iter().filter_map(|row| row.get("slug").and_then(Value::as_str)).collect();
     rows.iter()
+        .filter(|row| row.get("visibility").and_then(Value::as_str) != Some("hide"))
         .filter_map(|row| row.get("slug").and_then(Value::as_str))
         .filter(|slug| !bundled.contains(slug))
         .map(str::to_string)
@@ -358,6 +365,7 @@ mod tests {
             json!({ "slug": "gpt-6.1-sol" }),
             json!({ "slug": "gpt-5.6-sol" }),
             json!({ "slug": "server-only" }),
+            json!({ "slug": "gpt-reserve", "visibility": "hide" }),
             json!({ "display_name": "no slug" }),
         ];
         let bundled = vec![json!({ "slug": "gpt-5.6-sol" }), json!({ "slug": "gpt-6.1-sol" }), json!({})];

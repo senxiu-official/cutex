@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:project-events",
+  "title": "ProjectEvents",
+  "description": "Project log (capability project-events, cutex-desktop docs/design/022): GET /v2/projects/{projectId}/events (projectEventPage), the data of GET /v2/projects/{projectId}/events/stream SSE frames (`event: cutex/projectEvents/event`, `id:` = the row cursor; projectEvent) and the params of the host event cutex/projectEvents/appended (appended).",
+  "anyOf": [{ "$ref": "#/$defs/projectEventPage" }, { "$ref": "#/$defs/projectEvent" }, { "$ref": "#/$defs/appended" }, { "$ref": "#/$defs/background" }],
+  "$defs": {
+    "cursor": { "type": "string", "pattern": "^pe:[0-9]+$", "description": "Opaque project-log cursor; compare only for equality" },
+    "nullableString": { "type": ["string", "null"] },
+    "projectEvent": {
+      "type": "object",
+      "required": ["cursor", "at", "projectId", "cutexSessionId", "agentName", "kind", "status", "title", "detail", "parent", "refs", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "at": { "type": "string", "description": "RFC 3339 UTC: when the source event was received (membership rows and gaps: when the projector noticed)" },
+        "projectId": { "type": "string", "description": "The project the agent belonged to when the row was written; never changed afterwards" },
+        "cutexSessionId": { "$ref": "#/$defs/nullableString" },
+        "agentName": { "$ref": "#/$defs/nullableString" },
+        "kind": {
+          "enum": [
+            "turn.completed", "turn.failed", "turn.interrupted",
+            "ask.created", "ask.answered", "ask.failed", "ask.closed",
+            "subagent.started", "subagent.finished", "background.started", "background.finished",
+            "approval.requested", "approval.decided",
+            "artifact.published", "workflow.run", "ownerNotify.created", "job.finished",
+            "runtime.online", "runtime.offline", "member.joined", "member.left", "journal.gap"
+          ]
+        },
+        "status": { "$ref": "#/$defs/nullableString", "description": "turn: completed|failed|interrupted; ask: execution / answer status / close outcome; subagent.finished: completed|interrupted; approval: requested|approved|denied; workflow.run: completed|errored|stopped|rejected|expired; ownerNotify: level; job: terminal status; runtime: runtime status" },
+        "title": { "$ref": "#/$defs/nullableString", "description": "Short text (≤ 120 chars): turn = first user message; ask = brief title; sub-agent = agent path; approval = summary; artifact = name; ..." },
+        "detail": { "$ref": "#/$defs/nullableString" },
+        "parent": {
+          "type": "object",
+          "required": ["turnId", "taskId", "threadId"],
+          "additionalProperties": false,
+          "properties": { "turnId": { "$ref": "#/$defs/nullableString" }, "taskId": { "$ref": "#/$defs/nullableString" }, "threadId": { "$ref": "#/$defs/nullableString" } }
+        },
+        "refs": {
+          "type": "object",
+          "required": ["askId", "jobId", "artifactId", "workflowRunId", "approvalId", "notificationId"],
+          "additionalProperties": false,
+          "properties": {
+            "askId": { "$ref": "#/$defs/nullableString" }, "jobId": { "$ref": "#/$defs/nullableString" },
+            "artifactId": { "$ref": "#/$defs/nullableString" }, "workflowRunId": { "$ref": "#/$defs/nullableString" },
+            "approvalId": { "$ref": "#/$defs/nullableString" }, "notificationId": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        "source": {
+          "type": "object",
+          "required": ["method", "eventCursor"],
+          "additionalProperties": false,
+          "properties": {
+            "method": { "$ref": "#/$defs/nullableString", "description": "Event-log method of the source event; null for membership rows and gaps" },
+            "eventCursor": { "$ref": "#/$defs/nullableString", "description": "Management v2 event-log cursor (c2:…) of the source event" }
+          }
+        },
+        "durationMs": { "type": "integer", "minimum": 0 },
+        "toolCalls": { "type": "integer", "minimum": 0 },
+        "backfilled": { "const": true, "description": "Written by the first-start replay of the retained event log (project = membership at replay time)" }
+      }
+    },
+    "projectEventPage": {
+      "type": "object",
+      "required": ["projectId", "streamId", "cursor", "earliestCursor", "order", "hasMore", "events"],
+      "additionalProperties": false,
+      "properties": {
+        "projectId": { "type": "string" },
+        "streamId": { "type": "string", "description": "Journal identity; pass it back as ?streamId= to detect a recreated journal" },
+        "cursor": { "$ref": "#/$defs/cursor", "description": "Newest cursor of the whole journal" },
+        "earliestCursor": { "$ref": "#/$defs/cursor", "description": "after= cursors below this are expired (409 cursor_expired) for this project" },
+        "order": { "enum": ["newestFirst", "oldestFirst"], "description": "oldestFirst only for ?after=" },
+        "hasMore": { "type": "boolean" },
+        "nextCursor": { "anyOf": [{ "$ref": "#/$defs/cursor" }, { "type": "null" }], "description": "r252+: with hasMore, the cursor to pass as before= (after= for oldestFirst) for the next page. A page stops after reading a bounded number of rows, so for a reader who sees few rows it can be short or even empty while hasMore is true; continue from nextCursor, not from the last event. null without hasMore; absent before r252" },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/projectEvent" } }
+      }
+    },
+    "appended": {
+      "type": "object",
+      "required": ["projectId", "cursor"],
+      "additionalProperties": false,
+      "properties": { "projectId": { "type": "string" }, "cursor": { "$ref": "#/$defs/cursor" } }
+    },
+    "stop": {
+      "description": "How to stop an item with an existing request (null for non-owners and unknown items). native: POST /v2/sessions/{cutexSessionId}/app-server/requests with native.message {id, method, params}; job: POST /v2/job-service/cancel {jobId, expectedRevision}.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "cutexSessionId", "method", "params"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "native" },
+            "cutexSessionId": { "type": "string" },
+            "method": { "enum": ["claude/tasks/stop", "thread/backgroundTerminals/terminate"] },
+            "params": { "type": "object" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "jobId", "expectedRevision"],
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "job" }, "jobId": { "type": "string" }, "expectedRevision": {} }
+        },
+        { "type": "null" }
+      ]
+    },
+    "backgroundItem": {
+      "type": "object",
+      "required": ["kind", "source", "id", "title", "detail", "turnId", "threadId", "startedAt", "state", "stop"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["subagent", "background", "task", "job"] },
+        "source": { "enum": ["claude", "codex", "job"] },
+        "id": { "type": "string", "description": "Claude taskId, Codex processId or jobId" },
+        "title": { "$ref": "#/$defs/nullableString" },
+        "detail": { "$ref": "#/$defs/nullableString" },
+        "turnId": { "$ref": "#/$defs/nullableString" },
+        "threadId": { "$ref": "#/$defs/nullableString" },
+        "startedAt": { "$ref": "#/$defs/nullableString" },
+        "state": { "enum": ["running", "pending", "unknown"], "description": "unknown: the runtime is offline; the last known state of a Claude task" },
+        "stop": { "$ref": "#/$defs/stop" }
+      }
+    },
+    "background": {
+      "type": "object",
+      "description": "GET /v2/projects/{projectId}/background (answers reused for 5 s)",
+      "required": ["projectId", "generatedAt", "jobsAvailable", "agents"],
+      "additionalProperties": false,
+      "properties": {
+        "projectId": { "type": "string" },
+        "generatedAt": { "type": "string" },
+        "jobsAvailable": { "type": "boolean", "description": "false: no Job Service on this host (jobs not listed)" },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["cutexSessionId", "agentName", "backend", "runtime", "complete", "items"],
+            "additionalProperties": false,
+            "properties": {
+              "cutexSessionId": { "type": "string" },
+              "agentName": { "$ref": "#/$defs/nullableString" },
+              "backend": { "enum": ["claude", "codex"] },
+              "runtime": { "enum": ["online", "offline"] },
+              "complete": { "type": "boolean", "description": "true: the runtime answered its list request (Codex: the agent's own thread only)" },
+              "items": { "type": "array", "items": { "$ref": "#/$defs/backgroundItem" } }
+            }
+          }
+        }
+      }
+    }
+  }
+}

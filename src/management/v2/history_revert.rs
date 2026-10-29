@@ -91,8 +91,13 @@ pub(super) fn dispatch(
     }
     crate::asks::lifecycle::check_no_obligations_default(cutex_session_id, "revert")
         .map_err(super::asks::operation_error)?;
+    // The revert replaces the session's log / timeline: the offline history
+    // reader must be gone (and stay gone) before the first file moves.
+    let fence = super::history::fence_offline_reader(cutex_session_id);
     let result = revert(cutex_session_id, &params.before_turn_id, params.rewind_files);
+    // Caches built from the previous history; the next read starts afresh.
     super::history::invalidate_session(cutex_session_id);
+    drop(fence);
     let result = result?;
     // A reverted turn that answered an ask: flag it and tell the requester.
     let removed: Vec<String> = result
@@ -222,6 +227,34 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// Offline history, then revert: the warm offline reader (cwd = state
+    /// directory, timeline open) is gone before the handler moves files, and
+    /// a read during the revert cannot start a new one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_reader_is_stopped_before_the_revert_moves_files() {
+        use super::super::history::reader_probe;
+        fn handler(id: &str, _: &str, _: bool) -> Result<Value, UserInputExecutionError> {
+            let dir = reader_probe::dir(id);
+            assert_eq!(reader_probe::holders(&dir), Vec::<u32>::new(), "the offline reader still holds the files the revert swaps");
+            assert!(reader_probe::read(id).is_err(), "no offline reader starts during the revert");
+            Ok(sample_result())
+        }
+        let (root, repository) = repository();
+        let id = format!("cutex.revert-reader-{}", uuid::Uuid::new_v4());
+        let dir = reader_probe::session(&id);
+        reader_probe::read(&id).unwrap();
+        assert!(!reader_probe::holders(&dir).is_empty());
+        let owner = HumanManagementPrincipal::authenticated();
+        dispatch(&repository, handler, Some(&owner), &id, &json!({ "revision": 7 }),
+            &request(json!({ "beforeTurnId": "turn-2" }))).unwrap();
+        assert_eq!(reader_probe::spawns(&id), 1);
+        reader_probe::read(&id).expect("history reads again after the revert");
+        super::super::history::evict_offline_reader(&id);
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn result_and_event_match_the_registry() {
         super::super::contract_validation::validate_cutex_response(&json!({
@@ -287,6 +320,26 @@ mod tests {
             missing.as_object_mut().unwrap().remove(key);
             assert!(validate_result(&missing).is_err(), "Claude revert without {key}");
         }
+    }
+
+    /// Shape of `dsh_structure::revert` (cli_app): Claude-like restart facts,
+    /// conversation only (`filesRestored: false`).
+    #[test]
+    fn dsh_results_carry_runtime_state_and_warnings() {
+        let mut result = claude_result();
+        result["runtimeState"] = json!("online");
+        result["native"] = json!({ "method": "dsh/thread/revert", "result": {
+            "actionId": "revert-1", "removedTurnIds": ["n:turn:3", "n:turn:2"], "keptTurnIds": ["n:turn:1"],
+            "filesRestored": false, "status": "completed" } });
+        validate_result(&result).expect("DSH revert");
+        let mut offline = result.clone();
+        offline["runtimeRestarted"] = json!(false);
+        offline["runtimeState"] = json!("offline");
+        offline["runtimePid"] = Value::Null;
+        validate_result(&offline).expect("DSH revert of a stopped agent");
+        let mut missing = result;
+        missing.as_object_mut().unwrap().remove("warnings");
+        assert!(validate_result(&missing).is_err(), "DSH revert without warnings");
     }
 
     #[test]

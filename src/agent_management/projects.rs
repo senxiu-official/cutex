@@ -162,10 +162,7 @@ impl ProjectPresentationInput {
             ));
         }
         let badge = self.badge_label.trim();
-        if !(1..=2).contains(&UnicodeWidthStr::width(badge))
-            || badge.chars().any(char::is_control)
-            || badge.contains(char::is_whitespace)
-        {
+        if !crate::session::model::valid_badge_text(badge) {
             return Err(AgentManagementError::InvalidRequest(
                 "invalid_project_badge_label",
             ));
@@ -2209,7 +2206,7 @@ mod tests {
 
         let mut invalid = request;
         invalid.expected_presentation_revision = 1;
-        invalid.presentation.badge_label = "ABC".to_string();
+        invalid.presentation.badge_label = "ABCDE".to_string();
         assert_eq!(
             provider.update_project_presentation(&invocation("cutex.director"), &invalid),
             Err(AgentManagementError::InvalidRequest(
@@ -2229,14 +2226,22 @@ mod tests {
         assert!(valid("Alpha", "A").validate().is_ok());
         assert!(valid("Alpha", "界").validate().is_ok());
         assert!(valid("Alpha", "CX").validate().is_ok());
+        assert!(valid("Alpha", "ABCD").validate().is_ok());
+        assert!(valid("Alpha", "中文").validate().is_ok());
+        assert!(valid("Alpha", "A\u{0301}").validate().is_ok());
+        assert!(valid("Alpha", "❤️").validate().is_ok());
+        assert!(valid("Alpha", "👨‍👩‍👧‍👦").validate().is_ok());
+        for bad in [format!("A{}","\u{200b}".repeat(100_000)),"A\u{202e}".into(),"A\u{200d}".into(),"A\u{3164}".into()] {
+            assert!(valid("Alpha",&bad).validate().is_err());
+        }
         for invalid in [
             valid("", "A"),
             valid("bad\nname", "A"),
             valid(&"x".repeat(81), "A"),
             valid("Alpha", ""),
-            valid("Alpha", "ABC"),
+            valid("Alpha", "ABCDE"),
             valid("Alpha", "A B"),
-            valid("Alpha", "界A"),
+            valid("Alpha", "界界A"),
         ] {
             assert!(matches!(
                 invalid.validate(),

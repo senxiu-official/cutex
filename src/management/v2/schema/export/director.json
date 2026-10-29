@@ -1,0 +1,536 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:director",
+  "title": "Project Director",
+  "description": "Owner-only design 044 project Director resources; feature-detect directorAddress/directorHandover/managementStartAdoption.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/director"
+    },
+    {
+      "$ref": "#/$defs/handoverList"
+    },
+    {
+      "$ref": "#/$defs/startReviewList"
+    },
+    {
+      "$ref": "#/$defs/scopeCandidateList"
+    },
+    {
+      "$ref": "#/$defs/sourceContent"
+    }
+  ],
+  "$defs": {
+    "transition": {
+      "type": "object",
+      "required": [
+        "changeId",
+        "projectId",
+        "authorityActionId",
+        "requestSha256",
+        "oldDirector",
+        "newDirector",
+        "oldEpoch",
+        "newEpoch",
+        "reason",
+        "handover",
+        "state",
+        "preparedAt",
+        "recipients",
+        "handoverDispatched"
+      ],
+      "properties": {
+        "changeId": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "authorityActionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestSha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "oldDirector": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "newDirector": {
+          "type": ["string", "null"]
+        },
+        "cleared": {"type":"boolean"},
+        "oldEpoch": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "newEpoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "initial",
+            "epochRefresh",
+            "ownerAssigned",
+            "replacementConfirmed",
+            "recovery",
+            "cleared"
+          ]
+        },
+        "handover": {
+          "type": "string",
+          "enum": [
+            "none",
+            "autoProjectStamped",
+            "review",
+            "ownerApprovedScopeOnly"
+          ]
+        },
+        "replacementActionId": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "prepared",
+            "finalized",
+            "superseded",
+            "aborted"
+          ]
+        },
+        "preparedAt": {
+          "type": "string"
+        },
+        "settledAt": {
+          "type": "string"
+        },
+        "recipients": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "handoverDispatched": {
+          "type": "boolean"
+        },
+        "eventEmitted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "handoverReview": {
+      "type": "object",
+      "required": [
+        "id",
+        "projectId",
+        "askId",
+        "from",
+        "to",
+        "changeId",
+        "revision",
+        "state",
+        "reason",
+        "provenanceKnown"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "askId": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "changeId": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "accepted",
+            "discarded",
+            "superseded"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "provenanceKnown": {
+          "type": "boolean"
+        },
+        "actor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ownerOnly": {"type":"boolean"},
+        "resolvedTo": {"type":"string"}
+      }
+    },
+    "startReview": {
+      "type": "object",
+      "required": [
+        "reviewId",
+        "projectId",
+        "sourceActionId",
+        "sourceMessageId",
+        "sourceOperation",
+        "originalRequester",
+        "originalDirector",
+        "targetSession",
+        "contentSha256",
+        "directorAtReview",
+        "epochAtReview",
+        "revision",
+        "state",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "reviewId": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "sourceActionId": {
+          "type": "string"
+        },
+        "sourceMessageId": {
+          "type": "string"
+        },
+        "sourceOperation": {
+          "type": "string"
+        },
+        "originalRequester": {
+          "type": "string"
+        },
+        "originalDirector": {
+          "type": "string"
+        },
+        "targetSession": {
+          "type": "string"
+        },
+        "contentSha256": {
+          "type": "string"
+        },
+        "directorAtReview": {
+          "type": "string"
+        },
+        "epochAtReview": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "open",
+            "deliveryUnknown",
+            "adopted",
+            "discarded"
+          ]
+        },
+        "adoptionId": {
+          "type": "string"
+        },
+        "settledBy": {
+          "type": "string"
+        },
+        "settledByOwner": {
+          "type": "boolean"
+        },
+        "settleReason": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string"
+        }
+      }
+    },
+    "adoptionReceipt": {
+      "type": "object",
+      "required": [
+        "adoptionId",
+        "approveActionId",
+        "requestSha256",
+        "reviewId",
+        "projectId",
+        "sourceActionId",
+        "sourceMessageId",
+        "contentSha256",
+        "targetSession",
+        "approvedBy",
+        "approvedByOwner",
+        "approvedDirector",
+        "approvedEpoch",
+        "messageId",
+        "state",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "adoptionId": {
+          "type": "string"
+        },
+        "approveActionId": {
+          "type": "string"
+        },
+        "requestSha256": {
+          "type": "string"
+        },
+        "reviewId": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "sourceActionId": {
+          "type": "string"
+        },
+        "sourceMessageId": {
+          "type": "string"
+        },
+        "contentSha256": {
+          "type": "string"
+        },
+        "targetSession": {
+          "type": "string"
+        },
+        "approvedBy": {
+          "type": "string"
+        },
+        "approvedByOwner": {
+          "type": "boolean"
+        },
+        "approvedDirector": {
+          "type": "string"
+        },
+        "approvedEpoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "messageId": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "approved",
+            "submitted",
+            "submissionUnknown",
+            "delivered",
+            "stale"
+          ]
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string"
+        }
+      }
+    },
+    "director": {
+      "type": "object",
+      "required": [
+        "projectId",
+        "directorSessionId",
+        "authorityEpoch",
+        "changes"
+      ],
+      "properties": {
+        "projectId": {
+          "type": "string"
+        },
+        "directorSessionId": {
+          "type": ["string", "null"]
+        },
+        "authorityEpoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/transition"
+          }
+        }
+      }
+    },
+    "handoverList": {
+      "type": "object",
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/handoverReview"
+          }
+        }
+      }
+    },
+    "startReviewList": {
+      "type": "object",
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/startReview"
+          }
+        }
+      }
+    },
+    "scopeCandidate": {
+      "type": "object",
+      "required": [
+        "askId",
+        "title",
+        "requester",
+        "targetSession",
+        "projectHint",
+        "provenanceKnown"
+      ],
+      "properties": {
+        "askId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "requester": {
+          "type": "object"
+        },
+        "targetSession": {
+          "type": "string"
+        },
+        "projectHint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provenanceKnown": {
+          "type": "boolean"
+        }
+      }
+    },
+    "scopeCandidateList": {
+      "type": "object",
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scopeCandidate"
+          }
+        }
+      }
+    },
+    "sourceContent": {
+      "type": "object",
+      "required": [
+        "reviewId",
+        "content",
+        "delivery"
+      ],
+      "properties": {
+        "reviewId": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "delivery": {
+          "type": "object"
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "required": [
+        "expectedEpoch",
+        "expectedRevision"
+      ],
+      "properties": {
+        "expectedEpoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actionId": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "scopeRequest": {
+      "type": "object",
+      "required": [
+        "id",
+        "expectedEpoch",
+        "askIds"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "expectedEpoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "askIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

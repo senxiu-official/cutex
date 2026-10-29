@@ -38,6 +38,12 @@ pub fn ensure_unique_name(
     name: &str,
     ignore_account_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    // A profile that already has a reserved name (design 041) may keep it.
+    let keeps_own_name = ignore_account_id
+        .is_some_and(|id| store.accounts.iter().any(|account| account.id == id && account.name == name));
+    if !keeps_own_name && super::lifecycle::is_reserved_profile_name(name) {
+        anyhow::bail!("{}", super::lifecycle::RESERVED_PROFILE_NAME_MESSAGE);
+    }
     if store.accounts.iter().any(|account| {
         account.name == name && ignore_account_id.map(|id| id != account.id).unwrap_or(true)
     }) {

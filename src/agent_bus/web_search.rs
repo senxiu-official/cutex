@@ -75,15 +75,12 @@ pub fn definition() -> Value {
 }
 
 /// The profile a session's runtime runs on: the launched profile id of its
-/// current runtime binding, else the session's profile (name or id).
+/// current runtime binding, else the same configured/default selection as launch.
 pub fn session_profile<'a>(
     record: &crate::session::model::CutexSessionRecord,
     store: &'a crate::profiles::model::AccountsStore,
 ) -> Option<&'a StoredAccount> {
-    let launched = record.app_server_runtime.as_ref().and_then(|binding| binding.launched_profile_id.as_deref());
-    launched
-        .and_then(|id| crate::profiles::settings_api::find(store, id))
-        .or_else(|| record.profile.as_deref().and_then(|profile| crate::profiles::settings_api::find(store, profile)))
+    crate::profiles::session_profile::effective(record, store)
 }
 
 /// Whether a session is offered `web_search`: an agent (or the owner's quick
@@ -93,9 +90,15 @@ pub fn enabled_for_record_in(
     record: &crate::session::model::CutexSessionRecord,
     store: &crate::profiles::model::AccountsStore,
 ) -> bool {
-    crate::agent_bus::tool_policy::browser_eligible_session(record)
-        && record.runtime_backend != crate::session::model::CutexSessionRuntimeBackend::ClaudeSubscription
-        && session_profile(record, store).is_some_and(crate::profiles::settings_api::search_tool)
+    enabled_profile(record, store).is_some()
+}
+
+fn enabled_profile<'a>(record: &crate::session::model::CutexSessionRecord, store: &'a crate::profiles::model::AccountsStore) -> Option<&'a StoredAccount> {
+    if !crate::agent_bus::tool_policy::browser_eligible_session(record)
+        || record.runtime_backend == crate::session::model::CutexSessionRuntimeBackend::ClaudeSubscription {
+        return None;
+    }
+    session_profile(record, store).filter(|account| crate::profiles::settings_api::search_tool(account))
 }
 
 pub fn enabled_for_record(record: &crate::session::model::CutexSessionRecord) -> bool {
@@ -548,6 +551,7 @@ fn record_usage(
         token_source: crate::management::v2::usage::UsageTokenSource::NativeLast,
         model_context_window: None,
         compaction_count: None,
+        model_requests: None,
         cumulative_total: tokens.clone(),
         tokens,
     };
@@ -573,10 +577,10 @@ pub fn handle(caller: &str, thread_id: &str, generation: u64, body: &[u8]) -> Va
     let Ok(store) = crate::profiles::settings_api::load_store() else {
         return refusal("persistence_unavailable", "Nothing was sent: the profile store is unavailable; retry later.");
     };
-    if !enabled_for_record_in(&record, &store) {
+    let account = enabled_profile(&record, &store);
+    let Some(account) = account.cloned() else {
         return refusal("search_tool_disabled", "Nothing was sent: web_search is not enabled for your profile (owner setting searchTool).");
-    }
-    let account = session_profile(&record, &store).expect("enabled implies a profile").clone();
+    };
     let target = match target_for(&record, &account) {
         Ok(target) => target,
         Err(error) => return refusal("profile_unavailable", format!("Nothing was sent: {}.", scrub(&format!("{error:#}"), ""))),

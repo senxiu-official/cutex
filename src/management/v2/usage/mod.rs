@@ -59,7 +59,13 @@ pub use query::UsageQueryResult;
 pub use query::UsageSourceLabel;
 pub use query::MAX_RANGE_DAYS;
 pub use quota_history::record_quota_gauges;
+pub use quota_history::read_since as read_quota_history_since;
 pub use quota_history::QuotaSnapshot;
+
+/// Delete derived per-session state; the append-only usage ledger stays intact.
+pub fn forget_deleted_session(id: &str) -> anyhow::Result<()> {
+    store::forget_deleted_session_at(&runtime_dir()?.join("management-v2"), id)
+}
 
 pub fn record_usage_event(
     envelope: &EventEnvelope,
@@ -158,10 +164,14 @@ pub(crate) fn load_usage_ledger_at_for_tests(root: &Path) -> anyhow::Result<Usag
 }
 
 fn record_direct_usage_sample_at(root: &Path, sample: UsageSample) -> anyhow::Result<()> {
+    let session_id = sample.cutex_session_id.clone();
     let entry = UsageLedgerEntry::Usage(Box::new(sample));
     entry.validate()?;
     let observed_at = entry.observed_at().to_string();
-    store::update_usage_state_at(root, &observed_at, |_| {
+    store::update_usage_state_at(root, &observed_at, |state| {
+        if state.deleted_sessions.contains(&session_id) {
+            return Ok(store::UsageMutation::default());
+        }
         Ok(store::UsageMutation { changed: true, entries: vec![entry] })
     })
 }

@@ -191,14 +191,35 @@ mod tests {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
 
+    // Test-only Win32 pipe IO. Never changes production spawn flags/handles.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileType(handle: HANDLE) -> u32;
+        fn WriteFile(handle: HANDLE, buffer: *const std::ffi::c_void, size: u32,
+            written: *mut u32, overlapped: *mut std::ffi::c_void) -> i32;
+        fn ReadFile(handle: HANDLE, buffer: *mut std::ffi::c_void, size: u32,
+            read: *mut u32, overlapped: *mut std::ffi::c_void) -> i32;
+        fn PeekNamedPipe(handle: HANDLE, buffer: *mut std::ffi::c_void, size: u32,
+            read: *mut u32, available: *mut u32, left: *mut u32) -> i32;
+    }
+
     #[test]
     fn spawn_probe_child() {
         let Ok(path) = std::env::var("CUTEX_SPAWN_PROBE") else { return; };
         let handle = std::env::var("CUTEX_SPAWN_EXTRA_HANDLE").unwrap().parse::<usize>().unwrap() as HANDLE;
+        let challenge = std::env::var("CUTEX_SPAWN_CHALLENGE").unwrap();
+        let mut written = 0;
+        // A reused numeric handle is not proof of inheritance. Only bytes
+        // received on the parent's original pipe can prove object identity.
         let mut flags = 0;
-        let accessible = unsafe { GetHandleInformation(handle, &mut flags) } != 0;
+        let numeric_accessible = unsafe { GetHandleInformation(handle, &mut flags) } != 0;
+        let wrote = unsafe { GetFileType(handle) } == 3 // FILE_TYPE_PIPE
+            && unsafe { WriteFile(handle, challenge.as_ptr().cast(), challenge.len() as u32,
+                &mut written, std::ptr::null_mut()) } != 0;
         std::fs::write(path, serde_json::to_vec(&serde_json::json!({
-            "extraHandleAccessible": accessible,
+            "numericHandleAccessible": numeric_accessible,
+            "challengeWriteSucceeded": wrote,
+            "challengeBytesWritten": written,
             "cwd": std::env::current_dir().unwrap(),
             "value": std::env::var("CUTEX_SPAWN_VALUE").unwrap(),
             "removed": std::env::var_os("CUTEX_SPAWN_REMOVED").is_none(),
@@ -216,12 +237,13 @@ mod tests {
         let mut read = std::ptr::null_mut();
         let mut write = std::ptr::null_mut();
         check(unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) }).unwrap();
-        let _read = unsafe { OwnedHandle::from_raw_handle(read) };
+        let read = unsafe { OwnedHandle::from_raw_handle(read) };
         let write = unsafe { OwnedHandle::from_raw_handle(write) };
         check(unsafe { SetHandleInformation(write.as_raw_handle(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }).unwrap();
         let root = std::env::temp_dir().join(format!("cutex-spawn-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         for whitelist in [false, true] {
+            let challenge = format!("cutex-pipe-challenge-{}", uuid::Uuid::new_v4());
             let path = root.join(if whitelist { "after.json" } else { "before.json" });
             let log_path = root.join(if whitelist { "after.log" } else { "before.log" });
             let log = File::create(&log_path).unwrap();
@@ -229,6 +251,7 @@ mod tests {
             command.args(["--exact", "platform::windows_spawn::tests::spawn_probe_child", "--nocapture"])
                 .env("CUTEX_SPAWN_PROBE", &path)
                 .env("CUTEX_SPAWN_EXTRA_HANDLE", (write.as_raw_handle() as usize).to_string())
+                .env("CUTEX_SPAWN_CHALLENGE", &challenge)
                 .env("CUTEX_SPAWN_VALUE", "unicode 测试 with spaces \" and trailing \\")
                 .env_remove("CUTEX_SPAWN_REMOVED").current_dir(&root);
             let status = if whitelist {
@@ -239,7 +262,21 @@ mod tests {
             };
             assert!(status.success());
             let evidence: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-            assert_eq!(evidence["extraHandleAccessible"], !whitelist, "{evidence}");
+            let mut available = 0;
+            check(unsafe { PeekNamedPipe(read.as_raw_handle(), std::ptr::null_mut(), 0,
+                std::ptr::null_mut(), &mut available, std::ptr::null_mut()) }).unwrap();
+            eprintln!("pipe identity whitelist={whitelist} originalPipeBytes={available} child={evidence}");
+            if whitelist {
+                assert_eq!(available, 0, "whitelisted child reached the original parent pipe: {evidence}");
+            } else {
+                assert_eq!(evidence["challengeWriteSucceeded"], true, "positive control: {evidence}");
+                assert_eq!(available as usize, challenge.len(), "positive control must reach original pipe");
+                let mut bytes = vec![0u8; available as usize];
+                let mut received = 0;
+                check(unsafe { ReadFile(read.as_raw_handle(), bytes.as_mut_ptr().cast(), available,
+                    &mut received, std::ptr::null_mut()) }).unwrap();
+                assert_eq!(&bytes[..received as usize], challenge.as_bytes(), "exact pipe challenge");
+            }
             assert_eq!(evidence["cwd"], serde_json::json!(root));
             assert_eq!(evidence["value"], "unicode 测试 with spaces \" and trailing \\");
             assert_eq!(evidence["removed"], true);

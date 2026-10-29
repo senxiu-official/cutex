@@ -534,7 +534,7 @@ fn occurrence_in(
     let record = store.sessions.get(owner).context("ingress owner absent")?;
     ensure!(
         record.cutex_session_id == owner
-            && !record.is_retired()
+            && !crate::agent_management::agent_execution_blocked(&record)
             && record.runtime_generation == generation
             && record.app_server_launch_claim_id.is_none(),
         "ingress owner stale/archived/not ready"
@@ -622,7 +622,19 @@ fn occurrence_in(
     Ok((binding, runtime.clone()))
 }
 impl ExternalInputClient {
+    /// Persistent RPC-only control connection. The managed runtime owner still
+    /// processes the authoritative event/approval stream; this connection must
+    /// drain its duplicate subscription even between scheduler ticks.
+    /// Unlike `connect`, this does not support `next_hint` / `drain_hints`.
+    pub fn connect_rpc_only(path: &Path, owner: &str, generation: u64) -> anyhow::Result<Self> {
+        Self::connect_with_control_drain(path, owner, generation, true)
+    }
+
     pub fn connect(path: &Path, owner: &str, generation: u64) -> anyhow::Result<Self> {
+        Self::connect_with_control_drain(path, owner, generation, false)
+    }
+
+    fn connect_with_control_drain(path: &Path, owner: &str, generation: u64, control: bool) -> anyhow::Result<Self> {
         let contract = crate::session::store::with_cutex_session_store_at(path, |store| {
             store
                 .sessions
@@ -642,7 +654,12 @@ impl ExternalInputClient {
                     .is_some_and(|host| matches!(host, "127.0.0.1" | "::1")) => {},
             _ => anyhow::bail!("ingress requires an authenticated private endpoint"),
         }
-        let client = AppServerClient::connect(AppServerClientOptions::new(endpoint))?;
+        let options = AppServerClientOptions::new(endpoint);
+        let client = if control {
+            AppServerClient::connect_rpc_only(options)?
+        } else {
+            AppServerClient::connect(options)?
+        };
         crate::launch::stock::validate_ingress_capability(
             artifacts.bundle.common_ingress(),
             client.initialize_response(),

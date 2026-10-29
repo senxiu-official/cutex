@@ -17,7 +17,6 @@ use serde_json::Value;
 
 use crate::agent_bus::model::AgentBusMessage;
 use crate::app_server::commands::InterAgentContextPersistedReceipt;
-use crate::config::atomic::write_private_pretty_json_atomic;
 use crate::config::paths::runtime_dir;
 use crate::management::v2::model::CutexMessage;
 use crate::management::v2::model::EventCorrelation;
@@ -28,6 +27,10 @@ use crate::platform::host::current_host_name;
 
 const AGENT_BUS_STATE_FILE: &str = "agent-bus-message-state.json";
 const AGENT_BUS_LOCK_FILE: &str = "agent-bus-message-state.lock";
+
+#[path = "agent_bus_settlement_state.rs"]
+mod settlement_state;
+use settlement_state::{settlement_closed, settlement_view, validate_settlement_record};
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -89,6 +92,11 @@ struct StoredAgentBusMessage {
     /// it and drop it on their next rewrite, which only loses display data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     meta: Option<AgentBusMessageMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settlement: Option<super::agent_bus_settlement_model::SettlementRecord>,
+    /// Rebuildable observation sidecar; never serialized into agent_bus rows.
+    #[serde(skip)]
+    observed_settlement: Option<super::agent_bus_settlement_model::SettlementRecord>,
 }
 
 /// One side of an agent message as clients see it (`AgentParty`).
@@ -112,7 +120,7 @@ impl AgentParty {
                 .and_then(|r| r.formal_agent_name.clone().or_else(|| r.display_name_override.clone()))
                 .map(|name| sanitize_party_name(&name))
                 .filter(|name| !name.is_empty()),
-            runtime: record.map(|r| if r.claude_session.is_some() { "claude" } else { "codex" }.to_string()),
+            runtime: record.map(|r| if let Some(session) = &r.dsh_session { session.flavor.runtime_name() } else if r.claude_session.is_some() { "claude" } else { "codex" }.to_string()),
         }
     }
 }
@@ -153,6 +161,10 @@ pub struct AgentBusMessageMeta {
 #[serde(rename_all = "camelCase")]
 struct AgentBusMessageStore {
     version: u8,
+    #[serde(skip)]
+    observation_generation: Option<u64>,
+    #[serde(skip)]
+    observation_unavailable: bool,
     #[serde(default)]
     external_recovery_actions:
         BTreeMap<String, crate::app_server::external_recovery::RecoveryReceipt>,
@@ -251,6 +263,8 @@ pub struct StuckAgentBusMessage {
     pub error: Option<Value>,
     pub reasons: Vec<String>,
     pub content_preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<super::agent_bus_settlement_model::SettlementView>,
 }
 
 #[derive(Debug, Clone)]
@@ -289,7 +303,7 @@ impl OwnerDiscardError {
             Self::InvalidReason => "a nonempty reason of at most 1024 bytes is required".into(),
             Self::DigestMismatch => "the message's semantic digest differs from expectedSemanticSha256".into(),
             Self::ProtectedControl => "Task / Job / control messages need allowProtected: check the assignment or job first".into(),
-            Self::NotDiscardable { state } => format!("only pending or stale_held messages can be discarded (state {state})"),
+            Self::NotDiscardable { state } => format!("only pending, inbox_accepted or stale_held messages can be discarded (state {state})"),
         }
     }
 }
@@ -420,6 +434,7 @@ fn stuck_view(
         error: snapshot.error.clone(),
         reasons,
         content_preview: crate::agent_bus::audit::content_preview(&snapshot.content, 200),
+        settlement: settlement_view(stored, Utc::now()),
     }
 }
 
@@ -430,6 +445,25 @@ pub fn agent_bus_message_repository() -> anyhow::Result<&'static AgentBusMessage
         || Ok(runtime_dir()?.join("management-v2")),
         AgentBusMessageRepository::open,
     )
+}
+
+/// Receipt response reads do not create/migrate an absent or legacy bus store.
+/// Uses a separate read cache: never invokes the writer opener/ACL setup.
+pub fn receipt_read_inputs_default(
+    message_ids: &[String],
+) -> anyhow::Result<crate::asks::receipt_uncertainty::read_views::ReceiptReadContext> {
+    #[cfg(test)]
+    require_private_test_home()?;
+    static READER: super::process_repository::ProcessRepository<AgentBusMessageRepository> =
+        super::process_repository::ProcessRepository::new();
+    let root = runtime_dir()?.join("management-v2");
+    if message_ids.is_empty() || !root.join(super::hot_store::DATABASE_FILE).is_file()
+        || !root.join(AGENT_BUS_LOCK_FILE).is_file() {
+        return Ok(Default::default());
+    }
+    READER.get_or_open(|| Ok(root), |root| Ok(AgentBusMessageRepository {
+        root, process_lock: Mutex::new(()), cache: Mutex::new(None), admission_index: Mutex::new(None),
+    }))?.receipt_read_inputs(message_ids)
 }
 
 #[cfg(test)]
@@ -458,6 +492,42 @@ fn validate_private_test_home(home: &str, private: &str) -> anyhow::Result<()> {
 }
 
 impl AgentBusMessageRepository {
+    /// Kit stdin helper: the normal current parsers over supplied bytes only.
+    /// No repository instance, path, connection, lock, migration or runtime IO.
+    pub(crate) fn validate_kit_input_rows(
+        rows: &super::hot_store::Rows,
+        legacy: Option<&[u8]>,
+        observations: &super::hot_store::Rows,
+    ) -> anyhow::Result<()> {
+        bus_store_from_rows(rows)?;
+        if let Some(bytes) = legacy {
+            decode_legacy_bus_store(bytes)?;
+        }
+        Self::validate_settlement_observation_rows(observations)?;
+        Ok(())
+    }
+
+    /// Offline validation only: never open/secure the repository, take a
+    /// writable lock, migrate legacy JSON, or publish a compatibility view.
+    /// Pass a disposable copy for strict zero source mutation: SQLite itself
+    /// can create WAL shared-memory sidecars even with READ_ONLY connections.
+    pub(crate) fn validate_persisted_read_only(root: &Path) -> anyhow::Result<()> {
+        let legacy = root.join(AGENT_BUS_STATE_FILE);
+        let database = bus_database_path(&legacy);
+        if let Some(loaded) = super::hot_store::verified_rows(&database, "agent_bus")? {
+            bus_store_from_rows(&loaded.rows)?;
+        } else {
+            anyhow::ensure!(!super::hot_store::has_store(&database, "agent_bus")?,
+                "agent-bus migration/handoff is unverified; reconcile before rollback");
+            match fs::read(&legacy) {
+                Ok(bytes) => { decode_legacy_bus_store(&bytes)?; }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("read legacy agent-bus rollback state"),
+            }
+        }
+        Ok(())
+    }
+
     /// Includes already ACKed input records. The canonical store has no pruning;
     /// do not derive this worklist from the transport's pending-message queue.
     pub(crate) fn due_presentations(&self, owner: &str, now: i64) -> anyhow::Result<Vec<String>> {
@@ -484,7 +554,7 @@ impl AgentBusMessageRepository {
         id: &str,
         now: i64,
     ) -> anyhow::Result<()> {
-        self.mutate_checked(|s| {
+        self.mutate_checked_message(id, |s| {
             let m = s
                 .messages
                 .get_mut(id)
@@ -512,7 +582,7 @@ impl AgentBusMessageRepository {
         id: &str,
         thread: &str,
     ) -> anyhow::Result<crate::app_server::presentation::Receipt> {
-        self.mutate_checked(|s| {
+        self.mutate_checked_message(id, |s| {
             let m = s
                 .messages
                 .get_mut(id)
@@ -589,7 +659,7 @@ impl AgentBusMessageRepository {
             expected == receipt && receipt.owner_id == owner,
             "presentation receipt mismatch"
         );
-        self.mutate_checked(|s| {
+        self.mutate_checked_message(id, |s| {
             let m = s
                 .messages
                 .get_mut(id)
@@ -617,7 +687,7 @@ impl AgentBusMessageRepository {
         })
     }
     pub(crate) fn presentation_error(&self, id: &str, error: &str) -> anyhow::Result<()> {
-        self.mutate_checked(|s| {
+        self.mutate_checked_message(id, |s| {
             let p = s
                 .messages
                 .get_mut(id)
@@ -640,7 +710,7 @@ impl AgentBusMessageRepository {
         &self,
         receipt: &crate::app_server::external_recovery::RecoveryReceipt,
     ) -> anyhow::Result<()> {
-        self.mutate_checked(|s| {
+        self.mutate_recovery(&receipt.action_id, |s| {
             if let Some(old) = s.external_recovery_actions.get(&receipt.action_id) {
                 anyhow::ensure!(
                     old.review == receipt.review && old.retry_id == receipt.retry_id,
@@ -731,7 +801,8 @@ impl AgentBusMessageRepository {
         ) {
             anyhow::bail!("agent-bus delivery mode is outside the v2 contract");
         }
-        self.update(|store| {
+        let dirty_message_id = message.message_id.clone();
+        self.update_message(&dirty_message_id, |store| {
             if let Some(existing) = store.messages.get(&message.message_id) {
                 if existing.owner_cutex_session_id == message.owner_cutex_session_id
                     && existing.snapshot.from_cutex_session_id == message.from_cutex_session_id
@@ -819,6 +890,8 @@ impl AgentBusMessageRepository {
                     queued_at: Some(message.queued_at.to_rfc3339()),
                     updated_at: message.queued_at.to_rfc3339(),
                     meta,
+                    settlement: None,
+                    observed_settlement: None,
                 },
             );
             Ok((true, true))
@@ -840,7 +913,7 @@ impl AgentBusMessageRepository {
         // already frozen envelope changes nothing, so the whole store is not
         // serialized just to learn that (47 MB per call on the Linux host,
         // r240 idle CPU, 2026-10-15).
-        self.update_inner(true, |store| {
+        self.update_inner(DirtyRows::Messages(vec![message_id.to_string()]), true, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -907,7 +980,7 @@ impl AgentBusMessageRepository {
                 && spilled.message.delivery == frozen.message.delivery,
             "spilled native envelope differs beyond its text"
         );
-        self.mutate(|store| {
+        self.mutate_message(message_id, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -936,7 +1009,7 @@ impl AgentBusMessageRepository {
         receipt: &crate::app_server::external_input::Receipt,
         generation: u64,
     ) -> anyhow::Result<()> {
-        self.mutate_checked(|store| {
+        self.mutate_checked_message(message_id, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -997,7 +1070,7 @@ impl AgentBusMessageRepository {
         message_id: &str,
         turn_id: &str,
     ) -> anyhow::Result<bool> {
-        let event = self.mutate_checked(|store| {
+        let event = self.mutate_checked_message(message_id, |store| {
             let Some(stored) = store.messages.get_mut(message_id) else {
                 return Ok(None);
             };
@@ -1095,6 +1168,9 @@ impl AgentBusMessageRepository {
                     if let Some(error) = &m.snapshot.error {
                         entry["error"] = error.clone();
                     }
+                    if let Some(view) = settlement_view(m, Utc::now()) {
+                        entry["settlement"] = json!(view);
+                    }
                     entry
                 })
                 .collect())
@@ -1127,7 +1203,7 @@ impl AgentBusMessageRepository {
         let desired = json!({"code":"external_input_pending", "message":error});
         // Called after every retained-pending delivery attempt: the usual
         // same-error case reads the cached state and writes nothing.
-        self.update_inner(true, |store| {
+        self.update_inner(DirtyRows::Messages(vec![message_id.to_string()]), true, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -1144,7 +1220,7 @@ impl AgentBusMessageRepository {
         })
     }
 
-    pub(crate) fn observe_external_input(
+    pub fn observe_external_input(
         &self,
         message_id: &str,
         frozen: &crate::app_server::external_input::Envelope,
@@ -1152,7 +1228,7 @@ impl AgentBusMessageRepository {
     ) -> anyhow::Result<()> {
         // Repeated sweeps usually observe the same native status: no change,
         // no whole-store serialization.
-        self.update_inner(true, |store| {
+        self.update_inner(DirtyRows::Messages(vec![message_id.to_string()]), true, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -1192,7 +1268,7 @@ impl AgentBusMessageRepository {
         }
         // The legacy projection keeps the A4 receipt id as nativeSubmissionId;
         // the v2 ledger holds the complete receipt.
-        let event = self.mutate(|store| {
+        let event = self.mutate_message(message_id, |store| {
             let stored = store.messages.get_mut(message_id).with_context(|| {
                 format!("agent-bus v2 message state disappeared for {message_id}")
             })?;
@@ -1217,7 +1293,7 @@ impl AgentBusMessageRepository {
         stable.as_object_mut().context("receipt must be an object")?.remove("duplicate");
         // Processing state may progress; immutable identity is the idempotent acceptance proof.
         stable.as_object_mut().unwrap().remove("state");
-        self.mutate(|store| {
+        self.mutate_message(message, |store| {
             let stored = store.messages.get_mut(message).context("message not found")?;
             anyhow::ensure!(stored.owner_cutex_session_id == owner, "message owner mismatch");
             if let Some(previous) = &stored.snapshot.local_inbox_receipt {
@@ -1249,7 +1325,7 @@ impl AgentBusMessageRepository {
         if stored.owner_cutex_session_id != owner_cutex_session_id {
             anyhow::bail!("agent-bus message owner session changed");
         }
-        self.mutate(|store| {
+        self.mutate_message(message_id, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -1274,7 +1350,7 @@ impl AgentBusMessageRepository {
         if stored.owner_cutex_session_id != owner_cutex_session_id {
             anyhow::bail!("agent-bus message owner session changed");
         }
-        self.mutate(|store| {
+        self.mutate_message(message_id, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -1301,10 +1377,12 @@ impl AgentBusMessageRepository {
             let now = Utc::now();
             let wait = crate::agent_bus::delivery::wake_busy_wait();
             let held = super::admission::ridealong_held(asks, session, false);
+            let sessions = crate::session::store::load_cutex_session_store_shared().ok();
+            let is_local_session = local_sender(sessions.as_deref());
             Ok(messages.filter_map(|stored| {
                 let snapshot = &stored.snapshot;
                 let message = stored.canonical_envelope.as_ref()?;
-                if snapshot.to_cutex_session_id != session
+                if settlement_closed(stored) || snapshot.to_cutex_session_id != session
                     || !matches!(snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held")
                     || message.kind != crate::agent_bus::model::AgentBusEnvelopeKind::Message
                     || !message.delivery_mode.trigger_turn()
@@ -1328,7 +1406,7 @@ impl AgentBusMessageRepository {
                 let accepted = snapshot.a2_submission_id.is_some() || snapshot.local_inbox_receipt.is_some()
                     || snapshot.external_input_last_observed.as_ref().is_some_and(|status|
                         status.delivery_state != crate::app_server::external_input::DeliveryState::Unknown);
-                let detail = ridealong_detail(stored, message, asks);
+                let detail = ridealong_detail(stored, message, asks, &is_local_session);
                 let (timing, next_step_at) = bus_admission_timing(message, snapshot.external_input.as_ref(), now, wait);
                 Some(super::admission::AdmissionNextStep {
                     id: message.id.clone(),
@@ -1336,9 +1414,12 @@ impl AgentBusMessageRepository {
                         message.created_at_epoch_secs.min(i64::MAX as u64) as i64, 0,
                     ).unwrap_or(DateTime::<Utc>::UNIX_EPOCH).to_rfc3339()),
                     eligible: !accepted && snapshot.state != "stale_held" && held.is_none(),
+                    wait_reason: accepted.then(|| "nativeReceipt".into()),
                     timing, next_step_at, held: held.clone(), ask_id: detail.ask_id,
                     delivery_kind: detail.kind.into(), label: Some(detail.label),
-                    from: detail.from, from_host: detail.from_host, preview: detail.preview,
+                    from: detail.from, from_host: detail.from_host,
+                    from_cutex_session_id: detail.from_cutex_session_id, preview: detail.preview,
+                    settlement: settlement_view(stored, now),
                 })
             }).collect())
         })
@@ -1347,33 +1428,27 @@ impl AgentBusMessageRepository {
     /// The admission worker only observes external replacements here. An unchanged
     /// file needs neither the cross-process store lock nor an index traversal.
     pub fn refresh_admission_if_changed(&self) -> anyhow::Result<bool> {
-        let path = self.root.join(AGENT_BUS_STATE_FILE);
-        let stamp = crate::platform::file_stamp::FileStamp::of(&path);
+        let generation = super::hot_store::generation(
+            &self.root.join(super::hot_store::DATABASE_FILE),
+            "agent_bus",
+        )?;
+        let observation_generation = super::hot_store::generation(
+            &self.root.join(super::hot_store::DATABASE_FILE), settlement_state::EVIDENCE_STORE,
+        );
         {
             let index = self.admission_index.lock().map_err(|_| anyhow::anyhow!("agent-bus admission index lock poisoned"))?;
-            if index.as_ref().map(|index| &index.stamp) == Some(&stamp)
-                || (stamp.is_none() && index.is_none()) {
+            if observation_generation.as_ref().is_ok_and(|observed|
+                index.as_ref().is_some_and(|index| !index.observation_unavailable && index.generation == generation && index.observation_generation == *observed)
+                || (generation.is_none() && observed.is_none() && index.is_none())) {
                 return Ok(false);
             }
         }
         self.with_lock(|path| {
-            let stamp = crate::platform::file_stamp::FileStamp::of(path);
-            let cache = self.cache.lock().map_err(|_| anyhow::anyhow!("agent-bus cache lock poisoned"))?;
+            let mut cache = self.cache.lock().map_err(|_| anyhow::anyhow!("agent-bus cache lock poisoned"))?;
+            let (store, generation) = fresh_store(&mut cache, path)?;
             let mut index = self.admission_index.lock().map_err(|_| anyhow::anyhow!("agent-bus admission index lock poisoned"))?;
-            if index.as_ref().is_some_and(|index| index.stamp == stamp) { return Ok(false); }
-            let mut refreshed = if let Some(cache) = cache.as_ref().filter(|cache| Some(&cache.stamp) == stamp.as_ref()) {
-                AdmissionIndex::new(&cache.store, Some(cache.digest))
-            } else if stamp.is_some() {
-                // Errors and retry timestamps change frequently. Read only admission
-                // facts here; hydrate and validate canonical bodies on actual use.
-                let bytes = fs::read(path)?;
-                let projection: AdmissionStoreProjection = serde_json::from_slice(&bytes)?;
-                anyhow::ensure!(matches!(projection.version, 2..=7), "unsupported management v2 agent-bus state version");
-                AdmissionIndex::from_projection(projection.messages, Some(store_digest(&bytes)))
-            } else {
-                AdmissionIndex::from_projection(BTreeMap::new(), None)
-            };
-            if crate::platform::file_stamp::FileStamp::of(path) == stamp { refreshed.stamp = stamp; }
+            if index.as_ref().is_some_and(|index| !store.observation_unavailable && !index.observation_unavailable && index.generation == generation && index.observation_generation == store.observation_generation) { return Ok(false); }
+            let refreshed = AdmissionIndex::new(&store, generation);
             refreshed.notify_changes(index.as_ref());
             *index = Some(refreshed);
             Ok(true)
@@ -1388,7 +1463,7 @@ impl AgentBusMessageRepository {
             Ok(messages.filter_map(|stored| {
                 let snapshot = &stored.snapshot;
                 let message = stored.canonical_envelope.as_ref()?;
-                if snapshot.state == "stale_held" || !message.sender_kind.is_agent()
+                if settlement_closed(stored) || snapshot.state == "stale_held" || !message.sender_kind.is_agent()
                     || message.control_type.is_some()
                     || message.kind != crate::agent_bus::model::AgentBusEnvelopeKind::Message
                 {
@@ -1408,7 +1483,7 @@ impl AgentBusMessageRepository {
     /// Written only by the bridge that held the session input lock, observed
     /// idle, and got native acceptance. A later context receipt binds the turn.
     pub fn record_admission_started_idle(&self, session: &str, id: &str) -> anyhow::Result<()> {
-        self.update(|store| {
+        self.update_message(id, |store| {
             let Some(stored) = store.messages.get_mut(id) else { return Ok(((), false)); };
             anyhow::ensure!(stored.snapshot.to_cutex_session_id == session, "admission recipient changed");
             let changed = !stored.admission_started_idle;
@@ -1437,13 +1512,10 @@ impl AgentBusMessageRepository {
     fn with_admission_index<T>(&self, action: impl FnOnce(&AgentBusMessageStore, &AdmissionIndex) -> anyhow::Result<T>) -> anyhow::Result<T> {
         self.with_lock(|path| {
             let mut cache = self.cache.lock().map_err(|_| anyhow::anyhow!("agent-bus cache lock poisoned"))?;
-            let before = crate::platform::file_stamp::FileStamp::of(path);
-            let (store, digest) = fresh_store(&mut cache, path)?;
-            let after = crate::platform::file_stamp::FileStamp::of(path);
+            let (store, generation) = fresh_store(&mut cache, path)?;
             let mut index = self.admission_index.lock().map_err(|_| anyhow::anyhow!("agent-bus admission index lock poisoned"))?;
-            if index.as_ref().is_none_or(|index| index.digest != digest) {
-                let mut refreshed = AdmissionIndex::new(&store, digest);
-                if before == after { refreshed.stamp = before; }
+            if index.as_ref().is_none_or(|index| index.generation != generation || index.observation_generation != store.observation_generation || index.observation_unavailable != store.observation_unavailable) {
+                let refreshed = AdmissionIndex::new(&store, generation);
                 refreshed.notify_changes(index.as_ref());
                 *index = Some(refreshed);
             }
@@ -1522,7 +1594,7 @@ impl AgentBusMessageRepository {
             store
                 .messages
                 .values()
-                .filter(|stored| stored.snapshot.state == "pending")
+                .filter(|stored| !settlement_closed(stored) && stored.snapshot.state == "pending")
                 .map(|stored| {
                     Ok(PendingAgentBusMessage {
                         owner_cutex_session_id: stored.owner_cutex_session_id.clone(),
@@ -1555,7 +1627,7 @@ impl AgentBusMessageRepository {
         stale_after_secs: u64,
         at: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
-        self.mutate(|store| {
+        self.mutate_message(message_id, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -1601,7 +1673,7 @@ impl AgentBusMessageRepository {
         expected_semantic_sha256: &str,
         at: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
-        self.mutate(|store| {
+        self.mutate_message(message_id, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -1642,7 +1714,7 @@ impl AgentBusMessageRepository {
             !reason.trim().is_empty() && reason.len() <= 1024,
             "a bounded nonempty discard reason is required"
         );
-        self.mutate(|store| {
+        self.mutate_message(message_id, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -1691,7 +1763,7 @@ impl AgentBusMessageRepository {
             let mut records = store
                 .messages
                 .values()
-                .filter(|stored| matches!(stored.snapshot.state.as_str(), "pending" | "stale_held"))
+                .filter(|stored| !settlement_closed(stored) && matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held"))
                 .filter_map(|stored| {
                     let created = stored_created_epoch_secs(stored);
                     let age = created
@@ -1725,7 +1797,7 @@ impl AgentBusMessageRepository {
         }))
     }
 
-    /// Owner discard of one undelivered message: `pending` / `stale_held`
+    /// Owner discard of one undelivered message: `pending` / `inbox_accepted` / `stale_held`
     /// becomes terminal and is never redriven. Without native submission
     /// evidence it becomes `discarded` (the existing tombstone); with it,
     /// `quarantined` (Cutex cannot retract what the native runtime may
@@ -1752,10 +1824,13 @@ impl AgentBusMessageRepository {
                     return Err(OwnerDiscardError::DigestMismatch);
                 }
             }
+            if settlement_closed(stored) {
+                return Err(OwnerDiscardError::NotDiscardable { state: "followup_closed".into() });
+            }
             if is_owner_discarded(&stored.snapshot) {
                 return Ok(false);
             }
-            if !matches!(stored.snapshot.state.as_str(), "pending" | "stale_held") {
+            if !matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held") {
                 return Err(OwnerDiscardError::NotDiscardable {
                     state: stored.snapshot.state.clone(),
                 });
@@ -1791,7 +1866,7 @@ impl AgentBusMessageRepository {
             Ok(true) => {}
         }
         let at_text = at.to_rfc3339();
-        let (outcome, event) = self.mutate_checked(|store| {
+        let (outcome, event) = self.mutate_checked_message(message_id, |store| {
             let stored = store
                 .messages
                 .get_mut(message_id)
@@ -1945,7 +2020,7 @@ impl AgentBusMessageRepository {
             );
             // The owner discarded it (`cutex human bus-messages discard`):
             // ACK it wherever it is still queued, native evidence or not.
-            if is_owner_discarded(&stored.snapshot) {
+            if settlement_closed(stored) || is_owner_discarded(&stored.snapshot) {
                 return Ok(true);
             }
             let suppressed = matches!(stored.snapshot.state.as_str(), "stale_held" | "discarded");
@@ -2011,6 +2086,63 @@ impl AgentBusMessageRepository {
         Ok(self.get(message_id)?.map(|stored| stored.snapshot))
     }
 
+    /// Coherent, bounded, owned snapshot + retained exact collector evidence.
+    /// No runtime/session query, close-policy fence, outbox or business write.
+    /// Only verified existing SQLite is read: no legacy migration on this path.
+    pub fn receipt_read_inputs(
+        &self,
+        message_ids: &[String],
+    ) -> anyhow::Result<crate::asks::receipt_uncertainty::read_views::ReceiptReadContext> {
+        use crate::asks::receipt_uncertainty::{read_context::MAX_CONTEXT_MESSAGES,
+            read_views::{ReceiptReadContext, ReceiptReadInput}};
+        let ids: std::collections::BTreeSet<_> = message_ids.iter().take(MAX_CONTEXT_MESSAGES).collect();
+        let database = self.root.join(super::hot_store::DATABASE_FILE);
+        if ids.is_empty() || !database.is_file() {return Ok(ReceiptReadContext::new());}
+        let _process = self.process_lock.lock().map_err(|_|anyhow::anyhow!("agent-bus process lock poisoned"))?;
+        let lock = match OpenOptions::new().read(true).open(self.root.join(AGENT_BUS_LOCK_FILE)) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ReceiptReadContext::new()),
+            Err(error) => return Err(error.into()),
+        };
+        lock.lock_shared()?;
+        let Some(generation) = super::hot_store::generation(&database, "agent_bus")? else {
+            return Ok(ReceiptReadContext::new());
+        };
+        let mut cache = self.cache.lock().map_err(|_|anyhow::anyhow!("agent-bus cache lock poisoned"))?;
+        if cache.as_ref().is_none_or(|entry| entry.generation != generation) {
+            let Some(loaded) = super::hot_store::verified_rows(&database, "agent_bus")? else {
+                return Ok(ReceiptReadContext::new());
+            };
+            let store = bus_store_from_rows(&loaded.rows)?;
+            *cache = Some(CachedStore {generation: loaded.generation, store});
+        }
+        let entry = cache.as_mut().expect("verified read cache installed");
+        // verified_rows and observation refresh open SQLite read-only. Do not
+        // call fresh_store/load_or_migrate (writer opener/schema setup).
+        settlement_state::refresh_observations(entry, &database)?;
+        let store = &entry.store;
+        Ok(ids.into_iter().filter_map(|id|store.messages.get(id).map(|stored| {
+            let terminal = stored.settlement.as_ref().or(stored.observed_settlement.as_ref())
+                .filter(|record|validate_settlement_record(stored, record).is_ok())
+                .map(|record|record.evidence.clone());
+            (id.clone(), ReceiptReadInput {snapshot:stored.snapshot.clone(), terminal,
+                observer:None,status_unavailable:false})
+        })).collect())
+    }
+
+    /// Reconcile a provider outbox after an uncertain bus-send response. Match
+    /// the exact trusted control namespace as well as the external id; never
+    /// infer identity from titles, recipient names, or body equality.
+    pub fn snapshot_by_external_message_id(&self, external_id:&str, control_type:&str)->anyhow::Result<Option<AgentBusMessageSnapshot>>{
+        self.read(|store|{
+            let mut matches=store.messages.values().filter(|stored|stored.canonical_envelope.as_ref().is_some_and(|message|
+                message.external_message_id.as_deref()==Some(external_id) && message.control_type.as_deref()==Some(control_type)
+                    && message.from==crate::agent_management::AGENT_MANAGEMENT_SYSTEM_SENDER));
+            let result=matches.next().map(|stored|stored.snapshot.clone());
+            anyhow::ensure!(matches.next().is_none(),"provider external message identity is ambiguous");Ok(result)
+        })
+    }
+
     pub fn record_failed(
         &self,
         owner_cutex_session_id: &str,
@@ -2024,7 +2156,7 @@ impl AgentBusMessageRepository {
         if self.get(message_id)?.is_none() {
             return Ok(false);
         }
-        let event = self.mutate(|store| {
+        let event = self.mutate_message(message_id, |store| {
             let stored = store.messages.get_mut(message_id).with_context(|| {
                 format!("agent-bus v2 message state disappeared for {message_id}")
             })?;
@@ -2060,6 +2192,9 @@ impl AgentBusMessageRepository {
                 .filter(|stored| stored.owner_cutex_session_id == cutex_session_id)
                 .map(|stored| {
                     let mut value = serde_json::to_value(&stored.snapshot)?;
+                    if let Some(view) = settlement_view(stored, Utc::now()) {
+                        value["settlement"] = serde_json::to_value(view)?;
+                    }
                     let peer = stored_peer_tell_fields(stored);
                     // Agent messaging v2 additions for agent-sourced messages
                     // (a cross-host tell: `name@host` sender and `remote`).
@@ -2089,31 +2224,62 @@ impl AgentBusMessageRepository {
     }
 
     pub fn migrate_legacy_v1(&self) -> anyhow::Result<()> {
-        // Runs on every agent registration (each refresh, every 30 s per
-        // agent). A state that loads through the validated cache is v2 or
-        // later; only a state the cache rejects is parsed again unchecked.
-        if self.read(|_| Ok(())).is_ok() {
-            return Ok(());
-        }
+        // The first normal read performs the v1 quarantine while importing
+        // into SQLite. The legacy JSON remains untouched as the rollback
+        // backup, so this periodic compatibility hook is now only a warm-up.
+        self.read(|_| Ok(()))
+    }
+
+    /// Offline rollback export for a release that still reads the JSON file.
+    /// The caller must stop all cutex processes sharing this home first.
+    pub(crate) fn verify_legacy_export(&self) -> anyhow::Result<bool> {
+        Self::validate_settlement_rollback_read_only(&self.root)?;
+        let Some(loaded) = super::hot_store::verified_rows(
+            &bus_database_path(&self.root.join(AGENT_BUS_STATE_FILE)),
+            "agent_bus",
+        )? else {
+            return Ok(false);
+        };
+        bus_store_from_rows(&loaded.rows)?;
+        Ok(true)
+    }
+
+    /// Offline rollback export for a release that still reads the JSON file.
+    /// The caller must stop all cutex processes sharing this home first.
+    pub fn export_legacy_json(&self) -> anyhow::Result<bool> {
+        Self::validate_settlement_rollback_read_only(&self.root)?;
         self.with_lock(|path| {
-            let mut store = load_store_unchecked(path)?;
-            if store.version != 1 {
-                return Ok(());
-            }
-            for stored in store.messages.values_mut() {
-                if stored.snapshot.state != "delivered" {
-                    stored.snapshot.state = "quarantined".to_string();
-                    stored.snapshot.error = Some(json!({
-                        "source": "cutex",
-                        "code": "legacy_v1_canonical_envelope_unavailable",
-                        "message": "legacy ordinary message cannot be safely redriven",
-                        "retryable": false,
-                        "details": {}
-                    }));
+            let Some(loaded) = super::hot_store::verified_rows(&bus_database_path(path), "agent_bus")? else {
+                return Ok(false);
+            };
+            let store = bus_store_from_rows(&loaded.rows)?;
+            let already_equal = if path.exists() {
+                if let Ok(existing) = load_store(path) {
+                    serde_json::to_value(&existing)? == serde_json::to_value(&store)?
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if !already_equal {
+                crate::config::atomic::write_private_pretty_json_atomic(
+                    path,
+                    &store,
+                    "agent-bus rollback export",
+                )?;
             }
-            store.version = 2;
-            write_private_pretty_json_atomic(path, &store, "management v2 agent-bus state")
+            let checked = load_store(path)?;
+            anyhow::ensure!(
+                serde_json::to_value(&checked)? == serde_json::to_value(&store)?,
+                "agent-bus rollback export verification failed"
+            );
+            super::hot_store::handoff_to_legacy(
+                &bus_database_path(path),
+                "agent_bus",
+                loaded.generation,
+            )?;
+            Ok(true)
         })
     }
 
@@ -2136,7 +2302,7 @@ impl AgentBusMessageRepository {
         if ids.is_empty() {
             return Ok(0);
         }
-        self.mutate(|store| {
+        self.mutate_messages(ids, |store| {
             let before = store.messages.len();
             store
                 .messages
@@ -2153,19 +2319,47 @@ impl AgentBusMessageRepository {
         &self,
         action: impl FnOnce(&mut AgentBusMessageStore) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        self.update(|store| action(store).map(|result| (result, true)))
+        self.update_inner(DirtyRows::All, false, |store| action(store).map(|result| (result, true)))
     }
 
-    /// [`Self::mutate`] for an action that changes the store only after every
-    /// fallible check passed: its error leaves the cached state in place.
-    /// Several of these fail routinely (a polled message without a durable
-    /// record, a presentation not due yet); each failure used to make the next
-    /// access parse the whole 43 MB state again (Linux host, 2026-10-09).
-    fn mutate_checked<T>(
+    fn mutate_message<T>(
         &self,
+        message_id: &str,
         action: impl FnOnce(&mut AgentBusMessageStore) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        self.update_inner(true, |store| action(store).map(|result| (result, true)))
+        self.update_inner(DirtyRows::Messages(vec![message_id.to_string()]), false, |store| {
+            action(store).map(|result| (result, true))
+        })
+    }
+
+    fn mutate_messages<T>(
+        &self,
+        message_ids: &[String],
+        action: impl FnOnce(&mut AgentBusMessageStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.update_inner(DirtyRows::Messages(message_ids.to_vec()), false, |store| {
+            action(store).map(|result| (result, true))
+        })
+    }
+
+    fn mutate_recovery<T>(
+        &self,
+        action_id: &str,
+        action: impl FnOnce(&mut AgentBusMessageStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.update_inner(DirtyRows::Recovery(vec![action_id.to_string()]), true, |store| {
+            action(store).map(|result| (result, true))
+        })
+    }
+
+    fn mutate_checked_message<T>(
+        &self,
+        message_id: &str,
+        action: impl FnOnce(&mut AgentBusMessageStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.update_inner(DirtyRows::Messages(vec![message_id.to_string()]), true, |store| {
+            action(store).map(|result| (result, true))
+        })
     }
 
     /// Runs `action` on the cached store itself (taken out of the cache, not
@@ -2178,13 +2372,22 @@ impl AgentBusMessageRepository {
         &self,
         action: impl FnOnce(&mut AgentBusMessageStore) -> anyhow::Result<(T, bool)>,
     ) -> anyhow::Result<T> {
-        self.update_inner(false, action)
+        self.update_inner(DirtyRows::All, false, action)
+    }
+
+    fn update_message<T>(
+        &self,
+        message_id: &str,
+        action: impl FnOnce(&mut AgentBusMessageStore) -> anyhow::Result<(T, bool)>,
+    ) -> anyhow::Result<T> {
+        self.update_inner(DirtyRows::Messages(vec![message_id.to_string()]), false, action)
     }
 
     /// `unchanged_on_error`: the action never changes the store before it
     /// fails, so a failed action's store goes back into the cache.
     fn update_inner<T>(
         &self,
+        dirty: DirtyRows,
         unchanged_on_error: bool,
         action: impl FnOnce(&mut AgentBusMessageStore) -> anyhow::Result<(T, bool)>,
     ) -> anyhow::Result<T> {
@@ -2193,47 +2396,38 @@ impl AgentBusMessageRepository {
                 .cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("management v2 agent-bus cache lock was poisoned"))?;
-            let (mut store, digest, stamp) = take_store(&mut cache, path)?;
-            let unchanged = |cache: &mut Option<CachedStore>, store: AgentBusMessageStore, digest: Option<(usize, u64)>| {
-                if let (Some(stamp), Some(digest)) = (stamp.clone(), digest) {
-                    *cache = Some(CachedStore { stamp, digest, store });
+            let (mut store, generation, exists) = take_store(&mut cache, path)?;
+            let before = dirty_rows(&store, &dirty)?;
+            let unchanged = |cache: &mut Option<CachedStore>, store: AgentBusMessageStore| {
+                if exists {
+                    *cache = Some(CachedStore { generation, store });
                 }
             };
             let (result, changed) = match action(&mut store) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     if unchanged_on_error {
-                        unchanged(&mut cache, store, digest);
+                        unchanged(&mut cache, store);
                     }
                     return Err(error);
                 }
             };
             if !changed {
-                unchanged(&mut cache, store, digest);
+                unchanged(&mut cache, store);
                 return Ok(result);
             }
-            note_whole_state_serialization();
-            let data = serde_json::to_vec_pretty(&store).with_context(|| {
-                format!("Failed to serialize management v2 agent-bus state: {}", path.display())
-            })?;
-            // An unchanged state is not rewritten (on the Linux host a 46 MB file was
-            // rewritten byte-identical every few seconds, 2026-10-09).
-            let written = store_digest(&data);
-            if digest == Some(written) {
-                unchanged(&mut cache, store, Some(written));
+            let database = bus_database_path(path);
+            let changes = bus_changes(&store, dirty, before)?;
+            if changes.is_empty() {
+                unchanged(&mut cache, store);
                 return Ok(result);
             }
-            crate::config::atomic::write_private_bytes_atomic(path, &data).with_context(|| {
-                format!("Failed to write management v2 agent-bus state: {}", path.display())
-            })?;
+            let next = super::hot_store::commit(&database, "agent_bus", generation, changes)?;
             let mut index = self.admission_index.lock().map_err(|_| anyhow::anyhow!("agent-bus admission index lock poisoned"))?;
-            let mut refreshed = AdmissionIndex::new(&store, Some(written));
-            refreshed.stamp = crate::platform::file_stamp::FileStamp::of(path);
+            let refreshed = AdmissionIndex::new(&store, Some(next));
             refreshed.notify_changes(index.as_ref());
             *index = Some(refreshed);
-            if let Some(stamp) = crate::platform::file_stamp::FileStamp::of(path) {
-                *cache = Some(CachedStore { stamp, digest: written, store });
-            }
+            *cache = Some(CachedStore { generation: next, store });
             Ok(result)
         })
     }
@@ -2318,25 +2512,41 @@ struct RidealongDetail {
     label: String,
     from: Option<String>,
     from_host: Option<String>,
+    /// The sending agent's session, only when it is a session of this host.
+    from_cutex_session_id: Option<String>,
     preview: Option<String>,
     ask_id: Option<String>,
+}
+
+/// Whether a sender session id names an agent session of this host
+/// (`from_cutex_session_id` is never another host's session).
+fn local_sender(store: Option<&crate::session::model::CutexSessionStore>) -> impl Fn(&str) -> bool + '_ {
+    let host = crate::platform::host::current_host_name();
+    move |id: &str| {
+        store.and_then(|store| store.sessions.get(id))
+            .is_some_and(|record| crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, &host))
+    }
 }
 
 fn ridealong_detail(
     stored: &StoredAgentBusMessage,
     message: &AgentBusMessage,
     asks: &crate::asks::store::AskState,
+    is_local_session: &dyn Fn(&str) -> bool,
 ) -> RidealongDetail {
+    // The agent sender's own session (peer tells and alarms never get one).
+    let sender_session = || message.from_cutex_session_id.as_deref().map(str::trim)
+        .filter(|id| !id.is_empty() && message.sender_kind.is_agent() && is_local_session(id)).map(str::to_string);
     use super::admission::ridealong_preview;
     let display_source = || message.display_source.as_deref().map(str::trim).filter(|name| !name.is_empty())
         .map(str::to_string);
-    if crate::agent_bus::delivery::always_after_turn(message) {
+    if crate::agent_bus::delivery::always_after_turn(message) || crate::agent_bus::delivery::is_approval_notice(message) {
         // A legacy alarm envelope carries the old `[message from …] ` prefix.
         let legacy = format!("[message from {}] ", crate::agent_bus::alarms::ALARM_SYSTEM_SENDER);
         let preview = ridealong_preview(message.content.strip_prefix(&legacy).unwrap_or(&message.content));
         return RidealongDetail {
             kind: "alarm", label: preview.clone().unwrap_or_else(|| "Alarm".into()),
-            from: None, from_host: None, preview, ask_id: None,
+            from: None, from_host: None, from_cutex_session_id: None, preview, ask_id: None,
         };
     }
     if crate::agent_bus::peer_tell::is_peer_tell(message) {
@@ -2347,7 +2557,7 @@ fn ridealong_detail(
             kind: "tell", label: preview.clone().unwrap_or_else(|| "Peer message".into()),
             from: Some(facts.as_ref().map(|facts| facts.sender_label()).unwrap_or_else(|| message.from.clone())),
             from_host: facts.map(|facts| crate::peers::wire::sanitize_name(&facts.host)),
-            preview, ask_id: None,
+            from_cutex_session_id: None, preview, ask_id: None,
         };
     }
     // The sending agent's display name (agent messaging v2 meta), else the
@@ -2362,7 +2572,7 @@ fn ridealong_detail(
         let preview = ridealong_preview(&message.content);
         return RidealongDetail {
             kind: "tell", label: preview.clone().unwrap_or_else(|| "Agent message".into()),
-            from, from_host: None, preview, ask_id: None,
+            from, from_host: None, from_cutex_session_id: sender_session(), preview, ask_id: None,
         };
     }
     let control = message.control_type.as_deref();
@@ -2383,7 +2593,8 @@ fn ridealong_detail(
         };
         return RidealongDetail {
             kind: "bus", preview: Some(label.clone()), label,
-            from: display_source().or_else(|| Some("Cutex Job Service".into())), from_host: None, ask_id,
+            from: display_source().or_else(|| Some("Cutex Job Service".into())), from_host: None,
+            from_cutex_session_id: None, ask_id,
         };
     }
     let (label, body_preview) = match control {
@@ -2400,7 +2611,7 @@ fn ridealong_detail(
     let from = sender_name().or_else(display_source).or_else(canonical_from);
     let ask_id = message.control_payload.as_ref().and_then(|payload| payload.get("askId"))
         .and_then(Value::as_str).filter(|id| asks.asks.contains_key(*id)).map(str::to_string);
-    RidealongDetail { kind: "bus", label: label.into(), from, from_host: None, preview, ask_id }
+    RidealongDetail { kind: "bus", label: label.into(), from, from_host: None, from_cutex_session_id: sender_session(), preview, ask_id }
 }
 
 /// Bootstrap fields of a message no agent sent (alarm, Job Service, owner …;
@@ -2658,27 +2869,177 @@ fn load_store(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
     validate_store(load_store_unchecked(path)?)
 }
 
-/// Content digest of the serialized store (length + 64-bit hash): a mutation
-/// that leaves the serialization unchanged is not written again.
-fn store_digest(bytes: &[u8]) -> (usize, u64) {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    (bytes.len(), hasher.finish())
+fn bus_database_path(legacy: &Path) -> PathBuf {
+    legacy.parent().unwrap_or_else(|| Path::new(".")).join(super::hot_store::DATABASE_FILE)
 }
 
-// This projection deliberately omits message bodies, rendering and retry errors.
-// Its facts are identical whether read from JSON or an already validated store.
-#[derive(Deserialize)]
-struct AdmissionStoreProjection {
-    version: u8,
-    #[serde(default)]
-    messages: BTreeMap<String, AdmissionMessageProjection>,
+fn bus_store_rows(store: &AgentBusMessageStore) -> anyhow::Result<super::hot_store::Rows> {
+    let mut rows = super::hot_store::Rows::new();
+    rows.insert(("state".into(), "version".into()), serde_json::to_vec(&store.version)?);
+    for (key, value) in &store.external_recovery_actions {
+        rows.insert(("recovery".into(), key.clone()), serde_json::to_vec(value)?);
+    }
+    for (key, value) in &store.messages {
+        rows.insert(("message".into(), key.clone()), serde_json::to_vec(value)?);
+    }
+    Ok(rows)
+}
+
+fn bus_store_from_rows(source: &super::hot_store::Rows) -> anyhow::Result<AgentBusMessageStore> {
+    let mut store = AgentBusMessageStore::default();
+    let mut seen_version = false;
+    for ((collection, key), value) in source {
+        match collection.as_str() {
+            "state" if key == "version" => {
+                store.version = serde_json::from_slice(value)?;
+                seen_version = true;
+            }
+            "recovery" => {
+                store.external_recovery_actions.insert(key.clone(), serde_json::from_slice(value)?);
+            }
+            "message" => {
+                store.messages.insert(key.clone(), serde_json::from_slice(value)?);
+            }
+            _ => anyhow::bail!("unknown agent-bus SQLite row {collection}/{key}"),
+        }
+    }
+    if !seen_version {
+        store.version = 2;
+    }
+    validate_store(store)
+}
+
+fn decode_legacy_bus_store(bytes: &[u8]) -> anyhow::Result<super::hot_store::Rows> {
+    let mut store: AgentBusMessageStore = serde_json::from_slice(bytes)?;
+    if store.version == 1 {
+        for stored in store.messages.values_mut() {
+            if stored.snapshot.state != "delivered" {
+                stored.snapshot.state = "quarantined".to_string();
+                stored.snapshot.error = Some(json!({
+                    "source": "cutex",
+                    "code": "legacy_v1_canonical_envelope_unavailable",
+                    "message": "legacy ordinary message cannot be safely redriven",
+                    "retryable": false,
+                    "details": {}
+                }));
+            }
+        }
+        store.version = 2;
+    }
+    bus_store_rows(&validate_store(store)?)
+}
+
+#[derive(Clone)]
+enum DirtyRows {
+    All,
+    Messages(Vec<String>),
+    Recovery(Vec<String>),
+}
+
+fn bus_changes(
+    store: &AgentBusMessageStore,
+    dirty: DirtyRows,
+    before_dirty: super::hot_store::Rows,
+) -> anyhow::Result<Vec<super::hot_store::RowChange>> {
+    let mut changes = Vec::new();
+    let after_dirty = dirty_rows(store, &dirty)?;
+    let put_or_delete = |changes: &mut Vec<_>, collection: &str, key: &str, value: Option<Vec<u8>>| {
+        match value {
+            Some(value) => changes.push(super::hot_store::RowChange::Put {
+                collection: collection.into(), key: key.into(), value,
+            }),
+            None => changes.push(super::hot_store::RowChange::Delete {
+                collection: collection.into(), key: key.into(),
+            }),
+        }
+    };
+    match dirty {
+        DirtyRows::Messages(ids) => {
+            for id in ids.into_iter().collect::<std::collections::BTreeSet<_>>() {
+                put_or_delete(
+                    &mut changes,
+                    "message",
+                    &id,
+                    store.messages.get(&id).map(serde_json::to_vec).transpose()?,
+                );
+            }
+        }
+        DirtyRows::Recovery(ids) => {
+            for id in ids.into_iter().collect::<std::collections::BTreeSet<_>>() {
+                put_or_delete(
+                    &mut changes,
+                    "recovery",
+                    &id,
+                    store.external_recovery_actions.get(&id).map(serde_json::to_vec).transpose()?,
+                );
+            }
+        }
+        DirtyRows::All => {
+            note_whole_state_serialization();
+            let before = before_dirty;
+            let after = bus_store_rows(store)?;
+            let keys = before.keys().chain(after.keys()).cloned().collect::<std::collections::BTreeSet<_>>();
+            for (collection, key) in keys {
+                match (before.get(&(collection.clone(), key.clone())), after.get(&(collection.clone(), key.clone()))) {
+                    (Some(old), Some(new)) if old == new => {}
+                    (_, Some(value)) => put_or_delete(&mut changes, &collection, &key, Some(value.clone())),
+                    (Some(_), None) => put_or_delete(&mut changes, &collection, &key, None),
+                    (None, None) => unreachable!(),
+                }
+            }
+            return Ok(changes);
+        }
+    }
+    changes.retain(|change| match change {
+        super::hot_store::RowChange::Put { collection, key, value } => {
+            before_dirty.get(&(collection.clone(), key.clone())) != Some(value)
+        }
+        super::hot_store::RowChange::Delete { collection, key } => {
+            before_dirty.contains_key(&(collection.clone(), key.clone()))
+        }
+    });
+    let version_key = ("state".to_string(), "version".to_string());
+    if before_dirty.get(&version_key) != after_dirty.get(&version_key) {
+        changes.push(super::hot_store::RowChange::Put {
+            collection: version_key.0,
+            key: version_key.1,
+            value: serde_json::to_vec(&store.version)?,
+        });
+    }
+    Ok(changes)
+}
+
+fn dirty_rows(store: &AgentBusMessageStore, dirty: &DirtyRows) -> anyhow::Result<super::hot_store::Rows> {
+    if matches!(dirty, DirtyRows::All) {
+        return bus_store_rows(store);
+    }
+    let mut rows = super::hot_store::Rows::new();
+    rows.insert(("state".into(), "version".into()), serde_json::to_vec(&store.version)?);
+    match dirty {
+        DirtyRows::Messages(ids) => {
+            for id in ids.iter().collect::<std::collections::BTreeSet<_>>() {
+                if let Some(message) = store.messages.get(id) {
+                    rows.insert(("message".into(), (*id).clone()), serde_json::to_vec(message)?);
+                }
+            }
+        }
+        DirtyRows::Recovery(ids) => {
+            for id in ids.iter().collect::<std::collections::BTreeSet<_>>() {
+                if let Some(action) = store.external_recovery_actions.get(id) {
+                    rows.insert(("recovery".into(), (*id).clone()), serde_json::to_vec(action)?);
+                }
+            }
+        }
+        DirtyRows::All => unreachable!(),
+    }
+    Ok(rows)
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AdmissionMessageProjection {
+    #[serde(default)]
+    settlement: Option<super::agent_bus_settlement_model::SettlementView>,
     canonical_envelope: Option<AdmissionCanonicalProjection>,
     snapshot: AdmissionSnapshotProjection,
     queued_at: Option<String>,
@@ -2779,6 +3140,7 @@ impl From<&StoredAgentBusMessage> for AdmissionMessageProjection {
     fn from(stored: &StoredAgentBusMessage) -> Self {
         let snapshot = &stored.snapshot;
         Self {
+            settlement: settlement_view(stored, Utc::now()),
             canonical_envelope: stored.canonical_envelope.as_ref().map(|message| AdmissionCanonicalProjection {
                 id: message.id.clone(), kind: message.kind.clone(), from: message.from.clone(), to: message.to.clone(),
                 from_cutex_session_id: message.from_cutex_session_id.clone(), to_cutex_session_id: message.to_cutex_session_id.clone(),
@@ -2806,21 +3168,25 @@ impl From<&StoredAgentBusMessage> for AdmissionMessageProjection {
 }
 
 struct AdmissionIndex {
-    stamp: Option<crate::platform::file_stamp::FileStamp>,
-    digest: Option<(usize, u64)>,
+    generation: Option<u64>,
+    observation_generation: Option<u64>,
+    observation_unavailable: bool,
     sessions: BTreeMap<String, Vec<String>>,
     fingerprints: BTreeMap<String, Vec<(String, AdmissionMessageProjection)>>,
     started_turns: BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 impl AdmissionIndex {
-    fn new(store: &AgentBusMessageStore, digest: Option<(usize, u64)>) -> Self {
-        Self::from_projection(store.messages.iter().filter(|(_, stored)| stored.admission_started_idle
-            || matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held"))
-            .map(|(id, stored)| (id.clone(), AdmissionMessageProjection::from(stored))).collect(), digest)
+    fn new(store: &AgentBusMessageStore, generation: Option<u64>) -> Self {
+        let mut index = Self::from_projection(store.messages.iter().filter(|(_, stored)| !settlement_closed(stored) && (stored.admission_started_idle
+            || matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held")))
+            .map(|(id, stored)| (id.clone(), AdmissionMessageProjection::from(stored))).collect(), generation);
+        index.observation_generation = store.observation_generation;
+        index.observation_unavailable = store.observation_unavailable;
+        index
     }
 
-    fn from_projection(messages: BTreeMap<String, AdmissionMessageProjection>, digest: Option<(usize, u64)>) -> Self {
+    fn from_projection(messages: BTreeMap<String, AdmissionMessageProjection>, generation: Option<u64>) -> Self {
         let mut sessions: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut fingerprints: BTreeMap<String, Vec<(String, AdmissionMessageProjection)>> = BTreeMap::new();
         let mut started_turns: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
@@ -2840,7 +3206,7 @@ impl AdmissionIndex {
                 fingerprints.entry(snapshot.to_cutex_session_id.clone()).or_default().push((id, stored));
             }
         }
-        Self { stamp: None, digest, sessions, fingerprints, started_turns }
+        Self { generation, observation_generation: None, observation_unavailable:false, sessions, fingerprints, started_turns }
     }
 
     fn notify_changes(&self, previous: Option<&Self>) {
@@ -2865,6 +3231,8 @@ fn bus_admission_timing(
     if crate::agent_bus::delivery::always_after_turn(message) {
         return ("afterTurn".into(), None);
     }
+    // An approval decision notice waits for nothing (023).
+    let wait = if crate::agent_bus::delivery::is_approval_notice(message) { Some(std::time::Duration::ZERO) } else { wait };
     if let Some(frozen) = frozen {
         return (if frozen.message.delivery == Delivery::Soon { "nextStep" } else { "afterTurn" }.into(), None);
     }
@@ -2882,8 +3250,7 @@ fn bus_admission_timing(
 
 /// One parsed, validated version of the state file, keyed by its identity.
 struct CachedStore {
-    stamp: crate::platform::file_stamp::FileStamp,
-    digest: (usize, u64),
+    generation: u64,
     store: AgentBusMessageStore,
 }
 
@@ -2893,35 +3260,29 @@ struct CachedStore {
 fn fresh_store<'a>(
     cache: &'a mut Option<CachedStore>,
     path: &Path,
-) -> anyhow::Result<(std::borrow::Cow<'a, AgentBusMessageStore>, Option<(usize, u64)>)> {
-    let stamp = crate::platform::file_stamp::FileStamp::of(path);
-    let hit = matches!((cache.as_ref(), stamp.as_ref()), (Some(entry), Some(stamp)) if entry.stamp == *stamp);
+) -> anyhow::Result<(std::borrow::Cow<'a, AgentBusMessageStore>, Option<u64>)> {
+    let database = bus_database_path(path);
+    let generation = super::hot_store::generation(&database, "agent_bus")?;
+    let hit = matches!((cache.as_ref(), generation), (Some(entry), Some(generation)) if entry.generation == generation);
     if !hit {
         *cache = None;
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            // No file yet: nothing to cache.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok((std::borrow::Cow::Owned(empty_store()), None));
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to read management v2 agent-bus state: {}", path.display())
-                })
-            }
-        };
-        let store = validate_store(serde_json::from_slice(&bytes)?)?;
-        let digest = store_digest(&bytes);
-        match (stamp, crate::platform::file_stamp::FileStamp::of(path)) {
-            (Some(before), Some(after)) if before == after => {
-                *cache = Some(CachedStore { stamp: before, digest, store });
-            }
-            // Changed while read (a writer outside the lock): use, never cache.
-            _ => return Ok((std::borrow::Cow::Owned(store), Some(digest))),
+        let loaded = super::hot_store::load_or_migrate(
+            &database,
+            "agent_bus",
+            path,
+            decode_legacy_bus_store,
+            |rows| bus_store_from_rows(rows).map(|_| ()),
+        )?;
+        let store = bus_store_from_rows(&loaded.rows)?;
+        if loaded.exists {
+            *cache = Some(CachedStore { generation: loaded.generation, store });
+        } else {
+            return Ok((std::borrow::Cow::Owned(store), None));
         }
     }
-    let entry = cache.as_ref().expect("cache filled above");
-    Ok((std::borrow::Cow::Borrowed(&entry.store), Some(entry.digest)))
+    let entry = cache.as_mut().expect("cache filled above");
+    settlement_state::refresh_observations(entry, &database)?;
+    Ok((std::borrow::Cow::Borrowed(&entry.store), Some(entry.generation)))
 }
 
 /// Like [`fresh_store`], but hands out the store itself and empties the
@@ -2932,38 +3293,21 @@ fn take_store(
     path: &Path,
 ) -> anyhow::Result<(
     AgentBusMessageStore,
-    Option<(usize, u64)>,
-    Option<crate::platform::file_stamp::FileStamp>,
+    u64,
+    bool,
 )> {
-    let stamp = crate::platform::file_stamp::FileStamp::of(path);
-    let hit = matches!((cache.as_ref(), stamp.as_ref()), (Some(entry), Some(stamp)) if entry.stamp == *stamp);
-    if hit {
-        let entry = cache.take().expect("cache hit above");
-        return Ok((entry.store, Some(entry.digest), Some(entry.stamp)));
+    match fresh_store(cache, path)? {
+        (std::borrow::Cow::Owned(store), generation) => return Ok((store, generation.unwrap_or(0), false)),
+        (std::borrow::Cow::Borrowed(_), _) => {}
     }
-    *cache = None;
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok((empty_store(), None, None));
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("failed to read management v2 agent-bus state: {}", path.display())
-            })
-        }
-    };
-    let store = validate_store(serde_json::from_slice(&bytes)?)?;
-    let digest = store_digest(&bytes);
-    let stamp = match (stamp, crate::platform::file_stamp::FileStamp::of(path)) {
-        (Some(before), Some(after)) if before == after => Some(before),
-        _ => None,
-    };
-    Ok((store, Some(digest), stamp))
+    let entry = cache.take().expect("fresh store populated cache");
+    Ok((entry.store, entry.generation, true))
 }
 
 fn empty_store() -> AgentBusMessageStore {
     AgentBusMessageStore {
+        observation_generation: None,
+        observation_unavailable: false,
         external_recovery_actions: BTreeMap::new(),
         version: 2,
         messages: BTreeMap::new(),
@@ -2971,7 +3315,7 @@ fn empty_store() -> AgentBusMessageStore {
 }
 
 fn validate_store(store: AgentBusMessageStore) -> anyhow::Result<AgentBusMessageStore> {
-    if !matches!(store.version, 2 | 3 | 4 | 5 | 6 | 7) {
+    if !matches!(store.version, 2 | 3 | 4 | 5 | 6 | 7 | 8) {
         anyhow::bail!("unsupported management v2 agent-bus state version");
     }
     if store.version < 5
@@ -2983,6 +3327,10 @@ fn validate_store(store: AgentBusMessageStore) -> anyhow::Result<AgentBusMessage
         anyhow::bail!("presentation obligation requires Bus state v5");
     }
     for m in store.messages.values() {
+        if let Some(settlement) = &m.settlement {
+            anyhow::ensure!(store.version >= 8, "message settlement requires Bus state v8");
+            validate_settlement_record(m, settlement)?;
+        }
         if let Some(canonical) = &m.canonical_envelope {
             if canonical.control_type.as_deref()
                 == Some(crate::agent_bus::job_completion::SCHEMA_V2)
@@ -3110,34 +3458,78 @@ fn secure_file(_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn sqlite_generation(root: &Path) -> u64 {
+        super::super::hot_store::generation(
+            &root.join(super::super::hot_store::DATABASE_FILE),
+            "agent_bus",
+        ).unwrap().unwrap()
+    }
+
+    fn persisted_store(root: &Path) -> AgentBusMessageStore {
+        let loaded = super::super::hot_store::verified_rows(
+            &root.join(super::super::hot_store::DATABASE_FILE),
+            "agent_bus",
+        ).unwrap().unwrap();
+        bus_store_from_rows(&loaded.rows).unwrap()
+    }
+
+    fn replace_persisted_store(root: &Path, store: &AgentBusMessageStore) {
+        let database = root.join(super::super::hot_store::DATABASE_FILE);
+        let generation = sqlite_generation(root);
+        let before = super::super::hot_store::verified_rows(&database, "agent_bus")
+            .unwrap()
+            .unwrap()
+            .rows;
+        let changes = bus_changes(store, DirtyRows::All, before).unwrap();
+        super::super::hot_store::commit(&database, "agent_bus", generation, changes).unwrap();
+    }
+
+    #[test]
+    fn provider_reconciliation_matches_exact_external_id_sender_and_control_and_refuses_ambiguity(){
+        let root=std::env::temp_dir().join(format!("director-bus-reconcile-{}",uuid::Uuid::new_v4()));
+        let repository=AgentBusMessageRepository::open(&root).unwrap();
+        let mut queued=system_queued_message("original instructions");
+        queued.canonical_envelope.from=crate::agent_management::AGENT_MANAGEMENT_SYSTEM_SENDER.into();
+        queued.canonical_envelope.control_type=Some("adoption".into());
+        repository.record_queued_isolated(queued).unwrap();
+        assert_eq!(repository.snapshot_by_external_message_id("event-1","adoption").unwrap().unwrap().message_id,"jsc_stable");
+        assert!(repository.snapshot_by_external_message_id("event-1","notice").unwrap().is_none());
+        assert!(repository.snapshot_by_external_message_id("other","adoption").unwrap().is_none());
+        repository.mutate(|store|{store.messages.get_mut("jsc_stable").unwrap().canonical_envelope.as_mut().unwrap().from="ordinary agent".into();Ok(())}).unwrap();
+        assert!(repository.snapshot_by_external_message_id("event-1","adoption").unwrap().is_none());
+        repository.mutate(|store|{
+            let existing=store.messages.get_mut("jsc_stable").unwrap();existing.canonical_envelope.as_mut().unwrap().from=crate::agent_management::AGENT_MANAGEMENT_SYSTEM_SENDER.into();
+            let mut duplicate=existing.clone();duplicate.snapshot.message_id="duplicate".into();duplicate.canonical_envelope.as_mut().unwrap().id="duplicate".into();store.messages.insert("duplicate".into(),duplicate);Ok(())
+        }).unwrap();
+        assert!(repository.snapshot_by_external_message_id("event-1","adoption").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn repeated_pending_error_and_duplicate_queue_neither_rewrite_nor_lose_writes() {
-        use crate::platform::file_stamp::FileStamp;
         let root = std::env::temp_dir().join(format!("cutex-bus-pending-{}", uuid::Uuid::new_v4()));
         let first = AgentBusMessageRepository::open(&root).unwrap();
         let second = AgentBusMessageRepository::open(&root).unwrap();
         let queued = system_queued_message("pending body");
         let id = queued.message_id.clone();
         assert!(first.record_queued_isolated(queued.clone()).unwrap());
-        let path = root.join(AGENT_BUS_STATE_FILE);
         // Same message again: accepted as a duplicate, nothing rewritten.
-        let stamp = FileStamp::of(&path).unwrap();
+        let generation = sqlite_generation(&root);
         assert!(!first.record_queued_isolated(queued).unwrap());
-        assert_eq!(FileStamp::of(&path).unwrap(), stamp);
+        assert_eq!(sqlite_generation(&root), generation);
         first.record_external_input_error(&id, "native pending").unwrap();
-        let stamp = FileStamp::of(&path).unwrap();
+        let generation = sqlite_generation(&root);
         for _ in 0..3 {
             first.record_external_input_error(&id, "native pending").unwrap();
         }
-        assert_eq!(FileStamp::of(&path).unwrap(), stamp, "same error must not rewrite");
+        assert_eq!(sqlite_generation(&root), generation, "same error must not rewrite");
         assert_eq!(
             second.get(&id).unwrap().unwrap().snapshot.error,
             Some(json!({"code":"external_input_pending","message":"native pending"}))
         );
         // A new error is written and seen by the other repository (process).
-        std::thread::sleep(std::time::Duration::from_millis(20));
         first.record_external_input_error(&id, "native pending 2").unwrap();
-        assert_ne!(FileStamp::of(&path).unwrap(), stamp);
+        assert!(sqlite_generation(&root) > generation);
         assert_eq!(
             second.get(&id).unwrap().unwrap().snapshot.error.unwrap()["message"],
             "native pending 2"
@@ -3151,10 +3543,10 @@ mod tests {
         assert!(first.presentation_error("missing-message", "x").is_err());
         assert!(first.begin_presentation_attempt("owner", "missing-message", 0).is_err());
         assert!(first.cache.lock().unwrap().is_some(), "a checked failure keeps the cache");
-        let stamp = FileStamp::of(&path).unwrap();
+        let generation = sqlite_generation(&root);
         first.migrate_legacy_v1().unwrap();
         assert!(first.cache.lock().unwrap().is_some());
-        assert_eq!(FileStamp::of(&path).unwrap(), stamp);
+        assert_eq!(sqlite_generation(&root), generation);
         // A failed update drops the possibly half-changed store: the next
         // read comes from the file, not from the aborted change.
         let failed: anyhow::Result<()> = first.mutate(|store| {
@@ -3168,7 +3560,6 @@ mod tests {
 
     #[test]
     fn unchanged_mutation_is_not_rewritten_and_other_writers_are_seen() {
-        use crate::platform::file_stamp::FileStamp;
         let root = std::env::temp_dir().join(format!("cutex-bus-cache-{}", uuid::Uuid::new_v4()));
         let first = AgentBusMessageRepository::open(&root).unwrap();
         // Another process: its own repository (and cache) on the same root.
@@ -3176,8 +3567,7 @@ mod tests {
         let queued = system_queued_message("original");
         let id = queued.message_id.clone();
         first.record_queued_isolated(queued).unwrap();
-        let path = root.join(AGENT_BUS_STATE_FILE);
-        let stamp = FileStamp::of(&path).unwrap();
+        let generation = sqlite_generation(&root);
         assert!(first.get(&id).unwrap().is_some());
         first.mutate(|_| Ok(())).unwrap();
         second.mutate(|store| {
@@ -3185,16 +3575,15 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(FileStamp::of(&path).unwrap(), stamp, "no-op mutations must not rewrite");
+        assert_eq!(sqlite_generation(&root), generation, "no-op mutations must not rewrite");
         // A real change by the other writer is visible through the cache.
-        std::thread::sleep(std::time::Duration::from_millis(20));
         second
             .mutate(|store| {
                 store.messages.get_mut(&id).unwrap().snapshot.content = "changed".into();
                 Ok(())
             })
             .unwrap();
-        assert_ne!(FileStamp::of(&path).unwrap(), stamp);
+        assert!(sqlite_generation(&root) > generation);
         assert_eq!(first.get(&id).unwrap().unwrap().snapshot.content, "changed");
         // And this writer's own change is visible to the other one.
         first
@@ -3204,8 +3593,60 @@ mod tests {
             })
             .unwrap();
         assert_eq!(second.get(&id).unwrap().unwrap().snapshot.content, "again");
-        assert_eq!(load_store(&path).unwrap().messages[&id].snapshot.content, "again");
+        assert_eq!(persisted_store(&root).messages[&id].snapshot.content, "again");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "private synthetic 1k/10k retained-message comparison benchmark"]
+    fn benchmark_delivery_with_retained_messages() {
+        eprintln!("items,json_bytes,legacy_delivery_ms,sqlite_delivery_ms");
+        for items in [1_000, 10_000] {
+            let root = std::env::temp_dir().join(format!(
+                "cutex-bus-delivery-benchmark-{items}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let repository = AgentBusMessageRepository::open(&root).unwrap();
+            repository
+                .record_queued_isolated(system_queued_message(&"x".repeat(4_000)))
+                .unwrap();
+            let template = persisted_store(&root).messages["jsc_stable"].clone();
+            repository
+                .mutate(|store| {
+                    store.messages.clear();
+                    for index in 0..items {
+                        let id = format!("message-{index}");
+                        let mut stored = template.clone();
+                        stored.snapshot.message_id = id.clone();
+                        stored.canonical_envelope.as_mut().unwrap().id = id.clone();
+                        store.messages.insert(id, stored);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let mut legacy = persisted_store(&root);
+            let legacy_path = root.join("legacy-benchmark.json");
+            let initial = serde_json::to_vec_pretty(&legacy).unwrap();
+            std::fs::write(&legacy_path, &initial).unwrap();
+            let started = std::time::Instant::now();
+            for index in 0..3 {
+                legacy.messages.get_mut("message-0").unwrap().updated_at = format!("legacy-{index}");
+                std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+            }
+            let legacy_ms = started.elapsed().as_millis();
+            let started = std::time::Instant::now();
+            for index in 0..3 {
+                repository
+                    .mutate_message("message-0", |store| {
+                        store.messages.get_mut("message-0").unwrap().updated_at = format!("sqlite-{index}");
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let sqlite_ms = started.elapsed().as_millis();
+            eprintln!("{items},{},{legacy_ms},{sqlite_ms}", initial.len());
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -3354,9 +3795,7 @@ mod tests {
         assert!(reopened
             .record_external_input_delivered(&owner, "jsc_stable", &frozen, &receipt, 3)
             .is_err());
-        let raw: Value =
-            serde_json::from_slice(&fs::read(root.join(AGENT_BUS_STATE_FILE)).unwrap()).unwrap();
-        assert_eq!(raw["version"], 4);
+        assert_eq!(persisted_store(&root).version, 4);
         assert_eq!(
             AgentBusMessageRepository::open(&root)
                 .unwrap()
@@ -3456,12 +3895,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cutex-bus-ridealong-detail-{}", uuid::Uuid::new_v4()));
         let repository = AgentBusMessageRepository::open(&root).unwrap();
         let target = system_queued_message("x").to_cutex_session_id;
-        let detail = |stored_id: &str, asks: &crate::asks::store::AskState| {
+        // Only cutex.sender is a session of this host.
+        let local = |id: &str| id == "cutex.sender";
+        let detail_with = |stored_id: &str, asks: &crate::asks::store::AskState, local: &dyn Fn(&str) -> bool| {
             repository.read(|store| {
                 let stored = &store.messages[stored_id];
-                Ok(ridealong_detail(stored, stored.canonical_envelope.as_ref().unwrap(), asks))
+                Ok(ridealong_detail(stored, stored.canonical_envelope.as_ref().unwrap(), asks, local))
             }).unwrap()
         };
+        let detail = |stored_id: &str, asks: &crate::asks::store::AskState| detail_with(stored_id, asks, &local);
         let asks = crate::asks::store::AskState::default();
         // An agent tell: the sender's display name and the first line.
         let mut tell = system_queued_message("please review\nthe whole body");
@@ -3484,6 +3926,9 @@ mod tests {
         let got = detail("tell", &asks);
         assert_eq!((got.kind, got.label.as_str(), got.from.as_deref(), got.preview.as_deref()),
             ("tell", "please review", Some("Reviewer"), Some("please review")));
+        // Its session (for the avatar), only while it is a session of this host.
+        assert_eq!(got.from_cutex_session_id.as_deref(), Some("cutex.sender"));
+        assert_eq!(detail_with("tell", &asks, &|_| false).from_cutex_session_id, None);
         // A cross-host tell: `name@host` and the host label.
         let mut peer = system_queued_message("see the log");
         peer.message_id = "peer".into();
@@ -3497,6 +3942,8 @@ mod tests {
         let got = detail("peer", &asks);
         assert_eq!((got.kind, got.from.as_deref(), got.from_host.as_deref(), got.preview.as_deref()),
             ("tell", Some("worker@alpha"), Some("alpha"), Some("see the log")));
+        // Another host's sender never gets a session id, even a known-looking one.
+        assert_eq!(detail_with("peer", &asks, &|_| true).from_cutex_session_id, None);
         // A legacy alarm envelope: the prefix is not part of the preview.
         let mut alarm = system_queued_message("[message from Cutex Alarm] stand-up\nmore");
         alarm.message_id = "alarm".into();
@@ -3506,7 +3953,7 @@ mod tests {
         alarm.canonical_envelope.control_type = None;
         repository.record_queued_isolated(alarm).unwrap();
         let got = detail("alarm", &asks);
-        assert_eq!((got.kind, got.label.as_str(), got.from.as_deref()), ("alarm", "stand-up", None));
+        assert_eq!((got.kind, got.label.as_str(), got.from.as_deref(), got.from_cutex_session_id), ("alarm", "stand-up", None, None));
         // A Job v2 completion bound to a delegation names it; the frozen JSON
         // body is never previewed.
         use crate::agent_bus::job_completion::{CompletionV2, FrozenProjection, SCHEMA_V2};
@@ -3536,13 +3983,16 @@ mod tests {
         assert_eq!(detail("jsc_stable", &asks).ask_id.as_deref(), Some(ask.ask_id.as_str()));
         // The wire shape: camelCase, absent when unknown.
         let step = super::super::admission::AdmissionNextStep {
+            settlement: None,
             id: "x".into(), delivery_kind: "tell".into(), label: Some("l".into()), enqueued_at: "t".into(),
-            timing: "afterTurn".into(), next_step_at: None, held: None, ask_id: None,
-            from: Some("worker@alpha".into()), from_host: Some("alpha".into()), preview: None, eligible: true,
+            timing: "afterTurn".into(), next_step_at: None, wait_reason: None, held: None, ask_id: None,
+            from: Some("worker@alpha".into()), from_host: Some("alpha".into()), from_cutex_session_id: None, preview: None, eligible: true,
         };
         let value = serde_json::to_value(&step).unwrap();
         assert_eq!((value["from"].as_str(), value["fromHost"].as_str()), (Some("worker@alpha"), Some("alpha")));
-        assert!(value.get("preview").is_none());
+        assert!(value.get("preview").is_none() && value.get("fromCutexSessionId").is_none());
+        let local_step = super::super::admission::AdmissionNextStep { from_cutex_session_id: Some("cutex.sender".into()), ..step };
+        assert_eq!(serde_json::to_value(&local_step).unwrap()["fromCutexSessionId"], "cutex.sender");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3672,17 +4122,18 @@ mod tests {
         crate::management::v2::admission::take_change(&target);
         assert!(reader.refresh_admission_if_changed().unwrap());
         assert!(crate::management::v2::admission::take_change(&target));
-        assert!(reader.cache.lock().unwrap().is_none());
-        let path = root.join(AGENT_BUS_STATE_FILE);
-        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        value["messages"]["jsc_stable"]["snapshot"]["error"] = json!({"retry": "new error"});
-        value["messages"]["jsc_stable"]["updatedAt"] = json!("2026-10-12T01:02:03Z");
-        crate::config::atomic::write_private_pretty_json_atomic(&path, &value, "admission test state").unwrap();
+        assert!(reader.cache.lock().unwrap().is_some());
+        writer.mutate_message("jsc_stable", |store| {
+            let message = store.messages.get_mut("jsc_stable").unwrap();
+            message.snapshot.error = Some(json!({"retry": "new error"}));
+            message.updated_at = "2026-10-12T01:02:03Z".into();
+            Ok(())
+        }).unwrap();
         assert!(reader.refresh_admission_if_changed().unwrap());
         assert!(!crate::management::v2::admission::take_change(&target));
-        assert!(reader.cache.lock().unwrap().is_none());
+        assert!(reader.cache.lock().unwrap().is_some());
         assert!(!reader.refresh_admission_if_changed().unwrap());
-        let full: AgentBusMessageStore = serde_json::from_value(value).unwrap();
+        let full = persisted_store(&root);
         let expected = AdmissionIndex::new(&full, None);
         let actual = reader.admission_index.lock().unwrap();
         assert_eq!(actual.as_ref().unwrap().fingerprints, expected.fingerprints);
@@ -3703,8 +4154,7 @@ mod tests {
         queued.canonical_envelope.to = target.clone();
         queued.canonical_envelope.to_cutex_session_id = Some(target.clone());
         repository.record_queued_isolated(queued).unwrap();
-        let path = root.join(AGENT_BUS_STATE_FILE);
-        let base: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let base = serde_json::to_value(persisted_store(&root)).unwrap();
         let reader = AgentBusMessageRepository::open(&root).unwrap();
         reader.refresh_admission_if_changed().unwrap();
         let other = format!("cutex.{}", uuid::Uuid::new_v4());
@@ -3724,8 +4174,6 @@ mod tests {
             ("/queuedAt", json!("2026-10-12T01:02:03Z")),
             ("/snapshot/a2SubmissionId", json!("submitted")),
             ("/snapshot/localInboxReceipt", json!({"turnId": "native-turn"})),
-            ("/snapshot/externalInput", json!({"message": {"delivery": "soon", "text": "not retained"}})),
-            ("/snapshot/externalInputLastObserved", json!({"deliveryState": "pending"})),
             ("/snapshot/semanticSha256", json!("b".repeat(64))),
             ("/snapshot/toCutexSessionId", json!(other)),
         ] {
@@ -3735,30 +4183,43 @@ mod tests {
             let message = &mut changed["messages"]["jsc_stable"];
             let (parent, key) = pointer.rsplit_once('/').unwrap();
             message.pointer_mut(parent).unwrap().as_object_mut().unwrap().insert(key.into(), value);
-            crate::config::atomic::write_private_pretty_json_atomic(&path, &changed, "admission test state").unwrap();
+            let changed: AgentBusMessageStore = serde_json::from_value(changed).unwrap();
+            replace_persisted_store(&root, &changed);
             assert!(reader.refresh_admission_if_changed().unwrap());
             assert!(crate::management::v2::admission::take_change(&target), "missed {pointer}");
             if pointer == "/snapshot/toCutexSessionId" { assert!(crate::management::v2::admission::take_change(&other)); }
-            assert!(reader.cache.lock().unwrap().is_none());
+            assert!(reader.cache.lock().unwrap().is_some());
         }
         // A terminal receipt changes currentTurn even when no pending item exists.
         let mut terminal = base;
         let message = &mut terminal["messages"]["jsc_stable"];
         message["snapshot"]["state"] = json!("delivered");
-        crate::config::atomic::write_private_pretty_json_atomic(&path, &terminal, "admission test state").unwrap();
+        replace_persisted_store(&root, &serde_json::from_value(terminal.clone()).unwrap());
         reader.refresh_admission_if_changed().unwrap();
         crate::management::v2::admission::take_change(&target);
         terminal["messages"]["jsc_stable"]["admissionStartedIdle"] = json!(true);
         for receipt in ["externalInputReceipt", "a4Receipt", "localInboxReceipt"] {
             let mut with_receipt = terminal.clone();
-            with_receipt["messages"]["jsc_stable"]["snapshot"][receipt] = json!({"turnId": receipt});
-            crate::config::atomic::write_private_pretty_json_atomic(&path, &with_receipt, "admission test state").unwrap();
+            with_receipt["messages"]["jsc_stable"]["snapshot"][receipt] = match receipt {
+                "externalInputReceipt" => json!({
+                    "schema": "codex.external-input-receipt.v1", "receiptId": "r",
+                    "ownerId": target, "threadId": "t", "messageId": "m",
+                    "semanticSha256": "a".repeat(64), "responseItemId": "i",
+                    "turnId": receipt, "ordinal": 1
+                }),
+                "a4Receipt" => json!({
+                    "receiptId": "r", "responseItemId": "i", "turnId": receipt,
+                    "rolloutOrdinal": 1
+                }),
+                _ => json!({"turnId": receipt}),
+            };
+            replace_persisted_store(&root, &serde_json::from_value(with_receipt).unwrap());
             reader.refresh_admission_if_changed().unwrap();
             assert!(crate::management::v2::admission::take_change(&target));
             assert!(reader.admission_index.lock().unwrap().as_ref().unwrap().started_turns[&target].contains(receipt));
         }
         terminal["messages"]["jsc_stable"]["meta"] = json!({"contextTurnId": "claude-turn"});
-        crate::config::atomic::write_private_pretty_json_atomic(&path, &terminal, "admission test state").unwrap();
+        replace_persisted_store(&root, &serde_json::from_value(terminal).unwrap());
         reader.refresh_admission_if_changed().unwrap();
         assert!(crate::management::v2::admission::take_change(&target));
         assert!(reader.admission_index.lock().unwrap().as_ref().unwrap().started_turns[&target].contains("claude-turn"));
@@ -3827,18 +4288,15 @@ mod tests {
         repository
             .record_external_input_error("jsc_stable", "temporary")
             .unwrap();
-        let path = root.join(AGENT_BUS_STATE_FILE);
-        let first = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let first = sqlite_generation(&root);
         repository
             .record_external_input_error("jsc_stable", "temporary")
             .unwrap();
-        assert_eq!(first, std::fs::metadata(&path).unwrap().modified().unwrap());
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(first, sqlite_generation(&root));
         repository
             .record_external_input_error("jsc_stable", "changed")
             .unwrap();
-        assert_ne!(first, std::fs::metadata(&path).unwrap().modified().unwrap());
+        assert_ne!(first, sqlite_generation(&root));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3988,12 +4446,10 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
-        let path = root.join(AGENT_BUS_STATE_FILE);
-        let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["version"], 6);
-        stored["version"] = 5.into();
-        fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
-        assert!(reopened.snapshot_by_message_id("jsc_stable").is_err());
+        let mut stored = persisted_store(&root);
+        assert_eq!(stored.version, 6);
+        stored.version = 5;
+        assert!(validate_store(stored).is_err());
         fs::remove_dir_all(root).unwrap();
     }
     fn fixture_a4(repository: &AgentBusMessageRepository, owner: &str) {
@@ -4122,7 +4578,7 @@ mod tests {
             after.presentation.as_ref().unwrap().commit_generation,
             Some(1)
         );
-        let mut store = load_store(&root.join(AGENT_BUS_STATE_FILE)).unwrap();
+        let mut store = persisted_store(&root);
         store
             .messages
             .get_mut("jsc_stable")
@@ -4132,13 +4588,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .version = 1;
-        write_private_pretty_json_atomic(
-            &root.join(AGENT_BUS_STATE_FILE),
-            &store,
-            "fixture wrong template version",
-        )
-        .unwrap();
-        assert!(load_store(&root.join(AGENT_BUS_STATE_FILE)).is_err());
+        assert!(validate_store(store).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4247,9 +4697,7 @@ mod tests {
         assert!(repo.due_presentations(&owner, 200).unwrap().is_empty());
         assert!(!repo.record_queued_private_job(q, None).unwrap());
         assert_eq!(
-            load_store(&root.join(AGENT_BUS_STATE_FILE))
-                .unwrap()
-                .version,
+            persisted_store(&root).version,
             5
         );
         fs::remove_dir_all(root).unwrap();
@@ -4280,14 +4728,12 @@ mod tests {
         q.message_id = "new-job".into();
         q.canonical_envelope.id = q.message_id.clone();
         repo.record_queued_private_job(q, Some(&policy)).unwrap();
-        let path = root.join(AGENT_BUS_STATE_FILE);
-        let mut state = load_store(&path).unwrap();
+        let mut state = persisted_store(&root);
         assert_eq!(state.version, 5);
         // Exact old reader version predicate rejects v5, rather than dropping new fields.
         assert!(!matches!(state.version, 2 | 3 | 4));
         state.version = 4;
-        write_private_pretty_json_atomic(&path, &state, "fixture downgrade").unwrap();
-        assert!(load_store(&path).is_err());
+        assert!(validate_store(state).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4327,10 +4773,7 @@ mod tests {
             .record_queued_private_job(forged, Some(&policy))
             .is_err());
         assert_eq!(
-            load_store(&root.join(AGENT_BUS_STATE_FILE))
-                .unwrap()
-                .messages
-                .len(),
+            persisted_store(&root).messages.len(),
             6
         );
         fs::remove_dir_all(root).unwrap();
@@ -4393,6 +4836,8 @@ mod tests {
                         },
                         updated_at: Utc::now().to_rfc3339(),
                         meta: None,
+                        settlement: None,
+                        observed_settlement: None,
                     },
                 );
                 Ok(())
@@ -4475,8 +4920,53 @@ mod tests {
             snapshot[0]["error"]["code"],
             "legacy_v1_canonical_envelope_unavailable"
         );
-        let persisted: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 2);
+        let backup: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(backup["version"], 1, "migration keeps the r256 JSON backup unchanged");
+        assert_eq!(persisted_store(&root).version, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_legacy_fails_closed_and_rollback_export_contains_latest_rows() {
+        let corrupt_root = std::env::temp_dir().join(format!("cutex-bus-corrupt-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&corrupt_root).unwrap();
+        fs::write(corrupt_root.join(AGENT_BUS_STATE_FILE), b"{\"messages\":").unwrap();
+        let corrupt = AgentBusMessageRepository::open(&corrupt_root).unwrap();
+        assert!(corrupt.snapshot("cutex.target").is_err());
+        assert_eq!(
+            super::super::hot_store::generation(&corrupt_root.join(super::super::hot_store::DATABASE_FILE), "agent_bus").unwrap(),
+            None,
+        );
+        fs::remove_dir_all(corrupt_root).unwrap();
+
+        let root = std::env::temp_dir().join(format!("cutex-bus-export-{}", uuid::Uuid::new_v4()));
+        let repository = AgentBusMessageRepository::open(&root).unwrap();
+        let queued = system_queued_message("rollback body");
+        let owner = queued.owner_cutex_session_id.clone();
+        repository.record_queued_isolated(queued).unwrap();
+        repository.record_external_input_error("jsc_stable", "latest error").unwrap();
+        assert!(!root.join(AGENT_BUS_STATE_FILE).exists());
+        repository.export_legacy_json().unwrap();
+        assert_eq!(
+            super::super::hot_store::generation(
+                &root.join(super::super::hot_store::DATABASE_FILE),
+                "agent_bus",
+            )
+            .unwrap(),
+            None,
+            "rollback handoff makes the old JSON authoritative",
+        );
+        let mut exported = load_store(&root.join(AGENT_BUS_STATE_FILE)).unwrap();
+        assert_eq!(exported.messages["jsc_stable"].snapshot.error.as_ref().unwrap()["message"], "latest error");
+        exported.messages.get_mut("jsc_stable").unwrap().snapshot.content = "r256 changed body".into();
+        crate::config::atomic::write_private_pretty_json_atomic(
+            &root.join(AGENT_BUS_STATE_FILE),
+            &exported,
+            "simulated r256 bus write",
+        )
+        .unwrap();
+        let reopened = AgentBusMessageRepository::open(&root).unwrap();
+        assert_eq!(reopened.snapshot(&owner).unwrap()[0]["content"], "r256 changed body");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4703,7 +5193,7 @@ mod tests {
         };
         let before = whole_state_serializations_on_this_thread();
         let frozen = repository.freeze_external_input(&owner, "jsc_stable", make).unwrap();
-        assert_eq!(whole_state_serializations_on_this_thread() - before, 1, "the first freeze writes");
+        assert_eq!(whole_state_serializations_on_this_thread() - before, 0, "row writes never serialize the whole store");
         let pending = ei::Status {
             message_id: frozen.message.id.clone(),
             semantic_sha256: frozen.semantic_sha256.clone(),
@@ -4728,7 +5218,7 @@ mod tests {
             ..pending.clone()
         };
         repository.observe_external_input("jsc_stable", &frozen, &claimed).unwrap();
-        assert_eq!(whole_state_serializations_on_this_thread(), settled + 1);
+        assert_eq!(whole_state_serializations_on_this_thread(), settled);
         assert_eq!(
             repository.snapshot_by_message_id("jsc_stable").unwrap().unwrap().external_input_last_observed,
             Some(claimed)
@@ -4919,6 +5409,8 @@ pub struct FinishedAgentBusMessage {
 const FINISHED_MESSAGE_STATES: &[&str] = &["delivered", "inbox_accepted", "quarantined", "discarded", "failed"];
 
 fn finished(stored: &StoredAgentBusMessage, cutoff: chrono::DateTime<chrono::Utc>) -> Option<FinishedAgentBusMessage> {
+    // Closure audit and request-key history are never aged out or reopened.
+    if stored.settlement.is_some() { return None; }
     if !FINISHED_MESSAGE_STATES.contains(&stored.snapshot.state.as_str()) {
         return None;
     }
@@ -4946,6 +5438,40 @@ mod owner_discard_tests {
     const TO: &str = "cutex.11111111-1111-4111-8111-111111111111";
     const FROM: &str = "cutex.22222222-2222-4222-8222-222222222222";
     const NOW: u64 = 1_000_000;
+
+    #[test]
+    fn accepted_native_control_can_be_explicitly_quarantined_without_faking_delivery() {
+        let (repository, root) = repo("accepted-control");
+        let control = message("accepted", "task ended", 10,
+            crate::agent_bus::model::AgentMessageKind::JobServiceSystem,
+            Some(crate::agent_bus::claude_task::CONTROL_TYPE));
+        repository.record_queued_isolated(control).unwrap();
+        freeze(&repository, "accepted");
+        repository.mutate_message("accepted", |store| {
+            let stored = store.messages.get_mut("accepted").unwrap();
+            stored.snapshot.state = "inbox_accepted".into();
+            stored.snapshot.local_inbox_receipt = Some(json!({"durable":true,"contextPersisted":false}));
+            Ok(())
+        }).unwrap();
+        let before = repository.snapshot_by_message_id("accepted").unwrap().unwrap();
+        let rows = repository.stuck_messages(0, NOW).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].native_submission_present);
+        assert_eq!(repository.owner_discard("accepted", None, "obsolete", false, Utc::now())
+            .unwrap().unwrap_err(), OwnerDiscardError::ProtectedControl);
+        assert!(repository.owner_discard("accepted", Some(&"0".repeat(64)), "obsolete", true, Utc::now())
+            .unwrap().is_err());
+        let _ = capture_events(|| repository.owner_discard("accepted", before.semantic_sha256.as_deref(),
+            "owner inspected interrupted task", true, Utc::now()).unwrap().unwrap());
+        let after = repository.snapshot_by_message_id("accepted").unwrap().unwrap();
+        assert_eq!(after.state, "quarantined");
+        assert_eq!(after.external_input, before.external_input);
+        assert_eq!(after.local_inbox_receipt, before.local_inbox_receipt);
+        assert!(after.external_input_receipt.is_none());
+        assert!(repository.stuck_messages(0, NOW).unwrap().is_empty());
+        assert!(repository.suppress_native_delivery(TO, "accepted").unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn repo(name: &str) -> (AgentBusMessageRepository, PathBuf) {
         let root = std::env::temp_dir().join(format!(

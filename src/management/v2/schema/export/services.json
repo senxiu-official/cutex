@@ -4,6 +4,9 @@
   "title": "Services",
   "anyOf": [
     {
+      "$ref": "#/$defs/eligibleOwners"
+    },
+    {
       "$ref": "#/$defs/serviceList"
     },
     {
@@ -33,9 +36,39 @@
           "$ref": "#/$defs/settings"
         }
       }
+    },
+    {
+      "$ref": "#/$defs/tileAnswer"
     }
   ],
   "$defs": {
+    "eligibleOwner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "realName", "projectId", "isDirector", "online", "unnamed"],
+      "properties": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "realName": {"type": "string"},
+        "projectId": {"type": ["string", "null"]},
+        "isDirector": {"type": "boolean"},
+        "online": {"type": "boolean"},
+        "unnamed": {"type": "boolean"}
+      }
+    },
+    "eligibleOwners": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostId", "slug", "owners"],
+      "properties": {
+        "hostId": {"type": "string"},
+        "slug": {"type": "string"},
+        "owners": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/eligibleOwner"}
+        }
+      }
+    },
     "viewTicketRequest": {
       "type": "object",
       "additionalProperties": false,
@@ -175,6 +208,69 @@
             "persistent"
           ]
         },
+        "purpose": {
+          "description": "Persistent-service purpose. Known values are foreground and background; clients treat other strings as uncategorised.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idleTtlMinutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 5
+        },
+        "effectiveIdleTtlMinutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 5
+        },
+        "maxIdleTtlMinutes": {
+          "type": "integer",
+          "minimum": 60
+        },
+        "pinned": {
+          "type": "boolean",
+          "default": false
+        },
+        "groupName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "starred": {
+          "type": "boolean",
+          "default": false
+        },
+        "sortOrder": {
+          "type": "integer",
+          "default": 0
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hidden": {
+          "type": "boolean",
+          "default": false
+        },
+        "archived": {
+          "type": "boolean",
+          "default": false
+        },
+        "archivedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "link": {
           "type": "string"
         },
@@ -245,6 +341,32 @@
             "preserve",
             "upstream"
           ]
+        },
+        "tile": {
+          "$ref": "#/$defs/tile"
+        },
+        "tilePath": {
+          "$ref": "#/$defs/tilePath"
+        },
+        "ownerCutexSessionId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The registering cutex session (session services: their only agent manager)."
+        },
+        "projectId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ownerScope": {
+          "enum": [
+            "session",
+            "project"
+          ],
+          "description": "Capability services-project-scope. Absent on older hosts: session. project: also managed by the current Director of projectId and by the registrant while in that project."
         }
       }
     },
@@ -281,7 +403,8 @@
           "enum": [
             "idle",
             "ttl",
-            "owner_archived"
+            "owner_archived",
+            "project_archived"
           ]
         },
         "reclaimedAt": {
@@ -334,9 +457,11 @@
           "maximum": 65535
         },
         "ephemeralIdleMinutes": {
-          "type": "integer",
-          "minimum": 5,
-          "maximum": 1440,
+          "description": "Default idle TTL; 0 keeps ephemeral services until their owner is archived.",
+          "anyOf": [
+            { "const": 0 },
+            { "type": "integer", "minimum": 5, "maximum": 1440 }
+          ],
           "default": 30
         },
         "ephemeralTtlHours": {
@@ -408,6 +533,170 @@
           "items": {
             "$ref": "#/$defs/tombstone"
           }
+        }
+      }
+    },
+    "tilePath": {
+      "type": "string",
+      "pattern": "^/([^/\\s\\\\#][^\\s\\\\#]*)?$",
+      "maxLength": 512
+    },
+    "tile": {
+      "type": "object",
+      "description": "A validated home page tile template (capability service-tiles). Paths are inside the service.",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "subtitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "lines": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          }
+        },
+        "image": {
+          "$ref": "#/$defs/tilePath"
+        },
+        "progress": {
+          "type": "object",
+          "required": [
+            "value"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "value": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 40
+            }
+          }
+        },
+        "badge": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 12
+        },
+        "actions": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "path"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20
+              },
+              "path": {
+                "$ref": "#/$defs/tilePath"
+              }
+            }
+          }
+        },
+        "refreshSeconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 86400
+        },
+        "sizes": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "s",
+              "m",
+              "w",
+              "l"
+            ]
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "tileAnswer": {
+      "type": "object",
+      "description": "GET /v2/services/{slug}/tile",
+      "required": [
+        "tile",
+        "fetchedAt",
+        "error",
+        "source"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "tile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/tile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fetchedAt": {
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "code",
+                "message"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "service_stopped",
+                    "unreachable",
+                    "timeout",
+                    "too_large",
+                    "not_found",
+                    "http_status",
+                    "redirect_outside_service",
+                    "too_many_redirects",
+                    "invalid_response",
+                    "invalid_json",
+                    "invalid_tile"
+                  ]
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        },
+        "source": {
+          "enum": [
+            "static",
+            "service"
+          ]
         }
       }
     }

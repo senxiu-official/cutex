@@ -86,7 +86,7 @@ pub(super) fn dispatch(
             let params = allowed_params(
                 &request.params,
                 &["queueId", "expectedRevision"],
-                &["expectedTurnId", "ifIdle"],
+                &["expectedTurnId", "ifIdle", "joinDelegation"],
             )?;
             let queue_id = required_string_param(params, "queueId")?;
             let expected = required_safe_integer_param(params, "expectedRevision")?;
@@ -133,6 +133,9 @@ pub(super) fn dispatch(
                 cutex_session_id: session_id.to_string(),
                 thread_id: thread_id.to_string(),
                 params: UserInputSubmitParams {
+                                        join_delegation: params.get("joinDelegation")
+                        .map(super::user_input::parse_owner_join).transpose()
+                        .map_err(|message| invalid_user_input_error(&message))?,
                     client_user_message_id: item.client_user_message_id.clone(),
                     origin: item.origin.clone(),
                     strategy: UserInputStrategy::Auto,
@@ -143,6 +146,21 @@ pub(super) fn dispatch(
             // No queue mutation precedes native acceptance. Sending/unknown is
             // durably recorded by the backend; failed calls leave this item intact.
             let execution = steer(&command, start_if_idle, session)?;
+            if !execution.app_server_accepted
+                || !matches!((execution.disposition, execution.native_method.as_deref()),
+                    (UserInputDisposition::Steered, Some("turn/steer")) |
+                    (UserInputDisposition::Started, Some("turn/start"))) {
+                return Err(UserInputExecutionError {
+                    stage: "native_request".into(), code: "outcome_unknown".into(),
+                    message: "runtime did not return a valid acceptance receipt; the queued input was kept".into(),
+                    retryable: false, details: json!({}), outcome_unknown: true,
+                });
+            }
+            let image_delivery = super::user_input::image_steering::accepted_delivery(
+                &item.input,
+                session.pointer("/runtime/backend").and_then(Value::as_str) == Some("claude_subscription"),
+                &execution,
+            );
             let correlation = EventCorrelation {
                 thread_id: Some(command.thread_id.clone()),
                 turn_id: execution.turn_id.clone(),
@@ -157,7 +175,7 @@ pub(super) fn dispatch(
                 session_id,
                 correlation.clone(),
                 "cutex/userInput/submitted",
-                json!({
+                with_image_delivery(json!({
                     "managementRequestId": request.request_id,
                     "clientUserMessageId": item.client_user_message_id,
                     "origin": item.origin,
@@ -168,7 +186,7 @@ pub(super) fn dispatch(
                     "turnId": execution.turn_id,
                     "appServerAccepted": true,
                     "submittedAt": chrono::Utc::now().to_rfc3339(),
-                }),
+                }), image_delivery),
             )
             .map_err(post_operation_persistence_error)?;
             let removed = queue
@@ -182,23 +200,28 @@ pub(super) fn dispatch(
             let (revision, _) = queue
                 .list(session_id)
                 .map_err(post_operation_persistence_error)?;
-            append_cutex_event(events, session_id, correlation, "cutex/userInput/queueRemoved", json!({
+            append_cutex_event(events, session_id, correlation, "cutex/userInput/queueRemoved", with_image_delivery(json!({
                 "queueId": queue_id,
                 "clientUserMessageId": item.client_user_message_id,
                 "revision": removed.revision,
                 "queueRevision": revision,
                 "reason": if execution.disposition == UserInputDisposition::Steered { "steered" } else { "submitted" },
                 "removedAt": chrono::Utc::now().to_rfc3339(),
-            })).map_err(post_operation_persistence_error)?;
-            Ok(json!({
+            }), image_delivery)).map_err(post_operation_persistence_error)?;
+            Ok(with_image_delivery(json!({
                 "disposition": execution.disposition,
                 "turnId": execution.turn_id,
                 "clientUserMessageId": item.client_user_message_id,
                 "queueRevision": revision,
-            }))
+            }), image_delivery))
         }
         _ => unreachable!("not a queue order method"),
     }
+}
+
+fn with_image_delivery(mut value: Value, delivery: Option<&str>) -> Value {
+    if let Some(delivery) = delivery { value["imageDelivery"] = json!(delivery); }
+    value
 }
 
 fn move_error(error: anyhow::Error) -> UserInputExecutionError {
@@ -319,6 +342,7 @@ mod tests {
                     assert_eq!(command.params.client_user_message_id, "b");
                     assert_eq!(command.params.origin.client_id, "desktop");
                     Ok(UserInputSubmitExecution {
+                        join_refusal: None,
                         disposition: UserInputDisposition::Steered,
                         app_server_accepted: true,
                         native_request_id: Some(json!("native-1")),
@@ -350,6 +374,91 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn image_delivery_receipts_match_accepted_provider_mode_and_persisted_events() {
+        for (backend, method, disposition, mode) in [
+            ("claude_subscription", "turn/steer", UserInputDisposition::Steered, "pathText"),
+            ("native", "turn/steer", UserInputDisposition::Steered, "nativeImage"),
+            ("claude_subscription", "turn/start", UserInputDisposition::Started, "nativeImage"),
+        ] {
+            let f = Fixture::new();
+            let params = parse_user_input_submit_params(&json!({"clientUserMessageId":"images",
+                "origin":{"kind":"other","clientId":"desktop"},"strategy":"queue",
+                "input":[{"type":"text","text":"original"},{"type":"localImage","path":"/target/upload.png"}]})).unwrap();
+            f.queue.enqueue("session", "thread", "enqueue", &params).unwrap();
+            let item = f.list().1.remove(0);
+            let request = f.request(STEER_METHOD, json!({"queueId":item.queue_id,
+                "expectedRevision":item.revision,"ifIdle":"start"}));
+            let result = dispatch(&f.events, &f.queue, |command, _, _| {
+                assert_eq!(f.list().1.len(), 1, "queue remains until runtime success");
+                assert_eq!(command.params.input, params.input);
+                Ok(UserInputSubmitExecution { join_refusal:None, disposition,
+                    app_server_accepted:true, native_request_id:Some(json!("native-image")),
+                    native_method:Some(method.into()), turn_id:Some("turn".into()), queue:None, queue_paused:false })
+            }, "session", &json!({"native":{"threadId":"thread"},"runtime":{"backend":backend}}), &request).unwrap();
+            assert_eq!(result["imageDelivery"], mode);
+            assert!(f.list().1.is_empty());
+            let reopened = EventRepository::open(f.root.join("events"), crate::platform::host::current_host_name()).unwrap();
+            let page = reopened.page(super::super::repository::ReplayQuery {
+                cutex_session_id:Some("session".into()), ..Default::default()
+            }).unwrap();
+            let messages: Vec<_> = page.events.into_iter().filter_map(|event| event.cutex).collect();
+            for method in ["cutex/userInput/submitted", "cutex/userInput/queueRemoved"] {
+                let message = messages.iter().find(|event| event.method == method).unwrap();
+                assert_eq!(message.params["imageDelivery"], mode);
+                if method.ends_with("submitted") { assert_eq!(message.params["input"], json!(params.input)); }
+            }
+        }
+        let f = Fixture::new();
+        let item = f.enqueue("b");
+        let result = f.dispatch(&f.request(STEER_METHOD, json!({"queueId":item.queue_id,
+            "expectedRevision":item.revision,"ifIdle":"fail"}))).unwrap();
+        assert!(result.get("imageDelivery").is_none(), "text-only receipt stays unchanged");
+        assert!(f.events().iter().all(|event| event.params.get("imageDelivery").is_none()));
+    }
+
+    #[test]
+    fn unconfirmed_queue_steer_never_emits_a_success_receipt_or_removes_input() {
+        for failure in ["refused", "unknown", "unaccepted", "queued", "wrong-method"] {
+            let f = Fixture::new();
+            let item = f.enqueue("b");
+            let before = f.list();
+            let request = f.request(STEER_METHOD, json!({"queueId":item.queue_id,
+                "expectedRevision":item.revision,"ifIdle":"fail"}));
+            let result = dispatch(&f.events, &f.queue, |_,_,_| {
+                if matches!(failure, "refused" | "unknown") {
+                    return Err(UserInputExecutionError { stage:"native_request".into(),code:failure.into(),
+                        message:"fixture failure".into(),retryable:false,details:json!({}),outcome_unknown:failure=="unknown" });
+                }
+                Ok(UserInputSubmitExecution { join_refusal:None,
+                    disposition:if failure=="queued" { UserInputDisposition::Queued } else { UserInputDisposition::Steered },
+                    app_server_accepted:failure!="unaccepted", native_request_id:None,
+                    native_method:Some(if failure=="wrong-method" { "turn/start" } else { "turn/steer" }.into()),
+                    turn_id:Some("turn".into()),queue:None,queue_paused:false })
+            }, "session", &json!({"native":{"threadId":"thread"},"runtime":{"backend":"claude_subscription"}}), &request);
+            assert!(result.is_err(), "{failure}");
+            assert_eq!(f.list(), before, "{failure}");
+            assert!(f.events().is_empty(), "{failure}");
+        }
+    }
+
+    #[test]
+    fn explicit_owner_join_reaches_atomic_dispatch_and_removes_only_on_acceptance() {
+        let h = Fixture::new();
+        let item = h.enqueue("joined");
+        let join = json!({"askId":"ask-a", "attempt":2, "expectedTurnId":"turn", "runtimeGeneration":7});
+        let request = h.request(STEER_METHOD, json!({"queueId":item.queue_id,"expectedRevision":item.revision,"ifIdle":"fail","joinDelegation":join}));
+        let result = dispatch(&h.events, &h.queue, |command, start, _| {
+            assert!(!start);
+            assert_eq!(serde_json::to_value(command.params.join_delegation.as_ref().unwrap()).unwrap(), join);
+            Ok(UserInputSubmitExecution { join_refusal: None, disposition: UserInputDisposition::Steered,
+                app_server_accepted:true, native_request_id:Some(json!("native-joined")), native_method:Some("turn/steer".into()),
+                turn_id:Some("turn".into()),queue:None,queue_paused:false })
+        }, "session", &json!({"native":{"threadId":"thread"}}), &request).unwrap();
+        assert_eq!(result["disposition"], "steered");
+        assert!(h.list().1.is_empty());
     }
 
     #[test]

@@ -3,10 +3,41 @@ use anyhow::{Context, ensure};
 use cutex::platform::process::ProcessTerminateOutcome;
 use cutex::session::model::CutexSessionRecord;
 
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_stop_cleanup_does_not_record_requested_success() {
+        let id = format!("cutex.stop-auto-{}", uuid::Uuid::new_v4());
+        let mut record = CutexSessionRecord::new(id.clone(), None,
+            cutex::platform::host::current_host_name(), ".".into(), None).unwrap();
+        record.runtime_generation = 7;
+        assert!(stop_processes(&record, false).unwrap().stopped);
+        assert_eq!(cutex::session::runtime_stop::state(&id, 7), None);
+        record.runtime_pid = Some(1); // Unproven claim: refusal must not create intent either.
+        assert!(stop_processes(&record, false).is_err());
+        assert_eq!(cutex::session::runtime_stop::state(&id, 7), None);
+        record.runtime_pid = None;
+        cutex::session::runtime_stop::RequestedStop::run(&id, 7,
+            || stop_processes(&record, false), |outcome| outcome.stopped).unwrap();
+        assert_eq!(cutex::session::runtime_stop::state(&id, 7),
+            Some(cutex::session::runtime_stop::StopState::Offline));
+    }
+}
+
 pub(super) fn stop_and_commit(
     record: &CutexSessionRecord,
     force: bool,
 ) -> anyhow::Result<ProcessTerminateOutcome> {
+    let lane = cutex::management::v2::user_input::session_input_lock(&record.cutex_session_id)?;
+    let _operation = lane.reserve()?;
+    let current = cutex::session::store::load_cutex_session_store()?;
+    let current = current.sessions.get(&record.cutex_session_id)
+        .context("native stop session disappeared")?;
+    ensure!(current.runtime_generation == record.runtime_generation
+        && current.app_server_runtime == record.app_server_runtime,
+        "native owner changed before stop; owner unchanged");
     let outcome = stop_processes(record, force)?;
     if outcome.stopped {
         let _ = super::app_server_runtime::disconnect_runtime(&record.cutex_session_id);
@@ -20,6 +51,15 @@ pub(super) fn stop_and_commit(
 
 /// No SessionStore writes or manager joins: also usable inside an archive transaction.
 pub(super) fn stop_processes(
+    record: &CutexSessionRecord,
+    force: bool,
+) -> anyhow::Result<ProcessTerminateOutcome> {
+    // This primitive also serves crash recovery and failed-launch cleanup.
+    // Only the explicit lifecycle entry may record requested-stop evidence.
+    stop_processes_inner(record, force)
+}
+
+fn stop_processes_inner(
     record: &CutexSessionRecord,
     force: bool,
 ) -> anyhow::Result<ProcessTerminateOutcome> {

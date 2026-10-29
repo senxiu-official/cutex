@@ -1,7 +1,7 @@
 # cutex: build the release archives (cutex + cutex-mcp) for Linux x64 and Windows x64 and keep them as
-# workflow artifacts. Nothing is published from here and no signing key is in CI: the owner downloads
-# the artifacts (`gh run download`), writes and signs the release manifest offline (minisign) and
-# uploads everything to the GitHub Releases that cutex's backend updates read
+# workflow artifacts. Nothing is published from here and this build has no signing key. The separate
+# Sign release workflow checks and signs these artifacts with the release environment's minisign key,
+# then uploads everything to the GitHub Releases that cutex's backend updates read
 # (docs/backend-upgrade.md: tag cutex-<release>, channel-release).
 #
 # Release label: the `release` input, else the tag name without its leading `v` (v0.2.0 -> 0.2.0).
@@ -135,6 +135,9 @@ jobs:
         run: rustup toolchain install 1.95.0 --profile minimal && rustc +1.95.0 --version
       - name: Python 3.12 from the runner's tool cache (the system Python 3.10 cannot build the pinned wheels)
         run: bash .github/ci/component-e2e-pythons.sh
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "24.21.0"
       - name: Build and pack
         env:
           LEAK_POLICY: ${{ matrix.leak_policy }}
@@ -151,6 +154,37 @@ jobs:
           # GitHub's Windows images have `python`, not `python3`.
           if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
           "$py" .github/ci/components.py check "$NAME" "$VERSION" "$PLATFORM" "$RUNNER_TEMP/out" --commit "$(git rev-parse HEAD)"
+      - name: Compare Claude r32 with the existing immutable runtime bytes
+        if: matrix.name == 'claude-runtime' && matrix.version == 'claude-r32'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          case "$PLATFORM" in
+            linux-x64) expected=c210c9fc5a9f87b48b5dd2ec87cb2ac7777863b34288d1febb90ca8246c5dde2 ;;
+            windows-x64) expected=a17df7ad4ec6b8d9f0f812380effa2c60c5eaedee0cf8d9967906b400f993112 ;;
+            *) exit 1 ;;
+          esac
+          archive="$RUNNER_TEMP/out/component-claude-runtime-claude-r32-$PLATFORM.tar.gz"
+          got="$(sha256sum "$archive" | cut -d' ' -f1)"
+          [ "$got" = "$expected" ] || { echo "Claude r32 immutable archive mismatch: $got != $expected" >&2; exit 1; }
+      - name: Compare unchanged Job Service with its immutable published archive
+        if: matrix.name == 'job-service' && matrix.version == '0.1.1'
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q minisign
+          name=component-job-service-0.1.1-linux-x64.tar.gz
+          d="$RUNNER_TEMP/published-job-service"
+          mkdir -p "$d"
+          base="https://github.com/$REPO/releases/download/component-job-service-0.1.1"
+          curl -fsSL --retry 3 -o "$d/$name" "$base/$name"
+          curl -fsSL --retry 3 -o "$d/$name.minisig" "$base/$name.minisig"
+          minisign -V -p .github/ci/cutex-release.pub -m "$d/$name"
+          cmp "$RUNNER_TEMP/out/$name" "$d/$name"
+          echo 'Job Service 0.1.1 is byte-identical to its verified published archive'
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: component-${{ matrix.name }}-${{ matrix.platform }}

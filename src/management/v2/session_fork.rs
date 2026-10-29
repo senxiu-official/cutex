@@ -35,6 +35,8 @@ pub struct SessionForkRequest {
     pub after_turn_id: Option<String>,
     /// Name of the new agent; `None`: `"<source name> (fork)"`.
     pub name: Option<String>,
+    /// New profile of the same CLI kind and provider family; omitted keeps the source.
+    pub profile: Option<String>,
 }
 
 /// Default name of a fork; `taken` names get a numbered suffix.
@@ -64,7 +66,7 @@ pub(super) fn parse_params(params: &Value) -> Result<SessionForkRequest, UserInp
         .ok_or_else(|| invalid_user_input_error("params must be an object"))?;
     if let Some(key) = object
         .keys()
-        .find(|key| !matches!(key.as_str(), "afterTurnId" | "name"))
+        .find(|key| !matches!(key.as_str(), "afterTurnId" | "name" | "profile"))
     {
         return Err(invalid_user_input_error(&format!("unknown parameter {key}")));
     }
@@ -92,9 +94,25 @@ pub(super) fn parse_params(params: &Value) -> Result<SessionForkRequest, UserInp
             )))
         }
     };
+    let profile = match object.get("profile") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name))
+            if !name.trim().is_empty()
+                && name.len() <= 200
+                && !name.chars().any(char::is_control) =>
+        {
+            Some(name.trim().to_owned())
+        }
+        _ => {
+            return Err(invalid_user_input_error(
+                "profile must be a non-empty profile name or null",
+            ))
+        }
+    };
     Ok(SessionForkRequest {
         after_turn_id,
         name,
+        profile,
     })
 }
 
@@ -186,6 +204,17 @@ pub fn fork_result(cutex_session_id: &str, facts: &Value, session: Value) -> Val
         "name": field("name"),
         "session": session,
     });
+    for key in [
+        "profile",
+        "sourceProfile",
+        "historyBytes",
+        "coldCache",
+        "forkBoundaryNote",
+    ] {
+        if let Some(value) = facts.get(key) {
+            result[key] = value.clone();
+        }
+    }
     if let Some(warnings) = facts.get("warnings").filter(|warnings| warnings.is_array()) {
         result["warnings"] = warnings.clone();
     }
@@ -208,21 +237,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_profile_and_warning_facts_are_additive() {
+        assert_eq!(
+            parse_params(&json!({"profile":" target "}))
+                .unwrap()
+                .profile
+                .as_deref(),
+            Some("target")
+        );
+        for bad in [
+            json!({"profile":""}),
+            json!({"profile":42}),
+            json!({"profile":"bad\nname"}),
+        ] {
+            assert!(parse_params(&bad).is_err());
+        }
+        let mut facts = facts();
+        facts["historyBytes"] = json!(2048);
+        facts["coldCache"] = json!(true);
+        facts["profile"] = json!("target");
+        facts["forkBoundaryNote"] = json!("Source obligations belong to the source.");
+        let result = fork_result("source", &facts, json!({}));
+        assert_eq!(result["historyBytes"], 2048);
+        assert_eq!(result["coldCache"], true);
+        assert_eq!(result["profile"], "target");
+        super::super::contract_validation::validate_cutex_response(&json!({"contractVersion":2,"requestId":"fork-profile","cutexSessionId":"source","cutex":{"method":METHOD,"result":result}})).unwrap();
+    }
+
+    #[test]
+    fn unavailable_post_fork_size_preserves_a_successful_result_contract() {
+        let mut facts=facts();
+        let (size,warning)=crate::session::fork::optional_history_bytes(Err(anyhow::anyhow!("history index unavailable")));
+        facts["historyBytes"]=json!(size);
+        facts["warnings"]=json!(warning.into_iter().collect::<Vec<_>>());
+        let result=fork_result("source",&facts,json!({}));
+        assert!(result["historyBytes"].is_null());
+        assert!(result["newCutexSessionId"].is_string());
+        super::super::contract_validation::validate_cutex_response(&json!({"contractVersion":2,"requestId":"fork-size","cutexSessionId":"source","cutex":{"method":METHOD,"result":result}})).unwrap();
+    }
+
+    #[test]
     fn params_accept_optional_turn_and_name() {
         assert_eq!(
             parse_params(&json!({})).unwrap(),
-            SessionForkRequest { after_turn_id: None, name: None }
+            SessionForkRequest {
+                after_turn_id: None,
+                name: None,
+                profile: None
+            }
         );
         assert_eq!(
             parse_params(&json!({ "afterTurnId": " turn-2 ", "name": " Side quest " })).unwrap(),
             SessionForkRequest {
                 after_turn_id: Some("turn-2".into()),
+                profile: None,
                 name: Some("Side quest".into())
             }
         );
         assert_eq!(
             parse_params(&json!({ "afterTurnId": null, "name": null })).unwrap(),
-            SessionForkRequest { after_turn_id: None, name: None }
+            SessionForkRequest {
+                after_turn_id: None,
+                name: None,
+                profile: None
+            }
         );
         for bad in [
             json!({ "afterTurnId": "" }),

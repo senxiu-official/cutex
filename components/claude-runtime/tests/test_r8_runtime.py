@@ -140,10 +140,20 @@ async def test_agent_tool_inherits_policy_and_cannot_create_unbound_turns(ph):
     ph.store.db.execute('INSERT OR REPLACE INTO thread_tool_approvals VALUES(?,?)', (tid, 'default'))
     data = {'session_id': bridge.sid, 'tool_name': 'Agent', 'tool_input': {'prompt': 'analyze', 'run_in_background': False}}
     assert await bridge.pre_tool(data, 'agent', {}) == {}
-    # Leaving run_in_background out is a background subagent in newer Claude Code.
-    for args in [{'mode': 'bypassPermissions', 'run_in_background': False}, {'run_in_background': True}, {'prompt': 'analyze'}]:
-        denied = await bridge.pre_tool({**data, 'tool_input': args}, str(uuid.uuid4()), {})
-        assert denied['hookSpecificOutput']['permissionDecision'] == 'deny'
+    denied = await bridge.pre_tool({**data, 'tool_input': {'mode': 'bypassPermissions', 'run_in_background': False}},
+                                   str(uuid.uuid4()), {})
+    assert denied['hookSpecificOutput']['permissionDecision'] == 'deny'
+    # claude-r23: a background subagent (run_in_background true, or left out as newer Claude
+    # Code runs it in the background then) is admitted and remembered by its spawning call.
+    for args in [{'run_in_background': True}, {'prompt': 'analyze'}]:
+        call = str(uuid.uuid4())
+        assert await bridge.pre_tool({**data, 'tool_input': args}, call, {}) == {}
+        assert bridge.background_spawns[call] == bridge.binding
+    # A subagent's own subagents stay foreground.
+    child = {**data, 'agent_id': 'child', 'tool_input': {'prompt': 'nested'}}
+    bridge.children['child'] = bridge.binding
+    denied = await bridge.pre_tool(child, str(uuid.uuid4()), {})
+    assert 'foreground' in denied['hookSpecificOutput']['permissionDecisionReason']
     assert ph.sdk.clients[0].options.env['CLAUDE_CODE_HARBOR_KITE'] == '0'
 
 

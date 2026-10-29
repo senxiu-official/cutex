@@ -258,6 +258,7 @@ fn window_gauge(id: &str, window: &Value, observed_at: i64) -> Option<Gauge> {
         balance: None,
         reset_at: window.get("resetsAt").and_then(Value::as_i64).filter(|t| *t > 0),
         window_label: minutes.map(window_caption),
+        display_label: None,
         observed_at: Some(observed_at),
         stale: false,
         error: None,
@@ -282,6 +283,7 @@ fn credits_gauge(credits: &Value, observed_at: i64) -> Option<Gauge> {
         balance: Some(balance),
         reset_at: None,
         window_label: None,
+        display_label: None,
         observed_at: Some(observed_at),
         stale: false,
         error: None,
@@ -532,28 +534,29 @@ pub struct NativeRateLimitReader;
 
 impl RateLimitReader for NativeRateLimitReader {
     fn read(&self, account: &StoredAccount) -> Result<Value, String> {
-        use super::profile_login::LoginEndpointFactory;
-        let target = super::profile_login::login_target(account).map_err(|e| format!("{e:#}"))?;
-        let before = auth_stamp(&target.auth_path);
-        let result = super::profile_login::RuntimeLoginFactory
-            .spawn(&target)
-            .map_err(|error| format!("codex app-server unavailable: {error}"))
-            .and_then(|mut endpoint| {
-                endpoint
-                    .request(RATE_LIMITS_READ_METHOD, json!({ "excludeResetCreditDetails": true }))
-                    .map_err(|error| format!("{RATE_LIMITS_READ_METHOD} failed: {error}"))
-            });
-        // A token refresh rewrites auth.json (inherited ACLs on Windows,
-        // which owner launch rejects): restore Cutex's private custody.
-        if auth_stamp(&target.auth_path) != before {
-            if let Ok(files) = crate::profiles::materialize::materialized_account_files(account) {
-                if let Err(error) = crate::profiles::materialize::set_materialized_file_permissions(&files) {
-                    eprintln!("profile quota: could not re-secure profile auth file: {error:#}");
-                }
+        native_request(account, RATE_LIMITS_READ_METHOD, json!({ "excludeResetCreditDetails": true }))
+    }
+}
+
+/// One request to a short-lived app-server for the profile (no turn).
+pub fn native_request(account: &StoredAccount, method: &str, params: Value) -> Result<Value, String> {
+    use super::profile_login::LoginEndpointFactory;
+    let target = super::profile_login::login_target(account).map_err(|e| format!("{e:#}"))?;
+    let before = auth_stamp(&target.auth_path);
+    let result = super::profile_login::RuntimeLoginFactory
+        .spawn(&target)
+        .map_err(|error| format!("codex app-server unavailable: {error}"))
+        .and_then(|mut endpoint| endpoint.request(method, params).map_err(|error| format!("{method} failed: {error}")));
+    // A token refresh rewrites auth.json (inherited ACLs on Windows,
+    // which owner launch rejects): restore Cutex's private custody.
+    if auth_stamp(&target.auth_path) != before {
+        if let Ok(files) = crate::profiles::materialize::materialized_account_files(account) {
+            if let Err(error) = crate::profiles::materialize::set_materialized_file_permissions(&files) {
+                eprintln!("profile quota: could not re-secure profile auth file: {error:#}");
             }
         }
-        result
     }
+    result
 }
 
 fn auth_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {

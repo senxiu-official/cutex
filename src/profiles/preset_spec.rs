@@ -174,9 +174,8 @@ pub const SPECS: &[PresetSpec] = &[
         default_model: Some(crate::profiles::gemini::GEMINI_DEFAULT_MODEL),
         reasoning_effort: None,
         web_search: Some(crate::profiles::gemini::GEMINI_WEB_SEARCH),
-        // Google function declarations refuse mixed / typeless / nullable
-        // enums, which MCP tool schemas often carry.
-        tool_schema_compat: Some(crate::profiles::gemini::GEMINI_TOOL_SCHEMA_COMPAT),
+        // Opt-in after a schema rejection; do not override an existing choice.
+        tool_schema_compat: None,
         forced_login_api: false,
         catalog: PresetCatalog::None,
     },

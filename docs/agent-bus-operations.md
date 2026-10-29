@@ -1,5 +1,133 @@
 # Agent Bus operations
 
+## Uncertain active-message follow-up settlement
+
+Capability `agent-bus-message-settlement-v1` adds an optional `settlement` to
+message snapshots, stuck-message rows and `AdmissionNextStep` rows. Delivery
+facts stay separate. `outcome_unknown` says the adapter-assigned actual turn
+ended without a successful context-persisted receipt; neither output nor an
+empty receipt alone is enough. Closing ends owner follow-up, never claims
+delivery, non-delivery, successful handling, withdrawal or absence of effects.
+
+The initial collector supports ordinary active Claude messages on the audited
+`cute-claude-app-server` 0.8.5 interface. It does not start/recover an offline
+runtime. Passive notes, other runtimes without sufficient evidence, protected
+Task/Job/control/delegation internals, pending/running input, missing actual
+binding and conflicting/reverted history have no close eligibility. For busy
+input the explicit `contextTurnId` must identify the actual terminal turn;
+`turnId` can be only a reservation. Native and local payload digests differ
+and are independently checked. The adapter's attempt UUID is bookkeeping for
+the assigned turn, not a provider request ID. List reads never probe runtimes.
+
+The projection is:
+
+```json
+{
+  "state": "outcome_unknown",
+  "canClose": true,
+  "evidenceToken": "opaque-server-issued-token",
+  "evidence": {
+    "runtime": "claude", "runtimeGeneration": 7,
+    "threadId": "adapter-thread", "actualTurnId": "actual-turn",
+    "terminalStatus": "failed", "observedAt": "2026-10-27T00:00:00Z"
+  },
+  "closure": null
+}
+```
+
+Evidence has a 180-second lease. The observer refreshes bounded observations
+through controlled reconciliation; stale evidence does not permit closure.
+Optional background collection runs after the ordinary observer delivery/poll
+pass and only while the settlement capability is advertised. Agent and message
+cursors rotate fairly, with at most four messages and sixteen candidate visits
+per phase. Native RPCs share a 250ms allowance, at most 75ms per message;
+explicit owner collection keeps its independent 15-second proof budget.
+Repository reads, identity fences and sidecar writes still use blocking IO, so
+these limits are not a hard wall-clock bound for the entire observer pass.
+Sidecar write failure is logged without aborting ordinary delivery or inventing
+evidence. Failed or expired collection cannot authorize a close.
+Closed state survives expiry, offline runtimes and later valid delivery.
+Closure contains the authenticated actor, `closedAt`, reason and request ID.
+
+`POST /v2/agent-bus/stuck-messages/close` uses existing owner Management
+authentication and full device scope; agent credentials and non-owner/scoped
+device credentials cannot use it. The body accepts exactly:
+
+```json
+{
+  "messageId": "message-id",
+  "expectedEvidenceToken": "opaque-server-issued-token",
+  "requestId": "unique-owner-operation-id",
+  "reason": "Owner ended follow-up; outcome remains unknown"
+}
+```
+
+Byte limits are message ID 512, token 256, request ID 128 and reason 1024;
+all must be nonblank. The server records the trimmed reason but compares the
+exact request for idempotency. `200 {messageId,changed,settlement}` means the
+audit close is durable. Same request key/payload/authenticated actor replays
+with `changed:false`, including after restart or when the runtime is offline.
+Reusing a key for another payload, message or actor conflicts. Invalid input
+is 400, unauthorized is 403, unknown message is 404, stale/token/state/receipt
+or ineligible conflicts are 409, unavailable observation/storage is 503.
+
+Closure rechecks current facts on an already-running generation-fenced handle
+and repeats token/identity/lease checks under the business-store write lock.
+Runtime reads and the daemon commit are not one atomic snapshot. A receipt
+observed before close rejects it; a later receipt updates original delivery
+facts and retains the closure audit. The desktop refreshes conflicts and
+retains the same request key across uncertain-write recovery; it must not
+silently submit a new operation. It shows “关闭跟进，不代表送达或处理成功” with
+an inline confirmation, and only offers the action with the capability and
+server `canClose:true`.
+
+### Persistence and rollback compatibility
+
+All data uses `runtime/management-v2/management-state.sqlite3`, existing
+`hot_store_meta` / `hot_store_rows` tables and SQLite WAL transactions.
+
+- Rebuildable observations use namespace `agent_bus_settlement_evidence`,
+  collection `evidence`, row key message ID, row value `{version:1,record}`.
+  Namespace metadata has hot-store `format_version:1`. Record contains a
+  server token and versioned, content-free native/local/actual-turn evidence;
+  closure/request/audit are null and `pendingSessions` is empty. Unknown
+  versions/fields and close data in this namespace are rejected. The original
+  `agent_bus` message bytes, generation and format version do not change on
+  automatic observation. Older readers may ignore the namespace; it has no
+  delivery, retry, discard or admission authority by itself.
+- Only an authenticated owner close writes `settlement` in the original
+  `agent_bus` namespace, `message/<messageId>` row, and changes `state/version`
+  to **8 in the same transaction**. That record holds the complete evidence,
+  exact request, immutable audit (actor/time/reason/original state/identities,
+  request and evidence digests) and per-session notification outbox. Existing
+  r263/r264 readers reject version 8 instead of silently dropping closure or
+  redriving its original message. Closed audit/request rows are not aged out.
+- Close excludes the item from admission and resubmission but leaves receipt
+  reconciliation available. `cutex/agentBus/messageSettlementUpdated` carries
+  `{messageId,requestId,settlement}` to both session streams after commit.
+  Per-session outbox acknowledgment repairs partial publication after restart
+  or reads; a crash between publication and acknowledgment may repeat an event
+  with the same request ID, never another business close. Consumers apply the
+  projection idempotently and retain it when delivery events arrive later.
+
+Observation changes also publish `messageSettlementUpdated` after the sidecar
+commit, with `requestId` equal to the server evidence token (or a server
+notification UUID when clearing it). `settlement:null` explicitly clears only
+an unclosed observation. A known closure is never erased by null/stale replay
+or a later delivery event. Observation notifications are rebuildable: a lost
+publication is repaired on the next controlled refresh or authoritative
+bootstrap/list read. Both sent and received bootstrap rows expose the same
+projection. Actual owner closes use the durable per-session outbox above.
+
+Kit guards may allow only the exact observation namespace/version described
+above. `AgentBusMessageRepository::validate_settlement_observations_read_only`
+validates that sidecar. `validate_settlement_rollback_read_only` refuses bus
+format 8/closure before rollback writes; legacy export also refuses it. Thus
+automatic observation preserves pre-close rollback eligibility, while an
+actual close requires keeping the new reader. Back up the complete SQLite/WAL
+state before any rollback attempt. There is no implicit conversion of a close
+to discard or removal of audit to make an older writer accept it.
+
 Operator notes for the Agent Bus daemon (`cutex agent serve`): where its token
 comes from, its audit log, and how the owner settles messages that cannot be
 delivered.
@@ -164,8 +292,34 @@ cutex human bus-messages discard MESSAGE_ID --reason TEXT [--expected-sha256 HEX
 
 `--min-age` takes `30m`, `1h`, `2d`, seconds, or `0` for all.
 
+The list also includes `inbox_accepted` messages whose native context receipt
+is still missing. An explicit owner discard can quarantine these records,
+preserving their frozen input and receipt evidence. It does not retract an
+input already held by the runtime or claim that the model read it. Protected
+task/control records still require `--allow-protected`; use
+`--expected-sha256` to refuse a changed record.
+
 Older owner tools stay: `cutex human external-input analyze|release|discard`
 (pre-native `stale_held` only).
+
+## Idle delegation results and owner input (r263)
+
+Successful delegation results for an idle session batch for at most five seconds
+from the oldest pending delivery, including a cold cache. Shorter configured
+windows and disabled batching still apply. New arrivals and scheduler restarts
+cannot extend that cap. Questions, failures and turn-completion bypasses remain
+immediate; foreground-busy next-step timing is unchanged.
+
+When a native-capable Claude session is idle and the owner sends a new input,
+already-arrived delegation results are staged as authenticated passive external
+context before that owner turn starts. Their source, structured view, native
+identity and receipt remain separate from the owner's text. Pending or uncertain
+acceptance is not an acknowledgement; only the native context receipt identifies
+the consuming turn. A passive receipt never owns the turn admission slot.
+Paused/numbered work keeps its existing ordering, and unsupported runtimes retain
+the previous conservative path. A clearly oversized/full inbox can still prevent
+combined context; the owner's instruction remains deliverable and results remain
+available for explicit reading rather than being replayed.
 
 ## 4. Wake timing for a busy recipient (r217h1 / r217h2, typed in r220)
 

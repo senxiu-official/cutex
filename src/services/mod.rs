@@ -10,11 +10,13 @@
 //!   object / Unix process group) and kill the whole tree.
 
 pub mod agent_api;
+mod authority;
 pub mod health;
 pub mod process;
 pub mod proxy;
 pub mod store;
 pub mod supervisor;
+pub mod tile;
 pub mod traffic;
 
 pub use store::RegisterRequest;

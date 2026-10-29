@@ -24,6 +24,8 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
@@ -38,7 +40,7 @@ const APPROVAL_TTL_HOURS: i64 = 24;
 const RETENTION_DAYS: i64 = 7;
 const MAX_RECORDS: usize = 500;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalKind {
     /// `service_register|update` with a managed (cutex-run) command.
@@ -74,6 +76,15 @@ pub enum ApprovalState {
     /// Approved and used by the retried action.
     Consumed,
     Expired,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRisk {
+    Low,
+    #[default]
+    Medium,
+    High,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -112,6 +123,15 @@ pub struct ApprovalRecord {
     /// tell a call that already gave up from one still waiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<ApprovalWait>,
+    /// Host-computed risk; absent on records written before auto-rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<ApprovalRisk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_rule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_decision: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_revision: Option<u64>,
 }
 
 /// Who made an approval decision (`approval-decided-by`), so an unexpected
@@ -196,6 +216,9 @@ pub struct Waiter {
     pub duration: std::time::Duration,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
+    /// Authenticated runtime occurrence from the Agent Bus fence. Together
+    /// with `turn_id`, this binds turn-scoped automatic approval rules.
+    pub runtime_generation: Option<u64>,
     /// Cheap, checked every poll: the caller still waits for the answer
     /// (its connection is open).
     pub connected: Box<dyn Fn() -> bool + Send + Sync>,
@@ -211,6 +234,7 @@ impl Waiter {
         secs: u64,
         thread_id: Option<String>,
         turn_id: Option<String>,
+        runtime_generation: Option<u64>,
         connected: impl Fn() -> bool + Send + Sync + 'static,
         current: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Self {
@@ -218,6 +242,7 @@ impl Waiter {
             duration: std::time::Duration::from_secs(secs.min(APPROVAL_WAIT_SECS)),
             thread_id,
             turn_id,
+            runtime_generation,
             connected: Box::new(connected),
             current: Box::new(current),
             poll: std::time::Duration::from_millis(400),
@@ -451,13 +476,123 @@ pub fn request_digest(value: &Value) -> String {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct StoreFile {
+pub(crate) struct StoreFile {
     #[serde(default)]
-    approvals: Vec<ApprovalRecord>,
+    pub(crate) approvals: Vec<ApprovalRecord>,
+    #[serde(default)]
+    pub(crate) rules_revision: u64,
+    #[serde(default)]
+    pub(crate) approval_rules: Vec<crate::approval_rules::ApprovalRule>,
+    #[serde(default)]
+    pub(crate) approval_rule_audit: Vec<crate::approval_rules::ApprovalRuleAudit>,
+    #[serde(default)]
+    pub(crate) approval_rule_confirmations: Vec<crate::approval_rules::ConfirmationToken>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) director_rule_overrides:
+        BTreeMap<String, crate::approval_rules::DirectorRuleOverride>,
 }
 
 pub struct ApprovalStore {
+    pub(crate) path: PathBuf,
+}
+
+/// Only the owner rule-list projection is cached; gate/mutation paths never use it.
+/// Strong file identity plus change metadata detect cross-process replacements,
+/// including equal-size/equal-mtime files. Only one small projection is retained.
+#[derive(Clone, Default, Serialize)]
+pub(crate) struct RuleListSnapshot {
+    pub(crate) revision: u64,
+    pub(crate) rules: Vec<crate::approval_rules::ApprovalRule>,
+    pub(crate) director_overrides: BTreeMap<String, crate::approval_rules::DirectorRuleOverride>,
+}
+
+struct RuleListCache {
     path: PathBuf,
+    stamp: RuleListStamp,
+    // Unix allows replacement of an open object and retains it against inode
+    // reuse. Windows MoveFileEx can reject even share-delete metadata handles;
+    // Windows uses full 128-bit file ID plus creation/write/change times.
+    #[cfg(unix)]
+    _file: std::fs::File,
+    snapshot: RuleListSnapshot,
+}
+static RULE_LIST_CACHE: OnceLock<Mutex<Option<RuleListCache>>> = OnceLock::new();
+static RULE_LIST_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+const RULE_LIST_CACHE_MAX_PROJECTION_BYTES: usize = 1024 * 1024;
+
+fn rule_projection_fits(value: &impl Serialize) -> bool {
+    struct Limit(usize);
+    impl std::io::Write for Limit {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            if self.0 > RULE_LIST_CACHE_MAX_PROJECTION_BYTES {
+                return Err(std::io::Error::other("rule projection exceeds cache budget"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    serde_json::to_writer(Limit(0), value).is_ok()
+}
+
+#[derive(PartialEq, Eq)]
+struct RuleListStamp {
+    length: u64,
+    #[cfg(windows)]
+    identity: crate::platform::private_fs::FileIdentity,
+    #[cfg(windows)]
+    times: [i64; 3],
+    #[cfg(unix)]
+    identity: (u64, u64),
+    #[cfg(unix)]
+    times: [i64; 4],
+}
+
+fn rule_list_stamp(file: &std::fs::File) -> Option<RuleListStamp> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+        };
+        let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                (&mut info as *mut FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        Some(RuleListStamp {
+            length: file.metadata().ok()?.len(),
+            identity: crate::platform::private_fs::identity(file).ok()?,
+            times: [info.CreationTime, info.LastWriteTime, info.ChangeTime],
+        })
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let info = file.metadata().ok()?;
+        Some(RuleListStamp {
+            length: info.len(),
+            identity: (info.dev(), info.ino()),
+            times: [
+                info.mtime(),
+                info.mtime_nsec(),
+                info.ctime(),
+                info.ctime_nsec(),
+            ],
+        })
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = file;
+        None
+    }
 }
 
 pub(crate) fn timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -503,6 +638,122 @@ pub fn decision_needs_retry(kind: ApprovalKind) -> bool {
 }
 
 impl ApprovalStore {
+    /// Read-only lists observe one complete committed version without parsing
+    /// unrelated approval/audit history on a cache hit. Readers still wait for
+    /// an active writer through the existing store lock.
+    /// Validate the entire StoreFile on a miss, including history, so malformed
+    /// records retain the existing corruption error instead of being skipped.
+    pub(crate) fn rule_list_snapshot(&self) -> anyhow::Result<RuleListSnapshot> {
+        use std::io::Read;
+        // On Windows even a short metadata/read handle can block MoveFileEx.
+        // Share the existing approval lock for the open/read/stamp window only;
+        // all official writers hold it exclusively. Never parse under this lock.
+        let parent = self.path.parent().context("approval store has no directory")?;
+        std::fs::create_dir_all(parent)?;
+        let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(lock_path(&self.path))?;
+        FileExt::lock_shared(&lock).context("approval store read lock")?;
+        let mut file = match std::fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RuleListSnapshot::default())
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let stamp = rule_list_stamp(&file);
+        let cache = RULE_LIST_CACHE.get_or_init(|| Mutex::new(None));
+        let generation = {
+            let cached = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = cached
+                .as_ref()
+                .filter(|entry| entry.path == self.path && stamp.as_ref() == Some(&entry.stamp))
+            {
+                let snapshot = entry.snapshot.clone();
+                drop(cached);
+                #[cfg(windows)]
+                drop(file);
+                drop(lock);
+                return Ok(snapshot);
+            }
+            RULE_LIST_CACHE_GENERATION.load(Ordering::Relaxed)
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let after = rule_list_stamp(&file);
+        #[cfg(windows)]
+        drop(file); // Never pin a Windows replacement target in the cache.
+        drop(lock);
+        anyhow::ensure!(
+            stamp == after,
+            "approval store changed while reading; retry"
+        );
+        let store: StoreFile =
+            serde_json::from_slice(&bytes).context("approval store is corrupt")?;
+        let snapshot = RuleListSnapshot {
+            revision: store.rules_revision,
+            rules: store.approval_rules,
+            director_overrides: store.director_rule_overrides,
+        };
+        // Official stores have at most 500 owner rules. Never retain history,
+        // or an unbounded manually enlarged rule/role-override projection.
+        let cacheable = after.is_some() && snapshot.rules.len() <= 500
+            && snapshot.director_overrides.len() <= 4096
+            && rule_projection_fits(&snapshot);
+        let next = after
+            .filter(|_| cacheable)
+            .map(|stamp| RuleListCache {
+                path: self.path.clone(),
+                stamp,
+                #[cfg(unix)]
+                _file: file,
+                snapshot: snapshot.clone(),
+            });
+        let mut cached = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A cold reader must not replace a fresher projection published by an
+        // official write while it was parsing the old immutable file object.
+        if RULE_LIST_CACHE_GENERATION.load(Ordering::Relaxed) == generation {
+            *cached = next;
+            RULE_LIST_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(snapshot)
+    }
+
+    // Called only after an official changed write, while its existing file lock
+    // is held. The parsed store is authoritative; do not parse/clone history a
+    // second time. Failure merely drops the optimization, never the mutation.
+    fn refresh_rule_list_after_write(&self, store: &StoreFile) {
+        #[derive(Serialize)]
+        struct Projection<'a> {
+            revision: u64,
+            rules: &'a [crate::approval_rules::ApprovalRule],
+            director_overrides: &'a BTreeMap<String, crate::approval_rules::DirectorRuleOverride>,
+        }
+        let next = (|| {
+            if store.approval_rules.len() > 500 || store.director_rule_overrides.len() > 4096
+                || !rule_projection_fits(&Projection { revision: store.rules_revision,
+                    rules: &store.approval_rules, director_overrides: &store.director_rule_overrides }) {
+                return None;
+            }
+            let file = std::fs::File::open(&self.path).ok()?;
+            let stamp = rule_list_stamp(&file)?;
+            #[cfg(windows)]
+            drop(file);
+            Some(RuleListCache {
+                path: self.path.clone(), stamp,
+                #[cfg(unix)]
+                _file: file,
+                snapshot: RuleListSnapshot { revision: store.rules_revision,
+                    rules: store.approval_rules.clone(), director_overrides: store.director_rule_overrides.clone() },
+            })
+        })();
+        let mut cached = RULE_LIST_CACHE.get_or_init(|| Mutex::new(None)).lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *cached = next;
+        RULE_LIST_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn open_default() -> anyhow::Result<Self> {
         Ok(Self::at(store_path()?))
     }
@@ -511,7 +762,7 @@ impl ApprovalStore {
         Self { path: path.into() }
     }
 
-    fn with_store<T>(&self, mutate: impl FnOnce(&mut StoreFile) -> T) -> anyhow::Result<T> {
+    pub(crate) fn with_store<T>(&self, mutate: impl FnOnce(&mut StoreFile) -> T) -> anyhow::Result<T> {
         let parent = self
             .path
             .parent()
@@ -529,14 +780,15 @@ impl ApprovalStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => StoreFile::default(),
             Err(error) => return Err(error.into()),
         };
-        let before = serde_json::to_vec(&store.approvals)?;
+        let before = serde_json::to_vec(&store)?;
         let result = mutate(&mut store);
-        if serde_json::to_vec(&store.approvals)? != before {
+        if serde_json::to_vec(&store)? != before {
             crate::config::atomic::write_private_pretty_json_atomic(
                 &self.path,
                 &store,
                 "owner approvals",
             )?;
+            self.refresh_rule_list_after_write(&store);
         }
         Ok(result)
     }
@@ -567,9 +819,13 @@ impl ApprovalStore {
         now: DateTime<Utc>,
         consume: bool,
     ) -> anyhow::Result<GateOutcome> {
+        // Read role authority before taking the approval-store lock. This avoids
+        // an approval↔Agent Management lock inversion while still re-checking
+        // the current Director seat for every request.
+        let director_grant = crate::approval_rules::current_director_for(&request);
         self.with_store(|store| {
             expire_and_prune(&mut store.approvals, now);
-            let latest = store.approvals.iter_mut().rev().find(|record| {
+            let latest = store.approvals.iter().rposition(|record| {
                 record.requester_cutex_session_id == request.requester_cutex_session_id
                     && record.request_sha256 == request.request_sha256
                     && matches!(
@@ -577,18 +833,22 @@ impl ApprovalStore {
                         ApprovalState::Pending | ApprovalState::Approved | ApprovalState::Denied
                     )
             });
-            if let Some(record) = latest {
-                match record.state {
+            if let Some(index) = latest {
+                match store.approvals[index].state {
                     ApprovalState::Approved => {
                         if consume {
-                            record.state = ApprovalState::Consumed;
-                            record.consumed_at = Some(now.to_rfc3339());
+                            store.approvals[index].state = ApprovalState::Consumed;
+                            store.approvals[index].consumed_at = Some(now.to_rfc3339());
                         }
-                        return Ok(GateOutcome::Approved(record.clone()));
+                        return Ok(GateOutcome::Approved(store.approvals[index].clone()));
                     }
                     ApprovalState::Pending => {
+                        if let Some(record) = crate::approval_rules::auto_decide(store, &request, now, consume, director_grant.as_ref()) {
+                            store.approvals[index].state = ApprovalState::Expired;
+                            return Ok(GateOutcome::Approved(record));
+                        }
                         // An earlier call's hold is not this call's.
-                        let mut record = record.clone();
+                        let mut record = store.approvals[index].clone();
                         record.wait = None;
                         return Ok(GateOutcome::Pending {
                             record,
@@ -596,7 +856,7 @@ impl ApprovalStore {
                         });
                     }
                     ApprovalState::Denied => {
-                        return Ok(GateOutcome::DeniedEarlier(record.clone()))
+                        return Ok(GateOutcome::DeniedEarlier(store.approvals[index].clone()))
                     }
                     _ => {}
                 }
@@ -610,6 +870,10 @@ impl ApprovalStore {
                     "browser approval capacity"
                 );
             }
+            if let Some(record) = crate::approval_rules::auto_decide(store, &request, now, consume, director_grant.as_ref()) {
+                return Ok(GateOutcome::Approved(record));
+            }
+            let risk = crate::approval_rules::risk_for(&request);
             let record = ApprovalRecord {
                 approval_id: format!("apr-{}", uuid::Uuid::new_v4().simple()),
                 kind: request.kind,
@@ -627,6 +891,10 @@ impl ApprovalStore {
                 decided_by: None,
                 consumed_at: None,
                 wait: None,
+                risk: Some(risk),
+                matched_rule_id: None,
+                auto_decision: false,
+                rule_revision: None,
             };
             store.approvals.push(record.clone());
             Ok(GateOutcome::Pending {
@@ -658,9 +926,10 @@ impl ApprovalStore {
             request.kind == ApprovalKind::BrowserClaim,
             "browser claim kind required"
         );
+        let director_grant = crate::approval_rules::current_director_for(&request);
         self.with_store(|store| {
             expire_and_prune(&mut store.approvals, now);
-            if let Some(record) = store.approvals.iter_mut().rev().find(|r| {
+            if let Some(index) = store.approvals.iter().rposition(|r| {
                 r.kind == ApprovalKind::BrowserClaim
                     && r.requester_cutex_session_id == request.requester_cutex_session_id
                     && r.request_sha256 == request.request_sha256
@@ -674,26 +943,41 @@ impl ApprovalStore {
                 // cannot transfer to its replacement: ask the owner again.
                 // Denials stay sticky for this session/device generation.
                 let binding_changed = ["threadId", "runtimeGeneration"].iter()
-                    .any(|key| record.details[*key] != request.details[*key]);
-                let changed = binding_changed && record.state != ApprovalState::Denied;
-                if changed {
-                    if record.state == ApprovalState::Approved {
-                        record.state = ApprovalState::Pending;
-                        record.decided_at = None;
-                        record.decided_by = None;
-                        record.consumed_at = None;
-                        record.note = None;
+                    .any(|key| store.approvals[index].details[*key] != request.details[*key]);
+                if binding_changed && store.approvals[index].auto_decision {
+                    // Rule matches stay bound to the runtime/turn facts that were approved.
+                    store.approvals[index].state = ApprovalState::Expired;
+                } else {
+                    let changed = binding_changed && store.approvals[index].state != ApprovalState::Denied;
+                    if changed {
+                        if store.approvals[index].state == ApprovalState::Approved {
+                            store.approvals[index].state = ApprovalState::Pending;
+                            store.approvals[index].decided_at = None;
+                            store.approvals[index].decided_by = None;
+                            store.approvals[index].consumed_at = None;
+                            store.approvals[index].note = None;
+                        }
+                        for key in ["threadId", "runtimeGeneration"] {
+                            store.approvals[index].details[key] = request.details[key].clone();
+                        }
                     }
-                    for key in ["threadId", "runtimeGeneration"] {
-                        record.details[key] = request.details[key].clone();
+                    if store.approvals[index].state == ApprovalState::Pending && !store.approvals[index].auto_decision {
+                        if let Some(record) = crate::approval_rules::auto_decide(store, &request, now, false, director_grant.as_ref()) {
+                            store.approvals[index].state = ApprovalState::Expired;
+                            return Ok((record, true));
+                        }
                     }
+                    return Ok((store.approvals[index].clone(), changed));
                 }
-                return Ok((record.clone(), changed));
             }
             anyhow::ensure!(
                 make_browser_room(&mut store.approvals),
                 "browser approval capacity"
             );
+            if let Some(record) = crate::approval_rules::auto_decide(store, &request, now, false, director_grant.as_ref()) {
+                return Ok((record, true));
+            }
+            let risk = crate::approval_rules::risk_for(&request);
             let record = ApprovalRecord {
                 approval_id: format!("apr-{}", uuid::Uuid::new_v4().simple()),
                 kind: request.kind,
@@ -711,6 +995,10 @@ impl ApprovalStore {
                 decided_by: None,
                 consumed_at: None,
                 wait: None,
+                risk: Some(risk),
+                matched_rule_id: None,
+                auto_decision: false,
+                rule_revision: None,
             };
             store.approvals.push(record.clone());
             Ok((record, true))
@@ -1051,11 +1339,28 @@ impl ApprovalStore {
 /// notice).
 pub fn gate_with_wait(
     store: &ApprovalStore,
-    request: ApprovalRequest,
+    mut request: ApprovalRequest,
     waiter: Option<&Waiter>,
     on_requested: impl FnOnce(&ApprovalRecord),
     on_undelivered: impl FnOnce(&ApprovalRecord),
 ) -> anyhow::Result<GateOutcome> {
+    // This metadata comes from the authenticated Agent Bus fence, not the
+    // model payload. It is added before auto-rule matching. Older façades
+    // without a waiter simply cannot match a turn-scoped rule.
+    if let (Some(waiter), Some(details)) = (waiter, request.details.as_object_mut()) {
+        if let Some(thread) = &waiter.thread_id {
+            details.insert("threadId".into(), serde_json::Value::String(thread.clone()));
+        }
+        if let Some(turn) = &waiter.turn_id {
+            details.insert("turnId".into(), serde_json::Value::String(turn.clone()));
+        }
+        if let Some(generation) = waiter.runtime_generation {
+            details.insert(
+                "runtimeGeneration".into(),
+                serde_json::Value::from(generation),
+            );
+        }
+    }
     let now = Utc::now();
     let outcome = store.gate(request, now)?;
     let GateOutcome::Pending { record, created } = &outcome else {
@@ -1262,6 +1567,183 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         (ApprovalStore::at(dir.join("approvals.json")), dir)
+    }
+
+    #[test]
+    fn rule_snapshot_detects_same_size_same_timestamp_replacement_and_corruption() {
+        let (store, dir) = store("rule-cache");
+        store.with_store(|data| data.rules_revision = 1).unwrap();
+        assert_eq!(store.rule_list_snapshot().unwrap().revision, 1);
+        let modified = std::fs::metadata(&store.path).unwrap().modified().unwrap();
+        let length = std::fs::metadata(&store.path).unwrap().len();
+        // Simulate a writer outside this process's publication path: otherwise
+        // with_store would refresh our cache and hide a weak stamp check.
+        let mut replacement = std::fs::read(&store.path).unwrap();
+        let revision = b"\"rules_revision\": 1";
+        let position = replacement.windows(revision.len()).position(|bytes| bytes == revision).unwrap();
+        replacement[position + revision.len() - 1] = b'2';
+        let replacement_path = dir.join("replacement.json");
+        std::fs::write(&replacement_path, replacement).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement_path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        std::fs::rename(&replacement_path, &store.path).unwrap();
+        assert_eq!(std::fs::metadata(&store.path).unwrap().len(), length);
+        assert_eq!(
+            std::fs::metadata(&store.path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(store.rule_list_snapshot().unwrap().revision, 2);
+        let mut corrupt = std::fs::read(&store.path).unwrap();
+        corrupt[0] = b'!';
+        std::fs::write(&store.path, corrupt).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&store.path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(store
+            .rule_list_snapshot()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("approval store is corrupt"));
+        std::fs::remove_file(&store.path).unwrap();
+        let missing = store.rule_list_snapshot().unwrap();
+        assert_eq!(missing.revision, 0);
+        assert!(missing.rules.is_empty());
+        std::fs::write(
+            &store.path,
+            br#"{"rules_revision":3,"approvals":[{"invalid":true}]}"#,
+        )
+        .unwrap();
+        assert!(
+            store.rule_list_snapshot().is_err(),
+            "unrelated malformed history must still fail validation"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rule_snapshot_external_writer_child() {
+        let Some(path) = std::env::var_os("CUTEX_TEST_RULE_SNAPSHOT_CHILD") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        assert!(path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("cutex-approvals-rule-cache-"));
+        let store = ApprovalStore::at(path);
+        store
+            .with_store(|data| data.rules_revision = 7)
+            .unwrap();
+        // This child runs alone: no other test can evict its single-entry cache.
+        // A normal approval mutation must publish its new file stamp without
+        // requiring the next list GET to deserialize history again.
+        store.gate(request("cache-refresh-after-gate"), Utc::now()).unwrap();
+        let file = std::fs::File::open(&store.path).unwrap();
+        let stamp = rule_list_stamp(&file);
+        if let Some(stamp) = stamp {
+            let cached = RULE_LIST_CACHE.get().unwrap().lock().unwrap_or_else(|p| p.into_inner());
+            let entry = cached.as_ref().expect("official write must refresh the rule projection");
+            assert_eq!(entry.path, store.path);
+            assert_eq!(entry.snapshot.revision, 7);
+            assert!(entry.stamp == stamp);
+        }
+    }
+
+    #[test]
+    fn rule_snapshot_observes_another_process_and_never_reuses_a_different_path() {
+        let (store, dir) = store("rule-cache");
+        store.with_store(|data| data.rules_revision = 1).unwrap();
+        assert_eq!(store.rule_list_snapshot().unwrap().revision, 1);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "approvals::tests::rule_snapshot_external_writer_child",
+                "--nocapture",
+            ])
+            .env("CUTEX_TEST_RULE_SNAPSHOT_CHILD", &store.path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(store.rule_list_snapshot().unwrap().revision, 7);
+        let other = ApprovalStore::at(dir.join("other.json"));
+        other.with_store(|data| data.rules_revision = 9).unwrap();
+        assert_eq!(other.rule_list_snapshot().unwrap().revision, 9);
+        assert_eq!(store.rule_list_snapshot().unwrap().revision, 7);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rule_snapshot_large_history_is_read_without_rewriting() {
+        let (store, dir) = store("rule-cache-size");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = serde_json::to_vec(
+            &json!({"rules_revision":12,"futurePadding":"x".repeat(17 * 1024 * 1024)}),
+        )
+        .unwrap();
+        std::fs::write(&store.path, &bytes).unwrap();
+        assert_eq!(store.rule_list_snapshot().unwrap().revision, 12);
+        assert_eq!(store.rule_list_snapshot().unwrap().revision, 12);
+        assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rule_snapshot_does_not_retain_an_unbounded_rule_projection() {
+        let (store, dir) = store("rule-cache-projection");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rule = json!({"ruleId":"large","enabled":true,
+            "subject":{"type":"agent","cutexSessionId":"cutex.fixture","displayName":"x".repeat(RULE_LIST_CACHE_MAX_PROJECTION_BYTES + 1)},
+            "kinds":["browser_open"],"constraints":{},"expiry":{"mode":"revoked"},
+            "revision":1,"createdAt":"2026-10-25T00:00:00Z","updatedAt":"2026-10-25T00:00:00Z","createdBy":"fixture"});
+        std::fs::write(&store.path, serde_json::to_vec(&json!({"approval_rules":[rule]})).unwrap()).unwrap();
+        assert_eq!(store.rule_list_snapshot().unwrap().rules.len(), 1);
+        let cached = RULE_LIST_CACHE.get().unwrap().lock().unwrap_or_else(|p| p.into_inner());
+        assert!(cached.as_ref().is_none_or(|entry| entry.path != store.path));
+        drop(cached);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rule_snapshot_warm_and_cold_reads_wait_out_atomic_writes_without_pinning_json() {
+        let (store, dir) = store("rule-cache-lock");
+        store.with_store(|data| data.rules_revision = 1).unwrap();
+        for (cold, revision) in [(false, 2), (true, 3)] {
+            if cold {
+                *RULE_LIST_CACHE.get().unwrap().lock().unwrap_or_else(|p| p.into_inner()) = None;
+                RULE_LIST_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+            }
+            let lock = OpenOptions::new().read(true).write(true).open(lock_path(&store.path)).unwrap();
+            lock.lock_exclusive().unwrap();
+            let path = store.path.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                tx.send(ApprovalStore::at(path).rule_list_snapshot().map(|value| value.revision)).unwrap();
+            });
+            assert!(matches!(rx.recv_timeout(std::time::Duration::from_millis(50)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                "a GET must not open/pin the JSON while its official writer holds the store lock");
+            let data = StoreFile { rules_revision: revision, ..Default::default() };
+            crate::config::atomic::write_private_pretty_json_atomic(&store.path, &data, "synthetic approval replacement").unwrap();
+            store.refresh_rule_list_after_write(&data);
+            drop(lock);
+            assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap().unwrap(), revision);
+            reader.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn request(digest: &str) -> ApprovalRequest {
@@ -1609,6 +2091,7 @@ mod tests {
             1,
             Some("thread-1".into()),
             Some("turn-1".into()),
+            Some(1),
             move || connected.load(Ordering::SeqCst),
             move || current.load(Ordering::SeqCst),
         );

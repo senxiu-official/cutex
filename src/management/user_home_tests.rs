@@ -92,6 +92,7 @@ fn home_shape_and_size_rules() {
             {"hostId": "host-a", "kind": "service", "key": "web"},
             {"hostId": "host-b", "kind": "url", "key": "https://example.com", "title": "Example", "size": "w"},
             {"hostId": "host-b", "kind": "agent", "key": "cutex.a", "title": null, "size": null},
+            {"hostId": "host-b", "kind": "page", "key": "project-view:proj-1", "title": "Project", "size": "m"},
         ],
         "coverEtag": "client-supplied",
         "unknownTopLevel": [1, 2, 3],
@@ -127,6 +128,12 @@ fn home_shape_and_size_rules() {
         json!({"pins": too_many_pins}),
         json!({"pins": [{"kind": "service", "key": "k"}]}),
         pin(json!({"kind": "folder"})),
+        pin(json!({"kind": "page", "key": "no-separator"})),
+        pin(json!({"kind": "page", "key": "project-view:"})),
+        pin(json!({"kind": "page", "key": ":proj-1"})),
+        pin(json!({"kind": "page", "key": "Project-View:proj-1"})),
+        pin(json!({"kind": "page", "key": "9view:proj-1"})),
+        pin(json!({"kind": "page", "key": format!("{}:x", "a".repeat(65))})),
         pin(json!({"key": ""})),
         pin(json!({"size": "xl"})),
         pin(json!({"title": "t".repeat(201)})),
@@ -135,6 +142,12 @@ fn home_shape_and_size_rules() {
         assert_eq!((error.status, error.code), (400, "invalid_home"), "{bad}");
     }
     assert!(validate_home(&json!({"bio": "x".repeat(MAX_BIO_CHARS)})).is_ok(), "200 characters fit");
+    for good in ["project-view:proj-1", "a:b", "project-view.view:host:proj", &format!("{}:x", "a".repeat(64))] {
+        assert!(valid_page_key(good), "{good}");
+        assert!(validate_home(&pin(json!({"kind": "page", "key": good}))).is_ok(), "{good}");
+    }
+    // The page key rule only applies to page pins.
+    assert!(validate_home(&pin(json!({"kind": "service", "key": "no-separator"}))).is_ok());
     assert!(validate_home(&json!({"bio": "字".repeat(MAX_BIO_CHARS)})).is_ok(), "characters, not bytes");
 
     let big = json!({"notes": "x".repeat(MAX_HOME_BYTES)});
@@ -193,4 +206,20 @@ fn cover_uploads_parse_with_the_cover_limit() {
     let data = base64::engine::general_purpose::STANDARD.encode(png(300, 100));
     assert_eq!(parse_cover_upload(&json!({"contentType": "image/png", "data": data})).unwrap().bytes, png(300, 100));
     assert_eq!(parse_cover_upload(&json!({"data": "x"})).unwrap_err().code, "invalid_cover");
+}
+
+#[test]
+fn page_pins_follow_the_exported_schema() {
+    let schema = crate::management::v2::schema_export::validator("users", "homePin").unwrap();
+    for (pin, valid) in [
+        (json!({"hostId": "h", "kind": "page", "key": "project-view:proj-1"}), true),
+        (json!({"hostId": "h", "kind": "page", "key": "no-page-id"}), false),
+        (json!({"hostId": "h", "kind": "page", "key": "Project:proj-1"}), false),
+        (json!({"hostId": "h", "kind": "page", "key": "project-view:"}), false),
+        (json!({"hostId": "h", "kind": "url", "key": "no-page-id"}), true),
+    ] {
+        assert_eq!(schema.is_valid(&pin), valid, "schema: {pin}");
+        assert_eq!(validate_home(&json!({"pins": [pin.clone()]})).is_ok(), valid, "host: {pin}");
+    }
+    assert!(PIN_KINDS.contains(&"page"));
 }

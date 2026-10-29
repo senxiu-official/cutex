@@ -29,7 +29,8 @@ pub struct DocumentSettings {
     /// Closed delegations, finished agent messages and their documents stay
     /// this long before they are archived.
     pub closed_retention_days: u32,
-    /// Archived months are deleted after this many days (0 keeps them).
+    /// Archived months are deleted after this many days (0 keeps them, the
+    /// default since r252: owner decision 2026-10-23; was 365).
     pub archive_retention_days: u32,
     /// One owner reminder about an open delegation idle this long (0: off).
     pub idle_reminder_days: u32,
@@ -46,7 +47,7 @@ impl Default for DocumentSettings {
             preview_bytes: 800,
             quota_bytes: 1024 * 1024 * 1024,
             closed_retention_days: 30,
-            archive_retention_days: 365,
+            archive_retention_days: 0,
             idle_reminder_days: 14,
             upload_grace_hours: 24,
             sweep_interval_hours: 6,
@@ -164,6 +165,9 @@ mod tests {
         assert_eq!(broken.effective().preview_bytes, 800);
         let view = settings.view();
         assert_eq!(view["documents"]["closedRetentionDays"], 30);
+        assert_eq!(view["documents"]["archiveRetentionDays"], 0, "the archive is kept by default since r252");
+        // An explicit value (an owner setting, or a block an older release wrote) still applies.
+        assert_eq!(settings.patched(&serde_json::json!({"archiveRetentionDays": 365})).unwrap().archive_retention_days, 365);
         assert_eq!(view["documentsRange"]["archiveRetentionDays"], serde_json::json!([0, 3650]));
     }
 }

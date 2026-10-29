@@ -55,6 +55,12 @@ impl AskLimits {
         let Ok(path) = crate::config::paths::config_dir().map(|dir| dir.join("config.json")) else {
             return Self::default();
         };
+        Self::load_from_path(&path)
+    }
+
+    /// The same raw-file parser used at runtime, with an explicit path for
+    /// offline callers/tests that must not resolve or mutate the user's home.
+    pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
         std::fs::read(path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())

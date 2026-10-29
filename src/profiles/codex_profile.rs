@@ -26,6 +26,48 @@ pub const WEB_SEARCH_VALUES: &[&str] = &["disabled", "cached", "indexed", "live"
 /// values, for providers whose function declarations refuse mixed, typeless
 /// or nullable enums. Older natives ignore the key.
 pub const TOOL_SCHEMA_COMPAT_VALUES: &[&str] = &["off", "strict"];
+/// Root keys cute-codex reads for generated-image history trimming: at each
+/// turn start, when the history holds more than `max_inline` generated
+/// images, all but the newest `keep` are replaced in the model request by a
+/// short placeholder with the saved file path. Unset = off. Natives without
+/// the feature ignore the keys.
+pub const IMAGE_HISTORY_MAX_INLINE_KEY: &str = "generated_image_history_max_inline";
+pub const IMAGE_HISTORY_KEEP_KEY: &str = "generated_image_history_keep";
+/// `keep` range; `max_inline` runs from `keep + 1` to [`IMAGE_HISTORY_MAX_INLINE_MAX`].
+pub const IMAGE_HISTORY_KEEP_RANGE: std::ops::RangeInclusive<u64> = 1..=50;
+pub const IMAGE_HISTORY_MAX_INLINE_MAX: u64 = 500;
+
+/// Profile `imageHistoryTrim` (both root keys set together; off = neither).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageHistoryTrim {
+    pub max_inline: u64,
+    pub keep: u64,
+}
+
+impl ImageHistoryTrim {
+    /// `keep` in 1..=50, `max_inline` in (keep+1)..=500.
+    pub fn validate(&self) -> Result<(), String> {
+        if !IMAGE_HISTORY_KEEP_RANGE.contains(&self.keep) {
+            return Err(format!(
+                "keep must be {}..{}",
+                IMAGE_HISTORY_KEEP_RANGE.start(),
+                IMAGE_HISTORY_KEEP_RANGE.end()
+            ));
+        }
+        if self.max_inline <= self.keep || self.max_inline > IMAGE_HISTORY_MAX_INLINE_MAX {
+            return Err(format!(
+                "maxInline must be {}..{} (greater than keep)",
+                self.keep + 1,
+                IMAGE_HISTORY_MAX_INLINE_MAX
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "maxInline": self.max_inline, "keep": self.keep })
+    }
+}
 /// Provider-table path of the native r53 switch that sends base instructions
 /// in the top-level Responses `instructions` field instead of a `developer`
 /// input message (D4). Unset = native default (false). Natives before r53
@@ -42,6 +84,8 @@ pub struct CodexProfileConfigSnapshot {
     pub update_plan_enabled: Option<bool>,
     pub web_search: Option<String>,
     pub tool_schema_compat: Option<String>,
+    /// Both root keys present; a lone key reads as off (null).
+    pub image_history_trim: Option<ImageHistoryTrim>,
     pub model_catalog_json: Option<String>,
     pub model_context_window: Option<u64>,
     pub model_auto_compact_token_limit: Option<u64>,
@@ -69,6 +113,8 @@ pub struct CodexProfileConfigPatch {
     pub update_plan_enabled: ConfigValueUpdate<bool>,
     pub web_search: ConfigValueUpdate<String>,
     pub tool_schema_compat: ConfigValueUpdate<String>,
+    /// Clear removes both root keys.
+    pub image_history_trim: ConfigValueUpdate<ImageHistoryTrim>,
     pub model_catalog_json: ConfigValueUpdate<String>,
     pub model_context_window: ConfigValueUpdate<u64>,
     pub model_auto_compact_token_limit: ConfigValueUpdate<u64>,
@@ -96,6 +142,7 @@ impl CodexProfileConfigPatch {
             && matches!(self.update_plan_enabled, ConfigValueUpdate::Unchanged)
             && matches!(self.web_search, ConfigValueUpdate::Unchanged)
             && matches!(self.tool_schema_compat, ConfigValueUpdate::Unchanged)
+            && matches!(self.image_history_trim, ConfigValueUpdate::Unchanged)
             && matches!(self.model_catalog_json, ConfigValueUpdate::Unchanged)
             && matches!(self.model_context_window, ConfigValueUpdate::Unchanged)
             && matches!(self.model_auto_compact_token_limit, ConfigValueUpdate::Unchanged)
@@ -137,6 +184,13 @@ pub fn inspect_codex_profile_config(
         update_plan_enabled: optional_nested_bool(&root, &UPDATE_PLAN_ENABLED_PATH)?,
         web_search: optional_string(&root, "web_search")?,
         tool_schema_compat: optional_string(&root, "tool_schema_compat")?,
+        image_history_trim: match (
+            optional_provider_u64(Some(&root), IMAGE_HISTORY_MAX_INLINE_KEY)?,
+            optional_provider_u64(Some(&root), IMAGE_HISTORY_KEEP_KEY)?,
+        ) {
+            (Some(max_inline), Some(keep)) => Some(ImageHistoryTrim { max_inline, keep }),
+            _ => None,
+        },
         model_catalog_json: optional_string(&root, "model_catalog_json")?,
         model_context_window: optional_provider_u64(Some(&root), "model_context_window")?,
         model_auto_compact_token_limit: optional_provider_u64(
@@ -219,6 +273,27 @@ pub fn apply_codex_profile_config_patch(
         );
     }
     apply_optional_string(&mut root, "tool_schema_compat", &patch.tool_schema_compat, false)?;
+    match &patch.image_history_trim {
+        ConfigValueUpdate::Unchanged => {}
+        ConfigValueUpdate::Clear => {
+            root.remove(IMAGE_HISTORY_MAX_INLINE_KEY);
+            root.remove(IMAGE_HISTORY_KEEP_KEY);
+        }
+        ConfigValueUpdate::Set(trim) => {
+            trim.validate()
+                .map_err(|error| anyhow::anyhow!("imageHistoryTrim: {error}"))?;
+            apply_optional_u64(
+                &mut root,
+                IMAGE_HISTORY_MAX_INLINE_KEY,
+                &ConfigValueUpdate::Set(trim.max_inline),
+            )?;
+            apply_optional_u64(
+                &mut root,
+                IMAGE_HISTORY_KEEP_KEY,
+                &ConfigValueUpdate::Set(trim.keep),
+            )?;
+        }
+    }
     apply_optional_string(
         &mut root,
         "model_catalog_json",

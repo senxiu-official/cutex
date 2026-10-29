@@ -31,10 +31,15 @@ from .sdk_runtime import RuntimeOwner, TurnInterrupted, OutcomeUncertain, system
 from .inputs import sdk_user_message
 from .side_chats import BOUNDARY_BLOCKS as SIDE_BOUNDARY_BLOCKS
 from .model_config import ModelConfig
+from .live_settings import Compaction
 from .model_observations import ModelObservations
+from .mcp_recovery import RecoveringSdkClient, cancelled_host_tool_result
 
 from .subagent_transcripts import SubagentTranscripts
-from .native_tools import EDIT_TOOLS, OWNER_DECLINED, OWNER_STOPPED, UNANSWERED_PERMISSION, NativeTools, PlanState, exclusions, external_mcp_tool, interrupted_item
+from .native_tools import (COMMAND_TOOLS, EDIT_TOOLS, OWNER_DECLINED, OWNER_STOPPED, UNANSWERED_PERMISSION, NativeTools,
+                           PlanState, bypass_safety_denial, command_spec, exclusions, external_mcp_allowed,
+                           external_mcp_tool, interrupted_item, preview)
+from .safety_grants import BLOCKED_EVENT, UPDATED_EVENT
 from . import permission_rules
 from .approvals import is_allowed
 
@@ -44,6 +49,25 @@ MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 SDK_TARGET = '0.2.166'
 SERVER_NAME = 'cutex'
 CALL_FIELD = '_cutex_invocation'
+# Tools a subagent may use in plan mode (besides MCP tools).
+PLAN_SUBAGENT_TOOLS = frozenset({'Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch', 'AskUserQuestion',
+                                 'Agent', 'Task', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet'})
+# A main-agent tool call outside any cutex turn: Claude Code's own turn for a
+# background task's notification. The message keeps the old prefix (logs, tests).
+NO_TURN_TOOLS = ('No active turn accepts tools. This is Claude Code\'s own turn for a background task '
+                 'notification: the user does not see it and it cannot use tools. Reply in one line and end '
+                 'the turn; cutex sends you the result as a visible message, act on it there.')
+# Background subagents (claude-r23): admitted by agent id after their turn ends.
+MAX_BACKGROUND = 64
+BACKGROUND_NO_HOST_TOOLS = ('cutex tools are not available to a background subagent. Finish without them and say '
+                            'in your final reply what the main agent should do with them.')
+BACKGROUND_NO_AGENTS = 'A background subagent cannot start subagents. Do the work yourself.'
+BACKGROUND_NO_QUESTIONS = ('A background subagent cannot ask the user. Make a reasonable choice or stop, and say '
+                           'in your final reply what needs the user.')
+BACKGROUND_NEEDS_APPROVAL = ('This tool call needs approval, and a background subagent cannot ask for it. Do not '
+                             'retry it or work around it: finish without it and say in your final reply which step '
+                             'needs approval. The main agent can do it itself or use a foreground subagent '
+                             '(run_in_background: false).')
 
 
 def field(obj: Any, key: str, default: Any = None) -> Any:
@@ -114,6 +138,17 @@ def refresh_retry_delays() -> tuple[float, ...]:
     return tuple(d for d in delays if 0 <= d <= 600)[:5]
 
 
+HISTORY_SIGNATURE_REJECTION = ('The account rejected encrypted reasoning or a thinking signature in conversation history. '
+    'The session history is preserved; nothing was stripped or deleted. Use an account that accepts this history, '
+    'or start a new conversation.')
+
+
+def history_signature_rejected(texts) -> bool:
+    # Native error diagnostics only, bounded and never echoed: provider text may contain secrets.
+    pattern = r'(?:thinking|redacted_thinking|reasoning).{0,100}signature|signature.{0,100}(?:thinking|reasoning)|encrypted.{0,80}(?:reasoning|content|decrypt)'
+    return any(isinstance(text, str) and re.search(pattern, text[:8192], re.I | re.S) for text in texts)
+
+
 class SdkResponseError(ProviderError):
     """A recognized SDK failure, with only adapter-authored diagnostic text."""
     transient_refresh = False
@@ -130,7 +165,9 @@ class SdkResponseError(ProviderError):
         texts = [field(block, 'text', '') for block in field(message, 'content', [])]
         if code == 'server_error' and any(isinstance(text, str) and re.search(r'\b529\b|overloaded', text, re.I) for text in texts):
             self.codex_error_info = 'serverOverloaded'
-        if account:
+        if code == 'invalid_request' and history_signature_rejected(texts):
+            text = HISTORY_SIGNATURE_REJECTION
+        elif account:
             hint = ' Check the API key and base URL.' if code == 'authentication_failed' else ''
             text = f'{api_error_subject(account)} rejected the request ({code}).{hint}'
         elif any(isinstance(text, str) and REFRESH_LOCK_TEXT.search(text) for text in texts):
@@ -147,7 +184,9 @@ class SdkResponseError(ProviderError):
             self.codex_error_info = 'unauthorized'
             text = 'Official Claude OAuth refresh failed. Check the official CLI login/refresh state.'
         else:
-            text = f'Official Claude returned an error ({code}). You may submit a fresh instruction; the failed input is not automatically retried.'
+            # The prefix is what cutex's quota detection matches (quota_continue::quota_error_text).
+            text = (f'Official Claude returned an error ({code}). You may submit a fresh instruction. This runtime '
+                    'does not retry it itself; cutex may requeue delegations once the limit resets.')
         super().__init__(text)
 
 
@@ -288,8 +327,37 @@ class OfficialSdkDriver:
             sdk_tools.append(self.sdk.SdkMcpTool(name=tool.name, description=tool.description,
                 input_schema=schema, handler=handler))
         server = self.sdk.create_sdk_mcp_server(name=SERVER_NAME, version='0.3.0', tools=sdk_tools)
+        async def background_permission(name, args, context, call_id, agent_id):
+            """A background subagent's permission request: no turn can show an
+            approval, so it is declined; under full access a safety block is
+            recorded on the origin turn and may be granted once, as in a turn."""
+            if name == 'AskUserQuestion':
+                return self.sdk.PermissionResultDeny(message=BACKGROUND_NO_QUESTIONS)
+            if name.startswith(f'mcp__{SERVER_NAME}__'):
+                return self.sdk.PermissionResultDeny(message=BACKGROUND_NO_HOST_TOOLS)
+            if engine.permissions.effective_mode(tid) != 'bypassPermissions':
+                return self.sdk.PermissionResultDeny(message=BACKGROUND_NEEDS_APPROVAL)
+            safety = getattr(engine, 'safety_grants', None)
+            used = safety.consume(tid, name, args, call_id) if safety is not None and call_id else None
+            if used is not None:
+                await engine.emit(tid, UPDATED_EVENT, {'threadId': tid, 'block': used})
+                return self.sdk.PermissionResultAllow(updated_input=args)
+            reason = getattr(context, 'title', None) or getattr(context, 'decision_reason', None)
+            reason = reason if isinstance(reason, str) and reason.strip() else None
+            message = bypass_safety_denial(reason)
+            if safety is not None and call_id and isinstance(args, dict):
+                origin = bridge.background.get(agent_id, (None, None))[0]
+                command = (command_spec(name, args, engine.settings.workspace)[0] if name in COMMAND_TOOLS
+                           else f"{name} {json.dumps(preview(args, 2048), ensure_ascii=False)}")
+                block = safety.record(tid, origin, call_id, name, args, command,
+                                      reason or 'Claude Code asked for approval of this tool call.')
+                await engine.emit(tid, BLOCKED_EVENT, {'threadId': tid, 'turnId': origin, 'itemId': call_id, 'block': block})
+            return self.sdk.PermissionResultDeny(message=message)
         async def permission_request(name, args, context):
             call_id = field(context, 'tool_use_id')
+            background = bridge.background_agent(call_id, field(context, 'agent_id'))
+            if background is not None:
+                return await background_permission(name, args, context, call_id, background)
             # In-process MCP also has the one-use PreToolUse grant. Older SDK
             # callbacks can omit context.tool_use_id, without weakening this
             # correlation to the authenticated native call.
@@ -430,11 +498,13 @@ class OfficialSdkDriver:
                  'CLAUDE_CODE_HARBOR_KITE': '0',
                  # Memory is cutex's (project memory in the append): Claude Code's own,
                  # account-local auto memory stays off for every Claude agent.
-                 'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'},
+                 'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1',
+                 # This model's auto-compaction when the profile sets it apart from the launch values.
+                 **(engine.compaction.child_env(thread['model']) if hasattr(engine, 'compaction') else {})},
             stderr=lambda line: None,  # Do not inherit raw CLI diagnostics on public stderr.
 
         )
-        return self.sdk.ClaudeSDKClient(options=options), bridge
+        return RecoveringSdkClient(self.sdk.ClaudeSDKClient(options=options)), bridge
 
 
 class SdkToolBridge:
@@ -451,6 +521,13 @@ class SdkToolBridge:
         self.host_tasks: set[asyncio.Task] = set()
         self.children: dict[str, tuple] = {}
         self.call_agents: dict[str, str | None] = {}
+        # Background subagents (claude-r23): spawning Agent call id -> origin binding
+        # until the task-start frame names the child, then child agent id -> origin
+        # binding, and the child's tool-call ids. Unlike `children`, revoke() keeps
+        # them: the child runs on after its turn ends, until its task ends.
+        self.background_spawns: dict[str, tuple[str, str]] = {}
+        self.background: dict[str, tuple[str, str]] = {}
+        self.background_calls: dict[str, str] = {}
         self.context_hooks: set[str] = set()
         if turn_id is not None:
             self.begin_turn(turn_id)
@@ -510,6 +587,58 @@ class SdkToolBridge:
             return False
         return call_id is None or (call_id in self.call_agents and self.call_agents[call_id] == agent)
 
+    def adopt_background(self, agent_id: Any, call_id: Any, backgrounded: bool = True) -> tuple[str, str] | None:
+        """The task-start frame ties a child agent to a background spawn of ours."""
+        if not isinstance(agent_id, str) or not agent_id or len(agent_id) > 256:
+            return None
+        if agent_id in self.background:
+            return self.background[agent_id]
+        origin = self.background_spawns.pop(call_id, None) if isinstance(call_id, str) else None
+        if origin is None or not backgrounded or len(self.background) >= MAX_BACKGROUND:
+            return None
+        self.background[agent_id] = origin
+        self.children.pop(agent_id, None)
+        return origin
+
+    def background_agent(self, call_id: Any, agent_id: Any) -> str | None:
+        """The background child a permission request belongs to, if any."""
+        if isinstance(agent_id, str) and agent_id in self.background:
+            owner = self.background_calls.get(call_id) if isinstance(call_id, str) else None
+            return agent_id if owner in (None, agent_id) else None
+        owner = self.background_calls.get(call_id) if isinstance(call_id, str) else None
+        return owner if owner in self.background and not agent_id else None
+
+    async def background_pre_tool(self, data: dict, tool_use_id: str | None) -> dict:
+        """A background child's tool call: admitted by its agent id, with or without a turn."""
+        agent_id = data['agent_id']
+        if data.get('session_id') != self.sid:
+            return self.denied('Native session or child context identity mismatch')
+        name = data.get('tool_name', '')
+        call_id = tool_use_id or data.get('tool_use_id')
+        if not isinstance(call_id, str) or not call_id:
+            return self.denied('Missing native tool-call ID')
+        if self.background_calls.get(call_id, agent_id) != agent_id or call_id in self.call_agents:
+            return self.denied('Native tool-call identity belongs to another agent')
+        if name in {'Agent', 'Task'}:
+            return self.denied(BACKGROUND_NO_AGENTS)
+        if name == 'AskUserQuestion':
+            return self.denied(BACKGROUND_NO_QUESTIONS)
+        if name.startswith(f'mcp__{SERVER_NAME}__'):
+            return self.denied(BACKGROUND_NO_HOST_TOOLS)
+        if self.engine.permissions.planning(self.tid) and name not in PLAN_SUBAGENT_TOOLS and not name.startswith('mcp__'):
+            return self.denied('Plan mode allows read-only subagent tools')
+        external = external_mcp_tool(self.engine.settings, name)
+        if name in exclusions(self.engine.settings) or (name.startswith('mcp__') and not external):
+            return self.denied('Tool is not enabled by this runtime configuration')
+        if external and not external_mcp_allowed(self.engine.settings, *external):
+            return self.denied('This MCP tool is turned off for this agent')
+        while len(self.background_calls) >= 4096:
+            self.background_calls.pop(next(iter(self.background_calls)))
+        self.background_calls[call_id] = agent_id
+        if getattr(self.engine, 'subagents', None) is not None:
+            await self.engine.subagents.child_tool(agent_id, call_id)
+        return {}
+
     def permission_context_valid(self, call_id, agent_id) -> bool:
         if not self.accepting or call_id not in self.call_agents:
             return False
@@ -521,7 +650,7 @@ class SdkToolBridge:
     async def subagent_start(self, data, tool_use_id, context):
         agent_id = data.get('agent_id')
         if (data.get('session_id') != self.sid or not self.accepting or not self.binding
-                or not isinstance(agent_id, str) or not agent_id or len(agent_id) > 256):
+                or not isinstance(agent_id, str) or not agent_id or len(agent_id) > 256 or agent_id in self.background):
             return {}
         self.children[agent_id] = self.binding
         owner = getattr(self.engine.driver, 'owners', {}).get(self.tid)
@@ -531,6 +660,12 @@ class SdkToolBridge:
 
     async def subagent_stop(self, data, tool_use_id, context):
         agent_id = data.get('agent_id')
+        if isinstance(agent_id, str) and agent_id in self.background and data.get('session_id') == self.sid:
+            # Kept until its task ends: a late tool hook of the child stays admitted.
+            owner = getattr(self.engine.driver, 'owners', {}).get(self.tid)
+            if owner:
+                await owner.tasks.child_stopped(agent_id)
+            return {}
         if not self.callback_valid(data) or agent_id not in self.children:
             return {}
         self.children.pop(agent_id, None)
@@ -540,9 +675,13 @@ class SdkToolBridge:
         return {}
 
     async def pre_tool(self, data: dict, tool_use_id: str | None, context: Any) -> dict:
+        if data.get('agent_id') and data.get('agent_id') in self.background:
+            return await self.background_pre_tool(data, tool_use_id)
         binding = self.binding
         if binding is None or not self.accepting:
-            return self.denied('No active turn accepts tools')
+            # Claude Code's own notification turn (or a call after the turn ended):
+            # no cutex turn owns it (docs/BUSY_DELIVERY.md, "Claude Code's notification turn").
+            return self.denied(NO_TURN_TOOLS)
         if not self.callback_valid(data):
             return self.denied('Native session or child context identity mismatch')
         full_name = data.get('tool_name', '')
@@ -555,19 +694,21 @@ class SdkToolBridge:
         self.call_agents[call_id] = agent_id
         if agent_id and getattr(self.engine, 'subagents', None) is not None:
             await self.engine.subagents.child_tool(agent_id, call_id)
+        background = False
         if full_name in {'Agent', 'Task'}:
             arguments = data.get('tool_input', {})
             if not isinstance(arguments, dict):
                 return self.denied('Invalid subagent arguments')
             # Newer Claude Code runs a subagent in the background unless the call says otherwise, so
-            # only an explicit `run_in_background: false` is a foreground subagent.
-            if arguments.get('run_in_background') is not False:
-                return self.denied('Use foreground subagents: pass run_in_background: false. Autonomous background agent turns cannot be attributed to an adapter input.')
+            # only an explicit `run_in_background: false` is a foreground subagent (claude-r23:
+            # background ones run on after the turn; a subagent's own subagents stay foreground).
+            background = arguments.get('run_in_background') is not False
+            if background and agent_id:
+                return self.denied('A subagent can only start foreground subagents: pass run_in_background: false.')
             if arguments.get('mode') not in (None, self.engine.permissions.effective_mode(self.tid)):
                 return self.denied('Subagents must inherit the parent permission mode')
-        if agent_id and self.engine.permissions.planning(self.tid) and full_name not in {
-                'Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch', 'AskUserQuestion',
-                'Agent', 'Task', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet'} and not full_name.startswith('mcp__'):
+        if agent_id and self.engine.permissions.planning(self.tid) and full_name not in PLAN_SUBAGENT_TOOLS \
+                and not full_name.startswith('mcp__'):
             return self.denied('Plan mode allows read-only subagent tools')
         if full_name == 'AskUserQuestion':
             args = data.get('tool_input', {})
@@ -580,9 +721,14 @@ class SdkToolBridge:
         if not full_name.startswith('mcp__') or external_mcp_tool(self.engine.settings, full_name):
             # Native tools and host-selected external MCP tools: observed, never run here.
             decision = await self.native.start(full_name, data.get('tool_input', {}), tool_use_id or data.get('tool_use_id'))
-            if (full_name in {'Agent', 'Task'} and not agent_id and decision == {}
-                    and getattr(self.engine, 'subagents', None) is not None):
-                await self.engine.subagents.start(self.tid, self.sid, binding[0], call_id, data.get('tool_input', {}))
+            if full_name in {'Agent', 'Task'} and not agent_id and decision == {}:
+                if getattr(self.engine, 'subagents', None) is not None:
+                    await self.engine.subagents.start(self.tid, self.sid, binding[0], call_id, data.get('tool_input', {}),
+                                                      background=background)
+                if background:
+                    while len(self.background_spawns) >= MAX_BACKGROUND:
+                        self.background_spawns.pop(next(iter(self.background_spawns)))
+                    self.background_spawns[call_id] = binding
             return decision
 
         prefix = f'mcp__{SERVER_NAME}__'
@@ -620,6 +766,15 @@ class SdkToolBridge:
         self.host_tasks.add(task)
         try:
             return await task
+        except asyncio.CancelledError:
+            # Cancelling the host child (stop/revoke/turn teardown) does not
+            # cancel this MCP request task. Letting that child's cancellation
+            # escape kills mcp 2.2's entire server task group, including sibling
+            # tools, and SDK 0.2.166 then stays stopped until a new initialize.
+            # Preserve cancellation aimed at this request/connection itself.
+            if asyncio.current_task().cancelling():
+                raise
+            return cancelled_host_tool_result()
         finally:
             self.host_tasks.discard(task)
 
@@ -723,7 +878,11 @@ class SubscriptionEngine(Engine):
         self.reset_launch_model = os.environ.get('CUTEX_CLAUDE_RESET_LAUNCH_MODEL') == '1'
         self.launch_models_applied: set[str] = set()
         self.model_observations = ModelObservations(store)
+        # Auto-compaction per model (cutex's profile table and launch values; live_settings).
+        self.compaction = Compaction()
         self.subagents = SubagentTranscripts(self)
+        # Background subagent usage for turns still running (add_task_usage).
+        self.pending_task_usage: dict[str, list[dict]] = {}
         store.db.execute('''CREATE TABLE IF NOT EXISTS sdk_sessions(
             thread_id TEXT PRIMARY KEY REFERENCES threads(id), session_id TEXT NOT NULL UNIQUE,
             attempted INTEGER NOT NULL DEFAULT 0, last_status TEXT NOT NULL DEFAULT 'allocated')''')
@@ -732,6 +891,35 @@ class SubscriptionEngine(Engine):
         store.db.execute('CREATE TABLE IF NOT EXISTS thread_launch_models(thread_id TEXT PRIMARY KEY REFERENCES threads(id), model TEXT NOT NULL)')
         # Claude Code fast mode per thread (a `fastMode` flag setting at connect).
         store.db.execute('CREATE TABLE IF NOT EXISTS thread_fast_mode(thread_id TEXT PRIMARY KEY REFERENCES threads(id), enabled INTEGER NOT NULL)')
+
+    async def add_task_usage(self, tid: str, turn_id: str, task_id: str, usage: dict) -> None:
+        """G9, best effort: a background subagent's model usage (its messages' usage,
+        summed per API message) is added to its origin turn as a `modelRequests`
+        entry of kind `background-task`. The thread's `total` then grows once, so
+        cutex's usage ledger counts it under the session's profile. An origin turn
+        still running takes it with its Result."""
+        entry = {'kind': 'background-task', 'taskId': task_id[:256], 'outcome': 'received', 'usage': usage,
+                 'billingScope': 'background-subagent-messages-estimate'}
+        row = self.store.db.execute('SELECT state FROM turns WHERE id=? AND thread_id=?', (turn_id, tid)).fetchone()
+        if row is None:
+            return
+        if row[0] == 'inProgress':
+            self.pending_task_usage.setdefault(turn_id, []).append(entry)
+            return
+        await self._append_turn_usage(tid, turn_id, [entry])
+
+    async def _flush_task_usage(self, tid: str, turn_id: str) -> None:
+        """A turn that ended without its Result keeps the background usage it was given."""
+        pending = self.pending_task_usage.pop(turn_id, [])
+        if pending:
+            await self._append_turn_usage(tid, turn_id, pending)
+
+    async def _append_turn_usage(self, tid: str, turn_id: str, entries: list[dict]) -> None:
+        row = self.store.db.execute('SELECT usage FROM turns WHERE id=?', (turn_id,)).fetchone()
+        record = json.loads(row[0]) if row and row[0] else {}
+        calls = list(record.get('modelRequests') or []) + entries
+        self.store.db.execute('UPDATE turns SET usage=? WHERE id=?', (dump({**record, 'modelRequests': calls}), turn_id))
+        await self._emit_usage(tid, turn_id, calls, keep_last=True)
 
     def ensure_launch_thread(self, tid: str, model: str, cwd: str, instructions: str) -> bool:
         """Apply changed host launch defaults only while the native owner is offline.
@@ -794,13 +982,19 @@ class SubscriptionEngine(Engine):
         row = self.store.db.execute('SELECT effort FROM thread_efforts WHERE thread_id=?', (tid,)).fetchone()
         return row[0] if row else self.settings.effort
 
-    async def set_model_effort(self, tid: str, model: str, effort, fast: bool | None = None) -> None:
+    async def set_model_effort(self, tid: str, model: str, effort, fast: bool | None = None, *, live: bool = False) -> None:
+        """`live` (a CLI that takes these on the running child, live_settings): applied to the running
+        child, also while a turn runs. Otherwise a model change alone goes live and an effort / fast mode
+        change (or a model change that changes auto-compaction) replaces the idle child."""
         if fast is not None and fast == self.thread_fast(tid):
             fast = None
-        if effort == self.thread_effort(tid) and fast is None:
+        owner = self.driver.owners.get(tid) if getattr(self.driver, 'persistent', False) else None
+        if live and owner is not None and not owner.task.done():
+            await owner.set_model_effort(model, effort, fast, live=True)
+            return
+        if effort == self.thread_effort(tid) and fast is None and not self.compaction.differs(self.store.thread(tid)['model'], model):
             await self.set_model(tid, model)
             return
-        owner = self.driver.owners.get(tid) if getattr(self.driver, 'persistent', False) else None
         if owner is None or owner.task.done():
             if effort == self.thread_effort(tid) and model == self.store.thread(tid)['model']:
                 # Fast mode alone, runtime offline: the next connect applies it.
@@ -861,12 +1055,18 @@ class SubscriptionEngine(Engine):
                 connection_generation=owner.native_connection_generation, selection_id=owner.model_selection_id):
             await self.emit(tid, 'claude/model/observed', self.model_status(tid))
 
-    async def set_model(self, tid: str, model: str) -> None:
-        if self.store.thread(tid)['model'] == model:
+    async def set_model(self, tid: str, model: str, *, live: bool = False) -> None:
+        current = self.store.thread(tid)['model']
+        if current == model:
             return
         owner = self.driver.owners.get(tid) if getattr(self.driver, 'persistent', False) else None
         if owner is None:
             raise RpcError(-32009, 'Start the Claude runtime before changing model')
+        if live or self.compaction.differs(current, model):
+            # Live: the model and its auto-compaction together. Otherwise a model whose auto-compaction
+            # differs needs a new child (the environment is read at start).
+            await owner.set_model_effort(model, self.thread_effort(tid), live=live)
+            return
         await owner.set_model(model)
 
     async def _interrupt_before_close(self, tid: str) -> None:
@@ -986,12 +1186,19 @@ class SubscriptionEngine(Engine):
         last_call: dict = {}
 
         async def begin_text(index: int) -> dict:
+            old = pending.pop(index, None)
+            if old is not None:
+                await finish_text(old)
             item = {'type': 'agentMessage', 'id': identifier(), 'text': '', 'phase': 'commentary',
                     'memoryCitation': None, 'delivery': None, 'questions': None}
             pending[index] = item
             self.store.put_item(turn_id, item)
             await self.emit(tid, 'item/started', {'threadId': tid, 'turnId': turn_id, 'item': item})
             return item
+
+        async def finish_text(item: dict) -> None:
+            self.store.put_item(turn_id, item)
+            await self.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})
 
         # One Claude thinking block = one Codex `reasoning` item. Claude 4+
         # never returns the raw chain of thought: with display "summarized" the
@@ -1074,13 +1281,31 @@ class SubscriptionEngine(Engine):
                 kind, index = event.get('type'), event.get('index', 0)
                 block_type = event.get('content_block', {}).get('type') if kind == 'content_block_start' else None
                 delta_type = event.get('delta', {}).get('type') if kind == 'content_block_delta' else None
-                if block_type == 'text':
-                    await begin_text(index)
+                if kind == 'message_start':
+                    # A new native message may reuse every content-block index.
+                    # Close any unconfirmed previous blocks before reusing them.
+                    for item in list(pending.values()):
+                        await finish_text(item)
+                    pending.clear()
+                    for item in list(reasoning.values()):
+                        await finish_reasoning(item)
+                    reasoning.clear()
+                    streamed.clear()
+                elif block_type == 'text':
+                    item = await begin_text(index)
+                    initial = event['content_block'].get('text', '')
+                    if isinstance(initial, str) and initial:
+                        item['text'] = initial
+                        await self.emit(tid, 'item/agentMessage/delta', {'threadId': tid, 'turnId': turn_id, 'itemId': item['id'], 'delta': initial}, durable=False)
                 elif block_type in {'thinking', 'redacted_thinking'}:
                     item = await begin_reasoning(index)
                     if block_type == 'redacted_thinking':
                         # Encrypted thinking: an empty item still shows that and how long Claude reasoned.
                         redacted.add(item['id'])
+                    else:
+                        initial = event['content_block'].get('thinking', '')
+                        if isinstance(initial, str) and initial:
+                            await reasoning_delta(item, initial)
                 elif delta_type == 'text_delta':
                     item = pending.get(index) or await begin_text(index)
                     chunk = event['delta']['text']
@@ -1105,7 +1330,12 @@ class SubscriptionEngine(Engine):
                 await self.observe_model(tid, turn_id, message)
                 usage = field(message, 'usage')
                 if isinstance(usage, dict):
-                    last_call = usage_counts(usage) or last_call
+                    counts = usage_counts(usage)
+                    if counts and counts != last_call:
+                        # Context occupancy after each model request, while the
+                        # turn runs (claude-r22): not only at its terminal result.
+                        last_call = counts
+                        await self._emit_usage(tid, turn_id, usage_calls, last=last_call)
                 content = field(message, 'content', [])
                 for block in content:
                     if message_type(block) in {'ThinkingBlock', 'thinking'}:
@@ -1127,7 +1357,11 @@ class SubscriptionEngine(Engine):
                                 await self.emit(tid, 'item/completed', {'threadId':tid,'turnId':turn_id,'item':item})
                                 last_item = item
                             continue
-                        matched = next((i for i, item in pending.items() if item['text'] == text), None)
+                        # Canonical text can differ from the streamed prefix.
+                        # Match text blocks in their native arrival order, not
+                        # by prose or absolute indices (the SDK drops redacted
+                        # thinking blocks from its canonical content list).
+                        matched = next(iter(pending), None)
                         item = pending.pop(matched) if matched is not None else await begin_text(-1)
                         if matched is None:
                             pending.pop(-1, None)
@@ -1145,6 +1379,8 @@ class SubscriptionEngine(Engine):
                 counts = usage_counts(field(message, 'usage') or {})
                 usage_calls[-1].update(outcome='received', usage=counts,
                     sdkNumTurns=field(message, 'num_turns'), billingScope='sdk-main-loop-reported-not-an-invoice')
+                # Background subagents of this turn that already ended (add_task_usage).
+                usage_calls[0:0] = self.pending_task_usage.pop(turn_id, [])
                 self._usage(turn_id, usage_calls)
                 await self._emit_usage(tid, turn_id, usage_calls, last=last_call or None,
                                        window=context_window(field(message, 'model_usage')))
@@ -1154,7 +1390,10 @@ class SubscriptionEngine(Engine):
                     def safe_reason(value):
                         return value if isinstance(value, str) and len(value) <= 80 and value.replace('_', '').isalnum() and value.isascii() else 'unknown'
                     reason = f"subtype={safe_reason(subtype)}, terminal={safe_reason(terminal)}"
-                    terminal_failure = terminal_failure or f'Official runtime ended unsuccessfully ({reason}). You may submit a new instruction; the failed input is not automatically retried.'
+                    if history_signature_rejected(field(message, 'errors', []) or []):
+                        terminal_failure = terminal_failure or HISTORY_SIGNATURE_REJECTION
+                    else:
+                        terminal_failure = terminal_failure or f'Official runtime ended unsuccessfully ({reason}). You may submit a new instruction; the failed input is not automatically retried.'
                     return
                 if last_item and last_item['type'] == 'agentMessage' and last_item.get('phase') != 'final_answer':
                     # Only the terminal result tells which text was the last one: it completed as
@@ -1171,12 +1410,13 @@ class SubscriptionEngine(Engine):
             await self.emit(tid, 'turn/started', {'threadId': tid, 'turn': self.store.turn(turn_id, include_items=False)})
             await self.emit(tid, 'thread/status/changed', {'threadId': tid, 'status': {'type': 'active', 'activeFlags': []}})
             await self.emit_input_presentation(tid, record["message_id"])
+            payload = json.loads(record['payload'])
+            compact = payload.get('eventType') == COMPACT_EVENT
+            quota_notes = self.busy_delivery.continue_quota_notes(tid, turn_id) if payload['source']['kind'] == 'user' and not compact else []
             for item in self.store.items(turn_id):
                 await self.emit(tid, 'item/started', {'threadId': tid, 'turnId': turn_id, 'item': item})
                 await self.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})
             self._usage(turn_id, usage_calls)
-            payload = json.loads(record['payload'])
-            compact = payload.get('eventType') == COMPACT_EVENT
             prompt = '/compact' if compact else (record.get('prompt') or Store.project_input(payload)[0]['text'])
             if planning and not compact:
                 prompt = ('[Frontend Plan mode: use read-only tools and AskUserQuestion as needed. '
@@ -1190,7 +1430,7 @@ class SubscriptionEngine(Engine):
             # Notes read in at an owner turn's start (Store.claim) go first, each its own
             # text block: Claude Code expands @path mentions only in the last text block
             # (the owner's text), never in these. An agent's turn has them in its prompt.
-            notes = self.store.turn_note_frames(turn_id) if payload['source']['kind'] == 'user' and not compact else []
+            notes = [*quota_notes, *self.store.turn_note_frames(turn_id)] if payload['source']['kind'] == 'user' and not compact else []
             # A Side chat's first message follows its instructions and boundary (cute-codex /side).
             side = getattr(self, 'side_chats', None)
             if side is not None and not compact and side.boundary_pending(tid):
@@ -1249,6 +1489,7 @@ class SubscriptionEngine(Engine):
                 await self.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})
             self.store.db.execute('UPDATE sdk_sessions SET last_status=? WHERE thread_id=?', (state, tid))
             self.store.finish(tid, turn_id, state, error)
+            await self._flush_task_usage(tid, turn_id)
             if uncertain:
                 self.store.db.execute("UPDATE inputs SET state='uncertain' WHERE turn_id=?", (turn_id,))
             await self.emit(tid, 'turn/completed', {'threadId': tid, 'turn': self.store.turn(turn_id)})
@@ -1257,8 +1498,17 @@ class SubscriptionEngine(Engine):
 
 
 def usage_counts(usage: dict) -> dict:
-    return {k: max(0, v) for k, v in usage.items()
-            if k in {'input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'} and type(v) is int}
+    counts = {k: max(0, v) for k, v in usage.items()
+              if k in {'input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'} and type(v) is int}
+    # Preserve actual cache policy evidence without adding these breakdowns to
+    # token totals a second time. Unknown/zero creation never implies a TTL.
+    creation = usage.get('cache_creation')
+    if isinstance(creation, dict):
+        for ttl in ('5m', '1h'):
+            value = creation.get(f'ephemeral_{ttl}_input_tokens')
+            if type(value) is int and value >= 0:
+                counts[f'cache_creation_ephemeral_{ttl}_input_tokens'] = value
+    return counts
 
 
 def context_window(model_usage) -> int | None:

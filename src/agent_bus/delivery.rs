@@ -73,11 +73,35 @@ pub fn wake_busy_wait() -> Option<std::time::Duration> {
 }
 
 /// System alarms always reach a busy recipient after its running turn
-/// (task 01): they are never held for, or upgraded to, the busy-wake
-/// next-step timing on either runtime. Legacy alarms carry only the sender.
+/// (task 01): an agent's own reminders are never held for, or upgraded to,
+/// the busy-wake next-step timing on either runtime. Legacy alarms carry only
+/// the sender. The exception is an approval decision notice (023,
+/// [`is_approval_notice`]): it is read at the next step with no wait.
 pub fn always_after_turn(message: &crate::agent_bus::model::AgentBusMessage) -> bool {
+    (message.sender_kind.is_alarm_system()
+        || message.from == crate::agent_bus::alarms::ALARM_SYSTEM_SENDER)
+        && !is_approval_notice(message)
+}
+
+/// An owner-approval decision notice (023): a system alarm of the
+/// `cutex.approvals` owner, recognised by its `alarm-approval-` message id
+/// (the alarm store re-checks the owner when the delivery authenticates it).
+pub fn is_approval_notice(message: &crate::agent_bus::model::AgentBusMessage) -> bool {
     message.sender_kind.is_alarm_system()
-        || message.from == crate::agent_bus::alarms::ALARM_SYSTEM_SENDER
+        && message.from == crate::agent_bus::alarms::ALARM_SYSTEM_SENDER
+        && message.external_message_id.as_deref().is_some_and(|id| {
+            id.starts_with(crate::agent_bus::alarms::APPROVAL_NOTICE_MESSAGE_PREFIX)
+        })
+}
+
+/// The busy wait for one wake: zero for an approval notice (023: read at the
+/// next step at once), [`wake_busy_wait`] for the rest.
+pub fn busy_wait_for(message: &crate::agent_bus::model::AgentBusMessage) -> Option<std::time::Duration> {
+    if is_approval_notice(message) {
+        Some(std::time::Duration::ZERO)
+    } else {
+        wake_busy_wait()
+    }
 }
 
 /// What to do now with an unfrozen wake (r217h1).

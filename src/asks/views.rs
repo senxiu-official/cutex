@@ -281,6 +281,7 @@ mod tests {
         let ask_id = store.with_state(|state| state.create_ask(new_ask("a", "Old ask"), now).unwrap().0.ask_id).unwrap();
         crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap();
         // Strip every r208 field, as r207 wrote the file.
+        store.export_legacy_json().unwrap();
         let path = store.dir().join("asks-v1.json");
         let mut raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         for attempt in raw["asks"][&ask_id]["attempts"].as_array_mut().unwrap() {
@@ -289,9 +290,18 @@ mod tests {
             object.remove("progress");
         }
         std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
-        let state = store.snapshot().unwrap();
+        let database = store.dir().join(crate::management::v2::hot_store::DATABASE_FILE);
+        for candidate in [database.clone(), database.with_extension("sqlite3-wal"), database.with_extension("sqlite3-shm")] {
+            match std::fs::remove_file(candidate) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove migrated test database: {error}"),
+            }
+        }
+        let migrated = crate::asks::store::AskStore::at(&store_dir);
+        let state = migrated.snapshot().unwrap();
         let ask = &state.asks[&ask_id];
-        let rebuilt = crate::asks::scheduler::attempt_submission(&store, ask, ask.current_attempt().unwrap()).unwrap();
+        let rebuilt = crate::asks::scheduler::attempt_submission(&migrated, ask, ask.current_attempt().unwrap()).unwrap();
         assert!(rebuilt.view.is_none(), "pre-upgrade attempts never gain a view");
         let first = runtime.submitted.borrow()[0].1.clone();
         assert_eq!((rebuilt.message_id, rebuilt.text), (first.message_id, first.text));

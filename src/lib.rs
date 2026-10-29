@@ -11,6 +11,7 @@ pub mod build_info;
 pub mod browser_relay;
 /// Owner approvals for agent actions outside the caller's envelope.
 pub mod approvals;
+pub mod approval_rules;
 pub mod artifacts;
 /// Asks (委托): call/return between persistent agents.
 pub mod asks;
@@ -20,6 +21,7 @@ pub mod cli;
 pub mod compat;
 pub mod config;
 pub mod documents;
+pub mod director_address;
 pub mod files_revert;
 pub mod http;
 pub mod im;

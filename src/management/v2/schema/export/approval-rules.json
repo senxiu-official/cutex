@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:approval-rules",
+  "title": "ApprovalAutoRules",
+  "anyOf": [
+    { "$ref": "#/$defs/list" },
+    { "$ref": "#/$defs/mutation" },
+    { "$ref": "#/$defs/confirmation" },
+    { "$ref": "#/$defs/auditList" }
+  ],
+  "$defs": {
+    "kind": { "enum": ["managed_service", "service_lifetime", "agent_profile", "ask_delivery", "browser_claim", "browser_open", "workflow_run", "static_root"] },
+    "subject": {
+      "type": "object", "required": ["type", "cutexSessionId"],
+      "properties": { "type": { "const": "agent" }, "cutexSessionId": { "type": "string" }, "displayName": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "expiry": {
+      "type": "object", "required": ["mode"],
+      "properties": {
+        "mode": { "enum": ["turn", "hour", "today", "revoked"] },
+        "expiresAt": { "type": "string" },
+        "turn": { "type": "object", "required": ["runtimeGeneration", "turnId"], "properties": { "runtimeGeneration": { "type": "integer", "minimum": 1 }, "turnId": { "type": "string" } }, "additionalProperties": false }
+      }, "additionalProperties": false
+    },
+    "constraints": {
+      "type": "object", "properties": {
+        "profileIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "workflow": { "type": "object", "properties": { "maxAgents": { "type": "integer", "minimum": 1 }, "maxTokens": { "type": "integer", "minimum": 1 } }, "additionalProperties": false }
+      }, "additionalProperties": false
+    },
+    "rule": {
+      "type": "object", "required": ["ruleId", "enabled", "subject", "kinds", "constraints", "expiry", "highRiskKindsExplicit", "revision", "createdAt", "updatedAt", "createdBy", "expired"],
+      "properties": {
+        "ruleId": { "type": "string" }, "enabled": { "type": "boolean" }, "subject": { "$ref": "#/$defs/subject" },
+        "projectId": { "type": "string" }, "kinds": { "type": "array", "items": { "$ref": "#/$defs/kind" }, "uniqueItems": true },
+        "constraints": { "$ref": "#/$defs/constraints" }, "expiry": { "$ref": "#/$defs/expiry" },
+        "highRiskKindsExplicit": { "type": "array", "items": { "$ref": "#/$defs/kind" }, "uniqueItems": true },
+        "revision": { "type": "integer" }, "createdAt": { "type": "string" }, "updatedAt": { "type": "string" },
+        "createdBy": { "type": "string" }, "source": { "enum": ["role"] }, "grantedBy": { "enum": ["role:director"] },
+        "lastMatchedAt": { "type": "string" }, "expired": { "type": "boolean" }
+      }, "additionalProperties": false
+    },
+    "list": {
+      "type": "object", "required": ["contractVersion", "hostId", "revision", "catalog", "rules"],
+      "properties": { "contractVersion": { "const": 1 }, "hostId": { "type": "string" }, "revision": { "type": "integer" }, "catalog": { "type": "array" }, "rules": { "type": "array", "items": { "$ref": "#/$defs/rule" } } }
+    },
+    "mutation": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" }, "rule": { "$ref": "#/$defs/rule" }, "revoked": { "type": "boolean" }, "ruleId": { "type": "string" } } },
+    "confirmation": { "type": "object", "required": ["confirmationToken", "requiredPhrase", "expiresInSeconds"], "properties": { "confirmationToken": { "type": "string" }, "requiredPhrase": { "type": "string" }, "expiresInSeconds": { "type": "integer" } } },
+    "audit": { "type": "object", "required": ["auditId", "at", "action", "actor", "result", "details"], "properties": { "auditId": { "type": "string" }, "at": { "type": "string" }, "action": { "type": "string" }, "ruleId": { "type": "string" }, "ruleRevision": { "type": "integer" }, "actor": { "type": "string" }, "requesterCutexSessionId": { "type": "string" }, "projectId": { "type": "string" }, "kind": { "$ref": "#/$defs/kind" }, "risk": { "enum": ["low", "medium", "high"] }, "requestSha256": { "type": "string" }, "approvalId": { "type": "string" }, "result": { "type": "string" }, "details": {} } },
+    "auditList": { "type": "object", "required": ["audit"], "properties": { "audit": { "type": "array", "items": { "$ref": "#/$defs/audit" } }, "nextCursor": { "type": ["integer", "null"] } } }
+  }
+}

@@ -27,6 +27,22 @@ use crate::approvals::{ApprovalKind, ApprovalRecord, ApprovalRequest, ApprovalSt
 /// owner; P2 replaces this with the project's reviewer setting.
 pub const PROJECT_POLICY_P1: &str = "ask-delivery-owner-v1";
 
+/// The independent routing gate at FINAL admission. The scheduler caller holds
+/// director_address::with_role_action before acquiring AskStore; this check
+/// must occur after pause/stop/head/attempt checks and before lease insertion.
+/// Returning Pass grants routing only: never skip this module's owner capability
+/// approval as a consequence. Same original ask action preserves one-use replay.
+pub fn routing_admission(
+    state: &mut super::store::AskState,
+    authority: &crate::agent_management::AgentManagementSnapshot,
+    ask_id: &str,
+    host_id: &str,
+    now: DateTime<Utc>,
+    controllers: &super::routing_policy::integration::ControllerView<'_>,
+) -> Result<super::routing_policy::RouteVerdict, AskError> {
+    super::routing_policy::integration::check_admission(state,authority,ask_id,host_id,true,now,controllers)
+}
+
 /// One side of the gate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GateParty {
@@ -169,7 +185,7 @@ pub fn stale_reason(previous: &GateRecord, current: &GateRecord) -> Option<Strin
     })
 }
 
-fn approval_request(ask: &AskRecord, gate: &GateRecord, inputs: &GateInputs) -> Option<ApprovalRequest> {
+pub(crate) fn approval_request(ask: &AskRecord, gate: &GateRecord, inputs: &GateInputs) -> Option<ApprovalRequest> {
     let requester = inputs.requester.as_ref()?;
     let requester_label = requester.name.clone().unwrap_or_else(|| requester.cutex_session_id.clone());
     let target_label = inputs
@@ -375,5 +391,32 @@ pub(crate) mod tests {
             GateVerdict::Rejected { note: Some(note), .. } if note == "no"
         ));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn production_approval_request_drives_composite_risk() {
+        let ask = ask();
+        let broader = inputs(
+            Some(party(REQUESTER, SandboxLevel::ReadOnly, &[], "p")),
+            party(TARGET, SandboxLevel::FullAccess, &[], "p"),
+        );
+        let gate = evaluate(&ask_facts(&ask), &broader);
+        let request = approval_request(&ask, &gate, &broader).unwrap();
+        assert!(!request.details["differences"].as_array().unwrap().is_empty());
+        assert_eq!(crate::approval_rules::risk_for(&request), crate::approvals::ApprovalRisk::High);
+
+        let target = party(TARGET, SandboxLevel::WorkspaceWrite, &["/w"], "p");
+        let mut requester = target.clone();
+        requester.cutex_session_id = REQUESTER.into();
+        requester.name = Some("requester".into());
+        let mut policy_only = inputs(Some(requester), target);
+        policy_only.project_policy = "peer-review-skipped-v1".into();
+        let gate = evaluate(&ask_facts(&ask), &policy_only);
+        let mut request = approval_request(&ask, &gate, &policy_only).unwrap();
+        assert!(request.details["differences"].as_array().unwrap().is_empty());
+        assert_eq!(crate::approval_rules::risk_for(&request), crate::approvals::ApprovalRisk::Medium);
+
+        request.details.as_object_mut().unwrap().remove("versions");
+        assert_eq!(crate::approval_rules::risk_for(&request), crate::approvals::ApprovalRisk::High);
     }
 }

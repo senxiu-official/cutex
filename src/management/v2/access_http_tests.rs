@@ -16,6 +16,202 @@ use std::{
 };
 
 const ROOT: &str = "access-http-test-root-credential";
+#[path = "archive_api_http_tests.rs"]
+mod archive_api_http_tests;
+
+#[test]
+fn event_blobs_follow_session_read_grants_without_exposing_owner_history_media() {
+    use crate::management::client_tokens::DeviceScope;
+    let _home_lock=crate::config::paths::test_home_env_lock();
+    let instance=PrivateInstance::new();
+    let host=crate::platform::host::current_host_name();
+    let mut sessions=crate::session::model::CutexSessionStore::default();
+    for id in ["cutex.blob-a","cutex.blob-b","cutex.blob-hidden"] {
+        let mut session=crate::session::model::CutexSessionRecord::new(id.into(),None,host.clone(),instance.root.to_string_lossy().into_owned(),None).unwrap();
+        session.exposed_to_backend=true;
+        session.registration_class=crate::agent_bus::model::AgentRegistrationClass::Persistent;
+        sessions.sessions.insert(id.into(),session);
+    }
+    crate::session::store::save_cutex_session_store(&sessions).unwrap();
+    let tokens=ClientTokenStore::open_default().unwrap();
+    let users=UserStore::open_default().unwrap();
+    let reader=users.create_user("Blob reader",None,Grant {standalone_agents:vec!["cutex.blob-a".into(),"cutex.blob-b".into()],..Grant::default()},"root").unwrap();
+    let token=tokens.issue_scoped("blob-reader",DeviceScope::Read).unwrap();
+    users.bind_token(&token.token_id,Some(&reader.id),"root").unwrap();
+    let blobs=crate::management::v2::event_blobs::EventBlobStore::open_default().unwrap();
+    let descriptor=blobs.put("cutex.blob-a","application/octet-stream",b"image bytes").unwrap();
+    blobs.put("cutex.blob-hidden","application/octet-stream",b"image bytes").unwrap();
+    let id=descriptor["blobId"].as_str().unwrap();
+    let get=|session:&str,bearer:Option<&str>|exchange_with(p2_context(),"GET",&format!("/v2/sessions/{session}/blobs/{id}"),bearer,b"{}".to_vec(),"application/json","");
+    let (status,_,body)=get("cutex.blob-a",Some(&token.token));
+    assert_eq!(status,200,"{}",String::from_utf8_lossy(&body));
+    assert_eq!(body,b"image bytes");
+    assert_eq!(get("cutex.blob-a",None).0,401);
+    assert_eq!(get("cutex.blob-b",Some(&token.token)).0,404,"no grant for the same hash in this visible session");
+    assert_eq!(get("cutex.blob-hidden",Some(&token.token)).0,404,"hidden session stays hidden even with a blob grant");
+    assert_eq!(exchange_raw("GET",&format!("/v2/sessions/cutex.blob-a/media/{id}"),Some(&token.token),&json!({}),"").0,403);
+}
+
+#[test]
+fn guides_preferences_dispatch_shares_owner_state_and_enforces_device_scope() {
+    use crate::management::client_tokens::DeviceScope;
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let path = crate::management::v2::guides_preferences::PATH;
+    let body = json!({"schema":1,"skippedThrough":"0.2.0","updatedAt":"client-time","future":true});
+    assert_eq!(exchange("GET", path, None, &json!({})).0, 401);
+    let member = users.create_user("Guides member", None, Grant::default(), "root").unwrap();
+    let member_token = tokens.issue("guides-member").unwrap();
+    users.bind_token(&member_token.token_id, Some(&member.id), "root").unwrap();
+    let pending = tokens.issue("guides-pending").unwrap();
+    for token in [&member_token.token, &pending.token] {
+        assert_eq!(exchange("GET", path, Some(token), &json!({})).0, 403);
+        assert_eq!(exchange("PUT", path, Some(token), &body).0, 403);
+    }
+    let default = exchange("GET", path, Some(ROOT), &json!({}));
+    assert_eq!(default, (200, json!({"schema":1,"skippedThrough":null,"updatedAt":null})));
+    let storage = crate::config::paths::runtime_dir().unwrap().join("users/guides-preferences-v1.json");
+    assert!(!storage.exists());
+    for scope in [DeviceScope::Read, DeviceScope::Chat] {
+        let narrowed = tokens.issue_scoped("guides-narrowed", scope).unwrap();
+        users.bind_token(&narrowed.token_id, Some(OWNER), "root").unwrap();
+        assert_eq!(exchange("GET", path, Some(&narrowed.token), &json!({})).0, 200);
+        assert_eq!(exchange("PUT", path, Some(&narrowed.token), &body).0, 403);
+    }
+    let (paired, _) = tokens.issue_device("guides-owner", "Synthetic desktop", "other").unwrap();
+    users.bind_token(&paired.token_id, Some(OWNER), "root").unwrap();
+    REMOTE.with(|remote| remote.set(true));
+    let saved = exchange("PUT", path, Some(&paired.token), &body);
+    REMOTE.with(|remote| remote.set(false));
+    assert_eq!(saved.0, 200, "{saved:?}");
+    assert_eq!(saved.1["skippedThrough"], "0.2.0");
+    assert_ne!(saved.1["updatedAt"], "client-time");
+    assert_eq!(exchange("GET", path, Some(ROOT), &json!({})), saved);
+    assert_eq!(exchange("PUT", path, Some(ROOT), &json!({"schema":2,"skippedThrough":null})).0, 400);
+    let reset = exchange("PUT", path, Some(ROOT), &json!({"schema":1,"skippedThrough":null}));
+    assert_eq!(reset.0, 200);
+    assert!(reset.1["skippedThrough"].is_null());
+    assert!(reset.1["updatedAt"].is_string());
+    assert!(storage.exists());
+}
+
+#[test]
+fn avatar_style_dispatch_enforces_owner_scope_and_publishes_only_saved_changes() {
+    use crate::management::client_tokens::DeviceScope;
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let member = users.create_user("Style member", None, Grant::default(), "root").unwrap();
+    let member_token = tokens.issue("style-member").unwrap();
+    users.bind_token(&member_token.token_id, Some(&member.id), "root").unwrap();
+    let (status, created) = exchange("POST", "/v2/profiles", Some(ROOT),
+        &json!({"name":"Style owner","kind":"apiKey","preset":"glm","apiKey":"synthetic-placeholder"}));
+    assert_eq!(status, 201, "{created}");
+    let id = created["profile"]["id"].as_str().unwrap();
+    let path = format!("/v2/profiles/{id}");
+    let style = json!({"avatarStyle":{"kind":"portrait","portraitThemes":["future-pack/theme"]}});
+    assert_eq!(exchange("PATCH", &path, None, &style).0, 401);
+    assert_eq!(exchange("PATCH", &path, Some(&member_token.token), &style).0, 403);
+    for scope in [DeviceScope::Read, DeviceScope::Chat] {
+        let narrowed = tokens.issue_scoped("style-narrowed", scope).unwrap();
+        users.bind_token(&narrowed.token_id, Some(OWNER), "root").unwrap();
+        assert_eq!(exchange("PATCH", &path, Some(&narrowed.token), &style).0, 403);
+    }
+    let (paired, _) = tokens.issue_device("style-owner", "Synthetic desktop", "other").unwrap();
+    users.bind_token(&paired.token_id, Some(OWNER), "root").unwrap();
+    let repository = crate::management::v2::repository::management_v2_repository().unwrap();
+    let checkpoint = repository.checkpoint().unwrap();
+    REMOTE.with(|remote| remote.set(true));
+    let saved = exchange("PATCH", &path, Some(&paired.token), &style);
+    REMOTE.with(|remote| remote.set(false));
+    assert_eq!(saved.0, 200, "{saved:?}");
+    assert_eq!(saved.1["profile"]["appearance"]["avatarStyle"], style["avatarStyle"]);
+    assert_eq!(exchange("PATCH", &path, Some(ROOT), &style).1["changed"], false);
+    assert_eq!(exchange("PATCH", &path, Some(ROOT), &json!({"avatarStyle":{"kind":"unknown"}})).0, 400);
+    assert_eq!(exchange("PATCH", &path, Some(ROOT), &json!({"avatarThemes":["cats"]})).0, 200);
+    let events = host_events(&checkpoint, crate::management::v2::profiles_api::PROFILES_CHANGED_EVENT);
+    assert_eq!(events.len(), 1, "only the committed style change publishes");
+    assert_eq!(events[0]["profileId"], id);
+    assert_eq!(events[0]["fields"], json!(["avatarStyle"]));
+    assert!(!events[0].to_string().contains("future-pack"));
+    assert_eq!(exchange("PATCH", &path, Some(ROOT), &json!({"avatarStyle":null})).0, 200);
+    assert_eq!(host_events(&checkpoint, crate::management::v2::profiles_api::PROFILES_CHANGED_EVENT).len(), 2);
+}
+
+#[test]
+fn profile_link_secret_dispatch_enforces_owner_full_and_never_returns_secret() {
+    use base64::Engine;
+    use sha2::Digest;
+    use crate::management::client_tokens::DeviceScope;
+    let _home_lock=crate::config::paths::test_home_env_lock();
+    let _instance=PrivateInstance::new();
+    let tokens=ClientTokenStore::open_default().unwrap();
+    let users=UserStore::open_default().unwrap();
+    let full=tokens.issue("profile-link-owner").unwrap();
+    users.snapshot().unwrap();
+    let member=users.create_user("Link member",None,Grant::default(),"root").unwrap();
+    let member_token=tokens.issue("link-member").unwrap();
+    users.bind_token(&member_token.token_id,Some(&member.id),"root").unwrap();
+    let secret=base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(b"synthetic-secret-dispatch-first"));
+    let replacement=base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(b"synthetic-secret-dispatch-replacement"));
+    let body=json!({"secret":secret});
+    let path=crate::management::v2::profile_link::SECRET_PATH;
+    assert_eq!(exchange("GET",path,None,&json!({})).0,401);
+    assert_eq!(exchange("GET",path,Some(&member_token.token),&json!({})).0,403);
+    for scope in [DeviceScope::Read,DeviceScope::Chat] {
+        let narrowed=tokens.issue_scoped("link-narrowed",scope).unwrap();
+        users.bind_token(&narrowed.token_id,Some(OWNER),"root").unwrap();
+        for (method,payload) in [("GET",json!({})),("PUT",body.clone()),("DELETE",json!({}))] {
+            let denied=exchange(method,path,Some(&narrowed.token),&payload);
+            assert_eq!(denied.0,403,"{denied:?}");assert_eq!(any_code(&denied.1),"device_scope_denied");
+        }
+    }
+    assert_eq!(exchange("GET",path,Some(ROOT),&json!({})).1["secretId"],Value::Null);
+    let (paired,_)=tokens.issue_device("link-owner-device","Synthetic desktop","other").unwrap();
+    users.bind_token(&paired.token_id,Some(OWNER),"root").unwrap();
+    REMOTE.with(|remote|remote.set(true));
+    let (status,stored)=exchange("PUT",path,Some(&paired.token),&body);
+    REMOTE.with(|remote|remote.set(false));
+    assert_eq!(status,200,"{stored}");assert!(stored.get("secret").is_none());assert!(!stored.to_string().contains(&secret));
+    assert_eq!(exchange("GET",path,Some(&full.token),&json!({})).1,stored);
+    assert_eq!(exchange("PUT",path,Some(&paired.token),&body).0,403);
+    assert_eq!(exchange("DELETE",path,Some(&paired.token),&json!({})).0,403);
+    REMOTE.with(|remote|remote.set(true));
+    let remote=exchange("PUT",path,Some(&paired.token),&body);
+    let remote_get=exchange("GET",path,Some(&paired.token),&json!({}));
+    let remote_delete=exchange("DELETE",path,Some(&paired.token),&json!({}));
+    REMOTE.with(|remote|remote.set(false));
+    assert_eq!(remote.0,403,"{remote:?}");assert_eq!(any_code(&remote.1),"owner_local_only");
+    assert_eq!(remote_get,(200,stored.clone()));assert_eq!(remote_delete.0,403);
+    let rotated=exchange("PUT",path,Some(ROOT),&json!({"secret":replacement}));
+    assert_eq!(rotated.0,200);assert_ne!(rotated.1["secretId"],stored["secretId"]);
+    assert_eq!(exchange("DELETE",path,Some(ROOT),&json!({})).1["secretId"],Value::Null);
+    REMOTE.with(|remote|remote.set(true));
+    let initialized=exchange("PUT",path,Some(&paired.token),&body);
+    REMOTE.with(|remote|remote.set(false));
+    assert_eq!(initialized.0,403);
+    let off=exchange("GET",path,Some(&paired.token),&json!({}));
+    assert_eq!(off.1["disabled"],true);assert_eq!(off.1["secretId"],Value::Null);
+    let enabled=exchange("PUT",path,Some(ROOT),&body);
+    assert_eq!(enabled,(200,stored.clone()));
+    assert_eq!(exchange("DELETE",path,Some(ROOT),&json!({})).1["secretId"],Value::Null);
+    let audit=std::fs::read_to_string(crate::config::paths::runtime_dir().unwrap().join("profile-link/audit.jsonl")).unwrap();
+    let events:Vec<Value>=audit.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(events.len(),5);
+    assert!(events.iter().all(|e|e["action"]=="profileLinkSecretSet"));
+    assert_eq!(events[0]["details"]["secretIdBefore"],Value::Null);
+    assert_eq!(events[0]["details"]["secretIdAfter"],stored["secretId"]);
+    assert_eq!(events[0]["details"]["actor"],paired.token_id);
+    assert_eq!(events[3]["details"]["actor"],"root");
+    assert!(!audit.contains(&secret)&&!audit.contains(&replacement));
+    let malformed=exchange("PUT",path,Some(ROOT),&json!({"secret":secret,"actionId":secret,"requestId":secret}));
+    assert_eq!(malformed.0,400);
+    let log=std::fs::read_to_string(crate::config::paths::runtime_dir().unwrap().join("service-logs/management-errors.jsonl")).unwrap_or_default();
+    assert!(!log.contains(&secret));
+}
 
 thread_local! {
     /// The next exchanges arrive on a remote (non-loopback) listener.
@@ -36,6 +232,11 @@ impl PrivateInstance {
         std::fs::write(root.join(crate::config::paths::PRIVATE_HOME_MARKER), b"").unwrap();
         let previous = instance::selected().unwrap();
         instance::set_test_selection(Selection::Custom(root.join(".cutex")));
+        // Every fixture starts with an empty registry. Finish its empty
+        // journal recovery before exercising routes whose callbacks must not
+        // be invoked; otherwise batch order can trigger an unrelated load.
+        crate::management::v2::repository::management_v2_repository().unwrap()
+            .materialize_recovery_reset(&[],true).unwrap();
         Self { root, previous }
     }
 }
@@ -56,6 +257,7 @@ fn context() -> ManagementRequestContext {
         explicit_launch_action: |_, _| panic!("unexpected runtime action"),
         adopt_saved_native: |_, _| panic!("unexpected native adoption"),
         review_agent_archive: |_, _| panic!("unexpected archive review"),
+        owner_archive_action: |_, _| panic!("unexpected permanent archive"),
         execute_agent_archive: |_, _| panic!("unexpected archive"),
         durable_agent_candidates: |_| panic!("unexpected agent candidates"),
         import_durable_agent: |_, _| panic!("unexpected agent import"),
@@ -80,6 +282,7 @@ fn context() -> ManagementRequestContext {
         bind_project_authority: |_| panic!("unexpected project bind"),
         import_legacy_director_ownership: |_| panic!("unexpected ownership import"),
         reconcile_agent_reservation: |_| panic!("unexpected reservation"),
+        abandon_agent_create: |_| panic!("unexpected reservation"),
         list_management_projects: |_| panic!("unexpected project list"),
         read_management_project: |_, _| panic!("unexpected project read"),
         update_management_project_presentation: |_, _| panic!("unexpected project update"),
@@ -192,7 +395,7 @@ fn owner_user_and_pending_tokens_get_exactly_their_rights() {
     assert!(host.get("executable").is_none());
 
     // Pending: nothing else.
-    for (method, path) in [("GET", "/v2/sessions"), ("GET", "/v2/settings"), ("GET", "/v2/summary")] {
+    for (method, path) in [("GET", "/v2/sessions"), ("GET", "/v2/settings"), ("GET", "/v2/summary"), ("GET", "/v2/storage"), ("POST", "/v2/storage/refresh")] {
         let (status, value) = exchange(method, path, Some(&pending.token), &json!({}));
         assert_eq!((status, code(&value)), (403, "access_pending"), "{method} {path}");
     }
@@ -200,6 +403,8 @@ fn owner_user_and_pending_tokens_get_exactly_their_rights() {
     // Non-owner: owner routes refused, invisible objects 404, users API closed.
     for (method, path, body) in [
         ("GET", "/v2/settings", json!({})),
+        ("GET", "/v2/storage", json!({})),
+        ("POST", "/v2/storage/refresh", json!({})),
         ("GET", "/v2/users", json!({})),
         ("POST", "/v2/users", json!({"name": "escalate"})),
         ("PUT", &format!("/v2/users/token-bindings/{}", device.token_id) as &str, json!({"userId": "owner"})),
@@ -231,6 +436,13 @@ fn owner_user_and_pending_tokens_get_exactly_their_rights() {
     let (status, value) = exchange("GET", "/v2/agent-management/projects/p2", Some(&device.token), &json!({}));
     assert_eq!((status, code(&value)), (404, "project_not_found"));
 
+    // Storage is owner-only; a read uses no runtime callbacks and does not scan.
+    for token in [&owner.token, ROOT] {
+        let (status,value)=exchange("GET", "/v2/storage", Some(token), &json!({}));
+        assert_eq!(status,200,"{value}");
+        crate::management::v2::schema_export::assert_valid("storage","overview",&value);
+        assert_eq!(value["walk"]["state"],"idle");
+    }
     // The owner keeps everything, including the users API.
     let (status, listing) = exchange("GET", "/v2/users", Some(&owner.token), &json!({}));
     assert_eq!(status, 200);
@@ -351,6 +563,26 @@ fn scoped_sessions_check_methods_send_and_input_types() {
     let text = json!({"clientUserMessageId": "m", "origin": {"kind": "desktop", "clientId": "c"}, "strategy": "queue", "input": [{"type": "text", "text": "hi"}]});
     let image = json!({"clientUserMessageId": "m", "origin": {"kind": "desktop", "clientId": "c"}, "strategy": "queue", "input": [{"type": "localImage", "path": "/etc/shadow"}]});
     let path = "/v2/sessions/cutex.solo/cutex/requests";
+    for method in ["cutex/userInput/submit", "cutex/userInput/queue/steer"] {
+        for join in [json!({"askId":"ask-live","attempt":1,"expectedTurnId":"turn-live","runtimeGeneration":7}), Value::Null, json!({})] {
+            let mut params = if method.ends_with("submit") {
+                let mut params = text.clone();
+                params["strategy"] = json!("auto");
+                params
+            } else { json!({"queueId":"q","expectedRevision":1}) };
+            params["joinDelegation"] = join;
+            for token in [&read_token.token, &send_token.token] {
+                let (status, value) = exchange("POST", path, Some(token), &cutex(method, params.clone()));
+                assert_eq!((status, code(&value)), (403, "owner_required"), "{method}: {params}");
+            }
+        }
+    }
+    // The root owner's malformed join reaches ordinary schema validation.
+    let mut owner_params = text.clone();
+    owner_params["strategy"] = json!("auto");
+    owner_params["joinDelegation"] = Value::Null;
+    let (status, value) = exchange("POST", path, Some(ROOT), &cutex("cutex/userInput/submit", owner_params));
+    assert_ne!(status, 403, "root owner must bypass the non-owner gate: {value}");
     let cases: Vec<(&str, Value, u16, &str)> = vec![
         (read_token.token.as_str(), cutex("cutex/session/retire", json!({})), 403, "owner_required"),
         (send_token.token.as_str(), cutex("cutex/session/delete", json!({})), 403, "owner_required"),
@@ -1797,6 +2029,8 @@ fn own_home_page_and_cover_per_user() {
     let caps = exchange("GET", "/v2/capabilities", Some(&a.token), &json!({})).1;
     assert!(caps["featureList"].as_array().unwrap().iter().any(|f| f == "user-home"));
     assert_eq!(caps["features"]["userHome"], true);
+    assert!(caps["featureList"].as_array().unwrap().iter().any(|f| f == "user-home-page-pins"));
+    assert_eq!(caps["features"]["userHomePagePins"], true);
 
     // Empty, then a roundtrip with unknown keys kept and coverEtag server-owned.
     let (status, value) = exchange("GET", "/v2/users/me/home", Some(&a.token), &json!({}));
@@ -1809,7 +2043,10 @@ fn own_home_page_and_cover_per_user() {
         "sidebarEntry": true,
         "showWhenEmpty": true,
         "homeHost": "host-a",
-        "pins": [{"hostId": "host-a", "kind": "service", "key": "web", "title": "Web", "size": "m"}],
+        "pins": [
+            {"hostId": "host-a", "kind": "service", "key": "web", "title": "Web", "size": "m"},
+            {"hostId": "host-a", "kind": "page", "key": "project-view:proj-1", "title": "Project"},
+        ],
         "coverEtag": "ffffffffffffffff",
         "laterFeature": {"on": true},
     });
@@ -1834,6 +2071,7 @@ fn own_home_page_and_cover_per_user() {
         (json!({"revision": 1, "home": []}), 400, "invalid_home"),
         (json!({"revision": 1, "home": {"bio": "x".repeat(201)}}), 400, "invalid_home"),
         (json!({"revision": 1, "home": {"pins": [{"hostId": "h", "kind": "folder", "key": "k"}]}}), 400, "invalid_home"),
+        (json!({"revision": 1, "home": {"pins": [{"hostId": "h", "kind": "page", "key": "no-page-id"}]}}), 400, "invalid_home"),
         (json!({"revision": 1, "home": {"blocks": [{"id": "a", "visible": "yes"}]}}), 400, "invalid_home"),
         (json!({"revision": 1, "home": {"blob": "x".repeat(70 * 1024)}}), 413, "home_too_large"),
     ] {

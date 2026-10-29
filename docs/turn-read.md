@@ -7,8 +7,8 @@ No adapter, native runtime, storage migration, dependency, event or desktop chan
 
 `GET /v2/sessions/{id}/history/turns/{turnId}[?compact=1]` uses the same root-only
 authorization, hidden/archived session lookup and live-to-offline transport fallback as `/history`.
-The two path IDs are decoded separately; neither may contain a slash. Only `compact` is
-accepted as a query parameter. The native result is `thread/read` with exactly one turn.
+The two path IDs are decoded separately; neither may contain a slash. Only `compact` and
+`media` are accepted as query parameters. The native result is `thread/read` with exactly one turn.
 The envelope adds `turnId`, non-null `ordinal` (one-based), `turnCount` and `complete`.
 It does not include `cutexState`.
 
@@ -104,3 +104,17 @@ downgrade to a preview. A caller planning a mutation must hold its own operation
 and revalidate the binding/history version before applying changes; these read RPCs do
 not constitute a transaction. This task adds no file-revert operation or new helper HTTP API.
 
+
+## Media references (`history-media-refs`)
+
+`?media=ref` on `GET /v2/sessions/{id}/bootstrap`, `/history` and `/history/turns/{turnId}`
+replaces every media payload over 64 KiB (a `data:<mime>;base64,` string anywhere,
+`imageGeneration.result`, the `data` of an MCP `image` / `audio` block) with
+`cutex-media:<cutexSessionId>/<sha256>` and stores the bytes once in
+`runtime/management-v2/history-media/` (2 GiB, least recently used first out). Any other
+string over 1 MiB inside a tool item is cut and the item gets `truncated: true`. The body
+gains `mediaRefs` (how many were replaced). `GET /v2/sessions/{id}/media/{sha256}` returns
+the bytes with their type, for the session that saw the reference (root only, as history);
+`404 media_not_found` after eviction: read the turn again with `media=ref`. Without the
+parameter responses are unchanged. Reason: an image-generating Codex agent's history was
+1.5 GB, over a JavaScript string's limit (cutex-desktop docs/design/025).

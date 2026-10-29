@@ -506,7 +506,7 @@ fn maintain_inner(store: &Store, asks: &AskStore, before_commit: impl FnOnce()) 
                     })
                     .unwrap_or(now);
                 if age > ttl {
-                    let unknown = r.sync.accepted
+                    let unknown = create_may_have_run(&r.sync)
                         || matches!(p.status.as_str(), "identityChanged" | "versionMismatch");
                     actions.push(Maintenance::Fail {
                         id: a.ask_id.clone(),
@@ -589,7 +589,7 @@ fn maintain_inner(store: &Store, asks: &AskStore, before_commit: impl FnOnce()) 
                         if now - crate::asks::parse_time(received).unwrap_or(now) <= ttl {
                             continue;
                         }
-                        unknown = r.sync.accepted
+                        unknown = create_may_have_run(&r.sync)
                             || peers.peers.get(&r.peer_id).is_some_and(|p| {
                                 matches!(p.status.as_str(), "identityChanged" | "versionMismatch")
                             });
@@ -688,6 +688,136 @@ fn has_due_send(ask: &AskRecord, id: &str) -> bool {
     }
 }
 
+/// Write-ahead transport intent in the existing outbox projection. A crash
+/// after this commit may have sent the original PUT; never invent another ID.
+const CREATE_OUTCOME_UNKNOWN: &str = "createOutcomeUnknown";
+const ROUTING_PENDING: &str = "routingPending";
+
+#[derive(Debug, PartialEq, Eq)]
+enum CreateDispatch {
+    Send(super::model::Create),
+    Reconcile,
+    Defer,
+}
+
+fn create_may_have_run(sync: &super::model::Sync) -> bool {
+    sync.accepted
+        || sync.state == CREATE_OUTCOME_UNKNOWN
+        || sync.failures > 0
+        || (sync.last_error.is_some() && sync.state != ROUTING_PENDING)
+}
+
+/// Under authority -> AskStore lock, recheck the current outbox head and exact
+/// persisted request. No native/network work is performed in this transaction.
+fn prepare_create(
+    state: &mut AskState,
+    snapshot: &crate::agent_management::AgentManagementSnapshot,
+    expected: &AskRecord,
+    peer_id: &str,
+    op_id: &str,
+    controllers: &crate::asks::routing_policy::integration::ControllerView<'_>,
+    host: &str,
+    now: chrono::DateTime<Utc>,
+) -> CreateDispatch {
+    let Some(ask) = state.asks.get(&expected.ask_id).cloned() else {
+        return CreateDispatch::Defer;
+    };
+    let Some(remote) = ask
+        .remote
+        .as_ref()
+        .filter(|r| r.peer_id == peer_id && !r.sync.local_terminal)
+    else {
+        return CreateDispatch::Defer;
+    };
+    if !ask.is_open()
+        || remote
+            .sync
+            .pending_ops
+            .first()
+            .is_none_or(|o| o.op != "create" || o.op_id != op_id)
+        || expected
+            .remote
+            .as_ref()
+            .is_none_or(|r| r.request != remote.request)
+    {
+        return CreateDispatch::Defer;
+    }
+    let attempted = create_may_have_run(&remote.sync);
+    let checked =
+        if ask.requester.session() != Some(remote.request.requester.cutex_session_id.as_str()) {
+            Err(crate::asks::store::AskError::new(
+                "routing_scope_mismatch",
+                "Peer requester does not match persisted delegation source",
+            ))
+        } else {
+            crate::asks::routing_policy::integration::check_outbound_source(
+                snapshot,
+                state,
+                &ask,
+                host,
+                controllers,
+            )
+        };
+    if let Err(error) = checked {
+        state.update_ask(&ask.ask_id, now, |a| {
+            let sync = &mut a.remote.as_mut().unwrap().sync;
+            if !attempted {
+                sync.state = ROUTING_PENDING.into();
+            }
+            sync.last_error = Some(format!("routing_source:{}", error.code));
+            sync.next_attempt_at = Some((now + chrono::Duration::seconds(30)).to_rfc3339());
+        });
+        // An original uncertain outcome is reconciled by GET of the original
+        // ask ID. Policy revocation cannot turn it into a fresh PUT or failure.
+        return if attempted {
+            CreateDispatch::Reconcile
+        } else {
+            CreateDispatch::Defer
+        };
+    }
+    let request = remote.request.clone();
+    state.update_ask(&ask.ask_id, now, |a| {
+        let sync = &mut a.remote.as_mut().unwrap().sync;
+        sync.state = CREATE_OUTCOME_UNKNOWN.into();
+        sync.last_error = None;
+    });
+    CreateDispatch::Send(request)
+}
+
+fn preflight_create(
+    asks: &AskStore,
+    expected: &AskRecord,
+    peer_id: &str,
+    op_id: &str,
+) -> Result<CreateDispatch> {
+    let world = crate::asks::scheduler::HostWorld::load();
+    let host = crate::asks::routing_policy::integration::local_host_id();
+    let now = Utc::now();
+    crate::asks::routing_policy::integration::try_with_authority_for_world(&world, |snapshot| {
+        let controllers = crate::asks::routing_policy::integration::ControllerView::load(snapshot)?;
+        asks.with_state(|state| {
+            prepare_create(
+                state,
+                snapshot,
+                expected,
+                peer_id,
+                op_id,
+                &controllers,
+                &host,
+                now,
+            )
+        })
+        .map_err(|e| {
+            crate::asks::store::AskError::new(
+                "persistence_unavailable",
+                format!("peer source preflight: {e:#}"),
+            )
+        })
+    })
+    .map(|value| value.unwrap_or(CreateDispatch::Defer))
+    .map_err(|e| Error::new(&e.code, 503))
+}
+
 pub fn send_peer(store: &Store, asks: &AskStore, id: &str) -> Result<()> {
     let state = send_state(store)?;
     let Some(peer) = state.peers.get(id) else {
@@ -759,13 +889,29 @@ pub fn send_peer(store: &Store, asks: &AskStore, id: &str) -> Result<()> {
             let Some(peer) = current_sender(store, id)? else {
                 break;
             };
+            let create_dispatch = if let Some(op) = op.filter(|o| o.op == "create") {
+                Some(preflight_create(asks, a, id, &op.op_id)?)
+            } else {
+                None
+            };
+            if matches!(create_dispatch.as_ref(), Some(CreateDispatch::Defer)) {
+                continue;
+            }
+            let reconcile_create =
+                matches!(create_dispatch.as_ref(), Some(CreateDispatch::Reconcile));
             let result = match op {
+                Some(o) if o.op == "create" && reconcile_create => {
+                    super::client::call(store, &peer, "GET", &route, None)
+                }
                 Some(o) if o.op == "create" => super::client::call(
                     store,
                     &peer,
                     "PUT",
                     &route,
-                    Some(&serde_json::to_value(&r.request)?),
+                    Some(&serde_json::to_value(match create_dispatch.as_ref() {
+                        Some(CreateDispatch::Send(request)) => request,
+                        _ => unreachable!("create preflight must commit before PUT"),
+                    })?),
                 ),
                 Some(o) => super::client::call(
                     store,
@@ -803,6 +949,30 @@ pub fn send_peer(store: &Store, asks: &AskStore, id: &str) -> Result<()> {
                     })?;
                 }
                 Err(e) => {
+                    if reconcile_create {
+                        // A miss/error never proves an uncertain create did not
+                        // run. Retain its exact action/request/op IDs and only
+                        // retry observation; never terminalize or mint new work.
+                        asks.with_state(|state| {
+                            if let Some(remote) = state
+                                .asks
+                                .get_mut(&a.ask_id)
+                                .and_then(|a| a.remote.as_mut())
+                            {
+                                remote.sync.state = CREATE_OUTCOME_UNKNOWN.into();
+                                remote.sync.next_attempt_at =
+                                    Some(retry_at(remote.sync.failures.max(1)));
+                            }
+                        })?;
+                        if e.is_transport()
+                            || e.is_protocol()
+                            || e.is_address_rejected()
+                            || e.status == 401
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     note_error(store, &peer, &e)?;
                     let code = e.request_failure_code();
                     // A close for an unknown id is acknowledged: no remote execution remains.
@@ -957,4 +1127,294 @@ pub fn send_peer(store: &Store, asks: &AskStore, id: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The old transport suites seed durable outboxes directly. Give those
+/// fixtures real, isolated source authority and an explicit owner-selected
+/// open policy; send_peer still traverses the unchanged production preflight.
+#[cfg(test)]
+pub(super) struct TransportRoutingFixture {
+    home: std::path::PathBuf,
+    previous: [Option<std::ffi::OsString>; 2],
+    _guard: std::sync::MutexGuard<'static, ()>,
+    routing: crate::asks::routing_policy::RoutingState,
+}
+#[cfg(test)]
+impl TransportRoutingFixture {
+    pub(super) fn new(template: &mut AskRecord) -> Self {
+        use crate::asks::routing_policy::{self as routing, integration};
+        let guard = crate::config::paths::test_home_env_lock();
+        let home = crate::config::paths::real_user_home().unwrap()
+            .join(format!(".cutex-test-peer-routing-{}",uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(crate::config::paths::PRIVATE_HOME_MARKER),b"test").unwrap();
+        let previous=[std::env::var_os("HOME"),std::env::var_os("CUTEX_TEST_PRIVATE_HOME")];
+        unsafe {std::env::set_var("HOME",&home);std::env::set_var("CUTEX_TEST_PRIVATE_HOME",&home);}
+        // Build the restore guard before any fallible fixture setup, so even
+        // an assertion unwind cannot strand another test on this HOME.
+        let mut fixture=Self{home,previous,_guard:guard,routing:Default::default()};
+        let project=template.project_id.as_ref().expect("transport fixture project");
+        let source=template.requester.session().expect("local source");
+        let roster=crate::agent_management::AgentManagementStore::open_default().unwrap();
+        let _fence=roster.lock_mutations().unwrap();
+        roster.with_state(true,|mut snapshot| {
+            snapshot.project_states.insert(crate::agent_management::ProjectId::new(project.clone()).unwrap(),
+                serde_json::from_value(json!({"project_id":project,"lifecycle":"active","revision":1,
+                    "created_at":"2026-10-27T00:00:00Z","updated_at":"2026-10-27T00:00:00Z",
+                    "archived_at":null,"workspace_root":null,"last_director_epoch":null})).unwrap());
+            snapshot.current_project_memberships.insert(crate::role_revision::CutexSessionId::new(source).unwrap(),
+                serde_json::from_value(json!({"cutex_session_id":source,"project_id":project,"revision":1,
+                    "updated_at":"2026-10-27T00:00:00Z"})).unwrap());
+            Ok((snapshot,(),true))
+        }).unwrap();
+        let snapshot=roster.snapshot().unwrap();
+        let context=integration::trusted_context(&snapshot,project,routing::RoutingActor::Owner,&integration::local_host_id()).unwrap();
+        fixture.routing.update_policy(&context,&routing::UpdatePolicyRequest{
+            action_id:"transport-fixture-open".into(),expected_revision:0,member_mode:routing::MemberMode::Open},Utc::now()).unwrap();
+        let remote=template.remote.as_mut().unwrap();
+        remote.request.requester.cutex_session_id=source.to_owned();
+        remote.request.request_sha256=remote.request.digest();
+        fixture
+    }
+
+    pub(super) fn seed_policy(&self,state:&mut AskState) {
+        state.routing=self.routing.clone();
+    }
+}
+#[cfg(test)]
+impl Drop for TransportRoutingFixture {
+    fn drop(&mut self) {
+        for (name,previous) in ["HOME","CUTEX_TEST_PRIVATE_HOME"].into_iter().zip(self.previous.iter()) {
+            unsafe {match previous {Some(value)=>std::env::set_var(name,value),None=>std::env::remove_var(name)}}
+        }
+        let _=std::fs::remove_dir_all(&self.home);
+    }
+}
+
+#[cfg(test)]
+mod source_routing_tests {
+    use super::*;
+    use crate::asks::routing_policy::test_support;
+
+    #[test]
+    fn queued_legacy_first_send_checks_fresh_membership_and_accepted_controller_pause() {
+        use crate::asks::{project_control as control, routing_policy::{integration as routing, RoutingActor}};
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let (world, root) = crate::asks::scheduler::tests::world("peer-source-fresh-pause");
+        let fixture = test_support::for_directory(&world.directory);
+        let controllers = routing::ControllerView::load(&fixture.snapshot).unwrap();
+        let host = routing::local_host_id();
+        let now = Utc::now();
+        let (mut state, mut ask, peer) = crate::peers::tests::remote_record();
+        let source = ask.requester.session().unwrap().to_owned();
+        let controller = ask.target_cutex_session_id.clone();
+        let remote = ask.remote.as_mut().unwrap();
+        remote.request.requester.cutex_session_id = source.clone();
+        remote.request.request_sha256 = remote.request.digest();
+        remote.sync.pending_ops = vec![Op { op_id:"pop-fresh-pause".into(),op:"create".into(),outcome:None,reason:None }];
+        let original_request = remote.request.clone();
+        state.asks.insert(ask.ask_id.clone(),ask.clone());
+        assert!(ask.routing_request.is_none(), "exercise a legacy queued create");
+        test_support::configure(&mut state,&fixture,now).unwrap();
+        let ctx = routing::trusted_context(&fixture.snapshot,"alpha",RoutingActor::Owner,&host).unwrap();
+        control::pause(&mut state,&ctx,&control::PauseRequest {action_id:"peer-fresh-pause".into(),expected_epoch:0,
+            mode:control::Mode::AfterTurn,scope:control::Scope::Members},&control::Membership{
+                revision:0,members:Default::default(),excluded:Default::default()},&host,now).unwrap();
+        assert!(!crate::asks::agent_pause::is_paused(&state,&source),"cached members omit the source");
+        assert!(crate::asks::pause_admission::is_paused_in(&state,&fixture.snapshot,&source));
+        assert_eq!(prepare_create(&mut state,&fixture.snapshot,&ask,&peer.peer_id,"pop-fresh-pause",&controllers,&host,now),CreateDispatch::Defer);
+        assert_eq!(state.asks[&ask.ask_id].remote.as_ref().unwrap().sync.last_error.as_deref(),Some("routing_source:routing_source_paused"));
+        assert!(!create_may_have_run(&state.asks[&ask.ask_id].remote.as_ref().unwrap().sync));
+
+        // Original source remains unpaused. An accepted controller still held
+        // by another project's independent pause must not send in its place.
+        state.project_control.projects.clear();
+        let other = crate::asks::routing_policy::RoutingContext {project_id:"other".into(),..ctx};
+        control::pause(&mut state,&other,&control::PauseRequest {action_id:"peer-controller-pause".into(),expected_epoch:0,
+            mode:control::Mode::AfterTurn,scope:control::Scope::Members},&control::Membership{
+                revision:1,members:[controller.clone()].into(),excluded:Default::default()},&host,now).unwrap();
+        crate::asks::model::route::pin(&ask.ask_id,crate::asks::model::route::Pin {
+            controller:Ok(Some(controller)),history:vec![source.clone()],questions:None});
+        assert!(!crate::asks::pause_admission::is_paused_in(&state,&fixture.snapshot,&source));
+        assert_eq!(prepare_create(&mut state,&fixture.snapshot,&ask,&peer.peer_id,"pop-fresh-pause",&controllers,&host,now),CreateDispatch::Defer);
+        let current = &state.asks[&ask.ask_id];
+        assert_eq!(current.remote.as_ref().unwrap().sync.last_error.as_deref(),Some("routing_source:routing_source_paused"));
+        assert_eq!(current.remote.as_ref().unwrap().request,original_request);
+        assert_eq!(current.action_id,ask.action_id);
+        assert_eq!(current.remote.as_ref().unwrap().sync.pending_ops[0].op_id,"pop-fresh-pause");
+        assert!(!create_may_have_run(&current.remote.as_ref().unwrap().sync));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queued_create_is_gated_and_uncertain_original_reconciles_after_policy_change() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let (world, root) = crate::asks::scheduler::tests::world("peer-source-routing");
+        let fixture = test_support::for_directory(&world.directory);
+        let controllers =
+            crate::asks::routing_policy::integration::ControllerView::load(&fixture.snapshot)
+                .unwrap();
+        let host = crate::asks::routing_policy::integration::local_host_id();
+        let now = Utc::now();
+        let (mut state, mut ask, peer) = crate::peers::tests::remote_record();
+        let remote = ask.remote.as_mut().unwrap();
+        remote.request.requester.cutex_session_id = ask.requester.session().unwrap().into();
+        remote.request.request_sha256 = remote.request.digest();
+        remote.sync.pending_ops = vec![Op {
+            op_id: "pop-original-create".into(),
+            op: "create".into(),
+            outcome: None,
+            reason: None,
+        }];
+        let original_request = remote.request.clone();
+        state.asks.insert(ask.ask_id.clone(), ask.clone());
+        let original_action = ask.action_id.clone();
+        let denied = prepare_create(
+            &mut state,
+            &fixture.snapshot,
+            &ask,
+            &peer.peer_id,
+            "pop-original-create",
+            &controllers,
+            &host,
+            now,
+        );
+        assert_eq!(
+            denied,
+            CreateDispatch::Defer,
+            "default restricted policy cannot send a legacy queued peer create"
+        );
+        assert_eq!(
+            state.asks[&ask.ask_id].remote.as_ref().unwrap().sync.state,
+            ROUTING_PENDING
+        );
+        assert!(!create_may_have_run(
+            &state.asks[&ask.ask_id].remote.as_ref().unwrap().sync
+        ));
+        test_support::configure(&mut state, &fixture, Utc::now()).unwrap();
+        let sent = prepare_create(
+            &mut state,
+            &fixture.snapshot,
+            &ask,
+            &peer.peer_id,
+            "pop-original-create",
+            &controllers,
+            &host,
+            now,
+        );
+        assert_eq!(sent, CreateDispatch::Send(original_request.clone()));
+        assert_eq!(
+            state.asks[&ask.ask_id].remote.as_ref().unwrap().sync.state,
+            CREATE_OUTCOME_UNKNOWN,
+            "intent is durable before transport starts"
+        );
+        // Crash/restart after intent, before any transport response. Revoke
+        // the old open policy; the original outcome is still uncertain.
+        let mut state: AskState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        state.routing.policies.clear();
+        assert_eq!(
+            prepare_create(
+                &mut state,
+                &fixture.snapshot,
+                &ask,
+                &peer.peer_id,
+                "pop-original-create",
+                &controllers,
+                &host,
+                now
+            ),
+            CreateDispatch::Reconcile
+        );
+        let current = &state.asks[&ask.ask_id];
+        assert_eq!(current.action_id, original_action);
+        assert_eq!(current.remote.as_ref().unwrap().request, original_request);
+        assert_eq!(
+            current.remote.as_ref().unwrap().sync.pending_ops[0].op_id,
+            "pop-original-create"
+        );
+        assert!(current.is_open() && create_may_have_run(&current.remote.as_ref().unwrap().sync));
+        assert!(state.routing.grants.values().all(|g| g.used_count == 0));
+        // A stale in-memory transport snapshot cannot change the request that
+        // is claimed, and a stop after queue enumeration prevents any PUT.
+        let before = state.clone();
+        let mut stale = ask.clone();
+        stale.remote.as_mut().unwrap().request.text = "changed stale request".into();
+        assert_eq!(
+            prepare_create(
+                &mut state,
+                &fixture.snapshot,
+                &stale,
+                &peer.peer_id,
+                "pop-original-create",
+                &controllers,
+                &host,
+                now
+            ),
+            CreateDispatch::Defer
+        );
+        assert_eq!(state, before);
+        state.asks.get_mut(&ask.ask_id).unwrap().closed = Some(CloseOutcome::Stopped);
+        assert_eq!(
+            prepare_create(
+                &mut state,
+                &fixture.snapshot,
+                &ask,
+                &peer.peer_id,
+                "pop-original-create",
+                &controllers,
+                &host,
+                now
+            ),
+            CreateDispatch::Defer
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mismatched_wire_source_never_becomes_an_authorized_first_send() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let (world, root) = crate::asks::scheduler::tests::world("peer-source-mismatch");
+        let fixture = test_support::for_directory(&world.directory);
+        let controllers =
+            crate::asks::routing_policy::integration::ControllerView::load(&fixture.snapshot)
+                .unwrap();
+        let host = crate::asks::routing_policy::integration::local_host_id();
+        let now = Utc::now();
+        let (mut state, mut ask, peer) = crate::peers::tests::remote_record();
+        ask.remote.as_mut().unwrap().sync.pending_ops = vec![Op {
+            op_id: "pop-mismatch".into(),
+            op: "create".into(),
+            outcome: None,
+            reason: None,
+        }];
+        state.asks.insert(ask.ask_id.clone(), ask.clone());
+        test_support::configure(&mut state, &fixture, Utc::now()).unwrap();
+        assert_eq!(
+            prepare_create(
+                &mut state,
+                &fixture.snapshot,
+                &ask,
+                &peer.peer_id,
+                "pop-mismatch",
+                &controllers,
+                &host,
+                now
+            ),
+            CreateDispatch::Defer
+        );
+        assert!(state.asks[&ask.ask_id]
+            .remote
+            .as_ref()
+            .unwrap()
+            .sync
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("routing_scope_mismatch"));
+        assert!(!create_may_have_run(
+            &state.asks[&ask.ask_id].remote.as_ref().unwrap().sync
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

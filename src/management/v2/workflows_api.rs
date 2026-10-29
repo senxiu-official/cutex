@@ -113,6 +113,7 @@ impl StepBackend for ManagementSteps {
             request_id,
             cwd: Some(step.cwd.clone()),
             profile: step.profile.clone(),
+            variant_id: None,
             display_name: Some(display_name(step)),
             start: true,
             launch: Some(self.launch(step, claude)),

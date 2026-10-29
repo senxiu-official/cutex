@@ -22,21 +22,20 @@
 //! RFC 3339 `timestamp` verbatim and `turnId` is null only for histories
 //! without turn markers.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::OnceLock;
 
-use anyhow::ensure;
 use serde_json::{json, Value};
+
+use super::rollout_scan::{self, LineScanner};
+#[cfg(test)]
+use super::rollout_scan::CHUNK_BYTES;
 
 /// Native `PlanToolOutput` text for an accepted `update_plan` call.
 pub const PLAN_UPDATED_OUTPUT: &str = "Plan updated";
 /// Upper bound on rollout bytes read per derivation (all segments).
-pub const SCAN_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
-const CHUNK_BYTES: usize = 256 * 1024;
-const CACHE_ENTRIES: usize = 128;
+pub const SCAN_BUDGET_BYTES: u64 = rollout_scan::SCAN_BUDGET_BYTES;
 /// Lines that can matter; everything else is skipped without JSON parsing.
 const NEEDLES: [&str; 6] = [
     "update_plan",
@@ -54,40 +53,20 @@ pub fn latest_plan(home: &Path, thread_id: &str) -> anyhow::Result<Option<Value>
 }
 
 /// As [`latest_plan`] for an already resolved current rollout. Results are
-/// cached per rollout until it changes (appends change its length).
+/// cached per rollout; after an append only the new lines are scanned
+/// (`rollout_scan`).
 pub fn latest_plan_in_rollout(
     home: &Path,
     current: &Path,
     thread_id: &str,
 ) -> anyhow::Result<Option<Value>> {
-    let metadata = std::fs::metadata(current)?;
-    let stamp = (metadata.len(), metadata.modified().ok());
-    let key = (current.to_path_buf(), thread_id.to_string());
-    if let Some(hit) = cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&key).filter(|entry| entry.0 == stamp).map(|entry| entry.1.clone()))
-    {
-        return Ok(hit);
-    }
-    let result = scan_chain(home, current, stamp.0, thread_id, SCAN_BUDGET_BYTES)?;
-    if let Ok(mut cache) = cache().lock() {
-        if cache.len() >= CACHE_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(key, (stamp, result.clone()));
-    }
-    Ok(result)
+    static CACHE: rollout_scan::Cache<Option<Value>> = OnceLock::new();
+    rollout_scan::latest(&CACHE, home, current, thread_id, SCAN_BUDGET_BYTES, |scanner: Scanner| {
+        scanner.finish(thread_id)
+    })
 }
 
-type CacheKey = (PathBuf, String);
-type CacheStamp = (u64, Option<SystemTime>);
-
-fn cache() -> &'static Mutex<HashMap<CacheKey, (CacheStamp, Option<Value>)>> {
-    static CACHE: OnceLock<Mutex<HashMap<CacheKey, (CacheStamp, Option<Value>)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
+#[cfg(test)]
 fn scan_chain(
     home: &Path,
     current: &Path,
@@ -95,58 +74,17 @@ fn scan_chain(
     thread_id: &str,
     budget: u64,
 ) -> anyhow::Result<Option<Value>> {
-    let mut scanner = Scanner::default();
-    let mut budget = budget;
-    let mut seen = BTreeSet::new();
-    let mut segment = Some((current.to_path_buf(), length));
-    while let Some((path, end)) = segment {
-        ensure!(seen.insert(path.clone()), "cyclic native history reference");
-        if scan_segment(&path, end, &mut scanner, &mut budget)? {
-            break;
-        }
-        segment = super::native_history::history_base(home, &path)?;
-    }
-    Ok(scanner.finish(thread_id))
+    Ok(rollout_scan::scan_full::<Scanner>(home, current, length, budget)?.finish(thread_id))
 }
 
-/// Feeds `path[..end]` to `scanner` newest line first. Returns true when the
-/// scan is complete (or the budget is spent).
-fn scan_segment(
-    path: &Path,
-    end: u64,
-    scanner: &mut Scanner,
-    budget: &mut u64,
-) -> anyhow::Result<bool> {
-    let mut file = std::fs::File::open(path)?;
-    let end = end.min(file.metadata()?.len());
-    let mut position = end;
-    // Bytes of the (possibly partial) line that ends at `position`'s tail.
-    let mut carry: Vec<u8> = Vec::new();
-    let mut chunk = vec![0u8; CHUNK_BYTES];
-    while position > 0 {
-        if *budget == 0 {
-            return Ok(true);
-        }
-        let size = (position.min(CHUNK_BYTES as u64)).min(*budget) as usize;
-        position -= size as u64;
-        *budget -= size as u64;
-        file.seek(SeekFrom::Start(position))?;
-        file.read_exact(&mut chunk[..size])?;
-        let mut tail = size;
-        while let Some(newline) = chunk[..tail].iter().rposition(|&b| b == b'\n') {
-            let mut line = chunk[newline + 1..tail].to_vec();
-            line.extend_from_slice(&carry);
-            carry.clear();
-            if scanner.line(&line) {
-                return Ok(true);
-            }
-            tail = newline;
-        }
-        let mut head = chunk[..tail].to_vec();
-        head.extend_from_slice(&carry);
-        carry = head;
+impl LineScanner for Scanner {
+    fn line(&mut self, bytes: &[u8]) -> bool {
+        Scanner::line(self, bytes)
     }
-    Ok(scanner.line(&carry))
+
+    fn neutral(&self) -> bool {
+        self.accepted_calls.is_empty() && self.rolled_back_turns == 0 && self.found.is_none()
+    }
 }
 
 struct Found {
@@ -309,6 +247,7 @@ fn parse_update_plan_arguments(arguments: &str) -> Option<(Option<String>, Vec<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const THREAD: &str = "0189a000-0000-7000-8000-000000000001";
 
@@ -604,5 +543,34 @@ mod tests {
         // A budget that only covers the filler finds nothing (and fails soft).
         let none = scan_chain(&home.0, &path, length, THREAD, (CHUNK_BYTES as u64) * 3).unwrap();
         assert_eq!(none, None);
+    }
+
+    #[test]
+    fn appended_lines_update_the_cached_plan_like_a_full_scan() {
+        let home = home();
+        let path = home.0.join("sessions/2026").join(format!("rollout-y-{THREAD}.jsonl"));
+        let at = "2026-10-07T01:00:00.000Z";
+        let mut lines = vec![meta(Value::Null)];
+        lines.extend(turn("turn-1", at));
+        lines.push(call("c1", at, plan(None, &[("one", "pending")])));
+        lines.push(output("c1", at, "Plan updated"));
+        write(&path, &lines);
+        let appends: Vec<Vec<Value>> = vec![
+            turn("turn-2", at),
+            vec![call("c2", at, plan(None, &[("two", "completed")]))],
+            // The output of a call before the checkpoint.
+            vec![output("c2", at, "Plan updated")],
+            vec![json!({"timestamp":at,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}})],
+            turn("turn-3", at),
+        ];
+        for append in appends {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            for line in &append {
+                std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
+            }
+            drop(file);
+            assert_eq!(latest_plan_in_rollout(&home.0, &path, THREAD).unwrap(), scan(&home.0, &path));
+        }
+        assert_eq!(scan(&home.0, &path).unwrap()["plan"][0]["step"], "one", "the rollback dropped turn-2");
     }
 }

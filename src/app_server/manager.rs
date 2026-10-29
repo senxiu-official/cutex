@@ -199,6 +199,28 @@ pub trait AppServerRuntimeEventSink: Send + Sync + 'static {
     fn event_ledger(&self) -> Option<Arc<super::single_writer::Ledger>> {
         None
     }
+    /// Passive, once-per-receive presentation ingress, independent of journal
+    /// ownership. Never called by takeover replay. Implementations must verify
+    /// routing and must not journal text, mutate input/business state or issue
+    /// native requests. Activity timestamps may use their existing checkpoint
+    /// cadence; no callback may wait for the input admission lane.
+    fn handle_live_event_from_connection(
+        &self,
+        _context: &AppServerRuntimeEventContext,
+        _event: &AppServerEvent,
+        _origin: &AppServerHandle,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Ephemeral boundary at worker entry/exit. A presentation consumer can
+    /// invalidate unfinished text after a lost subscription without inventing
+    /// a durable runtime event or entering the input admission lane.
+    fn handle_live_connection_boundary(
+        &self,
+        _context: &AppServerRuntimeEventContext,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// An event another process journals: only connection-local claims
     /// (this process's own ephemeral threads) may run; no durable effects.
     fn handle_unowned_event(
@@ -233,6 +255,9 @@ pub struct AppServerRuntimeEventContext {
     pub thread_id: String,
     pub runtime_generation: u64,
     pub runtime_backend: String,
+    /// Exact native initialize capability; absent/false/other JSON types keep
+    /// the complete legacy durable-delta and takeover behavior.
+    pub full_text_item_terminal: bool,
     pub launched_profile: Option<String>,
     /// Stable id of the launched profile; readers resolve the current name
     /// from it (`current_profile`), so a rename applies to a live runtime.
@@ -559,6 +584,9 @@ impl AppServerRuntimeManager {
         let runtime = runtimes
             .get(cutex_session_id)
             .with_context(|| format!("app-server runtime is not connected: {cutex_session_id}"))?;
+        if let Some(reason) = runtime.handle.disconnect_reason() {
+            anyhow::bail!("app-server control connection failed: {reason}");
+        }
         let connected = runtime
             .status
             .lock()
@@ -598,6 +626,11 @@ impl AppServerRuntimeManager {
                 actual: Some(status.runtime_generation),
             });
         }
+        if let Some(reason) = runtime.handle.disconnect_reason() {
+            return Err(AppServerExactRuntimeHandleError::Unavailable(format!(
+                "app-server control connection failed: {reason}"
+            )));
+        }
         if !status.connected || !runtime.runtime_alive.load(Ordering::Acquire) {
             return Err(AppServerExactRuntimeHandleError::Unavailable(format!(
                 "app-server runtime is disconnected: {cutex_session_id}"
@@ -617,16 +650,20 @@ impl AppServerRuntimeManager {
                 .map_err(|_| anyhow::anyhow!("app-server runtime manager lock was poisoned"))?;
             runtimes
                 .get(cutex_session_id)
-                .map(|runtime| (runtime.status.clone(), runtime.runtime_alive.clone()))
+                .map(|runtime| (runtime.status.clone(), runtime.runtime_alive.clone(), runtime.handle.clone()))
         };
         status
-            .map(|(status, runtime_alive)| {
+            .map(|(status, runtime_alive, handle)| {
                 status
                     .lock()
                     .map(|status| {
                         let mut status = status.clone();
                         if !runtime_alive.load(Ordering::Acquire) {
                             status.connected = false;
+                        }
+                        if let Some(reason) = handle.disconnect_reason() {
+                            status.connected = false;
+                            status.last_error = Some(reason);
                         }
                         status
                     })
@@ -836,6 +873,27 @@ impl AppServerRuntimeManager {
         }
     }
 
+    /// Retry an observer's missing registration without replacing its native
+    /// connection. A live bridge owns its heartbeat retry; a stopped bridge can
+    /// be replaced. Startup failure deliberately leaves the native stream alive.
+    pub fn ensure_agent_bus_bridge(
+        &self,
+        cutex_session_id: &str,
+        bus: Arc<dyn RuntimeAgentBus>,
+        options: AppServerAgentBusBridgeOptions,
+    ) -> anyhow::Result<AppServerAgentBusBridgeStatus> {
+        if let Some(status) = self.agent_bus_status(cutex_session_id)? {
+            anyhow::ensure!(status.thread_id == options.thread_id
+                && status.runtime_agent_id == options.registration.id,
+                "observer bridge identity does not match the requested runtime");
+            if status.running {
+                return Ok(status);
+            }
+            self.stop_agent_bus_bridge(cutex_session_id)?;
+        }
+        self.start_agent_bus_bridge(cutex_session_id, bus, options)
+    }
+
     pub fn agent_bus_status(
         &self,
         cutex_session_id: &str,
@@ -965,6 +1023,7 @@ impl AppServerRuntimeManager {
                         .lock()
                         .map(|status| {
                             status.connected && runtime.runtime_alive.load(Ordering::Acquire)
+                                && runtime.handle.disconnect_reason().is_none()
                         })
                         .map_err(|_| anyhow::anyhow!("app-server runtime status lock was poisoned"))
                 })
@@ -982,6 +1041,10 @@ impl AppServerRuntimeManager {
         }
 
         let mut options = AppServerClientOptions::new(endpoint.clone());
+        // The ACP adapters (DSH, Kimi Code) relay asks to Management clients.
+        if runtime_backend == "dsh" || runtime_backend == "kimi" {
+            options.extra_capabilities.insert("dshInteractiveApprovals".to_string(), Value::Bool(true));
+        }
         if runtime_backend == "claude_subscription" {
             // Management relays Claude approvals and AskUserQuestion to its
             // clients (server-request-responses), like Codex server requests;
@@ -989,6 +1052,7 @@ impl AppServerRuntimeManager {
             options
                 .extra_capabilities
                 .insert("claudeInteractiveApprovals".to_string(), Value::Bool(true));
+            claude_observer_notifications(&mut options);
         }
         // Registered before connecting: an owner adopting meanwhile hands
         // over rather than taking every event (`single_writer`).
@@ -998,6 +1062,10 @@ impl AppServerRuntimeManager {
             .map(|ledger| ledger.open(cutex_session_id, runtime_generation));
         let client = AppServerClient::connect(options)?;
         let initialize_response = client.initialize_response().clone();
+        let full_text_item_terminal = initialize_response.get("fullTextItemTerminal") == Some(&Value::Bool(true));
+        if let Some(ownership) = ownership.as_mut() {
+            ownership.set_full_text_item_terminal(full_text_item_terminal);
+        }
         crate::launch::stock::validate_ingress_capability(
             crate::launch::stock::schema_has_external_input(&schema.version, &schema.sha256),
             &initialize_response,
@@ -1082,6 +1150,7 @@ impl AppServerRuntimeManager {
             thread_id: response_thread_id.clone(),
             runtime_generation,
             runtime_backend: runtime_backend.to_string(),
+            full_text_item_terminal,
             usage: crate::management::v2::usage::UsageRuntimeContext::capture(
                 cutex_session_id, &response_thread_id, runtime_generation,
                 launched_profile_id.as_deref(), &thread_settings_from_resume_response(&thread_response),
@@ -1091,6 +1160,7 @@ impl AppServerRuntimeManager {
             schema: schema.clone(),
         };
         let mut journal_options = DiagnosticJournalOptions::new(diagnostic_journal_path.into());
+        journal_options.event_blob_owner = Some((cutex_session_id.to_string(), response_thread_id.clone()));
         // Neither private stock nor U+S6 speaks the legacy K business ingress.
         let supports_cutex_ingress = !crate::launch::stock::is_private_native_schema(&schema.sha256)
             && !crate::launch::stock::is_stock_schema_version(&schema.version);
@@ -1206,6 +1276,11 @@ fn run_event_worker(
     mut ownership: Option<super::single_writer::ConnectionOwnership>,
 ) {
     let origin = client.handle();
+    if event_context.full_text_item_terminal {
+        if let Err(error) = event_sink.handle_live_connection_boundary(&event_context) {
+            mark_error(&status, format!("failed to invalidate live connection boundary: {error:#}"));
+        }
+    }
     // An event pulled while merging a delta backlog, handled next.
     let mut carried: Option<AppServerEvent> = None;
     let mut deferred_diagnostics: Vec<(AppServerEvent, usize)> = Vec::new();
@@ -1216,6 +1291,10 @@ fn run_event_worker(
             break;
         }
         deferred_diagnostics.retain(|(event, bytes)| {
+            if event_context.full_text_item_terminal && crate::management::v2::native_events::is_live_text_delta(event) {
+                deferred_bytes = deferred_bytes.saturating_sub(*bytes);
+                return false;
+            }
             if event_sink.should_defer_journal_event(&event_context, event, &origin) {
                 return true;
             }
@@ -1253,6 +1332,18 @@ fn run_event_worker(
                     &origin,
                     &status,
                 );
+                if event_context.full_text_item_terminal && crate::management::v2::native_events::is_live_text_delta(&event) {
+                    // Classification above still advances lease/emission-time
+                    // bookkeeping. Live payloads never enter diagnostic/deferred
+                    // journals, retained takeover data, or the durable sink.
+                    if let Err(error) = event_sink.handle_live_event_from_connection(
+                        &event_context, &event, &origin,
+                    ) {
+                        mark_error(&status, format!("failed to handle live native event: {error:#}"));
+                    }
+                    mark_event_received(&status);
+                    continue;
+                }
                 if !owned {
                     // Another process journals this event: in-memory status
                     // only (above), no diagnostics or durable effects.
@@ -1275,9 +1366,21 @@ fn run_event_worker(
                     }
                     continue;
                 }
+                if !event_sink.should_defer_journal_event(&event_context, &event, &origin)
+                    && event_sink.should_journal_event(&event_context, &event, &origin)
+                {
+                    if let Err(error) = normalize_bound_event(&event_context, &mut event) {
+                        runtime_alive.store(false, Ordering::Release);
+                        let reason = format!("failed to durably store native event media: {error:#}");
+                        mark_disconnected(&status, &reason);
+                        let _ = event_sink.handle_event_from_connection(&event_context,
+                            &AppServerEvent::Disconnected { reason }, &origin);
+                        break;
+                    }
+                }
                 if event_sink.should_defer_journal_event(&event_context, &event, &origin) {
-                    let bytes = event_as_inbound(&event)
-                        .map(|message| message.raw().to_string().len())
+                    let bytes = event_raw(&event)
+                        .map(crate::management::v2::event_blobs::encoded_len)
                         .unwrap_or(0);
                     // Diagnostics were already best effort and bounded on disk.
                     // Never spill undecidable raw data to disk on overflow.
@@ -1360,12 +1463,20 @@ fn run_event_worker(
             }
         }
     }
+    // Includes owned/unowned native Disconnected, actor failure and explicit
+    // stop. This path never runs durable effects or waits for input admission.
+    if event_context.full_text_item_terminal {
+        if let Err(error) = event_sink.handle_live_connection_boundary(&event_context) {
+            mark_error(&status, format!("failed to invalidate live connection boundary: {error:#}"));
+        }
+    }
     // Preserve definitely unrelated deferred diagnostics on shutdown too. A
     // failed fork whose id never arrived remains unclassifiable: emit bounded
     // count-only evidence rather than silently drop it or persist private text.
     let mut omitted_count = 0usize;
     let mut omitted_bytes = 0usize;
     for (event, bytes) in deferred_diagnostics {
+        if event_context.full_text_item_terminal && crate::management::v2::native_events::is_live_text_delta(&event) { continue; }
         if event_sink.should_defer_journal_event(&event_context, &event, &origin) {
             omitted_count += 1;
             omitted_bytes += bytes;
@@ -1404,7 +1515,16 @@ fn replay_taken_over_events(
     let Some(ownership) = ownership else {
         return;
     };
-    for event in ownership.take_replay() {
+    for mut event in ownership.take_replay() {
+        if event_context.full_text_item_terminal && crate::management::v2::native_events::is_live_text_delta(&event) { continue; }
+        if !event_sink.should_defer_journal_event(event_context, &event, origin)
+            && event_sink.should_journal_event(event_context, &event, origin)
+        {
+            if let Err(error) = normalize_bound_event(event_context, &mut event) {
+                mark_error(status, format!("failed to store replay event media: {error:#}"));
+                continue;
+            }
+        }
         if let Some(inbound) = event_as_inbound(&event)
             .filter(|_| event_sink.should_journal_event(event_context, &event, origin))
         {
@@ -1565,6 +1685,33 @@ fn event_as_inbound(event: &AppServerEvent) -> Option<InboundMessage> {
     }
 }
 
+fn event_raw(event: &AppServerEvent) -> Option<&Value> {
+    match event {
+        AppServerEvent::Notification(n) => Some(&n.raw),
+        AppServerEvent::ServerRequest(r) => Some(&r.raw),
+        _ => None,
+    }
+}
+
+/// Never persist an unresolved foreign or ephemeral thread under the parent
+/// session's media grants. The repository handles verified routed descendants.
+fn normalize_bound_event(context: &AppServerRuntimeEventContext, event: &mut AppServerEvent) -> anyhow::Result<()> {
+    let (raw, params) = match event {
+        AppServerEvent::Notification(n) => (&mut n.raw, &mut n.params),
+        AppServerEvent::ServerRequest(n) => (&mut n.raw, &mut n.params),
+        _ => return Ok(()),
+    };
+    if super::protocol::correlations(raw).thread_id.as_deref() != Some(context.thread_id.as_str()) {
+        return Ok(());
+    }
+    crate::management::v2::event_blobs::EventBlobStore::open_default()?
+        // Internal bookkeeping and approval decisions still need the complete
+        // text. Only the durable event/journal copies get the display budget.
+        .externalize_media(&context.cutex_session_id, raw)?;
+    *params = raw.get("params").cloned();
+    Ok(())
+}
+
 fn mark_event_received(status: &Arc<Mutex<AppServerManagedRuntimeStatus>>) {
     if let Ok(mut status) = status.lock() {
         status.last_event_at = Some(Utc::now().to_rfc3339());
@@ -1584,8 +1731,57 @@ fn mark_disconnected(status: &Arc<Mutex<AppServerManagedRuntimeStatus>>, reason:
     }
 }
 
+/// The adapter sends `claude/*` notifications only to a peer that asked for
+/// `claudeExtensions` (cute_claude `Engine.broadcast`). The observer needs
+/// `claude/task/updated` (a background subagent's `notifyParent` becomes the
+/// "Claude Task" message); without the flag it never arrived (r247). The
+/// high-volume frames nothing here reads stay opted out; any other `claude/*`
+/// method is ignored by the Claude event sink.
+pub const CLAUDE_OBSERVER_OPT_OUTS: &[&str] = &[
+    "claude/runtime/event",
+    "claude/runtime/statusChanged",
+    "claude/model/observed",
+    "claude/input/contextPersisted",
+    "claude/input/statusChanged",
+];
+
+fn claude_observer_notifications(options: &mut AppServerClientOptions) {
+    options
+        .extra_capabilities
+        .insert("claudeExtensions".to_string(), Value::Bool(true));
+    options.opt_out_notification_methods =
+        CLAUDE_OBSERVER_OPT_OUTS.iter().map(|method| method.to_string()).collect();
+}
+
+#[cfg(test)]
+#[path = "live_ingress_tests.rs"]
+mod live_ingress_tests;
+
+#[cfg(test)]
+#[path = "reconnect_backlog_tests.rs"]
+mod reconnect_backlog_tests;
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn event_media_shaping_never_truncates_internal_approval_or_answer_text() {
+        use super::*;
+        let context=AppServerRuntimeEventContext {
+            cutex_session_id:format!("cutex.{}",uuid::Uuid::new_v4()),thread_id:"thread-1".into(),
+            runtime_generation:1,runtime_backend:"test".into(),full_text_item_terminal:false,launched_profile:None,launched_profile_id:None,
+            usage:Default::default(),schema:Default::default(),
+        };
+        let command=format!("{}; dangerous suffix must remain visible","echo safe; ".repeat(50_000));
+        let raw=serde_json::json!({"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","command":command}});
+        let mut event=AppServerEvent::ServerRequest(super::super::protocol::RpcServerRequest {
+            id:serde_json::json!(7),method:"item/commandExecution/requestApproval".into(),params:raw.get("params").cloned(),raw:raw.clone(),
+        });
+        normalize_bound_event(&context,&mut event).unwrap();
+        let AppServerEvent::ServerRequest(request)=event else {panic!("server request");};
+        assert_eq!(request.raw,raw,"only persisted display copies may be text-truncated");
+        assert_eq!(request.params.as_ref().unwrap()["command"],command);
+    }
+
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
@@ -1629,8 +1825,7 @@ mod tests {
         directory
     }
 
-    #[test]
-    fn manager_disconnect_completes_when_event_queue_is_saturated() {
+    fn connected_saturated_manager() -> (AppServerRuntimeManager, Arc<AtomicBool>) {
         let (client, send_attempted_rx) = saturated_event_client_for_test();
         send_attempted_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1683,10 +1878,16 @@ mod tests {
                     worker: Some(worker),
                     agent_bus_bridge: None,
                     agent_bus_bridge_starting: false,
-                    runtime_alive,
+                    runtime_alive: runtime_alive.clone(),
                 },
             );
 
+        (manager, runtime_alive)
+    }
+
+    #[test]
+    fn manager_disconnect_completes_when_event_queue_is_saturated() {
+        let (manager, _) = connected_saturated_manager();
         let manager_for_disconnect = manager.clone();
         let (disconnect_done_tx, disconnect_done_rx) = mpsc::sync_channel(1);
         let disconnect_thread = thread::spawn(move || {
@@ -1705,6 +1906,47 @@ mod tests {
             .status("saturated-close")
             .expect("runtime status")
             .is_none());
+    }
+
+    #[test]
+    fn observer_registration_retry_preserves_native_connection_and_reuses_bridge() {
+        struct RecoveringBus { attempts: AtomicUsize }
+        impl RuntimeAgentBus for RecoveringBus {
+            fn register(&self, _: &AgentBusRegisterRequest) -> anyhow::Result<()> {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("simulated bus unavailable");
+                }
+                Ok(())
+            }
+            fn unregister(&self, _: &str) -> anyhow::Result<bool> { Ok(true) }
+            fn poll(&self, _: &str) -> anyhow::Result<Vec<AgentBusMessage>> { Ok(vec![]) }
+            fn ack(&self, _: &str, ids: &[String]) -> anyhow::Result<usize> { Ok(ids.len()) }
+        }
+        let (manager, alive) = connected_saturated_manager();
+        let status_before = manager.runtimes.lock().unwrap()["saturated-close"].status.clone();
+        let bus = Arc::new(RecoveringBus { attempts: AtomicUsize::new(0) });
+        let mut options = AppServerAgentBusBridgeOptions::new(AgentBusRegisterRequest {
+            id: "runtime-observer".into(), name: "observer".into(), base_name: None,
+            thread_name: None, path_key: None, session_id: Some("thread-1".into()),
+            profile: "test".into(), cwd: "/test".into(), pid: 42,
+            host_id: Some("test-host".into()), groups: vec![],
+            registration_class: AgentRegistrationClass::Persistent,
+        }, "thread-1");
+        options.registration_only = true;
+        assert!(manager.ensure_agent_bus_bridge("saturated-close", bus.clone(), options.clone()).is_err());
+        assert!(manager.status("saturated-close").unwrap().unwrap().connected);
+        assert!(alive.load(Ordering::Acquire));
+        assert!(manager.agent_bus_status("saturated-close").unwrap().is_none());
+        assert!(!manager.runtimes.lock().unwrap()["saturated-close"].agent_bus_bridge_starting);
+        let bridge = manager.ensure_agent_bus_bridge("saturated-close", bus.clone(), options.clone()).unwrap();
+        assert!(bridge.running && bridge.registered);
+        assert!(Arc::ptr_eq(&status_before, &manager.runtimes.lock().unwrap()["saturated-close"].status));
+        let reused = manager.ensure_agent_bus_bridge("saturated-close", bus.clone(), options).unwrap();
+        assert!(reused.registered);
+        assert_eq!(bus.attempts.load(Ordering::SeqCst), 2);
+        assert!(alive.load(Ordering::Acquire));
+        manager.disconnect("saturated-close").unwrap();
+        assert!(!alive.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2272,6 +2514,42 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
+    // The public status prefers a terminal transport reason. Verify the sink
+    // error in the worker's retained status and independently prove every
+    // command path is closed, rather than requiring one public error string.
+    #[cfg(unix)]
+    fn assert_terminal_sink_failure(manager: &AppServerRuntimeManager, expected: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let (retained, alive, handle) = {
+                let runtimes = manager.runtimes.lock().expect("runtime map");
+                let runtime = runtimes.get("cutex-1").expect("managed runtime");
+                let retained = runtime.status.lock().expect("retained status").clone();
+                (retained, runtime.runtime_alive.load(Ordering::Acquire), runtime.handle.clone())
+            };
+            let before = handle.disconnect_reason();
+            let public = manager.status("cutex-1").expect("status").expect("runtime");
+            let after = handle.disconnect_reason();
+            if !alive && !retained.connected
+                && retained.last_error.as_deref().is_some_and(|error| error.contains(expected))
+                && before == after
+            {
+                assert!(!public.connected, "public status reopened a failed runtime");
+                assert_eq!(public.last_error, after.clone().or(retained.last_error.clone()));
+                assert!(manager.commands("cutex-1").is_err(), "commands remained available");
+                assert!(manager.handle("cutex-1").is_err(), "handle remained available");
+                assert!(manager.handle_for_generation("cutex-1", 1).is_err(),
+                    "generation-specific handle remained available");
+                eprintln!("sink-failure evidence: connected={} worker_alive={} retained={:?} public={:?} transport={:?}; commands/handle/exact-handle rejected",
+                    public.connected, alive, retained.last_error, public.last_error, after);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline,
+                "sink failure did not close worker: retained={retained:?}, public={public:?}, alive={alive}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn durable_event_sink_failure_disconnects_runtime_and_stops_consumption() {
@@ -2327,27 +2605,8 @@ mod tests {
             )
             .expect("connect managed runtime");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let status = loop {
-            let status = manager
-                .status("cutex-1")
-                .expect("runtime status")
-                .expect("managed runtime status");
-            if !status.connected {
-                break status;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "runtime did not fail closed after sink failure"
-            );
-            thread::sleep(Duration::from_millis(10));
-        };
+        assert_terminal_sink_failure(&manager, "canonical event repository unavailable");
         assert_eq!(sink_calls.load(Ordering::SeqCst), 1);
-        assert!(status
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("canonical event repository unavailable")));
-        assert!(manager.commands("cutex-1").is_err());
         assert!(manager.disconnect("cutex-1").expect("disconnect runtime"));
 
         server.join().expect("server thread");
@@ -2404,35 +2663,11 @@ mod tests {
             )
             .expect("connect managed runtime");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let status = loop {
-            let status = manager
-                .status("cutex-1")
-                .expect("runtime status")
-                .expect("managed runtime status");
-            if !status.connected
-                && status
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("reject disconnected sink event"))
-            {
-                break status;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "runtime did not fail closed after transport disconnect"
-            );
-            thread::sleep(Duration::from_millis(10));
-        };
-        assert!(status
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("reject disconnected sink event")));
+        assert_terminal_sink_failure(&manager, "reject disconnected sink event");
         assert!(matches!(
             sink_events.lock().expect("sink event lock").as_slice(),
             [AppServerEvent::Disconnected { .. }]
         ));
-        assert!(manager.commands("cutex-1").is_err());
         assert!(manager.disconnect("cutex-1").expect("disconnect runtime"));
 
         server.join().expect("server thread");
@@ -2762,8 +2997,9 @@ mod tests {
     /// The Agent Bus process launched and connected a runtime; Management
     /// adopts it while a turn streams. The app-server sends every event to
     /// both connections; across both workers (delta coalescing included)
-    /// each event is journaled exactly once, nothing is lost at the cut, and
-    /// the shared diagnostic journal also holds each event once.
+    /// each legacy event is journaled exactly once, nothing is lost at the cut,
+    /// and the shared diagnostic journal also holds each event once. The
+    /// separate live-ingress fixture covers capability-enabled connections.
     #[cfg(unix)]
     #[test]
     fn two_processes_on_one_runtime_journal_each_native_event_once() {
@@ -2930,6 +3166,118 @@ mod tests {
         assert!(bus.disconnect("cutex-1").unwrap());
         assert!(!directory.join("event-owners.json").exists(), "lease and registration released");
         subscribers.lock().unwrap().clear();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    /// Deployed topology of a Claude runtime (r247 hachimi, r23-live-check):
+    /// the Agent Bus launched and observes the adapter, Management observes it
+    /// too, one of them owns each event. The fake adapter filters like
+    /// cute_claude `Engine.broadcast`: `claude/*` only to a peer that sent
+    /// `claudeExtensions`, nothing it opted out of. A background subagent's
+    /// `claude/task/updated` with `notifyParent` must reach exactly one sink;
+    /// before the fix no observer asked for the extensions and none saw it.
+    #[cfg(unix)]
+    #[test]
+    fn claude_observers_receive_the_task_notice_once_across_bus_and_management() {
+        use super::super::single_writer::{Ledger, ProcessIdentity, Role};
+        let directory = short_socket_test_directory();
+        let socket_path = directory.join("adapter.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+        type Peer = (WebSocket<std::os::unix::net::UnixStream>, bool, Vec<String>);
+        let peers: Arc<Mutex<Vec<Peer>>> = Arc::new(Mutex::new(Vec::new()));
+        let accepting = peers.clone();
+        let acceptor = thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().expect("accept client");
+                let mut socket = tungstenite::accept(stream).expect("accept websocket");
+                let initialize = read_json(&mut socket);
+                assert_eq!(initialize["method"], "initialize");
+                let capabilities = &initialize["params"]["capabilities"];
+                let extensions = capabilities["claudeExtensions"] == json!(true);
+                let opted_out = capabilities["optOutNotificationMethods"]
+                    .as_array()
+                    .expect("opt-out list")
+                    .iter()
+                    .map(|method| method.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>();
+                assert_eq!(capabilities["claudeInteractiveApprovals"], json!(true));
+                write_json(&mut socket, json!({ "id": initialize["id"].clone(), "result": { "userAgent": "cute-claude-app-server/test" } }));
+                assert_eq!(read_json(&mut socket)["method"], "initialized");
+                let resume = read_json(&mut socket);
+                assert_eq!(resume["method"], "thread/resume");
+                let mut peers = accepting.lock().unwrap();
+                write_json(
+                    &mut socket,
+                    json!({ "id": resume["id"].clone(), "result": { "thread": { "id": "thread-1", "status": { "type": "idle" } } } }),
+                );
+                peers.push((socket, extensions, opted_out));
+            }
+        });
+        let broadcast = |method: &str, params: Value| {
+            let message = json!({ "method": method, "params": params, "emittedAtMs": super::super::single_writer::now_ms() });
+            for (socket, extensions, opted_out) in peers.lock().unwrap().iter_mut() {
+                if opted_out.iter().any(|opted| opted == method) || (method.starts_with("claude/") && !*extensions) {
+                    continue;
+                }
+                write_json(socket, message.clone());
+            }
+        };
+        let live = |_: &ProcessIdentity| true;
+        let identity = |pid| ProcessIdentity { pid, started_at: None };
+        let bus_journal = Arc::new(Mutex::new(Vec::new()));
+        let management_journal = Arc::new(Mutex::new(Vec::new()));
+        let bus = AppServerRuntimeManager::new(Arc::new(RecordingSink {
+            ledger: Arc::new(Ledger::new(&directory, identity(1), Role::Launcher, live)),
+            journaled: bus_journal.clone(),
+            unowned: Arc::new(AtomicUsize::new(0)),
+        }));
+        let management = AppServerRuntimeManager::new(Arc::new(RecordingSink {
+            ledger: Arc::new(Ledger::new(&directory, identity(2), Role::Owner, live)),
+            journaled: management_journal.clone(),
+            unowned: Arc::new(AtomicUsize::new(0)),
+        }));
+        let diagnostics = directory.join("management-events.jsonl");
+        for manager in [&bus, &management] {
+            manager
+                .connect_endpoint(
+                    "cutex-claude-1",
+                    AppServerEndpoint::UnixSocket { socket_path: socket_path.clone() },
+                    diagnostics.display().to_string(),
+                    AppServerSchemaIdentity { version: "0.3.0+cutex".to_string(), sha256: "test".to_string() },
+                    ThreadBootstrap::Resume(ThreadResumeParams { thread_id: "thread-1".to_string(), ..Default::default() }),
+                    1,
+                    "claude_subscription",
+                    None,
+                )
+                .expect("connect Claude observer");
+        }
+        acceptor.join().expect("acceptor");
+        broadcast("turn/started", json!({ "threadId": "thread-1", "turn": { "id": "turn-1", "items": [] } }));
+        broadcast("claude/runtime/event", json!({ "threadId": "thread-1", "kind": "StreamEvent" }));
+        broadcast("claude/task/updated", json!({ "threadId": "thread-1", "task": { "taskId": "bvvxedjjm", "ownedBySubagent": true, "status": "running", "taskType": "local_bash", "turnId": null } }));
+        broadcast("turn/completed", json!({ "threadId": "thread-1", "turn": { "id": "turn-1", "items": [], "status": "completed" } }));
+        broadcast("claude/task/updated", json!({ "threadId": "thread-1", "task": { "taskId": "afa1b240b52a47bb4", "status": "completed", "notifyParent": { "noticeId": "afa1b240b52a47bb4", "status": "completed", "summary": "bg-done" } } }));
+        let methods = || {
+            bus_journal.lock().unwrap().iter().chain(management_journal.lock().unwrap().iter())
+                .map(|raw| (raw["method"].as_str().unwrap().to_string(), raw["params"]["task"]["notifyParent"].is_object()))
+                .collect::<Vec<_>>()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while methods().len() < 4 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(100));
+        let seen = methods();
+        assert_eq!(
+            seen.iter().filter(|(method, notify)| method == "claude/task/updated" && *notify).count(),
+            1,
+            "the notifyParent frame reaches exactly one observer: {seen:?}"
+        );
+        assert_eq!(seen.len(), 4, "turn/started, the subagent command, turn/completed, the notice: {seen:?}");
+        assert!(!seen.iter().any(|(method, _)| method == "claude/runtime/event"), "high-volume frames stay opted out");
+        assert!(management.disconnect("cutex-claude-1").unwrap());
+        assert!(bus.disconnect("cutex-claude-1").unwrap());
+        peers.lock().unwrap().clear();
         let _ = fs::remove_dir_all(directory);
     }
 

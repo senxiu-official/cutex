@@ -18,12 +18,22 @@
 //! them live whichever process made the change.
 
 pub mod answer;
+pub mod archive;
+pub mod agent_pause;
+pub mod result_coalescing;
 pub mod awaits;
 pub mod budget;
 pub mod caps;
 pub mod children;
 pub mod commands;
 pub mod control;
+pub mod continuation;
+pub mod routing_policy;
+pub mod receipt_uncertainty;
+pub mod operations;
+pub mod project_control;
+pub mod pause_admission;
+pub mod lineage;
 pub mod create_task;
 pub mod delivery;
 pub mod directory;
@@ -43,6 +53,9 @@ pub mod view;
 pub mod views;
 pub mod waits;
 pub mod wake;
+
+#[cfg(test)]
+mod control_load_tests;
 
 /// Inline brief cap (§5.4). Longer briefs go to an artifact.
 pub const INLINE_BRIEF_MAX_BYTES: usize = 4 * 1024;

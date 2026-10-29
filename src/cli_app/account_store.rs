@@ -421,7 +421,9 @@ fn migrate_legacy_store_v2_to_v3(
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: legacy_account.id,
             name: legacy_account.name,
             email: legacy_account.email,
@@ -439,6 +441,7 @@ fn migrate_legacy_store_v2_to_v3(
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         };
 
         materialize_migrated_account_files(

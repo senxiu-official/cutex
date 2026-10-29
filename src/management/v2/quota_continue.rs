@@ -355,6 +355,49 @@ impl StateFile {
         true
     }
 
+    /// A known (not estimated) future reset another agent on `account` waits
+    /// for: one account's limit resets once for all its agents.
+    pub fn known_account_reset(&self, account: &str, now: i64) -> Option<i64> {
+        self.sessions
+            .values()
+            .filter_map(|entry| entry.pending.as_ref())
+            .filter(|pending| !pending.estimated && pending.account_id.as_deref() == Some(account) && pending.reset_at > now)
+            .map(|pending| pending.reset_at)
+            .max()
+    }
+
+    /// Move an estimated probe of `session` on `account` to the account's
+    /// known reset (plus this agent's jitter). Returns whether it moved.
+    pub fn reschedule_estimated(&mut self, session: &str, account: &str, reset_at: i64, now: DateTime<Utc>) -> bool {
+        if reset_at <= now.timestamp() || !self.enabled(session) {
+            return false;
+        }
+        let Some(at) = Utc.timestamp_opt(reset_at + jitter_secs(session), 0).single() else {
+            return false;
+        };
+        let Some(pending) = self
+            .sessions
+            .get_mut(session)
+            .and_then(|entry| entry.pending.as_mut())
+            .filter(|pending| pending.estimated && pending.account_id.as_deref() == Some(account))
+        else {
+            return false;
+        };
+        pending.at = rfc3339(at);
+        pending.reset_at = reset_at;
+        pending.estimated = false;
+        true
+    }
+
+    /// `session` learned that `account`'s exhausted limit resets at
+    /// `reset_at`: the other agents on it that wait on an estimated probe
+    /// (their own reading came too early) wait for that reset instead of
+    /// probing before it. Returns the sessions moved.
+    pub fn adopt_account_reset(&mut self, session: &str, account: &str, reset_at: i64, now: DateTime<Utc>) -> Vec<String> {
+        let others: Vec<String> = self.sessions.keys().filter(|other| other.as_str() != session).cloned().collect();
+        others.into_iter().filter(|other| self.reschedule_estimated(other, account, reset_at, now)).collect()
+    }
+
     /// A turn of the agent completed: it is not stuck any more. Cancels a
     /// pending continuation and resets the estimated probes.
     pub fn turn_completed(&mut self, session: &str, now: DateTime<Utc>) -> bool {
@@ -887,6 +930,35 @@ mod tests {
         let view = state.view(S);
         assert_eq!(view["enabled"], json!(true));
         assert_eq!(view["pending"]["resetAt"], json!("1970-01-01T05:33:20Z"));
+    }
+
+    /// host-a 2026-10-21: two agents on one account failed first, before
+    /// the account's usage reading showed the exhausted window, and got an
+    /// estimated probe (30 min); the next two learned the reset (16 min
+    /// later). The early ones wait for that reset too, not probe before it.
+    #[test]
+    fn agents_on_one_account_share_its_known_reset() {
+        const T: &str = "cutex.22222222-2222-3333-4444-555555555555";
+        const U: &str = "cutex.33333333-2222-3333-4444-555555555555";
+        let mut state = StateFile::default();
+        let now = at(10_000);
+        assert!(state.hold(S, Some("s1".into()), 1, now));
+        assert!(state.schedule_estimated(S, Some("acc".into()), Some("s1".into()), 1, now));
+        assert!(state.schedule_estimated(U, Some("other".into()), None, 1, now));
+        assert_eq!(state.known_account_reset("acc", now.timestamp()), None, "an estimate is not known");
+        // T learns the reset of "acc": S moves, U (another account) stays.
+        let reset = 10_000 + 45 * 60;
+        assert_eq!(state.adopt_account_reset(T, "acc", reset, now), vec![S.to_string()]);
+        assert!(state.schedule(T, reset, Some("acc".into()), None, 1, now));
+        let moved = state.sessions[S].pending.clone().unwrap();
+        assert!(!moved.estimated);
+        assert_eq!(moved.reset_at, reset);
+        assert_eq!(crate::asks::parse_time(&moved.at).unwrap().timestamp(), reset + jitter_secs(S));
+        assert!(state.sessions[U].pending.as_ref().unwrap().estimated);
+        // A later failure on "acc" with no reading of its own uses it.
+        assert_eq!(state.known_account_reset("acc", now.timestamp()), Some(reset));
+        assert_eq!(state.known_account_reset("acc", reset), None, "past");
+        assert!(!state.reschedule_estimated(S, "acc", reset, now), "no longer estimated");
     }
 
     #[test]

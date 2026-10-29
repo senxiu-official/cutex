@@ -79,7 +79,7 @@ fn online_inner(id: &str, restart: bool) -> anyhow::Result<StockRuntimeReceipt> 
     let sessions = cutex::session::store::load_cutex_session_store()?;
     let record = sessions.sessions.get(id).context("agent disappeared")?;
     ensure!(
-        !record.is_retired(),
+        !cutex::agent_management::agent_execution_blocked(&record),
         "restore the archived Agent before starting it"
     );
     ensure!(
@@ -336,7 +336,7 @@ pub(super) fn reconnect_ready_runtime(
     record: &CutexSessionRecord,
     sessions: &cutex::session::model::CutexSessionStore,
 ) -> anyhow::Result<StockRuntimeReceipt> {
-    ensure!(!record.is_retired(), "cannot reconnect an archived agent");
+    ensure!(!cutex::agent_management::agent_execution_blocked(&record), "cannot reconnect an archived agent");
     ensure!(
         record.app_server_launch_claim_id.is_none(),
         "unresolved runtime claim requires recovery"
@@ -557,6 +557,11 @@ pub(super) fn configured(
         } else {
             projection.native_args(owner)?
         });
+        // Not in the reviewed projection (launch receipts persist it; older
+        // releases refuse unknown keys there): read at spawn.
+        launch = launch.args(
+            cutex::launch::selected_profile::ImageHistoryTrimArgs::of_profile(&profile.profile_id)?.args(),
+        );
         // A catalog-less API-key profile on its own provider: the automatic
         // reviewer reviews with the agent's model (`reviewer_catalog`).
         launch = launch.args(cutex::profiles::reviewer_catalog::launch_args(projection, &profile.model, bundle, native_home));
@@ -1100,7 +1105,7 @@ impl StockRuntimeExecutor for StockExecutor {
             "mcp_servers.cutex",
             serde_json::json!({"command":bundle.facade.path,"env_vars":mcp_env,
                 "env":facade_config_env(cutex::management::service::management_port(&config)),
-                "default_tools_approval_mode":"approve","enabled":cutex::agent_bus::tool_policy::cutex_mcp_enabled(record)}),
+                "default_tools_approval_mode":"approve","enabled":cutex::agent_bus::tool_policy::cutex_mcp_enabled_for_launch(record,&profile.profile_id)}),
         )?;
         launch = option(
             launch,
@@ -1125,6 +1130,18 @@ impl StockRuntimeExecutor for StockExecutor {
         launch = cutex::launch::thread_retention::apply(
             launch, bundle, &receipt.review.contract.native_home,
         )?;
+        // Design 034: opt-in stable Responses prompt cache key per host +
+        // workspace, only after the exact native advertises support; never
+        // refuses the launch (no support / failed probe = no key).
+        if cutex::config::prompt_cache_key::current().enabled {
+            launch = cutex::launch::prompt_cache_key::apply(
+                launch,
+                bundle,
+                &receipt.review.contract.native_home,
+                &cutex::platform::host::current_host_name(),
+                &record.cwd,
+            );
+        }
         let mut args = layout.app_server_args();
         if bundle.common_ingress() {
             // The accepted artifact is the direct app-server, not the stock CLI.
@@ -1213,8 +1230,10 @@ impl StockRuntimeExecutor for StockExecutor {
         // existing manager connect below validates the actual native endpoint.
         let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
-            if verify_stock_process(record, binding).is_ok()
-                && AppServerRuntimeLayout::from_binding(binding)?.endpoint_ready()
+            // The endpoint first (a loopback connect); the process verification
+            // (session store + bundle reload) only once it answers, not every round.
+            if AppServerRuntimeLayout::from_binding(binding)?.endpoint_ready()
+                && verify_stock_process(record, binding).is_ok()
             {
                 break;
             }
@@ -1230,7 +1249,6 @@ impl StockRuntimeExecutor for StockExecutor {
             );
             std::thread::park_timeout(std::time::Duration::from_millis(10));
         }
-        verify_stock_process(record, binding)?;
         let manager = super::app_server_runtime::runtime_manager();
         if let Some(status) = manager
             .status(&record.cutex_session_id)?
@@ -1507,7 +1525,7 @@ pub(super) fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus
         .sessions
         .get(id)
         .context("exact stock durable ID required")?;
-    ensure!(!record.is_retired(), "archived stock Agent cannot attach");
+    ensure!(!cutex::agent_management::agent_execution_blocked(&record), "archived stock Agent cannot attach");
     let binding = record
         .app_server_runtime
         .as_ref()

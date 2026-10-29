@@ -1,0 +1,6 @@
+{
+  "schema": "cutex/component/v1",
+  "name": "kimi-runtime",
+  "version": "kimi-r2",
+  "platforms": ["linux-x64", "windows-x64"]
+}

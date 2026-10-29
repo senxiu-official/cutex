@@ -6,13 +6,9 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.1.5**: owner devices (new owner devices are announced, host-control actions only on the host or
-over SSH, per-device scope full / chat / read, the owner in person), Claude Side chats and busy forks
-(claude-r21), cross-host wake, home pages and remote close of a desktop on the host, CC Switch import,
-and a rollback that never widens a device's access (0.1.x is "First Take"; 0.1.0 was the first
-public release). See [CHANGELOG.md](CHANGELOG.md).
+**0.2.0 Beautiful World**: persistent agent communication and delegation improvements, project services, account-aware Profiles and runtime variants. Ships native 0.164.0-r58 and Claude runtime claude-r32 with bundled Python. Kimi and DSH are experimental and are not included in the 0.2.0 binaries; they are planned for a later public update. Upgrading from 0.1.5 changes durable communication to format v2 and requires explicit one-way confirmation; older releases require offline data restoration. See [CHANGELOG.md](CHANGELOG.md).
 
-> **Known gaps in 0.1.x** (being fixed; this note goes away when they are):
+> **Known gaps in 0.2.x** (being fixed; this note goes away when they are):
 > - **Phone push / pairing a phone**: there is no public phone app yet.
 >
 > Claude agents need the optional `claude-runtime` component and long-running jobs (Linux) the

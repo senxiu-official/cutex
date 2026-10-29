@@ -68,13 +68,17 @@ fn apply_profile_settings_patch_inner(
         if let Some(style) = &options.style {
             style.validate()?;
         }
-        changed |= account.options != *options;
         // The legacy provider picker changed the category: the v2 value
         // (kimi / zai / ...) no longer applies.
         if account.options.provider != options.provider {
             account.provider_category = None;
         }
+        let before = account.options.clone();
         account.options = options.clone();
+        // This TUI draft never edits accountLink. Preserve a concurrent web association change.
+        account.options.account_link = before.account_link.clone();
+        cutex::profiles::appearance::record_appearance_changes(&mut account.options, &before);
+        changed |= account.options != before;
     }
 
     if let Some(name) = patch.name.as_deref() {
@@ -82,6 +86,12 @@ fn apply_profile_settings_patch_inner(
             anyhow::bail!("Profile name cannot be empty");
         }
         if account.name != name {
+            if cutex::profiles::lifecycle::is_reserved_profile_name(name) {
+                anyhow::bail!(
+                    "{}",
+                    cutex::profiles::lifecycle::RESERVED_PROFILE_NAME_MESSAGE
+                );
+            }
             account.name = name.to_string();
             changed = true;
         }
@@ -220,6 +230,56 @@ fn apply_quota_preset_update(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whole_options_draft_preserves_a_concurrent_web_manual_link_change() {
+        for current in [None, Some("none"), Some("m-AAAAAAAAAAAAAAAAAAAAAA")] {
+            let mut profile = account();
+            let mut draft = profile.options.clone();
+            draft.account_link = Some("stale-draft-value".into());
+            profile.options.account_link = current.map(str::to_string);
+            let before = profile.clone();
+            let patch = ProfileSettingsPatch {
+                options: Some(draft.clone()),
+                ..Default::default()
+            };
+            assert!(
+                !apply_profile_settings_patch(&mut profile, &patch).unwrap(),
+                "a draft that only differs in accountLink is a no-op"
+            );
+            assert_eq!(profile.options, before.options);
+            draft.style = Some(cutex::profiles::appearance::TextStyle::color("#123456"));
+            let patch = ProfileSettingsPatch {
+                options: Some(draft),
+                ..Default::default()
+            };
+            assert!(apply_profile_settings_patch(&mut profile, &patch).unwrap());
+            assert_eq!(profile.options.account_link.as_deref(), current);
+            assert_eq!(
+                profile.options.style.as_ref().unwrap().fg.as_deref(),
+                Some("#123456")
+            );
+            assert!(profile.options.appearance_updated_at.contains_key("color"));
+        }
+    }
+
+    #[test]
+    fn appearance_draft_clocks_do_not_turn_an_unchanged_commit_into_a_write() {
+        let mut profile = account();
+        let before = profile.clone();
+        let mut draft = profile.options.clone();
+        draft
+            .appearance_updated_at
+            .insert("color".into(), "2099-01-01T00:00:00Z".into());
+        let patch = super::ProfileSettingsPatch {
+            options: Some(draft),
+            ..Default::default()
+        };
+        assert!(!super::apply_profile_settings_patch(&mut profile, &patch).unwrap());
+        assert_eq!(
+            serde_json::to_value(&profile).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+    }
     use cutex::profiles::model::CliKind;
 
     use super::*;
@@ -231,7 +291,9 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: "profile-id".to_string(),
             name: "alpha".to_string(),
             email: Some("alpha@example.com".to_string()),
@@ -249,6 +311,7 @@ mod tests {
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         }
     }
 
@@ -321,7 +384,10 @@ mod tests {
 
         let error = apply_profile_settings_patch(&mut account, &patch)
             .expect_err("profile without a base URL has no usage endpoint");
-        assert!(error.to_string().contains("needs the profile's base URL"), "{error}");
+        assert!(
+            error.to_string().contains("needs the profile's base URL"),
+            "{error}"
+        );
         assert_eq!(account.quota_preset, cutex::profiles::quota::Preset::Custom);
         assert_eq!(account.quota_reader, None);
     }

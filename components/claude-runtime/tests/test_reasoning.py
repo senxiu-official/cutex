@@ -244,3 +244,39 @@ def test_settings_reject_unknown_thinking_values(tmp_path):
     for bad in ({'thinking': 'enabled'}, {'thinking_display': 'updates'}):
         with pytest.raises(ValueError):
             replace(base, **bad).validate()
+
+
+async def test_interim_text_between_tool_calls_is_commentary_never_reasoning(sh):
+    # Owner report 2026-10-21: a Claude turn's work group showed short user-facing lines as 推理 · 0s.
+    # Interleaved thinking: each model call is thinking -> text -> tool_use. Only thinking blocks
+    # become `reasoning`; the interim text is a commentary `agentMessage`, streamed or not.
+    def script(sid):
+        out = []
+        for n in (1, 2):
+            tool = {'type': 'tool_use', 'id': f'toolu_{n}', 'name': 'Bash', 'input': {'command': f'ls {n}'}}
+            out += [start(sid, 0, 'thinking'), delta(sid, 0, 'thinking_delta', thinking=f'English thought {n}'), stop(sid, 0),
+                    {'type': 'assistant', 'session_id': sid, 'content': [{'type': 'thinking', 'thinking': f'English thought {n}', 'signature': 's'}]},
+                    start(sid, 1, 'text'), delta(sid, 1, 'text_delta', text=f'我先看看第 {n} 个文件。'), stop(sid, 1),
+                    {'type': 'assistant', 'session_id': sid, 'content': [{'type': 'text', 'text': f'我先看看第 {n} 个文件。'}]},
+                    {'type': 'assistant', 'session_id': sid, 'content': [tool]}]
+        # A last call without stream events (thinking + text in one message), then the answer.
+        out += [{'type': 'assistant', 'session_id': sid, 'content': [
+                    {'type': 'thinking', 'thinking': 'English thought 3', 'signature': 's'},
+                    {'type': 'text', 'text': '设定文件都很短。'}]},
+                {'type': 'assistant', 'session_id': sid, 'content': [{'type': 'text', 'text': '完成。'}]},
+                result(sid)]
+        return out
+    tid, turn = await run(sh, script)
+    items = [i for i in sh.store.items(turn) if i['type'] != 'userMessage']
+    assert [(i['type'], i.get('summary') or i.get('text'), i.get('phase')) for i in items] == [
+        ('reasoning', ['English thought 1'], None), ('agentMessage', '我先看看第 1 个文件。', 'commentary'),
+        ('reasoning', ['English thought 2'], None), ('agentMessage', '我先看看第 2 个文件。', 'commentary'),
+        ('reasoning', ['English thought 3'], None), ('agentMessage', '设定文件都很短。', 'commentary'),
+        ('agentMessage', '完成。', 'final_answer')]
+    # On the wire too: no text ever reaches a reasoning item or a reasoning delta.
+    texts = {'我先看看第 1 个文件。', '我先看看第 2 个文件。', '设定文件都很短。', '完成。'}
+    for method, kind, payload in item_events(sh, turn):
+        if kind == 'reasoning':
+            assert not set(payload['summary']) & texts and payload['content'] == []
+        elif method in REASONING_METHODS:
+            assert payload.get('delta') not in texts

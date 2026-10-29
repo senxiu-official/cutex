@@ -51,6 +51,7 @@ const INTER_AGENT_STATUS_SCHEMA: &str = "cutex/inter-agent-delivery-status/v1";
 
 #[path = "bus_bridge_external.rs"]
 mod external;
+pub(crate) use external::publish_director_changed_review;
 
 #[cfg(test)]
 pub(crate) fn projected_external_envelope(
@@ -80,6 +81,44 @@ pub(crate) fn validate_external_recovery_target(
     roster: &crate::agent_management::AgentManagementSnapshot,
 ) -> anyhow::Result<()> {
     external::validate_target(message, owner, roster)
+}
+
+/// An Agent Management start or notice: the reserved sender and control
+/// type that only the in-process Management principal can queue.
+pub fn is_agent_management_message(message: &AgentBusMessage) -> bool {
+    message.from == AGENT_MANAGEMENT_SYSTEM_SENDER
+        && matches!(
+            message.control_type.as_deref(),
+            Some(
+            AGENT_MANAGEMENT_START_CONTROL_TYPE
+                | AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE
+                | crate::director_address::management::START_ADOPTED_CONTROL_TYPE
+                | crate::director_address::management::DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE
+        )
+        )
+}
+
+/// A Claude runtime input of an Agent Management start / notice to `owner`:
+/// the provenance validation (against the current roster) and the event type
+/// and model text of the Codex native envelope. A provenance failure is
+/// terminal ([`quarantine_terminal_external_input`]).
+pub fn agent_management_input(
+    message: &AgentBusMessage,
+    owner: &str,
+) -> anyhow::Result<(&'static str, String)> {
+    external::validate_management_delivery(message, owner)?;
+    external::management_model_text(message)
+}
+
+/// Quarantines `message` (to `owner`) when `error` is a terminal ingress
+/// failure, as the Codex native bridge does (durable error record, owner
+/// notice; the caller ACKs the live copy). `Ok(false)`: retryable.
+pub fn quarantine_terminal_external_input(
+    owner: &str,
+    message: &AgentBusMessage,
+    error: &anyhow::Error,
+) -> anyhow::Result<bool> {
+    external::quarantine_terminal(owner, message, error)
 }
 
 /// r219: finishes the durable record of a polled legacy Task Service message
@@ -172,6 +211,37 @@ mod job_service_completion_projection_tests {
             params.author_metadata.unwrap().display_name.as_deref(),
             Some("Cutex Job Service")
         );
+    }
+
+    #[test]
+    fn dsh_job_v2_completion_submits_frozen_model_text_with_its_own_digest() {
+        use crate::agent_bus::job_completion::{CompletionV2, FrozenProjection, SCHEMA_V2};
+        let target = "cutex.11111111-1111-4111-8111-111111111111";
+        let request: CompletionV2 = serde_json::from_value(serde_json::json!({
+            "schema":SCHEMA_V2,"eventId":"job-terminal:job_123:3","jobId":"job_123","jobRevision":3,
+            "terminalStatus":"exited","resultSha256":"a".repeat(64),"targetCutexSessionId":target,
+            "facts":{"factsVersion":1,"actionId":"human-job-1",
+                "stdout":{"observedBytes":39,"retainedBytes":39,"truncated":false},
+                "stderr":{"observedBytes":0,"retainedBytes":0,"truncated":false}},
+            "outputReference":"job-output:job_123"
+        })).unwrap();
+        let frozen = FrozenProjection::new(request).unwrap();
+        let mut message = completion_message();
+        message.id = "jsc_v2".into();
+        message.control_type = Some(SCHEMA_V2.into());
+        message.control_payload = Some(serde_json::to_value(&frozen).unwrap());
+        message.content = serde_json::to_string(&frozen).unwrap();
+        message.external_message_id = Some("job-terminal:job_123:3".into());
+        message.external_action_id = Some("job_123".into());
+        let canonical = inter_agent_params("thread-current", target, target, &message).unwrap();
+        assert!(canonical.content.starts_with('{'), "the durable digest keeps the canonical envelope");
+        let (params, digest) = job_v2_model_text_params(&message, canonical.clone()).unwrap();
+        assert_eq!(params.content, frozen.model_text);
+        assert!(!params.content.starts_with('{'));
+        assert_eq!(digest, inter_agent_semantic_sha256(&params));
+        assert_ne!(digest, inter_agent_semantic_sha256(&canonical));
+        message.content.push(' ');
+        assert!(job_v2_model_text_params(&message, canonical).is_err(), "a changed frozen body is never submitted");
     }
 
     #[test]
@@ -289,6 +359,9 @@ pub struct AppServerAgentBusBridgeOptions {
     pub registration_only: bool,
     /// Trusted launcher only; client still proves exact pinned occurrence.
     pub external_input_generation: Option<u64>,
+    /// Legacy receiver that takes a frozen Job v2 completion as its model
+    /// text (DSH: the adapter frames every inter-agent message itself).
+    pub job_v2_model_text: bool,
     pub registration: AgentBusRegisterRequest,
     pub cutex_session_id: String,
     pub thread_id: String,
@@ -303,6 +376,7 @@ impl AppServerAgentBusBridgeOptions {
         Self {
             registration_only: false,
             external_input_generation: None,
+            job_v2_model_text: false,
             registration,
             cutex_session_id: default_cutex_session_id_for_codex_session(&thread_id),
             thread_id,
@@ -310,6 +384,11 @@ impl AppServerAgentBusBridgeOptions {
             retry_interval: DEFAULT_RETRY_INTERVAL,
             registration_refresh_interval: DEFAULT_REGISTRATION_REFRESH_INTERVAL,
         }
+    }
+
+    pub fn with_job_v2_model_text(mut self, enabled: bool) -> Self {
+        self.job_v2_model_text = enabled;
+        self
     }
 
     pub fn with_cutex_session_id(mut self, cutex_session_id: impl Into<String>) -> Self {
@@ -616,7 +695,7 @@ fn run_bridge_worker(
                         &mut external_client,
                     )
                 } else {
-                    deliver_polled_messages(
+                    deliver_polled_messages_with(
                         bus.as_ref(),
                         submitter.as_ref(),
                         &options.registration.id,
@@ -626,6 +705,7 @@ fn run_bridge_worker(
                         messages,
                         &mut pending_acks,
                         &status,
+                        options.job_v2_model_text,
                     )
                 };
                 // Input delivery and ACK have already run. Display failures do
@@ -679,6 +759,7 @@ fn run_bridge_worker(
     }
 }
 
+#[cfg(test)]
 fn deliver_polled_messages(
     bus: &dyn RuntimeAgentBus,
     submitter: &dyn InterAgentMessageSubmitter,
@@ -690,13 +771,44 @@ fn deliver_polled_messages(
     pending_acks: &mut BTreeSet<String>,
     status: &Arc<Mutex<AppServerAgentBusBridgeStatus>>,
 ) -> anyhow::Result<DeliverySweepOutcome> {
+    deliver_polled_messages_with(bus, submitter, runtime_agent_id, recipient_label, cutex_session_id, thread_id,
+        messages, pending_acks, status, false)
+}
+
+/// The frozen Job v2 model text for a receiver that frames it itself. The
+/// durable digest stays the canonical envelope's; the submitted params and
+/// every status query use the digest of what is actually submitted.
+fn job_v2_model_text_params(
+    message: &AgentBusMessage,
+    mut params: ThreadInterAgentMessageParams,
+) -> anyhow::Result<(ThreadInterAgentMessageParams, String)> {
+    let frozen = crate::agent_bus::job_completion::FrozenProjection::from_message(message)?;
+    params.content = frozen.model_text;
+    let digest = inter_agent_semantic_sha256(&params);
+    Ok((params, digest))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_polled_messages_with(
+    bus: &dyn RuntimeAgentBus,
+    submitter: &dyn InterAgentMessageSubmitter,
+    runtime_agent_id: &str,
+    recipient_label: &str,
+    cutex_session_id: &str,
+    thread_id: &str,
+    messages: Vec<AgentBusMessage>,
+    pending_acks: &mut BTreeSet<String>,
+    status: &Arc<Mutex<AppServerAgentBusBridgeStatus>>,
+    job_v2_model_text: bool,
+) -> anyhow::Result<DeliverySweepOutcome> {
     let mut outcome = DeliverySweepOutcome {
         had_messages: !messages.is_empty(),
         ..DeliverySweepOutcome::default()
     };
     let mut prepared = Vec::new();
     for message in messages {
-        if message.control_type.as_deref() == Some(crate::agent_bus::job_completion::SCHEMA_V2) {
+        let job_v2 = message.control_type.as_deref() == Some(crate::agent_bus::job_completion::SCHEMA_V2);
+        if job_v2 && !job_v2_model_text {
             // A legacy submitter would put the canonical mechanical snapshot
             // into model input. Leave it pending, with no transport ACK.
             mark_error(
@@ -748,6 +860,26 @@ fn deliver_polled_messages(
                     }
                     continue;
                 }
+                if job_v2 {
+                    match job_v2_model_text_params(&message, params) {
+                        Ok((params, digest)) => prepared.push((message, params, digest)),
+                        Err(error) => {
+                            let quarantined = quarantine_or_audit_live_message(
+                                cutex_session_id,
+                                &message.id,
+                                serde_json::json!({"code":"canonical_envelope_invalid","message":error.to_string()}),
+                                Utc::now(),
+                            )?;
+                            if quarantined {
+                                let ids = [message.id.clone()];
+                                let acked = bus.ack(runtime_agent_id, &ids)?;
+                                mark_acknowledged(status, acked, pending_acks.len());
+                                outcome.made_progress = true;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 prepared.push((message, params, digest));
             }
             Err(error) => {
@@ -793,7 +925,20 @@ fn deliver_polled_messages(
                 }
             }
             let input_lock = crate::management::v2::user_input::session_input_lock(cutex_session_id)?;
-            let _input_guard = input_lock.lock().map_err(|_| anyhow::anyhow!("session input lock poisoned"))?;
+            let _input_guard = match input_lock.try_lock() {
+                Ok(reservation) => reservation,
+                Err(crate::management::v2::session_coordination::ReservationError::WouldBlock) => {
+                    // Keep the durable inbox pending. The bridge's next poll
+                    // retries, and shutdown must never join a lane waiter.
+                    outcome.retained_pending = true;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if crate::asks::pause_admission::is_held(&crate::asks::store::AskStore::open_default()?, cutex_session_id)? {
+                outcome.retained_pending = true;
+                continue;
+            }
             let starts_turn = params.delivery_mode.trigger_turn() && !submitter.thread_busy(thread_id)?;
             if params.delivery_mode.trigger_turn() {
                 let busy = !starts_turn;
@@ -1267,7 +1412,12 @@ fn agent_management_metadata(
     }
     if !matches!(
         message.control_type.as_deref(),
-        Some(AGENT_MANAGEMENT_START_CONTROL_TYPE | AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE)
+        Some(
+            AGENT_MANAGEMENT_START_CONTROL_TYPE
+                | AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE
+                | crate::director_address::management::START_ADOPTED_CONTROL_TYPE
+                | crate::director_address::management::DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE
+        )
     ) {
         anyhow::bail!(
             "Agent Management agent-bus message {} has an invalid control type",
@@ -2237,6 +2387,27 @@ mod tests {
         assert!(!outcome.made_progress);
         assert!(events.lock().unwrap().is_empty());
         assert!(pending_acks.is_empty());
+    }
+
+    #[test]
+    fn busy_lifecycle_keeps_bridge_delivery_pending_without_blocking_shutdown() {
+        if test_runs_in_private_home("app_server::bus_bridge::tests::busy_lifecycle_keeps_bridge_delivery_pending_without_blocking_shutdown") { return; }
+        let lane = crate::management::v2::user_input::session_input_lock("cutex.thread-1").unwrap();
+        let lifecycle = lane.reserve().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let bus = RecordingBus { inner: FakeBus::default(), events: events.clone() };
+            let submitter = FakeSubmitter { events: events.clone(), result: Mutex::new(None) };
+            let mut acks = BTreeSet::new();
+            let outcome = deliver_polled_messages(&bus, &submitter, "runtime-1", "agent", "cutex.thread-1", "thread-1",
+                vec![test_message(AgentDeliveryMode::AfterTurn)], &mut acks, &test_status()).unwrap();
+            tx.send((outcome.retained_pending, outcome.made_progress, acks.is_empty(), events.lock().unwrap().is_empty())).unwrap();
+        });
+        let before_release = rx.recv_timeout(Duration::from_secs(5));
+        drop(lifecycle);
+        worker.join().unwrap();
+        assert_eq!(before_release.expect("bridge blocked shutdown on session admission"), (true, false, true, true));
     }
 
     #[test]

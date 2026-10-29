@@ -42,6 +42,9 @@ const COMPACTION_DEBOUNCE_SECS: i64 = 30;
 /// remote compaction that drops the turn's ASK item): flag the attempt and
 /// ask the scheduler to steer a brief reminder into the turn.
 fn note_compaction(state: &mut AskState, ask_id: &str, attempt: u32, now: DateTime<Utc>) {
+    if !attempt_open(state, ask_id, attempt) {
+        return;
+    }
     state.update_ask(ask_id, now, |ask| {
         let Some(record) = ask.attempts.iter_mut().find(|record| record.n == attempt) else {
             return;
@@ -52,7 +55,7 @@ fn note_compaction(state: &mut AskState, ask_id: &str, attempt: u32, now: DateTi
             .and_then(super::parse_time)
             .is_some_and(|at| now - at < chrono::Duration::seconds(COMPACTION_DEBOUNCE_SECS));
         record.compacted_mid_attempt = true;
-        if !recent {
+        if !recent && record.last_message_artifact.is_none() {
             record.compaction_reminder_pending = true;
         }
         record.compacted_at = Some(now_rfc3339(now));
@@ -118,18 +121,6 @@ fn activity_line(item: &Value) -> Option<String> {
     Some(truncate_chars(&line, 160))
 }
 
-/// Which leased attempt (if any) a turn belongs to.
-fn leased_attempt(state: &AskState, session: &str, turn_id: &str) -> Option<(String, u32)> {
-    let lease = state.leases.get(session)?;
-    if lease.turn_id.as_deref() != Some(turn_id) {
-        return None;
-    }
-    match &lease.holder {
-        LeaseHolder::Ask { ask_id, attempt } => Some((ask_id.clone(), *attempt)),
-        _ => None,
-    }
-}
-
 /// Observe one runtime notification of `session`.
 pub fn observe(store: &AskStore, session: &str, method: &str, params: &Value, now: DateTime<Utc>) -> anyhow::Result<()> {
     observe_with(store, session, method, params, now, &|| false)
@@ -152,37 +143,54 @@ pub fn observe_with(
     if !is_relevant(method) {
         return Ok(());
     }
-    let Some(state) = store.peek()? else {
-        return Ok(());
-    };
-    let Some(lease) = state.leases.get(session) else {
-        return Ok(());
-    };
     let Some(turn_id) = turn_id_of(method, params) else {
         return Ok(());
     };
-    if lease.turn_id.as_deref() != Some(turn_id.as_str()) {
+    // Keep only identity and artifact readers, never an owned AskState (or
+    // an old shared generation) while waiting for the subsequent write.
+    let projection = store.project_snapshot(|state| {
+        let lease = state.leases.get(session)?;
+        if lease.turn_id.as_deref() != Some(turn_id.as_str()) { return None; }
+        let mut readers = Vec::new();
+        let mut own_message = None;
+        if let LeaseHolder::Ask { ask_id, attempt } = &lease.holder {
+            if let Some(ask) = state.asks.get(ask_id) {
+                if method == "item/completed" && answer::is_final_agent_message(&params["item"]) {
+                    readers = AskState::ask_sessions(ask);
+                }
+                if matches!(method, "item/started" | "item/completed") {
+                    own_message = ask.attempts.iter().find(|record| record.n == *attempt)
+                        .map(|record| record.native_message_id.clone());
+                }
+            }
+        }
+        Some((lease.holder.clone(), readers, own_message))
+    })?;
+    let Some((holder, readers, own_message)) = projection else {
         return Ok(());
-    }
-    if let LeaseHolder::Event { event_id } = &lease.holder {
+    };
+    if let LeaseHolder::Event { event_id } = &holder {
         if method == "thread/compacted" || is_compaction_item(method, params) {
             let event_id = event_id.clone();
             store.with_state(|state| note_event_compaction(state, &event_id, now))?;
             return Ok(());
         }
         if method == "turn/completed" {
+            if crate::management::v2::model_overload_retry::holds_default(session, Some(&turn_id)) { return Ok(()); }
             let event_id = event_id.clone();
             store.with_state(|state| {
                 super::delivery::acknowledge_event(state, &event_id, &turn_id, now);
+                if let Some(event) = state.events.get_mut(&event_id) {
+                    event.compaction_reminder_pending = false;
+                }
                 state.leases.remove(session);
             })?;
         }
         return Ok(());
     }
-    let Some((ask_id, attempt)) = leased_attempt(&state, session, &turn_id) else {
+    let LeaseHolder::Ask { ask_id, attempt } = holder else {
         return Ok(());
     };
-    let ask = state.asks.get(&ask_id).cloned();
     if method == "thread/compacted" || is_compaction_item(method, params) {
         store.with_state(|state| note_compaction(state, &ask_id, attempt, now))?;
         if method == "thread/compacted" {
@@ -198,6 +206,7 @@ pub fn observe_with(
                             record.state = AttemptState::Running;
                         }
                         record.started_at.get_or_insert_with(|| now_rfc3339(now));
+                        record.activity.last_activity_at=Some(now_rfc3339(now));
                     }
                     if !ask.execution.is_terminal() {
                         ask.execution = ExecutionState::Running;
@@ -211,23 +220,18 @@ pub fn observe_with(
             let mut message_artifact = None;
             if method == "item/completed" && answer::is_final_agent_message(&item) {
                 if let Some(text) = answer::agent_message_text(&item) {
-                    let readers: Vec<String> = ask
-                        .as_ref()
-                        .map(AskState::ask_sessions)
-                        .unwrap_or_default();
                     message_artifact = Some(store.put_artifact(text.as_bytes(), "text/markdown; charset=utf-8", &readers, Some(&ask_id), now)?);
                 }
             }
-            let own_message = ask
-                .as_ref()
-                .and_then(|ask| ask.attempts.iter().find(|record| record.n == attempt))
-                .map(|record| record.native_message_id.clone());
             store.with_state(|state| {
                 state.update_ask(&ask_id, now, |ask| {
                     let Some(record) = ask.attempts.iter_mut().find(|record| record.n == attempt) else {
                         return;
                     };
                     if method == "item/started" {
+                        if is_tool_item(&kind) || kind == "agentMessage" {
+                            record.activity.last_activity_at=Some(now_rfc3339(now));
+                        }
                         if is_tool_item(&kind) {
                             record.activity.tool_calls += 1;
                         }
@@ -248,7 +252,12 @@ pub fn observe_with(
                         }
                     }
                     if let Some(artifact) = &message_artifact {
+                        record.activity.last_activity_at=Some(now_rfc3339(now));
                         record.last_message_artifact = Some(artifact.clone());
+                        // A final answer is already visible. A reminder now
+                        // only invites a second summary while completion is
+                        // still in flight to the observer.
+                        record.compaction_reminder_pending = false;
                     }
                 });
                 if method == "item/completed" {
@@ -302,6 +311,10 @@ pub fn observe_with(
 /// target is no longer quota-blocked. Not for a stopped attempt, an
 /// `ifBusy: fail` ask, or past [`super::QUOTA_REQUEUE_LIMIT`]. Returns
 /// whether the ask was requeued (else the caller finalizes as usual).
+/// Appended to the error of an attempt [`requeue_quota_failure`] put back.
+pub const QUOTA_REQUEUED_NOTE: &str =
+    "[cutex: the delegation went back to the queue and is delivered again automatically once the usage limit resets.]";
+
 fn requeue_quota_failure(
     store: &AskStore,
     session: &str,
@@ -324,11 +337,14 @@ fn requeue_quota_failure(
     {
         return Ok(false);
     }
-    let (_, error) = turn_outcome(turn);
+    // The runtime's text may say the failed input is not retried (true of
+    // the runtime alone); cutex does redeliver it, so say so.
+    let error = turn_outcome(turn).1.map(|error| format!("{error} {QUOTA_REQUEUED_NOTE}"));
     store.with_state(|state| {
         // Another end-of-turn path already ended this attempt: nothing to
         // requeue (and not a second `quota_requeues` count).
-        if !attempt_open(state, ask_id, attempt) {
+        if !attempt_open(state, ask_id, attempt)
+            || state.asks.get(ask_id).and_then(|a|a.attempts.iter().find(|r|r.n == attempt)).is_some_and(|r| turn.get("id").and_then(Value::as_str).is_some_and(|id|r.turn_id.as_deref()!=Some(id))) {
             return true;
         }
         let mut requeued = false;
@@ -412,6 +428,31 @@ pub fn finalize(
     interrupt_reason: Option<InterruptReason>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    finalize_inner(store, session, ask_id, attempt, turn, interrupt_reason, now, None, &|| {})
+}
+
+pub fn finalize_fenced(
+    store: &AskStore, session: &str, ask_id: &str, attempt: u32, turn: &Value,
+    interrupt_reason: Option<InterruptReason>, now: DateTime<Utc>, expected: &AdmissionLease,
+) -> anyhow::Result<()> {
+    finalize_inner(store, session, ask_id, attempt, turn, interrupt_reason, now, Some(expected), &|| {})
+}
+
+#[cfg(test)]
+pub(crate) fn finalize_fenced_test(
+    store: &AskStore, session: &str, ask_id: &str, attempt: u32, turn: &Value,
+    interrupt_reason: Option<InterruptReason>, now: DateTime<Utc>, expected: &AdmissionLease,
+    before_commit: &dyn Fn(),
+) -> anyhow::Result<()> {
+    finalize_inner(store, session, ask_id, attempt, turn, interrupt_reason, now, Some(expected), before_commit)
+}
+
+fn finalize_inner(
+    store: &AskStore, session: &str, ask_id: &str, attempt: u32, turn: &Value,
+    interrupt_reason: Option<InterruptReason>, now: DateTime<Utc>, expected: Option<&AdmissionLease>,
+    before_commit: &dyn Fn(),
+) -> anyhow::Result<()> {
+    if crate::management::v2::model_overload_retry::holds_default(session, turn.get("id").and_then(Value::as_str)) && interrupt_reason.is_none() { return Ok(()); }
     let state = store.snapshot()?;
     let Some(ask) = state.asks.get(ask_id).cloned() else {
         return Ok(());
@@ -419,6 +460,11 @@ pub fn finalize(
     let Some(record) = ask.attempts.iter().find(|record| record.n == attempt).cloned() else {
         return Ok(());
     };
+    if expected.is_some_and(|lease| state.leases.get(session) != Some(lease)
+        || record.runtime_generation != lease.runtime_generation
+        || record.turn_id != lease.turn_id
+        || !matches!(&lease.holder, LeaseHolder::Ask { ask_id: id, attempt: n } if id == ask_id && *n == attempt)) { return Ok(()); }
+    if turn.get("id").and_then(Value::as_str).is_some_and(|id| record.turn_id.as_deref().is_some_and(|current| current != id)) { return Ok(()); }
     let (status, error) = turn_outcome(turn);
     // Items in `turn/completed` (Claude adapter) win over observed items.
     let items: Vec<Value> = turn.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -465,13 +511,31 @@ pub fn finalize(
         .and_then(|artifact| store.read_artifact(artifact, None).ok().flatten())
         .and_then(|(_, bytes)| super::views::preview(&String::from_utf8_lossy(&bytes)));
     let started = record.started_at.as_deref().and_then(super::parse_time);
+    let bounded_context = super::continuation::runtime::attempt_identity(&ask, attempt);
+    let bounded_director = ask.bounded_continuation.current.as_ref()
+        .and_then(|_| super::continuation::runtime::current_director(&ask));
+    before_commit();
     store.with_state(|state| {
         // Decided under the store lock: the observer's `turn/completed` and
         // the scheduler's reconciliation (or a re-delivered notification)
         // may both reach here for one attempt; only the first records the
         // answer and its requester delivery.
-        if !attempt_open(state, ask_id, attempt) {
+        if expected.is_some_and(|lease| state.leases.get(session) != Some(lease))
+            || !attempt_open(state, ask_id, attempt)
+            || state.asks.get(ask_id).and_then(|a|a.attempts.iter().find(|r|r.n==attempt))
+                .is_some_and(|r| r.turn_id != record.turn_id || r.runtime_generation != record.runtime_generation) {
             return;
+        }
+        if let Some(context) = &bounded_context {
+            let end = match status {
+                AnswerStatus::Completed if interrupt_reason.is_none() => super::continuation::EndKind::Normal,
+                AnswerStatus::Completed | AnswerStatus::Interrupted => super::continuation::EndKind::Interrupted,
+                AnswerStatus::Failed => super::continuation::EndKind::Failed,
+            };
+            if super::continuation::runtime::finish_turn(state, context, end,
+                message_artifact.clone(), preview.clone(), now, bounded_director.as_deref()) {
+                return;
+            }
         }
         let revision = state.answers.values().filter(|answer| answer.ask_id == ask_id).count() as u32 + 1;
         let answer_id = new_id("ans");
@@ -512,6 +576,7 @@ pub fn finalize(
         state.update_ask(ask_id, now, |ask| {
             if let Some(attempt_record) = ask.attempts.iter_mut().find(|item| item.n == attempt) {
                 attempt_record.ended_at = Some(now_rfc3339(now));
+                attempt_record.compaction_reminder_pending = false;
                 attempt_record.last_error = error.clone();
                 attempt_record.state = match status {
                     AnswerStatus::Completed => AttemptState::Answered,
@@ -534,6 +599,7 @@ pub fn finalize(
             // An await registered in a failed / interrupted turn is void.
             ask.awaiting = None;
             ask.resume = None;
+            ask.bounded_continuation.cancel("attempt_finalized");
             let stopped = ask.current_attempt().is_some_and(|attempt| attempt.stop_requested);
             match status {
                 AnswerStatus::Completed => {
@@ -615,6 +681,33 @@ mod tests {
         json!({"threadId": "t", "turnId": turn, "item": item})
     }
 
+    #[test]
+    fn caller_projection_keeps_own_message_and_unknown_view_identity() {
+        let (world, dir) = world("caller-identity");
+        let (store, store_dir) = temp_store("caller-identity");
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = Utc::now();
+        let ask = store.with_state(|state| state.create_ask(new_ask("identity", "x"), now).unwrap().0.ask_id).unwrap();
+        crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap();
+        let own = store.inspect(|state| state.asks[&ask].attempts[0].native_message_id.clone()).unwrap();
+        for (turn, id, view) in [
+            ("turn-1", own.as_str(), json!({"schema":"future.unknown"})),
+            ("wrong-turn", "wrong", json!({"schema":"future.unknown"})),
+            ("turn-1", "no-view", Value::Null),
+            ("turn-1", "foreign-note", json!({"schema":"future.unknown"})),
+            ("turn-1", "foreign-note", json!({"schema":"future.unknown"})),
+        ] {
+            observe(&store, TARGET, "item/completed", &item(turn,
+                json!({"type":"functionCallOutput", "id":id,"externalInputView":view})), now).unwrap();
+        }
+        store.inspect(|state| {
+            assert_eq!(state.asks[&ask].attempts[0].included_notes, vec!["foreign-note".to_string()]);
+            assert!(!state.asks[&ask].attempts[0].owner_steered);
+        }).unwrap();
+        std::fs::remove_dir_all(store_dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Acceptance §12.3 item 7 (answers, part): the final non-commentary
     /// message is the answer; a turn without one answers `null`; owner
     /// steering is flagged; the lease is released; one delivery per answer.
@@ -647,6 +740,8 @@ mod tests {
         assert!(answer.metadata.owner_steered);
         let (_, text) = store.read_artifact(answer.artifact_id.as_ref().unwrap(), Some(REQUESTER)).unwrap().unwrap();
         assert_eq!(text, b"All tests pass.");
+        assert!(store.read_artifact(answer.artifact_id.as_ref().unwrap(), Some(TARGET)).unwrap().is_some());
+        assert!(store.read_artifact(answer.artifact_id.as_ref().unwrap(), Some("unrelated-session")).unwrap().is_none());
         assert_eq!(state.deliveries.values().filter(|d| d.kind == DeliveryKind::Answer).count(), 1);
         assert!(state.notices.iter().any(|n| n.method == "cutex/ask/answered"));
 
@@ -824,6 +919,7 @@ mod tests {
         assert_eq!(record.quota_requeues, 1);
         assert_eq!(record.attempts[0].state, AttemptState::Failed);
         assert!(record.attempts[0].last_error.as_deref().unwrap().contains("rate_limit"));
+        assert!(record.attempts[0].last_error.as_deref().unwrap().ends_with(QUOTA_REQUEUED_NOTE), "says cutex redelivers it");
         assert!(record.answer_id.is_none() && state.answers.is_empty(), "no answer");
         assert!(state.leases.is_empty());
         assert!(!state.deliveries.values().any(|d| d.kind == DeliveryKind::Answer));

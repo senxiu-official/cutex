@@ -154,7 +154,7 @@ impl Capabilities {
 
 /// Name of a directory cutex allocates for a scratch workspace:
 /// `<yyyymmdd>-<8 lowercase hex>` (`human_sessions::create_private_workspace_in`).
-fn is_allocated_scratch_name(name: &str) -> bool {
+pub(crate) fn is_allocated_scratch_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() == 17
         && bytes[..8].iter().all(u8::is_ascii_digit)

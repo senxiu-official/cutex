@@ -115,7 +115,7 @@ fn apply_durable_notification(
     notification: &RpcNotification,
     timestamp: &str,
 ) -> anyhow::Result<bool> {
-    if record.is_retired() || record.runtime_generation != runtime_generation {
+    if cutex::agent_management::agent_execution_blocked(&record) || record.runtime_generation != runtime_generation {
         return Ok(false);
     }
     let changed = match notification.method.as_str() {

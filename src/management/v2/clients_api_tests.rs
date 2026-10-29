@@ -209,3 +209,169 @@ fn paths_and_presence_validation() {
         assert_eq!(parse_presence(&object(bad.clone())).unwrap_err().code, "invalid_request", "{bad}");
     }
 }
+
+#[test]
+fn exited_is_immediate_registrant_only_and_retry_safe() {
+    let mut registry = Registry::default();
+    let caller = token("a", user("alice"), DeviceScope::Read);
+    registry.heartbeat(presence("one", false), &caller, t0()).unwrap();
+    for other in [root(), token("b", user("alice"), DeviceScope::Full), token("c", user("bob"), DeviceScope::Full)] {
+        assert_eq!(registry.report_exited("one", &other, t0()).unwrap_err().details["reason"], "notRegistrant");
+        assert_eq!(registry.len(), 1);
+    }
+    registry.report_exited("one", &caller, t0()).unwrap();
+    assert!(registry.get("one").is_none());
+    assert!(registry.visible(&root(), t0()).is_empty());
+    assert_eq!(registry.user_of_instance("one").as_deref(), Some("alice"), "removed event still routes to its user");
+    assert_eq!(registry.take_state_events(), vec![json!({"instanceId":"one","state":"exited"})]);
+    registry.report_exited("one", &caller, t0() + Duration::seconds(1)).unwrap();
+    assert!(registry.take_state_events().is_empty(), "retry does not duplicate the event");
+    assert_eq!(registry.report_exited("one", &root(), t0()).unwrap_err().status, 403);
+    assert_eq!(registry.heartbeat(presence("one", true), &caller, t0()).unwrap_err().code, "client_instance_exited");
+    assert_eq!(registry.heartbeat(presence("one", true), &root(), t0()).unwrap_err().code, "client_instance_conflict");
+    assert_eq!(registry.report_exited("missing", &caller, t0()).unwrap_err().status, 404);
+    assert_eq!(registry.report_exited("one", &caller, t0() + Duration::seconds(EXPIRE_SECONDS + 1)).unwrap_err().status, 404);
+}
+
+#[test]
+fn replacement_is_scoped_to_install_and_credential_and_fences_late_heartbeats() {
+    let mut registry = Registry::default();
+    let caller = token("a", user("alice"), DeviceScope::Full);
+    let sibling = token("b", user("alice"), DeviceScope::Full);
+    let mut old = presence("old", true);
+    old.install_id = "same-install".into();
+    registry.heartbeat(old.clone(), &caller, t0()).unwrap();
+    let mut other = old.clone(); other.instance_id = "other-credential".into();
+    registry.heartbeat(other, &sibling, t0()).unwrap();
+    registry.heartbeat(presence("other-install", true), &caller, t0()).unwrap();
+    let mut new = old.clone(); new.instance_id = "new".into();
+    registry.heartbeat(new.clone(), &caller, t0() + Duration::seconds(1)).unwrap();
+    assert_eq!(registry.len(), 3);
+    assert!(registry.get("old").is_none());
+    assert!(registry.get("other-credential").is_some());
+    assert!(registry.get("other-install").is_some());
+    assert_eq!(registry.take_state_events(), vec![json!({"instanceId":"old","state":"exited"})]);
+    registry.heartbeat(new, &caller, t0() + Duration::seconds(2)).unwrap();
+    assert!(registry.take_state_events().is_empty());
+    assert_eq!(registry.heartbeat(old, &caller, t0() + Duration::seconds(3)).unwrap_err().code, "client_instance_exited");
+    assert!(registry.get("new").is_some());
+}
+
+#[test]
+fn rejected_presence_never_evicts_an_existing_install() {
+    let mut registry = Registry::default();
+    let caller = token("a", user("alice"), DeviceScope::Full);
+    let other = token("b", user("bob"), DeviceScope::Full);
+    registry.heartbeat(presence("mine", true), &caller, t0()).unwrap();
+    registry.heartbeat(presence("theirs", true), &other, t0()).unwrap();
+    let mut collision = presence("mine", true); collision.instance_id = "theirs".into();
+    assert_eq!(registry.heartbeat(collision, &caller, t0()).unwrap_err().status, 409);
+    let mut changed = presence("mine", true); changed.install_id = "install-theirs".into();
+    assert_eq!(registry.heartbeat(changed, &caller, t0()).unwrap_err().status, 409);
+    assert_eq!(registry.len(), 2);
+    assert!(registry.take_state_events().is_empty());
+}
+
+#[test]
+fn closing_expires_after_one_heartbeat_and_cancelled_keeps_normal_ttl() {
+    let mut registry = Registry::default();
+    registry.heartbeat(presence("closing", true), &root(), t0()).unwrap();
+    registry.heartbeat(presence("cancelled", true), &root(), t0()).unwrap();
+    registry.report_closing("closing", &root(), ClientState::Closing, t0()).unwrap();
+    registry.report_closing("cancelled", &root(), ClientState::Cancelled, t0()).unwrap();
+    registry.take_state_events();
+    registry.prune(t0() + Duration::seconds(HEARTBEAT_SECONDS));
+    assert_eq!(registry.len(), 2);
+    registry.prune(t0() + Duration::seconds(HEARTBEAT_SECONDS + 1));
+    assert!(registry.get("closing").is_none());
+    assert!(registry.get("cancelled").is_some());
+    assert_eq!(registry.take_state_events(), vec![json!({"instanceId":"closing","state":"exited"})]);
+    registry.report_exited("closing", &root(), t0() + Duration::seconds(62)).unwrap();
+    assert!(registry.take_state_events().is_empty());
+}
+
+#[test]
+fn heartbeat_refreshes_closing_deadline_and_cancelled_can_resume() {
+    let mut registry = Registry::default();
+    registry.heartbeat(presence("one", true), &root(), t0()).unwrap();
+    registry.report_closing("one", &root(), ClientState::Closing, t0()).unwrap();
+    registry.heartbeat(presence("one", true), &root(), t0() + Duration::seconds(50)).unwrap();
+    registry.prune(t0() + Duration::seconds(100));
+    assert_eq!(registry.get("one").unwrap().state, ClientState::Closing);
+    registry.report_closing("one", &root(), ClientState::Cancelled, t0() + Duration::seconds(100)).unwrap();
+    registry.prune(t0() + Duration::seconds(170));
+    assert_eq!(registry.len(), 1);
+}
+
+#[test]
+fn root_and_pending_can_only_remove_their_own_instances() {
+    let mut registry = Registry::default();
+    let pending = token("p", Principal::Pending, DeviceScope::Chat);
+    registry.heartbeat(presence("root", true), &root(), t0()).unwrap();
+    registry.heartbeat(presence("pending", true), &pending, t0()).unwrap();
+    assert_eq!(registry.report_exited("root", &pending, t0()).unwrap_err().status, 403);
+    assert_eq!(registry.report_exited("pending", &root(), t0()).unwrap_err().status, 403);
+    registry.report_exited("pending", &pending, t0()).unwrap();
+    registry.report_exited("root", &root(), t0()).unwrap();
+    assert!(registry.is_empty());
+}
+
+#[test]
+fn removed_receipts_are_bounded_and_replacement_works_at_capacity() {
+    let mut registry = Registry::default();
+    for n in 0..MAX_INSTANCES {
+        registry.heartbeat(presence(&format!("i{n}"), true),
+            &token(&format!("t{n}"), Principal::Pending, DeviceScope::Read), t0()).unwrap();
+    }
+    let mut next = presence("replacement", true); next.install_id = "install-i0".into();
+    registry.heartbeat(next, &token("t0", Principal::Pending, DeviceScope::Read), t0()).unwrap();
+    assert_eq!(registry.len(), MAX_INSTANCES);
+    assert!(registry.get("i0").is_none());
+    registry.clear();
+    for n in 0..MAX_REMOVED + 2 {
+        let id = format!("gone{n}");
+        registry.heartbeat(presence(&id, true), &root(), t0()).unwrap();
+        registry.report_exited(&id, &root(), t0()).unwrap();
+        registry.take_state_events();
+    }
+    assert_eq!(registry.removed.len(), MAX_REMOVED);
+    registry.prune(t0() + Duration::seconds(EXPIRE_SECONDS + 1));
+    assert!(registry.removed.is_empty());
+}
+
+#[test]
+fn exported_schema_accepts_exited_only_as_a_terminal_outcome() {
+    let schema: Value = serde_json::from_str(EXPORTED_SCHEMA.text).unwrap();
+    for (definition, value) in [
+        ("closingRequest", json!({"outcome":"exited"})),
+        ("closingResponse", json!({"instanceId":"one","state":"exited"})),
+        ("stateChangedEvent", json!({"instanceId":"one","state":"exited"})),
+    ] {
+        let mut selected = schema.clone();
+        selected.as_object_mut().unwrap().remove("anyOf");
+        selected["$ref"] = json!(format!("#/$defs/{definition}"));
+        assert!(jsonschema::validator_for(&selected).unwrap().is_valid(&value), "{definition}");
+    }
+    assert!(!schema["$defs"]["clientState"]["enum"].as_array().unwrap().contains(&json!("exited")), "removed instances never appear in the list");
+    super::super::contract_validation::validate_cutex_event_message(
+        &json!({"method":STATE_CHANGED,"params":{"instanceId":"one","state":"exited"}})).unwrap();
+}
+
+#[test]
+fn exited_route_returns_terminal_response_and_preserves_user_event_visibility() {
+    let id = format!("exit-{}", uuid::Uuid::new_v4());
+    let caller = token(&id, user("exit-route-user"), DeviceScope::Read);
+    let request = |path: String, body: Value| SimpleHttpRequest {
+        method: "POST".into(), path, headers: HashMap::new(), body: serde_json::to_vec(&body).unwrap(),
+    };
+    let presence = request(PRESENCE_PATH.into(), json!({"installId":id,"instanceId":id,"appName":"test"}));
+    assert_eq!(route(&presence, &caller).unwrap().0, 200);
+    let exited = request(format!("/v2/clients/{id}/closing"), json!({"outcome":"exited"}));
+    assert_eq!(route(&exited, &root()).unwrap_err().details["reason"], "notRegistrant");
+    let expected = (200, json!({"instanceId":id,"state":"exited"}));
+    assert_eq!(route(&exited, &caller).unwrap(), expected);
+    assert_eq!(route(&exited, &caller).unwrap(), expected);
+    assert!(with_registry(|registry| registry.get(&id).is_none()));
+    assert!(event_for_user(&json!({"instanceId":id}), "exit-route-user"));
+    assert!(!event_for_user(&json!({"instanceId":id}), "other-user"));
+}

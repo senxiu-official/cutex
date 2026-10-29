@@ -81,13 +81,19 @@ pub(super) fn dispatch(
         session,
         request.params.as_object().expect("validated object"),
     )?;
+    // The delete moves the session's state directory: stop its offline
+    // history reader first and keep it stopped (Windows: open handles / cwd).
+    let fence = super::history::fence_offline_reader(cutex_session_id);
     let result = delete(
         cutex_session_id,
         &SessionDeleteRequest {
             expected_revision,
             only_if_empty: false,
         },
-    )?;
+    );
+    super::history::invalidate_session(cutex_session_id);
+    drop(fence);
+    let result = result?;
     validate_receipt(&result, cutex_session_id)?;
     super::attachments::remove_session_attachments(cutex_session_id);
     append_deleted_event(event_repository, cutex_session_id, session, request, &result, false)?;
@@ -114,13 +120,16 @@ pub(super) fn dispatch_retire(
             None | Some(Value::Null) => None,
             Some(value) => value.as_u64(),
         };
-        match delete(
+        let fence = super::history::fence_offline_reader(cutex_session_id);
+        let deleted = delete(
             cutex_session_id,
             &SessionDeleteRequest {
                 expected_revision,
                 only_if_empty: true,
             },
-        ) {
+        );
+        drop(fence);
+        match deleted {
             Ok(result) if result.get("deleted").and_then(Value::as_bool) == Some(true) => {
                 validate_receipt(&result, cutex_session_id)?;
                 super::attachments::remove_session_attachments(cutex_session_id);
@@ -287,6 +296,32 @@ mod tests {
         assert_eq!(event.method, EVENT);
         assert_eq!(event.params["viaRetire"], false);
         assert_eq!(event.params["threadId"], "018a0000-0000-7000-8000-000000000001");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Offline history, then delete: the warm offline reader is gone before
+    /// the handler moves the state directory and cannot restart during it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_reader_is_stopped_before_the_delete_moves_the_state() {
+        use super::super::history::reader_probe;
+        fn handler(id: &str, _: &SessionDeleteRequest) -> Result<Value, UserInputExecutionError> {
+            let dir = reader_probe::dir(id);
+            assert_eq!(reader_probe::holders(&dir), Vec::<u32>::new(), "the offline reader still holds the state the delete moves");
+            assert!(reader_probe::read(id).is_err(), "no offline reader starts during the delete");
+            Ok(receipt(id))
+        }
+        let (root, repository) = repository();
+        let id = format!("cutex.delete-reader-{}", uuid::Uuid::new_v4());
+        let dir = reader_probe::session(&id);
+        reader_probe::read(&id).unwrap();
+        assert!(!reader_probe::holders(&dir).is_empty());
+        let owner = HumanManagementPrincipal::authenticated();
+        let session = json!({ "revision": 7, "native": { "threadId": "t-1" } });
+        dispatch(&repository, handler, Some(&owner), &id, &session, &request(METHOD, json!({}))).unwrap();
+        assert_eq!(reader_probe::spawns(&id), 1);
+        super::super::history::evict_offline_reader(&id);
+        let _ = std::fs::remove_dir_all(dir);
         std::fs::remove_dir_all(root).ok();
     }
 

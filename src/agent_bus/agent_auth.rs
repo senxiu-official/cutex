@@ -74,6 +74,7 @@ pub const BROWSER_FENCE_PATH: &str = "/api/mcp/v1/browser-fence";
 pub const MCP_ROUTE_PATHS: &[&str] = &[
     MCP_AGENT_LIST_PATH,
     "/api/agent-management/v1/actions",
+    crate::agent_bus::mcp::archive_mcp::PATH,
     "/api/services/v1",
     BROWSER_FENCE_PATH,
     // Asks (委托): agent_list / agent_ask / agent_wait / … (asks §6).

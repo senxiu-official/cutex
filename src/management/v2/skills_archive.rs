@@ -221,10 +221,16 @@ fn read_record(path: &Path) -> Option<Value> {
 }
 
 fn write_record(path: &Path, record: &Value) -> Result<(), ArchiveError> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(record).expect("record serializes"))
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| io_err("write archive record", e))
+    // Unique temp name (concurrent writers never share `record.json.tmp`),
+    // synced before the rename, Windows-safe replacement of an existing record.
+    let data = serde_json::to_vec_pretty(record).expect("record serializes");
+    crate::config::atomic::write_bytes_atomic(path, &data).map_err(|error| {
+        let kind = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
+        io_err("write archive record", std::io::Error::new(kind, format!("{error:#}")))
+    })
 }
 
 fn view(record: &Value, archive_dir: &Path) -> Value {
@@ -578,6 +584,36 @@ mod tests {
         let id = archived["archive"]["id"].as_str().unwrap();
         restore(&roots, "r", id).unwrap();
         assert!(std::fs::symlink_metadata(skills.join("notes")).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn records_are_written_atomically_without_a_shared_temp_name() {
+        use crate::config::atomic::test_hook::{self, Stage};
+        let (_tmp, roots) = setup();
+        let slot = roots.archive_dir.join("20261023T000000Z-pdf");
+        std::fs::create_dir_all(&slot).unwrap();
+        let path = slot.join(RECORD_FILE);
+        write_record(&path, &json!({ "id": "old" })).unwrap();
+        // A leftover of the old fixed temp name no longer blocks a write.
+        std::fs::create_dir_all(path.with_extension("json.tmp")).unwrap();
+        let stages = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = stages.clone();
+        let target = path.clone();
+        let guard = test_hook::observe(move |stage, tmp| {
+            assert_eq!(tmp.parent(), target.parent());
+            assert_eq!(read_record(&target).unwrap()["id"], "old", "the record is replaced only by the rename");
+            seen.borrow_mut().push(stage);
+        });
+        write_record(&path, &json!({ "id": "new" })).unwrap();
+        drop(guard);
+        assert_eq!(*stages.borrow(), vec![Stage::Created, Stage::Written]);
+        assert_eq!(read_record(&path).unwrap()["id"], "new");
+        let names: Vec<String> = std::fs::read_dir(&slot)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
     }
 
     #[test]

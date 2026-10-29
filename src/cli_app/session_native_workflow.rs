@@ -106,6 +106,12 @@ impl NativeLaunch {
     }
 
     pub(super) fn endpoint(&self) -> anyhow::Result<OwnedStdioEndpoint> {
+        self.endpoint_bounded(None)
+    }
+
+    /// `endpoint` whose replies may be up to `max_message_bytes` (history
+    /// readers: one native turn can be tens of MB).
+    pub(super) fn endpoint_bounded(&self, max_message_bytes: Option<usize>) -> anyhow::Result<OwnedStdioEndpoint> {
         let command = if let Some(deployment) =
             cutex::launch::local_deployment::LocalDeployment::selected()?
         {
@@ -121,7 +127,10 @@ impl NativeLaunch {
         } else {
             self.command(&["app-server".into(), "--stdio".into()])?
         };
-        let options = StdioAppServerOptions::new(command.get_program(), self.native_home.clone());
+        let mut options = StdioAppServerOptions::new(command.get_program(), self.native_home.clone());
+        if let Some(max) = max_message_bytes {
+            options.max_message_bytes = max;
+        }
         let mut endpoint = OwnedStdioEndpoint::spawn_command(options, command)?;
         let initialized = endpoint.request("initialize", json!({"clientInfo": {"name":"cutex_native_workflow", "version":env!("CARGO_PKG_VERSION")}, "capabilities":{"experimentalApi":true}}))?;
         anyhow::ensure!(

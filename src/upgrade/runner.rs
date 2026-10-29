@@ -170,7 +170,10 @@ fn wait_idle(run: &mut Run, plan: &Plan, host: &dyn Host, deadline: Instant) -> 
         }
         if host.now() >= deadline {
             let detail = format!("not idle within {}s; nothing changed, retry later", plan.max_wait.as_secs());
-            run.error = Some(super::state::RunError { code: "not_idle".into(), message: detail.clone() });
+            run.error = Some(super::state::RunError {
+                code: "not_idle".into(),
+                message: detail.clone(),
+            });
             run.enter(Phase::Deferred, Some(detail));
             host.record(run);
             return Wait::Stop;
@@ -226,13 +229,11 @@ fn verify(plan: &Plan, before: &Snapshot, host: &dyn Host, expect_online: &BTree
             problems.push("cutexBuild.commit missing".into());
         }
         let removed: BTreeSet<&String> = plan.capabilities_removed.iter().collect();
-        let lost: Vec<&String> =
-            before.features.iter().filter(|f| !removed.contains(f) && !host_dependent(f) && !after.features.contains(*f)).collect();
+        let lost: Vec<&String> = before.features.iter().filter(|f| !removed.contains(f) && !host_dependent(f) && !after.features.contains(*f)).collect();
         if !lost.is_empty() {
             problems.push(format!("capabilities lost: {lost:?}"));
         }
-        let missing: Vec<&String> =
-            plan.capabilities_added.iter().filter(|f| !host_dependent(f) && !after.features.contains(*f)).collect();
+        let missing: Vec<&String> = plan.capabilities_added.iter().filter(|f| !host_dependent(f) && !after.features.contains(*f)).collect();
         if !missing.is_empty() {
             problems.push(format!("capabilities missing: {missing:?}"));
         }
@@ -263,31 +264,22 @@ fn needs_owner(run: &mut Run, host: &dyn Host, reason: String, commands: Vec<Str
 
 /// Steps back to `from` after a failure before the commit point. Every step
 /// failure ends in needs-owner (never a second destructive attempt).
-fn roll_back(
-    run: &mut Run,
-    plan: &Plan,
-    host: &dyn Host,
-    from: &str,
-    backup: Option<&Path>,
-    swapped: bool,
-    offlined: &[String],
-) {
+fn roll_back(run: &mut Run, plan: &Plan, host: &dyn Host, from: &str, backup: Option<&Path>, swapped: bool, offlined: &[String]) {
     let displaced = plan.run_dir.join("displaced");
     run.enter(Phase::RollingBack, run.error.as_ref().map(|e| e.message.clone()));
     host.record(run);
-    let manual = vec![
-        "cutex upgrade status".to_string(),
-        format!("cutex upgrade rollback --to {from}"),
-        "cutex service status".to_string(),
-    ];
+    let manual = vec!["cutex upgrade status".to_string(), format!("cutex upgrade rollback --to {from}"), "cutex service status".to_string()];
     if plan.class == MigrationClass::OneWay && swapped {
         // The new binary may already have migrated state the old one cannot read.
         let _ = host.start_services();
         return needs_owner(
             run,
             host,
-            format!("{} is a one-way upgrade and failed before its commit point; no automatic rollback (fix forward or restore from {})",
-                plan.to_release, backup.map_or("the run backup".into(), |b| b.display().to_string())),
+            format!(
+                "{} is a one-way upgrade and failed before its commit point; no automatic rollback (fix forward or restore from {})",
+                plan.to_release,
+                backup.map_or("the run backup".into(), |b| b.display().to_string())
+            ),
             manual,
         );
     }
@@ -306,6 +298,23 @@ fn roll_back(
         if let Err(error) = host.stop_services() {
             return needs_owner(run, host, format!("could not stop the services for the rollback: {error:#}"), manual);
         }
+        // Compatibility exports are part of the old release's input, so
+        // finish them while the current binary is still selected. If this
+        // fails, restarting below keeps the current release authoritative.
+        match host.prepare_older_stores(&displaced, from) {
+            Ok(notes) => run.displaced.extend(notes),
+            Err(error) => {
+                return needs_owner(
+                    run,
+                    host,
+                    format!(
+                        "could not prepare the stores for {from}: {error:#}; services remain stopped and the pre-rollback backup is {}",
+                        backup.map_or_else(|| "the run backup".into(), |path| path.display().to_string())
+                    ),
+                    manual,
+                );
+            }
+        }
         if let Err(error) = host.activate(from) {
             return needs_owner(run, host, format!("could not switch back to {from}: {error:#}"), manual);
         }
@@ -323,10 +332,6 @@ fn roll_back(
                 Ok(false) => {}
                 Err(error) => return needs_owner(run, host, format!("could not move {store} aside: {error:#}"), manual),
             }
-        }
-        match host.prepare_older_stores(&displaced, from) {
-            Ok(notes) => run.displaced.extend(notes),
-            Err(error) => return needs_owner(run, host, format!("could not prepare the stores for {from}: {error:#}"), manual),
         }
         let _ = host.restore_components(&plan.run_dir);
     }
@@ -403,13 +408,19 @@ pub fn apply(run: &mut Run, plan: &Plan, host: &dyn Host) {
     run.enter(Phase::Swapping, None);
     host.record(run);
     if let Err(error) = host.activate(&plan.to_release) {
-        run.error = Some(super::state::RunError { code: "swap_failed".into(), message: format!("{error:#}") });
+        run.error = Some(super::state::RunError {
+            code: "swap_failed".into(),
+            message: format!("{error:#}"),
+        });
         // activate may have half-switched (Windows: one of two files).
         return roll_back(run, plan, host, &from, Some(&backup), true, &offlined);
     }
     if plan.mode == Mode::Full {
         if let Err(error) = host.select_runtime(&plan.to_release) {
-            run.error = Some(super::state::RunError { code: "select_failed".into(), message: format!("{error:#}") });
+            run.error = Some(super::state::RunError {
+                code: "select_failed".into(),
+                message: format!("{error:#}"),
+            });
             return roll_back(run, plan, host, &from, Some(&backup), true, &offlined);
         }
     }
@@ -419,13 +430,19 @@ pub fn apply(run: &mut Run, plan: &Plan, host: &dyn Host) {
     run.enter(Phase::Starting, None);
     host.record(run);
     if let Err(error) = host.start_services() {
-        run.error = Some(super::state::RunError { code: "start_failed".into(), message: format!("{error:#}") });
+        run.error = Some(super::state::RunError {
+            code: "start_failed".into(),
+            message: format!("{error:#}"),
+        });
         return roll_back(run, plan, host, &from, Some(&backup), true, &offlined);
     }
     run.enter(Phase::WaitingReady, None);
     host.record(run);
     if let Err(error) = host.wait_ready(plan.ready_timeout) {
-        run.error = Some(super::state::RunError { code: "not_ready".into(), message: format!("{error:#}") });
+        run.error = Some(super::state::RunError {
+            code: "not_ready".into(),
+            message: format!("{error:#}"),
+        });
         return roll_back(run, plan, host, &from, Some(&backup), true, &offlined);
     }
     run.downtime_ms = Some((host.now() - stopped_at).as_millis() as u64);
@@ -436,7 +453,10 @@ pub fn apply(run: &mut Run, plan: &Plan, host: &dyn Host) {
         match host.package_run_all() {
             Ok(id) => run.package_run_id = id,
             Err(error) => {
-                run.error = Some(super::state::RunError { code: "package_run_failed".into(), message: format!("{error:#}") });
+                run.error = Some(super::state::RunError {
+                    code: "package_run_failed".into(),
+                    message: format!("{error:#}"),
+                });
                 return roll_back(run, plan, host, &from, Some(&backup), true, &offlined);
             }
         }
@@ -460,7 +480,10 @@ pub fn apply(run: &mut Run, plan: &Plan, host: &dyn Host) {
             host.record(run);
         }
         Err(problems) => {
-            run.error = Some(super::state::RunError { code: "verify_failed".into(), message: problems });
+            run.error = Some(super::state::RunError {
+                code: "verify_failed".into(),
+                message: problems,
+            });
             roll_back(run, plan, host, &from, Some(&backup), true, &[]);
         }
     }
@@ -510,6 +533,10 @@ pub fn rollback(run: &mut Run, plan: &Plan, host: &dyn Host) {
     host.record(run);
     let displaced = plan.run_dir.join("displaced");
     let result = (|| -> anyhow::Result<()> {
+        // Export and validate every legacy view before selecting an older
+        // executable. A failure leaves the current release selected and the
+        // caller restarts it below.
+        run.displaced.extend(host.prepare_older_stores(&displaced, &plan.to_release)?);
         host.activate(&plan.to_release)?;
         if let Some(selection) = &plan.selection_backup {
             run.displaced.extend(host.restore_selection(selection, &displaced)?);
@@ -519,15 +546,18 @@ pub fn rollback(run: &mut Run, plan: &Plan, host: &dyn Host) {
                 run.displaced.push(store.clone());
             }
         }
-        run.displaced.extend(host.prepare_older_stores(&displaced, &plan.to_release)?);
         // The versions the rollback target names (a release without a
         // components section leaves them as they are).
         let _ = host.select_components(&plan.run_dir);
         Ok(())
     })();
     if let Err(error) = result {
-        let _ = host.start_services();
-        return needs_owner(run, host, format!("rollback switch failed: {error:#}"), manual);
+        return needs_owner(
+            run,
+            host,
+            format!("rollback switch failed: {error:#}; services remain stopped and the pre-rollback backup is {}", backup.display()),
+            manual,
+        );
     }
     run.enter(Phase::Starting, None);
     host.record(run);
@@ -639,7 +669,11 @@ pub(crate) mod fake {
             }
             let running = self.running.borrow().clone();
             Ok(Snapshot {
-                commit: Some(if running.starts_with("r240") { self.new_release_commit.clone() } else { self.commit.borrow().clone() }),
+                commit: Some(if running.starts_with("r240") {
+                    self.new_release_commit.clone()
+                } else {
+                    self.commit.borrow().clone()
+                }),
                 release: Some(running),
                 features: self.features.borrow().clone(),
                 health_errors: self.health_errors.borrow().clone(),
@@ -696,6 +730,10 @@ pub(crate) mod fake {
             self.step("move_aside")?;
             Ok(true)
         }
+        fn prepare_older_stores(&self, _displaced: &Path, _target: &str) -> anyhow::Result<Vec<String>> {
+            self.step("prepare_older_stores")?;
+            Ok(vec!["legacy views exported".into()])
+        }
         fn rollback_prep(&self, _migrations: &[Migration]) -> anyhow::Result<Vec<String>> {
             self.step("rollback_prep")?;
             Ok(self.hazards.borrow().clone())
@@ -751,7 +789,11 @@ mod tests {
 
     #[test]
     fn a_source_build_matches_its_dev_label_by_commit() {
-        let snap = |release: Option<&str>, commit: Option<&str>| Snapshot { release: release.map(Into::into), commit: commit.map(Into::into), ..Snapshot::default() };
+        let snap = |release: Option<&str>, commit: Option<&str>| Snapshot {
+            release: release.map(Into::into),
+            commit: commit.map(Into::into),
+            ..Snapshot::default()
+        };
         assert!(snap(None, Some("656cd91aa")).runs_release("dev-656cd91"));
         assert!(!snap(None, Some("1234567")).runs_release("dev-656cd91"));
         assert!(!snap(None, None).runs_release("dev-656cd91"));
@@ -764,14 +806,27 @@ mod tests {
     #[test]
     fn reload_upgrade_commits_without_touching_the_selection() {
         let host = FakeHost::new("r239");
-        let plan = Plan { migrations: Vec::new(), class: MigrationClass::ReloadSafe, ..plan(Mode::Reload, MigrationClass::ReloadSafe, PackageRun::After) };
+        let plan = Plan {
+            migrations: Vec::new(),
+            class: MigrationClass::ReloadSafe,
+            ..plan(Mode::Reload, MigrationClass::ReloadSafe, PackageRun::After)
+        };
         let run = go(&host, &plan);
         assert_eq!(run.phase, Phase::Committed, "{:?}", run.error);
         assert_eq!(host.steps(), vec!["busy", "snapshot", "stop", "backup", "activate_new", "start", "wait_ready", "snapshot"]);
         assert!(run.downtime_ms.is_some());
         assert_eq!(
             host.phases(),
-            vec![Phase::WaitingIdle, Phase::Stopping, Phase::BackingUp, Phase::Swapping, Phase::Starting, Phase::WaitingReady, Phase::Verifying, Phase::Committed]
+            vec![
+                Phase::WaitingIdle,
+                Phase::Stopping,
+                Phase::BackingUp,
+                Phase::Swapping,
+                Phase::Starting,
+                Phase::WaitingReady,
+                Phase::Verifying,
+                Phase::Committed
+            ]
         );
     }
 
@@ -799,7 +854,12 @@ mod tests {
     #[test]
     fn waits_for_idle_and_defers_without_changes() {
         let host = FakeHost::new("r239");
-        let busy = Busy { reason: "activeTurn".into(), cutex_session_id: Some("cutex.x".into()), name: Some("X".into()), detail: None };
+        let busy = Busy {
+            reason: "activeTurn".into(),
+            cutex_session_id: Some("cutex.x".into()),
+            name: Some("X".into()),
+            detail: None,
+        };
         *host.busy_script.borrow_mut() = vec![vec![busy.clone()]; 1000];
         let run = go(&host, &plan(Mode::Reload, MigrationClass::ReloadSafe, PackageRun::After));
         assert_eq!(run.phase, Phase::Deferred);
@@ -809,7 +869,13 @@ mod tests {
         // Becomes idle after two polls.
         let host = FakeHost::new("r239");
         *host.busy_script.borrow_mut() = vec![vec![busy.clone()], vec![busy]];
-        let run = go(&host, &Plan { migrations: Vec::new(), ..plan(Mode::Reload, MigrationClass::ReloadSafe, PackageRun::After) });
+        let run = go(
+            &host,
+            &Plan {
+                migrations: Vec::new(),
+                ..plan(Mode::Reload, MigrationClass::ReloadSafe, PackageRun::After)
+            },
+        );
         assert_eq!(run.phase, Phase::Committed);
         assert!(run.waiting_for.is_empty());
     }
@@ -826,7 +892,12 @@ mod tests {
     #[test]
     fn a_turn_starting_while_quiescing_brings_runtimes_back() {
         let host = FakeHost::new("r239");
-        let busy = Busy { reason: "activeTurn".into(), cutex_session_id: Some("cutex.y".into()), name: None, detail: None };
+        let busy = Busy {
+            reason: "activeTurn".into(),
+            cutex_session_id: Some("cutex.y".into()),
+            name: None,
+            detail: None,
+        };
         // idle (wait), idle (before x), busy (before y) -> back to waiting, then idle.
         *host.busy_script.borrow_mut() = vec![vec![], vec![], vec![busy]];
         let run = go(&host, &plan(Mode::Full, MigrationClass::RollbackSafe, PackageRun::During));
@@ -835,7 +906,11 @@ mod tests {
         let first_online = steps.iter().position(|s| s == "online").unwrap();
         let stop = steps.iter().position(|s| s == "stop").unwrap();
         assert!(first_online < stop, "cutex.x brought back before the retry: {steps:?}");
-        assert!(host.records.borrow().iter().any(|r| r.timeline.iter().any(|t| t.detail.as_deref().is_some_and(|d| d.contains("quiescing")))));
+        assert!(host
+            .records
+            .borrow()
+            .iter()
+            .any(|r| r.timeline.iter().any(|t| t.detail.as_deref().is_some_and(|d| d.contains("quiescing")))));
     }
 
     #[test]
@@ -844,7 +919,10 @@ mod tests {
         for f in HOST_DEPENDENT_CAPABILITIES {
             host.features.borrow_mut().insert(f.to_string());
         }
-        let plan = Plan { capabilities_added: vec!["c".into(), "job-external".into()], ..plan(Mode::Full, MigrationClass::RollbackSafe, PackageRun::After) };
+        let plan = Plan {
+            capabilities_added: vec!["c".into(), "job-external".into()],
+            ..plan(Mode::Full, MigrationClass::RollbackSafe, PackageRun::After)
+        };
         let mut run = new_run(RunKind::Apply, "r239", &plan);
         host.features.borrow_mut().insert("c".into());
         // The swap restarts the Job Service and it does not come back.
@@ -853,7 +931,10 @@ mod tests {
         assert_eq!(run.phase, Phase::Committed, "{:?}", run.error);
         assert!(!host.features.borrow().contains("job-external"), "the Job Service stayed down");
         // A cutex-built capability lost still fails.
-        let before = Snapshot { features: host.features.borrow().clone(), ..host.snapshot().unwrap() };
+        let before = Snapshot {
+            features: host.features.borrow().clone(),
+            ..host.snapshot().unwrap()
+        };
         host.features.borrow_mut().remove("a");
         assert!(verify(&plan, &before, &host, &BTreeSet::new()).unwrap_err().contains("capabilities lost"));
     }
@@ -871,7 +952,20 @@ mod tests {
         assert!(run.error.as_ref().unwrap().message.contains("capabilities missing"));
         let steps = host.steps();
         let tail: Vec<&str> = steps.iter().skip_while(|s| *s != "rollback_prep").map(String::as_str).collect();
-        assert_eq!(tail, vec!["rollback_prep", "stop", "activate_old", "restore_selection", "move_aside", "start", "wait_ready", "snapshot"]);
+        assert_eq!(
+            tail,
+            vec![
+                "rollback_prep",
+                "stop",
+                "prepare_older_stores",
+                "activate_old",
+                "restore_selection",
+                "move_aside",
+                "start",
+                "wait_ready",
+                "snapshot"
+            ]
+        );
         assert_eq!(*host.running.borrow(), "r239");
         assert!(run.displaced.contains(&"runtime/new-store".to_string()));
     }
@@ -882,7 +976,11 @@ mod tests {
         assert_eq!(online_converge(22), Duration::from_secs(192));
         assert_eq!(online_converge(100), Duration::from_secs(660));
         assert_eq!(online_converge(usize::MAX), Duration::from_secs(900));
-        let plan = Plan { capabilities_added: Vec::new(), capabilities_removed: Vec::new(), ..plan(Mode::Reload, MigrationClass::ReloadSafe, PackageRun::After) };
+        let plan = Plan {
+            capabilities_added: Vec::new(),
+            capabilities_removed: Vec::new(),
+            ..plan(Mode::Reload, MigrationClass::ReloadSafe, PackageRun::After)
+        };
         let expect: BTreeSet<String> = ["cutex.x", "cutex.y"].iter().map(|s| s.to_string()).collect();
         for (back_at, ok) in [(Some(120), true), (None, false)] {
             let host = FakeHost::new("r240");
@@ -902,7 +1000,10 @@ mod tests {
     fn start_failure_rolls_back_and_new_health_errors_fail_verify() {
         let host = FakeHost::new("r239");
         host.fail.borrow_mut().insert("wait_ready");
-        let plan = Plan { migrations: Vec::new(), ..plan(Mode::Reload, MigrationClass::ReloadSafe, PackageRun::After) };
+        let plan = Plan {
+            migrations: Vec::new(),
+            ..plan(Mode::Reload, MigrationClass::ReloadSafe, PackageRun::After)
+        };
         let mut run = new_run(RunKind::Apply, "r239", &plan);
         apply(&mut run, &plan, &host);
         // wait_ready also fails for the old release: needs-owner, no third attempt.
@@ -963,5 +1064,23 @@ mod tests {
         rollback(&mut run, &plan, &host);
         assert_eq!(run.phase, Phase::Failed);
         assert_eq!(run.error.unwrap().code, "rollback_hazard");
+    }
+
+    #[test]
+    fn rollback_export_failure_never_selects_or_starts_the_old_release() {
+        let host = FakeHost::new("r240");
+        host.fail.borrow_mut().insert("prepare_older_stores");
+        let plan = Plan {
+            to_release: "r239".into(),
+            to_commit: None,
+            ..plan(Mode::Full, MigrationClass::RollbackSafe, PackageRun::After)
+        };
+        let mut run = new_run(RunKind::Rollback, "r240", &plan);
+        rollback(&mut run, &plan, &host);
+        assert_eq!(run.phase, Phase::NeedsOwner);
+        assert_eq!(*host.running.borrow(), "r240");
+        assert!(!host.steps().iter().any(|step| step == "activate_old"));
+        assert!(!host.steps().iter().any(|step| step == "start"));
+        assert!(run.needs_owner.as_ref().unwrap().reason.contains("services remain stopped"));
     }
 }

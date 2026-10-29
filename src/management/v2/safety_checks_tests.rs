@@ -119,7 +119,7 @@ fn grant_reaches_the_runtime_closes_the_item_and_tells_the_agent_once() {
         runtime_ok(&calls, "granted"),
         |input| {
             submitted = Some(input.clone());
-            Ok(json!({"disposition": "queued"}))
+            Ok(json!({"disposition": "steered"}))
         })
         .unwrap();
     let calls = calls.into_inner();
@@ -127,10 +127,13 @@ fn grant_reaches_the_runtime_closes_the_item_and_tells_the_agent_once() {
     assert_eq!(calls[0].0, "thread/safetyCheck/grant");
     assert_eq!(calls[0].1, json!({"threadId": "thread-1", "blockId": "sb-1", "decidedBy": {"kind": "owner"}}));
     assert_eq!(result["block"]["state"], "granted");
-    assert_eq!(result["submit"]["disposition"], "queued");
+    assert_eq!(result["submit"]["disposition"], "steered");
     let input = submitted.unwrap();
     assert_eq!(input.method, "cutex/userInput/submit");
-    assert_eq!(input.params["strategy"], "queue", "busy: after the current turn");
+    // Owner 2026-10-19: busy, the grant joins the running turn at its next
+    // step (`auto` steers), never 本回合结束后送达.
+    assert_eq!(input.params["strategy"], "auto", "busy: inserted at the next step");
+    assert_eq!(input.params["startIfOffline"], true);
     assert_eq!(input.params["clientUserMessageId"], "safety-grant-sb-1");
     assert_eq!(input.params["input"][0]["text"], "主人已批准一次：rm -rf $S/$v（30 分钟内有效，仅此一次）");
     let notice = record(&store, "sb-1");

@@ -888,6 +888,7 @@ impl RowContext<'_> {
             token_source: UsageTokenSource::NativeLast,
             model_context_window: None,
             compaction_count: None,
+            model_requests: None,
             cumulative_total: tokens.clone(),
             tokens,
         };

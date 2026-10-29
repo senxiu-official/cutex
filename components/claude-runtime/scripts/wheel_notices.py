@@ -63,9 +63,15 @@ def fence(text: str) -> str:
 
 def render(wheels: Path) -> str:
     dists = {}
+    bundles_claude_cli = False
     for path in sorted(wheels.glob("*.whl")):
         name, version, lic, files = read_wheel(path)
         dists.setdefault((name.lower(), version), (name, version, lic, files))
+        with zipfile.ZipFile(path) as bundle:
+            bundles_claude_cli |= any(
+                "/_bundled/claude" in entry and not entry.endswith(".gitignore")
+                for entry in bundle.namelist()
+            )
     if not dists:
         raise SystemExit(f"{wheels}: no wheels")
     texts: dict[str, list[str]] = {}
@@ -75,8 +81,13 @@ def render(wheels: Path) -> str:
         "",
         "The claude-runtime component is licensed under the MIT License (LICENSE). It installs the Python",
         f"packages below from the wheels in `wheels/` ({len(dists)} packages), each redistributed unmodified",
-        "under its own license; each wheel also carries these files in its `.dist-info`. claude-agent-sdk",
-        "is built from its source distribution without the bundled Claude Code CLI (not redistributed).",
+        "under its own license; each wheel also carries these files in its `.dist-info`.",
+        ("The unmodified platform claude-agent-sdk wheel includes its version-matched official Claude Code CLI. "
+         "That binary is not declared MIT by this notice; its use and product preinstallation are subject to "
+         "Anthropic's Commercial Terms and documented legal/compliance conditions: "
+         "https://www.anthropic.com/legal/commercial-terms and https://code.claude.com/docs/en/legal-and-compliance."
+         if bundles_claude_cli else
+         "claude-agent-sdk is built from its source distribution without the bundled Claude Code CLI."),
         "",
         "| Package | Version | License |",
         "|---|---|---|",

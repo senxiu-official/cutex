@@ -178,6 +178,9 @@
             "null"
           ]
         },
+        "waitReason": {
+          "enum": ["resultCoalescing", "nativeReceipt"]
+        },
         "held": {
           "enum": [
             "ownerStop",
@@ -192,6 +195,10 @@
         },
         "fromHost": {
           "type": ["string", "null"]
+        },
+        "fromCutexSessionId": {
+          "type": ["string", "null"],
+          "description": "The sender's cutex session id when it is an agent on this host (local delegate, same-host tell); never another host's session"
         },
         "preview": {
           "type": ["string", "null"],

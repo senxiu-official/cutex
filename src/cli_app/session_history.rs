@@ -125,6 +125,11 @@ pub(crate) fn native_home_for(
     }
 }
 
+/// Reply bound of offline history readers: a native `thread/turns/list
+/// itemsView=full` page of an image-generating agent was 393 MB (30 turns, up
+/// to 88 MB each), far past the stdio default of 8 MiB, which failed the read.
+const HISTORY_MAX_MESSAGE_BYTES: usize = 1024 * 1024 * 1024;
+
 /// A private, initialized stdio app-server on `home` for an offline session.
 /// No thread is resumed: callers that only read stay read-only.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -159,8 +164,9 @@ pub(crate) fn isolated_endpoint(
         .args(["--listen", "stdio://"]);
         let mut command = launch.to_command();
         command.current_dir(&cwd);
-        let options =
+        let mut options =
             cutex::catalog::StdioAppServerOptions::new(&bundle.executable.path, home.to_path_buf());
+        options.max_message_bytes = HISTORY_MAX_MESSAGE_BYTES;
         let mut endpoint = OwnedStdioEndpoint::spawn_command(options, command)?;
         let initialized = endpoint.request("initialize", json!({"clientInfo":{"name":"cutex_history","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}))?;
         // Compare canonically: Windows homes are stored verbatim (`\\?\C:\...`)
@@ -181,7 +187,7 @@ pub(crate) fn isolated_endpoint(
             profile: record.and_then(|r| r.profile.clone()),
             model: None,
         };
-        launch.endpoint()
+        launch.endpoint_bounded(Some(HISTORY_MAX_MESSAGE_BYTES))
     }
 }
 
@@ -211,6 +217,9 @@ pub(crate) fn open_offline_history_endpoint(
             ),
             "offline history is only available on the session's own host"
         );
+        if let Some(session) = &record.dsh_session {
+            return Ok((Box::new(dsh_history_reader(session, &record.cwd)?), session.state_dir.clone()));
+        }
         if let Some(session) = &record.claude_session {
             return Ok((
                 Box::new(claude_history_reader(session)?),
@@ -225,20 +234,25 @@ pub(crate) fn open_offline_history_endpoint(
 
 /// `ManagementRequestContext::load_latest_plan`: `cutexState.latestPlan` from
 /// the session's current native rollout (`cutex::launch::native_plan`).
-/// `null` for Claude sessions, sessions of another host, unbound sessions and
-/// whenever the rollout cannot be read (it is presentation state only).
+/// `null` for sessions of another host, unbound sessions and whenever the
+/// rollout cannot be read (it is presentation state only). A local Claude or
+/// DSH session (no rollout) serves the newest checklist its adapter sent for
+/// its current thread (`management::v2::claude_plan`).
 pub(crate) fn latest_plan_for_management(cutex_session_id: &str) -> Value {
+    if let Some(plan) = claude_latest(cutex_session_id, cutex::management::v2::claude_plan::latest) {
+        return plan;
+    }
     derive_from_native_rollout(cutex_session_id, cutex::launch::native_plan::latest_plan)
 }
 
 /// `ManagementRequestContext::load_latest_token_usage`:
 /// `cutexState.latestTokenUsage` from the session's current native rollout
 /// (`cutex::launch::native_token_usage`); `null` in the same cases as
-/// [`latest_plan_for_management`], except that a local Claude session serves
-/// the newest usage report its adapter sent for its current thread
-/// (`management::v2::claude_token_usage`; Claude has no rollout).
+/// [`latest_plan_for_management`], except that a local Claude or DSH session
+/// serves the newest usage report its adapter sent for its current thread
+/// (`management::v2::claude_token_usage`; neither has a rollout).
 pub(crate) fn latest_token_usage_for_management(cutex_session_id: &str) -> Value {
-    if let Some(usage) = claude_latest_token_usage(cutex_session_id) {
+    if let Some(usage) = claude_latest(cutex_session_id, cutex::management::v2::claude_token_usage::latest) {
         return usage;
     }
     derive_from_native_rollout(
@@ -247,18 +261,23 @@ pub(crate) fn latest_token_usage_for_management(cutex_session_id: &str) -> Value
     )
 }
 
-/// `Some` (a value or `null`) for a local Claude session, `None` otherwise.
-fn claude_latest_token_usage(cutex_session_id: &str) -> Option<Value> {
+/// `Some` (a value or `null`) for a local Claude session, `None` otherwise:
+/// what `latest(cutex session id, bound thread)` keeps for it
+/// (`claude_token_usage` / `claude_plan`).
+fn claude_latest(
+    cutex_session_id: &str,
+    latest: fn(&str, &str) -> anyhow::Result<Option<Value>>,
+) -> Option<Value> {
     let store = cutex::session::store::load_cutex_session_store().ok()?;
-    claude_latest_token_usage_in(
+    claude_latest_in(
         &store,
         cutex_session_id,
         &cutex::platform::host::current_host_name(),
-        cutex::management::v2::claude_token_usage::latest,
+        latest,
     )
 }
 
-fn claude_latest_token_usage_in(
+fn claude_latest_in(
     store: &cutex::session::model::CutexSessionStore,
     cutex_session_id: &str,
     current_host: &str,
@@ -269,12 +288,14 @@ fn claude_latest_token_usage_in(
         cutex_session_id,
     )?;
     let record = store.sessions.get(&key)?;
-    let claude = record.claude_session.as_ref()?;
+    // Claude and DSH sessions have no rollout; the daemon keeps their values.
+    let thread_id = record.claude_session.as_ref().map(|claude| claude.thread_id.as_str())
+        .or_else(|| record.dsh_session.as_ref().map(|dsh| dsh.thread_id.as_str()))?;
     if !cutex::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, current_host) {
         return Some(Value::Null);
     }
     Some(
-        latest(&record.cutex_session_id, &claude.thread_id)
+        latest(&record.cutex_session_id, thread_id)
             .ok()
             .flatten()
             .unwrap_or(Value::Null),
@@ -319,6 +340,33 @@ fn derive_from_native_rollout(
 /// `cute_claude.history_reader` on the agent's private state directory. It
 /// never takes the adapter's writer lease and serves only history reads.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn dsh_history_reader(session: &cutex::runtime::dsh::DshSession, cwd: &str) -> anyhow::Result<OwnedStdioEndpoint> {
+    let reader = session.adapter.parent().context("DSH adapter source missing")?.join("history-reader.mjs");
+    anyhow::ensure!(reader.is_file(), "DSH history reader missing from pinned runtime");
+    let config = session.state_dir.join("history-reader.json");
+    cutex::config::atomic::write_private_pretty_json_atomic(&config, &json!({
+        "database":session.state_dir.join("timeline.sqlite"),"threadId":session.thread_id,
+        "nativeSessionId":session.native_session_id,"cwd":cwd
+    }), "DSH offline history reader")?;
+    let mut command = std::process::Command::new(&session.node);
+    command.arg(reader).env_clear().env("DSH_CUTEX_HISTORY_CONFIG", &config).current_dir(&session.state_dir);
+    // Its results are redacted like the runtime's (stored deltas of an older
+    // timeline may split a secret that the projection joins again).
+    command.env("DSH_CUTEX_REDACT", serde_json::to_string(&super::dsh_structure::redaction_secrets(session))?);
+    if let Some(sources) = super::dsh_structure::redaction_sources(session) {
+        command.env("KIMI_CUTEX_REDACT_SOURCES", sources);
+    }
+    for key in ["PATH","Path","SystemRoot","WINDIR","TEMP","TMP"] {
+        if let Some(value) = std::env::var_os(key) { command.env(key, value); }
+    }
+    let mut options = cutex::catalog::StdioAppServerOptions::new(&session.node, session.state_dir.clone());
+    options.max_message_bytes = 64 * 1024 * 1024;
+    let mut endpoint = OwnedStdioEndpoint::spawn_command(options, command)?;
+    endpoint.request("initialize", json!({"clientInfo":{"name":"cutex_history","version":env!("CARGO_PKG_VERSION")},"capabilities":{}}))?;
+    endpoint.notify("initialized", None)?;
+    Ok(endpoint)
+}
+
 fn claude_history_reader(
     session: &cutex::runtime::claude::ClaudeSession,
 ) -> anyhow::Result<OwnedStdioEndpoint> {
@@ -690,6 +738,9 @@ pub(crate) fn revert_for_management(
     let record = store.sessions.get(cutex_session_id).ok_or_else(|| {
         revert_error(failure("session_not_found", "the agent does not exist on this host", false))
     })?;
+    if record.dsh_session.is_some() {
+        return super::dsh_structure::revert(cutex_session_id, before_turn_id, rewind_files);
+    }
     if record.claude_session.is_some() {
         return super::claude_structure::revert(record, before_turn_id, rewind_files);
     }
@@ -737,6 +788,8 @@ pub(crate) fn revert_for_management(
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    let removed: Vec<&str> = outcome.removed_turn_ids.iter().map(String::as_str).collect();
+    forget_reverted_activity(cutex_session_id, &removed);
     Ok(json!({
         "cutexSessionId": cutex_session_id,
         "threadId": outcome.thread_id,
@@ -752,6 +805,16 @@ pub(crate) fn revert_for_management(
         "receiptPath": outcome.receipt,
         "native": { "method": outcome.native_method, "result": outcome.native_result },
     }))
+}
+
+/// After a history revert (Codex, Claude, DSH): the agent list's
+/// `lastOutput` / `lastToolCall` must not preview a removed turn
+/// (`activity::forget_reverted_turns`). Presentation state: a failure is
+/// logged, never fails the revert.
+pub(crate) fn forget_reverted_activity(cutex_session_id: &str, removed_turn_ids: &[&str]) {
+    if let Err(error) = cutex::management::v2::activity::forget_reverted_turns(cutex_session_id, removed_turn_ids) {
+        eprintln!("session activity of {cutex_session_id} not reset after revert: {error:#}");
+    }
 }
 
 fn revert_error(error: anyhow::Error) -> UserInputExecutionError {
@@ -1180,7 +1243,7 @@ mod tests {
         store.sessions.insert(claude.cutex_session_id.clone(), claude.clone());
         store.sessions.insert(codex.cutex_session_id.clone(), codex.clone());
         let latest = |session: &str, thread: &str| claude_token_usage::latest_at(&root, session, thread);
-        let read = |id: &str| claude_latest_token_usage_in(&store, id, "host-a", latest);
+        let read = |id: &str| claude_latest_in(&store, id, "host-a", latest);
 
         // No report yet: null (not the Codex rollout derivation).
         assert_eq!(read(&claude.cutex_session_id), Some(Value::Null));
@@ -1215,7 +1278,108 @@ mod tests {
         // Codex: not answered here (falls through to the rollout).
         assert_eq!(read(&codex.cutex_session_id), None);
         // A Claude session of another host: null.
-        assert_eq!(claude_latest_token_usage_in(&store, &claude.cutex_session_id, "host-b", latest), Some(Value::Null));
+        assert_eq!(claude_latest_in(&store, &claude.cutex_session_id, "host-b", latest), Some(Value::Null));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A Claude `turn/plan/updated` (TodoWrite / Task* checklist) becomes the
+    /// session's bootstrap / history `cutexState.latestPlan` (it was always
+    /// null for Claude sessions); Codex sessions keep the rollout derivation.
+    #[test]
+    fn claude_plan_event_feeds_latest_plan() {
+        use cutex::management::v2::claude_plan;
+        use cutex::management::v2::model::{
+            EventCorrelation, EventEnvelope, EventSource, NativeMessage, NativeMessageKind,
+        };
+        let root = std::env::temp_dir().join(format!("cutex-claude-plan-{}", uuid::Uuid::new_v4()));
+        let thread = "8c0e4b8e-6f3a-4c1e-9a52-0d9f6e2b7a12";
+        let mut claude = cutex::session::model::CutexSessionRecord::new(
+            "cutex-claude-2".into(), None, "host-a".into(), "/w".into(), None).unwrap();
+        claude.claude_session = Some(serde_json::from_value(json!({
+            "deployment": {"python": "/py", "adapter_source": "/a", "claude_cli": "/claude",
+                           "claude_home": "/home", "tui_binary": "/tui"},
+            "thread_id": thread, "state_dir": "/state", "model": "opus"
+        })).unwrap());
+        let codex = cutex::session::model::CutexSessionRecord::new(
+            "cutex-codex-2".into(), Some("00000000-0000-7000-8000-000000000002".into()),
+            "host-a".into(), "/w".into(), None).unwrap();
+        let mut store = cutex::session::model::CutexSessionStore::default();
+        store.sessions.insert(claude.cutex_session_id.clone(), claude.clone());
+        store.sessions.insert(codex.cutex_session_id.clone(), codex.clone());
+        let latest = |session: &str, thread: &str| claude_plan::latest_at(&root, session, thread);
+        let read = |id: &str| claude_latest_in(&store, id, "host-a", latest);
+
+        assert_eq!(read(&claude.cutex_session_id), Some(Value::Null));
+        let plan = json!([{"step": "Read the code", "status": "completed"},
+                          {"step": "Fix the bug", "status": "inProgress"}]);
+        let envelope = EventEnvelope {
+            contract_version: cutex::management::v2::model::CONTRACT_VERSION,
+            event_id: "e1".into(), cursor: "c1".into(), stream_id: "s".into(), sequence: 9,
+            received_at: "2026-10-21T03:04:05Z".into(),
+            cutex_session_id: claude.cutex_session_id.clone(), host_id: "host-a".into(),
+            source: EventSource::AppServer, sensitivity: "private".into(), schema: None,
+            correlation: EventCorrelation::default(),
+            native: Some(NativeMessage { kind: NativeMessageKind::Notification, message: json!({
+                "method": "turn/plan/updated",
+                "params": {"threadId": thread, "turnId": "turn-3", "explanation": null, "plan": plan}
+            })}),
+            cutex: None,
+        };
+        assert!(claude_plan::record_event_at(&root, &envelope, thread).unwrap());
+        let expected = json!({"threadId": thread, "turnId": "turn-3", "explanation": null, "plan": plan,
+                              "updatedAt": "2026-10-21T03:04:05Z"});
+        assert_eq!(read(&claude.cutex_session_id), Some(expected.clone()));
+        let mut body = json!({"cutexSessionId": claude.cutex_session_id});
+        cutex::management::v2::history::attach_cutex_state(
+            &mut body, read(&claude.cutex_session_id).unwrap(), Value::Null);
+        assert_eq!(body["cutexState"]["latestPlan"], expected);
+        assert_eq!(read(&codex.cutex_session_id), None);
+        assert_eq!(claude_latest_in(&store, &claude.cutex_session_id, "host-b", latest), Some(Value::Null));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// r265: a DSH session (no rollout either) serves the checklist its
+    /// adapter sent (`todo_write` as `turn/plan/updated`) for its bound
+    /// thread, so it survives a desktop reconnect; a revert of that turn drops it.
+    #[test]
+    fn dsh_plan_event_feeds_latest_plan() {
+        use cutex::management::v2::claude_plan;
+        use cutex::management::v2::model::{
+            EventCorrelation, EventEnvelope, EventSource, NativeMessage, NativeMessageKind,
+        };
+        let root = std::env::temp_dir().join(format!("cutex-dsh-plan-{}", uuid::Uuid::new_v4()));
+        let thread = "dsh-thread-1";
+        let mut dsh = cutex::session::model::CutexSessionRecord::new(
+            "cutex-dsh-2".into(), None, "host-a".into(), "/w".into(), None).unwrap();
+        dsh.dsh_session = Some(serde_json::from_value(json!({
+            "thread_id": thread, "state_dir": "/s", "node": "/n", "adapter": "/a", "dsh_cli": "/d",
+            "patch": "/s/profile.patch.yml", "install_root": "/i", "native_session_id": "n", "spike": false,
+        })).unwrap());
+        let mut store = cutex::session::model::CutexSessionStore::default();
+        store.sessions.insert(dsh.cutex_session_id.clone(), dsh.clone());
+        let latest = |session: &str, thread: &str| claude_plan::latest_at(&root, session, thread);
+        let read = |id: &str| claude_latest_in(&store, id, "host-a", latest);
+        assert_eq!(read(&dsh.cutex_session_id), Some(Value::Null));
+        let plan = json!([{"step": "Inspect", "status": "completed"}, {"step": "Write", "status": "pending"}]);
+        let envelope = |thread_id: &str| EventEnvelope {
+            contract_version: cutex::management::v2::model::CONTRACT_VERSION,
+            event_id: "e1".into(), cursor: "c1".into(), stream_id: "s".into(), sequence: 3,
+            received_at: "2026-10-27T03:04:05Z".into(),
+            cutex_session_id: dsh.cutex_session_id.clone(), host_id: "host-a".into(),
+            source: EventSource::AppServer, sensitivity: "private".into(), schema: None,
+            correlation: EventCorrelation::default(),
+            native: Some(NativeMessage { kind: NativeMessageKind::Notification, message: json!({
+                "method": "turn/plan/updated",
+                "params": {"threadId": thread_id, "turnId": "n:turn:2", "explanation": null, "plan": plan}
+            })}),
+            cutex: None,
+        };
+        assert!(!claude_plan::record_event_at(&root, &envelope("other"), thread).unwrap());
+        assert!(claude_plan::record_event_at(&root, &envelope(thread), thread).unwrap());
+        assert_eq!(read(&dsh.cutex_session_id), Some(json!({"threadId": thread, "turnId": "n:turn:2",
+            "explanation": null, "plan": plan, "updatedAt": "2026-10-27T03:04:05Z"})));
+        claude_plan::forget_removed_turns_at(&root, &dsh.cutex_session_id, &["n:turn:2"]).unwrap();
+        assert_eq!(read(&dsh.cutex_session_id), Some(Value::Null));
         let _ = std::fs::remove_dir_all(&root);
     }
 

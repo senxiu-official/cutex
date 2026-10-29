@@ -1,0 +1,7 @@
+{
+  "schema": "cutex/component-release-policy/v1",
+  "omit": {
+    "dsh-runtime": "DSH is experimental and is excluded from public 0.2 binary releases. Complete packaging exceeds r267's 20,000-entry archive limit; support is deferred to a later update. Source metadata and the runtime catalog remain available.",
+    "kimi-runtime": "Kimi is experimental and is excluded from public 0.2 binary releases. Live kimi-r2 lacks a Linux PTY binding and relies on system/cached or downloaded ripgrep; its original packaging is not reproducible byte for byte. A corrected payload requires a new runtime identity. Source metadata and the runtime catalog remain available."
+  }
+}

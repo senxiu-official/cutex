@@ -6,29 +6,108 @@ pub fn link_directory(source: &Path, destination: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::symlink(source, destination)?;
     #[cfg(windows)]
-    {
-        // Junctions work without Developer Mode or symlink privileges. Pass
-        // paths as environment data, never interpolate them into shell code.
-        // PowerShell 5 creates an invalid junction target from Rust's verbatim
-        // \?\ canonical path. Give it the equivalent ordinary absolute path.
-        let source = source.canonicalize()?;
-        let source = source.to_str().ok_or_else(|| anyhow::anyhow!("shared asset path is not Unicode"))?;
-        let source = if let Some(unc) = source.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{unc}")
-        } else {
-            source.strip_prefix(r"\\?\").unwrap_or(source).to_owned()
-        };
-        let result = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command",
-                "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:CUTEX_ASSET_LINK -Value $env:CUTEX_ASSET_SOURCE | Out-Null"])
-            .env("CUTEX_ASSET_LINK", destination)
-            .env("CUTEX_ASSET_SOURCE", source)
-            .output()?;
-        anyhow::ensure!(result.status.success(), "shared asset junction creation failed: {}", String::from_utf8_lossy(&result.stderr));
-    }
+    create_junction(source, destination)?;
     #[cfg(not(any(unix, windows)))]
     anyhow::bail!("shared asset directories are unsupported on this platform");
     Ok(())
+}
+
+#[cfg(windows)]
+fn create_junction(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // A junction is a mount-point reparse record. Creating it in process
+    // avoids launching PowerShell and never reparses user paths as commands.
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa000_0003;
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00a4;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn DeviceIoControl(
+            device: windows_sys::Win32::Foundation::HANDLE,
+            code: u32,
+            input: *const core::ffi::c_void,
+            input_len: u32,
+            output: *mut core::ffi::c_void,
+            output_len: u32,
+            returned: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+
+    let canonical = source.canonicalize()?;
+    let source = canonical
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("shared asset path is not Unicode"))?;
+    let (substitute, print) = if let Some(unc) = source.strip_prefix(r"\\?\UNC\") {
+        (format!(r"\??\UNC\{unc}"), format!(r"\\{unc}"))
+    } else if let Some(local) = source.strip_prefix(r"\\?\") {
+        (format!(r"\??\{local}"), local.to_owned())
+    } else {
+        anyhow::bail!("canonical shared asset path is not a Windows verbatim path");
+    };
+    let substitute: Vec<u16> = std::ffi::OsStr::new(&substitute).encode_wide().collect();
+    let print: Vec<u16> = std::ffi::OsStr::new(&print).encode_wide().collect();
+    let substitute_bytes = u16::try_from(substitute.len() * 2)
+        .map_err(|_| anyhow::anyhow!("shared asset path is too long"))?;
+    let print_bytes = u16::try_from(print.len() * 2)
+        .map_err(|_| anyhow::anyhow!("shared asset path is too long"))?;
+    let print_offset = substitute_bytes
+        .checked_add(2)
+        .ok_or_else(|| anyhow::anyhow!("shared asset path is too long"))?;
+    let mut path = Vec::with_capacity(substitute.len() + print.len() + 2);
+    path.extend_from_slice(&substitute);
+    path.push(0);
+    path.extend_from_slice(&print);
+    path.push(0);
+    let path_bytes = path.len() * 2;
+    let data_length = u16::try_from(8usize + path_bytes)
+        .map_err(|_| anyhow::anyhow!("shared asset path is too long"))?;
+    let mut buffer = Vec::with_capacity(16 + path_bytes);
+    buffer.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    buffer.extend_from_slice(&data_length.to_le_bytes());
+    buffer.extend_from_slice(&0u16.to_le_bytes());
+    buffer.extend_from_slice(&0u16.to_le_bytes());
+    buffer.extend_from_slice(&substitute_bytes.to_le_bytes());
+    buffer.extend_from_slice(&print_offset.to_le_bytes());
+    buffer.extend_from_slice(&print_bytes.to_le_bytes());
+    for unit in path {
+        buffer.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    std::fs::create_dir(destination)?;
+    let operation = (|| -> anyhow::Result<()> {
+        let directory = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(destination)?;
+        use std::os::windows::io::AsRawHandle;
+        let mut returned = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                directory.as_raw_handle(),
+                FSCTL_SET_REPARSE_POINT,
+                buffer.as_ptr().cast(),
+                u32::try_from(buffer.len())?,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    })();
+    if operation.is_err() {
+        let _ = std::fs::remove_dir(destination);
+    }
+    operation.context("shared asset junction creation failed")
 }
 
 #[cfg(test)]

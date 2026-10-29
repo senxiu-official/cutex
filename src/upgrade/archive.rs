@@ -112,9 +112,38 @@ pub fn unpack_tar_gz_file(archive: &Path, dest: &Path) -> anyhow::Result<Vec<Ent
     unpack_tar_gz(std::io::BufReader::new(file), dest)
 }
 
+/// Like [`unpack_tar_gz_file`], but materialise safe file links as regular files. This is reserved
+/// for the pinned python-build-standalone payload: component/release archives still refuse links.
+pub fn unpack_tar_gz_materialized_links_file(archive: &Path, dest: &Path) -> anyhow::Result<Vec<Entry>> {
+    let file = std::fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
+    unpack_tar_inner(flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file)), dest, true)
+}
+
 pub fn unpack_tar(mut reader: impl Read, dest: &Path) -> anyhow::Result<Vec<Entry>> {
+    unpack_tar_inner(&mut reader, dest, false)
+}
+
+fn link_target(path: &str, link: &str, hard: bool) -> anyhow::Result<String> {
+    ensure!(!link.contains('\\') && !link.contains('\0') && !link.starts_with('/'), "archive link `{path}` has unsafe target `{link}`");
+    let mut parts: Vec<&str> = if hard { Vec::new() } else { path.rsplit_once('/').map(|(parent, _)| parent.split('/').collect()).unwrap_or_default() };
+    for part in link.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => ensure!(parts.pop().is_some(), "archive link `{path}` leaves the destination"),
+            part => {
+                ensure!(!part.contains(':'), "archive link `{path}` has a drive or stream prefix");
+                parts.push(part);
+            }
+        }
+    }
+    sanitize(&parts.join("/"))
+}
+
+fn unpack_tar_inner(mut reader: impl Read, dest: &Path, materialize_links: bool) -> anyhow::Result<Vec<Entry>> {
     std::fs::create_dir_all(dest)?;
     let mut entries = Vec::new();
+    let mut pending_links: Vec<(String, String, bool)> = Vec::new();
+    let mut entry_count = 0usize;
     let mut total: u64 = 0;
     let mut long_name: Option<String> = None;
     let mut header = [0u8; BLOCK];
@@ -150,7 +179,8 @@ pub fn unpack_tar(mut reader: impl Read, dest: &Path) -> anyhow::Result<Vec<Entr
             }
         };
         let path = sanitize(&name)?;
-        ensure!(entries.len() < MAX_ENTRIES, "archive has too many entries");
+        entry_count += 1;
+        ensure!(entry_count <= MAX_ENTRIES, "archive has too many entries");
         let target = dest.join(PathBuf::from(&path));
         match typeflag {
             b'5' => {
@@ -197,9 +227,40 @@ pub fn unpack_tar(mut reader: impl Read, dest: &Path) -> anyhow::Result<Vec<Entr
                 }
                 entries.push(Entry { path, size, executable });
             }
+            b'1' | b'2' if materialize_links => {
+                ensure!(size == 0, "archive link `{path}` has data");
+                let link = cstr(&header[157..257]);
+                pending_links.push((path.clone(), link_target(&path, &link, typeflag == b'1')?, octal(&header[100..108]).unwrap_or(0o644) & 0o111 != 0));
+            }
             b'1' | b'2' => bail!("archive entry `{path}` is a link (refused)"),
             other => bail!("archive entry `{path}` has unsupported type `{}`", other as char),
         }
+    }
+    while !pending_links.is_empty() {
+        let mut remaining = Vec::new();
+        let mut progressed = false;
+        for (path, source_path, executable) in pending_links {
+            let source = dest.join(PathBuf::from(&source_path));
+            if !source.is_file() {
+                remaining.push((path, source_path, executable));
+                continue;
+            }
+            let target = dest.join(PathBuf::from(&path));
+            if let Some(parent) = target.parent() { std::fs::create_dir_all(parent)?; }
+            ensure!(!target.exists(), "archive link `{path}` replaces an existing entry");
+            let size = std::fs::copy(&source, &target)?;
+            total = total.checked_add(size).context("archive size overflow")?;
+            ensure!(total <= MAX_TOTAL_BYTES, "archive expands beyond the size limit");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }))?;
+            }
+            entries.push(Entry { path, size, executable });
+            progressed = true;
+        }
+        ensure!(progressed, "archive has unresolved or non-file links");
+        pending_links = remaining;
     }
     Ok(entries)
 }
@@ -213,6 +274,7 @@ pub(crate) mod writer {
         File { path: &'a str, data: &'a [u8], mode: u32 },
         Dir(&'a str),
         Symlink { path: &'a str, target: &'a str },
+        Hardlink { path: &'a str, target: &'a str },
         LongFile { path: &'a str, data: &'a [u8] },
     }
 
@@ -249,6 +311,7 @@ pub(crate) mod writer {
                 }
                 Item::Dir(path) => out.extend_from_slice(&header(path, 0, 0o755, b'5', "")),
                 Item::Symlink { path, target } => out.extend_from_slice(&header(path, 0, 0o777, b'2', target)),
+                Item::Hardlink { path, target } => out.extend_from_slice(&header(path, 0, 0o777, b'1', target)),
                 Item::LongFile { path, data: bytes } => {
                     let mut name = path.as_bytes().to_vec();
                     name.push(0);
@@ -323,6 +386,47 @@ mod tests {
         truncated.truncate(1200);
         assert!(unpack_tar(&truncated[..], &dest).is_err());
         let _ = std::fs::remove_dir_all(dest);
+    }
+
+    #[test]
+    fn pinned_payload_mode_materializes_safe_links_only() {
+        let dest = temp();
+        let archive = dest.with_extension("tar.gz");
+        std::fs::write(&archive, tar_gz(&[
+            Item::Symlink { path: "python/bin/python", target: "python3" },
+            Item::Symlink { path: "python/bin/python3", target: "python3.13" },
+            Item::Hardlink { path: "python/bin/python-hard", target: "python/bin/python3.13" },
+            Item::File { path: "python/bin/python3.13", data: b"python", mode: 0o755 },
+        ])).unwrap();
+        let entries = unpack_tar_gz_materialized_links_file(&archive, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("python/bin/python3")).unwrap(), b"python");
+        assert_eq!(std::fs::read(dest.join("python/bin/python")).unwrap(), b"python");
+        assert_eq!(std::fs::read(dest.join("python/bin/python-hard")).unwrap(), b"python");
+        assert!(!std::fs::symlink_metadata(dest.join("python/bin/python3")).unwrap().file_type().is_symlink());
+        assert_eq!(entries.len(), 4);
+        std::fs::remove_dir_all(&dest).unwrap();
+        std::fs::remove_file(&archive).unwrap();
+
+        let dest = temp();
+        let archive = dest.with_extension("tar.gz");
+        std::fs::write(&archive, tar_gz(&[Item::Symlink { path: "python/bin/python3", target: "../../../escape" }])).unwrap();
+        assert!(unpack_tar_gz_materialized_links_file(&archive, &dest).is_err());
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::remove_file(&archive).unwrap();
+
+        for target in ["..\\escape", "cycle-b"] {
+            let dest = temp();
+            let archive = dest.with_extension("tar.gz");
+            let items = if target == "cycle-b" {
+                vec![Item::Symlink { path: "cycle-a", target: "cycle-b" }, Item::Symlink { path: "cycle-b", target: "cycle-a" }]
+            } else {
+                vec![Item::Symlink { path: "python/link", target }]
+            };
+            std::fs::write(&archive, tar_gz(&items)).unwrap();
+            assert!(unpack_tar_gz_materialized_links_file(&archive, &dest).is_err());
+            let _ = std::fs::remove_dir_all(&dest);
+            std::fs::remove_file(&archive).unwrap();
+        }
     }
 
     #[test]

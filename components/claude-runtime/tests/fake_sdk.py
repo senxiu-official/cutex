@@ -48,7 +48,23 @@ def make_sdk():
             self.connected = asyncio.Event()
             self._transport = SimpleNamespace(_process=None)
             self.group = None
+            # Raw control requests (`apply_flag_settings`, as Claude Code 2.1.301 applies them: merged into
+            # the flag settings, effort / fast mode / env from the next model request).
+            self.flag_settings = {}
+            self._query = SimpleNamespace(_send_control_request=self._control_request)
             clients.append(self)
+
+        async def _control_request(self, request):
+            self.controls.append(('control', request))
+            if request.get('subtype') == 'apply_flag_settings':
+                settings = request['settings']
+                env = {**self.flag_settings.get('env', {}), **settings.get('env', {})}
+                self.flag_settings.update(settings)
+                if env:
+                    self.flag_settings['env'] = env
+                if 'effortLevel' in settings:
+                    self.options.effort = settings['effortLevel']
+            return None
 
         async def set_permission_mode(self, mode):
             self.options.permission_mode = mode

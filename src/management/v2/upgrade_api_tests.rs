@@ -165,3 +165,18 @@ fn managed_status_with_staged_release_matches_the_schema() {
     std::fs::remove_dir_all(&layout.base).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+
+#[test]
+fn watcher_schedules_immediately_without_subtracting_before_clock_start() {
+    let startup = Instant::now();
+    let mut last = None;
+    assert!(take_schedule_tick(&mut last, startup));
+    assert_eq!(last, Some(startup));
+    assert!(!take_schedule_tick(&mut last, startup + Duration::from_secs(299)));
+    assert_eq!(last, Some(startup));
+    assert!(take_schedule_tick(&mut last, startup + Duration::from_secs(300)));
+    assert_eq!(last, Some(startup + Duration::from_secs(300)));
+    // A stale sample cannot move the stored schedule backward or trigger work.
+    assert!(!take_schedule_tick(&mut last, startup));
+}

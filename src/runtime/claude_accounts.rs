@@ -910,6 +910,23 @@ pub fn api_launch_config(home: &Path) -> anyhow::Result<Option<Value>> {
     })))
 }
 
+/// Per-launch copy of an API account key in the session state dir (r265).
+pub const BOUND_API_KEY_FILE: &str = "claude-api-key.bound.json";
+
+/// Copy the account key named by `config.keyFile` to the session's private
+/// state dir and point `keyFile` there: a later key write (rotation) applies
+/// to runtimes started afterwards, never to this running one.
+pub fn bind_launch_key(config: &mut Value, state_dir: &Path) -> anyhow::Result<()> {
+    let source = config["keyFile"].as_str().map(PathBuf::from).context("API account launch config has no keyFile")?;
+    let raw = std::fs::read(&source).map_err(|error| anyhow::anyhow!("read Claude API account key: {}", error.kind()))?;
+    let key: Value = serde_json::from_slice(&raw).map_err(|_| anyhow::anyhow!("Claude API account key file is not valid JSON"))?;
+    let key = key.get("apiKey").and_then(Value::as_str).context("Claude API account key file holds no apiKey")?;
+    let bound = state_dir.join(BOUND_API_KEY_FILE);
+    write_private_pretty_json_atomic(&bound, &json!({ "apiKey": key }), "Claude API account key (bound)")?;
+    config["keyFile"] = json!(bound);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Status, login, logout (official CLI)
 // ---------------------------------------------------------------------------

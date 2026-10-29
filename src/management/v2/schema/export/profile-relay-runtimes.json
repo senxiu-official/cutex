@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:profile-relay-runtimes",
+  "title": "Profile provider interface addresses",
+  "description": "profile-relay-runtimes (generic part, docs/development/profile-relay-runtimes.md). Every Profile item and every profile preset carries providerInterfaces: one row per provider interface with its address and whether that address is the provider's official one (cutex decides; clients never compare hosts). Official addresses are only defaults: a relay keeps the provider's runtime options. Additive: present on every host with this contract, whether or not the capability flag profile-relay-runtimes is advertised; the flag says that every ACP runtime of the host (DSH, Kimi Code) sends requests to a relay address too. Without the flag, relay addresses for interfaces with relayAccepted false are refused. Hosts advertising the flag accept relay addresses for every address-bearing interface; a launch whose interface has no address answers variant_base_url_missing.",
+  "anyOf": [
+    { "$ref": "#/$defs/profileFields" },
+    { "$ref": "#/$defs/presetFields" },
+    { "$ref": "#/$defs/interfaceBaseUrlsWrite" }
+  ],
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "interfaceKind": {
+      "type": "string",
+      "description": "openaiCompatible (cute-codex; address = providerBaseUrl) | anthropicCompatible (Claude API account; address = the account's baseUrl) | deepseekNative (DSH: DeepSeek's Anthropic-compatible root, default https://api.deepseek.com/anthropic; address = interfaceBaseUrls) | kimiNative (Kimi Code: same address as openaiCompatible) | chatgptLogin | claudeSubscription | kimiAccount (logins: no address). Open set."
+    },
+    "providerInterface": {
+      "type": "object",
+      "required": ["kind", "baseUrl", "baseUrlDefault", "official", "relayAccepted"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/interfaceKind" },
+        "baseUrl": { "$ref": "#/$defs/nullableString", "description": "The address new agents use. null: a login (no address), or required but missing (deepseekNative while the main address is a relay and no DSH address is set: launches refuse with variant_base_url_missing; never guessed)." },
+        "baseUrlDefault": { "$ref": "#/$defs/nullableString", "description": "The provider's official address for this interface (the official region of baseUrl when it is official). null: none (custom, Gemini relays, logins)." },
+        "official": { "type": "boolean", "description": "baseUrl is one of the provider's official addresses for this interface. true for logins; false for relays and missing addresses." },
+        "relayAccepted": { "type": "boolean", "description": "This host's runtime for the interface uses a non-official address. false for logins, and for deepseekNative / kimiNative until the host advertises profile-relay-runtimes (writes of a relay address answer 400 relay_runtime_unavailable)." }
+      }
+    },
+    "profileFields": {
+      "type": "object",
+      "description": "GET /v2/profiles items, GET|PATCH /v2/profiles/{p} and POST /v2/profiles .profile.",
+      "required": ["providerInterfaces"],
+      "properties": {
+        "providerInterfaces": { "type": "array", "items": { "$ref": "#/$defs/providerInterface" } }
+      }
+    },
+    "presetFields": {
+      "type": "object",
+      "description": "GET /v2/profile-presets items: a new profile of the preset on its default address (deepseek adds deepseekNative; moonshot / kimi-code add kimiNative).",
+      "required": ["providerInterfaces"],
+      "properties": {
+        "providerInterfaces": { "type": "array", "items": { "$ref": "#/$defs/providerInterface" } }
+      }
+    },
+    "interfaceBaseUrlsWrite": {
+      "type": "object",
+      "description": "PATCH /v2/profiles/{p} and POST /v2/profiles (kind apiKey or dsh): interfaceBaseUrls merges into the profile's stored interface addresses; null restores the official default. Only interfaces whose address lives here (deepseekNative on DSH profiles and DeepSeek API-key profiles) are accepted. http(s) with a host, no credentials, query or fragment. Applies to runtimes started afterwards.",
+      "required": ["interfaceBaseUrls"],
+      "properties": {
+        "interfaceBaseUrls": {
+          "type": "object",
+          "propertyNames": { "enum": ["openaiCompatible", "anthropicCompatible", "deepseekNative", "kimiNative"] },
+          "additionalProperties": { "$ref": "#/$defs/nullableString" }
+        }
+      }
+    }
+  }
+}

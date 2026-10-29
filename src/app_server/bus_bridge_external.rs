@@ -250,6 +250,12 @@ fn size_rejected(e: &Envelope, policy: &crate::launch::stock::CanonicalBytePolic
     )
 }
 
+fn retry_known_unsent<T>(store:&crate::asks::store::AskStore,session:&str,submit:impl FnOnce()->anyhow::Result<T>)->anyhow::Result<Option<T>> {
+    if crate::asks::pause_admission::is_held(store,session)? {return Ok(None);}
+    // The guard has been released; never keep authority or AskStore across RPC.
+    submit().map(Some)
+}
+
 /// A quarantined message waits on the owner (需要你 `ownerMessage` on the
 /// sending agent's card, or the recipient's for service messages).
 fn notify_quarantine(message: &AgentBusMessage, recipient: &str, terminal: &TerminalExternalInputError) {
@@ -324,6 +330,31 @@ pub(super) fn validate_target(
         "external input recipient conflict"
     );
     if message.from == AGENT_MANAGEMENT_SYSTEM_SENDER {
+        if is_adopted_start(message) {
+            // r254 (design 044 §5): only a provider adoption receipt admits it.
+            let ext = crate::director_address::management::read_default()
+                .map_err(|error| anyhow::anyhow!("director-address state unavailable: {error:#}"))?;
+            return validate_adopted_target(message, owner, roster, &ext);
+        }
+        if is_director_notice(message) {
+            // r254: a passive Director-change notice needs its own record.
+            let ext = crate::director_address::management::read_default()
+                .map_err(|error| anyhow::anyhow!("director-address state unavailable: {error:#}"))?;
+            return crate::director_address::management::validate_director_notice(
+                &ext,
+                owner,
+                message.external_message_id.as_deref(),
+                roster,
+            )
+            .map_err(|why| {
+                let code = if why == "notice_superseded" {
+                    DIRECTOR_NOTICE_SUPERSEDED
+                } else {
+                    "management_notice_provenance_invalid"
+                };
+                terminal_external_input_error(code, format!("Director-change notice is not admissible: {why}"))
+            });
+        }
         let metadata = agent_management_metadata(message)?;
         if is_management_notice(message) {
             // A notice goes only to the requester its metadata names.
@@ -375,6 +406,185 @@ pub(super) fn validate_target(
 
 fn is_management_notice(message: &AgentBusMessage) -> bool {
     message.control_type.as_deref() == Some(crate::agent_management::AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE)
+        || is_director_notice(message)
+}
+
+/// A queued Director-change notice whose authority epoch has passed: held
+/// back silently (no owner warning, no wake); the newer notice summarises it.
+const DIRECTOR_NOTICE_SUPERSEDED: &str = "director_notice_superseded";
+
+fn is_director_notice(message: &AgentBusMessage) -> bool {
+    message.control_type.as_deref() == Some(crate::director_address::management::DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE)
+}
+
+fn is_adopted_start(message: &AgentBusMessage) -> bool {
+    message.control_type.as_deref() == Some(crate::director_address::management::START_ADOPTED_CONTROL_TYPE)
+}
+
+/// r254: an adopted start (fresh message id) is admitted only with the
+/// provider-persisted adoption receipt for exactly that id, under the
+/// same authority epoch / Director as the approval, to the source action's
+/// still-active successor, with unchanged content. The old start rules
+/// (`validate_unreviewed_start`) are not relaxed.
+fn validate_adopted_target(
+    message: &AgentBusMessage,
+    owner: &str,
+    roster: &crate::agent_management::AgentManagementSnapshot,
+    ext: &crate::director_address::management::ManagementExtension,
+) -> anyhow::Result<()> {
+    use crate::director_address::management as da;
+    let invalid = |why: &str| {
+        terminal_external_input_error(
+            "management_start_provenance_invalid",
+            format!("Adopted Management start is not admissible: {why}"),
+        )
+    };
+    let message_id = message.external_message_id.as_deref().ok_or_else(|| invalid("no message id"))?;
+    let receipt = da::adoption_for_message(ext, message_id).ok_or_else(|| invalid("no adoption receipt"))?;
+    let metadata = agent_management_metadata(message).map_err(|error| invalid(&format!("{error:#}")))?;
+    if metadata.requested_by_director != receipt.approved_director || metadata.requested_by_operator.is_some() {
+        return Err(invalid("requester is not the approving Director"));
+    }
+    da::validate_adopted_start(&receipt, owner, Some(message_id), &message.content, roster).map_err(invalid)
+}
+
+/// r254 (design 044 §5): after a start was quarantined as
+/// `management_start_provenance_invalid`, publish a review item for the
+/// current Director when the ONLY defect is a Director change of the source
+/// project. The quarantine stays as it is; nothing is delivered until the
+/// new Director (or the owner) acts. `Ok(true)`: a new review item.
+pub(crate) fn publish_director_changed_review(
+    owner: &str,
+    message: &AgentBusMessage,
+    roster: &crate::agent_management::AgentManagementSnapshot,
+    store: &dyn crate::director_address::management::ExtensionStateStore,
+) -> anyhow::Result<bool> {
+    use crate::director_address::management as da;
+    if message.from != AGENT_MANAGEMENT_SYSTEM_SENDER
+        || message.control_type.as_deref() != Some(crate::agent_management::AGENT_MANAGEMENT_START_CONTROL_TYPE)
+    {
+        return Ok(false);
+    }
+    let Some(message_id) = message.external_message_id.as_deref() else { return Ok(false) };
+    let metadata = agent_management_metadata(message)?;
+    let mut actions = roster
+        .actions
+        .values()
+        .filter(|a| a.external_message_id.as_deref() == Some(message_id));
+    let (Some(action), None) = (actions.next(), actions.next()) else { return Ok(false) };
+    if roster.bootstrap_intents.contains_key(&action.action_id) {
+        return Ok(false);
+    }
+    let mut opened = false;
+    store.update(&mut |ext| {
+        opened = match da::classify_director_changed_start(&metadata, owner, roster, action, ext) {
+            Some(found) => da::open_start_review(ext, &found, message_id, &message.content),
+            None => false,
+        };
+        Ok(opened)
+    })?;
+    Ok(opened)
+}
+
+/// Event type and model text of an Agent Management start or notice, the
+/// same for a Codex native envelope and a Claude input.
+pub(super) fn management_model_text(message: &AgentBusMessage) -> anyhow::Result<(&'static str, String)> {
+    let metadata = agent_management_metadata(message)?;
+    if is_adopted_start(message) {
+        return Ok(("management_start", format!(
+            "Requested by Director: {} (adopted after a project Director change)
+Action: follow the explicit start instructions.
+Instructions:
+{}",
+            crate::short_ids::display(metadata.requested_by_director.as_str()),
+            message.content
+        )));
+    }
+    if is_management_notice(message) {
+        return Ok(("management_notice",
+            format!("Message Type: NOTICE\nFrom: Cutex Agent Management\nPayload:\n{}", message.content)));
+    }
+    // The Director form is unchanged (frozen envelopes stay equal).
+    let requested_by = match &metadata.requested_by_operator {
+        Some(operator) => format!(
+            "operator: {} (project Director {})",
+            crate::short_ids::display(operator.as_str()),
+            crate::short_ids::display(metadata.requested_by_director.as_str())
+        ),
+        None => format!("Director: {}", crate::short_ids::display(metadata.requested_by_director.as_str())),
+    };
+    Ok(("management_start",
+        format!("Requested by {requested_by}\nAction: follow the explicit start instructions.\nInstructions:\n{}", message.content)))
+}
+
+/// Provenance of an Agent Management start / notice for `owner` against the
+/// current roster ([`validate_target`]). A message that claims the reserved
+/// sender or control type but whose record does not parse can never be
+/// delivered: that is terminal too.
+pub(super) fn validate_management_delivery(message: &AgentBusMessage, owner: &str) -> anyhow::Result<()> {
+    let code = if is_management_notice(message) {
+        "management_notice_provenance_invalid"
+    } else {
+        "management_start_provenance_invalid"
+    };
+    if message.from != AGENT_MANAGEMENT_SYSTEM_SENDER
+        || !matches!(
+            message.control_type.as_deref(),
+            Some(crate::agent_management::AGENT_MANAGEMENT_START_CONTROL_TYPE
+                | crate::agent_management::AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE
+                | crate::director_address::management::START_ADOPTED_CONTROL_TYPE
+                | crate::director_address::management::DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE)
+        )
+    {
+        return Err(terminal_external_input_error(code, "Management control record without the Management sender"));
+    }
+    agent_management_metadata(message)
+        .map_err(|error| terminal_external_input_error(code, format!("{error:#}")))?;
+    let roster = crate::agent_management::AgentManagementStore::open_default()?.snapshot()?;
+    validate_target(message, owner, &roster)
+}
+
+/// Quarantines `message` for `owner` when `error` is a terminal ingress
+/// failure: the same error record and owner notice as the Codex native
+/// bridge. `Ok(false)`: the error is retryable (nothing recorded).
+pub(super) fn quarantine_terminal(
+    owner: &str,
+    message: &AgentBusMessage,
+    error: &anyhow::Error,
+) -> anyhow::Result<bool> {
+    let Some(terminal) = error.downcast_ref::<TerminalExternalInputError>() else {
+        return Ok(false);
+    };
+    let quarantined = quarantine_or_audit_live_message(
+        owner,
+        &message.id,
+        serde_json::json!({
+            "source":"cutex",
+            "code":terminal.code,
+            "message":terminal.message,
+            "retryable":false,
+            "details":terminal.details
+        }),
+        Utc::now(),
+    )?;
+    if quarantined && terminal.code != DIRECTOR_NOTICE_SUPERSEDED {
+        notify_quarantine(message, owner, terminal);
+    }
+    if quarantined {
+        if terminal.code == "management_start_provenance_invalid" {
+            // Best effort: the quarantine is the durable record; a missed
+            // review item is found again by the core quarantine scan.
+            let published = crate::director_address::management::default_store_or_file()
+                .and_then(|store| {
+                    let roster = crate::agent_management::AgentManagementStore::open_default()?.snapshot()?;
+                    publish_director_changed_review(owner, message, &roster, store.as_ref())
+                });
+            if let Err(error) = published {
+                eprintln!("director-address start review for {} not published: {error:#}", message.id);
+            }
+        }
+    }
+    Ok(quarantined)
 }
 
 /// Start message of an Agent Management create / replace that no reviewed
@@ -526,25 +736,9 @@ pub(super) fn envelope(
         AgentMessageKind::Agent if message.from == AGENT_MANAGEMENT_SYSTEM_SENDER => {
             // Reuse the reserved in-process Management provenance validator;
             // ordinary send cannot manufacture this control record.
-            let metadata = agent_management_metadata(message)?;
-            if is_management_notice(message) {
-                (Source { kind: SourceKind::Service, id: AGENT_MANAGEMENT_SYSTEM_SENDER.into() },
-                 "management_notice",
-                 format!("Message Type: NOTICE\nFrom: Cutex Agent Management\nPayload:\n{}", message.content))
-            } else {
-                // The Director form is unchanged (frozen envelopes stay equal).
-                let requested_by = match &metadata.requested_by_operator {
-                    Some(operator) => format!(
-                        "operator: {} (project Director {})",
-                        crate::short_ids::display(operator.as_str()),
-                        crate::short_ids::display(metadata.requested_by_director.as_str())
-                    ),
-                    None => format!("Director: {}", crate::short_ids::display(metadata.requested_by_director.as_str())),
-                };
-                (Source { kind: SourceKind::Service, id: AGENT_MANAGEMENT_SYSTEM_SENDER.into() },
-                 "management_start",
-                 format!("Requested by {requested_by}\nAction: follow the explicit start instructions.\nInstructions:\n{}", message.content))
-            }
+            let (event_type, text) = management_model_text(message)?;
+            (Source { kind: SourceKind::Service, id: AGENT_MANAGEMENT_SYSTEM_SENDER.into() },
+             event_type, text)
         }
         AgentMessageKind::Agent => {
             ensure!(
@@ -796,7 +990,8 @@ pub(super) fn deliver_presentations(
 /// whether it goes passive (`asks::awaits::note_job_completion`). Any
 /// failure keeps today's `after_turn` delivery.
 /// A wake that may be held for, or read at, a busy recipient's next step.
-/// Awaited job completions are passive, alarms always after-turn.
+/// Awaited job completions are passive, alarms always after-turn except
+/// approval decision notices (023: next step, no wait).
 fn busy_wake_candidate(message: &AgentBusMessage, job_passive: bool) -> bool {
     !job_passive
         && !crate::agent_bus::delivery::always_after_turn(message)
@@ -830,6 +1025,59 @@ fn awaited_job_completion(message: &AgentBusMessage, session: &str) -> bool {
         eprintln!("asks: job completion {} for {session} not noted: {error:#}", request.event_id);
         false
     })
+}
+
+/// Job notices coalesce per agent (token audit 2026-10-22: on host-b 831
+/// turns in a week were started by job notices, 704 of them for a single
+/// notice, ~1.2B input tokens). A job notice waits until the agent's batch
+/// settles: no newer job notice for [`JOB_NOTICE_SETTLE_SECS`], at most
+/// [`JOB_NOTICE_MAX_DELAY_SECS`] after the oldest. Then the batch shares one
+/// turn: every notice but the newest goes in `passive` (read when the turn
+/// starts), the newest starts the turn. Never held: a notice a delegation
+/// awaits (it is passive already), any notice while the agent waits on a
+/// delegation (`delegation_await`), or while other turn-starting input is
+/// pending for it (the notices then go as before).
+pub(super) const JOB_NOTICE_SETTLE_SECS: u64 = 300;
+pub(super) const JOB_NOTICE_MAX_DELAY_SECS: u64 = 900;
+
+/// What one delivery pass does with the agent's pending job notices.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct JobNoticePlan {
+    /// Not delivered this pass (looked at again on the next poll).
+    pub hold: std::collections::BTreeSet<String>,
+    /// Delivered `passive` (ride along with the batch's turn).
+    pub passive: std::collections::BTreeSet<String>,
+}
+
+fn coalescible_job_notice(message: &AgentBusMessage) -> bool {
+    message.sender_kind == AgentMessageKind::JobServiceSystem
+        && message.control_type.as_deref() == Some(crate::agent_bus::job_completion::SCHEMA_V2)
+        && message.delivery_mode == crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn
+}
+
+pub(super) fn job_notice_plan(messages: &[AgentBusMessage], now_epoch_secs: u64, waiting: bool) -> JobNoticePlan {
+    let mut jobs: Vec<&AgentBusMessage> = messages.iter().filter(|message| coalescible_job_notice(message)).collect();
+    let other_wake = messages.iter().any(|message| !coalescible_job_notice(message) && message.delivery_mode.trigger_turn());
+    if jobs.is_empty() || waiting || other_wake {
+        return JobNoticePlan::default();
+    }
+    jobs.sort_by(|a, b| (a.created_at_epoch_secs, &a.id).cmp(&(b.created_at_epoch_secs, &b.id)));
+    let age = |message: &AgentBusMessage| now_epoch_secs.saturating_sub(message.created_at_epoch_secs);
+    let (oldest, newest) = (jobs[0], jobs[jobs.len() - 1]);
+    if age(newest) < JOB_NOTICE_SETTLE_SECS && age(oldest) < JOB_NOTICE_MAX_DELAY_SECS {
+        return JobNoticePlan { hold: jobs.iter().map(|message| message.id.clone()).collect(), passive: Default::default() };
+    }
+    JobNoticePlan { hold: Default::default(), passive: jobs[..jobs.len() - 1].iter().map(|message| message.id.clone()).collect() }
+}
+
+/// Whether `session` waits on a delegation (`delegation_await`): its notices
+/// are never held then.
+fn awaiting_delegations(session: &str) -> bool {
+    crate::asks::store::AskStore::open_default()
+        .and_then(|store| store.peek())
+        .ok()
+        .flatten()
+        .is_some_and(|state| state.waits.values().any(|wait| wait.cutex_session_id == session))
 }
 
 /// Deliver an awaited job completion `passive` (re-digested): it starts no
@@ -908,6 +1156,15 @@ pub(super) fn deliver(
     let client = connection.as_ref().expect("connected");
     let repository = agent_bus_message_repository()?;
     let mut held_wakes = 0usize;
+    let job_plan = job_notice_plan(
+        &messages,
+        Utc::now().timestamp().max(0) as u64,
+        awaiting_delegations(&options.cutex_session_id),
+    );
+    // The batch's passive notices go first: the notice that starts the
+    // turn must come after them so the turn reads them all.
+    let mut messages = messages;
+    messages.sort_by_key(|message| !job_plan.passive.contains(&message.id));
     for polled in messages {
         let result = (|| -> anyhow::Result<bool> {
             if repository.suppress_native_delivery(&options.cutex_session_id, &polled.id)? {
@@ -953,6 +1210,13 @@ pub(super) fn deliver(
             // for) goes passive: the delegation's continuation turn reads it
             // (delegation await §2.4).
             let job_passive = awaited_job_completion(&message, &options.cutex_session_id);
+            // Job notices coalesce into one turn per batch (token audit).
+            let unfrozen = repository.snapshot_by_message_id(&message.id)?.is_some_and(|snapshot| snapshot.external_input.is_none());
+            if !job_passive && unfrozen && job_plan.hold.contains(&message.id) {
+                held_wakes += 1;
+                return Ok(false);
+            }
+            let job_passive = job_passive || (unfrozen && job_plan.passive.contains(&message.id));
             let receiver_limit = crate::app_server::external_input::size::ReceiverLimit::from_policy(
                 &client.binding().canonical_byte_limit,
             );
@@ -962,8 +1226,14 @@ pub(super) fn deliver(
             // unfrozen wake until its turn ends (then a clean new turn) or
             // `agent_bus.wake_busy_wait_secs` passed (then read at its next step).
             let input_lock = crate::management::v2::user_input::session_input_lock(&options.cutex_session_id)?;
-            let _input_guard = input_lock.lock().map_err(|_| anyhow::anyhow!("session input lock poisoned"))?;
-            let wake_wait = crate::agent_bus::delivery::wake_busy_wait();
+            let _input_guard = match input_lock.try_lock() {
+                Ok(reservation) => reservation,
+                // No native forward or ack: the existing delivery sweep
+                // retains this durable message and retries after admission.
+                Err(crate::management::v2::session_coordination::ReservationError::WouldBlock) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            let wake_wait = crate::agent_bus::delivery::busy_wait_for(&message);
             let wake_age = std::time::Duration::from_secs(
                 (Utc::now().timestamp().max(0) as u64).saturating_sub(message.created_at_epoch_secs),
             );
@@ -984,6 +1254,10 @@ pub(super) fn deliver(
             if !job_passive && message.delivery_mode.trigger_turn()
                 && repository.snapshot_by_message_id(&message.id)?.is_some_and(|snapshot| snapshot.external_input.is_none())
             {
+                if crate::asks::pause_admission::is_held(&crate::asks::store::AskStore::open_default()?, &options.cutex_session_id)? {
+                    held_wakes += 1;
+                    return Ok(false);
+                }
                 let busy = client.thread_busy()?;
                 let joins_running = busy && (next_step
                     || message.delivery_mode == crate::agent_bus::delivery::AgentDeliveryMode::Soon);
@@ -1036,6 +1310,13 @@ pub(super) fn deliver(
                 }
             }
             if observed.delivery_state == DeliveryState::Unknown {
+                // A frozen key is not proof of native acceptance. Reconcile
+                // current membership before every new submit, passive too;
+                // status/receipt recovery above remains available while paused.
+                if crate::asks::pause_admission::is_held(&crate::asks::store::AskStore::open_default()?, &options.cutex_session_id)? {
+                    held_wakes += 1;
+                    return Ok(false);
+                }
                 if current.message.delivery != Delivery::Passive {
                     let busy = client.thread_busy()?;
                     let joins_running = busy && current.message.delivery == Delivery::Soon;
@@ -1061,8 +1342,11 @@ pub(super) fn deliver(
                         frozen = spilled;
                         current = frozen.clone();
                         current.runtime_generation = generation;
-                        match client.submit(&current) {
-                            Ok(mut submitted) => submitted.statuses.remove(0),
+                        // The first RPC was definitely refused. This second
+                        // submit is a fresh opportunity, not receipt recovery.
+                        match retry_known_unsent(&crate::asks::store::AskStore::open_default()?,&options.cutex_session_id,||client.submit(&current)) {
+                            Ok(Some(mut submitted)) => submitted.statuses.remove(0),
+                            Ok(None)=>{held_wakes+=1;return Ok(false);},
                             Err(error) if refused(&error) => {
                                 return Err(size_rejected(&current, &client.binding().canonical_byte_limit));
                             }
@@ -1210,6 +1494,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn size_refusal_retry_rechecks_pause_and_lifecycle_without_changing_identity() {
+        let (store,dir)=crate::asks::store::tests::temp_store("bus-size-retry-pause");
+        let identity=("original-message","original-semantic-sha");
+        let calls=std::cell::Cell::new(1); // known size refusal of the first RPC
+        store.with_state(|s|{crate::asks::agent_pause::pause(s,"cutex.retry","owner",None,chrono::Utc::now());}).unwrap();
+        assert!(retry_known_unsent(&store,"cutex.retry",||{calls.set(calls.get()+1);Ok(identity)}).unwrap().is_none());
+        let roster=crate::agent_management::AgentManagementStore::open_default().unwrap();
+        let held=roster.lock_mutations().unwrap();
+        assert!(retry_known_unsent(&store,"cutex.retry",||{calls.set(calls.get()+1);Ok(identity)}).unwrap().is_none());
+        drop(held);
+        assert_eq!(calls.get(),1);
+        store.with_state(|s|crate::asks::agent_pause::resume(s,"cutex.retry")).unwrap();
+        assert_eq!(retry_known_unsent(&store,"cutex.retry",||{
+            // A real retry callback can acquire both stores: no native RPC is
+            // invoked while the admission guard is still held.
+            assert!(matches!(crate::asks::pause_admission::try_with_authority(|_|Ok(()))?,crate::asks::pause_admission::Admission::Ready(())));
+            store.with_state(|_|())?;calls.set(calls.get()+1);Ok(identity)
+        }).unwrap(),Some(identity));
+        assert_eq!(calls.get(),2);
+        let _=std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn alarms_are_never_busy_wake_candidates_on_codex() {
         if super::super::tests::test_runs_in_private_home("app_server::bus_bridge::external::tests::alarms_are_never_busy_wake_candidates_on_codex") { return; }
         use crate::agent_bus::delivery::{wake_timing, AgentDeliveryMode, WakeTiming};
@@ -1235,6 +1542,47 @@ mod tests {
         assert_eq!(timing(&wake), WakeTiming::NextStep);
         assert_eq!(timing(&alarm), WakeTiming::AfterTurn);
         assert_eq!(timing(&legacy), WakeTiming::AfterTurn);
+    }
+
+    /// 023: an approval decision notice is a next-step candidate with no wait
+    /// on Codex (busy: read at the next step at once; idle: a turn now); the
+    /// agent's own reminders stay after-turn.
+    #[test]
+    fn approval_notices_are_next_step_and_reminders_stay_after_turn_on_codex() {
+        if super::super::tests::test_runs_in_private_home("app_server::bus_bridge::external::tests::approval_notices_are_next_step_and_reminders_stay_after_turn_on_codex") { return; }
+        use crate::agent_bus::delivery::{busy_wait_for, wake_timing, WakeTiming};
+        let mut reminder = message();
+        reminder.sender_kind = crate::agent_bus::model::AgentMessageKind::AlarmSystem;
+        reminder.from = crate::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
+        reminder.external_message_id = Some("alarm-0b5e".into());
+        let mut approval = reminder.clone();
+        approval.external_message_id = Some(format!("{}0b5e", crate::agent_bus::alarms::APPROVAL_NOTICE_MESSAGE_PREFIX));
+        // A forged prefix on an agent message is no approval notice.
+        let mut forged = message();
+        forged.external_message_id = approval.external_message_id.clone();
+        assert!(!crate::agent_bus::delivery::is_approval_notice(&forged));
+        assert!(busy_wake_candidate(&approval, false));
+        assert!(!busy_wake_candidate(&reminder, false));
+        assert_eq!(busy_wait_for(&approval), Some(std::time::Duration::ZERO));
+        // The bridge's gate, with the per-message wait, for a just-queued message.
+        let timing = |message: &AgentBusMessage, busy: bool| {
+            if busy_wake_candidate(message, false) {
+                wake_timing(std::time::Duration::ZERO, busy_wait_for(message), || Some(busy))
+            } else {
+                WakeTiming::AfterTurn
+            }
+        };
+        assert_eq!(timing(&approval, true), WakeTiming::NextStep, "busy: next step, no wait");
+        assert_eq!(timing(&approval, false), WakeTiming::NextStep, "idle: delivered now (starts a turn)");
+        assert_eq!(timing(&reminder, true), WakeTiming::AfterTurn);
+        // What the bridge freezes: `soon` only for the approval notice.
+        let base = envelope(&message(), &binding()).unwrap();
+        let mut e = base.clone();
+        wake_at_next_step(&mut e, timing(&approval, true) == WakeTiming::NextStep).unwrap();
+        assert_eq!(e.message.delivery, Delivery::Soon);
+        let mut e = base.clone();
+        wake_at_next_step(&mut e, timing(&reminder, true) == WakeTiming::NextStep).unwrap();
+        assert_eq!(e.message.delivery, Delivery::AfterTurn);
     }
 
     #[test]
@@ -1303,6 +1651,60 @@ mod tests {
             std::fs::write(path.join("codex-alarm-receipt.json"), serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
         }
         std::fs::write(std::path::Path::new(&std::env::var_os("CUTEX_TEST_PRIVATE_HOME").unwrap()).join("alarm-test-done"), b"ok").unwrap();
+    }
+
+    fn job_notice(id: &str, created: u64) -> AgentBusMessage {
+        let mut m = message();
+        m.id = id.into();
+        m.from = "cutex-job-service".into();
+        m.from_cutex_session_id = None;
+        m.sender_kind = AgentMessageKind::JobServiceSystem;
+        m.control_type = Some(crate::agent_bus::job_completion::SCHEMA_V2.into());
+        m.created_at_epoch_secs = created;
+        m
+    }
+
+    /// Token audit 2026-10-22: job notices of one agent share a turn. A batch
+    /// waits until it settles (no newer notice for the settle time, at most
+    /// the max delay after the oldest), then all but the newest go passive
+    /// (order: oldest first) and the newest starts the turn. Nothing is
+    /// dropped; a waiting agent or other pending input is never delayed.
+    #[test]
+    fn job_notices_coalesce_into_one_turn_per_batch() {
+        let settle = JOB_NOTICE_SETTLE_SECS;
+        let notices = vec![job_notice("job-b", 1_000 + 60), job_notice("job-a", 1_000), job_notice("job-c", 1_000 + 120)];
+        let ids = |set: &std::collections::BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>();
+        // Fresh batch: every notice waits.
+        let plan = job_notice_plan(&notices, 1_000 + 130, false);
+        assert_eq!(ids(&plan.hold), ["job-a", "job-b", "job-c"]);
+        assert!(plan.passive.is_empty());
+        // Settled: one turn — the older two passive, the newest starts it.
+        let plan = job_notice_plan(&notices, 1_000 + 120 + settle, false);
+        assert!(plan.hold.is_empty());
+        assert_eq!(ids(&plan.passive), ["job-a", "job-b"]);
+        // A notice stream that never settles goes at the max delay.
+        let stream: Vec<_> = (0..20).map(|i| job_notice(&format!("job-{i:02}"), 1_000 + i * 45)).collect();
+        assert_eq!(job_notice_plan(&stream, 1_000 + 19 * 45 + 10, false).hold.len(), 20, "still arriving, under the max delay");
+        let plan = job_notice_plan(&stream, 1_000 + JOB_NOTICE_MAX_DELAY_SECS, false);
+        assert!(plan.hold.is_empty() && plan.passive.len() == 19, "released at the max delay");
+        // A single settled notice simply starts its turn.
+        assert_eq!(job_notice_plan(&notices[1..2], 1_000 + settle, false), JobNoticePlan::default());
+        // Never delayed: the agent waits on a delegation, or other input is pending.
+        assert_eq!(job_notice_plan(&notices, 1_000 + 130, true), JobNoticePlan::default());
+        let mut with_message = notices.clone();
+        with_message.push(message());
+        assert_eq!(job_notice_plan(&with_message, 1_000 + 130, false), JobNoticePlan::default());
+        // A passive note pending next to them does not count as a wake.
+        let mut note = message();
+        note.delivery_mode = crate::agent_bus::delivery::AgentDeliveryMode::Passive;
+        let mut with_note = notices.clone();
+        with_note.push(note);
+        assert_eq!(ids(&job_notice_plan(&with_note, 1_000 + 130, false).hold).len(), 3);
+        // The delivery order puts the passive ones first, the newest last.
+        let plan = job_notice_plan(&notices, 1_000 + 120 + settle, false);
+        let mut ordered = notices.clone();
+        ordered.sort_by_key(|message| !plan.passive.contains(&message.id));
+        assert_eq!(ordered.last().unwrap().id, "job-c");
     }
 
     fn message() -> AgentBusMessage {
@@ -1995,6 +2397,81 @@ mod tests {
         roster
     }
 
+    fn director_address_message(control: &str, director: &str, external_id: &str, content: &str) -> AgentBusMessage {
+        serde_json::from_value(serde_json::json!({"id":"bus-da-1","from":AGENT_MANAGEMENT_SYSTEM_SENDER,
+            "to":"runtime-m1","fromCutexSessionId":director,"toCutexSessionId":"cutex.m1","content":content,
+            "deliveryMode":"after_turn","triggerTurn":true,"createdAtEpochSecs":1,"controlType":control,
+            "controlPayload":{"schema":"cutex/agent-management/v1","requested_by_director":director},
+            "externalMessageId":external_id})).unwrap()
+    }
+
+    #[test]
+    fn a_start_invalidated_only_by_a_director_change_stays_quarantined_and_opens_one_review() {
+        use crate::director_address::management::{self as da, ExtensionStateStore};
+        let (ext, roster) = da::tests::changed_world_fixture();
+        let store = da::MemoryExtensionStore::default();
+        store.update(&mut |state| { *state = ext.clone(); Ok(true) }).unwrap();
+        let start = director_address_message(
+            crate::agent_management::AGENT_MANAGEMENT_START_CONTROL_TYPE, "cutex.a", "msg-start-w", "do X");
+        assert_eq!(
+            terminal_code(validate_target(&start, "cutex.m1", &roster)),
+            Some("management_start_provenance_invalid"),
+            "the old start rules are not relaxed"
+        );
+        assert!(publish_director_changed_review("cutex.m1", &start, &roster, &store).unwrap());
+        assert!(!publish_director_changed_review("cutex.m1", &start, &roster, &store).unwrap(), "one review per source");
+        let reviews = store.read().unwrap().start_reviews;
+        assert_eq!(reviews.len(), 1);
+        let item = reviews.values().next().unwrap();
+        assert_eq!((item.director_at_review.as_str(), item.state), ("cutex.b", da::StartReviewState::Open));
+        assert!(store.read().unwrap().adoptions.is_empty(), "nothing is delivered before the new Director acts");
+        // another defect (wrong recipient): no review
+        let fresh = da::MemoryExtensionStore::default();
+        fresh.update(&mut |state| { *state = ext.clone(); Ok(true) }).unwrap();
+        assert!(!publish_director_changed_review("cutex.m2", &start, &roster, &fresh).unwrap());
+    }
+
+    #[test]
+    fn an_adopted_start_is_admitted_only_with_its_receipt_and_current_authority() {
+        use crate::director_address::management::{self as da};
+        let (ext, mut roster, receipt) = da::tests::adopted_fixture();
+        let adopted = |director: &str, id: &str, content: &str| {
+            director_address_message(da::START_ADOPTED_CONTROL_TYPE, director, id, content)
+        };
+        let ok = adopted("cutex.b", &receipt.message_id, "do X");
+        validate_adopted_target(&ok, "cutex.m1", &roster, &ext).unwrap();
+        for (message, owner, why) in [
+            (adopted("cutex.b", &receipt.message_id, "do Y"), "cutex.m1", "changed content"),
+            (adopted("cutex.b", "msg-adopted-forged", "do X"), "cutex.m1", "no receipt"),
+            (adopted("cutex.a", &receipt.message_id, "do X"), "cutex.m1", "old Director"),
+            (adopted("cutex.b", &receipt.message_id, "do X"), "cutex.m2", "other recipient"),
+        ] {
+            assert_eq!(
+                terminal_code(validate_adopted_target(&message, owner, &roster, &ext)),
+                Some("management_start_provenance_invalid"),
+                "{why}"
+            );
+        }
+        // B's approval is not C's
+        da::tests::move_authority(&mut roster, "c", 3);
+        assert_eq!(
+            terminal_code(validate_adopted_target(&ok, "cutex.m1", &roster, &ext)),
+            Some("management_start_provenance_invalid")
+        );
+    }
+
+    #[test]
+    fn ordinary_senders_cannot_claim_the_director_address_control_types() {
+        use crate::director_address::management as da;
+        for control in [da::START_ADOPTED_CONTROL_TYPE, da::DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE] {
+            let mut message = director_address_message(control, "cutex.b", "x-1", "hi");
+            assert!(crate::app_server::bus_bridge::is_agent_management_message(&message));
+            message.from = "cutex.b".into();
+            assert!(!crate::app_server::bus_bridge::is_agent_management_message(&message));
+            assert!(validate_management_delivery(&message, "cutex.m1").is_err());
+        }
+    }
+
     fn terminal_code(result: anyhow::Result<()>) -> Option<&'static str> {
         result.err().and_then(|error| error.downcast_ref::<TerminalExternalInputError>().map(|t| t.code))
     }
@@ -2044,6 +2521,32 @@ mod tests {
         let mut forged = message();
         forged.control_type = Some(control.into());
         assert!(envelope(&forged, &binding()).is_err());
+    }
+
+    #[test]
+    fn claude_management_input_is_the_codex_envelope_text_with_the_same_provenance() {
+        if super::super::tests::test_runs_in_private_home("app_server::bus_bridge::external::tests::claude_management_input_is_the_codex_envelope_text_with_the_same_provenance") { return; }
+        let mut bind = binding();
+        bind.owner_id = DIRECTOR.into();
+        let notice = start_message(crate::agent_management::AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE, DIRECTOR, None);
+        let e = envelope(&notice, &bind).unwrap();
+        let (event_type, text) = super::super::agent_management_input(&notice, DIRECTOR).unwrap();
+        assert_eq!((event_type, text.as_str()), (e.message.event_type.as_str(), e.message.text.as_str()));
+        // Not to the requester / no matching action (empty roster): terminal.
+        let error = super::super::agent_management_input(&notice, WORKER).unwrap_err();
+        assert!(error.downcast_ref::<TerminalExternalInputError>().is_none(), "recipient conflict stays retryable");
+        let mut misdirected = notice.clone();
+        misdirected.to_cutex_session_id = Some(WORKER.into());
+        let error = super::super::agent_management_input(&misdirected, WORKER).unwrap_err();
+        assert_eq!(error.downcast_ref::<TerminalExternalInputError>().map(|t| t.code), Some("management_notice_provenance_invalid"));
+        let start = start_message(crate::agent_management::AGENT_MANAGEMENT_START_CONTROL_TYPE, WORKER, None);
+        let error = super::super::agent_management_input(&start, WORKER).unwrap_err();
+        assert_eq!(error.downcast_ref::<TerminalExternalInputError>().map(|t| t.code), Some("management_start_provenance_invalid"));
+        // Unparseable metadata under the reserved sender is terminal too.
+        let mut broken = start.clone();
+        broken.control_payload = Some(serde_json::json!({"schema":"other"}));
+        let error = super::super::agent_management_input(&broken, WORKER).unwrap_err();
+        assert_eq!(error.downcast_ref::<TerminalExternalInputError>().map(|t| t.code), Some("management_start_provenance_invalid"));
     }
 
     #[test]

@@ -1561,7 +1561,7 @@ fn cmd_profile_models(target: &str, refresh: bool, apply: bool) -> anyhow::Resul
     let base = config.get("model_providers").and_then(|v| v.get(provider))
         .and_then(|v| v.get("base_url")).and_then(toml::Value::as_str)
         .unwrap_or("https://api.openai.com/v1");
-    let source = model_discovery::models_url(base)?.to_string();
+    let source = model_discovery::discovery_url(base)?.to_string();
     let cached_path = directory.join("discovered-models.json");
     let cached = fs::read(&cached_path).ok().and_then(|bytes| serde_json::from_slice::<ModelCatalog>(&bytes).ok())
         .filter(|catalog| catalog.source_url == source);

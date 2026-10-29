@@ -1,0 +1,405 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:storage",
+  "title": "Host storage (read-only P1)",
+  "description": "Owner-only cached inventory. Directory sizes are logical bytes, do not follow links, and may be stale. GET never walks. Unknown JSON item counts are null. No cleanup API or actions.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/overview"
+    },
+    {
+      "$ref": "#/$defs/items"
+    },
+    {
+      "$ref": "#/$defs/refresh"
+    }
+  ],
+  "$defs": {
+    "measurement": {
+      "type": "object",
+      "required": [
+        "bytes",
+        "files",
+        "links",
+        "unreadable"
+      ],
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "links": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unreadable": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "oldestAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "newestAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "required": [
+        "rule",
+        "days",
+        "keepReferenced",
+        "configurable",
+        "setting"
+      ],
+      "properties": {
+        "rule": {
+          "enum": [
+            "forever",
+            "age",
+            "count",
+            "size",
+            "rotate",
+            "archive",
+            "internal",
+            "derived",
+            "native",
+            "none"
+          ]
+        },
+        "days": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "minHours": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "keepReferenced": {
+          "type": "boolean"
+        },
+        "configurable": {
+          "type": "boolean"
+        },
+        "setting": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "detail": {
+          "type": "string"
+        }
+      }
+    },
+    "store": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/measurement"
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "group",
+            "labelKey",
+            "label",
+            "path",
+            "kind",
+            "measure",
+            "measuredAt",
+            "datesFrom",
+            "items",
+            "retention",
+            "actions",
+            "drillDown"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "group": {
+              "type": "string"
+            },
+            "labelKey": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "directory",
+                "file",
+                "jsonl",
+                "json",
+                "sqlite",
+                "mixed"
+              ]
+            },
+            "measure": {
+              "enum": [
+                "walk",
+                "stat"
+              ]
+            },
+            "measuredAt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "datesFrom": {
+              "enum": [
+                "mtime",
+                "record",
+                "filename"
+              ]
+            },
+            "items": {
+              "type": "object",
+              "required": [
+                "count",
+                "unit"
+              ],
+              "properties": {
+                "count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "unit": {
+                  "type": "string"
+                }
+              }
+            },
+            "retention": {
+              "$ref": "#/$defs/retention"
+            },
+            "actions": {
+              "type": "array",
+              "maxItems": 0,
+              "description": "Read-only P1 has no cleanup actions"
+            },
+            "drillDown": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "overview": {
+      "type": "object",
+      "required": [
+        "host",
+        "generatedAt",
+        "home",
+        "volume",
+        "totals",
+        "walk",
+        "groups",
+        "stores"
+      ],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "generatedAt": {
+          "type": "string"
+        },
+        "home": {
+          "type": "string"
+        },
+        "volume": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "totalBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "freeBytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "totals": {
+          "type": "object",
+          "required": [
+            "bytes",
+            "files"
+          ],
+          "properties": {
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "walk": {
+          "type": "object",
+          "required": [
+            "state",
+            "stale"
+          ],
+          "properties": {
+            "state": {
+              "enum": [
+                "idle",
+                "running"
+              ]
+            },
+            "startedAt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "finishedAt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "progress": {
+              "type": [
+                "object",
+                "null"
+              ]
+            }
+          }
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "labelKey",
+              "label",
+              "bytes"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "labelKey": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "stores": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/store"
+          }
+        }
+      }
+    },
+    "items": {
+      "type": "object",
+      "required": [
+        "store",
+        "items",
+        "nextCursor"
+      ],
+      "properties": {
+        "store": {
+          "type": "string"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/measurement"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "id",
+                  "path"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "refresh": {
+      "type": "object",
+      "required": [
+        "state",
+        "startedAt"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "running"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

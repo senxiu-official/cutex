@@ -1,7 +1,7 @@
 //! Authenticated loopback host routing on the existing management listener.
 pub mod auth;
 mod forward;
-mod head;
+pub(crate) mod head;
 use crate::management::listeners::{ConnectionInfo, ConnectionSlot};
 use crate::services::store::{ServiceRuntime, ServiceStore};
 use head::{read_head, Head};
@@ -220,6 +220,10 @@ fn serve(
                 break;
             }
         };
+        if record.archived {
+            let _ = error(stream, 409, "service_archived");
+            break;
+        }
         if record.runtime == ServiceRuntime::Static {
             let _ = crate::services::static_files::serve(&record, method, target, stream);
             break;

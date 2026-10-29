@@ -1,6 +1,6 @@
 //! Management's read-only connection to already running Claude adapters.
 //! Recovery reconnects observers; it never spawns an adapter or a model turn.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -10,12 +10,16 @@ use cutex::management::v2::native_events::{
     pending_event_from_app_server, NativeEventContext, NativeEventDisposition,
 };
 use cutex::management::v2::repository::management_v2_repository;
+use cutex::management::v2::claude_observer::{candidate_identities, with_state, RuntimeIdentity};
 
 static MANAGER: OnceLock<AppServerRuntimeManager> = OnceLock::new();
 static OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[path = "claude_busy_delivery.rs"]
 mod busy_delivery;
+
+#[path = "claude_settlement.rs"]
+mod settlement;
 
 pub(super) fn lifecycle(id: &str, online: bool) -> anyhow::Result<serde_json::Value> {
     use anyhow::{ensure, Context};
@@ -71,8 +75,29 @@ pub(super) fn manager() -> &'static AppServerRuntimeManager {
 struct ClaudeEventSink;
 
 impl cutex::app_server::manager::AppServerRuntimeEventSink for ClaudeEventSink {
+    fn handle_live_connection_boundary(&self, context: &AppServerRuntimeEventContext) -> anyhow::Result<()> {
+        management_v2_repository()?.invalidate_live(&context.cutex_session_id, context.runtime_generation);
+        Ok(())
+    }
     fn event_ledger(&self) -> Option<Arc<cutex::app_server::single_writer::Ledger>> {
         cutex::app_server::single_writer::process_ledger()
+    }
+
+    fn handle_live_event_from_connection(
+        &self,
+        context: &AppServerRuntimeEventContext,
+        event: &cutex::app_server::client::AppServerEvent,
+        _origin: &cutex::app_server::client::AppServerHandle,
+    ) -> anyhow::Result<()> {
+        if let Some((pending, bound)) = cutex::management::v2::native_events::live_text_pending(
+            &claude_native_context(context), event,
+            |thread| cutex::management::v2::subagent_lineage::is_descendant(
+                &context.cutex_session_id, &context.thread_id, thread),
+        )? {
+            management_v2_repository()?.publish_live(pending.clone());
+            if bound { cutex::management::v2::activity::record_live_output_signal(&pending)?; }
+        }
+        Ok(())
     }
 
     fn handle_event(
@@ -84,11 +109,8 @@ impl cutex::app_server::manager::AppServerRuntimeEventSink for ClaudeEventSink {
     }
 }
 
-fn handle_claude_event(
-    context: &AppServerRuntimeEventContext,
-    event: &cutex::app_server::client::AppServerEvent,
-) -> anyhow::Result<()> {
-    let native = NativeEventContext {
+fn claude_native_context(context: &AppServerRuntimeEventContext) -> NativeEventContext {
+    NativeEventContext {
         cutex_session_id: context.cutex_session_id.clone(),
         thread_id: context.thread_id.clone(),
         host_id: cutex::platform::host::current_host_name(),
@@ -98,12 +120,41 @@ fn handle_claude_event(
             protocol: "claude-app-server-subset".into(), major_version: 1,
             version: context.schema.version.clone(), sha256: context.schema.sha256.clone(),
             channel: AppServerSchemaChannel::Experimental,
-            // Per-event identity stays small; the full feature surface is
-            // the session resource's native.schema.capabilities.features.
-            capabilities: serde_json::json!({"persistentRuntime":true,"history":"paginated","sameTurnSteering":false}),
+            capabilities: serde_json::json!({"persistentRuntime":true,"history":"paginated","sameTurnSteering":false,
+                "features":{"fullTextItemTerminal":context.full_text_item_terminal}}),
             extensions: vec!["claude-runtime-v1".into()],
         },
-    };
+    }
+}
+
+fn handle_claude_event(
+    context: &AppServerRuntimeEventContext,
+    event: &cutex::app_server::client::AppServerEvent,
+) -> anyhow::Result<()> {
+    if context.full_text_item_terminal && cutex::management::v2::native_events::is_live_text_delta(event) { return Ok(()); }
+    if let cutex::app_server::client::AppServerEvent::Notification(notification) = event {
+        if notification.method.starts_with("claude/") {
+            // Adapter extensions (`claudeExtensions`): only a background
+            // subagent / command's end matters here (claude-r23): one "Claude
+            // Task" message to the agent, deduplicated by notice id. Never
+            // published, journaled into the session or fatal to this observer.
+            if let Some(params) = claude_task_notice_params(&context.thread_id, &notification.method, notification.params.as_ref()) {
+                if let Err(error) = notify_parent(&context.cutex_session_id, params) {
+                    eprintln!("Claude task notice for {} not queued: {error:#}", context.cutex_session_id);
+                }
+            }
+            // Status changes only, as cutex/claudeTask/changed (project log).
+            if let ("claude/task/updated", Some(params)) = (notification.method.as_str(), notification.params.as_ref()) {
+                if params.get("threadId").and_then(serde_json::Value::as_str) == Some(context.thread_id.as_str()) {
+                    if let Err(error) = cutex::management::v2::project_events::record_claude_task(&context.cutex_session_id, params) {
+                        eprintln!("Claude task change for {} not recorded: {error:#}", context.cutex_session_id);
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
+    let native = claude_native_context(context);
     // Same bookkeeping order as Codex runtimes: a server request is
     // recorded as pending before it becomes visible on the stream.
     let synchronize_before_publish = matches!(event, cutex::app_server::client::AppServerEvent::ServerRequest(_))
@@ -120,11 +171,12 @@ fn handle_claude_event(
         return Ok(());
     }
     if let NativeEventDisposition::Publish(pending) = disposition {
-        let envelope = management_v2_repository()?.append(pending)?;
+        let envelope = cutex::management::v2::native_events::append_observed_event(pending)?;
         // A subAgentActivity `started` names a subagent transcript as a verified descendant.
         for frame in subagent_frames(context, &native, event, None)? {
             management_v2_repository()?.append(frame)?;
         }
+        if let Some(envelope) = envelope {
         cutex::management::v2::activity::record_activity_event(&envelope)?;
         // Token usage goes into the usage ledger under the session's
         // profile, as for Codex runtimes: GET /v2/usage and the quota
@@ -143,6 +195,12 @@ fn handle_claude_event(
         if let Err(error) = cutex::management::v2::claude_token_usage::record_event(&envelope, &context.thread_id) {
             eprintln!("Claude latest token usage for {} not kept: {error:#}", context.cutex_session_id);
         }
+        // Likewise cutexState.latestPlan (Codex: launch::native_plan): the
+        // bound thread's newest checklist (`turn/plan/updated`).
+        if let Err(error) = cutex::management::v2::claude_plan::record_event(&envelope, &context.thread_id) {
+            eprintln!("Claude latest plan for {} not kept: {error:#}", context.cutex_session_id);
+        }
+    }
     }
     if !synchronize_before_publish {
         super::app_server_state_sync::handle_runtime_event(context, event)?;
@@ -150,6 +208,7 @@ fn handle_claude_event(
     // Quota auto-continue first: a usage-limit failure holds the agent
     // (`blocked(quota)`) before the asks observer puts a failed
     // delegation back in the queue; a completed turn cancels.
+    super::model_overload_retry::on_runtime_event(&context.cutex_session_id, &context.thread_id, context.runtime_generation, event);
     super::claude_quota_continue::on_runtime_event(&context.cutex_session_id, &context.thread_id, context.runtime_generation, event);
     // Asks next: a turn end releases the ask lease before the owner
     // queue decides whether it may flush (as for Codex runtimes).
@@ -184,9 +243,34 @@ fn handle_claude_event(
     // Flush the Management input queue when the Claude turn ends. A
     // failed item is reported (`cutex/userInput/failed`) and stays
     // queued; it must not drop this observer connection.
-    if let Err(error) = super::app_server_user_input::handle_runtime_event(&context.cutex_session_id, event) {
+    if let Err(error) = super::app_server_user_input::handle_runtime_event_for_generation(&context.cutex_session_id, context.runtime_generation, event) {
         eprintln!("Claude queued input for {} was not flushed: {error:#}", context.cutex_session_id);
     }
+    Ok(())
+}
+
+/// The params of a bound-thread `claude/task/updated` that carries `notifyParent`.
+fn claude_task_notice_params<'a>(
+    thread_id: &str,
+    method: &str,
+    params: Option<&'a serde_json::Value>,
+) -> Option<&'a serde_json::Value> {
+    let params = params.filter(|_| method == "claude/task/updated")?;
+    (params.get("threadId").and_then(serde_json::Value::as_str) == Some(thread_id)
+        && params.pointer("/task/notifyParent").is_some_and(serde_json::Value::is_object))
+        .then_some(params)
+}
+
+/// `notifyParent` of a `claude/task/updated` (adapter `input.backgroundSubagents`)
+/// becomes one Agent Bus message from "Claude Task" to the same agent. The bus
+/// keeps its stable `ctask-` id once (a repeated notice is deduplicated there).
+fn notify_parent(cutex_session_id: &str, params: &serde_json::Value) -> anyhow::Result<()> {
+    let Some(notice) = cutex::agent_bus::claude_task::ClaudeTaskNotice::from_task_updated(params) else {
+        return Ok(());
+    };
+    let request = cutex::agent_bus::claude_task::send_request(cutex_session_id, &notice)?;
+    let config = cutex::config::store::load_codez_config();
+    cutex::agent_bus::client::send_claude_task_notice(&config, &request)?;
     Ok(())
 }
 
@@ -237,6 +321,42 @@ fn subagent_frames(
 }
 
 pub(super) fn observe(id: &str) -> anyhow::Result<()> {
+    // Explicit starts bypass an old occurrence's backoff and update diagnostics too.
+    let identity = cutex::session::store::with_cutex_session_store(|store| {
+        store.sessions.get(id).and_then(|record| Some(RuntimeIdentity {
+            generation: record.runtime_generation,
+            pid: record.runtime_pid?,
+            connection_id: record.claude_session.as_ref()?.connection_id.clone(),
+        }))
+    })?;
+    if let Some(identity) = &identity {
+        with_state(|state| { state.activate(id, identity.clone(), Instant::now()); state.attempted(id); });
+    }
+    let result = observe_inner(id);
+    record_observation_result(id, identity.as_ref(), "observe", &result);
+    result
+}
+
+fn record_observation_result(id: &str, identity: Option<&RuntimeIdentity>, stage: &str, result: &anyhow::Result<()>) {
+    let Some(identity) = identity else { return };
+    with_state(|state| match result {
+        Ok(()) => { if state.complete(id, identity, None, Instant::now()) { eprintln!("Claude observation recovered for {id}"); } }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            let stage = if detail.starts_with("Claude bus registration pending:") { "registration" } else { stage };
+            let changed = state.complete(id, identity, Some((stage, &detail)), Instant::now());
+            if error.downcast_ref::<cutex::runtime::claude::ClaudeObservationOffline>().is_some() {
+                if state.suspend(id, identity, Instant::now()) {
+                    eprintln!("Claude observer inactive for {id}: {detail}");
+                }
+            } else if changed {
+                eprintln!("Claude observation unavailable for {id}: {detail}");
+            }
+        }
+    });
+}
+
+fn observe_inner(id: &str) -> anyhow::Result<()> {
     let _guard = OBSERVATION_LOCK
         .lock()
         .map_err(|_| anyhow::anyhow!("Claude observer lock poisoned"))?;
@@ -247,14 +367,19 @@ pub(super) fn observe(id: &str) -> anyhow::Result<()> {
             return Err(error);
         }
     };
-    if manager().status(id)?.is_some_and(|s| {
+    let connected = manager().status(id)?.is_some_and(|s| {
         s.connected && s.runtime_generation == observation.record.runtime_generation
-    }) {
+    });
+    // A failed initial bus registration leaves the native stream connected.
+    // Retry only the missing bridge; an existing bridge retries its heartbeat.
+    if connected && manager().agent_bus_status(id)?.is_some_and(|bridge| bridge.running) {
         return Ok(());
     }
-    manager().disconnect(id)?;
     let record = observation.record.clone();
-    manager().connect_adapter(observation)?;
+    if !connected {
+        manager().disconnect(id)?;
+        manager().connect_adapter(observation)?;
+    }
     cutex::runtime::claude::refresh_mcp_binding(id)?;
     let name = cutex::session::service::cutex_session_display_name(&record);
     let thread = record.app_server_thread_id().unwrap().to_string();
@@ -281,16 +406,13 @@ pub(super) fn observe(id: &str) -> anyhow::Result<()> {
     // Registration and heartbeat only until Claude's different ingress receipt
     // semantics are mapped explicitly. Never invoke Codex's insertion methods.
     options.registration_only = true;
-    if let Err(error) = manager().start_agent_bus_bridge(
+    manager().ensure_agent_bus_bridge(
         id,
         Arc::new(cutex::agent_bus::client::AgentBusHttpClient::from_config(
             &cutex::config::store::load_codez_config(),
         )),
         options,
-    ) {
-        manager().disconnect(id)?;
-        return Err(error);
-    }
+    ).map_err(|error| anyhow::anyhow!("Claude bus registration pending: {error:#}"))?;
     // Safety blocks the adapter reported while nobody observed it.
     cutex::management::v2::safety_checks::reconcile(id, &thread);
     // Like a Codex connect: input queued while no observer was connected
@@ -298,6 +420,47 @@ pub(super) fn observe(id: &str) -> anyhow::Result<()> {
     if let Err(error) = super::app_server_user_input::flush_queued_if_idle(id) {
         eprintln!("Claude queued input for {id} was not flushed: {error:#}");
     }
+    Ok(())
+}
+
+// Rebuildable settlement sidecar failures must not abort ordinary delivery.
+// Close remains independently fail-closed; this never retries or fabricates facts.
+fn persist_settlement_observation(
+    id: &str,
+    message_id: &str,
+    persist: impl FnOnce() -> anyhow::Result<bool>,
+) {
+    if let Err(error) = persist() {
+        eprintln!("Claude settlement persistence for {id}/{message_id}: {error:#}");
+    }
+}
+
+/// Rebuildable evidence only. Called by the bounded post-delivery phase, never
+/// from ordinary delivery/poll or while holding a session input/store guard.
+fn observe_settlement_message(id: &str, message_id: &str, deadline: Instant) -> anyhow::Result<()> {
+    let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
+    observe_settlement_message_with(repository, id, message_id, deadline, settlement::collect_background)
+}
+
+fn observe_settlement_message_with(
+    repository: &cutex::management::v2::agent_bus_state::AgentBusMessageRepository,
+    id: &str, message_id: &str, deadline: Instant,
+    collect: impl FnOnce(&cutex::management::v2::agent_bus_state::AgentBusMessageSnapshot, Instant)
+        -> anyhow::Result<cutex::management::v2::agent_bus_settlement_model::Observation>,
+) -> anyhow::Result<()> {
+    let Some(snapshot) = repository.snapshot_by_message_id(message_id)? else {return Ok(());};
+    anyhow::ensure!(snapshot.to_cutex_session_id == id, "settlement recipient changed");
+    let evidence = match collect(&snapshot, deadline) {
+        Ok(cutex::management::v2::agent_bus_settlement_model::Observation::Terminal(evidence)) => Some(evidence),
+        Ok(cutex::management::v2::agent_bus_settlement_model::Observation::Ineligible) => None,
+        Err(error) => {
+            eprintln!("Claude settlement observation for {id}/{message_id}: {error:#}");
+            None // Unavailable observations never create close eligibility.
+        }
+    };
+    persist_settlement_observation(id, message_id, || {
+        repository.observe_settlement(message_id, evidence, chrono::Utc::now())
+    });
     Ok(())
 }
 
@@ -347,8 +510,12 @@ fn deliver_messages(
     for message in bus.poll(runtime)? {
         // Service controls need their own typed target/seat checks and receipts.
         // A cross-host tell is an ordinary passive note with a peer control record.
+        // An Agent Management start / notice is validated against its action
+        // (the Codex bridge's provenance check) when its input is built.
+        let management = cutex::app_server::bus_bridge::is_agent_management_message(&message);
         if !(message.sender_kind.is_agent() || message.sender_kind.is_alarm_system())
-            || (message.control_type.is_some() && !cutex::agent_bus::peer_tell::is_peer_tell(&message))
+            || (message.control_type.is_some() && !cutex::agent_bus::peer_tell::is_peer_tell(&message)
+                && !cutex::agent_bus::claude_task::is_claude_task(&message) && !management)
             || message.kind != cutex::agent_bus::model::AgentBusEnvelopeKind::Message {
             continue;
         }
@@ -359,9 +526,21 @@ fn deliver_messages(
             bus.ack(runtime, &[message.id])?;
             continue;
         }
+        // Only the native ingress takes it (no legacy local-inbox receipt).
+        if management && !native { continue; }
         let meta = repository.message_meta(&message.id)?;
         let payload = match claude_message_params(&sessions, thread, id, &message, meta.as_ref(), v2) {
             Ok(payload) => payload,
+            Err(error) if management => {
+                // Bad Management provenance is permanent: quarantined (the
+                // requester gets its notice on the ACK), as on Codex.
+                if !cutex::app_server::bus_bridge::quarantine_terminal_external_input(id, &message, &error)? {
+                    return Err(error);
+                }
+                bus.ack(runtime, &[message.id.clone()])?;
+                eprintln!("warning: Claude Agent Management message {} quarantined: {error:#}", message.id);
+                continue;
+            }
             Err(error) if error.is::<cutex::agent_bus::alarms::AlarmAwaitingQueueCommit>() => continue,
             Err(error) if message.sender_kind.is_alarm_system()
                 && error.is::<cutex::agent_bus::alarms::InvalidAlarmProvenance>() => {
@@ -393,7 +572,7 @@ fn deliver_messages(
         let _input_guard = input_lock.lock().map_err(|_| anyhow::anyhow!("session input lock poisoned"))?;
         let active = manager().status(id)?.filter(|status| status.connected && status.runtime_generation == record.runtime_generation);
         let busy_turn = active.as_ref().and_then(|status| status.active_turn_id.as_deref());
-        let wait = cutex::agent_bus::delivery::wake_busy_wait();
+        let wait = claude_task_wait(&message, cutex::agent_bus::delivery::busy_wait_for(&message));
         busy_delivery::note(&message, wait, busy_turn);
         let age = Duration::from_secs((chrono::Utc::now().timestamp().max(0) as u64).saturating_sub(message.created_at_epoch_secs));
         let timing = busy_delivery::timing(age, wait, active.as_ref().map(|status| status.active_turn_id.is_some()),
@@ -416,19 +595,37 @@ fn deliver_messages(
             if !accepted && !joins_running && (busy
                 || !cutex::management::v2::admission::delivery_may_start(id, &message.id)?) { continue; }
         }
+        if !already_accepted && cutex::asks::pause_admission::is_held(
+            &cutex::asks::store::AskStore::open_default()?, id,
+        )? { continue; }
         let prepared_turn = (busy_turn.is_none() && !already_accepted && message.delivery_mode.trigger_turn())
             .then(|| cutex::management::v2::admission::prepare_turn(id, "delivery", None));
         let mut receipt = if let Some(existing) = existing {
             existing
         } else if native || frozen.is_some() {
             ensure!(native, "native Claude input was frozen but this runtime lacks its protocol; no legacy fallback");
-            let envelope = repository.freeze_external_input(id, &message.id, |canonical| {
+            let frozen_input = repository.freeze_external_input(id, &message.id, |canonical| {
                 let mut projection = claude_message_params(&sessions, thread, id, canonical, meta.as_ref(), true)?;
                 if timing == cutex::agent_bus::delivery::WakeTiming::NextStep {
+                    // Of the system alarms only approval notices are read early (023).
+                    ensure!(!canonical.sender_kind.is_alarm_system()
+                        || cutex::agent_bus::delivery::is_approval_notice(canonical),
+                        "an alarm other than an approval notice is never read at the next step");
                     projection["metadata"]["deliveryMode"] = serde_json::json!("soon");
                 }
                 super::claude_ingress::envelope(id, thread, record.runtime_generation, &projection)
-            })?;
+            });
+            let envelope = match frozen_input {
+                Ok(envelope) => envelope,
+                // The durable canonical record failed the provenance check.
+                Err(error) if management
+                    && cutex::app_server::bus_bridge::quarantine_terminal_external_input(id, &message, &error)? => {
+                    bus.ack(runtime, &[message.id.clone()])?;
+                    eprintln!("warning: Claude Agent Management message {} quarantined: {error:#}", message.id);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             ensure!(envelope.owner_id == id && envelope.thread_id == thread, "frozen Claude input binding changed");
             super::claude_ingress::submit(&handle, &envelope, record.runtime_generation)?
         } else { match handle.request("claude/input/submit", payload) {
@@ -505,6 +702,26 @@ fn claude_message_params(
         }
         return Ok(payload);
     }
+    if cutex::app_server::bus_bridge::is_agent_management_message(message) {
+        // Agent Management start (a new agent's first instructions) or notice
+        // (to the requester): a service source, no view (a v1 envelope), the
+        // Codex envelope's text, validated against the current roster.
+        let (event_type, text) = cutex::app_server::bus_bridge::agent_management_input(message, id)?;
+        return Ok(management_input_params(thread, id, message, event_type, text));
+    }
+    if cutex::agent_bus::claude_task::is_claude_task(message) {
+        // A background task of this agent ended: a service source, a wake.
+        let (notice, text) = cutex::agent_bus::claude_task::model_text(message)?;
+        let mut payload = serde_json::json!({"threadId":thread,"messageId":message.id,
+            "source":{"kind":"service","id":cutex::agent_bus::claude_task::SOURCE_ID},
+            "eventType":cutex::agent_bus::claude_task::EVENT_TYPE,"text":text,
+            "metadata":{"sourceName":cutex::agent_bus::claude_task::SOURCE_ID,"cutexSessionId":id,
+                "deliveryMode":"after-turn"}});
+        if v2 {
+            payload["view"] = serde_json::to_value(cutex::agent_bus::claude_task::view(message, &notice)?)?;
+        }
+        return Ok(payload);
+    }
     if cutex::agent_bus::peer_tell::is_peer_tell(message) {
         // Cross-host tell: a service source naming the remote agent.
         let (facts, text) = cutex::agent_bus::peer_tell::model_text(message)?;
@@ -535,7 +752,78 @@ fn claude_message_params(
     Ok(payload)
 }
 
+fn management_input_params(
+    thread: &str,
+    id: &str,
+    message: &cutex::agent_bus::model::AgentBusMessage,
+    event_type: &str,
+    text: String,
+) -> serde_json::Value {
+    use cutex::agent_bus::delivery::AgentDeliveryMode;
+    let mode = match message.delivery_mode {
+        AgentDeliveryMode::Passive => "passive",
+        AgentDeliveryMode::Soon => "soon",
+        _ => "after-turn",
+    };
+    serde_json::json!({"threadId":thread,"messageId":message.id,
+        "source":{"kind":"service","id":cutex::agent_management::AGENT_MANAGEMENT_SYSTEM_SENDER},
+        "eventType":event_type,"text":text,
+        "metadata":{"sourceName":"Cutex Agent Management","cutexSessionId":id,"deliveryMode":mode}})
+}
+
+#[cfg(test)]
+mod director_service_tests {
+    #[test]
+    fn offline_director_notice_renders_as_a_passive_service_without_agent_source(){
+        let message:cutex::agent_bus::model::AgentBusMessage=serde_json::from_value(serde_json::json!({
+            "id":"notice-1","from":cutex::agent_management::AGENT_MANAGEMENT_SYSTEM_SENDER,"to":"runtime-member",
+            "toCutexSessionId":"cutex.22222222-2222-4222-8222-222222222222","content":"The Director changed",
+            "deliveryMode":"passive","triggerTurn":false,"createdAtEpochSecs":1,
+            "controlType":cutex::director_address::management::DIRECTOR_CHANGE_NOTICE_CONTROL_TYPE
+        })).unwrap();
+        assert!(message.from_cutex_session_id.is_none());
+        let value=super::management_input_params("thread","cutex.22222222-2222-4222-8222-222222222222",&message,"management_notice",message.content.clone());
+        assert_eq!(value["source"]["kind"],"service");
+        assert_eq!(value["source"]["id"],cutex::agent_management::AGENT_MANAGEMENT_SYSTEM_SENDER);
+        assert_eq!(value["metadata"]["deliveryMode"],"passive");
+        assert_eq!(value["eventType"],"management_notice");
+    }
+}
+
+/// A Claude task notice is meant for the agent's next step: no busy wait
+/// (`soon` at once when the parent is busy, a new turn when it is idle).
+fn claude_task_wait(
+    message: &cutex::agent_bus::model::AgentBusMessage,
+    wait: Option<Duration>,
+) -> Option<Duration> {
+    if cutex::agent_bus::claude_task::is_claude_task(message) {
+        Some(Duration::ZERO)
+    } else {
+        wait
+    }
+}
+
+/// Clear only unclosed sidecar observations. This path must work while the
+/// runtime is offline: repository reads/writes only, never a native request.
+fn invalidate_settlement_observations(id: &str) {
+    let result = (|| -> anyhow::Result<()> {
+        let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
+        let now = chrono::Utc::now();
+        for envelope in repository.pending_native_envelopes(id)? {
+            if let Err(error) = repository.observe_settlement(&envelope.message.id, None, now) {
+                // Try the remaining rows even if one sidecar write fails.
+                eprintln!("Claude settlement invalidation for {id}/{}: {error:#}", envelope.message.id);
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("Claude settlement invalidation for {id}: {error:#}");
+    }
+}
+
 pub(super) fn disconnect(id: &str) -> anyhow::Result<()> {
+    invalidate_settlement_observations(id);
     let _guard = OBSERVATION_LOCK
         .lock()
         .map_err(|_| anyhow::anyhow!("Claude observer lock poisoned"))?;
@@ -544,46 +832,80 @@ pub(super) fn disconnect(id: &str) -> anyhow::Result<()> {
 }
 
 pub(super) fn spawn_observer() -> anyhow::Result<()> {
+    cutex::management::v2::agent_bus_settlement_model::register_collector(settlement::collect);
+    cutex::management::v2::agent_bus_settlement_model::register_runtime_fence(settlement::runtime_fence);
     std::thread::Builder::new()
         .name("cutex-claude-observer".into())
         .spawn(|| {
-            let mut tracked = HashSet::<String>::new();
-            let mut failures = HashMap::<String, String>::new();
+            let mut store_failure = None;
             let mut reconciliation_attempts = HashMap::<String, (u64, Instant)>::new();
+            let mut previous_candidates = HashMap::<String, RuntimeIdentity>::new();
+            let mut outbox_attempt = None::<Instant>;
+            let mut settlement_observations = settlement::BackgroundObservations::default();
             loop {
+                // Independent of candidate discovery/connection success: a
+                // fresh process and a fully offline host still repair outbox.
+                if outbox_attempt.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+                    outbox_attempt = Some(Instant::now());
+                    if let Err(error) = cutex::management::v2::agent_bus_state::agent_bus_message_repository()
+                        .and_then(|repository| repository.flush_settlement_outbox()) {
+                        eprintln!("Claude settlement outbox recovery: {error:#}");
+                    }
+                }
                 // Borrow the cached store (no whole-store copy every 5 s).
                 let host = cutex::platform::host::current_host_name();
                 let result = cutex::session::store::with_cutex_session_store(|store| {
-                    store
-                        .sessions
-                        .values()
-                        .filter(|r| {
-                            r.claude_session.is_some()
-                                && r.runtime_pid.is_some()
-                                && !r.is_retired()
-                                && cutex::runtime::lifecycle::cutex_session_host_is_local(
-                                    &r.host_id, &host,
-                                )
-                        })
-                        .map(|r| r.cutex_session_id.clone())
-                        .collect::<HashSet<_>>()
+                    candidate_identities(store.sessions.values(), &host)
                 });
                 match result {
-                    Ok(wanted) => {
+                    Ok(mut wanted) => {
+                        store_failure = None;
+                        // Probe the whole snapshot once. A PID claim alone is not a live runtime.
+                        let pids = wanted.values().map(|identity| identity.pid).collect::<Vec<_>>();
+                        let live = cutex::platform::process::running_process_ids(&pids);
+                        wanted.retain(|_, identity| live.contains(&identity.pid));
+                        // sync_candidates reactivates changed occurrences but
+                        // returns only removed IDs. Invalidate the old evidence
+                        // before observing a replacement generation/connection.
+                        for (id, identity) in &wanted {
+                            if previous_candidates.get(id).is_some_and(|previous| previous != identity) {
+                                invalidate_settlement_observations(id);
+                                reconciliation_attempts.remove(id);
+                            }
+                        }
+                        previous_candidates = wanted.iter().map(|(id, identity)| (id.clone(), identity.clone())).collect();
+                        let now = Instant::now();
+                        let removed = with_state(|state| state.sync_candidates(&wanted, now));
                         let bus = cutex::agent_bus::client::AgentBusHttpClient::from_config(
                             &cutex::config::store::load_codez_config(),
                         );
-                        for removed in tracked.difference(&wanted) {
-                            let _ = disconnect(removed);
-                            failures.remove(removed);
-                            reconciliation_attempts.remove(removed);
+                        for removed in removed {
+                            let _ = disconnect(&removed);
+                            reconciliation_attempts.remove(&removed);
+                            eprintln!("Claude observer inactive for {removed}: no eligible local live runtime");
                         }
-                        for id in &wanted {
-                            match observe(id).and_then(|()| deliver_messages(id, &bus, &mut reconciliation_attempts)) {
+                        settlement_observations.retain_candidates(&wanted.keys().cloned().collect::<Vec<_>>());
+                        settlement_observations.after_deliveries(settlement::background_enabled(), || {
+                        let mut delivered = Vec::new();
+                        for id in &wanted.keys().cloned().collect::<Vec<_>>() {
+                            if !with_state(|state| state.due(id, Instant::now())) { continue; }
+                            with_state(|state| state.attempted(id));
+                            let observation = observe_inner(id);
+                            let stage = if observation.is_err() { "observe" } else { "delivery" };
+                            let result = observation.and_then(|()| deliver_messages(id, &bus, &mut reconciliation_attempts));
+                            match result {
                                 Ok(()) => {
-                                    failures.remove(id);
-                                }
+                                    record_observation_result(id, wanted.get(id), stage, &Ok(()));
+                                    delivered.push(id.clone());
+                                },
                                 Err(error) => {
+                                    // Includes an offline occurrence discovered
+                                    // after the candidate scan, and failed
+                                    // connection checks while the PID survives.
+                                    invalidate_settlement_observations(id);
+                                    let offline = error.downcast_ref::<cutex::runtime::claude::ClaudeObservationOffline>().is_some();
+                                    record_observation_result(id, wanted.get(id), stage, &Err(error));
+                                    if offline { reconciliation_attempts.remove(id); continue; }
                                     // A dead adapter (PID gone, endpoint
                                     // refused) is offline: clear its stale
                                     // claim; the next pass stops observing it.
@@ -591,28 +913,36 @@ pub(super) fn spawn_observer() -> anyhow::Result<()> {
                                         Ok(true) => {
                                             eprintln!("Claude adapter of {id} is gone; cleared its stale runtime claim");
                                             let _ = disconnect(id);
-                                            failures.remove(id);
+                                            // Drop immediately, including a lifecycle change
+                                            // after the candidate scan. Start re-adds it.
+                                            wanted.remove(id);
+                                            reconciliation_attempts.remove(id);
+                                            with_state(|state| { state.sync_candidates(&wanted, Instant::now()); });
                                             continue;
                                         }
                                         Ok(false) => {}
-                                        Err(reconcile) => eprintln!(
-                                            "Claude dead-adapter check for {id} failed: {reconcile:#}"
-                                        ),
-                                    }
-                                    let detail = format!("{error:#}");
-                                    if failures.get(id) != Some(&detail) {
-                                        eprintln!(
-                                            "Claude observation unavailable for {id}: {detail}"
-                                        );
-                                        failures.insert(id.clone(), detail);
+                                        Err(_) => {} // Preserve the original failure and its retry state.
                                     }
                                 }
                             }
                         }
-                        tracked = wanted;
+                        delivered
+                        }, |id| {
+                            cutex::management::v2::agent_bus_state::agent_bus_message_repository()?
+                                .pending_native_envelopes(id)
+                                .map(|envelopes| envelopes.into_iter().map(|envelope| envelope.message.id).collect())
+                        }, |id, message, deadline| {
+                            if let Err(error) = observe_settlement_message(id, message, deadline) {
+                                eprintln!("Claude settlement source for {id}/{message}: {error:#}");
+                            }
+                        });
                     }
                     Err(error) => {
-                        eprintln!("Claude observer could not read session store: {error:#}")
+                        let detail = format!("{error:#}");
+                        if store_failure.as_ref() != Some(&detail) {
+                            eprintln!("Claude observer could not read session store: {detail}");
+                            store_failure = Some(detail);
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_secs(5));
@@ -688,6 +1018,12 @@ fn reconcile_native_message(id: &str, generation: u64, envelope: &cutex::app_ser
             let local = repository.snapshot_by_message_id(&envelope.message.id)?.and_then(|snapshot| snapshot.local_inbox_receipt);
             busy_delivery::read(id, &envelope.message.id, turn, local.as_ref());
         }
+    } else {
+        // Preserve validated native uncertainty for diagnostics, including
+        // output-observed without an SDK acknowledgement after a restart.
+        manager().handle_for_generation(id, generation)?;
+        cutex::management::v2::agent_bus_state::agent_bus_message_repository()?
+            .observe_external_input(&envelope.message.id, envelope, &status)?;
     }
     Ok(())
 }
@@ -695,6 +1031,30 @@ fn reconcile_native_message(id: &str, generation: u64, envelope: &cutex::app_ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_persistence_failure_is_best_effort_and_never_retries() {
+        let calls = std::cell::Cell::new(0);
+        for fail in [true, false] {
+            persist_settlement_observation("synthetic-recipient", "synthetic-message", || {
+                calls.set(calls.get() + 1);
+                if fail { anyhow::bail!("synthetic sidecar unavailable"); }
+                Ok(true)
+            });
+            // Both a failed attempt and later recovery return normally.
+        }
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn unchanged_settlement_persistence_is_not_retried() {
+        let calls = std::cell::Cell::new(0);
+        persist_settlement_observation("synthetic-recipient", "synthetic-message", || {
+            calls.set(calls.get() + 1);
+            Ok(false)
+        });
+        assert_eq!(calls.get(), 1);
+    }
 
     fn claude_native(context: &AppServerRuntimeEventContext) -> NativeEventContext {
         NativeEventContext {
@@ -732,7 +1092,7 @@ mod tests {
         let context = AppServerRuntimeEventContext {
             cutex_session_id: format!("cutex-claude-sub-{}", uuid::Uuid::new_v4()),
             thread_id: "root".into(), runtime_generation: 1, runtime_backend: "claude_subscription".into(),
-            launched_profile: None, launched_profile_id: None, usage: Default::default(),
+            full_text_item_terminal: false, launched_profile: None, launched_profile_id: None, usage: Default::default(),
             schema: cutex::app_server::journal::AppServerSchemaIdentity { version: "0.3.0+cutex".into(), sha256: "a".repeat(64) },
         };
         let child = "claude:sid:task:task-a";
@@ -747,6 +1107,47 @@ mod tests {
         assert!(frames_for(&context, &stranger).is_empty());
         // A bound-thread event that teaches nothing publishes no subagent frame.
         assert!(frames_for(&context, &claude_event("turn/started", serde_json::json!({"threadId": "root", "turn": {"id": "t"}}))).is_empty());
+    }
+
+    /// r247 hachimi (r23-live-check): the adapter's `claude/*` frames reach the
+    /// observer once it asks for `claudeExtensions`. Only a bound-thread
+    /// `claude/task/updated` with `notifyParent` becomes a notice; every other
+    /// `claude/*` frame (a subagent-owned command's `turnId: null` included) is
+    /// ignored before any store is touched and never ends the observer.
+    #[test]
+    fn claude_extension_frames_are_ignored_except_the_task_notice() {
+        let context = AppServerRuntimeEventContext {
+            cutex_session_id: format!("cutex-claude-ext-{}", uuid::Uuid::new_v4()),
+            thread_id: "a43c4add".into(), runtime_generation: 1, runtime_backend: "claude_subscription".into(),
+            full_text_item_terminal: false, launched_profile: None, launched_profile_id: None, usage: Default::default(),
+            schema: cutex::app_server::journal::AppServerSchemaIdentity { version: "0.3.0+cutex".into(), sha256: "a".repeat(64) },
+        };
+        // Recorded on hachimi (adapter events seq 39 and 75), ids shortened.
+        let subagent_command = serde_json::json!({"threadId": "a43c4add", "task": {"description": "Print eight steps",
+            "ownedBySubagent": true, "status": "running", "taskId": "bvvxedjjm", "taskType": "local_bash",
+            "toolUseId": "toolu_01Dn", "turnId": null}});
+        let finished = serde_json::json!({"threadId": "a43c4add", "task": {"background": true,
+            "description": "Background sleep loop test", "status": "completed", "taskId": "afa1b240b52a47bb4",
+            "taskType": "local_agent", "toolUseId": "toolu_01Fr", "turnId": "3216c31d",
+            "usage": {"duration_ms": 164130, "tool_uses": 1, "total_tokens": 11012},
+            "notifyParent": {"description": "Background sleep loop test", "noticeId": "afa1b240b52a47bb4",
+                "originTurnId": "3216c31d", "status": "completed", "summary": "bg-done", "summaryTruncated": false,
+                "taskId": "afa1b240b52a47bb4", "taskType": "local_agent", "toolUseId": "toolu_01Fr",
+                "transcript": "claude:3c57b94d:task:afa1b240b52a47bb4"}}});
+        for (method, params) in [
+            ("claude/task/updated", subagent_command.clone()),
+            ("claude/runtime/event", serde_json::json!({"threadId": "a43c4add", "kind": "StreamEvent"})),
+            ("claude/input/statusChanged", serde_json::json!({"messageId": "m", "durable": true})),
+            ("claude/someFutureFrame", serde_json::json!({"threadId": "a43c4add", "turnId": ""})),
+        ] {
+            handle_claude_event(&context, &claude_event(method, params)).expect("ignored, observer stays connected");
+        }
+        assert!(claude_task_notice_params("a43c4add", "claude/task/updated", Some(&subagent_command)).is_none());
+        let params = claude_task_notice_params("a43c4add", "claude/task/updated", Some(&finished)).expect("notice params");
+        let notice = cutex::agent_bus::claude_task::ClaudeTaskNotice::from_task_updated(params).expect("valid notice");
+        assert_eq!(notice.summary.as_deref(), Some("bg-done"));
+        assert!(claude_task_notice_params("other-thread", "claude/task/updated", Some(&finished)).is_none());
+        assert!(claude_task_notice_params("a43c4add", "claude/runtime/event", Some(&finished)).is_none());
     }
 
     /// PERF-03: one observer pass over several online Claude runtimes with an
@@ -813,6 +1214,66 @@ mod tests {
         assert_eq!(copies, 0);
         std::fs::write(std::env::var_os("CUTEX_TEST_PRIVATE_HOME").map(std::path::PathBuf::from).unwrap()
             .join("clone-test-done"), b"ok").unwrap();
+    }
+
+    /// claude-r23: a "Claude Task" notice (built from the adapter's notifyParent) is a
+    /// service-source wake: a busy parent reads it at its next tool step at once
+    /// (no busy wait, `soon`), an idle parent gets a turn at once.
+    #[test]
+    fn claude_task_notice_projection_and_next_step_timing() {
+        use cutex::agent_bus::delivery::WakeTiming;
+        use serde_json::json;
+        let owner = "cutex.00000000-0000-0000-0000-000000000003";
+        let params = json!({"threadId":"thread","task":{"taskId":"task-a","status":"completed","notifyParent":{
+            "noticeId":"task-a","taskId":"task-a","taskType":"local_agent","status":"completed",
+            "description":"Review docs","summary":"All good.","transcript":"claude:s:task:task-a"}}});
+        let notice = cutex::agent_bus::claude_task::ClaudeTaskNotice::from_task_updated(&params).unwrap();
+        let request = cutex::agent_bus::claude_task::send_request(owner, &notice).unwrap();
+        let message: cutex::agent_bus::model::AgentBusMessage = serde_json::from_value(json!({
+            "id": request.external_message_id, "kind":"message", "from":"Claude Task", "to":"runtime",
+            "toCutexSessionId": owner, "content": request.content, "deliveryMode":"after_turn",
+            "triggerTurn": true, "createdAtEpochSecs": 1, "senderKind":"agent",
+            "controlType": request.control_type, "controlPayload": request.control_payload,
+            "externalMessageId": request.external_message_id
+        })).unwrap();
+        let sessions = cutex::session::model::CutexSessionStore::default();
+        let payload = claude_message_params(&sessions, "thread", owner, &message, None, true).unwrap();
+        assert_eq!(payload["source"], json!({"kind":"service","id":"Claude Task"}));
+        assert_eq!(payload["eventType"], "claude_task");
+        assert_eq!(payload["metadata"]["deliveryMode"], "after-turn");
+        assert_eq!(payload["view"]["schema"], "cutex.claude-task.v1");
+        let text = payload["text"].as_str().unwrap();
+        assert!(text.contains("Your background subagent finished.") && text.ends_with("Its final reply:\nAll good."), "{text}");
+        // Frozen as a native envelope, after-turn or (busy, next step) soon.
+        let envelope = super::super::claude_ingress::envelope(owner, "thread", 3, &payload).unwrap();
+        assert_eq!(envelope.message.delivery, cutex::app_server::external_input::Delivery::AfterTurn);
+        let mut soon = payload.clone();
+        soon["metadata"]["deliveryMode"] = json!("soon");
+        let envelope = super::super::claude_ingress::envelope(owner, "thread", 3, &soon).unwrap();
+        assert_eq!(envelope.message.delivery, cutex::app_server::external_input::Delivery::Soon);
+        let mut passive = payload.clone();
+        passive["metadata"]["deliveryMode"] = json!("passive");
+        assert!(super::super::claude_ingress::envelope(owner, "thread", 3, &passive).is_err());
+        // Timing: no busy wait for the notice; an agent wake keeps the configured one.
+        let wait = Some(Duration::from_secs(120));
+        assert!(busy_delivery::candidate(&message, true));
+        let notice_wait = claude_task_wait(&message, wait);
+        assert_eq!(notice_wait, Some(Duration::ZERO));
+        assert_eq!(busy_delivery::timing(Duration::ZERO, notice_wait, Some(true), true), WakeTiming::NextStep);
+        assert_eq!(busy_delivery::timing(Duration::ZERO, notice_wait, Some(false), true), WakeTiming::NextStep);
+        assert_eq!(busy_delivery::timing(Duration::ZERO, notice_wait, Some(true), false), WakeTiming::AfterTurn);
+        let mut agent = message.clone();
+        agent.control_type = None;
+        agent.control_payload = None;
+        assert_eq!(claude_task_wait(&agent, wait), wait);
+        assert_eq!(busy_delivery::timing(Duration::ZERO, wait, Some(true), true), WakeTiming::Hold);
+        // A forged notice (a sender session) is refused before any submission.
+        let mut forged = message.clone();
+        forged.from_cutex_session_id = Some("cutex.someone".into());
+        assert!(claude_message_params(&sessions, "thread", owner, &forged, None, true).is_err());
+        // No notice in an ordinary task update.
+        assert!(cutex::agent_bus::claude_task::ClaudeTaskNotice::from_task_updated(
+            &json!({"threadId":"thread","task":{"taskId":"task-a","status":"running"}})).is_none());
     }
 
     #[test]
@@ -911,6 +1372,72 @@ mod tests {
             std::fs::write(path.join("claude-alarm-legacy-params.json"), serde_json::to_vec_pretty(&params).unwrap()).unwrap();
         }
         std::fs::write(std::path::Path::new(&std::env::var_os("CUTEX_TEST_PRIVATE_HOME").unwrap()).join("alarm-test-done"), b"ok").unwrap();
+    }
+
+    #[test]
+    fn isolated_agent_management_messages_become_native_inputs_or_quarantine() {
+        const CHILD: &str = "CUTEX_CLAUDE_MANAGEMENT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!("cutex-claude-management-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(".cutex-test-private-home"), b"management test").unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli_app::claude_runtime::tests::isolated_agent_management_messages_become_native_inputs_or_quarantine", "--nocapture"])
+                .env("HOME", &root).env("CUTEX_TEST_PRIVATE_HOME", &root).env(CHILD, "1")
+                .status().unwrap();
+            let ran = root.join("management-test-done").is_file();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(result.success() && ran);
+            return;
+        }
+        use serde_json::json;
+        use cutex::agent_management::{AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE, AGENT_MANAGEMENT_START_CONTROL_TYPE,
+            AGENT_MANAGEMENT_SYSTEM_SENDER};
+        const DIRECTOR: &str = "cutex.33333333-3333-4333-8333-333333333333";
+        const WORKER: &str = "cutex.22222222-2222-4222-8222-222222222222";
+        let management = |id: &str, control: &str, to: &str, mode: &str| -> cutex::agent_bus::model::AgentBusMessage {
+            serde_json::from_value(json!({"id":id,"from":AGENT_MANAGEMENT_SYSTEM_SENDER,"to":"runtime",
+                "fromCutexSessionId":DIRECTOR,"toCutexSessionId":to,"content":"Do the brief","deliveryMode":mode,
+                "triggerTurn":mode != "passive","createdAtEpochSecs":1,"controlType":control,
+                "controlPayload":{"schema":"cutex/agent-management/v1","requested_by_director":DIRECTOR},
+                "externalMessageId":format!("agent-management:act-1:{id}")})).unwrap()
+        };
+        let sessions = cutex::session::model::CutexSessionStore::default();
+        // A notice to its requester (no action needed): the Codex text, a
+        // passive v1 service envelope.
+        let notice = management("bus-notice-1", AGENT_MANAGEMENT_NOTICE_CONTROL_TYPE, DIRECTOR, "passive");
+        assert!(cutex::app_server::bus_bridge::is_agent_management_message(&notice));
+        let params = claude_message_params(&sessions, "thread", DIRECTOR, &notice, None, true).unwrap();
+        assert_eq!(params["source"], json!({"kind":"service","id":AGENT_MANAGEMENT_SYSTEM_SENDER}));
+        assert_eq!(params["eventType"], "management_notice");
+        assert_eq!(params["metadata"]["deliveryMode"], "passive");
+        assert!(params["text"].as_str().unwrap().starts_with("Message Type: NOTICE\nFrom: Cutex Agent Management\nPayload:\n"));
+        let envelope = super::super::claude_ingress::envelope(DIRECTOR, "thread", 7, &params).unwrap();
+        assert_eq!((envelope.version, envelope.view.is_none()), (1, true));
+        // A start message is an after-turn wake once its action matches; with
+        // no create / replace action it is terminal and is quarantined.
+        let start = management("bus-start-1", AGENT_MANAGEMENT_START_CONTROL_TYPE, WORKER, "after_turn");
+        let error = claude_message_params(&sessions, "thread", WORKER, &start, None, true).unwrap_err();
+        let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository().unwrap();
+        repository.record_queued(cutex::management::v2::agent_bus_state::AgentBusQueuedMessage {
+            owner_cutex_session_id: WORKER.into(), message_id: start.id.clone(), from_cutex_session_id: Some(DIRECTOR.into()),
+            to_cutex_session_id: WORKER.into(), from_runtime_agent_id: None, to_runtime_agent_id: Some("runtime".into()),
+            delivery_mode: "after_turn".into(), content: start.content.clone(), queued_at: chrono::Utc::now(),
+            canonical_envelope: start.clone(), semantic_sha256: cutex::app_server::bus_bridge::inter_agent_semantic_sha256(
+                &cutex::app_server::bus_bridge::inter_agent_params("thread", "ignored", WORKER, &start).unwrap()),
+        }).unwrap();
+        assert!(cutex::app_server::bus_bridge::quarantine_terminal_external_input(WORKER, &start, &error).unwrap());
+        let snapshot = repository.snapshot_by_message_id(&start.id).unwrap().unwrap();
+        assert_eq!(snapshot.state, "quarantined");
+        assert_eq!(snapshot.error.unwrap()["code"], "management_start_provenance_invalid");
+        // A retryable error is never quarantined.
+        assert!(!cutex::app_server::bus_bridge::quarantine_terminal_external_input(
+            WORKER, &start, &anyhow::anyhow!("store busy")).unwrap());
+        // An ordinary agent message that claims the control type is not one.
+        let mut forged = start.clone();
+        forged.from = "worker".into();
+        assert!(!cutex::app_server::bus_bridge::is_agent_management_message(&forged));
+        std::fs::write(std::path::Path::new(&std::env::var_os("CUTEX_TEST_PRIVATE_HOME").unwrap()).join("management-test-done"), b"ok").unwrap();
     }
 
     #[test]

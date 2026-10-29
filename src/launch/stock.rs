@@ -753,11 +753,32 @@ pub fn canonical(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Current nonsecret configuration, bound separately from durable identity.
+thread_local! {
+    /// The last effort fallback a launch review on this thread made
+    /// (owner creates report it: POST /v2/human/agents `effortFallback`).
+    static LAST_EFFORT_FALLBACK: std::cell::RefCell<Option<super::selected_profile::EffortFallback>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Forget an earlier review's effort fallback (start of a create).
+pub fn clear_effort_fallback() {
+    LAST_EFFORT_FALLBACK.with(|slot| slot.borrow_mut().take());
+}
+
+/// The effort fallback of the last launch review on this thread, once.
+pub fn take_effort_fallback() -> Option<super::selected_profile::EffortFallback> {
+    LAST_EFFORT_FALLBACK.with(|slot| slot.borrow_mut().take())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StockConfiguration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_projection: Option<super::selected_profile::Projection>,
+    /// The profile default effort this model does not offer and the level
+    /// used instead (docs/design/028 (b)). Review output only: never
+    /// written into launch receipts (older binaries deny unknown fields).
+    #[serde(skip)]
+    pub effort_fallback: Option<super::selected_profile::EffortFallback>,
     /// The reviewed private ChatGPT auth file of a profile with
     /// `privateChatgptAuthFile` on. The serialized name predates the generic
     /// switch and stays: launch receipts persist it, and older binaries
@@ -809,6 +830,14 @@ pub struct DummyProvider {
     pub supports_websockets: bool,
 }
 impl StockConfiguration {
+    /// Frozen family of the reviewed launch, independent of later profile edits.
+    pub fn conversation_family(&self) -> String {
+        crate::profiles::providers::family_for(
+            &crate::profiles::model::CliKind::Codex,
+            Some(&self.model_provider), Some(&self.provider.base_url),
+        ).0
+    }
+
     /// Revalidate mutable Human New overrides against the source profile.
     ///
     /// Human New first resolves a valid profile default, then allows the user to
@@ -830,6 +859,7 @@ impl StockConfiguration {
             Some(self.approval.clone()),
             Some(&self.model),
             self.reasoning.as_ref(),
+            None,
             true,
         )?;
         Ok(())
@@ -1020,8 +1050,16 @@ fn configuration_for_record(
         approval,
         record.model_defaults.as_ref(),
         record.reasoning_defaults.as_ref(),
+        None,
         migration,
     )?;
+    let profiles = crate::profiles::settings_api::load_store()?;
+    let family = conversation_family_for_record(record, &profiles);
+    if let Some(family) = family.as_deref() {
+        let profile = crate::profiles::settings_api::find(&profiles, &configuration.profile_id)
+            .context("the selected profile no longer exists")?;
+        ensure_conversation_family(family, profile)?;
+    }
     configuration.approvals_reviewer = record.approvals_reviewer.clone();
     configuration.network_access = record.sandbox_network_access.unwrap_or(false);
     configuration.writable_roots = record.sandbox_writable_roots.clone();
@@ -1033,6 +1071,22 @@ fn configuration_for_record(
         }
     }
     Ok(configuration)
+}
+
+/// Legacy fallback uses launch evidence, never today's global default.
+pub fn conversation_family_for_record(record: &CutexSessionRecord, profiles: &crate::profiles::model::AccountsStore) -> Option<String> {
+    record.provider_family.clone().or_else(|| {
+        record.app_server_runtime.as_ref().and_then(|binding| binding.current_launched_profile())
+            .as_deref().and_then(|name| crate::profiles::settings_api::find(profiles, name))
+            .filter(|profile| profile.cli_kind == crate::profiles::model::CliKind::Codex)
+            .map(|profile| crate::profiles::providers::provider_family(profile).0)
+    })
+}
+
+fn ensure_conversation_family(family: &str, profile: &crate::profiles::model::StoredAccount) -> anyhow::Result<()> {
+    let next=crate::profiles::providers::provider_family(profile).0;
+    ensure!(family==next,"cannot resume this conversation from {family} on {next}: different provider families; fork to a compatible profile or restore its previous profile");
+    Ok(())
 }
 
 /// Configuration is independent of identity. Bootstrap has no durable/native
@@ -1051,6 +1105,7 @@ pub fn bootstrap_configuration(
         Some(spec.approval_policy.clone()),
         Some(&spec.model),
         Some(&spec.reasoning),
+        None,
         false,
     )
 }
@@ -1067,6 +1122,7 @@ pub fn local_bootstrap_configuration(
         Some(spec.approval_policy.clone()),
         Some(&spec.model),
         Some(&spec.reasoning),
+        None,
         true,
     )
 }
@@ -1105,11 +1161,23 @@ pub fn local_configuration_with_selection(
         Some("danger-full-access".into()),
         Some("never".into()),
         model.or(defaults.and_then(|d| d.model.as_ref())).or(inherited.model.as_ref()),
-        reasoning
-            .or(defaults.and_then(|d| d.reasoning.as_ref()))
-            .or(inherited.reasoning.as_ref()),
+        selected_and_default_effort(reasoning, defaults.and_then(|d| d.reasoning.as_ref()), inherited.reasoning.as_ref()).0,
+        selected_and_default_effort(reasoning, defaults.and_then(|d| d.reasoning.as_ref()), inherited.reasoning.as_ref()).1,
         true,
     )
+}
+
+/// `(selected, default)` effort of a human create: only the creator's own
+/// effort is a selection; the new-session default and the profile's own
+/// effort stay defaults, so one the model does not offer falls back instead
+/// of being refused as if chosen (owner 10-22, design 028 (b)).
+pub(crate) fn selected_and_default_effort<'a>(
+    chosen: Option<&'a String>,
+    new_session_default: Option<&'a String>,
+    profile_default: Option<&'a String>,
+) -> (Option<&'a String>, Option<&'a String>) {
+    let chosen = chosen.filter(|r| !crate::profiles::reasoning::is_default(r));
+    (chosen, new_session_default.or(profile_default))
 }
 
 fn configuration_for_selection(
@@ -1119,9 +1187,13 @@ fn configuration_for_selection(
     approval: Option<String>,
     selected_model: Option<&String>,
     selected_reasoning: Option<&String>,
+    default_reasoning: Option<&String>,
     migration: bool,
 ) -> anyhow::Result<StockConfiguration> {
     use crate::profiles::model::{AccountsStore, CliKind, RuntimeConfig};
+    // A new-session / inherited default effort is a DEFAULT, not a choice:
+    // when the model does not offer it, the review falls back (design 028 (b)).
+    let default_reasoning = default_reasoning.filter(|r| !crate::profiles::reasoning::is_default(r));
     // `default` / empty select the profile default (agent_create, §8.2).
     let selected_reasoning =
         selected_reasoning.filter(|r| !crate::profiles::reasoning::is_default(r));
@@ -1212,6 +1284,9 @@ fn configuration_for_selection(
             raw.clone()
         };
         let mut selected = super::selected_profile::Config::parse(&projected_raw)?;
+        if let Some(default) = default_reasoning {
+            selected.model_reasoning_effort = Some(default.clone());
+        }
         if (selected_model.is_none() && selected.model.is_none())
             || (selected_reasoning.is_none() && selected.model_reasoning_effort.is_none())
         {
@@ -1220,12 +1295,17 @@ fn configuration_for_selection(
                 toml::from_str(&std::fs::read_to_string(home.join("config.toml"))?)?;
             selected.inherit_model_defaults(&shared);
         }
+        let profile_default = selected.model_reasoning_effort.clone();
         let (mut projection, model, reasoning) = selected.review(
             &account.id,
             files.auth_path.clone(),
             selected_model,
             selected_reasoning,
         )?;
+        let effort_fallback = super::selected_profile::EffortFallback::of(&model, selected_reasoning, profile_default, reasoning.as_deref());
+        if let Some(fallback) = &effort_fallback {
+            LAST_EFFORT_FALLBACK.with(|slot| *slot.borrow_mut() = Some(fallback.clone()));
+        }
         if let Some(tui) = &projection.settings.tui {
             projection.status = super::selected_status::Status::review(
                 &files.custom_status_items_path,
@@ -1265,6 +1345,7 @@ fn configuration_for_selection(
             }
         };
         return Ok(StockConfiguration {
+            effort_fallback,
             selected_projection: Some(projection),
             private_chatgpt_auth: None,
             profile_name: name.clone(),
@@ -1390,6 +1471,7 @@ fn configuration_for_selection(
     );
     let reasoning = selected_reasoning
         .cloned()
+        .or(default_reasoning.cloned())
         .or(profile.model_reasoning_effort);
     ensure!(
         reasoning
@@ -1399,6 +1481,7 @@ fn configuration_for_selection(
     );
     use sha2::Digest;
     Ok(StockConfiguration {
+        effort_fallback: None,
         selected_projection: None,
         private_chatgpt_auth,
         profile_name: name.clone(),
@@ -1844,6 +1927,7 @@ mod tests {
             "owner": 3, "directory_device": 4, "directory_inode": 5, "account_sha256": "a".repeat(64)});
         let auth: super::super::chatgpt_auth_file::ReviewedChatgptAuth = serde_json::from_value(value).unwrap();
         let configuration = StockConfiguration {
+            effort_fallback: None,
             selected_projection: None,
             private_chatgpt_auth: Some(auth),
             profile_name: "alpha".into(),
@@ -2050,6 +2134,7 @@ mod permission_profile_tests {
 
     fn configuration(sandbox: &str, network: bool, roots: &[&str]) -> StockConfiguration {
         StockConfiguration {
+            effort_fallback: None,
             selected_projection: None,
             private_chatgpt_auth: None,
             profile_name: "p".into(),
@@ -2179,3 +2264,48 @@ mod inherited_model_catalog_tests {
         assert!(!drop_inherited_model_catalog(home.as_path(), &[]).unwrap());
     }
 }
+
+#[cfg(test)]
+mod human_effort_tests {
+    #[test]
+    fn a_human_create_keeps_profile_and_new_session_efforts_as_defaults() {
+        let (max, high, default) = ("max".to_string(), "high".to_string(), "default".to_string());
+        // Nothing chosen: the profile's `max` is a default the review may replace.
+        assert_eq!(super::selected_and_default_effort(None, None, Some(&max)), (None, Some(&max)));
+        // The new-session default wins over the profile's, still as a default.
+        assert_eq!(super::selected_and_default_effort(None, Some(&high), Some(&max)), (None, Some(&high)));
+        // `default` from a client means the same as nothing chosen.
+        assert_eq!(super::selected_and_default_effort(Some(&default), None, Some(&max)), (None, Some(&max)));
+        // Only the creator's own choice is explicit (and refused if not offered).
+        assert_eq!(super::selected_and_default_effort(Some(&high), None, Some(&max)), (Some(&high), Some(&max)));
+    }
+}
+    #[test]
+    fn a_later_default_change_cannot_bypass_a_cleared_conversations_family() {
+        let mut profile=crate::profiles::lifecycle::new_claude_account("default-profile");
+        profile.cli_kind=crate::profiles::model::CliKind::Codex;
+        profile.source=Some("official".into());
+        assert!(ensure_conversation_family("deepseek",&profile).unwrap_err().to_string().contains("different provider families"));
+        ensure_conversation_family(crate::profiles::providers::FAMILY_OPENAI_CHATGPT,&profile).unwrap();
+    }
+
+    #[test]
+    fn legacy_launch_family_survives_default_changes_and_runtime_clear() {
+        let mut profile = crate::profiles::lifecycle::new_claude_account("original");
+        profile.cli_kind = crate::profiles::model::CliKind::Codex;
+        profile.source = Some("official".into());
+        let profiles = crate::profiles::model::AccountsStore { version: 3, accounts: vec![profile], active_account_id: None };
+        let mut record = CutexSessionRecord::new_at("cutex.family-test".into(), None, "test".into(), "/tmp".into(), None, "2026-10-24T00:00:00Z".into()).unwrap();
+        record.app_server_runtime = Some(serde_json::from_value(serde_json::json!({
+            "transport":"unix_socket", "endpoint":"fake", "pid":1, "runtime_dir":"fake", "launched_profile":"original",
+            "diagnostic_journal_path":"fake", "schema_version":"v2", "schema_sha256":"fake", "started_at":"2026-10-24T00:00:00Z"
+        })).unwrap());
+        let family = conversation_family_for_record(&record, &profiles).unwrap();
+        assert_eq!(family, crate::profiles::providers::FAMILY_OPENAI_CHATGPT);
+        // The frozen family wins even when launch evidence later disappears or changes.
+        record.provider_family = Some("deepseek".into());
+        crate::session::runtime_reconciliation::clear_runtime_fields(&mut record, false);
+        assert!(record.app_server_runtime.is_none());
+        assert_eq!(conversation_family_for_record(&record, &profiles).as_deref(), Some("deepseek"));
+        assert!(ensure_conversation_family("deepseek", &profiles.accounts[0]).is_err());
+    }

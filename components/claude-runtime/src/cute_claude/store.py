@@ -361,6 +361,10 @@ class Store:
         """Mark pending notes as read into `turn_id` (at most once) and record
         their timeline items: [(item, model frame)], oldest first."""
         with self.transaction():
+            # A turn that already ended takes none: its end settled its notes
+            # (ExternalInputService.settle_notes) and a later one would stick.
+            if not self.db.execute("SELECT 1 FROM turns WHERE id=? AND thread_id=? AND state='inProgress'", (turn_id, tid)).fetchone():
+                return []
             return self._take_notes(tid, turn_id)
 
     def _take_notes(self, tid: str, turn_id: str) -> list[tuple[dict, str]]:

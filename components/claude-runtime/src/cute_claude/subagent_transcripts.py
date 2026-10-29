@@ -1,4 +1,4 @@
-"""Read-only transcripts of foreground Agent/Task subagents (P2, `features.subagentTranscripts`).
+"""Read-only transcripts of Agent/Task subagents (P2, `features.subagentTranscripts`).
 
 Claude Code forwards a subagent's messages on the parent's stream with
 ``parent_tool_use_id`` = the spawning Agent/Task ``tool_use`` id (with
@@ -22,6 +22,14 @@ a bounded, presentation-only copy per subagent so a frontend can open it:
   thread's subscribers only (never stored as parent events, never observed by
   the parent's input bookkeeping).
 
+Background subagents (claude-r23, ``input.backgroundSubagents``): a run spawned
+with ``run_in_background`` (``background = 1``) stays open after its turn ends;
+it closes on the SDK task's terminal status (``background_ended``). Its stream
+messages keep arriving while no adapter turn runs and land here as well. The
+model usage of its messages (by API message id) is summed per run for the
+origin turn (``take_usage``). A run left open by an earlier adapter process is
+reported lost to the parent on the next ``thread/resume`` (``lost_notices``).
+
 Bounds: ``MAX_ITEMS`` items per subagent (later ones are dropped, the run is
 marked truncated), ``MAX_RUNS`` subagents per thread (oldest pruned), text
 blocks cut at ``TEXT_BYTES``; tool items carry the same bounded previews as the
@@ -43,6 +51,7 @@ MAX_RUNS = 100
 TEXT_BYTES = 65536
 REF_PREFIX = 'claude:'
 TERMINAL = {'completed', 'failed', 'interrupted'}
+USAGE_KEYS = {'input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'}
 
 
 def field(obj: Any, key: str, default: Any = None) -> Any:
@@ -80,20 +89,42 @@ class SubagentTranscripts:
             started REAL NOT NULL, completed REAL)''')
         db.execute('CREATE INDEX IF NOT EXISTS subagent_runs_task ON subagent_runs(session_id,task_id)')
         db.execute('CREATE INDEX IF NOT EXISTS subagent_runs_thread ON subagent_runs(thread_id,started)')
+        if 'background' not in {row[1] for row in db.execute('PRAGMA table_info(subagent_runs)')}:
+            db.execute('ALTER TABLE subagent_runs ADD COLUMN background INTEGER NOT NULL DEFAULT 0')
         db.execute('''CREATE TABLE IF NOT EXISTS subagent_items(
             seq INTEGER PRIMARY KEY AUTOINCREMENT, call_id TEXT NOT NULL, item_id TEXT NOT NULL,
             thread_id TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(call_id,item_id))''')
         # A run still open from an earlier adapter process lost its child.
         with self.store.transaction():
-            for row in db.execute("SELECT call_id FROM subagent_runs WHERE status='running'").fetchall():
-                self._close_items(row[0], 'Adapter restarted while the subagent was running.')
+            lost = db.execute("SELECT * FROM subagent_runs WHERE status='running'").fetchall()
+            for row in lost:
+                self._close_items(row['call_id'], 'Adapter restarted while the subagent was running.')
             db.execute("UPDATE subagent_runs SET status='interrupted',completed=? WHERE status='running'", (time.time(),))
+        self.lost_notices([row for row in lost if row['background'] and row['task_id']])
         # In-memory correlation (per adapter process): child tool id -> spawning call id
         # (stream) and child tool id -> child agent id (hooks), plus child agent ids
         # whose spawning call is not known yet.
         self.child_calls: dict[str, str] = {}
         self.child_agents: dict[str, str] = {}
         self.unlinked: dict[str, tuple[str, str, str]] = {}  # agent id -> (tid, sid, turn id)
+        # Background runs: call id -> {API message id: usage counts} (max per message:
+        # Claude Code repeats a message's usage on each of its content blocks).
+        self.usage: dict[str, dict[str, dict]] = {}
+
+    def lost_notices(self, rows) -> None:
+        """Background runs an earlier adapter process left open: the parent hears
+        of them once a client resumes its thread (``Store.recovered_events``)."""
+        from .runtime_tasks import notice
+        for row in rows:
+            task = {'taskId': row['task_id'], 'turnId': row['turn_id'], 'taskType': 'local_agent',
+                    'status': 'lost', 'background': True, 'toolUseId': row['call_id']}
+            if row['description']:
+                task['description'] = row['description']
+            task['notifyParent'] = notice(task, 'lost', None, transcript=self.thread_ref(row),
+                                          reason='The Claude runtime restarted while it ran.')
+            params = self.store.stamp_event('claude/task/updated', {'threadId': row['thread_id'], 'task': task})
+            self.store.event(row['thread_id'], 'claude/task/updated', params)
+            self.store.recovered_events.setdefault(row['thread_id'], []).append(('claude/task/updated', params))
 
     # ----- identity -------------------------------------------------------
 
@@ -125,16 +156,16 @@ class SubagentTranscripts:
 
     # ----- lifecycle --------------------------------------------------------
 
-    async def start(self, tid: str, sid: str, turn_id: str, call_id: str, arguments: dict) -> None:
-        """The main agent spawned a foreground subagent (PreToolUse admitted the call)."""
+    async def start(self, tid: str, sid: str, turn_id: str, call_id: str, arguments: dict, *, background: bool = False) -> None:
+        """The main agent spawned a subagent (PreToolUse admitted the call)."""
         if not isinstance(call_id, str) or not call_id or len(call_id) > 256 or self._row(call_id) is not None:
             return
         text = lambda key, limit: str(arguments.get(key))[:limit] if isinstance(arguments.get(key), str) else None
         now = time.time()
         with self.store.transaction():
-            self.store.db.execute('''INSERT INTO subagent_runs(call_id,thread_id,session_id,turn_id,agent_type,description,prompt,status,started)
-                VALUES(?,?,?,?,?,?,?,'running',?)''', (call_id, tid, sid, turn_id, text('subagent_type', 200),
-                                                       text('description', 500), text('prompt', TEXT_BYTES), now))
+            self.store.db.execute('''INSERT INTO subagent_runs(call_id,thread_id,session_id,turn_id,agent_type,description,prompt,status,started,background)
+                VALUES(?,?,?,?,?,?,?,'running',?,?)''', (call_id, tid, sid, turn_id, text('subagent_type', 200),
+                                                       text('description', 500), text('prompt', TEXT_BYTES), now, int(background)))
             self._prune(tid)
         prompt = text('prompt', TEXT_BYTES)
         if prompt:
@@ -147,6 +178,7 @@ class SubagentTranscripts:
         for row in old:
             self.store.db.execute('DELETE FROM subagent_items WHERE call_id=?', (row[0],))
             self.store.db.execute('DELETE FROM subagent_runs WHERE call_id=?', (row[0],))
+            self.usage.pop(row[0], None)
 
     async def link(self, call_id: Any, task_id: Any) -> None:
         """Ties the SDK task / child agent id to its spawning call (first link wins)."""
@@ -217,15 +249,45 @@ class SubagentTranscripts:
             self.child_agents[tool_call_id] = agent_id
 
     async def finished(self, call_id: str, success: bool, *, declined: bool = False) -> None:
-        """The spawning Agent/Task call completed (its result is the subagent's answer)."""
+        """The spawning Agent/Task call completed (its result is the subagent's answer).
+
+        A background spawn completes at launch ("Async agent launched"): its run
+        stays open until the SDK task ends (``background_ended``)."""
         row = self._row(call_id) if isinstance(call_id, str) else None
-        if row is None or row['status'] in TERMINAL:
+        if row is None or row['status'] in TERMINAL or (row['background'] and success):
             return
         await self._close(row, 'completed' if success else ('interrupted' if declined else 'failed'))
 
+    def set_background(self, call_id: Any, background: bool) -> None:
+        """The task-start frame says whether the spawn really runs in the background."""
+        if isinstance(call_id, str):
+            self.store.db.execute("UPDATE subagent_runs SET background=? WHERE call_id=? AND status='running'",
+                                  (int(background), call_id))
+
+    async def background_ended(self, sid: str, task_id: str, status: str, note: str | None = None) -> None:
+        """The SDK task of a background run reached a terminal status."""
+        row = self.store.db.execute("SELECT * FROM subagent_runs WHERE session_id=? AND task_id=? AND background=1 "
+                                    "AND status='running'", (sid, task_id)).fetchone()
+        if row is not None:
+            await self._close(row, {'completed': 'completed', 'failed': 'failed'}.get(status, 'interrupted'), note=note)
+
+    def take_usage(self, sid: str, task_id: str) -> dict | None:
+        """Summed model usage of a background run's messages (taken once)."""
+        row = self.store.db.execute('SELECT call_id FROM subagent_runs WHERE session_id=? AND task_id=?',
+                                    (sid, task_id)).fetchone()
+        seen = self.usage.pop(row[0], None) if row else None
+        if not seen:
+            return None
+        total: dict[str, int] = {}
+        for counts in seen.values():
+            for key, value in counts.items():
+                total[key] = total.get(key, 0) + value
+        return total
+
     async def turn_ended(self, tid: str, turn_id: str) -> None:
-        rows = self.store.db.execute("SELECT * FROM subagent_runs WHERE thread_id=? AND turn_id=? AND status='running'",
-                                     (tid, turn_id)).fetchall()
+        # A linked background run outlives its turn; one never launched does not.
+        rows = self.store.db.execute("""SELECT * FROM subagent_runs WHERE thread_id=? AND turn_id=? AND status='running'
+            AND NOT (background=1 AND task_id IS NOT NULL)""", (tid, turn_id)).fetchall()
         for row in rows:
             await self._close(row, 'interrupted', note='The turn ended before the subagent finished.')
         for agent_id in [a for a, entry in self.unlinked.items() if entry[0] == tid and entry[2] == turn_id]:
@@ -274,6 +336,8 @@ class SubagentTranscripts:
             content = message['message'].get('content')
         if not isinstance(content, list):
             return True
+        if row['background'] and typ in {'assistant', 'AssistantMessage'}:
+            self._note_usage(call_id, message)
         uuid = field(message, 'uuid')
         base = uuid if isinstance(uuid, str) and uuid else f'{call_id}:{self._count(call_id)}'
         for index, block in enumerate(content):
@@ -304,6 +368,19 @@ class SubagentTranscripts:
                 if isinstance(tool_id, str):
                     await self._complete(call_id, tool_id, field(block, 'content'), not field(block, 'is_error', False))
         return True
+
+    def _note_usage(self, call_id: str, message: Any) -> None:
+        usage = field(message, 'usage')
+        if usage is None and isinstance(field(message, 'message'), dict):
+            usage = message['message'].get('usage')
+        key = field(message, 'message_id') or field(message, 'uuid')
+        if not isinstance(usage, dict) or not isinstance(key, str):
+            return
+        counts = {k: v for k, v in usage.items() if k in USAGE_KEYS and type(v) is int and v >= 0}
+        seen = self.usage.setdefault(call_id, {})
+        if counts and (key in seen or len(seen) < 4096):
+            old = seen.get(key, {})
+            seen[key] = {k: max(v, old.get(k, 0)) for k, v in counts.items()}
 
     def _tool_item(self, name: str, arguments: dict, tool_id: str) -> dict:
         # The parent timeline's projection (presentation only; nothing runs here).

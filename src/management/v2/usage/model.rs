@@ -222,6 +222,10 @@ pub struct UsageSample {
     pub model_context_window: Option<u64>,
     #[serde(default)]
     pub compaction_count: Option<u64>,
+    /// Model requests this row covers when it is not one (a Claude turn
+    /// reports its SDK steps, `tokenUsage.modelRequests`); absent = 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_requests: Option<u64>,
     pub tokens: TokenUsageBreakdown,
     pub cumulative_total: TokenUsageBreakdown,
 }
@@ -529,6 +533,10 @@ pub(super) struct UsageStateFile {
     pub updated_at: Option<String>,
     #[serde(default)]
     pub sessions: HashMap<String, SessionUsageState>,
+    /// Session IDs are never reused. Keep deletion fences so delayed native
+    /// events cannot recreate a baseline and charge the whole counter again.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub deleted_sessions: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub reset_windows: Vec<ResetWindowState>,
     #[serde(default)]
@@ -543,6 +551,7 @@ impl Default for UsageStateFile {
             observed_since: None,
             updated_at: None,
             sessions: HashMap::new(),
+            deleted_sessions: Default::default(),
             reset_windows: Vec::new(),
             pending_entries: Vec::new(),
         }

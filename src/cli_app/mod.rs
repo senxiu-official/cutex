@@ -14,13 +14,16 @@ mod app_server_runtime;
 mod app_server_state_sync;
 mod app_server_user_input;
 mod asks_claude;
+mod asks_dsh;
 mod asks_runtime;
 mod auth;
 mod human;
 mod claude_runtime;
 mod claude_quota_continue;
+mod model_overload_retry;
 mod claude_ingress;
 mod claude_structure;
+mod dsh_structure;
 mod claude_repin;
 mod claude_account_cli;
 mod human_diagnostics;
@@ -45,6 +48,7 @@ mod management_focus;
 mod management_lifecycle;
 mod notify;
 mod status_preferences;
+mod storage_cli;
 mod service_control;
 mod thread_titles;
 mod side_chats;
@@ -63,6 +67,7 @@ mod session_management;
 mod session_native_workflow;
 mod session_history;
 mod session_delete;
+mod session_delete_cli;
 mod session_fork;
 mod session_presenter;
 mod session_reconcile;
@@ -103,6 +108,7 @@ pub(crate) use app::run;
 
 pub(crate) fn json_process_error(error: &anyhow::Error) -> Option<serde_json::Value> {
     session_archive::json_process_error(error)
+        .or_else(|| session_delete_cli::json_process_error(error))
 }
 
 mod light_new;

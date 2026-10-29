@@ -468,3 +468,23 @@ async def test_fork_with_only_queued_notes_keeps_every_turn_without_closing(nati
     assert result['forkedThroughTurnId'] == n.turns[1] and result['sourceRuntimeUntouched'] is True
     assert len(History(n.store).full_read(result['threadId'])) == 2
     assert n.store.pending_notes(n.tid) == 1 and n.store.pending_notes(result['threadId']) == 0
+
+
+@pytest.mark.parametrize('effort', ['low', None])
+async def test_profile_fork_uses_target_defaults_not_source_interactive_overrides(native, tmp_path, effort):
+    native.store.db.execute('CREATE TABLE IF NOT EXISTS thread_efforts(thread_id TEXT PRIMARY KEY, effort TEXT)')
+    native.store.db.execute('CREATE TABLE IF NOT EXISTS thread_launch_models(thread_id TEXT PRIMARY KEY, model TEXT NOT NULL)')
+    native.store.db.execute('INSERT OR REPLACE INTO thread_efforts VALUES(?,?)', (native.tid, 'max'))
+    native.store.db.execute('INSERT OR REPLACE INTO thread_launch_models VALUES(?,?)', (native.tid, 'old-model'))
+    child = identifier()
+    result = await native.ops.fork(native.tid, {'targetThreadId': child, 'targetStateDir': str(tmp_path / 'profile-fork'),
+        'launchDefaults': {'model': 'target-model', 'effort': effort}})
+    forked = Store(Path(result['stateDir']))
+    try:
+        assert forked.thread(child)['model'] == 'target-model'
+        assert forked.db.execute('SELECT model FROM thread_launch_models WHERE thread_id=?', (child,)).fetchone()[0] == 'target-model'
+        row = forked.db.execute('SELECT effort FROM thread_efforts WHERE thread_id=?', (child,)).fetchone()
+        assert (row[0] if row else None) == effort
+        assert native.store.db.execute('SELECT effort FROM thread_efforts WHERE thread_id=?', (native.tid,)).fetchone()[0] == 'max'
+    finally:
+        forked.close()

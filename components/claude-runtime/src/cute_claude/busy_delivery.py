@@ -106,6 +106,40 @@ class BusyDelivery:
         await self.server.engine.emit(tid, 'item/started', {'threadId': tid, 'turnId': turn_id, 'item': item})
         await self.server.engine.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})
 
+    def continue_quota_notes(self, tid, turn_id):
+        """Carry quota-stopped agent notes into a fresh owner instruction.
+
+        An offered hook is not a context receipt. Re-present only agent notes,
+        with their original identities, so the new SDK result can acknowledge
+        them. Never retry tools, delegations, owner steers or uncertain crashes.
+        """
+        frames = []
+        with self.store.transaction():
+            active = self.store.db.execute("SELECT 1 FROM turns WHERE thread_id=? AND id=? AND state='inProgress'", (tid, turn_id)).fetchone()
+            thread = self.store.thread(tid)
+            if not active or thread['halted'] or thread['archived'] or tid in self.store.history_mutations:
+                return frames
+            rows = self.store.db.execute('''SELECT i.*,b.context_turn_id AS previous_context_turn FROM inputs i JOIN busy_inputs b
+                ON b.thread_id=i.thread_id AND b.message_id=i.message_id
+                JOIN turns t ON t.thread_id=i.thread_id AND t.id=b.context_turn_id
+                WHERE i.thread_id=? AND i.state IN ('failed','interrupted')
+                  AND t.state IN ('failed','interrupted') AND t.reverted=0
+                  AND json_extract(t.error,'$.codexErrorInfo')='usageLimitExceeded'
+                  AND b.offered=1 AND b.persisted=0
+                  AND json_extract(i.payload,'$.source.kind')='agent'
+                  AND json_extract(i.payload,'$.eventType')='agent_message'
+                ORDER BY i.seq LIMIT ?''', (tid, self.server.settings.max_pending)).fetchall()
+            for row in rows:
+                payload = json.loads(row['payload'])
+                # One item identity per inbox message. Move its unacknowledged
+                # claim projection; the old turn's event journal remains intact.
+                self.store.db.execute('UPDATE items SET turn_id=? WHERE turn_id=? AND id=?', (turn_id, row['previous_context_turn'], row['message_id']))
+                self.store.put_item(turn_id, self.store.external_item(row['message_id'], payload))
+                self.store.db.execute("UPDATE inputs SET state='injecting' WHERE seq=?", (row['seq'],))
+                self.store.db.execute('UPDATE busy_inputs SET context_turn_id=? WHERE thread_id=? AND message_id=?', (turn_id, tid, row['message_id']))
+                frames.append(self.store.project_input(payload)[0]['text'])
+        return frames
+
     async def acknowledge(self, tid, turn_id):
         """Called only when the SDK successfully completes the consuming turn.
 

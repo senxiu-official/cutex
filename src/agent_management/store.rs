@@ -169,6 +169,11 @@ impl AgentManagementStore {
         .map_err(anyhow::Error::new)
     }
 
+    /// The store directory (receipt files live next to the store).
+    pub(crate) fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     pub fn snapshot(&self) -> Result<AgentManagementSnapshot, AgentManagementError> {
         // Read-only: hand out the loaded state itself (no second copy).
         self.with_state(false, |state| Ok((AgentManagementSnapshot::empty(), state, false)))
@@ -200,7 +205,8 @@ impl AgentManagementStore {
             .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
         match FileExt::try_lock_exclusive(&lock) {
             Ok(()) => Ok(Some(lock)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            // Windows reports a held lock as ERROR_LOCK_VIOLATION, not WouldBlock.
+            Err(error) if crate::platform::file_lock::lock_contended(&error) => Ok(None),
             Err(_) => Err(AgentManagementError::PersistenceUnavailable),
         }
     }
@@ -358,8 +364,10 @@ fn write_snapshot(
     snapshot: &AgentManagementSnapshot,
 ) -> Result<(), AgentManagementError> {
     invalidate_snapshot_cache();
+    crate::director_address::invalidate_authority_cache();
     write_private_pretty_json_atomic(&root.join(STORE_FILE), snapshot, "agent management store")
         .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+    crate::director_address::invalidate_authority_cache();
     #[cfg(unix)]
     File::open(root)
         .and_then(|directory| directory.sync_all())
@@ -426,6 +434,21 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.snapshot().unwrap().store_revision, 7);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn delivery_try_lock_reports_a_held_mutation_lock_as_busy() {
+        let root = std::env::temp_dir().join(format!(
+            "cutex-agent-management-try-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = AgentManagementStore::open(&root).expect("open");
+        let held = store.lock_mutations().expect("lock");
+        // Windows: ERROR_LOCK_VIOLATION (33) is busy, not PersistenceUnavailable.
+        assert!(store.try_lock_delivery_mutations().expect("busy, not an error").is_none());
+        drop(held);
+        assert!(store.try_lock_delivery_mutations().expect("free").is_some());
         fs::remove_dir_all(root).expect("cleanup");
     }
 

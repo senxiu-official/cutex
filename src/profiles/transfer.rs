@@ -45,7 +45,7 @@ pub const BUNDLE_SCHEMA_VERSION: u64 = 1;
 pub const AUDIT_DIR: &str = "profile-transfer";
 
 /// Store-record keys never exported (identity, derived state, host-local ids).
-const IDENTITY_KEYS: &[&str] = &["id", "name", "email", "last_used_at", "claude_account"];
+const IDENTITY_KEYS: &[&str] = &["id", "name", "email", "last_used_at", "claude_account", "kimi_account"];
 
 /// The credential a profile uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +129,8 @@ fn unsupported(message: impl Into<String>) -> TransferError {
 /// The parsed `auth.json` of a Codex profile (never logged).
 fn read_auth(account: &StoredAccount) -> anyhow::Result<Option<Value>> {
     let files = materialized_account_files(account)?;
-    Ok(read_optional_text(&files.auth_path)?.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()))
+    Ok(read_optional_text(&files.auth_path)?
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok()))
 }
 
 fn api_key_of(auth: &Value) -> Option<&str> {
@@ -142,6 +143,7 @@ fn api_key_of(auth: &Value) -> Option<&str> {
 
 /// Which credential `account` uses (from its auth.json, else its source).
 pub fn credential_kind(account: &StoredAccount) -> CredentialKind {
+    if account.cli_kind == CliKind::Dsh || account.cli_kind == CliKind::Kimi { return CredentialKind::None; }
     if account.cli_kind == CliKind::Claude {
         return CredentialKind::Claude;
     }
@@ -174,9 +176,14 @@ fn url_has_userinfo(url: &str) -> bool {
 /// Secrets that may sit in the profile part of `config.toml`. Removed unless
 /// credentials travel; returns the dropped field paths.
 fn strip_config_secrets(root: &mut toml::value::Table, dropped: &mut Vec<String>) {
-    if let Some(providers) = root.get_mut("model_providers").and_then(toml::Value::as_table_mut) {
+    if let Some(providers) = root
+        .get_mut("model_providers")
+        .and_then(toml::Value::as_table_mut)
+    {
         for (id, provider) in providers.iter_mut() {
-            let Some(provider) = provider.as_table_mut() else { continue };
+            let Some(provider) = provider.as_table_mut() else {
+                continue;
+            };
             for key in ["experimental_bearer_token", "http_headers"] {
                 if provider.remove(key).is_some() {
                     dropped.push(format!("model_providers.{id}.{key}"));
@@ -184,14 +191,21 @@ fn strip_config_secrets(root: &mut toml::value::Table, dropped: &mut Vec<String>
             }
         }
     }
-    if let Some(policy) = root.get_mut("shell_environment_policy").and_then(toml::Value::as_table_mut) {
+    if let Some(policy) = root
+        .get_mut("shell_environment_policy")
+        .and_then(toml::Value::as_table_mut)
+    {
         if policy.remove("set").is_some() {
             dropped.push("shell_environment_policy.set".into());
         }
     }
 }
 
-fn export_codex(account: &StoredAccount, with_secrets: bool, dropped: &mut Vec<String>) -> anyhow::Result<Value> {
+fn export_codex(
+    account: &StoredAccount,
+    with_secrets: bool,
+    dropped: &mut Vec<String>,
+) -> anyhow::Result<Value> {
     let files = materialized_account_files(account)?;
     let profile_toml = match read_optional_text(&files.config_path)? {
         Some(raw) => extract_profile_config_toml(&raw)?,
@@ -242,22 +256,31 @@ pub struct Export {
 /// secrets are included; a ChatGPT login never is.
 pub fn export_profile(profile: &str, include_credentials: bool) -> Result<Export, TransferError> {
     let store = load_store()?;
-    let account = find(&store, profile).cloned().ok_or(TransferError::NotFound)?;
+    let account = find(&store, profile)
+        .cloned()
+        .ok_or(TransferError::NotFound)?;
     let kind = credential_kind(&account);
     let mut dropped: Vec<String> = Vec::new();
 
     let mut record = serde_json::to_value(&account).map_err(anyhow::Error::from)?;
-    let object = record.as_object_mut().ok_or_else(|| anyhow::anyhow!("profile record is not an object"))?;
+    let object = record
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("profile record is not an object"))?;
     for key in IDENTITY_KEYS {
         object.remove(*key);
     }
+    strip_link_metadata(object);
     if account.source.as_deref() != Some("api-key") {
         // ChatGPT plan / its label belong to the login, not the settings.
         object.remove("plan_type");
         object.remove("plan_label");
     }
     if !include_credentials
-        && account.proxy.as_ref().and_then(|proxy| proxy.url.as_deref()).is_some_and(url_has_userinfo)
+        && account
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.url.as_deref())
+            .is_some_and(url_has_userinfo)
     {
         object.remove("proxy");
         dropped.push("proxy".into());
@@ -265,13 +288,17 @@ pub fn export_profile(profile: &str, include_credentials: bool) -> Result<Export
 
     let codex = match account.cli_kind {
         CliKind::Codex => export_codex(&account, include_credentials, &mut dropped)?,
-        CliKind::Claude => Value::Null,
+        CliKind::Claude | CliKind::Dsh | CliKind::Kimi => Value::Null,
     };
     let claude_account = match account.claude_account.as_deref() {
         None | Some(claude_accounts::DEFAULT_ACCOUNT_ID) => Value::Null,
         Some(id) => claude_accounts::load()
             .ok()
-            .and_then(|registry| registry.find(id).map(|found| json!({ "label": found.label, "kind": found.kind.as_str() })))
+            .and_then(|registry| {
+                registry
+                    .find(id)
+                    .map(|found| json!({ "label": found.label, "kind": found.kind.as_str() }))
+            })
             .unwrap_or(Value::Null),
     };
 
@@ -313,7 +340,10 @@ pub fn export_profile(profile: &str, include_credentials: bool) -> Result<Export
 
 enum CatalogPart {
     Local(Value),
-    Selected { json: Value, overlay: Option<Overlay> },
+    Selected {
+        json: Value,
+        overlay: Option<Overlay>,
+    },
 }
 
 struct ParsedBundle {
@@ -331,7 +361,9 @@ fn catalog_json(value: &Value) -> Result<Value, TransferError> {
     if value.get("models").is_some_and(Value::is_array) {
         Ok(value.clone())
     } else {
-        Err(unsupported("codex.catalog.json: a model catalog object with a models array is required"))
+        Err(unsupported(
+            "codex.catalog.json: a model catalog object with a models array is required",
+        ))
     }
 }
 
@@ -367,10 +399,19 @@ fn parse_catalog(value: Option<&Value>) -> Result<Option<CatalogPart>, TransferE
 
 fn parse_api_key(credentials: &Value) -> Result<ApiKey, TransferError> {
     if credentials.get("kind").and_then(Value::as_str) != Some("apiKey") {
-        return Err(unsupported("credentials.kind: only apiKey credentials can be imported"));
+        return Err(unsupported(
+            "credentials.kind: only apiKey credentials can be imported",
+        ));
     }
-    let key = credentials.get("apiKey").and_then(Value::as_str).map(str::trim).unwrap_or_default();
-    if key.is_empty() || key.len() > MAX_API_KEY_BYTES || key.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    let key = credentials
+        .get("apiKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if key.is_empty()
+        || key.len() > MAX_API_KEY_BYTES
+        || key.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
         return Err(TransferError::Invalid(format!(
             "credentials.apiKey: must be 1-{MAX_API_KEY_BYTES} non-whitespace characters"
         )));
@@ -378,10 +419,23 @@ fn parse_api_key(credentials: &Value) -> Result<ApiKey, TransferError> {
     Ok(ApiKey(key.to_string()))
 }
 
+// Associations and observation clocks belong to the owner/host, not portable configuration.
+// Strip raw JSON before deserialization too: even malformed untrusted metadata must not be adopted.
+fn strip_link_metadata(record: &mut Map<String, Value>) {
+    if let Some(options) = record.get_mut("options").and_then(Value::as_object_mut) {
+        options.remove("account_link");
+        options.remove("appearance_updated_at");
+    }
+}
+
 fn parse_bundle(bundle: &Value) -> Result<ParsedBundle, TransferError> {
-    let bundle = bundle.as_object().ok_or_else(|| TransferError::Invalid("bundle: JSON object required".into()))?;
+    let bundle = bundle
+        .as_object()
+        .ok_or_else(|| TransferError::Invalid("bundle: JSON object required".into()))?;
     if bundle.get("format").and_then(Value::as_str) != Some(BUNDLE_FORMAT) {
-        return Err(unsupported(format!("bundle.format: must be {BUNDLE_FORMAT}")));
+        return Err(unsupported(format!(
+            "bundle.format: must be {BUNDLE_FORMAT}"
+        )));
     }
     match bundle.get("schemaVersion").and_then(Value::as_u64) {
         Some(BUNDLE_SCHEMA_VERSION) => {}
@@ -396,26 +450,46 @@ fn parse_bundle(bundle: &Value) -> Result<ParsedBundle, TransferError> {
         .get("credentialKind")
         .and_then(Value::as_str)
         .and_then(CredentialKind::parse)
-        .ok_or_else(|| unsupported("bundle.credentialKind: must be apiKey, chatgpt, claude or none"))?;
+        .ok_or_else(|| {
+            unsupported("bundle.credentialKind: must be apiKey, chatgpt, claude or none")
+        })?;
     let mut record: Map<String, Value> = match bundle.get("profile") {
         Some(Value::Object(record)) => record.clone(),
-        _ => return Err(unsupported("bundle.profile: profile record object required")),
+        _ => {
+            return Err(unsupported(
+                "bundle.profile: profile record object required",
+            ))
+        }
     };
     for key in IDENTITY_KEYS {
         record.remove(*key);
     }
+    strip_link_metadata(&mut record);
     // Placeholders, replaced by the import.
     record.insert("id".into(), json!(uuid::Uuid::new_v4().to_string()));
     record.insert("name".into(), json!("imported"));
     // Generic message: serde errors may quote values.
-    let account: StoredAccount = serde_json::from_value(Value::Object(record)).map_err(|_| {
+    let mut account: StoredAccount = serde_json::from_value(Value::Object(record)).map_err(|_| {
         unsupported("bundle.profile: not a profile record this cutex reads (unknown CLI kind, runtime or field type)")
     })?;
+    if account.cli_kind == CliKind::Dsh {
+        account.options.dsh.validate().map_err(|_| TransferError::Invalid("bundle.profile.options.dsh: invalid DSH options".into()))?;
+    }
+    if let Some(style) = &account.options.avatar_style {
+        account.options.avatar_style = Some(crate::profiles::avatar::normalize_avatar_style(style)
+            .map_err(|_| TransferError::Invalid("bundle.profile.options.avatar_style: invalid avatar style".into()))?);
+    }
 
     let claude = match bundle.get("claudeAccount") {
         Some(Value::Object(claude)) => {
-            let label = claude.get("label").and_then(Value::as_str).map(str::to_string);
-            let kind = claude.get("kind").and_then(Value::as_str).and_then(ClaudeAccountKind::parse);
+            let label = claude
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let kind = claude
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(ClaudeAccountKind::parse);
             label.zip(kind)
         }
         _ => None,
@@ -431,15 +505,25 @@ fn parse_bundle(bundle: &Value) -> Result<ParsedBundle, TransferError> {
                 if root
                     .get("model_catalog_json")
                     .and_then(toml::Value::as_str)
-                    .is_some_and(|path| !matches!(path.replace('\\', "/").as_str(), "models.json" | "./models.json"))
+                    .is_some_and(|path| {
+                        !matches!(
+                            path.replace('\\', "/").as_str(),
+                            "models.json" | "./models.json"
+                        )
+                    })
                 {
-                    return Err(unsupported("codex.config: model_catalog_json must not name a host path"));
+                    return Err(unsupported(
+                        "codex.config: model_catalog_json must not name a host path",
+                    ));
                 }
                 Some(text.clone())
             }
             Some(_) => return Err(unsupported("codex.config: string or null required")),
         };
-        (config, parse_catalog(codex.and_then(|codex| codex.get("catalog")))?)
+        (
+            config,
+            parse_catalog(codex.and_then(|codex| codex.get("catalog")))?,
+        )
     } else {
         (None, None)
     };
@@ -458,14 +542,29 @@ fn parse_bundle(bundle: &Value) -> Result<ParsedBundle, TransferError> {
     let dropped = bundle
         .get("dropped")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     let source_name = bundle
         .get("source")
         .and_then(|source| source.get("profileName"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    Ok(ParsedBundle { account, kind, api_key, claude, config, catalog, dropped, source_name })
+    Ok(ParsedBundle {
+        account,
+        kind,
+        api_key,
+        claude,
+        config,
+        catalog,
+        dropped,
+        source_name,
+    })
 }
 
 #[derive(Debug)]
@@ -488,10 +587,21 @@ fn write_codex_files(account: &StoredAccount, parsed: &ParsedBundle) -> anyhow::
         Some(CatalogPart::Selected { json, overlay }) => {
             let path = catalog_overlay::write_effective_file(&dir, json)?;
             if let Some(overlay) = overlay {
-                write_private_pretty_json_atomic(&dir.join(catalog_overlay::OVERLAY_FILE), overlay, "imported model overlay")?;
+                write_private_pretty_json_atomic(
+                    &dir.join(catalog_overlay::OVERLAY_FILE),
+                    overlay,
+                    "imported model overlay",
+                )?;
             }
-            let mut root = config.as_deref().map(parse_toml_table).transpose()?.unwrap_or_default();
-            root.insert("model_catalog_json".into(), toml::Value::String(path.to_string_lossy().into_owned()));
+            let mut root = config
+                .as_deref()
+                .map(parse_toml_table)
+                .transpose()?
+                .unwrap_or_default();
+            root.insert(
+                "model_catalog_json".into(),
+                toml::Value::String(path.to_string_lossy().into_owned()),
+            );
             config = Some(toml::to_string_pretty(&root)?);
         }
         Some(CatalogPart::Local(json)) => {
@@ -523,7 +633,12 @@ pub fn import_profile(bundle: &Value, name: &str) -> Result<ImportOutcome, Trans
     account.email = None;
     account.last_used_at = None;
     account.claude_account = None;
+    // r266: a Kimi account is a login of the source host; the owner picks one here.
+    account.variants.kimi_account = None;
     let mut warnings = Vec::new();
+    if account.cli_kind == CliKind::Kimi {
+        warnings.push(json!({ "code": "kimiAccountRequired" }));
+    }
 
     if account.private_chatgpt_auth_file {
         // Bound to the source host's own native auth.json.
@@ -535,10 +650,18 @@ pub fn import_profile(bundle: &Value, name: &str) -> Result<ImportOutcome, Trans
     }
     if parsed.dropped.iter().any(|field| field == "proxy") {
         warnings.push(json!({ "code": "proxyCleared" }));
-    } else if account.proxy.as_ref().is_some_and(|proxy| proxy.url.is_some()) {
+    } else if account
+        .proxy
+        .as_ref()
+        .is_some_and(|proxy| proxy.url.is_some())
+    {
         warnings.push(json!({ "code": "proxyCopied" }));
     }
-    let secret_fields: Vec<&String> = parsed.dropped.iter().filter(|field| *field != "proxy").collect();
+    let secret_fields: Vec<&String> = parsed
+        .dropped
+        .iter()
+        .filter(|field| *field != "proxy")
+        .collect();
     if !secret_fields.is_empty() {
         warnings.push(json!({ "code": "secretFieldsCleared", "fields": secret_fields }));
     }
@@ -546,12 +669,19 @@ pub fn import_profile(bundle: &Value, name: &str) -> Result<ImportOutcome, Trans
     if account.cli_kind == CliKind::Claude {
         let registry = claude_accounts::load()?;
         let matched = parsed.claude.as_ref().and_then(|(label, kind)| {
-            registry.accounts.iter().find(|candidate| candidate.label == *label && candidate.kind == *kind)
+            registry
+                .accounts
+                .iter()
+                .find(|candidate| candidate.label == *label && candidate.kind == *kind)
         });
         let (target_id, target_label, logged_in) = match matched {
             Some(found) => {
                 account.claude_account = Some(found.id.clone());
-                (found.id.clone(), Some(found.label.clone()), found.last_status.as_ref().map(|s| s.logged_in))
+                (
+                    found.id.clone(),
+                    Some(found.label.clone()),
+                    found.last_status.as_ref().map(|s| s.logged_in),
+                )
             }
             None => (
                 claude_accounts::DEFAULT_ACCOUNT_ID.to_string(),
@@ -572,7 +702,9 @@ pub fn import_profile(bundle: &Value, name: &str) -> Result<ImportOutcome, Trans
 
     let credentials_copied = parsed.api_key.is_some();
     match parsed.kind {
-        CredentialKind::Chatgpt => warnings.push(json!({ "code": "needsLogin", "credential": "chatgpt" })),
+        CredentialKind::Chatgpt => {
+            warnings.push(json!({ "code": "needsLogin", "credential": "chatgpt" }))
+        }
         CredentialKind::ApiKey if !credentials_copied => {
             warnings.push(json!({ "code": "needsLogin", "credential": "apiKey" }))
         }
@@ -638,9 +770,100 @@ mod tests {
     fn remove(name: &str) {
         let mut store = load_store().unwrap();
         let account = find(&store, name).unwrap().clone();
-        store.accounts.retain(|candidate| candidate.id != account.id);
+        store
+            .accounts
+            .retain(|candidate| candidate.id != account.id);
         save_store(&store).unwrap();
         lifecycle::remove_profile_dir(&account);
+    }
+
+    #[test]
+    fn portable_avatar_styles_validate_and_copy_without_old_identity_clocks() {
+        let _home = TestHome::new();
+        let source = api_key_profile("avatar-source", "deepseek", None);
+        let exported = export_profile(&source.id, false).unwrap();
+        let mut bundle = exported.bundle.clone();
+        bundle["profile"]["options"]["avatar_style"] = json!({"kind":"portrait","portraitThemes":["https://bad.invalid/theme"]});
+        let before = load_store().unwrap().accounts.len();
+        assert!(import_profile(&bundle, "bad-avatar-import").is_err());
+        assert_eq!(load_store().unwrap().accounts.len(), before);
+        bundle["profile"]["options"]["avatar_style"] = json!({"kind":"emoji","emojiThemes":["cats","sea"]});
+        bundle["profile"]["options"]["appearance_updated_at"] = json!({"avatarStyle":"2026-10-24T00:00:00Z"});
+        let copied = import_profile(&bundle, "valid-avatar-import").unwrap().account;
+        assert_ne!(copied.id, source.id);
+        assert_eq!(serde_json::to_value(copied.options.avatar_style).unwrap(), json!({"kind":"emoji","emojiThemes":["sea","cats"]}));
+        assert!(copied.options.appearance_updated_at.is_empty());
+    }
+
+    #[test]
+    fn portable_export_and_import_drop_manual_links_and_clocks_even_when_malformed() {
+        let _home = TestHome::new();
+        let source = api_key_profile("linked", "deepseek", None);
+        let mut store = load_store().unwrap();
+        let original = store
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == source.id)
+            .unwrap();
+        original.options.account_link = Some("m-AAAAAAAAAAAAAAAAAAAAAA".into());
+        original
+            .options
+            .appearance_updated_at
+            .insert("introGreeting".into(), "2099-01-01T00:00:00.000Z".into());
+        original.options.intro_greeting = Some("portable greeting".into());
+        save_store(&store).unwrap();
+        for include_credentials in [false, true] {
+            let exported = export_profile(&source.id, include_credentials).unwrap();
+            assert!(exported.bundle["profile"]["options"]
+                .get("account_link")
+                .is_none());
+            assert!(exported.bundle["profile"]["options"]
+                .get("appearance_updated_at")
+                .is_none());
+            assert_eq!(
+                exported.bundle["profile"]["options"]["intro_greeting"],
+                "portable greeting"
+            );
+        }
+        let exported = export_profile(&source.id, false).unwrap();
+        for (index, manual) in [
+            json!("none"),
+            json!("m-AAAAAAAAAAAAAAAAAAAAAA"),
+            json!("invalid-manual"),
+            json!({"invalid":"type"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut bundle = exported.bundle.clone();
+            bundle["profile"]["options"]["account_link"] = manual;
+            bundle["profile"]["options"]["appearance_updated_at"] =
+                json!({"color":["malformed clock"]});
+            let imported = import_profile(&bundle, &format!("portable-{index}")).unwrap();
+            assert_eq!(imported.account.options.account_link, None);
+            assert!(imported.account.options.appearance_updated_at.is_empty());
+            assert_eq!(
+                imported.account.options.intro_greeting.as_deref(),
+                Some("portable greeting")
+            );
+            let view = serde_json::to_value(&imported.account).unwrap();
+            assert!(view["options"].get("account_link").is_none());
+            assert!(view["options"].get("appearance_updated_at").is_none());
+        }
+        let persisted = load_store().unwrap();
+        let original = persisted
+            .accounts
+            .iter()
+            .find(|a| a.id == source.id)
+            .unwrap();
+        assert_eq!(
+            original.options.account_link.as_deref(),
+            Some("m-AAAAAAAAAAAAAAAAAAAAAA")
+        );
+        assert_eq!(
+            original.options.appearance_updated_at["introGreeting"],
+            "2099-01-01T00:00:00.000Z"
+        );
     }
 
     #[test]
@@ -654,7 +877,10 @@ mod tests {
         assert!(!plain.credentials_included);
         assert!(!plain.bundle.to_string().contains(KEY));
         assert_eq!(plain.bundle["credentialKind"], "apiKey");
-        assert!(plain.bundle["profile"].get("id").is_none() && plain.bundle["profile"].get("name").is_none());
+        assert!(
+            plain.bundle["profile"].get("id").is_none()
+                && plain.bundle["profile"].get("name").is_none()
+        );
         assert_eq!(plain.bundle["codex"]["catalog"]["kind"], "local");
 
         let with_key = export_profile(&source.id, true).unwrap();
@@ -671,18 +897,28 @@ mod tests {
         assert_eq!(imported.account.options.quota, source.options.quota);
         assert_eq!(imported.account.plan_type, source.plan_type);
         let files = materialized_account_files(&imported.account).unwrap();
-        let auth: Value = serde_json::from_str(&std::fs::read_to_string(&files.auth_path).unwrap()).unwrap();
+        let auth: Value =
+            serde_json::from_str(&std::fs::read_to_string(&files.auth_path).unwrap()).unwrap();
         assert_eq!(auth["OPENAI_API_KEY"], KEY);
         let config = std::fs::read_to_string(&files.config_path).unwrap();
-        assert!(config.contains("model_provider = \"zai\"") && config.contains("glm-5.3"), "{config}");
+        assert!(
+            config.contains("model_provider = \"zai\"") && config.contains("glm-5.3"),
+            "{config}"
+        );
         assert!(files.model_catalog_path.exists());
         assert_eq!(credential_kind(&imported.account), CredentialKind::ApiKey);
 
         // Without the key: the copy needs the key entered again.
         let copy = import_profile(&plain.bundle, "GLM 2").unwrap();
         assert!(!copy.credentials_copied);
-        assert_eq!(copy.warnings, [json!({ "code": "needsLogin", "credential": "apiKey" })]);
-        assert!(!materialized_account_files(&copy.account).unwrap().auth_path.exists());
+        assert_eq!(
+            copy.warnings,
+            [json!({ "code": "needsLogin", "credential": "apiKey" })]
+        );
+        assert!(!materialized_account_files(&copy.account)
+            .unwrap()
+            .auth_path
+            .exists());
     }
 
     #[test]
@@ -690,23 +926,48 @@ mod tests {
         let _home = TestHome::new();
         let source = api_key_profile("ds", "deepseek", Some(KEY));
         let export = export_profile("ds", false).unwrap();
-        assert!(matches!(import_profile(&export.bundle, "ds"), Err(TransferError::NameConflict(_))));
-        assert!(matches!(import_profile(&export.bundle, &source.id), Err(TransferError::NameConflict(_))));
-        assert!(matches!(import_profile(&export.bundle, "a/b"), Err(TransferError::Invalid(_))));
-        assert!(matches!(export_profile("nope", false), Err(TransferError::NotFound)));
+        assert!(matches!(
+            import_profile(&export.bundle, "ds"),
+            Err(TransferError::NameConflict(_))
+        ));
+        assert!(matches!(
+            import_profile(&export.bundle, &source.id),
+            Err(TransferError::NameConflict(_))
+        ));
+        assert!(matches!(
+            import_profile(&export.bundle, "a/b"),
+            Err(TransferError::Invalid(_))
+        ));
+        assert!(matches!(
+            export_profile("nope", false),
+            Err(TransferError::NotFound)
+        ));
 
         let mut newer = export.bundle.clone();
         newer["schemaVersion"] = json!(2);
-        assert!(matches!(import_profile(&newer, "x"), Err(TransferError::Unsupported(_))));
+        assert!(matches!(
+            import_profile(&newer, "x"),
+            Err(TransferError::Unsupported(_))
+        ));
         let mut wrong = export.bundle.clone();
         wrong["format"] = json!("something-else");
-        assert!(matches!(import_profile(&wrong, "x"), Err(TransferError::Unsupported(_))));
+        assert!(matches!(
+            import_profile(&wrong, "x"),
+            Err(TransferError::Unsupported(_))
+        ));
         let mut kind = export.bundle.clone();
         kind["profile"]["cli_kind"] = json!("gemini");
-        assert!(matches!(import_profile(&kind, "x"), Err(TransferError::Unsupported(_))));
+        assert!(matches!(
+            import_profile(&kind, "x"),
+            Err(TransferError::Unsupported(_))
+        ));
         let mut host_path = export.bundle.clone();
-        host_path["codex"]["config"] = json!("model_catalog_json = \"/home/a/.cutex/profiles/x/models-1.json\"\n");
-        assert!(matches!(import_profile(&host_path, "x"), Err(TransferError::Unsupported(_))));
+        host_path["codex"]["config"] =
+            json!("model_catalog_json = \"/home/a/.cutex/profiles/x/models-1.json\"\n");
+        assert!(matches!(
+            import_profile(&host_path, "x"),
+            Err(TransferError::Unsupported(_))
+        ));
         // Unknown fields are ignored (additive schema).
         let mut extra = export.bundle.clone();
         extra["futureField"] = json!({ "a": 1 });
@@ -714,7 +975,14 @@ mod tests {
         import_profile(&extra, "ds copy").expect("unknown fields ignored");
         // Nothing half-written by the refused imports.
         let store = load_store().unwrap();
-        assert_eq!(store.accounts.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["ds", "ds copy"]);
+        assert_eq!(
+            store
+                .accounts
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ds", "ds copy"]
+        );
     }
 
     #[test]
@@ -725,7 +993,8 @@ mod tests {
         bundle["credentials"]["apiKey"] = json!("sk-has space-secret");
         let error = import_profile(&bundle, "k2").unwrap_err().to_string();
         assert!(!error.contains("secret"), "{error}");
-        bundle["credentials"] = json!({ "kind": "chatgpt", "tokens": { "refresh_token": "rt-secret" } });
+        bundle["credentials"] =
+            json!({ "kind": "chatgpt", "tokens": { "refresh_token": "rt-secret" } });
         let error = import_profile(&bundle, "k2").unwrap_err().to_string();
         assert!(!error.contains("rt-secret"), "{error}");
         // A malformed record never echoes values either.
@@ -754,11 +1023,18 @@ mod tests {
         )
         .unwrap();
         let mut store = load_store().unwrap();
-        let stored = store.accounts.iter_mut().find(|a| a.id == source.id).unwrap();
+        let stored = store
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == source.id)
+            .unwrap();
         stored.email = Some("owner@example.test".into());
         stored.plan_type = Some("pro".into());
         stored.private_chatgpt_auth_file = true;
-        stored.runtime = RuntimeConfig::Docker { image: "cutex-dev".into(), user_name: None };
+        stored.runtime = RuntimeConfig::Docker {
+            image: "cutex-dev".into(),
+            user_name: None,
+        };
         stored.proxy = Some(crate::profiles::model::ProxyConfig {
             enabled: true,
             url: Some("http://user:proxy-secret@127.0.0.1:7890".into()),
@@ -771,25 +1047,59 @@ mod tests {
 
         let export = export_profile("work", true).unwrap();
         assert_eq!(export.credential_kind, CredentialKind::Chatgpt);
-        assert!(!export.credentials_included, "a ChatGPT login never travels");
+        assert!(
+            !export.credentials_included,
+            "a ChatGPT login never travels"
+        );
         let text = export.bundle.to_string();
-        for secret in ["id-secret", "at-secret", "rt-secret", "owner@example.test", "\"pro\""] {
+        for secret in [
+            "id-secret",
+            "at-secret",
+            "rt-secret",
+            "owner@example.test",
+            "\"pro\"",
+        ] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
         let plain = export_profile("work", false).unwrap().bundle.to_string();
-        assert!(!plain.contains("proxy-secret") && !plain.contains("env-secret"), "{plain}");
+        assert!(
+            !plain.contains("proxy-secret") && !plain.contains("env-secret"),
+            "{plain}"
+        );
 
-        let imported = import_profile(&export_profile("work", false).unwrap().bundle, "work 2").unwrap();
-        let codes: Vec<_> = imported.warnings.iter().map(|w| w["code"].as_str().unwrap().to_string()).collect();
+        let imported =
+            import_profile(&export_profile("work", false).unwrap().bundle, "work 2").unwrap();
+        let codes: Vec<_> = imported
+            .warnings
+            .iter()
+            .map(|w| w["code"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(
             codes,
-            ["privateAuthReset", "runtimeDockerImage", "proxyCleared", "secretFieldsCleared", "needsLogin"]
+            [
+                "privateAuthReset",
+                "runtimeDockerImage",
+                "proxyCleared",
+                "secretFieldsCleared",
+                "needsLogin"
+            ]
         );
         assert!(!imported.account.private_chatgpt_auth_file);
         assert!(imported.account.proxy.is_none() && imported.account.email.is_none());
-        assert!(!materialized_account_files(&imported.account).unwrap().auth_path.exists());
-        let config = std::fs::read_to_string(materialized_account_files(&imported.account).unwrap().config_path).unwrap();
-        assert!(config.contains("gpt-5.5") && !config.contains("env-secret"), "{config}");
+        assert!(!materialized_account_files(&imported.account)
+            .unwrap()
+            .auth_path
+            .exists());
+        let config = std::fs::read_to_string(
+            materialized_account_files(&imported.account)
+                .unwrap()
+                .config_path,
+        )
+        .unwrap();
+        assert!(
+            config.contains("gpt-5.5") && !config.contains("env-secret"),
+            "{config}"
+        );
     }
 
     #[test]
@@ -800,22 +1110,44 @@ mod tests {
         let catalog = json!({ "models": [{ "slug": "grok-test", "display_name": "Grok test" }] });
         let path = catalog_overlay::write_effective_file(&dir, &catalog).unwrap();
         let files = materialized_account_files(&source).unwrap();
-        let mut root = parse_toml_table(&std::fs::read_to_string(&files.config_path).unwrap()).unwrap();
-        root.insert("model_catalog_json".into(), toml::Value::String(path.to_string_lossy().into_owned()));
+        let mut root =
+            parse_toml_table(&std::fs::read_to_string(&files.config_path).unwrap()).unwrap();
+        root.insert(
+            "model_catalog_json".into(),
+            toml::Value::String(path.to_string_lossy().into_owned()),
+        );
         std::fs::write(&files.config_path, toml::to_string_pretty(&root).unwrap()).unwrap();
-        let overlay = Overlay { version: OVERLAY_VERSION, migrated_from: None, entries: Vec::new() };
-        write_private_pretty_json_atomic(&dir.join(catalog_overlay::OVERLAY_FILE), &overlay, "test overlay").unwrap();
+        let overlay = Overlay {
+            version: OVERLAY_VERSION,
+            migrated_from: None,
+            entries: Vec::new(),
+        };
+        write_private_pretty_json_atomic(
+            &dir.join(catalog_overlay::OVERLAY_FILE),
+            &overlay,
+            "test overlay",
+        )
+        .unwrap();
 
         let export = export_profile("x", false).unwrap();
         assert_eq!(export.bundle["codex"]["catalog"]["kind"], "selected");
         let config = export.bundle["codex"]["config"].as_str().unwrap();
-        assert!(!config.contains("model_catalog_json"), "no host path: {config}");
+        assert!(
+            !config.contains("model_catalog_json"),
+            "no host path: {config}"
+        );
 
         let imported = import_profile(&export.bundle, "x copy").unwrap();
         let state = crate::profiles::catalog_api::load(&imported.account).unwrap();
         assert_eq!(state.catalog.unwrap(), catalog);
-        assert!(state.path.unwrap().starts_with(lifecycle::profile_dir(&imported.account).unwrap()));
-        assert_eq!(catalog_overlay::load(&imported.account).unwrap(), Some(overlay));
+        assert!(state
+            .path
+            .unwrap()
+            .starts_with(lifecycle::profile_dir(&imported.account).unwrap()));
+        assert_eq!(
+            catalog_overlay::load(&imported.account).unwrap(),
+            Some(overlay)
+        );
     }
 
     #[test]
@@ -840,6 +1172,9 @@ mod tests {
         assert_eq!(imported.account.options.claude.model, "opus");
         let warning = &imported.warnings[0];
         assert_eq!(warning["code"], "claudeAccountRebound");
-        assert_eq!((warning["matched"].as_bool(), warning["account"].as_str()), (Some(false), Some("default")));
+        assert_eq!(
+            (warning["matched"].as_bool(), warning["account"].as_str()),
+            (Some(false), Some("default"))
+        );
     }
 }

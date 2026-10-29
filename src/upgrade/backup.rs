@@ -38,9 +38,18 @@ pub const STATE_DIRS: &[&str] = &[
     "profiles",
     "services",
     "claude-accounts",
+    // r265 write-only stored profile keys (current key, version and the
+    // retired keys kept for redaction; `profiles::stored_keys::KEYS_DIR`).
+    "profile-keys",
+    // r266 Kimi accounts (homes with the OAuth credential) and their registry.
+    "kimi-accounts",
+    "runtime/kimi",
     "runtime/task-service",
     "runtime/agent-management",
     "runtime/management-v2",
+    "runtime/director-address",
+    "runtime/storage",
+    "runtime/profile-link",
     "runtime/claude",
     "runtime/asks",
     "runtime/owner-notify",
@@ -110,6 +119,22 @@ fn rel(home: &Path, path: &Path) -> String {
     path.strip_prefix(home).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
+fn verify_manifest(dest: &Path, expected: &BackupManifest) -> anyhow::Result<BackupManifest> {
+    let manifest_path = dest.join("home-manifest.json");
+    let manifest: BackupManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)
+        .with_context(|| format!("read back {}", manifest_path.display()))?;
+    ensure!(&manifest == expected, "backup manifest read-back does not match the files just copied");
+    for record in &manifest.files {
+        ensure!(super::manifest::safe_relative(&record.path), "unsafe backup manifest path `{}`", record.path);
+        let path = dest.join("home").join(&record.path);
+        let metadata = std::fs::symlink_metadata(&path).with_context(|| format!("verify backup file {}", path.display()))?;
+        ensure!(metadata.is_file(), "backup manifest entry {} is not a regular file", record.path);
+        ensure!(metadata.len() == record.bytes, "backup manifest byte count differs for {}", record.path);
+        ensure!(super::manifest::file_sha256_hex(&path)? == record.sha256, "backup manifest digest differs for {}", record.path);
+    }
+    Ok(manifest)
+}
+
 /// A consistent copy of a SQLite database (`VACUUM INTO`).
 pub fn sqlite_snapshot(source: &Path, dest: &Path) -> anyhow::Result<()> {
     if let Some(parent) = dest.parent() {
@@ -151,6 +176,14 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn top_level_metadata(path: &Path) -> anyhow::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("inspect backup item {}", path.display())),
+    }
+}
+
 /// Copy the state of `home` into `dest/home/` and write
 /// `dest/home-manifest.json`. Services must be stopped.
 pub fn backup(home: &Path, dest: &Path) -> anyhow::Result<BackupManifest> {
@@ -165,7 +198,7 @@ pub fn backup(home: &Path, dest: &Path) -> anyhow::Result<BackupManifest> {
     let mut sources = Vec::new();
     for item in STATE_FILES.iter().chain(STATE_DIRS) {
         let path = home.join(item);
-        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        let Some(meta) = top_level_metadata(&path)? else { continue };
         if meta.is_dir() {
             walk(&path, &mut sources, home)?;
         } else if meta.is_file() {
@@ -209,7 +242,7 @@ pub fn backup(home: &Path, dest: &Path) -> anyhow::Result<BackupManifest> {
         files,
     };
     crate::config::atomic::write_private_pretty_json_atomic(&dest.join("home-manifest.json"), &manifest, "backup manifest")?;
-    Ok(manifest)
+    verify_manifest(dest, &manifest)
 }
 
 /// Move `home/<relative>` to `displaced/<relative>` (never deleted).
@@ -282,29 +315,41 @@ mod tests {
         dir
     }
 
-    fn home() -> PathBuf {
+    fn home() -> (PathBuf, rusqlite::Connection) {
         let home = temp("home");
         std::fs::write(home.join("config.json"), b"{\"a\":1}").unwrap();
         std::fs::create_dir_all(home.join("runtime/light")).unwrap();
         std::fs::write(home.join("runtime/light/deployment.json"), b"old-selection").unwrap();
         std::fs::create_dir_all(home.join("runtime/asks/sub")).unwrap();
         std::fs::write(home.join("runtime/asks/sub/a.json"), b"ask").unwrap();
+        for (relative, contents) in [
+            ("runtime/director-address/ownership-v1.json", &b"director"[..]),
+            ("runtime/storage/cleanup-v1.json", &b"cleanup"[..]),
+            ("runtime/profile-link/metadata-v1.json", &b"profile-link"[..]),
+        ] {
+            let path = home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
         std::fs::create_dir_all(home.join("runtime/artifacts")).unwrap();
         std::fs::write(home.join("runtime/artifacts/big.bin"), b"never").unwrap();
         let db = rusqlite::Connection::open(home.join("cutex-sessions.sqlite3")).unwrap();
         db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE s(x); INSERT INTO s VALUES (1),(2);").unwrap();
         // The WAL is still open here: the snapshot must include its rows.
-        std::mem::forget(db);
-        home
+        (home, db)
     }
 
     #[test]
     fn backs_up_files_and_sqlite_snapshots() {
-        let home = home();
+        let (home, source_db) = home();
         let dest = temp("dest");
         let manifest = backup(&home, &dest).unwrap();
         assert!(manifest.items.contains(&"config.json".to_string()));
         assert!(manifest.items.contains(&"runtime/asks".to_string()));
+        for item in ["runtime/director-address", "runtime/storage", "runtime/profile-link"] {
+            assert!(manifest.items.contains(&item.to_string()), "{item}");
+            assert!(manifest.files.iter().any(|record| record.path.starts_with(&format!("{item}/"))), "{item}");
+        }
         assert!(!manifest.items.iter().any(|i| i.contains("artifacts")));
         let db = manifest.files.iter().find(|f| f.path == "cutex-sessions.sqlite3").unwrap();
         assert!(db.sqlite);
@@ -313,14 +358,54 @@ mod tests {
         assert_eq!(rows, 2);
         assert!(!manifest.files.iter().any(|f| f.path.ends_with("-wal") || f.path.ends_with("-shm")));
         assert_eq!(std::fs::read(dest.join("home/runtime/asks/sub/a.json")).unwrap(), b"ask");
-        assert!(dest.join("home-manifest.json").is_file());
+        let written: BackupManifest = serde_json::from_slice(&std::fs::read(dest.join("home-manifest.json")).unwrap()).unwrap();
+        assert_eq!(written, manifest);
+        drop(copy);
+        drop(source_db);
         std::fs::remove_dir_all(dest).unwrap();
         std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
+    fn r258_state_roots_are_part_of_the_backup_contract() {
+        for file in ["accounts.json", "cutex-sessions.json", "cutex-sessions.sqlite3"] {
+            assert!(STATE_FILES.contains(&file), "{file}");
+        }
+        for dir in ["services", "runtime/users", "runtime/approvals", "runtime/agent-management", "runtime/profile-avatars",
+            crate::profiles::stored_keys::KEYS_DIR, crate::profiles::kimi_accounts::HOMES_DIR, "runtime/kimi"] {
+            assert!(STATE_DIRS.contains(&dir), "{dir}");
+        }
+    }
+
+    #[test]
+    fn manifest_verification_detects_a_changed_backup_file() {
+        let (home, source_db) = home();
+        let dest = temp("verify");
+        let manifest = backup(&home, &dest).unwrap();
+        std::fs::write(dest.join("home/runtime/storage/cleanup-v1.json"), b"changed").unwrap();
+        let error = verify_manifest(&dest, &manifest).unwrap_err();
+        assert!(error.to_string().contains("runtime/storage/cleanup-v1.json"), "{error:#}");
+        drop(source_db);
+        std::fs::remove_dir_all(dest).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn top_level_metadata_skips_only_not_found() {
+        let root = temp("metadata");
+        assert!(top_level_metadata(&root.join("missing")).unwrap().is_none());
+        let error = top_level_metadata(Path::new("\0")).unwrap_err();
+        assert_ne!(
+            error.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "non-NotFound errors must fail the backup: {error:#}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn selection_restore_and_move_aside_never_delete() {
-        let home = home();
+        let (home, source_db) = home();
         let dest = temp("dest");
         backup(&home, &dest).unwrap();
         std::fs::write(home.join("runtime/light/deployment.json"), b"new-selection").unwrap();
@@ -339,6 +424,7 @@ mod tests {
         assert!(!move_aside(&home, "runtime/absent", &displaced).unwrap());
         assert!(move_aside(&home, "../x", &displaced).is_err());
         assert_eq!(std::fs::read(displaced.join("runtime/new-store/x")).unwrap(), b"x");
+        drop(source_db);
         for dir in [home, dest, displaced] {
             std::fs::remove_dir_all(dir).unwrap();
         }

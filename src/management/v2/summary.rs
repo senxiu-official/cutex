@@ -713,7 +713,7 @@ fn collect_meta_and_projects() -> (HashMap<String, AgentMeta>, BTreeMap<String, 
                 record.cutex_session_id.clone(),
                 AgentMeta {
                     kind: if record.is_owned_session() { "chat" } else { "agent" },
-                    provider: if record.claude_session.is_some() { "claude" } else { "codex" },
+                    provider: if let Some(session) = &record.dsh_session { session.flavor.runtime_name() } else if record.claude_session.is_some() { "claude" } else { "codex" },
                     project_id: None,
                 },
             );
@@ -1550,12 +1550,13 @@ pub(super) fn handle_events_filtered(
     };
     stream.write_all(crate::http::server::sse_response_head().as_bytes())?;
     stream.flush()?;
+    let watch = crate::management::listeners::RevocationWatch::for_stream(stream)?;
     stream_summary_filtered(
         stream,
         backlog,
         receiver,
         lagged,
-        crate::management::listeners::RevocationWatch::for_current_request(),
+        watch,
         visible,
     )
 }
@@ -1588,6 +1589,7 @@ pub fn stream_summary_filtered(
     }
     let mut last_write = Instant::now();
     loop {
+        if watch.disconnected()? { return Ok(()); }
         if let Some(token_id) = watch.revoked() {
             crate::management::listeners::write_revoked_frame(stream, &token_id)?;
             return Ok(());

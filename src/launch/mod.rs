@@ -20,6 +20,7 @@ pub mod selected_profile;
 pub mod selected_status;
 pub mod shared_config;
 pub mod stock;
+pub mod prompt_cache_key;
 pub mod thread_retention;
 pub mod version_registry;
 
@@ -27,6 +28,7 @@ pub mod session_display;
 
 pub mod native_history;
 pub mod native_plan;
+mod rollout_scan;
 pub mod native_token_usage;
 
 pub mod status_animation;

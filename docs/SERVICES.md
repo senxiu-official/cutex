@@ -5,6 +5,78 @@ client/device tokens keep their existing owner mapping). Agent Bus service
 tools use the authenticated agent's durable session and the existing project
 visibility boundary. No caller identity is accepted from tool arguments.
 
+## Eligible owners (capability `services-eligible-owners`)
+
+`GET /v2/services/{slug}/eligible-owners` returns
+`{hostId, slug, owners: [{id, name, realName, projectId, isDirector, online, unnamed}]}`.
+Clients check `featureList: services-eligible-owners` or
+`features.servicesEligibleOwners` before requesting it. This uses the existing
+owner-authorized Management services guard, including authorized client/device
+tokens; it is not an Agent Bus/MCP discovery API and accepts no caller identity.
+
+The list covers every known session accepted by the owner's assignment
+validator, including sessions absent from the sidebar, hidden sessions, local
+unnamed chats, offline agents and agents in other projects. It excludes retired
+sessions using the same lifecycle predicate as `PATCH ownerCutexSessionId`.
+Eligibility does not depend on runtime state, agent enablement or registration
+class. `name` uses the owner's display alias before the normal display-name
+chain; `realName` uses the same chain without the alias. `unnamed` identifies
+local-only chats with neither a formal agent name nor a nonempty display alias.
+
+`projectId` is the current roster project or Director seat, preferring this
+service's project when a Director has multiple seats; otherwise an ambiguous
+Director has `null`. `isDirector` means the current Director of **this service's
+project**, for project-first picker ordering. Both are presentation hints, not
+assignment restrictions. `online` uses the existing runtime-intent process
+liveness projection (binding present and not proven gone, including boot/PID
+reuse checks); it does not assert a connected native control channel. Offline
+sessions remain fully eligible. Rows have stable ID order; locale sorting,
+offline folding and hiding unnamed chats until searched belong to the client.
+
+The service must exist (404 `service_not_found`, or 410 `service_reclaimed` for
+a retained tombstone). Methods other than GET return 405 `method_not_allowed`.
+Unavailable session/project stores return 503 rather than a misleading empty
+list. The response is an unpaginated snapshot, not an assignment reservation:
+the existing PATCH validation still runs if a session is archived or removed
+between listing and reassignment. No service, session or runtime is changed.
+
+## Project ownership (capability `services-project-scope`)
+
+`ownerScope` is `session` or `project`; missing fields in older records mean
+`session`. `ownerCutexSessionId` remains the registering session. A project
+service also requires `projectId`. Its current Director and its registrant
+while still in that project may manage it, as may the owner. Director changes
+take effect on the next operation; a session service keeps its existing
+registrant-only management rule. Agent lists include `ownerScope` and
+`youMayManage`, and show process details only to agents allowed to manage them.
+`loginLinkCommand` remains owner only.
+
+`service_register` accepts optional `scope: session|project`. A Director of a
+single resolved project defaults new services to project scope; other callers
+default to session scope. Explicit project scope requires a current project;
+an explicit project request with an ambiguous Director context is refused. Agents cannot supply an owner
+or a project ID. `service_update` can promote a service of the caller's current
+project with `ownerScope: project`; only the owner can demote it to session.
+The owner's `PATCH /v2/services/{slug}` accepts `ownerScope` and `projectId`
+together, including conversion of legacy records without a project.
+
+Managing another member's service uses the caller's own execution and approval
+policy. Removing a persistent project service registered by someone else
+requires owner confirmation; the same confirmation applies when releasing
+that service's persistent retention. Final writes revalidate the caller under
+the roster mutation fence and reject records or project context changed while
+an approval was pending. Archiving or deleting the registering session
+does not reclaim project services; deleting the session clears their
+registrant field. Ephemeral project services instead follow project archive
+and the existing TTL/idle/lease rules. Persistent services retain the existing
+owner-controlled lifecycle. Older daemons ignore project ownership fields and
+apply their session management rules; clients must check the capability before
+offering conversion.
+
+`cutex/project/directorChanged` adds optional `projectServiceCount` (null if the
+registry could not be read). It counts that project's project services and
+provides a UI hint; the current list remains the source for service details.
+
 ## Host routing and authentication
 
 Only loopback Management connections route `<slug>.svc.localhost:<P>` to
@@ -114,7 +186,7 @@ restart count are persisted with runtime state.
 `service_restart {slug}` lets the owning agent restart its managed service after
 editing the code it runs. Ownership is the same as for `service_update` /
 `service_unregister` (only the agent that owns the record; `not_service_owner`
-otherwise). It needs no approval: command, cwd and env are unchanged, and the
+otherwise; project services also permit their current Director). It needs no approval: command, cwd and env are unchanged, and the
 `managed_service` grant that let the command run covers its restarts. It
 refuses external and static services with 409 `not_managed` (cutex runs no
 process for them) and a service the owner stopped with 409 `service_stopped`:
@@ -138,32 +210,50 @@ Changing what the service runs is `service_update`, which restarts it by itself.
 
 | Method and path | Behavior |
 | --- | --- |
-| `POST /v2/services` | Existing register body plus `lifetime`, `runtime: "static"`, `root` |
-| `PATCH /v2/services/{slug}` | Owner can change `lifetime` directly |
+| `POST /v2/services` | Existing register body plus `lifetime`, persistent-only `purpose`, `runtime: "static"`, `root` |
+| `PATCH /v2/services/{slug}` | Owner can change retention plus persistent `purpose`, `groupName`, `starred`, `sortOrder`, `note` and `hidden` |
+| `POST /v2/services/{slug}/archive` | Stops and hides the record without deleting its root/files; an agent cannot unregister it while archived |
+| `POST /v2/services/{slug}/restore` | Restores the archived record to the main list; a managed service remains stopped until explicitly started |
 | `GET /v2/services/{slug}` | Reclaimed slug returns 410 `service_reclaimed`, with `details.reason` and `details.reclaimedAt` |
 | `GET /v2/services?tombstones=1` | Includes a `tombstones` array in addition to the normal list |
+| `GET /v2/services?visibility=all` | Includes owner-hidden and owner-archived records; the default list omits both for old clients |
 | `POST /v2/services/{slug}/lease` | Optional `{holder, clientLeaseId}` (`holder` at most 64, `clientLeaseId` 1–128 printable characters); returns 201 `{leaseId, expiresAt, ttlSeconds: 150}`. With `clientLeaseId` (capability `services-lease-idempotent`) a repeated open from the same credential renews and returns the live lease that key opened instead of creating another, so a retried request leaves no orphan lease; the key is scoped to the calling credential (client token or root) and expires with its lease. Without it every call opens a new lease |
 | `POST /v2/services/{slug}/lease/{leaseId}` | Renews a live lease; 200 with the same shape; expired/unknown lease gives 404 `lease_not_found` |
 | `DELETE /v2/services/{slug}/lease/{leaseId}` | Idempotent 200 `{released: bool}` |
 | `PATCH /v2/services` | Updates settings below, validating the entire resulting settings object |
+| `GET /v2/settings` | Also exposes the registry settings as `services` (capability `services-ephemeral-ttl`) |
+| `PATCH /v2/settings` | `{services:{ephemeralIdleMinutes}}` updates the default; this nested setting is patched on its own |
+| `GET /v2/services/{slug}/tile` | The home page tile: `{tile, fetchedAt, error, source}` (see Tiles below) |
+| `GET /v2/services/{slug}/tile/image` | The tile's image (PNG, JPEG or WebP) |
 
 There are at most 64 live leases per service. Leases are memory-only and do not
 survive a daemon restart. Clients should renew every 60 seconds and acquire a
 new lease after a 404. Leases require owner authorization just like all services
 management routes; lease IDs alone are not credentials.
 
-Management views add `lifetime`, `link` (`cutex:service/<slug>/path`), `leases`,
-`expiresAt`, `idleReclaimAt` and `restartsLeft`. Persistent services have null
+Management views add `lifetime`, persistent-only `purpose`, `idleTtlMinutes`, `effectiveIdleTtlMinutes`,
+`maxIdleTtlMinutes`, retention `pinned`, owner organisation (`groupName`, `starred`,
+`sortOrder`, `note`, `hidden`, `archived`, `archivedAt`), `link` (`cutex:service/<slug>/path`), `leases`,
+`expiresAt`, `idleReclaimAt` and `restartsLeft`. Persistent and pinned services have null
 expiry and idle deadlines. A lease or an active connection also makes the idle
 deadline null. `restartsLeft` applies only to ephemeral managed services. Proxy
 fields are `proxyHost`, `activeConnections` and `lastTrafficAt`; the supervisor
 remains the sole writer of `state.json`, persisting traffic timestamps at most
 once per minute. Agent tools include lifetime/link and preserve their existing
-visibility rules; a peer's static `root` is redacted like its command/cwd.
+visibility rules; a peer's static `root` is redacted like its command/cwd. Owner organisation is
+redacted from every agent view. Purpose is deliberately an open string in views so an older client
+can put a future value under “uncategorised”; this host accepts `foreground` and `background` on writes.
+
+An agent may suggest `purpose` only while registering a persistent service. An owner purpose edit wins
+over later re-registers of the same slug. All owner organisation survives those re-registers and agents
+cannot write it. Ephemeral services have no purpose; the desktop presents them as “temporary”. Turning
+one persistent clears purpose, while the owner's “keep” action sends `lifetime: persistent` with a chosen
+purpose (foreground by default). Turning a service ephemeral clears purpose. Hidden keeps running. Archived stops, hides and is excluded from automatic
+TTL reclaim so it remains restorable; it never deletes the service's root or any file.
 
 | Setting | Default | Accepted range |
 | --- | --- | --- |
-| `ephemeralIdleMinutes` | 30 | 5–1440 |
+| `ephemeralIdleMinutes` | 30 | 0, or 5–1440 (`0` = until owner archive) |
 | `ephemeralTtlHours` | 24 | 1–720 |
 | `reclaimOnOwnerArchive` | true | boolean |
 | `tombstoneDays` | 7 | 0–90 |
@@ -183,8 +273,8 @@ active state directory. Release builds omit this override.
 
 ## Agent approvals and reveal
 
-`service_register` accepts `lifetime`, `runtime: "static"`, `root` and `reveal`.
-`service_update` accepts `lifetime`; only the owning agent can edit or downgrade
+`service_register` accepts `lifetime`, persistent-only `purpose`, `idle_ttl_minutes`, `runtime: "static"`, `root` and `reveal`.
+`service_update` accepts `lifetime` and `idle_ttl_minutes`; only the owning agent can edit or downgrade
 its service. `service_update` raises the managed-execution approval only when
 the effective runtime, command, cwd or env (after the env merge) differ from the
 stored record; restating unchanged values, or changing only port, path, name or
@@ -283,15 +373,71 @@ claim protection against a local process concurrently replacing filesystem
 objects between that check and open; OS-specific handle-relative traversal is
 outside this change. Treat a registered tree as locally trusted content.
 
+## Tiles (capability `service-tiles`)
+
+A service can give the owner's home page a tile: a small read-only template the desktop draws in
+its own style (cutex-desktop docs/research/home-page-20261019.md §2). Register / update
+(`POST|PATCH /v2/services`, `service_register` / `service_update` as `tile` / `tile_path`) take:
+
+- `tile`: a static template, validated on write (400 `invalid_tile`, the message names the field);
+  `null` on update clears it. The service view shows it as `tile`.
+- `tilePath`: a path inside the service that serves the template as JSON; `null` on update
+  restores the default. Unset: `/.well-known/cutex-tile.json`, unless a static `tile` is set (then
+  nothing is fetched). Static services never serve dot paths, so they need an explicit `tilePath`.
+
+Template fields (all optional; unknown fields are dropped, also inside `progress` and `actions`):
+
+| Field | Shape |
+| --- | --- |
+| `title` | 1–60 characters |
+| `subtitle` | 1–120 characters |
+| `lines` | at most 3 strings of 1–120 characters |
+| `image` | a path inside the service (PNG / JPEG / WebP, served by `/tile/image`) |
+| `progress` | `{value: 0..1, label?: 1–40 characters}` |
+| `badge` | 1–12 characters |
+| `actions` | at most 3 `{label: 1–20 characters, path}`; the desktop opens the path in the service view, it never calls it as an API |
+| `refreshSeconds` | integer, clamped to 60–86400 (default cache 300 s) |
+| `sizes` | sizes the tile supports, subset of `s`, `m`, `w`, `l` (unknown sizes dropped) |
+
+Text is trimmed and may not contain control characters. A path starts with exactly one `/`, is at
+most 512 bytes, has no whitespace, `\`, `#`, `.` / `..` segment or `/__cutex` prefix (also after
+percent decoding); a query is kept. URLs, `javascript:`, `data:` and protocol-relative `//host`
+values are refused.
+
+`GET /v2/services/{slug}/tile` answers `{tile: {...}|null, fetchedAt, error: {code, message}|null,
+source: "static"|"service"}`:
+
+- static `tile` without `tilePath`: that template, `source: "static"`, `fetchedAt` = the record's
+  `updatedAt`; no fetch.
+- otherwise the daemon fetches the path the way the proxy reaches the service (loopback port with
+  the proxy's `Host`, `X-Forwarded-Host: <slug>.svc.localhost`; a static service's root through the
+  static file rules), within 2 s, at most 16 KiB of JSON, following at most 3 redirects and only
+  those that stay inside the service (its proxy host or its own loopback port). It never starts a
+  stopped managed service (`service_stopped`). The answer is cached per service for the template's
+  `refreshSeconds` (300 s without one), a failure for 60 s; a record change refetches.
+- a failed fetch returns the static `tile` (if one is set, `source: "static"`) or `null`, with
+  `error.code` one of `service_stopped`, `unreachable`, `timeout`, `too_large`, `not_found`,
+  `http_status`, `redirect_outside_service`, `too_many_redirects`, `invalid_response`,
+  `invalid_json`, `invalid_tile`. Nothing at the default path is not an error (`tile: null`,
+  `error: null`).
+
+`GET /v2/services/{slug}/tile/image` fetches the current tile's `image` with the same rules (at most
+512 KiB) and answers it with the type sniffed from its bytes (PNG, JPEG, WebP; SVG and anything else:
+415 `tile_image_unsupported`), `X-Content-Type-Options: nosniff`, `Content-Security-Policy:
+default-src 'none'; sandbox`, `Cache-Control: private, max-age=60`. No image: 404
+`tile_image_not_found`; a failed fetch: 502 `tile_image_unavailable` (message starts with the
+fetch error code). Access is that of the services routes: the owner; device scope `read` may use
+both (they are `GET`s). Schema export `services`: `tile`, `tilePath`, `tileAnswer`.
+
 ## Schemas and rollback
 
-Capabilities `services-proxy` and `services-lifetime` advertise the contracts.
+Capabilities `services-proxy`, `services-lifetime`, `services-ephemeral-ttl` and `services-organize` advertise the contracts.
 The single LF `services.json` exports views, settings, tombstones, leases and
 view tickets. The methods schema includes `reclaimed` and `revealRequested`.
 
 The first supervisor start migrates an old registry under its file lock, saves
 its exact original bytes to `services/registry.json.pre-services-proxy`, and
-writes `schemaVersion: 1` with persistent defaults for old records. Mutations
+writes `schemaVersion: 3` (v2 preserves retention `pinned`; v3 adds purpose and owner organisation) with persistent defaults for old records. Mutations
 also perform this migration before writing. The backup is never overwritten;
 subsequent starts do not migrate again.
 
@@ -299,8 +445,14 @@ Rollback: stop the daemon, restore `registry.json.pre-services-proxy` as
 `registry.json`, then switch to the old binary. Registrations made after the
 backup will be absent. Do not run old and new daemons against one home.
 
+The r258 previous-build preflight refuses rollback while the registry contains
+new retention intent (`ephemeralIdleMinutes: 0`, per-service TTL/pin) or any
+persistent purpose / owner organisation state. The normal upgrade backup also
+includes the complete `services/` directory; the preflight never strips fields.
+
 Old cutex ignores unknown lifetime/root/settings/tombstone fields and drops them
-on its next save. However, `runtime: "static"` is an unknown enum variant to the
+on its next save (so does a cutex before `service-tiles` with `tile` / `tilePath`; the
+desktop then shows the icon tile). However, `runtime: "static"` is an unknown enum variant to the
 old reader: **one static record makes the entire registry fail to deserialize**.
 Unknown `crashLooped` runtime snapshots are discarded by the old reader's
 existing load-state fallback.

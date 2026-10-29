@@ -19,7 +19,9 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::config::atomic::write_private_pretty_json_atomic;
-use crate::config::store::{load_codez_config_checked, load_quick_state, save_codez_config, save_quick_state};
+use crate::config::store::{
+    load_codez_config_checked, load_quick_state, save_codez_config, save_quick_state,
+};
 use crate::config::text::{read_optional_text, write_optional_text_if_changed};
 use crate::profiles::appearance::{ProfileOptions, Provider};
 use crate::profiles::materialize::{
@@ -45,7 +47,9 @@ const SESSION_STORE_RETRIES: usize = 6;
 static LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
-    LIFECYCLE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    LIFECYCLE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,8 +58,11 @@ pub enum NewProfileKind {
     Chatgpt,
     /// Claude Code profile (shared official runtime).
     Claude,
+    Dsh,
     /// Codex profile on a third-party / OpenAI API-key provider.
     ApiKey,
+    /// r266 Kimi Code profile on a Kimi account (subscription login).
+    Kimi,
 }
 
 impl NewProfileKind {
@@ -63,7 +70,9 @@ impl NewProfileKind {
         match value {
             "chatgpt" => Some(Self::Chatgpt),
             "claude" => Some(Self::Claude),
+            "dsh" => Some(Self::Dsh),
             "apiKey" => Some(Self::ApiKey),
+            "kimi" => Some(Self::Kimi),
             _ => None,
         }
     }
@@ -72,7 +81,9 @@ impl NewProfileKind {
         match self {
             Self::Chatgpt => "chatgpt",
             Self::Claude => "claude",
+            Self::Dsh => "dsh",
             Self::ApiKey => "apiKey",
+            Self::Kimi => "kimi",
         }
     }
 }
@@ -120,8 +131,15 @@ impl std::fmt::Display for LifecycleError {
             Self::Invalid(message) => f.write_str(message),
             Self::NotFound => f.write_str("no profile has this ID or name"),
             Self::NameConflict(name) => write!(f, "a profile named {name} already exists"),
-            Self::InUse(sessions) => write!(f, "{} session(s) still reference this profile", sessions.len()),
-            Self::IsDefault(name) => write!(f, "{name} is the default profile; choose another default first"),
+            Self::InUse(sessions) => write!(
+                f,
+                "{} session(s) still reference this profile",
+                sessions.len()
+            ),
+            Self::IsDefault(name) => write!(
+                f,
+                "{name} is the default profile; choose another default first"
+            ),
             Self::Store(error) => write!(f, "{error:#}"),
         }
     }
@@ -140,17 +158,40 @@ pub fn validate_profile_name(name: &str) -> Result<String, String> {
     let trimmed = name.trim();
     if trimmed.is_empty()
         || trimmed.chars().count() > MAX_PROFILE_NAME_CHARS
-        || trimmed.chars().any(|c| c.is_control() || c == '/' || c == '\\')
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
     {
         return Err(format!(
             "name must be 1-{MAX_PROFILE_NAME_CHARS} visible characters without '/', '\\' or control characters"
         ));
     }
+    if is_reserved_profile_name(trimmed) {
+        return Err(RESERVED_PROFILE_NAME_MESSAGE.to_string());
+    }
     Ok(trimmed.to_string())
 }
 
+/// Design 041: `auto` and `auto:<provider>` name the per-provider automatic
+/// pick in `profile` fields, so no new or renamed profile may take them
+/// (ASCII case-insensitive). Existing profiles with such a name still load.
+pub fn is_reserved_profile_name(name: &str) -> bool {
+    let name = name.trim();
+    name.eq_ignore_ascii_case("auto")
+        || name
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("auto:"))
+}
+
+pub const RESERVED_PROFILE_NAME_MESSAGE: &str =
+    "name 'auto' and names starting with 'auto:' are reserved for the automatic profile pick";
+
 /// The name must not equal another profile's name or ID (lookups accept both).
-pub(crate) fn ensure_available(store: &AccountsStore, name: &str, ignore_id: Option<&str>) -> Result<(), LifecycleError> {
+pub(crate) fn ensure_available(
+    store: &AccountsStore,
+    name: &str,
+    ignore_id: Option<&str>,
+) -> Result<(), LifecycleError> {
     let taken = store
         .accounts
         .iter()
@@ -170,8 +211,10 @@ pub(crate) fn base_account(name: &str, cli_kind: CliKind, source: &str) -> Store
         search_tool: false,
         quota_reader: None,
         private_chatgpt_auth_file: false,
+        auto_pick: false,
         // New Claude profiles read the workspace's Claude Code project settings.
         claude_code: crate::profiles::claude_code::ClaudeCodeOptions::for_new_profile(&cli_kind),
+        variants: Default::default(),
         id: uuid::Uuid::new_v4().to_string(),
         name: name.to_string(),
         email: None,
@@ -189,13 +232,17 @@ pub(crate) fn base_account(name: &str, cli_kind: CliKind, source: &str) -> Store
         provider_category: None,
         claude_account: None,
         model_display_names: Default::default(),
+        interface_base_urls: Default::default(),
     }
 }
 
 /// The Claude Code profile `cutex login --cli claude` creates.
 pub fn new_claude_account(name: &str) -> StoredAccount {
     let mut account = base_account(name, CliKind::Claude, "official");
-    account.options = ProfileOptions { provider: Some(Provider::Claude), ..Default::default() };
+    account.options = ProfileOptions {
+        provider: Some(Provider::Claude),
+        ..Default::default()
+    };
     account
 }
 
@@ -233,6 +280,22 @@ pub fn create_profile(request: &NewProfile) -> Result<StoredAccount, LifecycleEr
 
     let mut account;
     match request.kind {
+        NewProfileKind::Dsh => {
+            account = base_account(&name, CliKind::Dsh, "dsh");
+            account.options.provider = Some(Provider::Deepseek);
+            if let Some(model) = &request.model {
+                account.options.dsh.model = model.clone();
+            }
+            account.options.dsh.validate().map_err(|error| LifecycleError::Invalid(error.to_string()))?;
+        }
+        NewProfileKind::Kimi => {
+            // r266: the Kimi account is attached by the caller (`kimiAccount`).
+            account = base_account(&name, CliKind::Kimi, "kimi");
+            if let Some(model) = &request.model {
+                super::kimi::validate_model(model).map_err(|error| LifecycleError::Invalid(format!("model: {error}")))?;
+                account.variants.kimi_defaults = Some(super::runtime_variants::VariantDefaults { model: Some(model.clone()), reasoning_effort: None });
+            }
+        }
         NewProfileKind::Claude => {
             account = new_claude_account(&name);
             if let Some(model) = &request.model {
@@ -256,7 +319,9 @@ pub fn create_profile(request: &NewProfile) -> Result<StoredAccount, LifecycleEr
             }
         }
         NewProfileKind::ApiKey => {
-            let preset = request.preset.unwrap_or_else(|| find_preset("custom").expect("custom preset"));
+            let preset = request
+                .preset
+                .unwrap_or_else(|| find_preset("custom").expect("custom preset"));
             account = base_account(&name, CliKind::Codex, "api-key");
             // The provider name is the profile's legacy plan label; the
             // generic custom preset's ("custom") tells the owner nothing.
@@ -274,7 +339,8 @@ pub fn create_profile(request: &NewProfile) -> Result<StoredAccount, LifecycleEr
                 preset.base_url,
                 request.base_url.as_deref(),
             );
-            let mut root = api_key_profile_config(preset.provider_id, preset.provider_name, base_url)?;
+            let mut root =
+                api_key_profile_config(preset.provider_id, preset.provider_name, base_url)?;
             // The request's model, else the preset's default (presets with a
             // spec already wrote it).
             if let Some(model) = request.model.as_deref().or(preset.default_model) {
@@ -287,7 +353,16 @@ pub fn create_profile(request: &NewProfile) -> Result<StoredAccount, LifecycleEr
                 .api_key
                 .as_ref()
                 .map(|key| json!({ "OPENAI_API_KEY": key.0, "tokens": null }).to_string());
-            if let Err(error) = materialize_new_account_files(&account, auth.as_deref(), Some(config), catalog.as_deref()) {
+            if auth.is_some() {
+                // r265: the first stored key is credential version 1.
+                account.variants.credential_version = 1;
+            }
+            if let Err(error) = materialize_new_account_files(
+                &account,
+                auth.as_deref(),
+                Some(config),
+                catalog.as_deref(),
+            ) {
                 remove_profile_dir(&account);
                 return Err(error.into());
             }
@@ -326,6 +401,9 @@ pub fn duplicate_profile(source: &str, name: &str) -> Result<StoredAccount, Life
     copy.name = name;
     copy.last_used_at = None;
     copy.email = None;
+    // A duplicate has no login identity. Copy looks, never a manual account association or its clocks.
+    copy.options.account_link = None;
+    copy.options.appearance_updated_at.clear();
     if copy.source.as_deref() != Some("api-key") {
         copy.plan_type = None;
         copy.plan_label = None;
@@ -356,15 +434,24 @@ fn copy_codex_config_files(source: &StoredAccount, target: &StoredAccount) -> an
             // Management edits select immutable catalog files. A duplicate owns
             // its copy (and the source's overlay of an official list), so
             // moving/deleting the source profile cannot break it.
-            let catalog = crate::profiles::catalog_api::load(source)?.catalog
-                .ok_or_else(|| anyhow::anyhow!("source profile's selected model catalog is missing"))?;
+            let catalog = crate::profiles::catalog_api::load(source)?
+                .catalog
+                .ok_or_else(|| {
+                    anyhow::anyhow!("source profile's selected model catalog is missing")
+                })?;
             let dir = profile_dir(target)?;
             let path = crate::profiles::catalog_overlay::write_effective_file(&dir, &catalog)?;
             if let Some(overlay) = crate::profiles::catalog_overlay::load(source)? {
                 write_private_pretty_json_atomic(
-                    &dir.join(crate::profiles::catalog_overlay::OVERLAY_FILE), &overlay, "duplicated model overlay")?;
+                    &dir.join(crate::profiles::catalog_overlay::OVERLAY_FILE),
+                    &overlay,
+                    "duplicated model overlay",
+                )?;
             }
-            root.insert("model_catalog_json".into(), toml::Value::String(path.to_string_lossy().into_owned()));
+            root.insert(
+                "model_catalog_json".into(),
+                toml::Value::String(path.to_string_lossy().into_owned()),
+            );
             config = Some(toml::to_string_pretty(&root)?);
         }
     }
@@ -381,7 +468,12 @@ fn copy_codex_config_files(source: &StoredAccount, target: &StoredAccount) -> an
             None => config
                 .as_deref()
                 .and_then(|config| parse_toml_table(config).ok())
-                .and_then(|table| table.get("model_provider").and_then(toml::Value::as_str).map(str::to_string))
+                .and_then(|table| {
+                    table
+                        .get("model_provider")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string)
+                })
                 .and_then(|provider| crate::profiles::preset_spec::catalog_for_provider(&provider)),
         };
         write_optional_text_if_changed(&target_files.model_catalog_path, catalog.as_deref())?;
@@ -400,7 +492,9 @@ pub fn session_references(sessions: &CutexSessionStore, name: &str) -> Vec<Sessi
     let mut refs: Vec<SessionRef> = sessions
         .sessions
         .values()
-        .filter(|record| crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, &host))
+        .filter(|record| {
+            crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, &host)
+        })
         .filter_map(|record| {
             let configured = record.profile.as_deref() == Some(name);
             let launched = launched_profile(record).as_deref() == Some(name);
@@ -465,17 +559,24 @@ pub fn delete_profile(target: &str) -> Result<DeleteOutcome, LifecycleError> {
 /// [`delete_profile`] with a choice for archived references (see
 /// [`ArchivedReferences`]); `DeleteOutcome::detached_sessions` lists the
 /// retired sessions whose profile was cleared.
-pub fn delete_profile_with(target: &str, archived: ArchivedReferences) -> Result<DeleteOutcome, LifecycleError> {
+pub fn delete_profile_with(
+    target: &str,
+    archived: ArchivedReferences,
+) -> Result<DeleteOutcome, LifecycleError> {
     let _guard = lock();
     let mut store = load_store()?;
-    let account = find(&store, target).cloned().ok_or(LifecycleError::NotFound)?;
+    let account = find(&store, target)
+        .cloned()
+        .ok_or(LifecycleError::NotFound)?;
     let mut config = load_codez_config_checked()?;
     if config.default_profile.as_deref() == Some(account.name.as_str()) {
         return Err(LifecycleError::IsDefault(account.name));
     }
     let detached_sessions = detach_or_refuse(&account.name, archived)?;
 
-    store.accounts.retain(|candidate| candidate.id != account.id);
+    store
+        .accounts
+        .retain(|candidate| candidate.id != account.id);
     if store.active_account_id.as_deref() == Some(account.id.as_str()) {
         store.active_account_id = store.accounts.first().map(|next| next.id.clone());
     }
@@ -494,11 +595,21 @@ pub fn delete_profile_with(target: &str, archived: ArchivedReferences) -> Result
     }
     // profile-avatar: the picture / intro portrait go with the profile.
     crate::profiles::avatar::remove_default(&account.id);
+    // r265: a stored DSH key goes with its profile (never into a backup).
+    if let Err(error) = crate::profiles::stored_keys::purge(&account.id) {
+        eprintln!("profile delete: stored key of {} not removed: {error:#}", account.id);
+    }
     let (backup_path, backup_error) = match move_to_deleted(&account) {
         Ok(path) => (Some(path), None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
-    Ok(DeleteOutcome { removed: account, backup_path, backup_error, references, detached_sessions })
+    Ok(DeleteOutcome {
+        removed: account,
+        backup_path,
+        backup_error,
+        references,
+        detached_sessions,
+    })
 }
 
 /// The session-store part of a delete: refuses while references remain
@@ -507,7 +618,10 @@ pub fn delete_profile_with(target: &str, archived: ArchivedReferences) -> Result
 /// retried) and returns their keys. A retired session whose stale runtime
 /// binding was launched on the profile keeps the binding (history only: a
 /// restore relaunches from the stored profile).
-fn detach_or_refuse(name: &str, archived: ArchivedReferences) -> Result<Vec<String>, LifecycleError> {
+fn detach_or_refuse(
+    name: &str,
+    archived: ArchivedReferences,
+) -> Result<Vec<String>, LifecycleError> {
     let mut attempt = 0;
     loop {
         let mut sessions = crate::session::store::load_cutex_session_store()?;
@@ -540,7 +654,9 @@ fn detach_or_refuse(name: &str, archived: ArchivedReferences) -> Result<Vec<Stri
         match crate::session::store::save_cutex_session_store(&sessions) {
             Ok(()) => {
                 for key in &keys {
-                    if let Err(error) = crate::session::im_bridge::persist_cutex_session_im_record(&sessions, key) {
+                    if let Err(error) =
+                        crate::session::im_bridge::persist_cutex_session_im_record(&sessions, key)
+                    {
                         eprintln!("profile delete: IM record of {key} not refreshed: {error:#}");
                     }
                 }
@@ -579,12 +695,20 @@ fn move_to_deleted(account: &StoredAccount) -> anyhow::Result<PathBuf> {
     let source = profile_dir(account)?;
     if source.exists() {
         std::fs::rename(&source, &backup).map_err(|error| {
-            anyhow::anyhow!("moving {} to {}: {error}", source.display(), backup.display())
+            anyhow::anyhow!(
+                "moving {} to {}: {error}",
+                source.display(),
+                backup.display()
+            )
         })?;
     } else {
         create_private_dir_all(&backup)?;
     }
-    write_private_pretty_json_atomic(&backup.join("profile.json"), account, "deleted profile record")?;
+    write_private_pretty_json_atomic(
+        &backup.join("profile.json"),
+        account,
+        "deleted profile record",
+    )?;
     Ok(backup)
 }
 
@@ -610,8 +734,13 @@ pub struct RenameOutcome {
 /// inputs: the old name stops resolving. The rename is appended to the
 /// rename history. On a failed later step the earlier writes are reverted.
 pub fn rename_profile(target: &str, new_name: &str) -> Result<RenameOutcome, LifecycleError> {
-    let new_name = validate_profile_name(new_name).map_err(LifecycleError::Invalid)?;
     let _guard = lock();
+    rename_profile_locked(target, new_name)
+}
+
+/// Caller must hold the profile lifecycle lock across the entire transaction.
+pub(crate) fn rename_profile_locked(target: &str, new_name: &str) -> Result<RenameOutcome, LifecycleError> {
+    let new_name = validate_profile_name(new_name).map_err(LifecycleError::Invalid)?;
     let mut store = load_store()?;
     let index = store
         .accounts
@@ -654,18 +783,25 @@ pub fn rename_profile(target: &str, new_name: &str) -> Result<RenameOutcome, Lif
     if let Err(error) = global {
         store.accounts[index].name = old_name.clone();
         let _ = save_store(&store);
-        crate::profiles::references::rename_global_profile_references(&mut config, &new_name, &old_name);
+        crate::profiles::references::rename_global_profile_references(
+            &mut config,
+            &new_name,
+            &old_name,
+        );
         crate::profiles::references::rename_profile_references(&mut state, &new_name, &old_name);
         let _ = save_codez_config(&config);
         let _ = save_quick_state(&state);
         revert_sessions(&new_name, &old_name, &references);
         return Err(error.into());
     }
-    if let Err(error) = crate::profiles::identity::record_rename(&profile_id, &old_name, &new_name) {
+    if let Err(error) = crate::profiles::identity::record_rename(&profile_id, &old_name, &new_name)
+    {
         eprintln!("profile rename: rename history not updated: {error:#}");
     }
     for key in &references.session_keys {
-        if let Err(error) = crate::session::im_bridge::persist_cutex_session_im_record(&sessions, key) {
+        if let Err(error) =
+            crate::session::im_bridge::persist_cutex_session_im_record(&sessions, key)
+        {
             eprintln!("profile rename: IM record for {key} not updated: {error:#}");
         }
     }
@@ -690,7 +826,8 @@ fn rename_in_session_store(old: &str, new: &str) -> Result<RenamedState, Lifecyc
         let mut sessions = crate::session::store::load_cutex_session_store()?;
         let mut state = load_quick_state();
         let mut config = load_codez_config_checked()?;
-        let references = rename_all_profile_references(&mut state, &mut config, &mut sessions, old, new)?;
+        let references =
+            rename_all_profile_references(&mut state, &mut config, &mut sessions, old, new)?;
         if references.session_keys.is_empty() {
             return Ok((sessions, references, state, config));
         }
@@ -735,12 +872,18 @@ pub(crate) mod tests {
     impl TestHome {
         pub(crate) fn new() -> Self {
             let guard = crate::config::paths::test_home_env_lock();
-            let root = std::env::temp_dir()
-                .join(format!("cutex-profile-lifecycle-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+            let root = std::env::temp_dir().join(format!(
+                "cutex-profile-lifecycle-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            ));
             std::fs::create_dir_all(root.join(".cutex")).unwrap();
             let previous = std::env::var_os("HOME");
             unsafe { std::env::set_var("HOME", &root) };
-            Self { root, previous, _guard: guard }
+            Self {
+                root,
+                previous,
+                _guard: guard,
+            }
         }
 
         pub(crate) fn root(&self) -> &std::path::Path {
@@ -789,14 +932,18 @@ pub(crate) mod tests {
         for bad in ["", "   ", "a/b", "a\\b", "tab\there", &"x".repeat(65)] {
             assert!(validate_profile_name(bad).is_err(), "{bad:?}");
         }
-        assert_eq!(NewProfileKind::parse("apiKey"), Some(NewProfileKind::ApiKey));
+        assert_eq!(
+            NewProfileKind::parse("apiKey"),
+            Some(NewProfileKind::ApiKey)
+        );
         assert_eq!(NewProfileKind::parse("api-key"), None);
     }
 
     #[test]
     fn create_writes_the_cli_layout_and_rejects_duplicates() {
         let _home = TestHome::new();
-        let glm = create_profile(&api_key("GLM", "glm", Some("sk-test-only"))).expect("create apiKey");
+        let glm =
+            create_profile(&api_key("GLM", "glm", Some("sk-test-only"))).expect("create apiKey");
         assert_eq!(glm.source.as_deref(), Some("api-key"));
         let files = materialized_account_files(&glm).unwrap();
         let config = std::fs::read_to_string(&files.config_path).unwrap();
@@ -806,7 +953,8 @@ pub(crate) mod tests {
         assert!(files.auth_path.exists());
         // GLM's catalog is written at creation and parses as a native catalog.
         let catalog: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&files.model_catalog_path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&files.model_catalog_path).unwrap())
+                .unwrap();
         crate::profiles::known_models::tests::assert_native_model_rows(&catalog);
         assert_eq!(catalog["models"][0]["slug"], "glm-5.3");
         // Zhipu Coding Plan quota: 5 h primary + weekly extra.
@@ -824,14 +972,26 @@ pub(crate) mod tests {
         let files = materialized_account_files(&custom).unwrap();
         assert!(!files.auth_path.exists(), "no key, no auth.json");
         let config = std::fs::read_to_string(&files.config_path).unwrap();
-        assert!(config.contains("model = \"m-1\"") && config.contains("llm.example.com"), "{config}");
-        assert_eq!(crate::profiles::providers::provider_family(&custom).0, "custom:llm.example.com");
+        assert!(
+            config.contains("model = \"m-1\"") && config.contains("llm.example.com"),
+            "{config}"
+        );
+        assert_eq!(
+            crate::profiles::providers::provider_family(&custom).0,
+            "custom:llm.example.com"
+        );
         // The generic preset writes no plan label; named presets do.
         assert_eq!(custom.plan_type, None);
 
         let deepseek = create_profile(&api_key("ds", "deepseek", None)).expect("deepseek");
-        assert_eq!(deepseek.plan_type.as_deref(), Some(crate::profiles::deepseek::DEEPSEEK_PROVIDER_NAME));
-        assert!(materialized_account_files(&deepseek).unwrap().model_catalog_path.exists());
+        assert_eq!(
+            deepseek.plan_type.as_deref(),
+            Some(crate::profiles::deepseek::DEEPSEEK_PROVIDER_NAME)
+        );
+        assert!(materialized_account_files(&deepseek)
+            .unwrap()
+            .model_catalog_path
+            .exists());
 
         let chatgpt = create_profile(&NewProfile {
             name: "work".into(),
@@ -843,8 +1003,14 @@ pub(crate) mod tests {
         })
         .expect("chatgpt");
         assert_eq!(chatgpt.source.as_deref(), Some("official"));
-        assert!(!materialized_account_files(&chatgpt).unwrap().auth_path.exists());
-        assert_eq!(crate::profiles::providers::provider_family(&chatgpt).0, "openai-chatgpt");
+        assert!(!materialized_account_files(&chatgpt)
+            .unwrap()
+            .auth_path
+            .exists());
+        assert_eq!(
+            crate::profiles::providers::provider_family(&chatgpt).0,
+            "openai-chatgpt"
+        );
 
         let claude = create_profile(&NewProfile {
             name: "claude".into(),
@@ -857,13 +1023,19 @@ pub(crate) mod tests {
         .expect("claude");
         assert_eq!(claude.cli_kind, CliKind::Claude);
 
-        assert!(matches!(create_profile(&api_key("GLM", "zai", None)), Err(LifecycleError::NameConflict(_))));
+        assert!(matches!(
+            create_profile(&api_key("GLM", "zai", None)),
+            Err(LifecycleError::NameConflict(_))
+        ));
         assert!(matches!(
             create_profile(&api_key(&glm.id, "zai", None)),
             Err(LifecycleError::NameConflict(_))
         ));
         assert!(matches!(
-            create_profile(&NewProfile { kind: NewProfileKind::Chatgpt, ..api_key("x", "zai", None) }),
+            create_profile(&NewProfile {
+                kind: NewProfileKind::Chatgpt,
+                ..api_key("x", "zai", None)
+            }),
             Err(LifecycleError::Invalid(_))
         ));
         let store = load_store().unwrap();
@@ -877,32 +1049,57 @@ pub(crate) mod tests {
         let _home = TestHome::new();
         // DeepSeek preset: its balance reader on, resolved endpoint stored.
         let deepseek = create_profile(&api_key("ds", "deepseek", Some("sk-test-only"))).unwrap();
-        assert_eq!((deepseek.quota_preset, deepseek.quota_reader), (Preset::Custom, Some(Reader::DeepseekBalance)));
+        assert_eq!(
+            (deepseek.quota_preset, deepseek.quota_reader),
+            (Preset::Custom, Some(Reader::DeepseekBalance))
+        );
         assert!(deepseek.options.quota.enabled);
-        assert_eq!(deepseek.options.quota.url, "https://api.deepseek.com/user/balance", "older binaries read it");
+        assert_eq!(
+            deepseek.options.quota.url, "https://api.deepseek.com/user/balance",
+            "older binaries read it"
+        );
         let view = config_view(&deepseek);
         assert_eq!(view["preset"], "deepseek_balance");
-        assert_eq!(view["resolvedPrimary"]["url"], "https://api.deepseek.com/user/balance");
+        assert_eq!(
+            view["resolvedPrimary"]["url"],
+            "https://api.deepseek.com/user/balance"
+        );
         assert_eq!(view["presetError"], serde_json::Value::Null);
         let stored = load_store().unwrap();
-        let stored = stored.accounts.iter().find(|a| a.id == deepseek.id).unwrap();
-        assert!(stored.options.quota.enabled && stored.quota_reader == Some(Reader::DeepseekBalance), "persisted");
+        let stored = stored
+            .accounts
+            .iter()
+            .find(|a| a.id == deepseek.id)
+            .unwrap();
+        assert!(
+            stored.options.quota.enabled && stored.quota_reader == Some(Reader::DeepseekBalance),
+            "persisted"
+        );
         // A custom preset on any relay: no reader, whatever the host.
         let relay = create_profile(&NewProfile {
             base_url: Some("https://relay.example/v1".into()),
             ..api_key("relay", "custom", None)
         })
         .unwrap();
-        assert_eq!((relay.quota_preset, relay.quota_reader), (Preset::Custom, None));
+        assert_eq!(
+            (relay.quota_preset, relay.quota_reader),
+            (Preset::Custom, None)
+        );
         assert!(!relay.options.quota.enabled);
         // Official Moonshot (Kimi): the preset of each platform names its reader.
         let kimi = create_profile(&api_key("k", "moonshot", None)).unwrap();
         assert_eq!(kimi.quota_reader, Some(Reader::MoonshotBalance));
         let view = config_view(&kimi);
-        assert_eq!(view["resolvedPrimary"]["url"], "https://api.moonshot.ai/v1/users/me/balance");
+        assert_eq!(
+            view["resolvedPrimary"]["url"],
+            "https://api.moonshot.ai/v1/users/me/balance"
+        );
         assert_eq!(view["resolvedPrimary"]["label"], "Kimi");
         let kimi_cn = create_profile(&api_key("k cn", "moonshot-cn", None)).unwrap();
-        assert_eq!(config_view(&kimi_cn)["resolvedPrimary"]["url"], "https://api.moonshot.cn/v1/users/me/balance");
+        assert_eq!(
+            config_view(&kimi_cn)["resolvedPrimary"]["url"],
+            "https://api.moonshot.cn/v1/users/me/balance"
+        );
         // The global preset on another base URL: no host rule, quota off.
         let moved = create_profile(&NewProfile {
             base_url: Some("https://api.moonshot.cn/v1".into()),
@@ -915,31 +1112,56 @@ pub(crate) mod tests {
         // key credits.
         for (name, preset, url) in [
             ("z", "zai", "https://api.z.ai/api/monitor/usage/quota/limit"),
-            ("zp", "zhipu", "https://open.bigmodel.cn/api/monitor/usage/quota/limit"),
+            (
+                "zp",
+                "zhipu",
+                "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            ),
             ("or", "openrouter", "https://openrouter.ai/api/v1/key"),
         ] {
             let profile = create_profile(&api_key(name, preset, None)).unwrap();
             assert!(profile.quota_reader.is_some(), "{preset}");
-            assert_eq!(config_view(&profile)["resolvedPrimary"]["url"], url, "{preset}");
+            assert_eq!(
+                config_view(&profile)["resolvedPrimary"]["url"],
+                url,
+                "{preset}"
+            );
         }
         // Kimi Code membership plan (both regions): the /usages reader on the
         // profile's own base URL, plus the optional week and month windows.
         for (name, preset, url) in [
             ("kc", "kimi-code", "https://api.kimi.ai/coding/v1/usages"),
-            ("kc cn", "kimi-code-cn", "https://api.kimi.com/coding/v1/usages"),
+            (
+                "kc cn",
+                "kimi-code-cn",
+                "https://api.kimi.com/coding/v1/usages",
+            ),
         ] {
             let profile = create_profile(&api_key(name, preset, None)).unwrap();
             assert_eq!(profile.quota_reader, Some(Reader::KimiCodePlan), "{preset}");
             let view = config_view(&profile);
             assert_eq!(view["resolvedPrimary"]["url"], url, "{preset}");
             assert_eq!(view["resolvedPrimary"]["window_label"], "5h", "{preset}");
-            let windows: Vec<_> = profile.options.quotas.iter().map(|c| (c.window_label.clone().unwrap(), c.optional)).collect();
-            assert_eq!(windows, [("week".to_string(), true), ("month".to_string(), true)], "{preset}");
+            let windows: Vec<_> = profile
+                .options
+                .quotas
+                .iter()
+                .map(|c| (c.window_label.clone().unwrap(), c.optional))
+                .collect();
+            assert_eq!(
+                windows,
+                [("week".to_string(), true), ("month".to_string(), true)],
+                "{preset}"
+            );
         }
         // Other APIs: no reader, left off.
         for (name, preset) in [("oa", "openai"), ("mm", "minimax"), ("x", "xai")] {
             let profile = create_profile(&api_key(name, preset, None)).unwrap();
-            assert_eq!((profile.quota_preset, profile.quota_reader), (Preset::Custom, None), "{preset}");
+            assert_eq!(
+                (profile.quota_preset, profile.quota_reader),
+                (Preset::Custom, None),
+                "{preset}"
+            );
             assert!(!profile.options.quota.enabled, "{preset}");
         }
         let chatgpt = create_profile(&NewProfile {
@@ -966,9 +1188,75 @@ pub(crate) mod tests {
         let config = std::fs::read_to_string(&files.config_path).unwrap();
         assert!(config.contains("model_provider = \"deepseek\""), "{config}");
         let store = load_store().unwrap();
-        assert_eq!(store.accounts[1].name, "ds copy", "inserted after the source");
-        assert!(matches!(duplicate_profile("ds", "ds copy"), Err(LifecycleError::NameConflict(_))));
-        assert!(matches!(duplicate_profile("nope", "x"), Err(LifecycleError::NotFound)));
+        assert_eq!(
+            store.accounts[1].name, "ds copy",
+            "inserted after the source"
+        );
+        assert!(matches!(
+            duplicate_profile("ds", "ds copy"),
+            Err(LifecycleError::NameConflict(_))
+        ));
+        assert!(matches!(
+            duplicate_profile("nope", "x"),
+            Err(LifecycleError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn duplicate_keeps_scalar_looks_but_drops_manual_account_link_and_clocks() {
+        let _home = TestHome::new();
+        let source = create_profile(&api_key("linked", "deepseek", None)).unwrap();
+        for (index, manual) in ["none", "m-AAAAAAAAAAAAAAAAAAAAAA", "invalid-legacy-manual"]
+            .iter()
+            .enumerate()
+        {
+            let mut store = load_store().unwrap();
+            let original = store
+                .accounts
+                .iter_mut()
+                .find(|a| a.id == source.id)
+                .unwrap();
+            original.options.account_link = Some((*manual).into());
+            original
+                .options
+                .appearance_updated_at
+                .insert("color".into(), "2099-01-01T00:00:00.000Z".into());
+            original.options.style = Some(crate::profiles::appearance::TextStyle::color("#123456"));
+            original.options.intro_greeting = Some("portable greeting".into());
+            save_store(&store).unwrap();
+            let copy = duplicate_profile(&source.id, &format!("copy-{index}")).unwrap();
+            assert_eq!(copy.options.account_link, None);
+            assert!(copy.options.appearance_updated_at.is_empty());
+            assert_eq!(
+                copy.options.style.as_ref().unwrap().fg.as_deref(),
+                Some("#123456")
+            );
+            assert_eq!(
+                copy.options.intro_greeting.as_deref(),
+                Some("portable greeting")
+            );
+            let persisted = load_store().unwrap();
+            assert_eq!(
+                persisted
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == copy.id)
+                    .unwrap()
+                    .options,
+                copy.options
+            );
+            assert_eq!(
+                persisted
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == source.id)
+                    .unwrap()
+                    .options
+                    .account_link
+                    .as_deref(),
+                Some(*manual)
+            );
+        }
     }
 
     #[test]
@@ -980,10 +1268,15 @@ pub(crate) mod tests {
         config.default_profile = Some("keep".into());
         config.quick_chat_default_profile = Some("gone".into());
         save_codez_config(&config).unwrap();
-        assert!(matches!(delete_profile("keep"), Err(LifecycleError::IsDefault(_))));
+        assert!(matches!(
+            delete_profile("keep"),
+            Err(LifecycleError::IsDefault(_))
+        ));
 
         let mut sessions = CutexSessionStore::default();
-        sessions.sessions.insert("cutex.s1".into(), session("cutex.s1", "gone"));
+        sessions
+            .sessions
+            .insert("cutex.s1".into(), session("cutex.s1", "gone"));
         crate::session::store::save_cutex_session_store(&sessions).unwrap();
         match delete_profile(&gone.id) {
             Err(LifecycleError::InUse(refs)) => {
@@ -1003,11 +1296,19 @@ pub(crate) mod tests {
         assert!(backup.join("auth.json").exists() && backup.join("profile.json").exists());
         assert!(!profile_dir(&gone).unwrap().exists());
         assert!(outcome.references.global_config_changed);
-        assert_eq!(load_codez_config_checked().unwrap().quick_chat_default_profile, None);
+        assert_eq!(
+            load_codez_config_checked()
+                .unwrap()
+                .quick_chat_default_profile,
+            None
+        );
         let store = load_store().unwrap();
         assert_eq!(store.accounts.len(), 1);
         assert_eq!(store.accounts[0].id, keep.id);
-        assert!(matches!(delete_profile("gone"), Err(LifecycleError::NotFound)));
+        assert!(matches!(
+            delete_profile("gone"),
+            Err(LifecycleError::NotFound)
+        ));
     }
 
     #[test]
@@ -1025,8 +1326,12 @@ pub(crate) mod tests {
         sessions.sessions.insert("cutex.archived".into(), archived);
         let mut elsewhere = session("cutex.elsewhere", "birch");
         elsewhere.host_id = format!("{}-other-host", crate::platform::host::current_host_name());
-        sessions.sessions.insert("cutex.elsewhere".into(), elsewhere);
-        sessions.sessions.insert("cutex.active".into(), session("cutex.active", "birch"));
+        sessions
+            .sessions
+            .insert("cutex.elsewhere".into(), elsewhere);
+        sessions
+            .sessions
+            .insert("cutex.active".into(), session("cutex.active", "birch"));
         crate::session::store::save_cutex_session_store(&sessions).unwrap();
 
         // Another host's record never counts; an active one refuses even with Detach.
@@ -1042,7 +1347,9 @@ pub(crate) mod tests {
         crate::session::store::save_cutex_session_store(&sessions).unwrap();
 
         // Only archived left: the default still refuses, Detach clears them and deletes.
-        assert!(matches!(delete_profile("birch"), Err(LifecycleError::InUse(refs)) if refs.len() == 1));
+        assert!(
+            matches!(delete_profile("birch"), Err(LifecycleError::InUse(refs)) if refs.len() == 1)
+        );
         let revision = sessions.sessions["cutex.archived"].durable_revision();
         let outcome = delete_profile_with("birch", ArchivedReferences::Detach).expect("delete");
         assert_eq!(outcome.detached_sessions, ["cutex.archived"]);
@@ -1050,7 +1357,11 @@ pub(crate) mod tests {
         let archived = &sessions.sessions["cutex.archived"];
         assert_eq!(archived.profile, None);
         assert!(archived.durable_revision() > revision);
-        assert_eq!(sessions.sessions["cutex.elsewhere"].profile.as_deref(), Some("birch"), "other host untouched");
+        assert_eq!(
+            sessions.sessions["cutex.elsewhere"].profile.as_deref(),
+            Some("birch"),
+            "other host untouched"
+        );
         assert!(find(&load_store().unwrap(), "birch").is_none());
     }
 
@@ -1063,19 +1374,38 @@ pub(crate) mod tests {
         config.default_profile = Some("old".into());
         save_codez_config(&config).unwrap();
         let mut sessions = CutexSessionStore::default();
-        sessions.sessions.insert("cutex.a".into(), session("cutex.a", "old"));
-        sessions.sessions.insert("cutex.b".into(), session("cutex.b", "other"));
+        sessions
+            .sessions
+            .insert("cutex.a".into(), session("cutex.a", "old"));
+        sessions
+            .sessions
+            .insert("cutex.b".into(), session("cutex.b", "other"));
         crate::session::store::save_cutex_session_store(&sessions).unwrap();
 
-        assert!(matches!(rename_profile("old", "other"), Err(LifecycleError::NameConflict(_))));
-        assert!(matches!(rename_profile("old", "a/b"), Err(LifecycleError::Invalid(_))));
+        assert!(matches!(
+            rename_profile("old", "other"),
+            Err(LifecycleError::NameConflict(_))
+        ));
+        assert!(matches!(
+            rename_profile("old", "a/b"),
+            Err(LifecycleError::Invalid(_))
+        ));
         let outcome = rename_profile("old", "new").expect("rename");
         assert!(outcome.changed);
         assert_eq!(outcome.references.session_keys, ["cutex.a"]);
-        assert_eq!(load_codez_config_checked().unwrap().default_profile.as_deref(), Some("new"));
+        assert_eq!(
+            load_codez_config_checked()
+                .unwrap()
+                .default_profile
+                .as_deref(),
+            Some("new")
+        );
         let sessions = crate::session::store::load_cutex_session_store().unwrap();
         assert_eq!(sessions.sessions["cutex.a"].profile.as_deref(), Some("new"));
-        assert_eq!(sessions.sessions["cutex.b"].profile.as_deref(), Some("other"));
+        assert_eq!(
+            sessions.sessions["cutex.b"].profile.as_deref(),
+            Some("other")
+        );
         assert!(find(&load_store().unwrap(), "new").is_some());
         assert!(!rename_profile("new", "new").unwrap().changed);
 
@@ -1084,7 +1414,9 @@ pub(crate) mod tests {
         // resolve the new name by id, or (r217 binding) via the rename history.
         let other_id = find(&load_store().unwrap(), "other").unwrap().id.clone();
         let mut sessions = crate::session::store::load_cutex_session_store().unwrap();
-        let binding = |profile: &str, id: Option<&str>| -> crate::session::model::CutexAppServerRuntimeBinding {
+        let binding = |profile: &str,
+                       id: Option<&str>|
+         -> crate::session::model::CutexAppServerRuntimeBinding {
             let mut value = json!({
                 "transport": "loopback_web_socket", "endpoint": "ws://127.0.0.1:1", "pid": 1,
                 "runtime_dir": "/tmp", "launched_profile": profile, "diagnostic_journal_path": "/tmp/j",
@@ -1096,7 +1428,11 @@ pub(crate) mod tests {
             serde_json::from_value(value).expect("binding fixture")
         };
         // r217-written binding: name only; r218 binding: name + id.
-        sessions.sessions.get_mut("cutex.b").unwrap().app_server_runtime = Some(binding("other", None));
+        sessions
+            .sessions
+            .get_mut("cutex.b")
+            .unwrap()
+            .app_server_runtime = Some(binding("other", None));
         let mut r218 = session("cutex.c", "other");
         r218.app_server_runtime = Some(binding("other", Some(&other_id)));
         sessions.sessions.insert("cutex.c".into(), r218);
@@ -1105,35 +1441,73 @@ pub(crate) mod tests {
         let outcome = rename_profile("other", "renamed").expect("live rename");
         assert_eq!(outcome.references.session_keys, ["cutex.b", "cutex.c"]);
         let sessions = crate::session::store::load_cutex_session_store().unwrap();
-        let r217_binding = sessions.sessions["cutex.b"].app_server_runtime.clone().unwrap();
-        let r218_binding = sessions.sessions["cutex.c"].app_server_runtime.clone().unwrap();
+        let r217_binding = sessions.sessions["cutex.b"]
+            .app_server_runtime
+            .clone()
+            .unwrap();
+        let r218_binding = sessions.sessions["cutex.c"]
+            .app_server_runtime
+            .clone()
+            .unwrap();
         assert_eq!(r217_binding, binding("other", None), "binding untouched");
-        assert_eq!(r218_binding, binding("other", Some(&other_id)), "binding untouched");
-        assert_eq!(r217_binding.current_launched_profile().as_deref(), Some("renamed"));
-        assert_eq!(r217_binding.current_launched_profile_ref().id.as_deref(), Some(other_id.as_str()));
-        assert_eq!(r218_binding.current_launched_profile().as_deref(), Some("renamed"));
+        assert_eq!(
+            r218_binding,
+            binding("other", Some(&other_id)),
+            "binding untouched"
+        );
+        assert_eq!(
+            r217_binding.current_launched_profile().as_deref(),
+            Some("renamed")
+        );
+        assert_eq!(
+            r217_binding.current_launched_profile_ref().id.as_deref(),
+            Some(other_id.as_str())
+        );
+        assert_eq!(
+            r218_binding.current_launched_profile().as_deref(),
+            Some("renamed")
+        );
         // Both still count as launched on the renamed profile (delete refuses).
         let refs = session_references(&sessions, "renamed");
         assert!(refs.iter().filter(|r| r.launched).count() == 2, "{refs:?}");
-        assert!(matches!(delete_profile("renamed"), Err(LifecycleError::InUse(_))));
+        assert!(matches!(
+            delete_profile("renamed"),
+            Err(LifecycleError::InUse(_))
+        ));
 
         // A live runtime (event context with the launch-time name and the
         // id) now reports under the new name.
-        let live = crate::profiles::identity::LaunchedProfile::resolve(Some(&other_id), Some("other"));
+        let live =
+            crate::profiles::identity::LaunchedProfile::resolve(Some(&other_id), Some("other"));
         assert_eq!(live.name.as_deref(), Some("renamed"));
         // A pre-r218 context (name only) resolved its id on connect, before
         // the rename; after it the old name no longer resolves (no alias).
         assert_eq!(crate::profiles::identity::id_for_name("other"), None);
         assert!(find(&load_store().unwrap(), "other").is_none());
         // Rename history (usage attribution only).
-        let history = crate::profiles::identity::load_history_at(&crate::profiles::identity::history_path().unwrap());
+        let history = crate::profiles::identity::load_history_at(
+            &crate::profiles::identity::history_path().unwrap(),
+        );
         let last = history.renames.last().unwrap();
-        assert_eq!((last.profile_id.as_str(), last.from.as_str(), last.to.as_str()), (other_id.as_str(), "other", "renamed"));
+        assert_eq!(
+            (
+                last.profile_id.as_str(),
+                last.from.as_str(),
+                last.to.as_str()
+            ),
+            (other_id.as_str(), "other", "renamed")
+        );
 
         // A new profile that takes the old name later does not capture the
         // r217 occurrence launched before the rename.
         create_profile(&api_key("other", "zai", Some("sk-test-only"))).unwrap();
-        assert_eq!(r217_binding.current_launched_profile().as_deref(), Some("renamed"));
-        assert_eq!(r218_binding.current_launched_profile().as_deref(), Some("renamed"));
+        assert_eq!(
+            r217_binding.current_launched_profile().as_deref(),
+            Some("renamed")
+        );
+        assert_eq!(
+            r218_binding.current_launched_profile().as_deref(),
+            Some("renamed")
+        );
     }
 }

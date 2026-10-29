@@ -1,5 +1,8 @@
 //! Management v2 Retire/Restore transaction wiring.
 
+#[path = "archive_api.rs"]
+pub(crate) mod api;
+
 use cutex::agent_bus::model::AgentBusAgent;
 use cutex::management::v2::user_input::UserInputExecutionError;
 use cutex::session::archive::commit_restore as commit_restore_record;
@@ -22,7 +25,6 @@ use cutex::session::store::CutexSessionStoreRevisionConflict;
 use super::management_context::load_app_server_runtime_status;
 #[cfg(test)]
 use super::management_lifecycle::filter_live_agents_for_management_identity;
-use super::management_lifecycle::stop_cutex_session_runtime_for_entry;
 use super::management_lifecycle::try_live_agents_for_management_entry;
 use super::management_lifecycle::try_live_agents_for_management_identity;
 
@@ -111,6 +113,13 @@ impl CutexSessionArchiveTransaction for ManagementArchiveTransaction {
         &mut self,
         record: &CutexSessionRecord,
     ) -> Result<(), CutexSessionArchiveError> {
+        if record.dsh_session.is_some() {
+            cutex::runtime::dsh::close(&record.cutex_session_id, record.runtime_generation)
+                .map_err(|error| CutexSessionArchiveError::RuntimeStopFailed { detail: format!("{error:#}") })?;
+            super::app_server_runtime::disconnect_runtime(&record.cutex_session_id)
+                .map_err(|error| CutexSessionArchiveError::RuntimeStopFailed { detail: format!("{error:#}") })?;
+            return Ok(());
+        }
         if record.claude_session.is_some() {
             return stop_claude_runtime(record);
         }
@@ -129,7 +138,7 @@ impl CutexSessionArchiveTransaction for ManagementArchiveTransaction {
                 }
             })?;
         let stop =
-            stop_cutex_session_runtime_for_entry(&entry, &live_agents, false).map_err(|error| {
+            super::management_lifecycle::stop_cutex_session_runtime_for_entry_fenced(&entry, &live_agents, false, Some(record.runtime_generation)).map_err(|error| {
                 CutexSessionArchiveError::RuntimeStopFailed {
                     detail: format!("{error:#}"),
                 }
@@ -345,12 +354,24 @@ fn session_missing(cutex_session_id: &str) -> CutexSessionArchiveError {
 }
 
 fn runtime_is_offline(record: &CutexSessionRecord) -> Result<bool, CutexSessionArchiveError> {
+    // A pre-binding crash leaves no durable PID or Bus/manager observation.
+    // DSH still owns its named scope; archive must stop it before retirement.
+    if dsh_scope_is_populated(record).map_err(|error| CutexSessionArchiveError::RuntimeStopFailed { detail: format!("cannot inspect DSH scope: {error:#}") })? {
+        return Ok(false);
+    }
     let manager_connected = load_app_server_runtime_status(&record.cutex_session_id)
         .map_err(|error| CutexSessionArchiveError::RuntimeStopFailed {
             detail: format!("failed to inspect app-server runtime: {error:#}"),
         })?
         .is_some_and(|status| status.connected);
     runtime_is_offline_from_observations(record, manager_connected, load_exact_live_agents(record))
+}
+
+fn dsh_scope_is_populated(record: &CutexSessionRecord) -> anyhow::Result<bool> {
+    if record.dsh_session.is_some() || record.runtime_backend == cutex::session::model::CutexSessionRuntimeBackend::Dsh {
+        return Ok(!cutex::runtime::process_scope::managed_agent_scope_is_absent(&record.cutex_session_id)?);
+    }
+    Ok(false)
 }
 
 /// The identity this session's runtime registers on the Agent Bus with, plus
@@ -586,6 +607,33 @@ fn archive_state_error(code: &str, message: &str) -> UserInputExecutionError {
 /// nothing is left running for the agent.
 pub(super) struct OfflineArchiveRuntime;
 
+/// Used only after provider authorization/name checks. The archive provider
+/// invokes runtime hooks without holding the session-store lock.
+pub(super) struct StoppingArchiveRuntime;
+
+impl cutex::agent_management::AgentArchiveRuntime for StoppingArchiveRuntime {
+    fn prepare(&mut self, record: &CutexSessionRecord, restoring: bool) -> anyhow::Result<()> {
+        cutex::agent_management::AgentArchiveRuntime::prepare(&mut OfflineArchiveRuntime, record, restoring)
+    }
+    fn stop_and_verify(&mut self, record: &CutexSessionRecord) -> anyhow::Result<()> {
+        let current = load_archive_record(&record.cutex_session_id)?;
+        anyhow::ensure!(current.runtime_generation == record.runtime_generation
+            && current.app_server_thread_id() == record.app_server_thread_id()
+            && current.runtime_backend == record.runtime_backend,
+            "archive_runtime_occurrence_changed_before_stop");
+        if !runtime_is_offline(&current)? {
+            // Native stop verifies its exact persisted owner; Claude/DSH close
+            // receive expected generation. Never resolve a fresh force:true ID.
+            ManagementArchiveTransaction.stop_runtime(record)?;
+        }
+        self.verify_offline(record)
+    }
+    fn verify_offline(&mut self, record: &CutexSessionRecord) -> anyhow::Result<()> {
+        let current = load_archive_record(&record.cutex_session_id)?;
+        ensure_archive_runtime_offline(&current)
+    }
+}
+
 impl cutex::agent_management::AgentArchiveRuntime for OfflineArchiveRuntime {
     fn prepare(&mut self, record: &CutexSessionRecord, _restoring: bool) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -609,9 +657,21 @@ impl cutex::agent_management::AgentArchiveRuntime for OfflineArchiveRuntime {
 }
 
 pub(super) fn archive_runtime_looks_online(record: &CutexSessionRecord) -> anyhow::Result<bool> {
-    Ok(record_has_runtime_claim(record)
+    Ok(dsh_scope_is_populated(record)? || record_has_runtime_claim(record)
         || load_app_server_runtime_status(&record.cutex_session_id)?
             .is_some_and(|status| status.connected))
+}
+
+/// Whether a runtime of `record` may still be registered (a claim, a
+/// connected app-server, or a live Agent Bus registration of its native
+/// session). An unreachable Agent Bus cannot refresh a registration either,
+/// so it counts as no live registration.
+pub(super) fn runtime_registration_live(record: &CutexSessionRecord) -> anyhow::Result<bool> {
+    if archive_runtime_looks_online(record)? {
+        return Ok(true);
+    }
+    Ok(record.app_server_thread_id().is_some()
+        && load_exact_live_agents(record).is_ok_and(|live| !live.is_empty()))
 }
 
 fn ensure_archive_runtime_offline(record: &CutexSessionRecord) -> anyhow::Result<()> {
@@ -632,6 +692,49 @@ fn ensure_archive_runtime_offline(record: &CutexSessionRecord) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn dsh_unbound_orphan_scope_is_not_offline_before_bus_registration() {
+        let home = super::super::test_home::IsolatedTestHome::new_private("dsh-orphan-archive").unwrap();
+        let config_dir = cutex::config::paths::config_dir().unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        // Even a regression must never contact a default/live Bus.
+        std::fs::write(config_dir.join("config.json"), r#"{"agent_bus_enabled":false,"agent_bus_port":1}"#).unwrap();
+        let mut record = CutexSessionRecord::new_at(
+            format!("cutex.{}", uuid::Uuid::new_v4()), None,
+            cutex::platform::host::current_host_name(), home.root().to_string_lossy().into_owned(),
+            None, "2026-10-25T00:00:00Z".into(),
+        ).unwrap();
+        record.runtime_backend = cutex::session::model::CutexSessionRuntimeBackend::Dsh;
+        assert!(!record_has_runtime_claim(&record));
+        let job = cutex::platform::windows_job::create_agent_job(
+            &cutex::runtime::process_scope::managed_agent_job_name(&record.cutex_session_id),
+        ).unwrap();
+        struct ScopeCleanup(String);
+        impl Drop for ScopeCleanup {
+            fn drop(&mut self) { let _ = cutex::runtime::process_scope::terminate_managed_agent_scope(&self.0, true); }
+        }
+        let _cleanup = ScopeCleanup(record.cutex_session_id.clone());
+        let log = std::fs::File::create(home.root().join("orphan-child.log")).unwrap();
+        let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut command = std::process::Command::new(powershell);
+        command.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]);
+        for (key, _) in std::env::vars_os() { command.env_remove(key); }
+        for key in ["PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
+            if let Some(value) = std::env::var_os(key) { command.env(key, value); }
+        }
+        for key in ["HOME", "USERPROFILE", "TEMP", "TMP", "APPDATA", "LOCALAPPDATA"] {
+            command.env(key, home.root());
+        }
+        let mut child = cutex::platform::windows_spawn::spawn_detached_in_job(&command, &log, &job).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(!runtime_is_offline(&record).unwrap(), "an unrecorded named scope cannot be retired as offline");
+        assert!(archive_runtime_looks_online(&record).unwrap(), "managed Agent archive must also stop an unrecorded DSH scope");
+        let stopped = cutex::runtime::process_scope::terminate_managed_agent_scope(&record.cutex_session_id, true).unwrap();
+        assert!(stopped.stopped);
+    }
 
     #[derive(Debug)]
     struct ClaimFreeLiveAgentTransaction {

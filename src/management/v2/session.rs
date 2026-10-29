@@ -88,6 +88,8 @@ pub const CUTEX_METHOD_REGISTRY_METHODS: &[&str] = &[
     "cutex/agentBus/wake",
     "cutex/asks/pause",
     "cutex/asks/resume",
+    "cutex/agent/pause",
+    "cutex/agent/resume",
     "cutex/ownerNotify/ack",
     "cutex/ownerNotify/reply",
     "cutex/ownerNotify/dismiss",
@@ -284,6 +286,72 @@ pub fn session_list_resource_with_hidden(
     }))
 }
 
+/// Eligibility-only snapshot for read routes which do not consume session
+/// projection fields (queue/list and focus/get). Avoid native status, activity,
+/// event-stream metadata and a redundant queue snapshot before the actual read.
+pub fn read_route_resource(
+    cutex_session_id:&str,
+    registry:&ImRegistry,
+    require_visible:bool,
+) -> anyhow::Result<Option<Value>> {
+    let store=load_cutex_session_store_shared()?;
+    let Some(record)=store.sessions.values().find(|r|r.cutex_session_id==cutex_session_id) else {return Ok(None)};
+    Ok(read_route_snapshot(record,session_is_visible(registry,record),require_visible,&crate::platform::host::current_host_name()))
+}
+
+fn read_route_snapshot(record:&CutexSessionRecord,visible:bool,require_visible:bool,host:&str)->Option<Value> {
+    active_session_is_eligible(record,visible,require_visible,host)
+        .then(||json!({"cutexSessionId":record.cutex_session_id}))
+}
+
+/// Internal online-submit routing inputs, never a public session resource.
+/// `None` means the caller MUST fall back to the complete resource path: it
+/// does not distinguish absent, hidden, offline or a changing runtime binding.
+/// No activity, pending-request, projection or event-repository reads occur.
+pub fn online_submit_resource(
+    cutex_session_id: &str,
+    registry: &ImRegistry,
+    load_runtime_status: RuntimeStatusLoader,
+    require_visible: bool,
+) -> anyhow::Result<Option<Value>> {
+    let store = load_cutex_session_store_shared()?;
+    let Some(record) = store.sessions.values()
+        .find(|record| record.cutex_session_id == cutex_session_id) else {
+        return Ok(None);
+    };
+    if !active_session_is_eligible(record, session_is_visible(registry, record),
+        require_visible, &crate::platform::host::current_host_name()) {
+        return Ok(None);
+    }
+    let status = load_runtime_status(cutex_session_id)?;
+    Ok(online_submit_snapshot(record, status.as_ref()))
+}
+
+fn active_session_is_eligible(record: &CutexSessionRecord, visible: bool, require_visible: bool, host: &str) -> bool {
+    crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, host)
+        && !record.is_retired()
+        && is_durable_management_session(record)
+        && (!require_visible || visible)
+}
+
+fn online_submit_snapshot(record: &CutexSessionRecord, status: Option<&AppServerManagedRuntimeStatus>) -> Option<Value> {
+    let thread = record.app_server_thread_id().filter(|thread| !thread.trim().is_empty())?;
+    let status = status.filter(|status| status.connected
+        && status.cutex_session_id == record.cutex_session_id
+        && status.thread_id == thread
+        && record.runtime_generation > 0
+        && record.runtime_generation <= super::model::MAX_SAFE_SEQUENCE
+        && status.runtime_generation == record.runtime_generation)?;
+    // offline_submit's connected branch reads appServerConnected/threadId and
+    // delegates straight to dispatch_user_input_submit, which only uses threadId.
+    // In particular this must never enter the offline StartPlan branch or a CAS mutation.
+    Some(json!({
+        "cutexSessionId": record.cutex_session_id,
+        "native": { "threadId": thread },
+        "runtime": { "appServerConnected": true, "status": "online", "runtimeGeneration": status.runtime_generation },
+    }))
+}
+
 pub fn session_resource(
     cutex_session_id: &str,
     registry: &ImRegistry,
@@ -365,13 +433,7 @@ fn session_resource_with_visibility(
         return Ok(None);
     };
     let visible = session_is_visible(registry, record);
-    if !crate::runtime::lifecycle::cutex_session_host_is_local(
-        &record.host_id,
-        &crate::platform::host::current_host_name(),
-    ) || record.is_retired()
-        || !is_durable_management_session(record)
-        || (require_visible && !visible)
-    {
+    if !active_session_is_eligible(record, visible, require_visible, &crate::platform::host::current_host_name()) {
         return Ok(None);
     }
     let activity_states = load_activity_states_best_effort();
@@ -534,6 +596,11 @@ fn annotate_retired_session_project(
 /// account the session was created on (resolved from its frozen login home;
 /// it never changes). Absent on other sessions.
 fn insert_claude_account(object: &mut serde_json::Map<String, Value>, record: &CutexSessionRecord) {
+    // r265 `launchBinding`: profile + variant + credential reference frozen
+    // at creation (no secret); absent on older sessions.
+    if let Some(binding) = &record.profile_binding {
+        object.insert("launchBinding".to_string(), binding.to_wire());
+    }
     if record.claude_session.is_none() {
         return;
     }
@@ -576,7 +643,7 @@ fn retired_session_resource_fields(
     activity: Option<&SessionActivityState>,
     context: &ProjectionContext,
 ) -> Value {
-    json!({
+    let mut value = json!({
         "contractVersion": 2,
         "cutexSessionId": record.cutex_session_id,
         "revision": record.durable_revision(),
@@ -596,6 +663,9 @@ fn retired_session_resource_fields(
         "displayNameOverride": record.display_name_override,
         "note": record.note,
         "avatar": record.avatar,
+        "avatarMode": record.avatar_mode,
+        "createdBy": record.created_by,
+        "badge": record.badge,
         "groups": normalized_groups(&record.agent_groups),
         "registrationClass": if record.registration_class == AgentRegistrationClass::Persistent {
             "persistent"
@@ -614,7 +684,29 @@ fn retired_session_resource_fields(
         "activity": activity_resource(activity),
         "createdAt": record.created_at,
         "updatedAt": record.updated_at,
-    })
+    });
+    context.archive.annotate(&mut value, record);
+    annotate_agent_activity(&mut value,activity);
+    annotate_continuation_capabilities(&mut value);
+    let (_,reasons,available)=context.pause_view(&record.cutex_session_id);
+    value["pauseReasons"]=reasons;
+    value["pauseReasonsAvailable"]=json!(available);
+    value
+}
+
+fn annotate_continuation_capabilities(value:&mut Value){
+    if let Some(runtime)=value.get_mut("runtime").and_then(Value::as_object_mut) {
+        runtime.insert("continuationWakeKinds".into(),json!(crate::asks::continuation::runtime::WAKE_KINDS));
+        runtime.insert("continuationChildKinds".into(),json!(crate::asks::continuation::runtime::CHILD_KINDS));
+    }
+}
+
+fn annotate_agent_activity(value:&mut Value,activity:Option<&SessionActivityState>){
+    let online=value.pointer("/runtime/status").and_then(Value::as_str).map(|s|s=="online");
+    let busy=value.pointer("/runtime/activeTurnId").and_then(Value::as_str).is_some();
+    let generation=value.pointer("/runtime/runtimeGeneration").and_then(Value::as_u64);
+    let fields=super::activity::agent_projection(activity,online,busy,generation,chrono::Utc::now());
+    value.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
 }
 
 pub fn focus_resource(cutex_session_id: &str) -> anyhow::Result<Value> {
@@ -820,12 +912,33 @@ pub(super) fn project_session_entry(
 /// so a config change is visible on the next request.
 #[derive(Default)]
 struct ProjectionContext {
+    archive: super::archive::projection::Batch,
     global_default_profile: std::cell::OnceCell<Option<String>>,
     pending_server_requests:
         std::cell::OnceCell<std::collections::HashMap<(String, u64), Vec<Value>>>,
+    pause_views: std::cell::OnceCell<Option<std::collections::BTreeMap<String,(Value,Value)>>>,
 }
 
 impl ProjectionContext {
+    fn pause_view(&self,session:&str)->(Value,Value,bool){
+        let views=self.pause_views.get_or_init(||( || -> anyhow::Result<_> {
+            let roster=crate::memory::load_agent_management_snapshot()?;
+            let store=crate::asks::store::AskStore::open_default()?;
+            store.project_snapshot(|state|{
+                let projects=crate::asks::project_control::project_snapshot(state,&roster);
+                let ids=state.presence.keys().chain(state.pauses.keys()).cloned().chain(
+                    projects.projects.values().flat_map(|p|p.members.iter().cloned())).collect::<std::collections::BTreeSet<_>>();
+                ids.into_iter().map(|id|{
+                    let individual=state.presence.get(&id).and_then(|p|p.agent_pause.as_ref());
+                    let mut reasons=crate::asks::project_control::reasons_in(&projects,&id);
+                    if let Some(p)=individual {reasons.push(json!({"kind":"agent","requestedAt":p.requested_at,"phase":p.phase}));}
+                    if let Some(p)=state.pauses.get(&id){reasons.push(json!({"kind":"asks","since":p.since}));}
+                    (id,(crate::asks::agent_pause::view(individual),json!(reasons)))
+                }).collect()
+            })
+        })().ok());
+        match views{Some(views)=>{let (pause,reasons)=views.get(session).cloned().unwrap_or((Value::Null,json!([])));(pause,reasons,true)},None=>(Value::Null,json!([]),false)}
+    }
     fn global_default_profile(&self) -> Option<&str> {
         self.global_default_profile
             .get_or_init(|| {
@@ -895,7 +1008,7 @@ fn session_fingerprint_base(value: &Value) -> anyhow::Result<[u8; 32]> {
         match key.as_str() {
             // `revision` is the record's own, `activity` changes without a
             // session revision and focus is hashed under the lock.
-            "revision" | "activity" | "focus" => {}
+            "revision" | "activity" | "focus" | "observedAt" | "lastActivityAt" | "activitySource" | "busySince" | "activityStatus" | "idleThresholdSeconds" => {}
             // The host-wide journal cursor advances for other sessions too.
             // Keep its current value in the response, but never count it as
             // this session's change (otherwise every unrelated event rewrites
@@ -958,12 +1071,27 @@ fn prepare_session_projection(
     management: &Value,
     context: &ProjectionContext,
 ) -> anyhow::Result<PreparedSessionProjection> {
+    // A late observer from an earlier runtime cannot change the current row.
+    let runtime_status = runtime_status.filter(|status| status.runtime_generation == record.runtime_generation);
     let backend = runtime_backend_name(record.runtime_backend);
     let app_server_connected = runtime_status
         .as_ref()
         .is_some_and(|status| status.connected);
+    let stop_state = (!app_server_connected).then(||
+        crate::session::runtime_stop::state(&record.cutex_session_id, record.runtime_generation)).flatten();
+    if stop_state == Some(crate::session::runtime_stop::StopState::Closing) {
+        super::native_events::observe_stop_from_snapshot(&record.cutex_session_id,
+            record.runtime_generation, backend,
+            runtime_status.as_ref().and_then(|status| status.last_error.as_deref()))?;
+    }
+    let expected_stop = matches!(stop_state, Some(crate::session::runtime_stop::StopState::Closing
+        | crate::session::runtime_stop::StopState::Offline));
     let runtime_state = if app_server_connected {
         "online"
+    } else if stop_state == Some(crate::session::runtime_stop::StopState::Closing) {
+        "closing"
+    } else if stop_state == Some(crate::session::runtime_stop::StopState::Offline) {
+        "offline"
     } else if runtime_status
         .as_ref()
         .and_then(|status| status.last_error.as_ref())
@@ -973,10 +1101,11 @@ fn prepare_session_projection(
     } else {
         "offline"
     };
-    let schema = record
+    let mut schema = record
         .app_server_runtime
         .as_ref()
         .map(|binding| {
+            if let Some(session) = &record.dsh_session { return crate::runtime::dsh::acp_native_schema(session); }
             json!({
                 "protocol": "codex-app-server",
                 "majorVersion": 2,
@@ -985,10 +1114,11 @@ fn prepare_session_projection(
                 "channel": "experimental",
                 // The Codex app-server implements `turn/steer` itself (r47+);
                 // its per-turn refusals are mapped by the queue steer route.
-                "capabilities": { "experimentalApi": true, "features": { "turnSteer": true } },
+                "capabilities": { "experimentalApi": true, "features": { "turnSteer": true, "contextOccupancy": false, "billingUsage": true } },
                 "extensions": ["cutex-inter-agent-v2"],
             })
         })
+        .or_else(|| record.dsh_session.as_ref().map(crate::runtime::dsh::acp_native_schema))
         .or_else(|| {
             record.claude_session.as_ref().map(|claude| {
                 let mut schema = crate::runtime::claude::native_schema(claude);
@@ -1006,6 +1136,28 @@ fn prepare_session_projection(
                 schema
             })
         });
+    // Images use the current runtime's steer capability, not just its installed version.
+    if let Some(features) = schema.as_mut()
+        .and_then(|schema| schema.pointer_mut("/capabilities/features"))
+        .filter(|features| features.is_object()) {
+        let connected = runtime_status.as_ref().is_some_and(|status| status.connected);
+        let can_steer = connected && record.dsh_session.is_none()
+            && if record.claude_session.is_some() {
+                runtime_status.as_ref().and_then(|status|
+                    crate::runtime::claude::live_same_turn_steering(
+                        &record.cutex_session_id, status.runtime_generation)) == Some(true)
+            } else { features.get("turnSteer").and_then(Value::as_bool) == Some(true) };
+        super::user_input::image_steering::project_capability(features,
+            record.claude_session.is_some(), can_steer);
+        // DSH / Kimi fork / revert run the pinned runtime's session-ops.mjs (r265);
+        // a session pinned to an older DSH runtime cannot offer them.
+        if let Some(dsh) = &record.dsh_session {
+            let ops = !dsh.spike && dsh.adapter.with_file_name("session-ops.mjs").is_file();
+            for feature in ["threadFork", "threadRevert"] {
+                features[feature] = json!(ops && features[feature] == true);
+            }
+        }
+    }
     let effective_next_launch = effective_next_launch_with(record, context);
     let launched_profile = record
         .app_server_runtime
@@ -1020,6 +1172,7 @@ fn prepare_session_projection(
                 .unwrap_or(LaunchProfileSource::Unknown.as_str())
         })
     });
+    let (agent_pause,pause_reasons,pause_reasons_available)=context.pause_view(&record.cutex_session_id);
     let mut value = json!({
         "contractVersion": 2,
         "cutexSessionId": record.cutex_session_id,
@@ -1038,6 +1191,7 @@ fn prepare_session_projection(
         "groups": normalized_groups(&record.agent_groups),
         "registrationClass": registration_class_value(record)?,
         "visible": visible,
+        "agentPause": agent_pause,
         "native": {
             "threadId": record.app_server_thread_id(),
             "schema": schema,
@@ -1062,7 +1216,7 @@ fn prepare_session_projection(
             "requiresVisibleTerminal": record.runtime_backend == CutexSessionRuntimeBackend::HostForeground,
             "tuiAttached": tui_is_known_attached(record, app_server_connected),
             "lastEventAt": runtime_status.as_ref().and_then(|status| status.last_event_at.clone()),
-            "lastError": runtime_status.as_ref().and_then(|status| status.last_error.clone()),
+            "lastError": if expected_stop { None } else { runtime_status.as_ref().and_then(|status| status.last_error.clone()) },
             "pendingServerRequests": context.pending_server_requests(&record.cutex_session_id, record.runtime_generation),
         },
         "runtimeDefaults": runtime_defaults_resource(record),
@@ -1084,8 +1238,16 @@ fn prepare_session_projection(
     );
     presentation.insert("note".to_string(), json!(record.note));
     presentation.insert("avatar".to_string(), json!(record.avatar));
+    presentation.insert("avatarMode".to_string(), json!(record.avatar_mode));
+    presentation.insert("createdBy".to_string(), json!(record.created_by));
+    presentation.insert("badge".to_string(), json!(record.badge));
     insert_claude_account(presentation, record);
     insert_claude_runtime(&mut value, record);
+    context.archive.annotate(&mut value, record);
+    annotate_agent_activity(&mut value,activity);
+    annotate_continuation_capabilities(&mut value);
+    value["pauseReasons"]=pause_reasons;
+    value["pauseReasonsAvailable"]=json!(pause_reasons_available);
     let fingerprint_base = session_fingerprint_base(&value)?;
     Ok(PreparedSessionProjection {
         value,
@@ -1160,6 +1322,8 @@ fn runtime_backend_name(backend: CutexSessionRuntimeBackend) -> &'static str {
         CutexSessionRuntimeBackend::CuteAlden => "cute_alden",
         CutexSessionRuntimeBackend::ClaudeSubscription => "claude_subscription",
         CutexSessionRuntimeBackend::Future => "future",
+        CutexSessionRuntimeBackend::Dsh => "dsh",
+        CutexSessionRuntimeBackend::Kimi => "kimi",
     }
 }
 
@@ -1377,6 +1541,157 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    fn online_submit_fixture() -> (CutexSessionRecord, AppServerManagedRuntimeStatus) {
+        let mut record = CutexSessionRecord::from_codex_session_id("online-submit-thread").unwrap();
+        record.runtime_generation = 7;
+        record.host_id = "online-submit-host".into();
+        record.registration_class = AgentRegistrationClass::LocalOnly;
+        let status = AppServerManagedRuntimeStatus {
+            cutex_session_id: record.cutex_session_id.clone(), thread_id: "online-submit-thread".into(),
+            runtime_generation: 7, connected: true, active_turn_id: Some("busy-turn".into()),
+            active_turn_observed_at: None, thread_status: None, thread_status_observed_at: None,
+            thread_settings: None, thread_settings_source: None, thread_settings_complete: false,
+            thread_settings_observed_at: None, runtime_workspace_roots: None, instruction_sources: None,
+            resume_snapshot_observed_at: None, event_method_counts: HashMap::new(),
+            initialized_user_agent: None, last_event_at: None, last_error: None,
+        };
+        (record, status)
+    }
+
+    #[test]
+    fn stopped_runtime_snapshot_clears_only_the_matching_requested_error() {
+        let _home = crate::config::paths::test_home_env_lock();
+        use crate::session::runtime_stop::RequestedStop;
+        let (mut record, mut status) = online_submit_fixture();
+        record.cutex_session_id = format!("cutex.stop-{}", uuid::Uuid::new_v4());
+        status.cutex_session_id = record.cutex_session_id.clone();
+        status.connected = false;
+        status.last_error = Some("connection reset (os error 10054)".into());
+        let project = |status| prepare_session_projection(&record, true, Some(status), None,
+            &json!({}), &ProjectionContext::default()).unwrap().value;
+        assert_eq!(project(status.clone())["runtime"]["status"], "error");
+        assert_eq!(project(status.clone())["runtime"]["continuationWakeKinds"], json!(["after", "children"]));
+        assert_eq!(project(status.clone())["runtime"]["continuationChildKinds"], json!(["delegation"]));
+        let stop = RequestedStop::begin(&record.cutex_session_id, 7).unwrap();
+        assert_eq!(project(status.clone())["runtime"]["status"], "closing");
+        assert_eq!(project(status.clone())["runtime"]["status"], "closing");
+        stop.finish(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let events = super::super::native_events::stop_test_events(&record.cutex_session_id);
+            if !events.is_empty() {
+                assert_eq!(events.len(), 1, "repeated snapshots share one pending observer");
+                assert_eq!(events[0].cutex.as_ref().unwrap().method, "cutex/runtime/offline");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "snapshot closing did not converge");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let value = project(status.clone());
+        assert_eq!(value["runtime"]["status"], "offline");
+        assert!(value["runtime"]["lastError"].is_null());
+        status.runtime_generation = 6;
+        status.connected = true;
+        let value = project(status);
+        assert_eq!(value["runtime"]["status"], "offline");
+        assert_eq!(value["runtime"]["appServerConnected"], false);
+    }
+
+    #[test]
+    fn read_routes_work_offline_without_exposing_hidden_remote_or_retired_sessions() {
+        let (mut record,_)=online_submit_fixture();
+        record.codex_session_id=None;record.app_server_runtime=None;record.runtime_generation=0;
+        let host="online-submit-host";
+        assert_eq!(read_route_snapshot(&record,true,true,host),Some(json!({"cutexSessionId":record.cutex_session_id})));
+        assert!(read_route_snapshot(&record,false,true,host).is_none());
+        assert!(read_route_snapshot(&record,false,false,host).is_some());
+        assert!(read_route_snapshot(&record,true,false,"remote-host").is_none());
+        record.archive_state=CutexSessionArchiveState::Retired;
+        assert!(read_route_snapshot(&record,true,false,host).is_none());
+        record.archive_state=CutexSessionArchiveState::Active;
+        record.registration_class=AgentRegistrationClass::Ephemeral;
+        assert!(read_route_snapshot(&record,true,false,host).is_none());
+    }
+
+    #[test]
+    fn online_submit_guards_preserve_active_local_durable_and_visibility_rules() {
+        let (mut record, _) = online_submit_fixture();
+        let host = "online-submit-host";
+        let registry = ImRegistry::default();
+        record.exposed_to_backend = false;
+        assert!(!session_is_visible(&registry, &record));
+        assert!(!active_session_is_eligible(&record, false, true, host));
+        assert!(active_session_is_eligible(&record, false, false, host));
+        record.exposed_to_backend = true;
+        assert!(active_session_is_eligible(&record, session_is_visible(&registry, &record), true, host));
+        assert!(!active_session_is_eligible(&record, true, false, "different-host"));
+        record.archive_state = CutexSessionArchiveState::Retired;
+        assert!(!active_session_is_eligible(&record, true, false, host));
+        record.archive_state = CutexSessionArchiveState::Active;
+        record.registration_class = AgentRegistrationClass::Ephemeral;
+        assert!(!active_session_is_eligible(&record, true, false, host));
+        record.registration_class = AgentRegistrationClass::Persistent;
+        record.exposed_to_backend = false;
+        assert!(active_session_is_eligible(&record, session_is_visible(&registry, &record), true, host));
+    }
+
+    #[test]
+    fn online_submit_requires_exact_connected_runtime_identity_thread_and_generation() {
+        let (record, status) = online_submit_fixture();
+        assert!(online_submit_snapshot(&record, Some(&status)).is_some());
+        assert!(online_submit_snapshot(&record, None).is_none());
+        for mutate in [
+            (|s: &mut AppServerManagedRuntimeStatus| s.connected = false) as fn(&mut AppServerManagedRuntimeStatus),
+            |s| s.cutex_session_id.push_str("-stale"),
+            |s| s.thread_id.push_str("-stale"),
+            |s| s.runtime_generation = 0,
+            |s| s.runtime_generation = 8,
+        ] {
+            let (_, mut stale) = online_submit_fixture(); mutate(&mut stale);
+            assert!(online_submit_snapshot(&record, Some(&stale)).is_none());
+        }
+        for generation in [0, super::super::model::MAX_SAFE_SEQUENCE + 1] {
+            let (mut record, mut status) = online_submit_fixture();
+            record.runtime_generation = generation; status.runtime_generation = generation;
+            assert!(online_submit_snapshot(&record, Some(&status)).is_none());
+        }
+        for thread in [None, Some(String::new()), Some(" ".into())] {
+            let (mut unbound, _) = online_submit_fixture(); unbound.codex_session_id = thread;
+            assert!(online_submit_snapshot(&unbound, Some(&status)).is_none());
+        }
+    }
+
+    #[test]
+    fn online_submit_snapshot_contains_only_route_fields_with_resource_field_parity() {
+        let (record, status) = online_submit_fixture();
+        let snapshot = online_submit_snapshot(&record, Some(&status)).unwrap();
+        assert_eq!(snapshot, json!({"cutexSessionId":record.cutex_session_id,
+            "native":{"threadId":record.app_server_thread_id()},
+            "runtime":{"appServerConnected":status.connected,"status":"online", "runtimeGeneration":record.runtime_generation}}));
+        for presentation in ["activity", "management", "revision", "focus", "displayName"] {
+            assert!(snapshot.get(presentation).is_none());
+        }
+        assert!(snapshot.pointer("/runtime/pendingServerRequests").is_none());
+    }
+
+    #[test]
+    fn online_submit_uses_claude_app_server_binding_instead_of_native_history_identity() {
+        let (mut record, mut status) = online_submit_fixture();
+        record.runtime_backend = CutexSessionRuntimeBackend::ClaudeSubscription;
+        record.claude_session = Some(serde_json::from_value(json!({
+            "deployment":{"python":"fixture","adapter_source":"fixture","claude_cli":"fixture",
+                "claude_home":"fixture","tui_binary":"fixture"},
+            "thread_id":"claude-app-server-thread","state_dir":"fixture","model":"fixture",
+            "native_session_id":"different-native-history-id"
+        })).unwrap());
+        // A manager still reporting the Codex/history binding cannot use the fast path.
+        assert!(online_submit_snapshot(&record, Some(&status)).is_none());
+        status.thread_id = "claude-app-server-thread".into();
+        let snapshot = online_submit_snapshot(&record, Some(&status)).unwrap();
+        assert_eq!(snapshot["native"]["threadId"], json!(record.app_server_thread_id()));
+        assert_eq!(snapshot["runtime"]["runtimeGeneration"], record.runtime_generation);
+    }
 
 
     struct ProjectionFixture {
@@ -2329,8 +2644,17 @@ mod tests {
         };
         let revision = projection_revision(&ids[0]);
         let serialized = projection_serializations_on_this_thread();
+        let stable_rows = |mut value:Value| {
+            for row in value["sessions"].as_array_mut().unwrap() {
+                // Activity observation is request-time evidence, not a
+                // business-state change or a reason to rewrite projections.
+                assert!(row["observedAt"].is_string());
+                row.as_object_mut().unwrap().remove("observedAt");
+            }
+            value["sessions"].clone()
+        };
         for _ in 0..3 {
-            assert_eq!(list()["sessions"], first["sessions"]);
+            assert_eq!(stable_rows(list()),stable_rows(first.clone()));
         }
         assert_eq!(projection_serializations_on_this_thread(), serialized);
         assert_eq!(FileStamp::of(&path).unwrap(), stamp, "unchanged listings must not rewrite");
@@ -2414,7 +2738,14 @@ mod tests {
 
         // Presentation fields stay (the desktop lists archived agents with them).
         assert_eq!(resource["note"], "reviewer");
-        for key in ["avatar", "displayNameOverride", "formalAgentName", "effectiveNextLaunch"] {
+        assert_eq!(resource["createdBy"],Value::Null,"legacy provenance is never inferred from an archived agent's name or ownership");
+        record.created_by=Some(crate::session::model::SessionCreatedBy::Agent {
+            cutex_session_id:crate::role_revision::CutexSessionId::new("cutex.original-director").unwrap(),
+            role:Some(crate::session::model::SessionCreatorRole::Director),
+        });
+        let with_creator=retired_session_resource_value(&record,None);
+        assert_eq!(with_creator["createdBy"],json!({"kind":"agent","cutexSessionId":"cutex.original-director","role":"director"}));
+        for key in ["avatar", "avatarMode", "createdBy", "displayNameOverride", "formalAgentName", "effectiveNextLaunch"] {
             assert!(resource.get(key).is_some(), "{key}");
         }
         assert_eq!(resource["lifecycle"], "retired");

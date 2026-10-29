@@ -28,6 +28,17 @@ const DIM: &str = "\x1b[2m";
 const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 
+const DSH_AUTH_UNSUPPORTED: &str = "DSH login and auth-file import are unsupported; create a DSH profile with options.dsh.apiKeyEnv (default DEEPSEEK_API_KEY). Only the managed runtime reads the named key environment variable at launch.";
+
+const KIMI_AUTH_UNSUPPORTED: &str = "Kimi profiles log in through a Kimi account (Management /v2/kimi/accounts, device code); Kimi API keys use a Kimi / Moonshot API-key profile with the kimi variant.";
+
+fn refuse_dsh_auth(kind: &CliKind) -> anyhow::Result<()> {
+    anyhow::ensure!(*kind != CliKind::Dsh, DSH_AUTH_UNSUPPORTED);
+    anyhow::ensure!(*kind != CliKind::Kimi, KIMI_AUTH_UNSUPPORTED);
+    Ok(())
+}
+
+
 pub(crate) fn add(
     auth_path: &str,
     config_path: Option<&str>,
@@ -37,6 +48,7 @@ pub(crate) fn add(
     cli: &str,
 ) -> anyhow::Result<()> {
     let cli_kind: CliKind = cli.parse()?;
+    refuse_dsh_auth(&cli_kind)?;
     let mut store = load_store()?;
     ensure_unique_name(&store, name, None)?;
 
@@ -60,12 +72,12 @@ pub(crate) fn login(
     base_url: Option<&str>,
     provider: Option<&str>,
 ) -> anyhow::Result<()> {
+    let cli_str = cli.unwrap_or("codex");
+    let cli_kind: CliKind = cli_str.parse()?;
+    refuse_dsh_auth(&cli_kind)?;
     if name.is_none() && api_key.is_none() {
         return login_interactive();
     }
-
-    let cli_str = cli.unwrap_or("codex");
-    let cli_kind: CliKind = cli_str.parse()?;
 
     if cli_kind == CliKind::Claude {
         anyhow::ensure!(api_key.is_none() && base_url.is_none(),"Claude Code profiles use the shared official login");
@@ -89,6 +101,8 @@ pub(crate) fn login(
     match cli_kind {
         CliKind::Claude => super::claude_profile::add(profile_name),
         CliKind::Codex => login_codex_official(profile_name, &mut store),
+        CliKind::Dsh => anyhow::bail!(DSH_AUTH_UNSUPPORTED),
+        CliKind::Kimi => anyhow::bail!(KIMI_AUTH_UNSUPPORTED),
     }
 }
 
@@ -131,6 +145,8 @@ pub(crate) fn login_interactive() -> anyhow::Result<()> {
         let default_url = match cli_kind {
             CliKind::Codex => "https://api.openai.com/v1",
             CliKind::Claude => "https://api.anthropic.com",
+            CliKind::Dsh => anyhow::bail!(DSH_AUTH_UNSUPPORTED),
+        CliKind::Kimi => anyhow::bail!(KIMI_AUTH_UNSUPPORTED),
         };
         let url = prompt_line(&format!("{BOLD}Step 3:{RESET} API base URL"), default_url)?;
         println!();
@@ -167,6 +183,8 @@ pub(crate) fn login_interactive() -> anyhow::Result<()> {
     match cli_kind {
         CliKind::Claude => super::claude_profile::add(&name),
         CliKind::Codex => login_codex_official(&name, &mut store),
+        CliKind::Dsh => anyhow::bail!(DSH_AUTH_UNSUPPORTED),
+        CliKind::Kimi => anyhow::bail!(KIMI_AUTH_UNSUPPORTED),
     }
 }
 
@@ -177,6 +195,7 @@ fn login_api_key(
     base_url: Option<&str>,
     provider: &str,
 ) -> anyhow::Result<()> {
+    refuse_dsh_auth(cli_kind)?;
     let mut store = load_store()?;
     ensure_unique_name(&store, name, None)?;
 
@@ -187,7 +206,9 @@ fn login_api_key(
         search_tool: false,
         quota_reader: None,
         private_chatgpt_auth_file: false,
+        auto_pick: false,
         claude_code: cutex::profiles::claude_code::ClaudeCodeOptions::for_new_profile(&cli_kind),
+        variants: Default::default(),
         id,
         name: name.to_string(),
         email: None,
@@ -205,6 +226,7 @@ fn login_api_key(
         provider_category: None,
         claude_account: None,
         model_display_names: Default::default(),
+        interface_base_urls: Default::default(),
     };
     // Same as POST /v2/profiles: a provider given as an API-key preset ID
     // that names a quota reader reads its quota from the start (on the
@@ -231,6 +253,8 @@ fn login_api_key(
             materialize_imported_account_files(&account, &snapshot)?;
         }
         CliKind::Claude => anyhow::bail!("Claude Code profiles use the shared official login"),
+        CliKind::Dsh => anyhow::bail!(DSH_AUTH_UNSUPPORTED),
+        CliKind::Kimi => anyhow::bail!(KIMI_AUTH_UNSUPPORTED),
     }
 
     add_account_to_store(&mut store, account)?;
@@ -362,5 +386,26 @@ fn runtime_from_option(
             ),
         },
         None => RuntimeConfig::Host,
+    }
+}
+
+#[cfg(test)]
+mod dsh_auth_tests {
+    use super::*;
+
+    #[test]
+    fn dsh_cli_auth_rejects_before_prompts_auth_reads_or_store_writes() {
+        let _home = super::super::test_home::IsolatedTestHome::new("dsh-cli-auth-refusal").unwrap();
+        let imported = add("/unused/auth.json", Some("/unused/config.toml"), None, None, "DSH", "dsh").unwrap_err();
+        assert_eq!(imported.to_string(), DSH_AUTH_UNSUPPORTED);
+        for (name, key) in [(None, None), (Some("DSH"), None), (Some("DSH"), Some("not-a-real-key"))] {
+            let error = login(name, Some("dsh"), key, None, None).unwrap_err();
+            assert_eq!(error.to_string(), DSH_AUTH_UNSUPPORTED);
+            assert!(!error.to_string().contains("not-a-real-key"));
+        }
+        let error = login_api_key("DSH", &CliKind::Dsh, "not-a-real-key", None, "deepseek").unwrap_err();
+        assert_eq!(error.to_string(), DSH_AUTH_UNSUPPORTED);
+        assert!(!cutex::config::paths::accounts_path().unwrap().exists());
+        assert!(!cutex::profiles::materialize::materialized_profiles_dir().unwrap().exists());
     }
 }

@@ -1,0 +1,8 @@
+{
+  "name": "cutex-kimi-runtime",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.19" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "dependencies": { "ws": "8.22.0" }
+}

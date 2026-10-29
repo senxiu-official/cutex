@@ -75,6 +75,32 @@ fn read_with(
     account: &str,
     get: impl FnOnce(&str) -> Result<Value, HttpFailure>,
 ) -> anyhow::Result<UsageRead> {
+    let access_token = match access_token(claude_home, now_ms)? {
+        AccessToken::Valid(token) => token,
+        AccessToken::Stale { expires_at_ms } => return Ok(UsageRead::StaleCredentials { expires_at_ms }),
+    };
+    let access_token = access_token.as_str();
+    match get(access_token) {
+        Ok(payload) => Ok(UsageRead::Payload(payload)),
+        Err(HttpFailure::Status(status @ (401 | 403))) => anyhow::bail!(
+            "official usage endpoint returned HTTP {status}: the Claude login was rejected; \
+             log in again: cutex human claude account login {account}"
+        ),
+        Err(HttpFailure::Status(status)) => anyhow::bail!("official usage endpoint returned HTTP {status}"),
+        Err(HttpFailure::Unavailable) => anyhow::bail!("official usage endpoint unavailable"),
+        Err(HttpFailure::Proxy(message)) => anyhow::bail!("official usage endpoint unavailable: {message}"),
+        Err(HttpFailure::InvalidBody) => anyhow::bail!("invalid or oversized official usage JSON"),
+    }
+}
+
+/// The account's OAuth access token, or its expiry when it is stale.
+pub(crate) enum AccessToken {
+    Valid(String),
+    Stale { expires_at_ms: i64 },
+}
+
+/// Reads `<claude_home>/.credentials.json` (the value never leaves cutex).
+pub(crate) fn access_token(claude_home: &Path, now_ms: i64) -> anyhow::Result<AccessToken> {
     let path = claude_home.join(".credentials.json");
     let raw = match std::fs::read(&path) {
         Ok(raw) => raw,
@@ -92,45 +118,33 @@ fn read_with(
         .context("Claude OAuth access token missing")?;
     if let Some(expires_at_ms) = credentials.pointer("/claudeAiOauth/expiresAt").and_then(Value::as_i64) {
         if expires_at_ms.saturating_sub(now_ms) < EXPIRY_MARGIN_MS {
-            return Ok(UsageRead::StaleCredentials { expires_at_ms });
+            return Ok(AccessToken::Stale { expires_at_ms });
         }
     }
-    match get(access_token) {
-        Ok(payload) => Ok(UsageRead::Payload(payload)),
-        Err(HttpFailure::Status(status @ (401 | 403))) => anyhow::bail!(
-            "official usage endpoint returned HTTP {status}: the Claude login was rejected; \
-             log in again: cutex human claude account login {account}"
-        ),
-        Err(HttpFailure::Status(status)) => anyhow::bail!("official usage endpoint returned HTTP {status}"),
-        Err(HttpFailure::Unavailable) => anyhow::bail!("official usage endpoint unavailable"),
-        Err(HttpFailure::Proxy(message)) => anyhow::bail!("official usage endpoint unavailable: {message}"),
-        Err(HttpFailure::InvalidBody) => anyhow::bail!("invalid or oversized official usage JSON"),
-    }
+    Ok(AccessToken::Valid(access_token.to_string()))
 }
 
-fn http_get(access_token: &str) -> Result<Value, HttpFailure> {
-    // A Claude account is not one Profile: its usage endpoint goes through the host proxy.
-    let agent = crate::config::proxy_outbound::OutboundProxy::host()
+/// HTTP agent through the host proxy (a Claude account is not one Profile).
+pub(crate) fn http_agent() -> Result<ureq::Agent, HttpFailure> {
+    Ok(crate::config::proxy_outbound::OutboundProxy::host()
         .apply(ureq::Agent::config_builder().timeout_global(Some(REQUEST_TIMEOUT)).max_redirects(0))
         .map_err(|error| HttpFailure::Proxy(error.to_string()))?
         .build()
-        .new_agent();
-    let mut response = agent
-        .get(CLAUDE_USAGE_URL)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("Accept", "application/json")
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("User-Agent", "cutex")
-        .call()
-        .map_err(|error| {
-            if let Some(message) = crate::config::proxy_outbound::proxy_error_message(&error) {
-                return HttpFailure::Proxy(message);
-            }
-            match error {
-                ureq::Error::StatusCode(status) => HttpFailure::Status(status),
-                _ => HttpFailure::Unavailable,
-            }
-        })?;
+        .new_agent())
+}
+
+/// Maps a ureq error without the token.
+pub(crate) fn http_failure(error: ureq::Error) -> HttpFailure {
+    if let Some(message) = crate::config::proxy_outbound::proxy_error_message(&error) {
+        return HttpFailure::Proxy(message);
+    }
+    match error {
+        ureq::Error::StatusCode(status) => HttpFailure::Status(status),
+        _ => HttpFailure::Unavailable,
+    }
+}
+
+pub(crate) fn read_body(mut response: ureq::http::Response<ureq::Body>) -> Result<Value, HttpFailure> {
     if !response.status().is_success() {
         return Err(HttpFailure::Status(response.status().as_u16()));
     }
@@ -140,6 +154,23 @@ fn http_get(access_token: &str) -> Result<Value, HttpFailure> {
         .limit(MAX_RESPONSE_BYTES)
         .read_json()
         .map_err(|_| HttpFailure::InvalidBody)
+}
+
+/// GET `url` with the account's bearer token (usage endpoints).
+pub(crate) fn http_get_url(url: &str, access_token: &str) -> Result<Value, HttpFailure> {
+    let response = http_agent()?
+        .get(url)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Accept", "application/json")
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("User-Agent", "cutex")
+        .call()
+        .map_err(http_failure)?;
+    read_body(response)
+}
+
+fn http_get(access_token: &str) -> Result<Value, HttpFailure> {
+    http_get_url(CLAUDE_USAGE_URL, access_token)
 }
 
 /// Windows of a usage payload: the `limits` rows, else the top-level

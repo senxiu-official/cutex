@@ -147,7 +147,12 @@ pub struct UsageRowKey {
 #[serde(rename_all = "camelCase")]
 pub struct UsageAmounts {
     pub turns: u64,
+    /// Model requests (a Claude turn counts its SDK steps when reported).
     pub requests: u64,
+    /// Largest input of one model request in the row: the context a step
+    /// re-read (a Claude turn's average per step). Token audit 2026-10-22:
+    /// the burn is context × requests; this makes a runaway visible.
+    pub max_request_input: u64,
     pub input: u64,
     pub cached_input: u64,
     pub cache_write_input: u64,
@@ -226,6 +231,7 @@ pub struct UnpricedModel {
 struct Accumulator {
     turns: HashSet<(String, String, String)>,
     requests: u64,
+    max_request_input: u64,
     tokens: TokenUsageBreakdown,
     cost: f64,
     unpriced_tokens: u64,
@@ -247,7 +253,9 @@ impl Accumulator {
             sample.thread_id.clone(),
             sample.turn_id.clone(),
         ));
-        self.requests += 1;
+        let requests = sample.model_requests.unwrap_or(1).max(1);
+        self.requests += requests;
+        self.max_request_input = self.max_request_input.max(sample.tokens.input_tokens / requests);
         let t = &mut self.tokens;
         let s = &sample.tokens;
         t.input_tokens = t.input_tokens.saturating_add(s.input_tokens);
@@ -279,6 +287,7 @@ impl Accumulator {
         UsageAmounts {
             turns: self.turns.len() as u64,
             requests: self.requests,
+            max_request_input: self.max_request_input,
             input: self.tokens.input_tokens,
             cached_input: self.tokens.cached_input_tokens,
             cache_write_input: self.tokens.cache_write_input_tokens,

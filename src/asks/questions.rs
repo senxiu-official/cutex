@@ -77,7 +77,7 @@ pub fn record_question(
     }
     state.notice(
         "cutex/ask/question",
-        AskState::ask_sessions(&ask),
+        AskState::question_sessions(&ask),
         json!({"reason": "asked", "question": record}),
     );
     Some(question_id)
@@ -105,6 +105,21 @@ pub enum Responder {
     Agent(String),
 }
 
+/// `session` may answer `ask`'s questions as the requester side now.
+/// The designated question route (`questions: director`) is tried first: it
+/// answers on its own while the ask's control is still under handover review,
+/// and grants nothing else (no read or control of the ask).
+pub fn may_answer(ask: &AskRecord, session: &str) -> Result<bool, AskError> {
+    let routed = super::model::route::question_recipient(ask);
+    if matches!(routed, Ok(Some(ref recipient)) if recipient == session) {
+        return Ok(true);
+    }
+    if ask.controlled_by(session)? {
+        return Ok(true);
+    }
+    routed.map(|_| false)
+}
+
 /// Resolve a question (first accepted response wins) and queue the native
 /// response.
 pub fn resolve(
@@ -125,8 +140,12 @@ pub fn resolve(
         .get(&question.ask_id)
         .cloned()
         .ok_or_else(|| AskError::new("question_not_found", "no such question"))?;
+    // Checked again for every answer, inside the store update (design 044
+    // §2.3/§4.3): the ask's current controller or the session the question is
+    // routed to now. An earlier controller (handover) gets the same answer as
+    // a stranger, so a late answer from it never wins; the owner always may.
     if let Responder::Agent(session) = responder {
-        if ask.requester.session() != Some(session.as_str()) {
+        if !may_answer(&ask, session)? {
             return Err(AskError::new("question_not_found", "no such question on your delegations"));
         }
     }
@@ -163,7 +182,7 @@ pub fn resolve(
     clear_input_hold(state, &question.ask_id, now);
     state.notice(
         "cutex/ask/question",
-        AskState::ask_sessions(&ask),
+        AskState::question_sessions(&ask),
         json!({"reason": "resolved", "question": resolved}),
     );
     Ok(resolved)
@@ -207,14 +226,20 @@ pub fn fall_through(state: &mut AskState, offline: &dyn Fn(&str) -> bool, now: D
         };
         let question = &state.questions[&question_id];
         let expired = parse_time(&question.created_at).is_some_and(|created| now - created >= timeout);
-        let requester_offline = ask.requester.session().is_some_and(offline);
+        // The session the question goes to now (design 044), not the original
+        // requester; an unknown recipient counts as offline (owner fallback).
+        let requester_offline = match super::model::route::question_recipient(&ask) {
+            Ok(Some(recipient)) => offline(&recipient),
+            Ok(None) => false,
+            Err(_) => true,
+        };
         if expired || requester_offline {
             let record = state.questions.get_mut(&question_id).expect("exists");
             record.routed_to_owner_at = Some(now_rfc3339(now));
             let snapshot = record.clone();
             state.notice(
                 "cutex/ask/question",
-                AskState::ask_sessions(&ask),
+                AskState::question_sessions(&ask),
                 json!({"reason": if expired { "timeout" } else { "requesterOffline" }, "routedToOwner": true, "question": snapshot}),
             );
             routed.push(question_id);
@@ -250,12 +275,12 @@ pub fn question_answer(ctx: &ToolContext<'_>, args: Value, action_id: &str) -> R
 /// Resolve in the store (bus process or Management v2).
 pub fn respond_in_store(store: &AskStore, question_id: &str, responder: &Responder, answers: &Value, now: DateTime<Utc>) -> Result<QuestionRecord, AskError> {
     let current_generation = store
-        .snapshot()
+        .lookup_snapshot(&[question_id])
         .ok()
         .and_then(|state| state.questions.get(question_id).cloned())
         .and_then(|question| state_generation(&question));
     store
-        .with_state(|state| resolve(state, question_id, responder, answers, current_generation, now))
+        .with_records(&[question_id],|state| resolve(state, question_id, responder, answers, current_generation, now))
         .map_err(|error| AskError::new("persistence_unavailable", format!("{error:#}")))?
 }
 

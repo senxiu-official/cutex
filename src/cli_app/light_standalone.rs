@@ -2,7 +2,7 @@
 //! No durable identity, managed owner, or runtime review action is created here.
 use anyhow::Context;
 use cutex::launch::local_deployment::LocalDeployment;
-use cutex::launch::selected_profile::Config;
+use cutex::launch::selected_profile::{Config, ImageHistoryTrimArgs};
 use cutex::launch::selected_status::Status;
 use cutex::profiles::model::{CliKind, RuntimeConfig, StoredAccount};
 use std::path::{Path, PathBuf};
@@ -86,7 +86,10 @@ pub(super) fn command(
     let global = cutex::config::store::load_codez_config_checked()?;
     let new_session = !args.iter().any(|arg| matches!(arg.as_str(), "resume" | "fork"));
     let defaults = new_session.then(|| global.new_session_defaults.get(&account.name)).flatten();
-    let (mut projection, model, reasoning) = Config::parse(&toml::to_string(&value)?)?.review(
+    let raw = toml::to_string(&value)?;
+    // Not part of the reviewed projection: a launch override.
+    let image_history_trim = ImageHistoryTrimArgs::from_toml(&raw)?;
+    let (mut projection, model, reasoning) = Config::parse(&raw)?.review(
         &account.id,
         files.auth_path,
         defaults.and_then(|d| d.model.as_ref()),
@@ -112,7 +115,8 @@ pub(super) fn command(
             true,
             &cutex::config::paths::host_codex_home_dir()?,
             &deployment.native_home,
-        )?);
+        )?)
+        .args(image_history_trim.args());
     launch = super::stock_lifecycle::option(
         launch,
         "model_provider",

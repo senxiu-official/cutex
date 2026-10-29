@@ -65,6 +65,10 @@ use crate::config::paths::runtime_dir;
 
 use super::native_requests::canonical_request_sha256;
 
+#[path = "request_unknown_diagnostic.rs"]
+pub mod unknown_diagnostic;
+pub use unknown_diagnostic::UnknownDiagnostic;
+
 pub const IDEMPOTENCY_DB_FILE: &str = "request-idempotency.sqlite3";
 const LEGACY_JSON_FILE: &str = "request-idempotency.json";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -517,16 +521,41 @@ impl RequestIdempotencyRepository {
     }
 
     pub fn mark_outcome_unknown(&self, claim: &RequestClaim) -> anyhow::Result<()> {
+        self.mark_unknown_with_metadata(claim, None)
+    }
+
+    /// Diagnostic metadata is not a replayable response. The state, CAS,
+    /// retention and BeginRequest::OutcomeUnknown semantics remain unchanged.
+    pub fn mark_outcome_unknown_diagnostic(
+        &self,
+        claim: &RequestClaim,
+        diagnostic: &UnknownDiagnostic,
+    ) -> anyhow::Result<()> {
+        self.mark_unknown_with_metadata(claim, Some(diagnostic))
+    }
+
+    fn mark_unknown_with_metadata(
+        &self,
+        claim: &RequestClaim,
+        diagnostic: Option<&UnknownDiagnostic>,
+    ) -> anyhow::Result<()> {
         if !claim.durable {
             return Ok(());
         }
+        let metadata = diagnostic
+            .map(|diagnostic| {
+                serde_json::to_string(
+                    &diagnostic.for_claim(&claim.cutex_session_id, &claim.request_id),
+                )
+            })
+            .transpose()?;
         if !settle_browser_claim(claim) {
             return Ok(());
         }
         self.update_claim(claim, |connection| {
             Ok(connection.execute(
                 "UPDATE requests SET state = ?5, updated_at = ?6, response_status = NULL,
-                        response_reason = NULL, response_body = NULL, response_sha256 = NULL
+                        response_reason = NULL, response_body = ?7, response_sha256 = NULL
                  WHERE cutex_session_id = ?1 AND request_id = ?2 AND state = 'forwarded'
                    AND body_sha256 = ?3 AND process_instance_id = ?4",
                 params![
@@ -535,7 +564,8 @@ impl RequestIdempotencyRepository {
                     claim.body_sha256,
                     claim.process_instance_id,
                     STATE_OUTCOME_UNKNOWN,
-                    now_ms()
+                    now_ms(),
+                    metadata
                 ],
             )?)
         })
@@ -643,6 +673,10 @@ impl RequestIdempotencyRepository {
         result
     }
 }
+
+#[cfg(test)]
+#[path = "request_unknown_diagnostic_tests.rs"]
+mod unknown_diagnostic_tests;
 
 struct ExistingRow {
     body_sha256: String,

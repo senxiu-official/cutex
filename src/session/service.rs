@@ -66,6 +66,13 @@ pub struct CutexSessionAdoptOptions<'a> {
     pub groups: Vec<String>,
     pub expose_to_im: bool,
     pub pin: bool,
+    /// The creator's model / effort (agent_create), recorded before the
+    /// adoption projects the launch configuration: without them the
+    /// projection validates the profile's own defaults (e.g. a profile
+    /// default effort the requested model does not offer) instead of what
+    /// the agent will run with. `None` keeps the record's values.
+    pub model_defaults: Option<String>,
+    pub reasoning_defaults: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +162,7 @@ pub fn set_cutex_session_profile_by_key(
     let record = store.sessions.get_mut(key).ok_or_else(|| {
         anyhow::anyhow!("cutex session disappeared while updating profile: {key}")
     })?;
-    if record.is_retired() {
+    if crate::agent_management::agent_execution_blocked(&record) {
         anyhow::bail!("cutex session is retired: {key}");
     }
     crate::runtime::claude_accounts::check_profile_change(record, profile.as_deref())
@@ -188,7 +195,7 @@ pub fn set_cutex_session_profile_by_key_with_expected_revision(
     let record = store.sessions.get_mut(key).ok_or_else(|| {
         anyhow::anyhow!("cutex session disappeared while updating profile: {key}")
     })?;
-    if record.is_retired() {
+    if crate::agent_management::agent_execution_blocked(&record) {
         anyhow::bail!("cutex session is retired: {key}");
     }
     let current_revision = record.durable_revision();
@@ -220,7 +227,7 @@ pub fn set_cutex_session_display_name_by_key(
     let record = store.sessions.get_mut(key).ok_or_else(|| {
         anyhow::anyhow!("cutex session disappeared while updating agent name: {key}")
     })?;
-    if record.is_retired() {
+    if crate::agent_management::agent_execution_blocked(&record) {
         anyhow::bail!("cutex session is retired: {key}");
     }
     record.display_name_hint = Some(display_name.to_string());
@@ -243,7 +250,7 @@ pub fn ensure_cutex_session_record_for_user_id(
             .sessions
             .get(&key)
             .ok_or_else(|| anyhow::anyhow!("cutex session disappeared while ensuring: {key}"))?;
-        if record.is_retired() {
+        if crate::agent_management::agent_execution_blocked(&record) {
             anyhow::bail!("cutex session is retired: {id}");
         }
     }
@@ -291,6 +298,12 @@ pub fn adopt_cutex_session_from(
     let newly_managed = record.registration_class != AgentRegistrationClass::Persistent;
     if newly_managed {
         record.runtime_backend = default_managed_session_runtime_backend();
+    }
+    if let Some(model) = options.model_defaults.clone() {
+        record.model_defaults = Some(model);
+    }
+    if let Some(reasoning) = options.reasoning_defaults.clone() {
+        record.reasoning_defaults = Some(reasoning);
     }
     apply_managed_session_defaults(
         record,
@@ -387,6 +400,16 @@ pub fn unmanage_cutex_session(
         .sessions
         .get_mut(&key)
         .ok_or_else(|| anyhow::anyhow!("cutex session disappeared while unmanaging: {key}"))?;
+    apply_unmanage(record)?;
+    Ok(CutexSessionUpdateOutcome {
+        key,
+        session_id: session_id_for_user_output(record, id),
+    })
+}
+
+/// The record change of `unmanage`: management metadata off (local-only, not
+/// an Agent, no managed cwd / launch defaults). History and runtime untouched.
+pub fn apply_unmanage(record: &mut CutexSessionRecord) -> anyhow::Result<()> {
     record.registration_class = AgentRegistrationClass::LocalOnly;
     record.exposed_to_backend = false;
     record.agent_enabled = false;
@@ -401,10 +424,7 @@ pub fn unmanage_cutex_session(
     record.service_tier = None;
     record.bump_durable_revision()?;
     record.updated_at = chrono::Utc::now().to_rfc3339();
-    Ok(CutexSessionUpdateOutcome {
-        key,
-        session_id: session_id_for_user_output(record, id),
-    })
+    Ok(())
 }
 
 fn require_cutex_session_key_for_user_id(
@@ -501,5 +521,32 @@ mod tests {
         )
         .expect("clear configured profile");
         assert_eq!(store.sessions["cutex-profile-fence"].profile, None);
+    }
+
+    /// agent_create: the creator's model / effort are on the record before
+    /// the adoption projects the launch configuration (Zooey 10-22: an
+    /// explicit `high` was validated against the profile default `max`).
+    #[test]
+    fn adoption_records_the_creators_model_and_effort_first() {
+        let mut store = CutexSessionStore::default();
+        let native = uuid::Uuid::new_v4().to_string();
+        let outcome = adopt_cutex_session(
+            &mut store,
+            &native,
+            CutexSessionEnsureSeed { host_id: "elsewhere-test-host".into(), cwd: "/work".into(), profile: Some("Zooey".into()) },
+            CutexSessionAdoptOptions {
+                display_name: Some("worker"),
+                managed_cwd: Some("/work".into()),
+                groups: Vec::new(),
+                expose_to_im: false,
+                pin: false,
+                model_defaults: Some("glm-5.3".into()),
+                reasoning_defaults: Some("high".into()),
+            },
+        )
+        .unwrap();
+        let record = &store.sessions[&outcome.key];
+        assert_eq!(record.model_defaults.as_deref(), Some("glm-5.3"));
+        assert_eq!(record.reasoning_defaults.as_deref(), Some("high"));
     }
 }

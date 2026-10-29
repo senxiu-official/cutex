@@ -112,6 +112,7 @@ pub fn infer(
     if auth_kind == "chatgpt" {
         return ProviderCategory::Codex;
     }
+    if *cli_kind == CliKind::Dsh { return ProviderCategory::Deepseek; }
     if *cli_kind == CliKind::Claude {
         return ProviderCategory::Claude;
     }

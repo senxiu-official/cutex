@@ -384,8 +384,10 @@ workflow runs do not hold.
 
 After a decision on a request the agent retries itself (`managed_service`,
 `service_lifetime`, `static_root`, `agent_profile`, `browser_open`), the requester gets a short cutex
-message through the alarm scheduler (owner `cutex.approvals`, delivered `after_turn` like any
-alarm, so a busy agent reads it after its turn): approved → retry the same call now; denied →
+message through the alarm scheduler (owner `cutex.approvals`, a cutex system notice; since 023 a
+busy agent reads it at its **next step** with no wait, in decision order, one notice per approval
+and outcome; Claude adapters without `soon` and releases before 023: after the turn; the agent's
+own alarms stay after-turn): approved → retry the same call now; denied →
 do not retry (with the owner's note). Capability `approval-decision-notice`. Ask deliveries,
 workflow runs and browser claims act on the decision themselves and get no such message.
 

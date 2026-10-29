@@ -296,6 +296,12 @@ pub enum CommandKind {
         command: UpgradeCommand,
     },
 
+    /// Offline durable-store migration and rollback tools
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
+
     /// Optional backend components of a managed install (components/README.md)
     Component {
         #[command(subcommand)]
@@ -558,6 +564,20 @@ pub enum SessionCommand {
         #[arg(long)]
         reason: Option<String>,
         /// Print machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Permanently delete a session (record + native history) through the running
+    /// Management API, like the desktop's "Delete…"; a recovery copy is kept under
+    /// runtime/session-deletes/
+    Delete {
+        /// cutex_session_id, Codex session id, or unique thread/display name
+        id: String,
+        /// Do not ask for confirmation (required when not on a terminal)
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Print the delete receipt as JSON
         #[arg(long)]
         json: bool,
     },
@@ -1261,6 +1281,22 @@ pub enum ManagementCommand {
         /// Strict reservation reconciliation JSON request
         #[arg(long)]
         request_file: String,
+        /// Local Management API port
+        #[arg(long)]
+        port: Option<u16>,
+        /// Dedicated Management root bearer override
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Abandon an unfinished agent_create: release its name, end the action
+    /// and remove the durable session / native thread it made (recovery copy
+    /// kept). Refuses completed or running actions; repeating is harmless.
+    AgentCreateAbandon {
+        /// The create's action ID (e.g. auto-5ae2f952…)
+        action_id: String,
+        /// Only list what would be removed
+        #[arg(long)]
+        dry_run: bool,
         /// Local Management API port
         #[arg(long)]
         port: Option<u16>,
@@ -2167,6 +2203,35 @@ pub enum UpgradeCommand {
     #[command(hide = true)]
     Run {
         run_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum StorageCommand {
+    /// Configure and run the permanent asks hot/archive split offline
+    AsksArchive {
+        /// Fixed RFC3339 cutoff; default is activation-day local midnight
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long = "daemon-stopped")]
+        daemon_stopped: bool,
+    },
+    /// Restore all archived asks to hot rows before an older binary starts
+    AsksArchiveRestore {
+        /// Exact preceding kit release: r259, r260, or r261
+        #[arg(long)]
+        target: String,
+        #[arg(long = "daemon-stopped")]
+        daemon_stopped: bool,
+    },
+    /// Export r257 SQLite stores for a pre-r257 binary after services stop
+    RollbackExport {
+        /// Release that will read the exported legacy stores (for example r256)
+        #[arg(long)]
+        target: String,
+        /// Confirm that management, agent-bus and runtime services are stopped
+        #[arg(long = "daemon-stopped")]
+        daemon_stopped: bool,
     },
 }
 

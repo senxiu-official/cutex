@@ -109,7 +109,7 @@ pub fn preserve_reviewed_groups(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("reviewed registration binding missing"))?;
     anyhow::ensure!(
-        !record.is_retired()
+        !crate::agent_management::agent_execution_blocked(&record)
             && (record.is_owned_session() || (record.agent_enabled
                 && record.registration_class == AgentRegistrationClass::Persistent))
             && agent.registration_class == record.registration_class

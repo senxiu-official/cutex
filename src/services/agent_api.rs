@@ -21,6 +21,8 @@ use serde_json::Value;
 use super::health::RuntimeSnapshot;
 use super::store::AgentPersistentApproval;
 use super::store::list_views;
+use super::store::may_manage;
+use super::store::ServiceOwnerScope;
 use super::store::service_view;
 use super::store::Caller;
 use super::store::ListFilter;
@@ -106,6 +108,18 @@ pub struct AgentServicePolicy {
     /// The call may hold for the owner's decision (approval-wait); `None`
     /// answers `approval_required` at once (older façades / adapters).
     pub waiter: Option<crate::approvals::Waiter>,
+    /// The caller is the current Director of exactly one project (its
+    /// `Caller::Agent::project_id`): a new service it registers without
+    /// `scope` becomes a project service (like `agent_delegate`'s
+    /// `ownershipScope`).
+    pub director_default_project: bool,
+    /// The caller directs several projects and is no member of one: an
+    /// explicit `scope: project` cannot name one (`director_project_ambiguous`).
+    pub project_ambiguous: bool,
+    /// Production writes refresh authority after approval and hold the roster
+    /// mutation fence through the registry commit. Internal adapters supply
+    /// their own trusted caller context instead.
+    pub revalidate_authority: bool,
 }
 
 impl AgentServicePolicy {
@@ -117,6 +131,9 @@ impl AgentServicePolicy {
             approvals: None,
             requester_name: None,
             waiter: None,
+            director_default_project: false,
+            project_ambiguous: false,
+            revalidate_authority: false,
         }
     }
 
@@ -138,12 +155,32 @@ impl AgentServicePolicy {
                 crate::app_server::live_settings::current_for(record).as_ref(),
             )
         });
+        let (director_default_project, project_ambiguous) =
+            crate::memory::load_agent_management_snapshot()
+                .map(|snapshot| {
+                    let projects = crate::asks::directory::Directory::director_projects(
+                        &snapshot,
+                        cutex_session_id,
+                    );
+                    let directs = |project: &str| {
+                        snapshot.projects.values().any(|authority| {
+                            authority.project_id.as_str() == project
+                                && authority.authorized_director_session.as_str()
+                                    == cutex_session_id
+                        })
+                    };
+                    (projects.len() == 1 && directs(&projects[0]), projects.len() > 1)
+                })
+                .unwrap_or((false, false));
         Self {
             boundary,
             managed_within_envelope,
             approvals: ApprovalStore::open_default().ok(),
             requester_name: record.and_then(|record| record.formal_agent_name),
             waiter: None,
+            director_default_project,
+            project_ambiguous,
+            revalidate_authority: true,
         }
     }
 
@@ -187,9 +224,28 @@ const PRIVATE_VIEW_FIELDS: [&str; 6] = [
     "root",
     "loginLinkCommand",
 ];
+const OWNER_ORGANISATION_FIELDS: [&str; 6] = [
+    "groupName",
+    "starred",
+    "sortOrder",
+    "note",
+    "hidden",
+    "archivedAt",
+];
 
-fn redact_for(caller: &str, record: &ServiceRecord, mut view: Value) -> Value {
-    if record.owner_cutex_session_id.as_deref() != Some(caller) {
+/// The agent view of a record: owner organisation removed, and how it runs
+/// shown only to agents that may manage it (its registrant; for a project
+/// service also the project's current Director).
+fn redact_for(caller: &Caller, record: &ServiceRecord, mut view: Value) -> Value {
+    if let Some(object) = view.as_object_mut() {
+        // Agent callers never receive the owner's login helper, including
+        // the current Director and the original registrant.
+        object.remove("loginLinkCommand");
+        for field in OWNER_ORGANISATION_FIELDS {
+            object.remove(field);
+        }
+    }
+    if !may_manage(record, caller) {
         if let Some(object) = view.as_object_mut() {
             for field in PRIVATE_VIEW_FIELDS {
                 object.remove(field);
@@ -307,7 +363,7 @@ fn managed_gate(
     gate_result(outcome)
 }
 
-fn lifetime_gate(
+pub(crate) fn lifetime_approval_request(
     policy: &AgentServicePolicy,
     caller: &Caller,
     op: &str,
@@ -315,20 +371,13 @@ fn lifetime_gate(
     args: &Value,
     managed: bool,
     root: Option<&CheckedRoot>,
-) -> GateResult {
+) -> Option<ApprovalRequest> {
     let Caller::Agent {
         cutex_session_id,
         project_id,
     } = caller
     else {
-        return Ok(None);
-    };
-    let Some(store) = &policy.approvals else {
-        return Err(rejected(ServicesError::new(
-            503,
-            "approvals_unavailable",
-            "persistent services require owner approval",
-        )));
+        return None;
     };
     // One exact-payload approval covers both grants, so consuming one approval
     // cannot strand a request behind a second gate and cause an approval loop.
@@ -345,13 +394,36 @@ fn lifetime_gate(
         details["grants"] = json!("persistent lifetime and serving every file under this exact root to the owner's browser");
         digest["staticRoot"] = json!(root.path);
     }
-    let outcome = gate(policy, store, ApprovalRequest {
+    Some(ApprovalRequest {
         kind: ApprovalKind::ServiceLifetime, reason: "persistent_service".into(),
         requester_cutex_session_id: cutex_session_id.clone(), requester_name: policy.requester_name.clone(), project_id: project_id.clone(),
         summary: summary.chars().take(300).collect(),
         details,
         request_sha256: request_digest(&digest),
-    });
+    })
+}
+
+fn lifetime_gate(
+    policy: &AgentServicePolicy,
+    caller: &Caller,
+    op: &str,
+    slug: &str,
+    args: &Value,
+    managed: bool,
+    root: Option<&CheckedRoot>,
+) -> GateResult {
+    let Some(request) = lifetime_approval_request(policy, caller, op, slug, args, managed, root)
+    else {
+        return Ok(None);
+    };
+    let Some(store) = &policy.approvals else {
+        return Err(rejected(ServicesError::new(
+            503,
+            "approvals_unavailable",
+            "persistent services require owner approval",
+        )));
+    };
+    let outcome = gate(policy, store, request);
     gate_result(outcome)
 }
 
@@ -410,6 +482,117 @@ fn static_root_gate(
     gate_result(outcome)
 }
 
+/// services-project-scope: an agent removing a persistent project service
+/// it did not register (e.g. the project's Director removing a member's
+/// board) needs the owner's confirmation. Raised only for a request the
+/// store would carry out; anything else is answered by the store.
+fn removal_gate(policy: &AgentServicePolicy, caller: &Caller, record: &ServiceRecord) -> GateResult {
+    if !may_manage(record, caller) {
+        return Err(rejected(ServicesError::new(403, "not_service_owner", "you may not manage this service")));
+    }
+    project_release_gate(policy, caller, record, "unregister", &json!({}), false, None)
+}
+
+fn needs_project_release_confirmation(caller: &Caller, record: &ServiceRecord) -> bool {
+    matches!(caller, Caller::Agent { cutex_session_id, .. }
+        if record.owner_scope == ServiceOwnerScope::Project
+            && record.lifetime == super::store::ServiceLifetime::Persistent
+            && !record.archived
+            && record.owner_cutex_session_id.as_deref() != Some(cutex_session_id.as_str()))
+}
+
+/// Approval retries must bind the same baseline and project as the first
+/// request, including fields inherited by a partial update. These internal
+/// digest fields never become a service patch or appear in approval details.
+fn bound_approval_args(mut args: Value, caller: &Caller, basis: Option<&ServiceRecord>) -> Value {
+    let project = match caller {
+        Caller::Agent { project_id, .. } => project_id.as_deref(),
+        Caller::Owner => None,
+    };
+    args["_serviceApprovalBasis"] = json!({"record": basis, "projectId": project});
+    args
+}
+
+/// One exact approval covers releasing retention and any execution/root grant
+/// in the same request, avoiding multiple consuming gates on a retry.
+fn project_release_gate(
+    policy: &AgentServicePolicy,
+    caller: &Caller,
+    record: &ServiceRecord,
+    op: &str,
+    args: &Value,
+    managed: bool,
+    root: Option<&CheckedRoot>,
+) -> GateResult {
+    let Caller::Agent {
+        cutex_session_id,
+        project_id,
+    } = caller
+    else {
+        return Ok(None);
+    };
+    if !needs_project_release_confirmation(caller, record) {
+        return Ok(None);
+    }
+    let Some(store) = &policy.approvals else {
+        return Err(rejected(ServicesError::new(
+            503,
+            "approvals_unavailable",
+            "releasing another registrant's persistent project service requires owner confirmation; nothing was changed",
+        )));
+    };
+    let registrant = record.owner_cutex_session_id.as_deref().unwrap_or("(none)");
+    let removing = op == "unregister";
+    let execution = managed && !policy.managed_within_envelope;
+    let action = if removing { "Remove" } else { "Make ephemeral" };
+    let outcome = gate(
+        policy,
+        store,
+        ApprovalRequest {
+            // Always high risk and never granted by a Director role rule.
+            kind: ApprovalKind::ManagedService,
+            reason: if removing { "project_service_remove" } else { "project_service_downgrade" }.into(),
+            requester_cutex_session_id: cutex_session_id.clone(),
+            requester_name: policy.requester_name.clone(),
+            project_id: project_id.clone(),
+            summary: format!(
+                "{action} persistent project service {} (registered by {registrant}); it may be permanently removed{}{}",
+                record.slug,
+                if execution { "; run the requested command unrestricted as the owner" } else { "" },
+                root.map(|root| format!("; serve {} outside the agent's directories", root.path)).unwrap_or_default(),
+            )
+            .chars()
+            .take(300)
+            .collect(),
+            details: json!({
+                "op": op,
+                "slug": record.slug,
+                "displayName": record.display_name,
+                "ownerScope": record.owner_scope.label(),
+                "projectId": record.project_id,
+                "registrant": record.owner_cutex_session_id,
+                "runtime": record.runtime.label(),
+                "lifetime": "persistent",
+                "targetLifetime": if removing { Value::Null } else { json!("ephemeral") },
+                "managedExecution": execution,
+                "command": args.get("command"),
+                "cwd": args.get("cwd"),
+                "envKeys": args.get("env").and_then(Value::as_object).map(|env| env.keys().collect::<Vec<_>>()),
+                "staticRoot": root.map(|root| &root.path),
+                "grants": "release persistent retention; any listed managed execution or static root is also approved",
+            }),
+            request_sha256: request_digest(&json!({
+                "op": op,
+                "record": record,
+                "args": args,
+                "managedExecution": execution,
+                "staticRoot": root.map(|root| &root.path),
+            })),
+        },
+    );
+    gate_result(outcome)
+}
+
 /// A gate's result for a request that collects approved-after-wait notes.
 fn pass(result: GateResult, notes: &mut Vec<Value>) -> Result<(), Value> {
     result.map(|note| notes.extend(note))
@@ -428,8 +611,8 @@ fn with_notes(mut result: Value, notes: Vec<Value>) -> Value {
 /// The caller's current project (member or Director seat), if any.
 pub fn caller_project(cutex_session_id: &str) -> Option<String> {
     let snapshot = crate::memory::load_agent_management_snapshot().ok()?;
-    crate::memory::project_for_session(&snapshot, cutex_session_id)
-        .map(|id| id.as_str().to_string())
+    let projects = crate::asks::directory::Directory::director_projects(&snapshot, cutex_session_id);
+    (projects.len() == 1).then(|| projects[0].clone())
 }
 
 /// Serve one authenticated agent request on the default store; `waiter`
@@ -514,26 +697,56 @@ pub fn handle_with_policy(
                     .into(),
                 );
             }
+            // services-project-scope: an explicit project scope needs one
+            // project; a sole-project Director's new services default to it.
+            if request.owner_scope.as_deref() == Some("project") && policy.project_ambiguous {
+                return rejected(ServicesError::new(
+                    409,
+                    "director_project_ambiguous",
+                    "you direct several projects and are no member of one: scope project cannot pick one",
+                ));
+            }
+            if request.owner_scope.is_none()
+                && policy.director_default_project
+                && !registry.services.contains_key(&request.slug)
+                && matches!(caller, Caller::Agent { project_id: Some(_), .. })
+            {
+                request.owner_scope = Some(ServiceOwnerScope::Project.label().into());
+            }
+            let mut args = bound_approval_args(args, caller, registry.services.get(&request.slug));
+            args["_serviceResolvedLifetime"] = json!(request.lifetime);
+            args["_serviceResolvedScope"] = json!(request.owner_scope);
             // Approved-after-wait notes of the gates below (Q21).
             let mut notes = Vec::new();
             // Validate everything before any approval: an invalid request
             // never reaches the owner (static-root-approval).
-            let root_review = match store.validate_register(request.clone(), caller) {
+            let root_review = match store.validate_register_if_unchanged(request.clone(), caller, registry.services.get(&request.slug)) {
                 Ok(check) => check.static_root_approval,
                 Err(error) => return rejected(error),
             };
+            let downgrade = request.lifetime.as_deref() == Some("ephemeral")
+                && registry.services.get(&request.slug)
+                    .is_some_and(|record| needs_project_release_confirmation(caller, record));
+            if downgrade {
+                if let Err(refusal) = pass(project_release_gate(
+                    policy, caller, &registry.services[&request.slug], "register", &args,
+                    managed, root_review.as_ref(),
+                ), &mut notes) {
+                    return refusal;
+                }
+            }
             // With `agentPersistentApproval = off` a persistent request is
             // granted without the lifetime approval; a managed command then
             // still goes through the separate `managed_service` gate below.
             let needs_lifetime = registry.settings.agent_persistent_approval
                 == AgentPersistentApproval::Ask
                 && request.lifetime.as_deref() == Some("persistent")
-                && store.get(&request.slug).ok().is_none_or(|record| {
+                && registry.services.get(&request.slug).is_none_or(|record| {
                     record.lifetime != super::store::ServiceLifetime::Persistent
                 });
             if needs_lifetime {
                 if let Ok(record) = store.get(&request.slug) {
-                    if record.owner_cutex_session_id.as_deref() != Some(cutex_session_id.as_str()) {
+                    if !may_manage(&record, caller) {
                         return rejected(ServicesError::new(
                             409,
                             "slug_taken",
@@ -552,7 +765,7 @@ pub fn handle_with_policy(
                 ), &mut notes) {
                     return refusal;
                 }
-            } else if let Some(root) = &root_review {
+            } else if let Some(root) = root_review.as_ref().filter(|_| !downgrade) {
                 if let Err(refusal) =
                     pass(static_root_gate(policy, caller, "register", &request.slug, &args, root), &mut notes)
                 {
@@ -561,20 +774,16 @@ pub fn handle_with_policy(
             }
             request.static_root_approved = root_review.is_some();
             let reveal = request.reveal;
-            if managed && request.command.is_some() && !needs_lifetime {
+            if managed && request.command.is_some() && !needs_lifetime && !downgrade {
                 // Gate only what the store would accept: another agent's slug
                 // is refused below anyway, and an idempotent re-register of
                 // the caller's own identical service changes nothing.
-                let existing = match store.load() {
-                    Ok(registry) => registry.services.get(&request.slug).cloned(),
-                    Err(error) => return rejected(error),
-                };
+                let existing = registry.services.get(&request.slug).cloned();
                 let skip = existing.is_some_and(|existing| {
-                    existing.owner_cutex_session_id.as_deref() != Some(cutex_session_id.as_str())
-                        || (existing.runtime == ServiceRuntime::Managed
+                    existing.runtime == ServiceRuntime::Managed
                             && existing.command == request.command
                             && existing.cwd == request.cwd
-                            && request.env.as_ref().is_none_or(|env| *env == existing.env))
+                            && request.env.clone().unwrap_or_default() == existing.env
                 });
                 if !skip {
                     if let Err(refusal) = pass(managed_gate(
@@ -589,11 +798,19 @@ pub fn handle_with_policy(
                     }
                 }
             }
-            match store.register(request, caller) {
+            let expected = registry.services.get(&request.slug);
+            match super::authority::commit(caller, policy.revalidate_authority, |fresh| {
+                store.register_if_unchanged(request, fresh, expected)
+            }) {
                 Ok((record, created)) => {
                     after_change();
                     let state = snapshots(store);
-                    let mut result = json!({"ok": true, "created": created, "service": service_view(&record, state.get(&record.slug)), "link": super::store::service_link(&record)});
+                    let view = redact_for(
+                        caller,
+                        &record,
+                        service_view(&record, state.get(&record.slug)),
+                    );
+                    let mut result = json!({"ok": true, "created": created, "service": view, "link": super::store::service_link(&record)});
                     if reveal {
                         result["reveal"] = json!(super::reveal::request(&record, cutex_session_id));
                     }
@@ -612,11 +829,6 @@ pub fn handle_with_policy(
                 Err(error) => return parse_error(error),
             };
             let mut notes = Vec::new();
-            let (preview, root_review) = match store.preview_update(&slug, request.clone(), caller)
-            {
-                Ok((preview, check)) => (preview, check.static_root_approval),
-                Err(error) => return rejected(error),
-            };
             let (existing, lifetime_approval) = match store.load() {
                 Ok(registry) => (
                     registry.services.get(&slug).cloned(),
@@ -624,11 +836,17 @@ pub fn handle_with_policy(
                 ),
                 Err(error) => return rejected(error),
             };
+            let Some(expected) = existing.as_ref() else {
+                return rejected(ServicesError::not_found(&slug));
+            };
+            let patch = bound_approval_args(patch, caller, Some(expected));
+            let (preview, root_review) = match store.preview_update_if_unchanged(&slug, request.clone(), caller, expected) {
+                Ok((preview, check)) => (preview, check.static_root_approval),
+                Err(error) => return rejected(error),
+            };
             // A change to what a managed service runs is gated like a new one;
-            // the store itself refuses non-owners.
-            if let Some(existing) = existing.filter(|existing| {
-                existing.owner_cutex_session_id.as_deref() == Some(cutex_session_id.as_str())
-            }) {
+            // the store itself refuses agents that may not manage it.
+            if let Some(existing) = existing.as_ref() {
                 let runtime = Some(preview.runtime);
                 // Compare what would run after the update with what runs now:
                 // restating the same command / cwd / env / runtime (or an env
@@ -641,6 +859,17 @@ pub fn handle_with_policy(
                 let needs_lifetime = lifetime_approval == AgentPersistentApproval::Ask
                     && request.lifetime.as_deref() == Some("persistent")
                     && existing.lifetime != super::store::ServiceLifetime::Persistent;
+                let downgrade = request.lifetime.as_deref() == Some("ephemeral")
+                    && needs_project_release_confirmation(caller, &existing);
+                if downgrade {
+                    if let Err(refusal) = pass(project_release_gate(
+                        policy, caller, &existing, "update", &patch,
+                        preview.runtime == ServiceRuntime::Managed && changes_process,
+                        root_review.as_ref(),
+                    ), &mut notes) {
+                        return refusal;
+                    }
+                }
                 if needs_lifetime {
                     if let Err(refusal) = pass(lifetime_gate(
                         policy,
@@ -653,14 +882,14 @@ pub fn handle_with_policy(
                     ), &mut notes) {
                         return refusal;
                     }
-                } else if let Some(root) = &root_review {
+                } else if let Some(root) = root_review.as_ref().filter(|_| !downgrade) {
                     if let Err(refusal) =
                         pass(static_root_gate(policy, caller, "update", &slug, &patch, root), &mut notes)
                     {
                         return refusal;
                     }
                 }
-                if runtime == Some(ServiceRuntime::Managed) && changes_process && !needs_lifetime {
+                if runtime == Some(ServiceRuntime::Managed) && changes_process && !needs_lifetime && !downgrade {
                     if let Err(refusal) = pass(managed_gate(
                         policy,
                         caller,
@@ -674,12 +903,14 @@ pub fn handle_with_policy(
                 }
             }
             request.static_root_approved = root_review.is_some();
-            match store.update(&slug, request, caller) {
+            match super::authority::commit(caller, policy.revalidate_authority, |fresh| {
+                store.update_if_unchanged(&slug, request, fresh, expected)
+            }) {
                 Ok(record) => {
                     after_change();
                     let state = snapshots(store);
                     with_notes(
-                        json!({"ok": true, "service": service_view(&record, state.get(&record.slug))}),
+                        json!({"ok": true,"service":redact_for(caller,&record,service_view(&record,state.get(&record.slug)))}),
                         notes,
                     )
                 }
@@ -695,11 +926,13 @@ pub fn handle_with_policy(
                 Ok(args) => args,
                 Err(error) => return parse_error(error),
             };
-            match store.request_restart(&slug, caller) {
+            match super::authority::commit(caller, policy.revalidate_authority, |fresh| {
+                store.request_restart(&slug, fresh)
+            }) {
                 Ok(record) => {
                     after_change();
                     let state = snapshots(store);
-                    json!({"ok": true, "slug": slug, "restartRequested": true, "service": service_view(&record, state.get(&record.slug))})
+                    json!({"ok": true, "slug": slug, "restartRequested": true, "service": redact_for(caller,&record,service_view(&record,state.get(&record.slug)))})
                 }
                 Err(error) => rejected(error),
             }
@@ -709,10 +942,20 @@ pub fn handle_with_policy(
                 Ok(args) => args,
                 Err(error) => return parse_error(error),
             };
-            match store.remove(&slug, caller) {
+            let mut notes = Vec::new();
+            let expected = match store.get(&slug) {
+                Ok(record) => record,
+                Err(error) => return rejected(error),
+            };
+            if let Err(refusal) = pass(removal_gate(policy, caller, &expected), &mut notes) {
+                return refusal;
+            }
+            match super::authority::commit(caller, policy.revalidate_authority, |fresh| {
+                store.remove_if_unchanged(&slug, fresh, &expected)
+            }) {
                 Ok(_) => {
                     after_change();
-                    json!({"ok": true, "slug": slug, "removed": true})
+                    with_notes(json!({"ok": true, "slug": slug, "removed": true}), notes)
                 }
                 Err(error) => rejected(error),
             }
@@ -734,9 +977,12 @@ pub fn handle_with_policy(
                 .into_iter()
                 .filter_map(|view| {
                     let record = registry.services.get(view["slug"].as_str()?)?;
-                    policy
-                        .visible(cutex_session_id, record)
-                        .then(|| redact_for(cutex_session_id, record, view))
+                    let manage = may_manage(record, caller);
+                    (manage || policy.visible(cutex_session_id, record)).then(|| {
+                        let mut view = redact_for(caller, record, view);
+                        view["youMayManage"] = json!(manage);
+                        view
+                    })
                 })
                 .collect();
             json!({"ok": true, "host": store.host(), "services": services})
@@ -757,6 +1003,41 @@ mod tests {
             cutex_session_id: session.into(),
             project_id: Some("proj".into()),
         }
+    }
+
+    #[test]
+    fn agents_set_and_clear_their_service_tile() {
+        let dir = std::env::temp_dir().join(format!(
+            "cutex-services-agent-tile-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = ServiceStore::new(&dir, "agenthost");
+        let call =
+            |caller: &Caller, body: Value| handle_with(&store, caller, body.to_string().as_bytes());
+        let registered = call(
+            &agent(S1),
+            json!({"op": "register", "args": {"slug": "tiled", "tile": {"title": "Build", "badge": "OK", "x": 1}, "tilePath": "/tile.json"}}),
+        );
+        assert_eq!(registered["ok"], true, "{registered}");
+        assert_eq!(registered["service"]["tile"], json!({"title": "Build", "badge": "OK"}));
+        assert_eq!(registered["service"]["tilePath"], "/tile.json");
+        let refused = call(
+            &agent(S1),
+            json!({"op": "update", "args": {"slug": "tiled", "tile": {"image": "https://example.com/a.png"}}}),
+        );
+        assert_eq!(refused["code"], "invalid_tile", "{refused}");
+        assert_eq!(
+            call(&agent(S2), json!({"op": "update", "args": {"slug": "tiled", "tile": null}}))["code"],
+            "not_service_owner"
+        );
+        let cleared = call(
+            &agent(S1),
+            json!({"op": "update", "args": {"slug": "tiled", "tile": null, "tilePath": null}}),
+        );
+        assert_eq!(cleared["ok"], true, "{cleared}");
+        assert!(cleared["service"].get("tile").is_none());
+        assert!(cleared["service"].get("tilePath").is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1009,6 +1290,9 @@ mod tests {
             approvals: Some(ApprovalStore::at(dir.join("approvals.json"))),
             requester_name: Some("worker".into()),
             waiter: None,
+            director_default_project: false,
+            project_ambiguous: false,
+            revalidate_authority: false,
         };
         let call = |body: Value| {
             handle_with_policy(&store, &agent(S1), body.to_string().as_bytes(), &policy)
@@ -1091,6 +1375,9 @@ mod tests {
             approvals: Some(ApprovalStore::at(dir.join("approvals.json"))),
             requester_name: None,
             waiter: None,
+            director_default_project: false,
+            project_ambiguous: false,
+            revalidate_authority: false,
         };
         let call = |body: Value| {
             handle_with_policy(&store, &agent(S1), body.to_string().as_bytes(), &policy)
@@ -1270,6 +1557,9 @@ mod tests {
             approvals: Some(ApprovalStore::at(dir.join("approvals.json"))),
             requester_name: None,
             waiter: None,
+            director_default_project: false,
+            project_ambiguous: false,
+            revalidate_authority: false,
         }
     }
 
@@ -1283,7 +1573,14 @@ mod tests {
         let path = dir.join("approvals.json");
         let mut policy = gated_policy(&dir);
         let hold = |millis: u64| {
-            let mut waiter = crate::approvals::Waiter::new(1, Some("t".into()), None, || true, || true);
+            let mut waiter = crate::approvals::Waiter::new(
+                1,
+                Some("t".into()),
+                None,
+                Some(1),
+                || true,
+                || true,
+            );
             waiter.duration = std::time::Duration::from_millis(millis);
             waiter.poll = std::time::Duration::from_millis(10);
             waiter
@@ -1454,6 +1751,349 @@ mod tests {
         assert_eq!(own["ok"], true, "{own}");
         std::fs::remove_dir_all(dir).unwrap();
     }
+    /// A roster whose project `proj` is directed by `director` (installed as
+    /// the request-local authority, like a caller holding the roster fence).
+    fn directed_by(director: &str) -> crate::agent_management::AgentManagementSnapshot {
+        let mut snapshot = crate::agent_management::AgentManagementSnapshot::empty();
+        snapshot.projects.insert(
+            crate::agent_management::ProjectId::new("proj").unwrap(),
+            serde_json::from_value(json!({
+                "project_id": "proj", "authorized_director_session": director,
+                "authority_epoch": 1, "updated_at": "2026-10-28T00:00:00Z"
+            }))
+            .unwrap(),
+        );
+        snapshot
+    }
+
+    fn find<'a>(listing: &'a Value, slug: &str) -> &'a Value {
+        listing["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|service| service["slug"] == slug)
+            .unwrap_or_else(|| panic!("{slug} not listed: {listing}"))
+    }
+
+    /// services-project-scope: a project service is managed by whoever is
+    /// the project's Director at the time of the call and by its registrant
+    /// while in the project; session services and non-members are unchanged.
+    #[test]
+    fn project_services_follow_the_current_director() {
+        let dir = std::env::temp_dir().join(format!("cutex-services-project-{}", uuid::Uuid::new_v4().simple()));
+        let store = ServiceStore::new(&dir, "agenthost");
+        let open = AgentServicePolicy::permissive();
+        let call = |caller: &Caller, body: Value, policy: &AgentServicePolicy| {
+            handle_with_policy(&store, caller, body.to_string().as_bytes(), policy)
+        };
+        let member = in_project(S1, "proj");
+        let old_director = in_project(S3, "proj");
+        let new_director = in_project(S4, "proj");
+        let outsider = in_project(S2, "proj2");
+        let board = json!({"op":"register","args":{"slug":"board","runtime":"managed","command":"serve --token t {port}","ownerScope":"project"}});
+        let update = |slug: &str, name: &str| json!({"op":"update","args":{"slug":slug,"displayName":name}});
+        let restart = json!({"op":"restart","args":{"slug":"board"}});
+
+        crate::director_address::with_authority_snapshot(&directed_by(S3), || {
+            let registered = call(&member, board.clone(), &open);
+            assert_eq!(registered["ok"], true, "{registered}");
+            assert_eq!(registered["service"]["ownerScope"], "project");
+            assert_eq!(registered["service"]["ownerCutexSessionId"], S1);
+            assert_eq!(registered["service"]["projectId"], "proj");
+            store.update("board", serde_json::from_value(json!({
+                "loginLinkCommand":"owner-only-login-helper"
+            })).unwrap(), &Caller::Owner).unwrap();
+            let member_listing = call(&member, json!({"op":"list"}), &open);
+            assert!(find(&member_listing, "board").get("loginLinkCommand").is_none());
+            // Default stays session for a member.
+            let mine = call(&member, json!({"op":"register","args":{"slug":"mine","runtime":"managed","command":"x {port}"}}), &open);
+            assert_eq!(mine["service"]["ownerScope"], "session", "{mine}");
+
+            // The current Director manages the member's project service and sees how it runs.
+            let listing = call(&old_director, json!({"op":"list"}), &open);
+            assert_eq!(find(&listing, "board")["youMayManage"], true);
+            assert_eq!(find(&listing, "board")["command"], "serve --token t {port}");
+            assert!(find(&listing, "board").get("loginLinkCommand").is_none());
+            assert_eq!(find(&listing, "mine")["youMayManage"], false);
+            assert!(find(&listing, "mine").get("command").is_none());
+            assert_eq!(call(&old_director, update("board", "Board"), &open)["ok"], true);
+            assert_eq!(call(&old_director, restart.clone(), &open)["ok"], true);
+            assert_eq!(call(&old_director, update("mine", "x"), &open)["code"], "not_service_owner");
+            // Re-registering it keeps the registrant and project.
+            let again = call(&old_director, board.clone(), &open);
+            assert_eq!(again["ok"], true, "{again}");
+            assert_eq!(store.get("board").unwrap().owner_cutex_session_id.as_deref(), Some(S1));
+            // Only the owner turns it back into a session service.
+            let demote = call(&old_director, json!({"op":"update","args":{"slug":"board","ownerScope":"session"}}), &open);
+            assert_eq!(demote["code"], "not_service_owner", "{demote}");
+            // A non-member neither manages nor sees how it runs.
+            let refused = call(&outsider, update("board", "x"), &open);
+            assert_eq!(refused["code"], "not_service_owner");
+            assert!(refused["detail"].as_str().unwrap().contains("current Director"), "{refused}");
+            assert_eq!(call(&outsider, board.clone(), &open)["code"], "slug_taken");
+            let listing = call(&outsider, json!({"op":"list"}), &open);
+            assert_eq!(find(&listing, "board")["youMayManage"], false);
+            assert!(find(&listing, "board").get("command").is_none());
+        });
+
+        // The seat changes: the successor manages at once, the predecessor no longer.
+        crate::director_address::with_authority_snapshot(&directed_by(S4), || {
+            assert_eq!(call(&old_director, update("board", "x"), &open)["code"], "not_service_owner");
+            assert_eq!(call(&old_director, restart.clone(), &open)["code"], "not_service_owner");
+            assert_eq!(
+                call(&old_director, json!({"op":"unregister","args":{"slug":"board"}}), &open)["code"],
+                "not_service_owner"
+            );
+            assert_eq!(find(&call(&old_director, json!({"op":"list"}), &open), "board")["youMayManage"], false);
+            assert_eq!(call(&new_director, update("board", "Board 2"), &open)["ok"], true);
+            assert_eq!(call(&new_director, restart.clone(), &open)["ok"], true);
+            // The registrant manages it while in the project, not after leaving it.
+            assert_eq!(call(&member, update("board", "Board 3"), &open)["ok"], true);
+            let left = Caller::Agent { cutex_session_id: S1.into(), project_id: None };
+            assert_eq!(call(&left, update("board", "x"), &open)["code"], "not_service_owner");
+            assert_eq!(call(&left, update("mine", "still mine"), &open)["ok"], true);
+
+            // A sole-project Director's new services default to project; explicit session wins.
+            let director_policy = AgentServicePolicy { director_default_project: true, ..AgentServicePolicy::permissive() };
+            let defaulted = call(&new_director, json!({"op":"register","args":{"slug":"dir-board"}}), &director_policy);
+            assert_eq!(defaulted["service"]["ownerScope"], "project", "{defaulted}");
+            let personal = call(&new_director, json!({"op":"register","args":{"slug":"dir-own","ownerScope":"session"}}), &director_policy);
+            assert_eq!(personal["service"]["ownerScope"], "session", "{personal}");
+            // An existing session slug is not converted by the default.
+            let kept = call(&member, json!({"op":"register","args":{"slug":"mine","runtime":"managed","command":"x {port}"}}), &director_policy);
+            assert_eq!(kept["service"]["ownerScope"], "session", "{kept}");
+            // Without a project or with several directed projects, project scope is refused.
+            let solo = Caller::Agent { cutex_session_id: S2.into(), project_id: None };
+            assert_eq!(
+                call(&solo, json!({"op":"register","args":{"slug":"solo","ownerScope":"project"}}), &open)["code"],
+                "project_scope_unavailable"
+            );
+            let ambiguous = AgentServicePolicy { project_ambiguous: true, ..AgentServicePolicy::permissive() };
+            assert_eq!(
+                call(&new_director, json!({"op":"register","args":{"slug":"amb","ownerScope":"project"}}), &ambiguous)["code"],
+                "director_project_ambiguous"
+            );
+            // A member promotes its own session service; the Director then manages it.
+            let promoted = call(&member, json!({"op":"update","args":{"slug":"mine","ownerScope":"project"}}), &open);
+            assert_eq!(promoted["service"]["ownerScope"], "project", "{promoted}");
+            assert_eq!(call(&new_director, update("mine", "Shared"), &open)["ok"], true);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// services-project-scope: removing a persistent project service another
+    /// agent registered waits for the owner; own or ephemeral ones do not.
+    #[test]
+    fn removing_another_agents_persistent_project_service_asks_the_owner() {
+        let dir = std::env::temp_dir().join(format!("cutex-services-project-rm-{}", uuid::Uuid::new_v4().simple()));
+        let store = ServiceStore::new(dir.join("services"), "host");
+        let approvals = ApprovalStore::at(dir.join("approvals.json"));
+        let policy = gated_policy(&dir);
+        for (slug, lifetime, registrant) in [("board", "persistent", S1), ("preview", "ephemeral", S1), ("own", "persistent", S3)] {
+            store
+                .register(
+                    serde_json::from_value(json!({"slug":slug,"lifetime":lifetime,"ownerScope":"project","projectId":"proj","ownerCutexSessionId":registrant})).unwrap(),
+                    &Caller::Owner,
+                )
+                .unwrap();
+        }
+        let call = |caller: &Caller, slug: &str| {
+            handle_with_policy(&store, caller, json!({"op":"unregister","args":{"slug":slug}}).to_string().as_bytes(), &policy)
+        };
+        let director = in_project(S3, "proj");
+        crate::director_address::with_authority_snapshot(&directed_by(S3), || {
+            // A non-member is refused without a card.
+            assert_eq!(call(&in_project(S2, "proj2"), "board")["code"], "not_service_owner");
+            assert!(approvals.list(false, chrono::Utc::now()).unwrap().is_empty());
+            let first = call(&director, "board");
+            assert_eq!(first["status"], "approval_required", "{first}");
+            assert!(store.get("board").is_ok());
+            let cards = approvals.list(false, chrono::Utc::now()).unwrap();
+            assert_eq!(cards.len(), 1);
+            assert_eq!(cards[0].kind, ApprovalKind::ManagedService);
+            assert_eq!(cards[0].reason, "project_service_remove");
+            assert_eq!(cards[0].details["registrant"], S1);
+            assert_eq!(cards[0].project_id.as_deref(), Some("proj"));
+            approvals
+                .decide(first["approval_id"].as_str().unwrap(), true, None, chrono::Utc::now())
+                .unwrap();
+            assert_eq!(call(&director, "board")["removed"], true);
+            assert!(store.get("board").is_err());
+            // Ephemeral, or registered by the caller itself: no card.
+            assert_eq!(call(&director, "preview")["removed"], true);
+            assert_eq!(call(&director, "own")["removed"], true);
+            assert!(approvals.list(false, chrono::Utc::now()).unwrap().is_empty());
+            // Re-registering an owner-created project service, or one whose
+            // deleted registrant was cleared, never makes the Director its
+            // registrant and must not bypass persistent removal confirmation.
+            store.register(serde_json::from_value(json!({
+                "slug":"orphan", "lifetime":"persistent", "ownerScope":"project", "projectId":"proj"
+            })).unwrap(), &Caller::Owner).unwrap();
+            let registered = handle_with_policy(&store, &director,
+                json!({"op":"register","args":{"slug":"orphan"}}).to_string().as_bytes(), &policy);
+            assert_eq!(registered["ok"], true, "{registered}");
+            assert!(store.get("orphan").unwrap().owner_cutex_session_id.is_none());
+            assert_eq!(call(&director, "orphan")["status"], "approval_required");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reregister_compares_the_effective_replacement_env() {
+        let dir = std::env::temp_dir().join(format!("cutex-project-env-{}", uuid::Uuid::new_v4()));
+        let store = ServiceStore::new(dir.join("services"), "host");
+        let approvals = ApprovalStore::at(dir.join("approvals.json"));
+        let policy = gated_policy(&dir);
+        let original = json!({"slug":"board","runtime":"managed","command":"serve {port}",
+            "env":{"MODE":"restricted"},"lifetime":"ephemeral","ownerScope":"project",
+            "projectId":"proj","ownerCutexSessionId":S1});
+        store.register(serde_json::from_value(original).unwrap(), &Caller::Owner).unwrap();
+        let director = in_project(S3, "proj");
+        crate::director_address::with_authority_snapshot(&directed_by(S3), || {
+            let call = |args: Value| handle_with_policy(&store, &director,
+                json!({"op":"register","args":args}).to_string().as_bytes(), &policy);
+            let unchanged = call(json!({"slug":"board","runtime":"managed","command":"serve {port}",
+                "env":{"MODE":"restricted"}}));
+            assert_eq!(unchanged["ok"], true, "{unchanged}");
+            assert!(approvals.list(false, chrono::Utc::now()).unwrap().is_empty());
+            let replacement = json!({"slug":"board","runtime":"managed","command":"serve {port}"});
+            let pending = call(replacement.clone());
+            assert_eq!(pending["status"], "approval_required", "{pending}");
+            assert_eq!(store.get("board").unwrap().env["MODE"], "restricted");
+            let cards = approvals.list(false, chrono::Utc::now()).unwrap();
+            assert_eq!(cards.len(), 1);
+            assert_eq!(cards[0].requester_cutex_session_id, S3);
+            assert_eq!(cards[0].kind, ApprovalKind::ManagedService);
+            approvals.decide(pending["approval_id"].as_str().unwrap(), true, None, chrono::Utc::now()).unwrap();
+            assert_eq!(call(replacement.clone())["ok"], true);
+            assert!(store.get("board").unwrap().env.is_empty());
+            assert_eq!(call(replacement)["ok"], true);
+            assert!(approvals.list(false, chrono::Utc::now()).unwrap().is_empty());
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nonregistrant_downgrade_requires_one_exact_owner_approval() {
+        let dir = std::env::temp_dir().join(format!("cutex-project-downgrade-{}", uuid::Uuid::new_v4()));
+        let store = ServiceStore::new(dir.join("services"), "host");
+        let approvals = ApprovalStore::at(dir.join("approvals.json"));
+        let director = in_project(S3, "proj");
+        crate::director_address::with_authority_snapshot(&directed_by(S3), || {
+            for op in ["register", "update"] {
+                for full_access in [false, true] {
+                    let slug = format!("{op}-{full_access}");
+                    store.register(serde_json::from_value(json!({
+                        "slug":slug,"runtime":"managed","command":"old {port}","lifetime":"persistent",
+                        "ownerScope":"project","projectId":"proj","ownerCutexSessionId":S1,
+                    })).unwrap(), &Caller::Owner).unwrap();
+                    let policy = AgentServicePolicy { managed_within_envelope: full_access, ..gated_policy(&dir) };
+                    let body = json!({"op":op,"args":{"slug":slug,"runtime":"managed",
+                        "command":"new {port}","lifetime":"ephemeral"}});
+                    let call = || handle_with_policy(&store, &director, body.to_string().as_bytes(), &policy);
+                    let pending = call();
+                    assert_eq!(pending["status"], "approval_required", "{pending}");
+                    let before = store.get(&slug).unwrap();
+                    assert_eq!(before.lifetime, super::super::store::ServiceLifetime::Persistent);
+                    assert_eq!(before.command, Some(ServiceCommand::Shell("old {port}".into())));
+                    let cards = approvals.list(false, chrono::Utc::now()).unwrap();
+                    assert_eq!(cards.len(), 1);
+                    assert_eq!(cards[0].reason, "project_service_downgrade");
+                    assert_eq!(cards[0].kind, ApprovalKind::ManagedService);
+                    assert_eq!(cards[0].requester_cutex_session_id, S3);
+                    assert_eq!(cards[0].details["managedExecution"], !full_access);
+                    approvals.decide(pending["approval_id"].as_str().unwrap(), true, None, chrono::Utc::now()).unwrap();
+                    let changed = call();
+                    assert_eq!(changed["ok"], true, "{changed}");
+                    assert_eq!(store.get(&slug).unwrap().lifetime, super::super::store::ServiceLifetime::Ephemeral);
+                    // One approval also covers this caller's changed managed command.
+                    assert!(approvals.list(false, chrono::Utc::now()).unwrap().is_empty());
+                }
+            }
+            // A registrant releasing its own retention keeps the existing behavior.
+            store.register(serde_json::from_value(json!({"slug":"own","lifetime":"persistent",
+                "ownerScope":"project","projectId":"proj","ownerCutexSessionId":S3})).unwrap(), &Caller::Owner).unwrap();
+            let own = handle_with_policy(&store, &director,
+                json!({"op":"update","args":{"slug":"own","lifetime":"ephemeral"}}).to_string().as_bytes(), &gated_policy(&dir));
+            assert_eq!(own["ok"], true, "{own}");
+            assert!(approvals.list(false, chrono::Utc::now()).unwrap().is_empty());
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unregister_refuses_a_replacement_created_during_owner_approval() {
+        let dir = std::env::temp_dir().join(format!("cutex-project-remove-replaced-{}", uuid::Uuid::new_v4()));
+        let store = ServiceStore::new(dir.join("services"), "host");
+        let approvals = ApprovalStore::at(dir.join("approvals.json"));
+        let original = json!({"slug":"board","displayName":"Original","lifetime":"persistent",
+            "ownerScope":"project","projectId":"proj","ownerCutexSessionId":S1});
+        store.register(serde_json::from_value(original.clone()).unwrap(), &Caller::Owner).unwrap();
+        let mut policy = gated_policy(&dir);
+        let services_dir = dir.join("services");
+        let approval_path = dir.join("approvals.json");
+        // The first connected callback runs after begin_wait. Replace the
+        // record and approve that waiting request before the gate resumes.
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let replacement = original.clone();
+        policy.waiter = Some(crate::approvals::Waiter::new(5, Some("t".into()), None, Some(1), move || {
+            if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let other = ServiceStore::new(&services_dir, "host");
+                other.remove("board", &Caller::Owner).unwrap();
+                let mut replacement = replacement.clone();
+                replacement["displayName"] = json!("Replacement");
+                other.register(serde_json::from_value(replacement).unwrap(), &Caller::Owner).unwrap();
+                let pending = ApprovalStore::at(&approval_path);
+                let cards = pending.list(false, chrono::Utc::now()).unwrap();
+                assert_eq!(cards.len(), 1);
+                pending.decide(&cards[0].approval_id, true, None, chrono::Utc::now()).unwrap();
+            }
+            true
+        }, || true));
+        crate::director_address::with_authority_snapshot(&directed_by(S3), || {
+            let body = json!({"op":"unregister","args":{"slug":"board"}});
+            let result = handle_with_policy(&store, &in_project(S3, "proj"), body.to_string().as_bytes(), &policy);
+            assert_eq!(result["code"], "service_changed", "{result}");
+            assert_eq!(store.get("board").unwrap().display_name, "Replacement");
+            // A retry must obtain a fresh approval for the replacement.
+            policy.waiter = None;
+            let retried = handle_with_policy(&store, &in_project(S3, "proj"), body.to_string().as_bytes(), &policy);
+            assert_eq!(retried["status"], "approval_required", "{retried}");
+            assert_eq!(approvals.list(false, chrono::Utc::now()).unwrap().len(), 1);
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_approval_retry_binds_the_inherited_service_baseline() {
+        for op in ["register", "update"] {
+            let dir = std::env::temp_dir().join(format!("cutex-service-approval-basis-{}", uuid::Uuid::new_v4()));
+            let store = ServiceStore::new(dir.join("services"), "host");
+            let approvals = ApprovalStore::at(dir.join("approvals.json"));
+            let policy = gated_policy(&dir);
+            store.register(serde_json::from_value(json!({
+                "slug":"board", "runtime":"managed", "command":"old {port}",
+                "env":{"MODE":"before"}, "ownerScope":"project", "projectId":"proj",
+                "ownerCutexSessionId":S1, "lifetime":"ephemeral"
+            })).unwrap(), &Caller::Owner).unwrap();
+            crate::director_address::with_authority_snapshot(&directed_by(S3), || {
+                let body = json!({"op":op,"args":{"slug":"board","runtime":"managed","command":"new {port}"}});
+                let call = || handle_with_policy(&store, &in_project(S3,"proj"), body.to_string().as_bytes(), &policy);
+                let first = call();
+                assert_eq!(first["status"], "approval_required", "{first}");
+                let old_card = approvals.list(false, chrono::Utc::now()).unwrap().remove(0);
+                store.update("board", serde_json::from_value(json!({"env":{"MODE":"after"}})).unwrap(), &Caller::Owner).unwrap();
+                approvals.decide(first["approval_id"].as_str().unwrap(), true, None, chrono::Utc::now()).unwrap();
+                let retry = call();
+                assert_eq!(retry["status"], "approval_required", "{retry}");
+                assert_ne!(retry["approval_id"], first["approval_id"]);
+                assert_eq!(store.get("board").unwrap().command, Some(ServiceCommand::Shell("old {port}".into())));
+                assert!(approvals.list(false, chrono::Utc::now()).unwrap().iter()
+                    .any(|card| card.request_sha256 != old_card.request_sha256));
+            });
+        }
+    }
+
     /// Thread-local cutex home with the given sessions (id -> cwd).
     fn static_fixture(sessions: &[(&str, &std::path::Path)], home: &std::path::Path) -> impl Drop {
         struct Reset;

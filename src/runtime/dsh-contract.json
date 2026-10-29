@@ -1,0 +1,11 @@
+{
+  "version": "dsh-acp-v1",
+  "runtimeBackend": "dsh",
+  "nativeProtocol": { "name": "acp", "version": 1, "sessionFormat": 4 },
+  "requests": ["initialize", "thread/start", "thread/resume", "thread/read", "thread/turns/list", "thread/items/list", "thread/loaded/list", "thread/busy", "thread/inter_agent_message", "thread/inter_agent_message/status", "turn/start", "turn/interrupt", "model/list", "thread/settings/update", "dsh/input/submit", "dsh/input/status", "dsh/runtime/status", "dsh/server/shutdown"],
+  "notifications": ["initialized", "turn/started", "turn/completed", "item/started", "item/completed", "item/agentMessage/delta", "item/reasoning/textDelta", "turn/plan/updated", "thread/status/changed", "serverRequest/resolved", "thread/settings/updated", "dsh/contextUsage/updated", "dsh/configOptions/updated", "thread/tokenUsage/updated", "item/updated", "dsh/launchSelection"],
+  "serverRequests": ["item/commandExecution/requestApproval"],
+  "approvalDecisions": ["accept", "decline", "cancel"],
+  "capabilities": { "resume": true, "interrupt": true, "steer": false, "fork": false, "revert": false, "delete": false, "contextOccupancy": true, "billingUsage": true, "textInputOnly": false, "imageInput": true, "threadSettingsUpdate": true },
+  "transcriptAuthority": "dsh-v4-native-sequence-with-atomic-sqlite-projection"
+}

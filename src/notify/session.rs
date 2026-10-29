@@ -135,25 +135,6 @@ fn session_at(root: &Path, thread_id: &str, change: Change) -> anyhow::Result<Pr
     session_at_with_initial(root, thread_id, change, initial)
 }
 
-fn notification_lock_busy(error: &std::io::Error) -> bool {
-    // fs2 uses LockFileEx on Windows; its lock-busy error is not WouldBlock.
-    error.kind() == ErrorKind::WouldBlock
-        || (cfg!(windows) && error.raw_os_error() == Some(33)) // ERROR_LOCK_VIOLATION
-}
-
-#[test]
-fn notification_lock_busy_accepts_only_platform_contention() {
-    assert!(notification_lock_busy(&std::io::Error::from(ErrorKind::WouldBlock)));
-    assert_eq!(notification_lock_busy(&std::io::Error::from_raw_os_error(33)), cfg!(windows));
-    for kind in [ErrorKind::PermissionDenied, ErrorKind::NotFound, ErrorKind::Other] {
-        assert!(!notification_lock_busy(&std::io::Error::from(kind)));
-    }
-    #[cfg(windows)]
-    for code in [5, 32, 6, 3] {
-        assert!(!notification_lock_busy(&std::io::Error::from_raw_os_error(code)));
-    }
-}
-
 fn session_at_with_initial(root: &Path, thread_id: &str, change: Change, initial: Option<Level>) -> anyhow::Result<Preference> {
     let thread_id = uuid::Uuid::parse_str(thread_id)
         .context("expected native session UUID")?
@@ -190,7 +171,7 @@ fn session_at_with_initial(root: &Path, thread_id: &str, change: Change, initial
             match lock.try_lock_exclusive() {
                 Ok(()) => break,
                 Err(error)
-                    if notification_lock_busy(&error) && Instant::now() < deadline =>
+                    if crate::platform::file_lock::lock_contended(&error) && Instant::now() < deadline =>
                 {
                     std::thread::sleep(Duration::from_millis(10))
                 }

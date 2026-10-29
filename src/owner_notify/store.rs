@@ -20,10 +20,15 @@ use crate::asks::{new_id, now_rfc3339, parse_time};
 use crate::config::owner_notify::OwnerNotifySettings;
 use crate::notification_levels::{Decision, Evaluator, Level as NotificationLevel, Scope};
 
-/// Final records are pruned after this long.
-const RETENTION_DAYS: i64 = 30;
-/// At most this many records are kept (oldest final ones go first).
-const MAX_RECORDS: usize = 2000;
+/// Final records without an owner reply are pruned after this long. A
+/// record the owner replied to is never pruned here: the documents sweep
+/// moves it into the record archive (kind `ownerNotification`) once it has
+/// been final `documents.closedRetentionDays` (owner decision 2026-10-23;
+/// before r252 replies were deleted after 30 days too).
+pub const RETENTION_DAYS: i64 = 30;
+/// At most this many records are kept (oldest final ones without a reply
+/// go first).
+pub const MAX_RECORDS: usize = 2000;
 /// Idempotency records of tool calls are kept this long.
 const ACTION_RETENTION_DAYS: i64 = 7;
 /// Bound on queued notices while the management process is down.
@@ -244,6 +249,16 @@ impl OwnerNotification {
             (_, Level::Attention) => NotificationLevel::NeedsYou,
             (_, Level::Info) => NotificationLevel::Inform,
         })
+    }
+
+    /// The owner wrote a reply: the record is kept until it is archived.
+    pub fn has_owner_reply(&self) -> bool {
+        self.reply.is_some()
+    }
+
+    /// When the record became final (closed, else acknowledged, else created).
+    pub fn final_at(&self) -> Option<DateTime<Utc>> {
+        parse_time(self.closed_at.as_deref().or(self.acknowledged_at.as_deref()).unwrap_or(&self.created_at))
     }
 
     pub fn has_channel(&self, channel: &str) -> bool {
@@ -722,14 +737,14 @@ impl OwnerNotifyState {
     pub fn prune(&mut self, now: DateTime<Utc>) {
         let cutoff = now - Duration::days(RETENTION_DAYS);
         self.notifications.retain(|_, record| {
-            !record.is_final()
-                || parse_time(record.closed_at.as_deref().or(record.acknowledged_at.as_deref()).unwrap_or(&record.created_at))
-                    .is_none_or(|at| at > cutoff)
+            !record.is_final() || record.has_owner_reply() || record.final_at().is_none_or(|at| at > cutoff)
         });
         if self.notifications.len() > MAX_RECORDS {
+            // Replies are never dropped by the cap (they wait for the archive).
             let mut ordered: Vec<(bool, String, String)> = self
                 .notifications
                 .values()
+                .filter(|record| !record.has_owner_reply())
                 .map(|record| (!record.is_final(), record.created_at.clone(), record.notification_id.clone()))
                 .collect();
             ordered.sort();
@@ -741,6 +756,32 @@ impl OwnerNotifyState {
         let action_cutoff = now - Duration::days(ACTION_RETENTION_DAYS);
         self.actions
             .retain(|_, record| parse_time(&record.at).is_none_or(|at| at > action_cutoff));
+    }
+}
+
+impl OwnerNotifyState {
+    /// Final records the owner replied to that became final before `cutoff`
+    /// (the documents sweep archives them, then calls [`Self::remove_archived`]).
+    pub fn replied_final_before(&self, cutoff: DateTime<Utc>) -> Vec<OwnerNotification> {
+        self.notifications
+            .values()
+            .filter(|record| record.is_final() && record.has_owner_reply())
+            .filter(|record| record.final_at().is_some_and(|at| at < cutoff))
+            .cloned()
+            .collect()
+    }
+
+    /// Remove archived records silently (like [`Self::prune`]); a record
+    /// that changed since it was archived stays.
+    pub fn remove_archived(&mut self, archived: &[OwnerNotification]) -> usize {
+        let mut removed = 0;
+        for record in archived {
+            if self.notifications.get(&record.notification_id) == Some(record) {
+                self.notifications.remove(&record.notification_id);
+                removed += 1;
+            }
+        }
+        removed
     }
 }
 
@@ -965,6 +1006,37 @@ mod tests {
         state.prune(at(60 * 24 * 31));
         assert!(!state.notifications.contains_key(&old.notification_id));
         assert!(state.notifications.contains_key(&waiting.notification_id));
+    }
+
+    /// Owner decision 2026-10-23: a reply is kept (then archived by the
+    /// documents sweep), never dropped by the age or the count limit.
+    #[test]
+    fn replied_records_survive_prune_until_archived() {
+        let mut state = OwnerNotifyState::default();
+        let settings = OwnerNotifySettings::default();
+        let asked = state.create(new("a", Level::Attention, true), &settings, at(0));
+        let record = state.notifications.get_mut(&asked.notification_id).unwrap();
+        record.reply = Some(Reply { text: "yes, ship it".into(), replied_at: now_rfc3339(at(1)), client_user_message_id: "m1".into() });
+        record.state = State::Answered;
+        record.closed_at = Some(now_rfc3339(at(1)));
+        let late = 60 * 24 * 400;
+        state.prune(at(late));
+        assert!(state.notifications.contains_key(&asked.notification_id), "kept past 30 days");
+        for i in 0..MAX_RECORDS as i64 + 5 {
+            let filler = state.create(new("b", Level::Info, false), &settings, at(late + i));
+            state.acknowledge("b", &filler.notification_id, at(late + i)).unwrap();
+        }
+        assert!(state.notifications.len() <= MAX_RECORDS);
+        assert!(state.notifications.contains_key(&asked.notification_id), "not dropped by the cap");
+        let due = state.replied_final_before(at(60 * 24 * 31));
+        assert_eq!(due.len(), 1);
+        assert!(state.replied_final_before(at(0)).is_empty());
+        // A record changed after it was read is not removed.
+        let mut stale = due[0].clone();
+        stale.text = "older copy".into();
+        assert_eq!(state.remove_archived(&[stale]), 0);
+        assert_eq!(state.remove_archived(&due), 1);
+        assert!(!state.notifications.contains_key(&asked.notification_id));
     }
 
     #[test]

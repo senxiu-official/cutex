@@ -255,7 +255,7 @@ fn revert_locked(
             "runtime package revert requires the explicit host backend"
         );
         ensure!(
-            !record.is_retired()
+            !crate::agent_management::agent_execution_blocked(&record)
                 && record.codex_session_id.as_deref() == Some(restore.native_id.as_str()),
             "active exact adopted identity required"
         );
@@ -455,7 +455,7 @@ fn validate_upgrade_source(
         "runtime package upgrade requires the explicit host backend"
     );
     ensure!(
-        !record.is_retired()
+        !crate::agent_management::agent_execution_blocked(&record)
             && record.agent_enabled
             && record.registration_class
                 == crate::agent_bus::model::AgentRegistrationClass::Persistent

@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:tool-action-receipt",
+  "title": "Cutex tool action receipt v1",
+  "$ref": "#/$defs/receipt",
+  "$defs": {
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "ok",
+        "tool",
+        "action_id",
+        "status",
+        "outcomeUnknown"
+      ],
+      "properties": {
+        "schema": {
+          "const": "cutex.tool-action-receipt.v1"
+        },
+        "ok": {
+          "const": true
+        },
+        "tool": {
+          "enum": [
+            "agent_create",
+            "agent_delegate"
+          ]
+        },
+        "action_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "awaitingApproval",
+            "unknown",
+            "notFound"
+          ]
+        },
+        "outcomeUnknown": {
+          "type": "boolean"
+        },
+        "result": {
+          "type": "object"
+        },
+        "retryAdmission": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "code",
+            "retryable"
+          ],
+          "properties": {
+            "status": {
+              "const": "no_write"
+            },
+            "code": {
+              "enum": [
+                "action_worker_capacity",
+                "action_caller_capacity",
+                "action_receipt_capacity",
+                "action_worker_unavailable"
+              ]
+            },
+            "retryable": {
+              "const": true
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "unknown",
+                  "notFound"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "outcomeUnknown": {
+                "const": true
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "outcomeUnknown": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "completed",
+                  "failed",
+                  "awaitingApproval"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "result"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

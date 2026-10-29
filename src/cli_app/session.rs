@@ -31,6 +31,9 @@ pub(crate) fn run_command(command: SessionCommand) -> anyhow::Result<()> {
         SessionCommand::Retire { id, reason, json } => {
             super::session_archive::cmd_session_retire(&id, reason.as_deref(), json)
         }
+        SessionCommand::Delete { id, yes, json } => {
+            super::session_delete_cli::cmd_session_delete(&id, yes, json)
+        }
         SessionCommand::Restore { id, json } => {
             super::session_archive::cmd_session_restore(&id, json)
         }

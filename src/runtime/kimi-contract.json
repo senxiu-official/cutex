@@ -1,0 +1,11 @@
+{
+  "version": "kimi-acp-v1",
+  "runtimeBackend": "kimi",
+  "nativeProtocol": { "name": "acp", "version": 1, "product": "@moonshot-ai/kimi-code", "productVersion": "2.3.3", "wireProtocol": "1.5" },
+  "requests": ["initialize", "thread/start", "thread/resume", "thread/read", "thread/turns/list", "thread/items/list", "thread/loaded/list", "thread/busy", "thread/inter_agent_message", "thread/inter_agent_message/status", "turn/start", "turn/interrupt", "model/list", "thread/settings/update", "dsh/input/submit", "dsh/input/status", "dsh/runtime/status", "dsh/server/shutdown", "kimi/input/submit", "kimi/input/status", "kimi/runtime/status", "kimi/server/shutdown"],
+  "notifications": ["initialized", "turn/started", "turn/completed", "item/started", "item/completed", "item/updated", "item/agentMessage/delta", "item/reasoning/textDelta", "turn/plan/updated", "thread/status/changed", "serverRequest/resolved", "thread/settings/updated", "thread/tokenUsage/updated", "kimi/contextUsage/updated", "kimi/configOptions/updated", "kimi/launchSelection"],
+  "serverRequests": ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"],
+  "approvalDecisions": ["accept", "acceptForSession", "decline", "cancel"],
+  "capabilities": { "resume": true, "interrupt": true, "steer": false, "fork": true, "revert": true, "delete": true, "contextOccupancy": true, "billingUsage": true, "textInputOnly": false, "imageInput": true, "threadSettingsUpdate": true, "osSandbox": false },
+  "transcriptAuthority": "kimi-wire-jsonl-with-atomic-sqlite-projection"
+}

@@ -33,9 +33,8 @@ fn pending_outbox_uses_stable_timestamp_and_observes_real_changes_without_writes
         peers: std::collections::BTreeMap::from([(peer.peer_id.clone(), peer.clone())]),
         ..Default::default()
     };
-    let path = asks.dir().join("asks-v1.json");
-    let before = std::fs::read(&path).unwrap();
-    let stamp = crate::platform::file_stamp::FileStamp::of(&path);
+    let path = asks.dir().join(crate::management::v2::hot_store::DATABASE_FILE);
+    let generation = crate::management::v2::hot_store::generation(&path, "asks").unwrap();
     let view = routes::peer_views(&peers, &asks)
         .unwrap()
         .remove(&peer.peer_id)
@@ -61,8 +60,7 @@ fn pending_outbox_uses_stable_timestamp_and_observes_real_changes_without_writes
     for _ in 0..10 {
         routes::peer_views(&peers, &asks).unwrap();
     }
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert_eq!(crate::platform::file_stamp::FileStamp::of(&path), stamp);
+    assert_eq!(crate::management::v2::hot_store::generation(&path, "asks").unwrap(), generation);
     AskStore::at(asks.dir())
         .with_state(|s| {
             s.asks
@@ -144,12 +142,10 @@ fn peer_changed_never_creates_or_mutates_ask_store_notices() {
         "first"
     );
     asks.with_state(|s| s.next_seq = 1).unwrap();
-    let path = asks.dir().join("asks-v1.json");
-    let stamp = crate::platform::file_stamp::FileStamp::of(&path);
-    let before = std::fs::read(&path).unwrap();
+    let path = asks.dir().join(crate::management::v2::hot_store::DATABASE_FILE);
+    let generation = crate::management::v2::hot_store::generation(&path, "asks").unwrap();
     routes::changed(&peer, "state");
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert_eq!(crate::platform::file_stamp::FileStamp::of(&path), stamp);
+    assert_eq!(crate::management::v2::hot_store::generation(&path, "asks").unwrap(), generation);
     assert!(asks.snapshot().unwrap().notices.is_empty());
 }
 
@@ -368,29 +364,20 @@ fn batched_peer_views_keep_each_peers_inbound_outbound_and_dead_letters_separate
 }
 
 #[test]
-fn inspect_observes_external_atomic_replacement_after_cache_was_populated() {
+fn inspect_observes_external_sqlite_commit_after_cache_was_populated() {
     let root = std::env::temp_dir().join(format!("peer-inspect-replace-{}", uuid::Uuid::new_v4()));
     let asks = AskStore::at(root.join("asks"));
     asks.with_state(|state| state.next_seq = 1717).unwrap();
     assert_eq!(asks.inspect(|state| state.next_seq).unwrap(), 1717);
-    let path = asks.dir().join("asks-v1.json");
-    let mut external: crate::asks::store::AskState =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    external.next_seq = 9182;
-    external.revision += 1;
-    // No AskStore write path or process-local cache invalidation participates.
-    let replacement = asks.dir().join("external-asks.json");
-    let replacement_bytes = serde_json::to_vec_pretty(&external).unwrap();
-    assert_eq!(
-        replacement_bytes.len(),
-        std::fs::metadata(&path).unwrap().len() as usize
-    );
-    std::fs::write(&replacement, replacement_bytes).unwrap();
-    std::fs::rename(&replacement, &path).unwrap();
+    // An independent handle/process advances the shared SQLite generation;
+    // no process-local cache invalidation participates.
+    let external = AskStore::at(asks.dir());
+    external.with_state(|state| state.next_seq = 9182).unwrap();
+    let revision = external.snapshot().unwrap().revision;
     assert_eq!(
         asks.inspect(|state| (state.next_seq, state.revision))
             .unwrap(),
-        (9182, external.revision)
+        (9182, revision)
     );
     assert_eq!(asks.inspect(|state| state.next_seq).unwrap(), 9182);
     std::fs::remove_dir_all(root).unwrap();

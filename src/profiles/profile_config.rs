@@ -33,6 +33,9 @@ pub const PROFILE_CONFIG_SCALAR_KEYS: &[&str] = &[
     "web_search",
     // Native `ToolSchemaCompat` (r53+): "off" | "strict".
     "tool_schema_compat",
+    // Generated-image history trimming (imageHistoryTrim; unset = off).
+    "generated_image_history_max_inline",
+    "generated_image_history_keep",
 ];
 pub const PROFILE_CONFIG_TABLE_KEYS: &[&str] = &["shell_environment_policy"];
 pub const DEFAULT_CUTEX_STATUS_LINE: [&str; 7] = [
@@ -641,7 +644,9 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: "acct-test".to_string(),
             name: "test".to_string(),
             email: None,
@@ -659,6 +664,7 @@ mod tests {
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         }
     }
 

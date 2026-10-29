@@ -127,13 +127,33 @@ impl AgentTurnQuestions {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ClaudeEffort { Low, Medium, High, Xhigh, Max }
+pub enum ClaudeEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
 impl ClaudeEffort {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Low => "low", Self::Medium => "medium", Self::High => "high", Self::Xhigh => "xhigh", Self::Max => "max" }
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
     }
     pub fn parse(value: &str) -> anyhow::Result<Option<Self>> {
-        Ok(match value { "" | "default" => None, "low" => Some(Self::Low), "medium" => Some(Self::Medium), "high" => Some(Self::High), "xhigh" => Some(Self::Xhigh), "max" => Some(Self::Max), _ => anyhow::bail!("Claude effort must be default/low/medium/high/xhigh/max") })
+        Ok(match value {
+            "" | "default" => None,
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => anyhow::bail!("Claude effort must be default/low/medium/high/xhigh/max"),
+        })
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +215,8 @@ pub struct ProfileOptions {
     pub provider: Option<Provider>,
     pub style: Option<TextStyle>,
     pub claude: ClaudeDefaults,
+    #[serde(skip_serializing_if = "super::dsh::DshOptions::is_default")]
+    pub dsh: super::dsh::DshOptions,
     /// Explicit opt-in/out for mid-conversation profile switching; absent
     /// derives from the profile's auth kind (see `allow_session_switch`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,14 +247,97 @@ pub struct ProfileOptions {
     /// An older cutex keeps it in `extra`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_themes: Option<Vec<String>>,
+    /// Explicit full agent-avatar style, independent of the legacy emoji list.
+    /// Absent = this desktop app's default; older binaries preserve it in extra.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_style: Option<super::avatar::AvatarStyle>,
     /// Custom intro greeting (capability `profile-avatar`); absent = the
     /// client's provider greetings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intro_greeting: Option<String>,
+    /// Owner's manual account-link choice. Never included verbatim in public profile views.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_link: Option<String>,
+    /// Per-field durable appearance clocks. Missing legacy clocks stay unknown until a change.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub appearance_updated_at: BTreeMap<String, String>,
     /// Fields a newer cutex wrote (kept on save; persistence is not
     /// `deny_unknown_fields`, RFC backend-auto-update §6.2).
     #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+pub(crate) fn appearance_values(
+    options: &ProfileOptions,
+) -> BTreeMap<&'static str, serde_json::Value> {
+    BTreeMap::from([
+        (
+            "color",
+            serde_json::json!(options
+                .style
+                .as_ref()
+                .and_then(|s| s.fg.as_ref())
+                .map(|s| s.to_ascii_uppercase())),
+        ),
+        ("avatarThemes", serde_json::json!(options.avatar_themes)),
+        ("avatarStyle", serde_json::json!(options.avatar_style)),
+        ("introGreeting", serde_json::json!(options.intro_greeting)),
+    ])
+}
+
+const APPEARANCE_CLOCK_SKEW_SECONDS: i64 = 5;
+
+fn valid_revision_clock(
+    value: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .filter(|t| *t <= now + chrono::Duration::seconds(APPEARANCE_CLOCK_SKEW_SECONDS))
+}
+
+/// Report invalid or implausibly future stored clocks as unknown, without rewriting legacy data.
+pub fn reported_revision_timestamp(value: &str) -> Option<String> {
+    valid_revision_clock(value, chrono::Utc::now()).map(crate::management::instance::format_utc)
+}
+
+/// Preserve millisecond ordering for nearby writes, but never anchor new edits to a skewed future.
+pub(crate) fn next_revision_timestamp(previous: Option<&str>) -> String {
+    next_revision_timestamp_at(previous, chrono::Utc::now())
+}
+
+fn next_revision_timestamp_at(
+    previous: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let previous = previous
+        .and_then(|s| valid_revision_clock(s, now))
+        .and_then(|t| t.checked_add_signed(chrono::Duration::milliseconds(1)))
+        .filter(|t| *t <= now + chrono::Duration::seconds(APPEARANCE_CLOCK_SKEW_SECONDS));
+    crate::management::instance::format_utc(previous.filter(|t| *t > now).unwrap_or(now))
+}
+
+/// Call at persistence time with the actual stored `before`, including when applying a TUI draft.
+/// Unchanged values restore the stored clock, so unrelated edits/draft reversions do not advance it.
+pub fn record_appearance_changes(options: &mut ProfileOptions, before: &ProfileOptions) {
+    let old = appearance_values(before);
+    for (field, value) in appearance_values(options) {
+        if old.get(field) != Some(&value) {
+            let timestamp = next_revision_timestamp(
+                before.appearance_updated_at.get(field).map(String::as_str),
+            );
+            options
+                .appearance_updated_at
+                .insert(field.into(), timestamp);
+        } else if let Some(timestamp) = before.appearance_updated_at.get(field) {
+            options
+                .appearance_updated_at
+                .insert(field.into(), timestamp.clone());
+        } else {
+            options.appearance_updated_at.remove(field);
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -249,7 +354,21 @@ impl Default for Appearance {
     fn default() -> Self {
         Self {
             providers: BTreeMap::new(),
-            model_display_names: [("gpt-6-astra".into(), "astra 6".into()), ("gpt-6-sol".into(), "sol 6".into()), ("gpt-5.6-sol".into(), "sol 5.6".into()), ("gpt-5.6-terra".into(), "terra 5.6".into()), ("gpt-6-luna".into(), "lune 6".into()), ("gpt-5.6-luna".into(), "lune 5.6".into()), ("sonnet".into(), "Sonnet".into()), ("opus".into(), "Opus".into()), ("haiku".into(), "Haiku".into()), ("opus[1m]".into(), "Opus[1m]".into()), ("claude-fable-5-1[1m]".into(), "fable5.1[1m]".into()), ("claude-fable-5-1".into(), "fable5.1".into())].into(),
+            model_display_names: [
+                ("gpt-6-astra".into(), "astra 6".into()),
+                ("gpt-6-sol".into(), "sol 6".into()),
+                ("gpt-5.6-sol".into(), "sol 5.6".into()),
+                ("gpt-5.6-terra".into(), "terra 5.6".into()),
+                ("gpt-6-luna".into(), "lune 6".into()),
+                ("gpt-5.6-luna".into(), "lune 5.6".into()),
+                ("sonnet".into(), "Sonnet".into()),
+                ("opus".into(), "Opus".into()),
+                ("haiku".into(), "Haiku".into()),
+                ("opus[1m]".into(), "Opus[1m]".into()),
+                ("claude-fable-5-1[1m]".into(), "fable5.1[1m]".into()),
+                ("claude-fable-5-1".into(), "fable5.1".into()),
+            ]
+            .into(),
             host_suffix: TextStyle {
                 bold: false,
                 ..TextStyle::color("#74BAC3")
@@ -277,6 +396,9 @@ impl Appearance {
 }
 /// Backend facts outrank display guesses; custom API classifications are explicit.
 pub fn provider(account: &StoredAccount) -> Provider {
+    if account.cli_kind == CliKind::Dsh {
+        return Provider::Deepseek;
+    }
     if account.cli_kind == CliKind::Claude {
         return Provider::Claude;
     }
@@ -346,8 +468,19 @@ impl IdentityField {
                 .chain(Provider::ALL.into_iter().map(|p| (p.label(), p.key())))
                 .collect(),
             Self::Color | Self::ClaudeModel => vec![],
-            Self::ClaudeEffort => vec![("Default", "default"),("Low","low"),("Medium","medium"),("High","high"),("XHigh","xhigh"),("Max","max")],
-            Self::ClaudeWrite | Self::ClaudeExec => vec![("Default (on)", "default"), ("Off", "false"), ("On", "true")],
+            Self::ClaudeEffort => vec![
+                ("Default", "default"),
+                ("Low", "low"),
+                ("Medium", "medium"),
+                ("High", "high"),
+                ("XHigh", "xhigh"),
+                ("Max", "max"),
+            ],
+            Self::ClaudeWrite | Self::ClaudeExec => vec![
+                ("Default (on)", "default"),
+                ("Off", "false"),
+                ("On", "true"),
+            ],
             _ => vec![("Off", "false"), ("On", "true")],
         }
     }
@@ -363,9 +496,20 @@ impl IdentityField {
                 .and_then(|s| s.fg.clone())
                 .unwrap_or("inherit".into()),
             Self::ClaudeModel => o.claude.model.clone(),
-            Self::ClaudeEffort => o.claude.effort.map(|v|v.as_str()).unwrap_or("default").into(),
-            Self::ClaudeWrite => o.claude.allow_write.map_or("default".into(), |v| v.to_string()),
-            Self::ClaudeExec => o.claude.allow_exec.map_or("default".into(), |v| v.to_string()),
+            Self::ClaudeEffort => o
+                .claude
+                .effort
+                .map(|v| v.as_str())
+                .unwrap_or("default")
+                .into(),
+            Self::ClaudeWrite => o
+                .claude
+                .allow_write
+                .map_or("default".into(), |v| v.to_string()),
+            Self::ClaudeExec => o
+                .claude
+                .allow_exec
+                .map_or("default".into(), |v| v.to_string()),
             _ => o
                 .style
                 .as_ref()
@@ -388,6 +532,7 @@ impl IdentityField {
         value: &str,
         base: &TextStyle,
     ) -> anyhow::Result<()> {
+        let before = o.clone();
         match self {
             Self::Provider => {
                 o.provider = if value == "inherit" || value.is_empty() {
@@ -409,11 +554,12 @@ impl IdentityField {
             _ => {
                 if value == "inherit" || value.is_empty() {
                     o.style = None;
+                    record_appearance_changes(o, &before);
                     return Ok(());
                 }
                 let s = o.style.get_or_insert_with(|| base.clone());
                 match self {
-                    Self::Color => s.fg = Some(value.into()),
+                    Self::Color => s.fg = Some(value.to_ascii_uppercase()),
                     Self::Bold => s.bold = value.parse()?,
                     Self::Dim => s.dim = value.parse()?,
                     Self::Italic => s.italic = value.parse()?,
@@ -423,6 +569,7 @@ impl IdentityField {
                 s.validate()?;
             }
         }
+        record_appearance_changes(o, &before);
         Ok(())
     }
 }
@@ -458,6 +605,94 @@ pub fn selected_profile_style(name: &str) -> anyhow::Result<Option<TextStyle>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appearance_clocks_are_per_field_and_survive_round_trip_and_draft_reversion() {
+        let original = ProfileOptions::default();
+        let mut next = original.clone();
+        IdentityField::Color
+            .apply(&mut next, "#abcdef", &TextStyle::default())
+            .unwrap();
+        assert_eq!(next.style.as_ref().unwrap().fg.as_deref(), Some("#ABCDEF"));
+        assert_eq!(next.appearance_updated_at.len(), 1);
+        let recorded = next.appearance_updated_at.clone();
+        let before = next.clone();
+        IdentityField::Color
+            .apply(&mut next, "#ABCDEF", &TextStyle::default())
+            .unwrap();
+        IdentityField::Bold
+            .apply(&mut next, "false", &TextStyle::default())
+            .unwrap();
+        assert_eq!(next.appearance_updated_at, recorded);
+        let encoded = serde_json::to_vec(&next).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ProfileOptions>(&encoded).unwrap(),
+            next
+        );
+        // A UI draft can contain clocks from edits that were subsequently undone.
+        next.style = original.style.clone();
+        record_appearance_changes(&mut next, &original);
+        assert!(next.appearance_updated_at.is_empty());
+        let mut changed = before.clone();
+        changed.intro_greeting = Some("hi".into());
+        record_appearance_changes(&mut changed, &before);
+        assert_eq!(
+            changed.appearance_updated_at.get("color"),
+            recorded.get("color")
+        );
+        assert!(changed.appearance_updated_at.contains_key("introGreeting"));
+    }
+
+    #[test]
+    fn appearance_clock_drops_implausible_future_values_and_bounds_nearby_ordering() {
+        let now = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00.000Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            next_revision_timestamp_at(Some("2099-01-01T00:00:00.000Z"), now),
+            "2030-01-01T00:00:00.000Z"
+        );
+        assert_eq!(
+            next_revision_timestamp_at(Some("2030-01-01T00:00:00.000Z"), now),
+            "2030-01-01T00:00:00.001Z"
+        );
+        assert_eq!(
+            next_revision_timestamp_at(Some("2030-01-01T00:00:04.000Z"), now),
+            "2030-01-01T00:00:04.001Z"
+        );
+        assert_eq!(
+            next_revision_timestamp_at(Some("2030-01-01T00:00:05.000Z"), now),
+            "2030-01-01T00:00:00.000Z"
+        );
+        let mut before = ProfileOptions::default();
+        before
+            .appearance_updated_at
+            .insert("introGreeting".into(), "2099-01-01T00:00:00.000Z".into());
+        let mut next = before.clone();
+        next.intro_greeting = Some("changed".into());
+        record_appearance_changes(&mut next, &before);
+        assert!(
+            reported_revision_timestamp(&next.appearance_updated_at["introGreeting"]).is_some()
+        );
+        assert_ne!(
+            next.appearance_updated_at["introGreeting"],
+            "2099-01-01T00:00:00.001Z"
+        );
+    }
+
+    #[test]
+    fn reported_revision_clock_is_unknown_for_invalid_or_future_values_without_mutation() {
+        assert_eq!(reported_revision_timestamp(""), None);
+        assert_eq!(reported_revision_timestamp("not-a-date"), None);
+        assert_eq!(
+            reported_revision_timestamp("9999-01-01T00:00:00.000Z"),
+            None
+        );
+        assert_eq!(
+            reported_revision_timestamp("2020-01-01T08:00:00+08:00").as_deref(),
+            Some("2020-01-01T00:00:00.000Z")
+        );
+    }
     #[test]
     fn profile_override_and_reset_preserve_provider_and_claude_defaults() {
         let mut options = ProfileOptions {

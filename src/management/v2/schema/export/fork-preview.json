@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:fork-preview",
+  "title": "Read-only fork preview",
+  "description": "Owner-only compatibility preview. No fork, model turn, history mutation or credential-content read. Sizes are stat-based upper bounds, not token/billing estimates; selected turn membership is validated only during the actual fork.",
+  "type": "object",
+  "required": ["contractVersion", "cutexSessionId", "afterTurnId", "profile", "sourceProfile", "sourceCliKind", "sourceProviderFamily", "targets", "eligible", "reason", "historyBytes", "historyBytesEstimate", "historyBytesMeaning", "coldCache", "boundaryNote"],
+  "properties": {
+    "contractVersion": {"const": 2},
+    "cutexSessionId": {"type": "string"},
+    "afterTurnId": {"type": ["string", "null"]},
+    "profile": {"type": ["string", "null"]},
+    "sourceProfile": {"type": ["string", "null"]},
+    "sourceCliKind": {"enum": ["codex", "claude"]},
+    "sourceProviderFamily": {"type": ["string", "null"]},
+    "targets": {"type": "array", "items": {"$ref": "#/$defs/target"}},
+    "eligible": {"type": "boolean"},
+    "reason": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/reason"}]},
+    "historyBytes": {"type": ["integer", "null"], "minimum": 0},
+    "historyBytesEstimate": {"enum": ["upperBound", "unavailable"]},
+    "historyBytesMeaning": {"type": "string"},
+    "coldCache": {"type": ["boolean", "null"]},
+    "boundaryNote": {"type": "string"}
+  },
+  "$defs": {
+    "reason": {"type": "object", "required": ["code", "message"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}}},
+    "target": {
+      "type": "object", "required": ["id", "name", "cliKind", "providerFamily", "eligible", "reason"],
+      "properties": {
+        "id": {"type": "string"}, "name": {"type": "string"}, "cliKind": {"type": "string"}, "providerFamily": {"type": "string"},
+        "eligible": {"type": "boolean"}, "reason": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/reason"}]}
+      }
+    }
+  }
+}

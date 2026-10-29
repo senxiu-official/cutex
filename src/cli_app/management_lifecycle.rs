@@ -1,6 +1,6 @@
 use std::process::Child;
 use std::process::ExitStatus;
-use std::sync::Mutex;
+use cutex::management::v2::session_coordination::OperationLane;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -72,7 +72,7 @@ use cutex::session::service::{
 use cutex::session::store::load_cutex_session_store;
 use cutex::session::store::CutexSessionStoreRevisionConflict;
 
-static SESSION_ONLINE_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static SESSION_ONLINE_START_LOCK: OnceLock<OperationLane> = OnceLock::new();
 const RUNTIME_STOP_CAS_ATTEMPTS: usize = 3;
 
 pub(crate) fn ensure_managed_tui_peer_with_profile(
@@ -87,7 +87,7 @@ pub(crate) fn ensure_managed_tui_peer_with_profile(
         .get(&key)
         .cloned()
         .ok_or_else(|| anyhow!("cutex session disappeared while restoring TUI peer: {key}"))?;
-    if record.is_retired() {
+    if cutex::agent_management::agent_execution_blocked(&record) {
         anyhow::bail!("cutex session is retired: {key}");
     }
     if record.runtime_backend != CutexSessionRuntimeBackend::CuteAlden {
@@ -200,7 +200,7 @@ fn persist_managed_tui_peer(
         .sessions
         .get_mut(key)
         .ok_or_else(|| anyhow!("cutex session disappeared while recording TUI peer: {key}"))?;
-    if record.is_retired() {
+    if cutex::agent_management::agent_execution_blocked(&record) {
         anyhow::bail!("cutex session is retired: {key}");
     }
     let current_binding = record
@@ -261,13 +261,22 @@ fn start_cutex_session_online_with_profile_inner(
     launch_profile: Option<&ResolvedLaunchProfile>,
     validate_occurrence: Option<&RuntimeOccurrenceValidator<'_>>,
 ) -> anyhow::Result<SessionOnlineStartOutcome> {
+    // Resolve the durable identity before any lifecycle/store barrier, then
+    // revalidate it after admission. A direct TUI start must not cross an
+    // owner/asks send already authorized for that session.
+    let before = load_cutex_session_store()?;
+    let reserved_key = cutex_session_key_for_user_id(&before, &entry.session_id)
+        .ok_or_else(|| anyhow!("cutex session is not known: {}", entry.session_id))?;
+    let lane = cutex::management::v2::user_input::session_input_lock(&reserved_key)?;
+    let _operation = lane.reserve()?;
     let _start_guard = SESSION_ONLINE_START_LOCK
-        .get_or_init(|| Mutex::new(()))
+        .get_or_init(OperationLane::new)
         .lock()
         .map_err(|_| anyhow!("session online start lock was poisoned"))?;
     let mut store = load_cutex_session_store()?;
     let key = cutex_session_key_for_user_id(&store, &entry.session_id)
         .ok_or_else(|| anyhow!("cutex session is not known: {}", entry.session_id))?;
+    anyhow::ensure!(key == reserved_key, "session identity changed during runtime start admission");
     let record = store
         .sessions
         .get(&key)
@@ -275,7 +284,7 @@ fn start_cutex_session_online_with_profile_inner(
         .ok_or_else(|| anyhow!("cutex session disappeared while starting: {key}"))?;
     cutex::agent_management::require_migrated_runtime(&record)?;
     if validate_occurrence.is_none() { ensure_agent_bus_for_launch_record()?; }
-    if record.is_retired() {
+    if cutex::agent_management::agent_execution_blocked(&record) {
         anyhow::bail!("cutex session is retired: {key}");
     }
     if let Some(validate) = validate_occurrence {
@@ -299,6 +308,8 @@ fn start_cutex_session_online_with_profile_inner(
         .map(|profile| &profile.account)
         .or(default_account.as_ref())
         .expect("launch profile or durable session profile");
+    let launch_family = super::management_context::check_codex_profile_family(&record, Some(&account.name))
+        .map_err(|error| anyhow!("{}: {}", error.code, error.message))?;
     let launch_profile_source = if launch_profile.is_some() {
         LaunchProfileSource::OneLaunchOverride
     } else if record
@@ -429,6 +440,14 @@ fn start_cutex_session_online_with_profile_inner(
     let mut alden_pid = None;
 
     let start_result = (|| -> anyhow::Result<AgentBusAgent> {
+        // Bus registration is a callback of this lane-owning start. Publish
+        // the exact pending occurrence before connecting/registering so Bus
+        // can admit only that occurrence without waiting for our reservation.
+        let mut pending = load_cutex_session_store()?;
+        commit_pending_online_occurrence_using(
+            &mut pending, &key, &record, &binding, &runtime_agent_id,
+            &app_server_launch_claim_id, persist_cutex_session_store_and_im_record,
+        )?;
         wait_for_app_server_endpoint(&layout, &mut app_server_child, &log_path)?;
         app_server_runtime::connect_runtime_with_model_provider(
             config,
@@ -521,6 +540,9 @@ fn start_cutex_session_online_with_profile_inner(
         let stored_record = store.sessions.get_mut(&key).ok_or_else(|| {
             anyhow!("cutex session disappeared while recording app-server: {key}")
         })?;
+        if stored_record.provider_family.is_none() {
+            stored_record.provider_family = launch_family;
+        }
         stored_record.app_server_runtime = Some(binding.clone());
         stored_record.pending_launch_id = None;
         stored_record.app_server_launch_claim_id = None;
@@ -581,6 +603,32 @@ fn start_cutex_session_online_with_profile_inner(
         runtime_launched: true,
         tui_launched: record.runtime_backend == CutexSessionRuntimeBackend::CuteAlden,
     })
+}
+
+fn commit_pending_online_occurrence_using(
+    store: &mut cutex::session::model::CutexSessionStore,
+    key: &str,
+    before: &CutexSessionRecord,
+    binding: &cutex::session::model::CutexAppServerRuntimeBinding,
+    runtime_agent_id: &str,
+    claim_id: &str,
+    mut persist: impl FnMut(&cutex::session::model::CutexSessionStore, &str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let current = store.sessions.get(key).ok_or_else(|| anyhow!("session disappeared before pending occurrence"))?;
+    anyhow::ensure!(runtime_claim_belongs_to_started_attempt(current, before, binding, runtime_agent_id, None, claim_id),
+        "runtime ownership changed before pending occurrence publication");
+    let generation = before.runtime_generation.checked_add(1)
+        .filter(|generation| *generation <= cutex::management::v2::model::MAX_SAFE_SEQUENCE)
+        .context("runtime generation exhausted")?;
+    let pending = store.sessions.get_mut(key).expect("checked session");
+    pending.runtime_generation = generation;
+    pending.current_runtime_agent_id = Some(runtime_agent_id.to_string());
+    pending.runtime_pid = Some(binding.pid);
+    pending.app_server_runtime = Some(binding.clone());
+    // Keep the launch nonce until finalization/confirmed child cleanup.
+    // These fields describe a claimed occurrence, not successful readiness.
+    pending.updated_at = Utc::now().to_rfc3339();
+    persist(store, key)
 }
 
 fn commit_fenced_online_claim_using(
@@ -1254,36 +1302,60 @@ pub(crate) fn stop_cutex_session_runtime_for_entry_fenced(
     force: bool,
     fence: Option<u64>,
 ) -> anyhow::Result<SessionRuntimeStopResult> {
-    let mut store = load_cutex_session_store()?;
-    let Some(key) = cutex_session_key_for_user_id(&store, &entry.session_id) else {
-        if let Some(agent) = live_agents.first() {
-            anyhow::bail!(
-                "runtime_stop_unsupported: cutex session record missing for live agent {}",
-                agent.id
-            );
+    let store = load_cutex_session_store()?;
+    let record = cutex_session_key_for_user_id(&store, &entry.session_id)
+        .and_then(|key| store.sessions.get(&key));
+    if let Some(record) = record {
+        if let Some(generation) = fence {
+            anyhow::ensure!(record.runtime_generation == generation, "runtime changed before stop; owner unchanged");
         }
-        return Ok(SessionRuntimeStopResult {
-            had_runtime: false,
-            stopped: true,
-            forced: false,
-            pid: None,
-            pids: Vec::new(),
-            alden_session_name: None,
-            runtime_agent_id: None,
-            detail: "cutex_session_not_found".to_string(),
+        ensure_cutex_session_runtime_host_is_local(record)?;
+        return requested_stop_for_record(record, |generation| {
+            stop_cutex_session_runtime_for_entry_inner(entry, live_agents, force,
+                &record.cutex_session_id, Some(generation))
         });
-    };
+    }
+    // Do not allow a record created after this lookup to become an unfenced target.
+    anyhow::ensure!(live_agents.is_empty(), "runtime_stop_unsupported: cutex session record missing");
+    Ok(SessionRuntimeStopResult { had_runtime: false, stopped: true, forced: false,
+        pid: None, pids: Vec::new(), alden_session_name: None, runtime_agent_id: None,
+        detail: "cutex_session_not_found".into() })
+}
+
+fn requested_stop_for_record(
+    record: &CutexSessionRecord,
+    operation: impl FnOnce(u64) -> anyhow::Result<SessionRuntimeStopResult>,
+) -> anyhow::Result<SessionRuntimeStopResult> {
+    cutex::session::runtime_stop::RequestedStop::run(
+        &record.cutex_session_id, record.runtime_generation,
+        || operation(record.runtime_generation), |result| result.stopped)
+}
+
+fn ensure_stop_generation(record: &CutexSessionRecord, fence: Option<u64>) -> anyhow::Result<()> {
+    if let Some(generation) = fence {
+        anyhow::ensure!(record.runtime_generation == generation,
+            "runtime changed before stop; owner unchanged");
+    }
+    Ok(())
+}
+
+fn stop_cutex_session_runtime_for_entry_inner(
+    entry: &CodingSessionRegistration,
+    live_agents: &[AgentBusAgent],
+    force: bool,
+    expected_id: &str,
+    fence: Option<u64>,
+) -> anyhow::Result<SessionRuntimeStopResult> {
+    let mut store = load_cutex_session_store()?;
+    let key = cutex_session_key_for_user_id(&store, &entry.session_id)
+        .context("runtime stop record disappeared before stop; outcome unproven")?;
+    anyhow::ensure!(key == expected_id, "runtime stop target changed; owner unchanged");
     let record = store
         .sessions
         .get(&key)
         .cloned()
         .ok_or_else(|| anyhow!("cutex session disappeared while stopping: {key}"))?;
-    if let Some(generation) = fence {
-        anyhow::ensure!(
-            record.runtime_generation == generation,
-            "runtime changed before stop; owner unchanged"
-        );
-    }
+    ensure_stop_generation(&record, fence)?;
     ensure_cutex_session_runtime_host_is_local(&record)?;
     if record.explicit_launch.is_some() {
         let outcome = super::native_stop::stop_and_commit(&record, force)?;
@@ -1485,7 +1557,7 @@ fn reconcile_runtime_stop_revision_conflict(
     expected: &CutexSessionRecord,
     current: &CutexSessionRecord,
 ) -> RuntimeStopRevisionReconciliation {
-    if current.is_retired() {
+    if cutex::agent_management::agent_execution_blocked(&current) {
         return RuntimeStopRevisionReconciliation::Fence("durable session was retired");
     }
     if !same_runtime_stop_identity(expected, current) {
@@ -1814,6 +1886,55 @@ mod profile_tests {
     }
 
     #[test]
+    fn pending_occurrence_is_durable_before_registration_and_keeps_recovery_nonce() {
+        let before = record(None);
+        let key = before.cutex_session_id.clone();
+        let mut pending = before.clone();
+        pending.app_server_launch_claim_id = Some("launch-nonce".into());
+        let mut store = cutex::session::model::CutexSessionStore::default();
+        store.sessions.insert(key.clone(), pending);
+        let binding = runtime_binding(Some("profile-a"));
+        let commits = std::cell::Cell::new(0);
+        commit_pending_online_occurrence_using(&mut store, &key, &before, &binding, "unique-runtime", "launch-nonce", |snapshot, committed_key| {
+            commits.set(commits.get() + 1);
+            assert_eq!(committed_key, key);
+            let pending = &snapshot.sessions[&key];
+            assert_eq!(pending.runtime_generation, before.runtime_generation + 1);
+            assert_eq!(pending.current_runtime_agent_id.as_deref(), Some("unique-runtime"));
+            assert_eq!(pending.runtime_pid, Some(binding.pid));
+            assert_eq!(pending.app_server_runtime.as_ref(), Some(&binding));
+            assert_eq!(pending.app_server_launch_claim_id.as_deref(), Some("launch-nonce"));
+            Ok(())
+        }).unwrap();
+        assert_eq!(commits.get(), 1);
+        assert!(runtime_claim_belongs_to_failed_start(&store.sessions[&key], &before, &binding, "unique-runtime", None, "launch-nonce"),
+            "confirmed cleanup must recognize its pre-registration occurrence");
+    }
+
+    #[test]
+    fn pending_occurrence_never_overwrites_a_replacement_or_another_launch_nonce() {
+        let before = record(None);
+        let key = before.cutex_session_id.clone();
+        let binding = runtime_binding(Some("profile-a"));
+        for case in ["generation", "nonce", "pid"] {
+            let mut current = before.clone();
+            current.app_server_launch_claim_id = Some("launch-nonce".into());
+            match case {
+                "generation" => current.runtime_generation += 2,
+                "nonce" => current.app_server_launch_claim_id = Some("other-launch".into()),
+                "pid" => current.runtime_pid = Some(binding.pid + 1),
+                _ => unreachable!(),
+            }
+            let mut store = cutex::session::model::CutexSessionStore::default();
+            store.sessions.insert(key.clone(), current.clone());
+            let error = commit_pending_online_occurrence_using(&mut store, &key, &before, &binding, "unique-runtime", "launch-nonce",
+                |_, _| panic!("replacement must be rejected before persistence")).unwrap_err();
+            assert!(error.to_string().contains("ownership changed"), "{case}");
+            assert_eq!(store.sessions[&key], current, "{case}: unchanged");
+        }
+    }
+
+    #[test]
     fn production_fenced_claim_rejects_newer_occurrence_after_initial_check_without_effect() {
         let key = "session";
         let expected = record(None);
@@ -1892,7 +2013,9 @@ mod profile_tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: "account-live-remote-tui".to_string(),
             name: "live-remote-tui".to_string(),
             email: None,
@@ -1910,6 +2033,7 @@ mod profile_tests {
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         }
     }
 
@@ -2247,6 +2371,26 @@ mod profile_tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn runtime_stop_without_external_fence_binds_inner_read_to_outer_generation() {
+        let mut outer = record(None);
+        outer.cutex_session_id = format!("cutex.stop-fence-{}", uuid::Uuid::new_v4());
+        outer.runtime_generation = 7;
+        let mut inner = outer.clone();
+        inner.runtime_generation = 8;
+        let mut reached_stop = false;
+        let result = requested_stop_for_record(&outer, |generation| {
+            ensure_stop_generation(&inner, Some(generation))?;
+            reached_stop = true;
+            unreachable!("new occurrence must not be stopped")
+        });
+        assert!(result.unwrap_err().to_string().contains("runtime changed before stop"));
+        assert!(!reached_stop);
+        assert_eq!(cutex::session::runtime_stop::state(&outer.cutex_session_id, 8), None);
+        assert_eq!(cutex::session::runtime_stop::state(&outer.cutex_session_id, 7),
+            Some(cutex::session::runtime_stop::StopState::Failed));
     }
 
     #[test]

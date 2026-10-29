@@ -9,20 +9,10 @@
 //! is derived from the create's action id: an exact create retry finds the
 //! same delegation (and creates it if the first call could not).
 
-use std::time::{Duration, Instant};
-
 use serde_json::{json, Value};
 
-use super::model::ExecutionState;
 use super::store::AskStore;
 use super::tools::{TellSend, ToolContext};
-
-/// How long a create result waits for the delegation to leave the queue
-/// (admitted into a turn, held, or final), like the start message's wait.
-const DELEGATION_WAIT: Duration = Duration::from_secs(8);
-/// The MCP adapter's 30 s budget for the whole create call, with slack.
-const CALL_BUDGET: Duration = Duration::from_secs(25);
-const POLL: Duration = Duration::from_millis(250);
 
 /// The delegation action id of the create / replace action `create_action_id`.
 /// Stable per action (fits `agent_delegate`'s action id alphabet).
@@ -55,20 +45,17 @@ pub fn attach(
     task: &str,
     create_action_id: &str,
     facade: u32,
-    call_started: Instant,
 ) {
-    let wait = DELEGATION_WAIT.min(CALL_BUDGET.saturating_sub(call_started.elapsed()));
     let store = match AskStore::open_default() {
         Ok(store) => store,
         Err(error) => {
-            if let Some(agent) = created_agent(response) {
-                set(response, not_delegated(&agent, "persistence_unavailable", &format!("{error:#}")));
+            if created_agent(response).is_some() {
+                set(response, uncertain_delegation(delegation_action_id(create_action_id), json!({"ok":false,"code":"persistence_unavailable","detail":format!("{error:#}")})));
             }
             return;
         }
     };
     let world = super::scheduler::HostWorld::load();
-    let sleep = || std::thread::sleep(POLL);
     attach_with(
         response,
         &store,
@@ -78,8 +65,6 @@ pub fn attach(
         create_action_id,
         crate::agent_bus::tool_policy::delegation_wait_enabled(caller),
         facade,
-        wait,
-        &sleep,
     );
 }
 
@@ -94,8 +79,6 @@ pub fn attach_with(
     create_action_id: &str,
     wait_tool: bool,
     facade: u32,
-    wait: Duration,
-    sleep: &dyn Fn(),
 ) {
     let Some(agent) = created_agent(response) else {
         return;
@@ -105,6 +88,7 @@ pub fn attach_with(
     };
     let wake_chain = |_: &str, _: &str, _: &str| None;
     let clock = chrono::Utc::now;
+    let sleep = || {};
     let ctx = ToolContext {
         store,
         world,
@@ -113,52 +97,50 @@ pub fn attach_with(
         send: &send,
         wake_chain: &wake_chain,
         clock: &clock,
-        sleep,
+        sleep: &sleep,
         wait: wait_tool,
         facade,
     };
     let action_id = delegation_action_id(create_action_id);
-    // The agent_delegate tool itself (same checks, record and reply).
+    // The agent_delegate tool itself: this includes routing approval + one-use
+    // reviewer grant registration and independent owner gate. Ordinary local
+    // creation captures provisional authority without waiting for lifecycle;
+    // final scheduler admission fences/revalidates and alone spends the grant.
+    // Do not call AskState.create_ask directly as a create+task fast path.
     let body = json!({
         "tool": super::tools::AGENT_DELEGATE,
         "arguments": {"target": agent, "text": task},
         "action_id": action_id,
     });
-    let mut delegation = super::tools::handle(&ctx, body.to_string().as_bytes());
+    let delegation = super::tools::handle(&ctx, body.to_string().as_bytes());
+    if is_uncertain(&delegation) {
+        set(response, uncertain_delegation(action_id, delegation));
+        return;
+    }
     if delegation["ok"] != true {
         let code = delegation["code"].as_str().unwrap_or("delegation_failed").to_string();
         let detail = delegation["detail"].as_str().unwrap_or_default().to_string();
         set(response, not_delegated(&agent, &code, &detail));
         return;
     }
-    refresh(&mut delegation, store, caller, &action_id, wait, sleep);
     set(response, delegation);
 }
 
-/// Wait up to `wait` for the delegation to leave the queue, then refresh
-/// its state fields in the reply.
-fn refresh(delegation: &mut Value, store: &AskStore, caller: &str, action_id: &str, wait: Duration, sleep: &dyn Fn()) {
-    let deadline = Instant::now() + wait;
-    loop {
-        let Ok(state) = store.snapshot() else { return };
-        let Some(ask) = state
-            .asks
-            .values()
-            .find(|ask| ask.action_id == action_id && ask.requester.session() == Some(caller))
-        else {
-            return;
-        };
-        let waiting = matches!(ask.execution, ExecutionState::Queued) && ask.hold.is_none();
-        if !waiting || Instant::now() >= deadline {
-            let view = super::view::requester_view(&state, ask);
-            for field in ["state", "hold", "hold_since", "queue_position", "attempt", "activity"] {
-                if let (Some(object), Some(value)) = (delegation.as_object_mut(), view.get(field)) {
-                    object.insert(field.to_string(), value.clone());
-                }
-            }
-            return;
-        }
-        sleep();
+/// Shared with receipt reconstruction: an uncertain child must never become a
+/// definite "not delivered" parent failure, even for legacy cached replies.
+pub(crate) fn is_uncertain(value: &Value) -> bool {
+    value["outcomeUnknown"]==true || matches!(value["status"].as_str(),Some("response_uncertain"|"unknown"))
+        || matches!(value["code"].as_str(),Some("outcome_unknown"|"response_uncertain"|"persistence_unavailable"))
+}
+fn uncertain_delegation(action_id: String, mut value: Value) -> Value {
+    value["ok"]=json!(false);value["status"]=json!("response_uncertain");value["outcomeUnknown"]=json!(true);
+    value["action_id"]=json!(action_id);
+    value["note"]=json!("The agent was created; its task attachment outcome is unknown. Query the original action ID. Any explicit retry must keep the original action ID; do not send a new delegation.");
+    value
+}
+pub(crate) fn normalize_uncertain_attachment(response: &mut Value, create_action_id: &str) {
+    if let Some(child)=response.pointer_mut("/outcome/receipt/result/delegation") {
+        if is_uncertain(child) {*child=uncertain_delegation(delegation_action_id(create_action_id),child.clone());}
     }
 }
 
@@ -181,7 +163,7 @@ fn not_delegated(agent: &str, code: &str, detail: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asks::model::Requester;
+    use crate::asks::model::{ExecutionState, Requester};
     use crate::asks::scheduler::tests::{world, FakeRuntime};
     use crate::asks::store::tests::{temp_store, REQUESTER, TARGET};
 
@@ -194,7 +176,19 @@ mod tests {
 
     fn run(world: &crate::asks::scheduler::tests::FakeWorld, store: &AskStore, response: &mut Value, action: &str) {
         attach_with(response, store, world, REQUESTER, "Map the repo and report", action, true,
-            crate::asks::tools::FACADE_DELEGATIONS, Duration::ZERO, &|| {});
+            crate::asks::tools::FACADE_DELEGATIONS);
+    }
+
+    fn read_tool(world: &crate::asks::scheduler::tests::FakeWorld, store: &AskStore, caller: &str, id: &str) -> Value {
+        let send = |_: &TellSend<'_>| -> anyhow::Result<Value> { panic!("read must not send") };
+        let wake = |_: &str, _: &str, _: &str| -> Option<u32> { panic!("read must not wake") };
+        let clock = chrono::Utc::now;
+        let sleep = || panic!("read must not wait");
+        let ctx = ToolContext { store, world, caller, now: clock(), send: &send,
+            wake_chain: &wake, clock: &clock, sleep: &sleep, wait: true,
+            facade: crate::asks::tools::FACADE_DELEGATIONS };
+        super::super::tools::handle(&ctx, json!({"tool":"delegation_read",
+            "arguments":{"delegation":id},"action_id":"read-created-task"}).to_string().as_bytes())
     }
 
     /// The task becomes a delegation from the creator to the new agent, an
@@ -211,11 +205,16 @@ mod tests {
         assert_eq!(delegation["ok"], true, "{delegation}");
         assert_eq!(delegation["created"], true);
         assert_eq!(delegation["state"], "queued");
-        assert!(delegation["delegation"].as_str().unwrap().starts_with("delegation-"), "{delegation}");
+        assert!(delegation["delegation"].is_string(), "{delegation}");
         assert!(delegation["detail"].as_str().unwrap().contains("Queued for"), "{delegation}");
         let state = store.snapshot().unwrap();
         assert_eq!(state.asks.len(), 1);
         let ask = state.asks.values().next().unwrap().clone();
+        let displayed_id = delegation["delegation"].as_str().unwrap();
+        assert!(displayed_id.starts_with("delegation-"));
+        // MCP returns a display selector, not a storage key. Exercise the real
+        // tool resolver now and again after the result has been produced.
+        assert_eq!(read_tool(&world, &store, REQUESTER, displayed_id)["code"], "answer_not_found");
         assert_eq!(ask.requester.session(), Some(REQUESTER), "the creator is the requester");
         assert_eq!(ask.target_cutex_session_id, TARGET);
         assert_eq!(ask.action_id, delegation_action_id("create-1"));
@@ -242,6 +241,20 @@ mod tests {
         assert!(state.deliveries.values().any(|delivery| delivery.requester_cutex_session_id == REQUESTER && delivery.ask_id == ask.ask_id && delivery.kind == crate::asks::model::DeliveryKind::Answer),
             "a result delivery to the creator: {:?}", state.deliveries);
         assert!(matches!(ask.requester, Requester::Agent { .. }));
+        for reader in [REQUESTER, TARGET] {
+            let read = read_tool(&world, &store, reader, displayed_id);
+            assert_eq!(read["ok"], true, "{read}");
+            assert_eq!(read["text"], "report");
+            assert_eq!(read["delegation"], delegation["delegation"]);
+            let canonical_read = read_tool(&world, &store, reader, &ask.ask_id);
+            assert_eq!(read, canonical_read, "both selectors must reach the same result");
+        }
+        let before = serde_json::to_value(store.snapshot().unwrap()).unwrap();
+        let denied = read_tool(&world, &store, "cutex.00000000-0000-0000-0000-0000000000ff", displayed_id);
+        assert_eq!(denied["ok"], false, "{denied}");
+        assert_eq!(denied["code"], "id_not_found");
+        assert!(denied.get("text").is_none());
+        assert_eq!(serde_json::to_value(store.snapshot().unwrap()).unwrap(), before);
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(store_dir);
     }

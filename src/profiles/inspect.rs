@@ -64,12 +64,14 @@ pub fn account_model_provider(account: &StoredAccount) -> Option<String> {
 }
 
 pub fn account_profile_config_table(account: &StoredAccount) -> Option<Table> {
+    if account.cli_kind == CliKind::Dsh { return None; }
     let files = materialized_account_files(account).ok()?;
     let raw = read_optional_text(&files.config_path).ok().flatten()?;
     parse_toml_table(&raw).ok()
 }
 
 pub fn account_auth_payload(account: &StoredAccount) -> Option<Value> {
+    if account.cli_kind == CliKind::Dsh { return None; }
     let files = materialized_account_files(account).ok()?;
     let raw = read_optional_text(&files.auth_path).ok().flatten()?;
     serde_json::from_str::<Value>(&raw).ok()

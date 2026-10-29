@@ -244,6 +244,47 @@ async def test_thinking_becomes_reasoning_summary_and_usage_is_last_call(sh):
     assert usage['total']['cacheWriteInputTokens'] == 800 and usage['total']['outputTokens'] == 50
 
 
+
+async def test_usage_is_emitted_mid_turn_with_the_last_known_window(sh):
+    """claude-r22: each assistant message with usage updates the context meter
+    while the turn runs; the window of the previous turn carries over."""
+    tid = await sh.thread()
+    def result(sid, window):
+        return {'type': 'result', 'session_id': sid, 'subtype': 'success', 'is_error': False, 'terminal_reason': 'completed',
+                'num_turns': 1, 'usage': {'input_tokens': 5, 'output_tokens': 5},
+                'model_usage': {'claude-sonnet': {'contextWindow': window}} if window else {}}
+    async def first(**kw):
+        emit, sid = kw['on_message'], kw['session_id']
+        await emit({'type': 'assistant', 'session_id': sid, 'content': [{'type': 'text', 'text': 'One.'}],
+                    'usage': {'input_tokens': 5, 'output_tokens': 5}})
+        await emit(result(sid, 200000))
+    sh.provider.behavior = first
+    await sh.turn(tid, 'one')
+    await sh.drain()
+    seen = len(sent(sh, 'thread/tokenUsage/updated'))
+    mid = []
+    async def second(**kw):
+        emit, sid = kw['on_message'], kw['session_id']
+        await emit({'type': 'assistant', 'session_id': sid, 'content': [{'type': 'text', 'text': 'Step.'}],
+                    'usage': {'input_tokens': 7, 'cache_read_input_tokens': 1000, 'output_tokens': 3}})
+        # Same usage again (one SDK message per content block): no second update.
+        await emit({'type': 'assistant', 'session_id': sid, 'content': [{'type': 'text', 'text': 'More.'}],
+                    'usage': {'input_tokens': 7, 'cache_read_input_tokens': 1000, 'output_tokens': 3}})
+        mid.extend(m['params'] for m in sent(sh, 'thread/tokenUsage/updated')[seen:])
+        await emit({'type': 'assistant', 'session_id': sid, 'content': [{'type': 'text', 'text': 'Done.'}],
+                    'usage': {'input_tokens': 9, 'cache_read_input_tokens': 2000, 'output_tokens': 4}})
+        await emit(result(sid, None))  # no modelUsage window this time
+    sh.provider.behavior = second
+    turn = await sh.turn(tid, 'two')
+    await sh.drain()
+    assert len(mid) == 1, mid
+    assert mid[0]['turnId'] == turn
+    assert mid[0]['tokenUsage']['last']['inputTokens'] == 1007
+    assert mid[0]['tokenUsage']['modelContextWindow'] == 200000
+    updates = [m['params'] for m in sent(sh, 'thread/tokenUsage/updated')[seen:] if m['params']['turnId'] == turn]
+    assert [u['tokenUsage']['last']['inputTokens'] for u in updates][:3] == [1007, 2009, 2009]
+    assert all(u['tokenUsage']['modelContextWindow'] == 200000 for u in updates)
+
 async def test_compact_runs_slash_compact_without_user_bubble(ph):
     tid = await ph.thread()
     await ph.call('claude/runtime/start', {'threadId': tid})

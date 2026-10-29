@@ -6,6 +6,20 @@ use serde_json::Value;
 /// Additive Management features beyond the frozen v2 baseline. Clients
 /// feature-detect on these strings (and the boolean `features` map).
 pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
+    // r266 controls; continuation child kinds are discovered separately.
+    ("delegation-routing-v1", "delegationRoutingV1"),
+    ("delegation-review-refs", "delegationReviewRefs"),
+    ("delegation-tree-stop-v1", "delegationTreeStopV1"),
+    ("project-run-control-v1", "projectRunControlV1"),
+    ("delegation-continuation-v1", "delegationContinuationV1"),
+    ("agent-activity-v1", "agentActivityV1"),
+    ("agent-bus-message-settlement-v1", "agentBusMessageSettlementV1"),
+    ("image-input-steering", "imageInputSteering"),
+    ("live-text-deltas", "liveTextDeltas"),
+    ("director-address", "directorAddress"),
+    ("director-change-notices", "directorChangeNotices"),
+    ("director-handover", "directorHandover"),
+    ("management-start-adoption", "managementStartAdoption"),
     // GET /v2/sessions?includeHidden=true and hidden exact-ID resolution (root).
     ("include-hidden", "includeHidden"),
     // cutex/session/metadata/update + note/avatar/displayNameOverride.
@@ -22,6 +36,18 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("new-thread-defaults", "newThreadDefaults"),
     // GET /v2/profiles/{profile}/quota, GET|PUT /v2/profiles/{profile}/quota-config.
     ("profile-quota", "profileQuota"),
+    // Quota config `display_label` (any printable text, <= 6 columns, CJK = 2,
+    // e.g. 「余额」) in GET|PUT quota-config, and gauges' `displayLabel`
+    // (show it instead of `label` when set). `label` stays 1-6 ASCII
+    // letters/digits (older releases check it on every read); a non-ASCII
+    // `label` in a PUT becomes the display label, `label` is then derived.
+    ("quota-display-label", "quotaDisplayLabel"),
+    // Design 041: profile "auto:<providerFamily>" in agent_create /
+    // member_replace / POST /v2/human/agents picks an opted-in profile of
+    // that provider (bare "auto" refused); reply `profilePick` (Human) /
+    // `result.profile_pick` (agent bus); profile `autoPick` (GET|PATCH);
+    // GET /v2/profile-auto-pick preview; names auto / auto:… reserved.
+    ("profile-auto-pick", "profileAutoPick"),
     // GET /v2/profiles, GET|PATCH /v2/profiles/{profile}.
     ("profiles-api", "profilesApi"),
     // GET|PATCH /v2/settings.
@@ -86,12 +112,19 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // /v2/services[...] (root): services registry, supervision, logs, open;
     // cutex/services/changed host events; service_* agent MCP tools.
     ("services", "services"),
-    // Simplified services: no `pinned`, no `onDemand` runtime / idleTimeoutMinutes;
+    // Simplified services: no `onDemand` runtime / legacy idleTimeoutMinutes;
     // `open` starts a stopped managed service; PATCH ownerCutexSessionId reassigns
     // (validated against cutex sessions); GET /v2/services?owner=.
     ("services-v2", "servicesV2"),
     ("services-proxy", "servicesProxy"),
     ("services-lifetime", "servicesLifetime"),
+    // /v2/settings services.ephemeralIdleMinutes (0 = until owner archive),
+    // per-service idleTtlMinutes / pinned, and agent TTL requests bounded by
+    // services.ephemeralTtlHours.
+    ("services-ephemeral-ttl", "servicesEphemeralTtl"),
+    // Persistent purpose plus owner-only grouping, star/order/note,
+    // visibility and reversible archive controls.
+    ("services-organize", "servicesOrganize"),
     // Services setting `agentPersistentApproval` (ask | off, default ask):
     // whether an agent's persistent-lifetime request raises a service_lifetime
     // approval; managed execution keeps its own managed_service gate.
@@ -107,6 +140,26 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // renews and returns the live lease it created (no orphan lease from a
     // retried request); the key expires with the lease. No key = a new lease.
     ("services-lease-idempotent", "servicesLeaseIdempotent"),
+    // 2026-10-28 project services (cutex-desktop
+    // .claude/previews/project-services-proposal-20261028.md): a service has
+    // `ownerScope` session | project (records without it: session). A
+    // project service (always with a `projectId`) is managed by the owner,
+    // by the current Director of its project (resolved live per call, so a
+    // new Director manages at once and the old one no longer does) and by
+    // its registrant (`ownerCutexSessionId`) while in the project. The owner
+    // sets it with PATCH /v2/services/{slug} `{ownerScope, projectId?}`
+    // (POST /v2/services takes it too; project without a projectId: 409
+    // project_scope_unavailable). Agents: service_register / service_update
+    // `scope` (only into project; back to session is owner only),
+    // service_list `ownerScope` + `youMayManage`; removing a persistent
+    // project service another agent registered asks the owner
+    // (managed_service approval, reason project_service_remove). Project
+    // services are not reclaimed with their archived registrant and do not
+    // block deleting it (the delete clears the registrant).
+    ("services-project-scope", "servicesProjectScope"),
+    // Owner Management GET /v2/services/{slug}/eligible-owners: all known
+    // non-archived sessions, including hidden, unnamed and offline sessions.
+    ("services-eligible-owners", "servicesEligibleOwners"),
     // GET /v2/profiles/{p}/models also lists models for profiles without an
     // editable catalog (ChatGPT / official Codex: the native models cache or
     // the native's bundled catalog; Claude: model aliases), with
@@ -145,9 +198,13 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // `preview` (first non-empty line, <= 80 chars) and `askId` for a Job
     // completion bound to a delegation; `label` is the preview (alarm /
     // tell) or a short control-type description (bus) instead of the old
-    // generic "Alarm" / "Agent message" / "Bus delivery".
+    // generic "Alarm" / "Agent message" / "Bus delivery". Optional
+    // `fromCutexSessionId`: the sender's session when it is an agent on this
+    // host (a local delegate, a same-host tell; never another host's).
     ("admission-ridealong-detail", "admissionRidealongDetail"),
+    ("admission-wait-reasons", "admissionWaitReasons"),
     ("queue-steer", "queueSteer"),
+    ("owner-join-delegation", "ownerJoinDelegation"),
     // GET /v2/profiles/{p}/quota reports native rate-limit gauges
     // (`codex-primary`, `codex-secondary`, `codex-credits`, `source:"native"`)
     // for ChatGPT-login profiles without a quota-config, from a persisted
@@ -221,6 +278,10 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // GET /v2/approvals, POST /v2/approvals/{id}/approve|deny and the
     // cutex/approvals/changed host event.
     ("owner-approvals", "ownerApprovals"),
+    // Design 047: root-only host-side automatic approval rules and audit.
+    ("approval-auto-rules", "approvalAutoRules"),
+    // Same-mode authority narrowing preserves the exact stored deadline (no renewal/typed confirm).
+    ("approval-rule-exact-narrow", "approvalRuleExactNarrow"),
     // 2026-10-17: Management serve watches the approval store, so approvals
     // requested by the Agent Bus (services, agent profiles) and consumed by a
     // retried call reach the host stream live as cutex/approvals/changed
@@ -288,7 +349,20 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // status: pending|inProgress|completed}], updatedAt (RFC 3339)} | null —
     // the newest update_plan call the native accepted ("Plan updated"),
     // derived from the session's current rollout (revert-consistent).
+    // Claude sessions (no rollout): the newest turn/plan/updated (TodoWrite /
+    // Task* checklist) the adapter sent for the bound thread, kept by the
+    // daemon across restarts (`claude_plan`; dropped when a revert removes
+    // its turn); before 2026-10-21 always null. DSH sessions (r265): the same,
+    // from the adapter's todo_write checklist.
     ("session-latest-plan", "sessionLatestPlan"),
+    // Claude background tasks (adapter claude-r23, native.schema features
+    // backgroundSubagents): a finished / failed / stopped / lost background
+    // subagent or command (`claude/task/updated` notifyParent) reaches the
+    // agent as one Agent Bus message from "Claude Task" (control type
+    // cutex.claude.task.v1, view cutex.claude-task.v1, id ctask-…, read at a
+    // busy agent's next step, a new turn when idle); the session native
+    // request `claude/tasks/stop {threadId, taskId}` stops a running one.
+    ("claude-background-tasks", "claudeBackgroundTasks"),
     // Claude sessions: native.schema {protocol: claude-app-server-subset,
     // capabilities.features} lists the Codex v2 surfaces the adapter serves
     // (unsupported methods fail with -32601 data.unsupported); Claude
@@ -296,6 +370,11 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // requests; cutex/userInput/submit `auto` on a busy Claude agent queues;
     // offline-history and offline-submit cover Claude sessions.
     ("claude-runtime-features", "claudeRuntimeFeatures"),
+    // claude-r28+: the component ships the version-matched Claude Code CLI.
+    // GET|PATCH /v2/settings `claudeCli` chooses bundled (default) or system;
+    // CUTEX_CLAUDE_CLI remains the highest-priority override. Component
+    // status reports the selected source and both detected versions.
+    ("claude-cli-choice", "claudeCliChoice"),
     // Management client tokens (`cxm1.…`, issued with `cutex management
     // client-token issue`): root-equivalent on Management, never on the Agent
     // Bus; GET /v2/client-tokens, DELETE /v2/client-tokens/{id}.
@@ -308,6 +387,8 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // GET /v2/fs/file?path=<absolute>&maxBytes= : host file read (owner
     // only: root credential or a client token), workspace fs/file body.
     ("fs-file-read", "fsFileRead"),
+    #[cfg(any(windows, target_os = "linux"))]
+    ("fs-file-transfer-v1", "fsFileTransferV1"),
     // Asks (委托, cutex-desktop docs/cutex-agent-asks.md P1): /v2/asks,
     // /v2/asks/{id}, /v2/asks/{id}/answer, cutex/ask/create|stop|close|retry|
     // respond, events cutex/ask/created|stateChanged|answered|closed|question|
@@ -351,6 +432,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // bootstrap cutexState carry asksPaused {since, by, origin} | null; event
     // cutex/asks/pauseChanged {asksPaused, reason: paused|resumed|ownerMessage}.
     ("asks-pause-v2", "asksPauseV2"),
+    ("agent-pause", "agentPause"),
     // Mobile API phase A (cutex-desktop docs/research/cutex-mobile-api.md):
     // config `management_listen` / repeated `--bind` incl. `tailscale`;
     // non-loopback listeners accept only client / device tokens (401
@@ -372,9 +454,31 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // and GET /v2/summary/events (SSE, cursor = journal seq, 7-day retention,
     // 409 cursor_expired).
     ("host-summary", "hostSummary"),
+    // Project log (cutex-desktop design 022 B): GET /v2/projects/{id}/events
+    // (?before= | ?after= pe:<seq>, limit 1..500 default 100, kinds=, sessionId=;
+    // newest first, after = oldest first; 409 cursor_expired), GET
+    // /v2/projects/{id}/events/stream (SSE, id = pe:<seq>, Last-Event-ID, lagged)
+    // and host event cutex/projectEvents/appended {projectId, cursor} (≤ 1 per
+    // project per 5 s). Rows: turns, delegations, sub-agents, approvals,
+    // artifacts, workflow runs, owner messages, jobs, runtime online/offline,
+    // member joined/left, journal gaps, Claude background commands
+    // (background.started/finished, from cutex/claudeTask/changed); tagged with
+    // the project at write time, kept 90 days / 50 000 per project. GET
+    // /v2/projects/{id}/background: per agent what runs now (Claude tasks,
+    // Codex background terminals, Jobs) with the existing stop request.
+    // Members see their agents' rows; no stop requests.
+    ("project-events", "projectEvents"),
     // ?compact=1 on bootstrap / history: tool item strings > 2 KB cut, item
     // gets truncated: true (full text = same request without compact).
     ("compact-history", "compactHistory"),
+    // ?media=ref on bootstrap / history: media over 64 KiB become
+    // cutex-media:<session>/<sha256> references read with
+    // GET /v2/sessions/{id}/media/{sha256}; other tool strings over 1 MiB
+    // are cut (truncated: true). Design 025 (an image thread of 1.5 GB).
+    ("history-media-refs", "historyMediaRefs"),
+    // Durable native-event binary references (cutexBlob descriptor), backed
+    // by visible-session read grants on /blobs/{sha}; 256 KiB appended event cap.
+    ("event-media-blobs", "eventMediaBlobs"),
     // Accept-Encoding: gzip → Content-Encoding: gzip on JSON responses
     // >= 1 KB (not SSE).
     ("gzip", "gzip"),
@@ -434,10 +538,19 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("input-overflow-documents", "inputOverflowDocuments"),
     // Closed delegations and finished agent messages are archived after
     // documents.closedRetentionDays (default 30) and kept
-    // documents.archiveRetentionDays (default 365):
+    // documents.archiveRetentionDays (default 0 = for good since r252, was 365):
     // GET /v2/record-archive?kind=&month=&involving=&q=&limit=&offset=,
     // GET /v2/record-archive/{recordId}; host event cutex/documents/sweep.
     ("record-archive", "recordArchive"),
+    // Retention rules visible (owner decision 2026-10-23, r252): GET
+    // /v2/settings `retention` [{id, rule: forever|age|archive|internal,
+    // days, keepReferenced, configurable, setting: {store: "config", key} |
+    // null, detail}] (read-only; store ids of cutex-desktop design 043).
+    // User data is kept by default: attachments live with their session,
+    // workflow runs / archive months / applied-revert before-images are
+    // kept, owner replies move into the record archive (kind
+    // ownerNotification; sweep report archivedOwnerReplies).
+    ("retention-rules", "retentionRules"),
     // Root-only human Job Service bridge (Linux only: no runner elsewhere):
     // POST /v2/job-service/management-query (list; rows carry `command`),
     // GET /v2/job-service/capabilities, POST /v2/job-service/cancel
@@ -494,6 +607,10 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // native version registry entries and Claude runtimes with the agents
     // pinned to each, plus the cutex release (schema export runtimes).
     ("runtimes-view", "runtimesView"),
+    // GET /v2/runtimes/idle + POST /v2/runtimes/stop-idle (root): which online
+    // agents are idle (stoppable / caution / blocked with reasons) and a batch
+    // stop, wakeable by default or as the owner's stop (design 031).
+    ("stop-idle-agents", "stopIdleAgents"),
     // Agent harness (cutex-desktop docs/research/agent-harness.md): every
     // launch starts with a `# Cutex` section (environment, labelled inputs,
     // cutex tools, output, this agent); Claude agents get it through the
@@ -614,6 +731,22 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // /v2/quota-auto-continue/{sessionId}/pending; host event
     // cutex/quotaAutoContinue/changed; schema export `quota-auto-continue`.
     ("claude-quota-auto-continue", "claudeQuotaAutoContinue"),
+    ("model-overload-auto-retry", "modelOverloadAutoRetry"),
+    // Usage-limit reset credits of a profile's account:
+    // GET /v2/profiles/{p}/reset-credits[?refresh=true] (count, expiry, rows;
+    // read on request, cached 60 s per account) and POST
+    // …/reset-credits/consume {idempotencyKey, creditId?} (owner click only).
+    // Codex ChatGPT logins and Claude subscription accounts; GLM / Z.ai is
+    // `unsupportedReason: zcodeOnly`.
+    ("profile-reset-credits", "profileResetCredits"),
+    // agent_create / replace replies carry `effort_fallback {model,
+    // requested, used, reason, note}` when the profile default effort was
+    // not offered by the model and another level was used (design 028 (b)).
+    ("agent-create-effort-fallback", "agentCreateEffortFallback"),
+    // Owner abandon of an unfinished agent_create: POST
+    // /v2/agent-management/create-abandon {action_id, dry_run?} (root);
+    // CLI `cutex human management agent-create-abandon` (design 028).
+    ("agent-create-abandon", "agentCreateAbandon"),
     // r233: a closed native input gate (Claude adapter halted after an
     // interrupted / failed turn, Codex N2 gate) that refused a delivery is
     // a pause the owner sees: asksPaused.origin `runtimeGate` (asks held
@@ -749,8 +882,18 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // "strict" lowers every tool-parameter enum to one shared `type` right
     // before a request is sent (Google function declarations refuse mixed /
     // typeless / nullable enums). detail.editable.toolSchemaCompat: Codex
-    // profiles. API-key preset `gemini` writes "strict".
+    // profiles. Strict mode is opt-in; no preset sets it automatically.
     ("profile-tool-schema-compat", "profileToolSchemaCompat"),
+    // Codex profile imageHistoryTrim ({maxInline, keep} | null = off) in
+    // /v2/profiles items + detail config + PATCH (null removes; keep 1..50,
+    // maxInline keep+1..500); stored as the profile-scoped root keys
+    // `generated_image_history_max_inline` / `generated_image_history_keep`
+    // and forwarded to native launches: at each turn start, when the history
+    // holds more than maxInline generated images, all but the newest keep go
+    // to the model as a placeholder with the saved file path (natives without
+    // the feature ignore the keys). detail.editable.imageHistoryTrim: Codex
+    // profiles. No preset sets it.
+    ("profile-image-history-trim", "profileImageHistoryTrim"),
     // Data-driven API-key presets: every preset with a catalog writes it at
     // creation (deepseek, zai, zhipu, moonshot / moonshot-cn, minimax /
     // minimax-cn, xai); zai / zhipu use the Responses endpoints (/api/v1);
@@ -784,6 +927,12 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // cutex/session/metadata/update avatar gains optional `color` (#rrggbb)
     // for emoji / icon avatars: an emoji AND a circle colour together.
     ("agent-avatar-color", "agentAvatarColor"),
+    ("session-badge", "sessionBadge"),
+    ("session-fork-profile", "sessionForkProfile"),
+    ("session-fork-preview", "sessionForkPreview"),
+    ("project-badge-wide", "projectBadgeWide"),
+    ("host-storage", "hostStorage"),
+    ("storage-cleanup", "storageCleanup"),
     // r236: browser_open (a page in the agent login pool) needs no owner
     // approval for an agent whose session runs with full access (native
     // sandbox danger-full-access + approval never, the desktop's 完全访问;
@@ -915,6 +1064,8 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // `task_mode: "message"` keeps the plain start message (`first_message`).
     // Human-reviewed bootstrap intents keep their reviewed start message.
     ("agent-create-task-delegation", "agentCreateTaskDelegation"),
+    ("tool-action-receipts", "toolActionReceipts"),
+    ("agent-archive-kind-v1", "agentArchiveKindV1"),
     // 2026-10-16 (owner decision): Claude Code safety checks under full
     // access (docs/safety-grants.md, safety_checks.rs). The adapter declines
     // them at once and reports a safety block; cutex keeps it as an owner
@@ -1031,6 +1182,20 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // the next runtime launch; adapter-gated (features.json settingSources /
     // mcpServers / claudeAiConnectors).
     ("claude-code-sources", "claudeCodeSources"),
+    // 2026-10-22: Claude auto-compaction per profile. Profile item / detail
+    // `claudeCompaction: {window, percent} | null` (+ detail
+    // `claudeCompactionError`), PATCH `claudeCompaction` (null removes);
+    // stored in profiles/<id>/claude-runtime.json, next runtime start.
+    ("claude-compaction", "claudeCompaction"),
+    // 2026-10-23: Claude auto-compaction per model. Profile item / detail
+    // `claudeCompactionModels: {"<model id>": {window, percent}} | null` (+
+    // detail `claudeCompactionModelsError`), PATCH (null / {} removes); stored
+    // in profiles/<id>/claude-compaction-models.json (claude-runtime.json is
+    // unchanged), passed to the adapter at the next runtime start. Applied by
+    // adapters whose features.json declares `compactionModels` (claude-r24):
+    // at Claude Code start and on every model switch; other models use
+    // claudeCompaction.
+    ("claude-compaction-models", "claudeCompactionModels"),
     // 2026-10-17: Claude P0. GET /v2/sessions/{id}/skills (root) -> the
     // Codex skills/list shape for a Claude agent's managed roots (workspace
     // .agents/skills + .claude/skills, account cutex-skills, host
@@ -1160,6 +1325,17 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // Keyed by profile id; removed with the profile. Images in
     // runtime/profile-avatars/ (never config.json / accounts.json).
     ("profile-avatar", "profileAvatar"),
+    // Full portrait/emoji/letter style is independent of legacy avatarThemes.
+    // Nullable appearance.avatarStyle has its own appearance revision/clock.
+    ("profile-avatar-style", "profileAvatarStyle"),
+    ("profile-avatar-style-import-if-unset", "profileAvatarStyleImportIfUnset"),
+    // Explicit fixed/inherit session intent; mode and avatar share a CAS field.
+    ("session-avatar-mode", "sessionAvatarMode"),
+    // Read-only immutable creation provenance; historical unknown stays null.
+    ("session-created-by", "sessionCreatedBy"),
+    // Owner's per-user/per-host answered-through desktop guide version.
+    ("guides.preferences", "guidesPreferences"),
+    ("profile-account-link", "profileAccountLink"),
     // 2026-10-19: import Profiles from CC Switch (farion1231/cc-switch; owner
     // only, crate::profiles::cc_switch, read-only). GET
     // /v2/profile-imports/cc-switch -> {found, source {path, format
@@ -1227,6 +1403,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // {deviceName, userId, local}, graceSeconds, at} and
     // cutex/client/stateChanged {instanceId, state}.
     ("client-remote-close", "clientRemoteClose"),
+    ("client-presence-lifecycle", "clientPresenceLifecycle"),
     // 2026-10-20: per-user home page settings on the host (cutex-desktop
     // docs/research/home-page-20261019.md §1; management::user_home):
     // GET /v2/users/me/home -> {revision, home: {...}|null, coverEtag,
@@ -1239,6 +1416,51 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // only (owner or a bound user; pending 403 access_pending); device scope
     // read may only read. Stored in runtime/users/home/.
     ("user-home", "userHome"),
+    // 2026-10-21: home pins of kind `page` (management::user_home
+    // valid_page_key): a client page, key `<pageId>:<argument>` (page id
+    // [a-z][a-z0-9._-]{0,63}, argument not empty), e.g.
+    // `project-view:<projectId>`. A cutex with `user-home` but without this
+    // answers 400 invalid_home for such a pin.
+    ("user-home-page-pins", "userHomePagePins"),
+    // 2026-10-20: service home page tiles (cutex-desktop
+    // docs/research/home-page-20261019.md §2; services::tile): register /
+    // update (POST|PATCH /v2/services, service_register / service_update)
+    // take an optional static `tile` template and / or `tilePath` (a path
+    // inside the service, default /.well-known/cutex-tile.json);
+    // GET /v2/services/{slug}/tile -> {tile|null, fetchedAt, error|null,
+    // source: static|service} (fetched through the service's loopback
+    // upstream, 2 s, <= 16 KiB, strict template, cached refreshSeconds >= 60);
+    // GET /v2/services/{slug}/tile/image (PNG / JPEG / WebP <= 512 KiB).
+    ("service-tiles", "serviceTiles"),
+    // Host setting `promptCacheKey {enabled}` (design 034, default off) in
+    // GET|PATCH /v2/settings: when on, each native launch is pinned to a
+    // stable Responses prompt cache key per host + workspace
+    // (`cutex-<host>-<sha256(cwd)[:16]>`, passed as
+    // `-c prompt_cache_key="<key>"` after probing the exact native with
+    // `--prompt-cache-key-capability`; r54+ fork natives advertise it).
+    // Applies to launches started after the change; older natives keep
+    // per-thread keys. Never refuses a launch: without support or when the
+    // probe fails the native starts without the key. GET /v2/settings
+    // `promptCacheKeyStatus`: off | pending | active | unsupported |
+    // probe_failed (the last launch's probe).
+    ("prompt-cache-key", "promptCacheKey"),
+    // r265 (docs/development/r265-profile-variants.md): profile items
+    // providerInterfaces / credential / runtimeVariants / defaultVariant /
+    // runtimeCompatibility; POST /v2/profiles/{p}/variants, PATCH|DELETE
+    // /v2/profiles/{p}/variants/{v}; PATCH defaultVariant / credential and
+    // write-only DSH apiKey (null clears); POST /v2/human/{agents,sessions}
+    // variantId; session resource launchBinding.
+    ("profile-runtime-variants", "profileRuntimeVariants"),
+    // r266 (docs/development/r266-kimi-profiles.md): runtime kimi in
+    // runtimeVariants / runtimeCompatibility, POST …/variants {runtime:kimi}
+    // on Kimi / Moonshot API-key profiles, Kimi-kind profiles (POST
+    // /v2/profiles {kind:kimi, kimiAccount}, PATCH kimiAccount),
+    // credential.kimiAccountId. Advertised whether or not the kimi-runtime
+    // component is installed (rows say componentNotInstalled).
+    ("kimi-runtime-profiles", "kimiRuntimeProfiles"),
+    // r266: /v2/kimi/accounts (Kimi subscription logins, device code driven
+    // by Management; never a token on the wire).
+    ("kimi-accounts", "kimiAccounts"),
     #[cfg(target_os = "linux")]
     ("job-service", "jobService"),
 ];
@@ -1248,11 +1470,45 @@ pub fn capabilities_resource() -> Value {
 }
 
 fn capabilities_with_jobs(jobs: super::human_jobs::JobCapabilities) -> Value {
+    let mut value = capabilities_with_optional_dsh(jobs, crate::components::dsh_runtime::advertised());
+    if crate::components::kimi_runtime::advertised() {
+        add_kimi_runtime_feature(&mut value);
+    }
+    value
+}
+
+/// r266: the Kimi Code runtime is offered only after installation (like
+/// `dsh-runtime`); Kimi Profiles exist either way (`kimi-runtime-profiles`).
+fn add_kimi_runtime_feature(value: &mut Value) {
+    if let Some(features) = value.get_mut("features").and_then(Value::as_object_mut) {
+        features.insert("kimiRuntime".into(), Value::Bool(true));
+    }
+    if let Some(list) = value.get_mut("featureList").and_then(Value::as_array_mut) {
+        list.push(Value::String("kimi-runtime".into()));
+    }
+}
+
+fn capabilities_with_optional_dsh(jobs: super::human_jobs::JobCapabilities, dsh_installed: bool) -> Value {
     let mut features = serde_json::Map::new();
     for (_, key) in MANAGEMENT_FEATURES {
         features.insert((*key).to_string(), Value::Bool(true));
     }
     let mut feature_list = MANAGEMENT_FEATURES.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    // An optional runtime is offered only after installation. Its component
+    // status separately explains a missing/broken Node without hiding repair.
+    if dsh_installed {
+        features.insert("dshRuntime".into(), Value::Bool(true));
+        feature_list.push("dsh-runtime");
+    }
+    // profile-relay-runtimes (docs/development/profile-relay-runtimes.md):
+    // every ACP runtime of this build sends requests to the profile's own
+    // interface address, relays included. Until then profiles still carry
+    // `providerInterfaces[].official` / `relayAccepted` and accept official
+    // `interfaceBaseUrls`; relay addresses for such runtimes are refused.
+    if crate::profiles::interface_urls::relay_runtimes_ready() {
+        features.insert(crate::profiles::interface_urls::FEATURE_KEY.into(), Value::Bool(true));
+        feature_list.push(crate::profiles::interface_urls::FEATURE);
+    }
     if cfg!(target_os = "linux") && jobs.external {
         features.insert("jobExternal".into(), Value::Bool(true));
         feature_list.push("job-external");
@@ -1296,6 +1552,8 @@ fn capabilities_with_jobs(jobs: super::human_jobs::JobCapabilities) -> Value {
         "cutexMethods": super::session::CUTEX_METHOD_REGISTRY_METHODS,
         "features": features,
         "featureList": feature_list,
+        "continuationWakeKinds": crate::asks::continuation::runtime::WAKE_KINDS,
+        "continuationChildKinds": crate::asks::continuation::runtime::CHILD_KINDS,
     })
 }
 
@@ -1304,9 +1562,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_dsh_is_advertised_only_after_installation() {
+        for installed in [false, true, false] {
+            let value = capabilities_with_optional_dsh(super::super::human_jobs::JobCapabilities::default(), installed);
+            assert_eq!(value["featureList"].as_array().unwrap().iter().any(|feature| feature == "dsh-runtime"), installed);
+            assert_eq!(value["features"].get("dshRuntime"), installed.then_some(&Value::Bool(true)));
+            assert!(value["featureList"].as_array().unwrap().iter().any(|feature| feature == "components"));
+            assert_eq!(value["features"]["liveTextDeltas"], true);
+        }
+    }
+
+    #[test]
+    fn profile_relay_runtimes_follows_runtime_readiness() {
+        use crate::profiles::interface_urls::{relay_runtimes_ready, FEATURE, FEATURE_KEY};
+        for installed in [false, true] {
+            let value = capabilities_with_optional_dsh(super::super::human_jobs::JobCapabilities::default(), installed);
+            let listed = value["featureList"].as_array().unwrap().iter().any(|feature| feature == FEATURE);
+            assert_eq!(listed, relay_runtimes_ready());
+            assert_eq!(value["features"].get(FEATURE_KEY), relay_runtimes_ready().then_some(&Value::Bool(true)));
+        }
+        // This build: DSH (DEEPSEEK_BASE_URL) and Kimi Code (its provider's
+        // base_url) read the profile's address, relays included.
+        assert!(relay_runtimes_ready());
+        let value = capabilities_with_optional_dsh(super::super::human_jobs::JobCapabilities::default(), false);
+        assert!(value["featureList"].as_array().unwrap().iter().any(|feature| feature == FEATURE));
+        assert_eq!(value["features"][FEATURE_KEY], true);
+    }
+
+    #[test]
     fn capabilities_advertise_registry_and_features() {
         let value = capabilities_resource();
         assert_eq!(value["contractVersion"], 2);
+        assert_eq!(value["continuationWakeKinds"], json!(["after", "children"]));
+        assert_eq!(value["continuationChildKinds"], json!(["delegation"]));
+        for (flag, key) in [
+            ("delegation-routing-v1", "delegationRoutingV1"),
+            ("delegation-tree-stop-v1", "delegationTreeStopV1"),
+            ("project-run-control-v1", "projectRunControlV1"),
+            ("delegation-continuation-v1", "delegationContinuationV1"),
+            ("agent-activity-v1", "agentActivityV1"),
+            ("agent-bus-message-settlement-v1", "agentBusMessageSettlementV1"),
+        ] {
+            assert_eq!(value["features"][key], true);
+            assert!(value["featureList"].as_array().unwrap().iter().any(|item| item == flag));
+        }
+        assert_eq!(value["features"]["approvalRuleExactNarrow"], true);
+        assert!(value["featureList"].as_array().unwrap().iter().any(|flag| flag == "approval-rule-exact-narrow"));
         assert_eq!(value["cutexBuild"], crate::build_info::build_json());
         assert_eq!(value["cutexBuild"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(value.get("cutexVersion").is_none() && value.get("gitSha").is_none());
@@ -1334,8 +1635,11 @@ mod tests {
             "claudeToolDefaults",
             "imExposureRetired",
             "profileQuota",
+            "quotaDisplayLabel",
+            "profileAutoPick",
             "profilesApi",
             "settingsApi",
+            "promptCacheKey",
             "userInstructions",
             "profileSwitch",
             "sessionHistoryRevert",
@@ -1384,10 +1688,13 @@ mod tests {
             "profileUpdatePlan",
             "profileWebSearch",
             "profileToolSchemaCompat",
+            "profileImageHistoryTrim",
+            "projectEvents",
             "profilePresetsV2",
             "nativeR53",
             "profileSearchTool",
             "sessionLatestPlan",
+            "claudeBackgroundTasks",
             "quickChatDefaultProfile",
             "claudeRuntimeFeatures",
             "managementClientTokens",
@@ -1448,6 +1755,11 @@ mod tests {
             "peerOwnerProfile",
             "sessionSandboxExtras",
             "profileAvatar",
+            "profileAvatarStyle",
+            "profileAvatarStyleImportIfUnset",
+            "sessionAvatarMode",
+            "sessionCreatedBy",
+            "guidesPreferences",
             "profileImportCcSwitch",
             "hostOwnerPerson",
             "ownerDeviceNotice",
@@ -1455,6 +1767,8 @@ mod tests {
             "deviceScope",
             "clientRemoteClose",
             "userHome",
+            "userHomePagePins",
+            "serviceTiles",
         ] {
             assert_eq!(value["features"][key], true, "{key}");
         }

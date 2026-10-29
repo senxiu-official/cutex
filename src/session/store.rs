@@ -281,6 +281,15 @@ pub fn session_store_json_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
     Ok(serde_json::to_vec(&value)?)
 }
 
+/// Cleanup already prepared its read-only evidence outside lifecycle locks.
+/// Open the same writer lock file without loading/reparsing the database.
+/// The caller acquires it only around the bounded recheck and rename.
+pub(crate) fn cleanup_lock_file(path: &Path) -> anyhow::Result<File> {
+    let parent=path.parent().context("session store parent")?;
+    let file=open_store_lock(&parent.join(CUTEX_SESSIONS_LOCK_FILE))?;
+    Ok(file)
+}
+
 fn open_store_lock(path: &Path) -> anyhow::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);

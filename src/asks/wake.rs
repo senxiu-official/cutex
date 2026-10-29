@@ -60,7 +60,18 @@ pub fn decide(
     if state.pauses.contains_key(target) {
         return WakeDecision::Never("ownerPaused");
     }
+    if super::agent_pause::is_paused(state, target) {
+        return WakeDecision::Never("agentPaused");
+    }
     let target_provenance = provenance.get(target);
+    // Who stands behind the ask now (design 044): the handover controller
+    // (e.g. the project's new Director), else the original requester. It only
+    // decides whether a wake may happen; it grants nothing else.
+    // An unknown handover (under review / reconcile) wakes nobody.
+    let controller = match ask.controller() {
+        Ok(controller) => controller.or_else(|| ask.requester.session().map(str::to_string)),
+        Err(_) => return WakeDecision::Never("handoverPending"),
+    };
     let domain = target_provenance
         .map(|item| item.origin_domain.clone())
         .unwrap_or_else(|| format!("agent:{target}"));
@@ -70,8 +81,11 @@ pub fn decide(
         // the owner's reviewed launch. Its creator or its project's Director
         // may reuse the owner's latest reviewed launch while it still
         // matches; nobody else, and never without one.
-        let requester = ask.requester.session();
-        let creator = requester.is_some_and(|requester| item.created_by.as_deref() == Some(requester));
+        let requester = controller.as_deref();
+        let creator = [ask.requester.session(), requester]
+            .into_iter()
+            .flatten()
+            .any(|requester| item.created_by.as_deref() == Some(requester));
         let director = requester.and_then(|requester| provenance.get(requester)).is_some_and(|requester| {
             requester.director && item.origin_domain.starts_with("project:") && requester.origin_domain == item.origin_domain
         });
@@ -80,11 +94,13 @@ pub fn decide(
         }
         reviewed_relaunch_by = requester.map(str::to_string);
     }
-    if let Some(requester) = ask.requester.session() {
+    if let Some(requester) = controller.as_deref() {
         if state.owner_offline.contains(target) {
             return WakeDecision::Never("ownerStopped");
         }
-        let own_child = target_provenance.is_some_and(|item| item.created_by.as_deref() == Some(requester));
+        let own_child = target_provenance.is_some_and(|item| {
+            item.created_by.as_deref() == Some(requester) || item.created_by.as_deref() == ask.requester.session()
+        });
         let same_project = match (target_provenance, provenance.get(requester)) {
             (Some(target), Some(requester)) => {
                 target.origin_domain.starts_with("project:") && target.origin_domain == requester.origin_domain

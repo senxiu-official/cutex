@@ -9,7 +9,10 @@
 //!
 //! Off the hot path: the runtime event hook only parses `turn/started` /
 //! `turn/completed` and hands them to one worker thread (management
-//! process). Turn ends arriving together are scanned once per project.
+//! process). A separate bounded scan worker coalesces project requests, so
+//! workspace traversal/hashing does not occupy the turn-window recorder. Turn ends
+//! arriving together are scanned once per project. The boundary channel remains
+//! lossless/unbounded; its batches are bounded and never do workspace I/O.
 //! Bounded: [`Budget`] (entries visited, wall time; the walk and the
 //! processing of what it found each get the time budget); a hit is logged,
 //! what was found is still processed, and the next scan resumes the walk
@@ -36,7 +39,7 @@
 //! instead of comparing them with the old root's files. State written before
 //! the root was recorded adopts the current root once, unchanged.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::OnceLock;
@@ -136,6 +139,9 @@ pub struct AgentFacts {
     pub ask_id: Option<String>,
 }
 
+#[path = "capture_worker.rs"]
+mod scan_worker;
+
 // --- hot path ---------------------------------------------------------------
 
 /// Runtime notification hook (management process, every runtime): only
@@ -173,15 +179,35 @@ fn worker() -> Option<&'static mpsc::Sender<TurnEvent>> {
 
 // --- worker -----------------------------------------------------------------
 
+/// A full queue must not turn the 500 ms coalescing deadline into an unlimited
+/// drain (recv_timeout(0) still receives queued messages). Preserve order while
+/// bounding both this batch and the wait for its first durable turn window.
+fn event_batch<T>(receiver: &mpsc::Receiver<T>, first: T, coalesce: Duration, max_events: usize) -> Vec<T> {
+    let mut events = vec![first];
+    let deadline = Instant::now() + coalesce;
+    while events.len() < max_events {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { break; }
+        match receiver.recv_timeout(remaining) {
+            Ok(event) => events.push(event),
+            Err(_) => break,
+        }
+    }
+    events
+}
+
 fn run(receiver: mpsc::Receiver<TurnEvent>) {
     let host = ManagementHost;
+    let scans = match scan_worker::Worker::start() {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            eprintln!("artifacts: auto capture scan worker not started: {error}; turn windows will still be recorded");
+            None
+        }
+    };
     let mut last_prune_ms = 0;
     while let Ok(first) = receiver.recv() {
-        let mut events = vec![first];
-        let deadline = Instant::now() + COALESCE;
-        while let Ok(event) = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            events.push(event);
-        }
+        let events = event_batch(&receiver, first, COALESCE, 256);
         if !host.settings().auto_capture.enabled {
             continue;
         }
@@ -194,28 +220,19 @@ fn run(receiver: mpsc::Receiver<TurnEvent>) {
         };
         let directory = crate::asks::directory::Directory::load().ok();
         let asks = crate::asks::store::AskStore::open_default().ok().and_then(|store| store.peek().ok().flatten());
-        let mut projects = BTreeSet::new();
+        let mut projects = BTreeMap::<String, i64>::new();
         for event in &events {
             let facts = facts_of(&host, directory.as_ref(), asks.as_ref(), &event.session);
             match record(&store, event, &facts) {
                 Ok(Some(project)) => {
-                    projects.insert(project);
+                    projects.entry(project).and_modify(|since| *since = (*since).min(event.at_ms)).or_insert(event.at_ms);
                 }
                 Ok(None) => {}
                 Err(error) => eprintln!("artifacts: auto capture: turn window of {}: {error:#}", event.session),
             }
         }
-        for project in projects {
-            match scan_project(&host, &store, &project, Utc::now(), Budget::default()) {
-                Ok(report) if report.budget_hit => eprintln!(
-                    "artifacts: auto capture of project {project} stopped at the scan budget ({} entries / {} s) after {} entries; the rest waits for the next turn end",
-                    Budget::default().max_entries,
-                    Budget::default().max_time.as_secs(),
-                    report.visited
-                ),
-                Ok(_) => {}
-                Err(error) => eprintln!("artifacts: auto capture of project {project}: {error:#}"),
-            }
+        if let Some(scans) = &scans {
+            for (project, at_ms) in projects { scans.schedule(project, at_ms); }
         }
         let now_ms = Utc::now().timestamp_millis();
         if now_ms - last_prune_ms >= PRUNE_EVERY_MS {
@@ -279,8 +296,9 @@ pub fn record(store: &ArtifactStore, event: &TurnEvent, facts: &AgentFacts) -> a
         })?;
         return Ok(None);
     }
-    let project = store.window_ended(&event.session, event.at_ms)?;
-    Ok(project.or_else(|| facts.project.clone()))
+    let project = store.window_ended(&event.session, event.at_ms)?.or_else(|| facts.project.clone());
+    if let Some(project) = &project { store.note_capture_requested(project, event.at_ms)?; }
+    Ok(project)
 }
 
 /// Who most likely wrote a file last changed at `mtime_ms`.
@@ -691,6 +709,18 @@ mod tests {
     fn sorted(mut names: Vec<String>) -> Vec<String> {
         names.sort();
         names
+    }
+
+    #[test]
+    fn turn_event_batches_respect_capacity_and_expired_deadlines_without_reordering() {
+        let (sender, receiver) = mpsc::channel();
+        for value in 0..1000 { sender.send(value).unwrap(); }
+        let first = receiver.recv().unwrap();
+        let batch = event_batch(&receiver, first, Duration::from_secs(10), 256);
+        assert_eq!(batch, (0..256).collect::<Vec<_>>());
+        let first = receiver.recv().unwrap();
+        assert_eq!(event_batch(&receiver, first, Duration::ZERO, 256), vec![256]);
+        assert_eq!(receiver.recv().unwrap(), 257);
     }
 
     #[test]

@@ -49,7 +49,12 @@ fn fork_projection_preserves_account_but_never_copies_runtime_ownership() {
         .join(&id);
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("state.sqlite3"), b"fixture").unwrap();
-    let source = source(&target);
+    let mut source = source(&target);
+    source.avatar_mode = Some(crate::session::model::CutexSessionAvatarMode::Fixed);
+    source.avatar = Some(crate::session::model::CutexSessionAvatar {
+        kind: crate::session::model::CutexSessionAvatarKind::Emoji,
+        value: "F".into(), color: None,
+    });
     let thread = uuid::Uuid::new_v4().to_string();
     let native = uuid::Uuid::new_v4().to_string();
     let facts = json!({"threadId": thread, "nativeSessionId": native, "stateDir": target});
@@ -64,6 +69,15 @@ fn fork_projection_preserves_account_but_never_copies_runtime_ownership() {
     );
     assert!(fork.explicit_launch.is_none());
     assert_eq!(fork.profile, source.profile);
+    assert_eq!(fork.avatar, source.avatar);
+    assert_eq!(fork.avatar_mode, source.avatar_mode);
+    let mut following = source.clone();
+    following.avatar_mode = Some(crate::session::model::CutexSessionAvatarMode::Inherit);
+    following.profile = Some("target-profile".into());
+    let inherited = fork_record(&following, &id, "Following fork", &facts).unwrap();
+    assert!(inherited.avatar.is_none());
+    assert_eq!(inherited.avatar_mode, following.avatar_mode);
+    assert_eq!(inherited.profile, following.profile);
     let binding = fork.claude_session.unwrap();
     let original = source.claude_session.as_ref().unwrap();
     assert_eq!(binding.deployment, original.deployment);
@@ -78,6 +92,33 @@ fn fork_projection_preserves_account_but_never_copies_runtime_ownership() {
     let mut invalid = facts;
     invalid["threadId"] = json!(original.thread_id);
     assert!(fork_record(&source, &id, "Fork", &invalid).is_err());
+    std::fs::remove_dir_all(target).unwrap();
+}
+
+#[test]
+fn owner_fork_uses_new_creator_and_never_inherits_source_agent() {
+    use crate::session::model::{SessionCreatedBy, SessionCreatorRole};
+    let _home = crate::config::paths::test_home_env_lock();
+    let id = format!("cutex.{}", uuid::Uuid::new_v4());
+    let target = crate::config::paths::runtime_dir().unwrap().join("claude/sessions").join(&id);
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("state.sqlite3"), b"fixture").unwrap();
+    let mut source = source(&target);
+    let original_creator = SessionCreatedBy::Agent {
+        cutex_session_id: crate::role_revision::CutexSessionId::new("cutex.source-creator").unwrap(),
+        role: Some(SessionCreatorRole::Director),
+    };
+    source.created_by = Some(original_creator.clone());
+    let facts = json!({
+        "threadId": uuid::Uuid::new_v4().to_string(),
+        "nativeSessionId": uuid::Uuid::new_v4().to_string(),
+        "stateDir": target,
+    });
+    let fork = fork_record_with_creator(&source, &id, "Owner fork", &facts, Some(SessionCreatedBy::Owner)).unwrap();
+    assert_eq!(fork.created_by, Some(SessionCreatedBy::Owner));
+    assert_eq!(source.created_by, Some(original_creator));
+    let generic_fork = fork_record(&source, &id, "Unknown fork", &facts).unwrap();
+    assert!(generic_fork.created_by.is_none(), "generic projection must not copy source provenance");
     std::fs::remove_dir_all(target).unwrap();
 }
 

@@ -70,8 +70,9 @@ pub type OfflineHistoryEndpointOpener = fn(
     std::path::PathBuf,
 )>;
 pub type ManagementBootstrapStateLoader = fn(&str, u64) -> anyhow::Result<serde_json::Value>;
-/// A cutex session's `cutexState.latestPlan` (`launch::native_plan`); `null`
-/// when it has none or it cannot be derived (Claude sessions, other hosts).
+/// A cutex session's `cutexState.latestPlan` (`launch::native_plan`; Claude
+/// sessions: `management::v2::claude_plan`); `null` when it has none or it
+/// cannot be derived (other hosts).
 pub type ManagementLatestPlanLoader = fn(&str) -> serde_json::Value;
 /// A cutex session's `cutexState.latestTokenUsage`
 /// (`launch::native_token_usage`); `null` when it has none or it cannot be
@@ -83,6 +84,9 @@ pub type ManagementProjectAuthorityHandler =
     fn(crate::agent_management::ProjectAuthorityRequest) -> serde_json::Value;
 pub type ManagementLegacyDirectorOwnershipImportHandler =
     fn(crate::agent_management::LegacyDirectorOwnershipImportRequest) -> serde_json::Value;
+/// Owner abandon of an unfinished agent_create (design 028).
+pub type ManagementCreateAbandonHandler =
+    fn(crate::agent_management::CreateAbandonRequest) -> serde_json::Value;
 pub type ManagementAgentReservationReconciliationHandler =
     fn(crate::agent_management::AgentReservationReconciliationRequest) -> serde_json::Value;
 pub type HumanManagementProjectCollectionHandler = fn(
@@ -130,6 +134,7 @@ pub enum ManagementNativeForwardError {
 
 #[derive(Clone, Copy)]
 pub struct ManagementRequestContext {
+    pub owner_archive_action: crate::management::v2::archive::api::Handler,
     pub explicit_launch_action:
         fn(
             &crate::management::control_plane::HumanManagementPrincipal,
@@ -194,6 +199,7 @@ pub struct ManagementRequestContext {
     pub bind_project_authority: ManagementProjectAuthorityHandler,
     pub import_legacy_director_ownership: ManagementLegacyDirectorOwnershipImportHandler,
     pub reconcile_agent_reservation: ManagementAgentReservationReconciliationHandler,
+    pub abandon_agent_create: ManagementCreateAbandonHandler,
     pub list_management_projects: HumanManagementProjectCollectionHandler,
     pub read_management_project: HumanManagementProjectReadHandler,
     pub update_management_project_presentation: HumanManagementPresentationUpdateHandler,
@@ -213,6 +219,12 @@ struct ServerShared {
 }
 
 static SERVER: OnceLock<ServerShared> = OnceLock::new();
+
+/// Eager recovery hook, also shared by isolated process-startup tests.
+pub(crate) fn initialize_runtime_observation() -> anyhow::Result<()> {
+    crate::management::v2::repository::management_v2_repository()?;
+    crate::management::v2::native_events::start_stop_observer()
+}
 
 /// Single-address entry point (kept for callers that bind one address).
 #[allow(clippy::too_many_arguments)]
@@ -249,6 +261,9 @@ pub fn run_management_server_on(
     let allow_remote = agent_management_admin_token
         .as_deref()
         .is_some_and(|root| !root.trim().is_empty());
+    // Resume persisted stop observations before accepting any requests. Failure
+    // is startup failure, not a silently abandoned convergence obligation.
+    initialize_runtime_observation()?;
     if SERVER
         .set(ServerShared {
             token,
@@ -270,6 +285,12 @@ pub fn run_management_server_on(
     }
     if let Err(error) = crate::management::v2::summary::start(context) {
         eprintln!("host summary unavailable: {error:#}");
+    }
+    if let Err(error) = crate::management::v2::project_events::start() {
+        eprintln!("project events unavailable: {error:#}");
+    }
+    if let Err(error) = crate::management::v2::storage_cleanup::resume_default() {
+        eprintln!("storage cleanup recovery unavailable: {error:#}");
     }
     // Loopback listeners first so a slow Tailscale never delays them.
     let mut ordered: Vec<ListenSpec> = specs.iter().filter(|s| s.is_loopback()).cloned().collect();
@@ -343,13 +364,14 @@ fn serve_management_connection(mut stream: TcpStream, info: ConnectionInfo, slot
         ));
         crate::management::listeners::set_current_client_token(None);
         crate::management::users::set_current_principal(None);
-        let result = handle_parsed_management_request(
+        let result = handle_admitted_management_request(
             &mut stream,
             request,
             shared.token.as_deref(),
             shared.agent_management_admin_token.as_deref(),
             shared.context,
             Some(peer),
+            slot.as_mut(),
         );
         if let Err(error) = result {
             set_keep_alive(KeepAlive::Off);
@@ -397,13 +419,49 @@ pub fn handle_management_request(
         }
     };
     let peer = stream.peer_addr().ok();
-    handle_parsed_management_request(
+    handle_admitted_management_request(
         stream,
         request,
         token,
         agent_management_admin_token,
         context,
         peer,
+        None,
+    )
+}
+
+/// Dispatch after the exact same bounded admission used by the listener.
+/// A caller serving a counted connection passes its slot; one-shot callers
+/// still share the heavy-read queue without fabricating a listener slot.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_admitted_management_request(
+    stream: &mut TcpStream,
+    request: SimpleHttpRequest,
+    token: Option<&str>,
+    agent_management_admin_token: Option<&str>,
+    context: ManagementRequestContext,
+    peer: Option<std::net::SocketAddr>,
+    slot: Option<&mut ConnectionSlot>,
+) -> anyhow::Result<()> {
+    let _work = match crate::management::v2::control_capacity::admit_request(&request, slot) {
+        Ok(work) => work,
+        Err(refusal) => {
+            return write_capacity_refusal(stream, &refusal);
+        }
+    };
+    handle_parsed_management_request(
+        stream, request, token, agent_management_admin_token, context, peer,
+    )
+}
+
+pub(super) fn write_capacity_refusal(
+    stream: &mut TcpStream,
+    refusal: &crate::management::v2::control_capacity::AdmissionRefusal,
+) -> anyhow::Result<()> {
+    set_keep_alive(KeepAlive::Off);
+    crate::management::v2::server::write_v2_error(
+        stream, 503, "Service Unavailable", "heavy_read_capacity_exceeded",
+        refusal.reason.message(), true, refusal.details(),
     )
 }
 

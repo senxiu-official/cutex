@@ -21,6 +21,48 @@ pub struct ExportedSchema {
 }
 
 pub const SCHEMAS: &[ExportedSchema] = &[
+    super::archive::api::EXPORTED_SCHEMA,
+    ExportedSchema {
+        name: "guides-preferences", title: "Owner-user guide preferences",
+        routes: &["GET /v2/human/preferences/guides", "PUT /v2/human/preferences/guides"],
+        text: include_str!("schema/export/guides-preferences.json"),
+    },
+    ExportedSchema {
+        name: "image-input", title: "Busy image input policy and steering receipts",
+        routes: &["GET|PATCH /v2/settings imageInput", "GET /v2/sessions/{id}", "cutex/userInput/submit", "cutex/userInput/queue/steer"],
+        text: include_str!("schema/export/image-input.json"),
+    },
+    ExportedSchema {
+        name: "tool-action-receipt", title: "Bounded tool execution and read-only action receipts",
+        routes: &["MCP agent_create", "MCP agent_delegate", "MCP action_status"],
+        text: include_str!("schema/export/tool-action-receipt.json"),
+    },
+    ExportedSchema {
+        name: "profile-link", title: "Owner profile account linking",
+        routes: &["GET /v2/profile-link/secret", "PUT /v2/profile-link/secret", "DELETE /v2/profile-link/secret", "GET /v2/profiles", "GET /v2/profiles/{profile}", "PATCH /v2/profiles/{profile}"],
+        text: include_str!("schema/export/profile-link.json"),
+    },
+    super::director::EXPORTED_SCHEMA,
+    ExportedSchema {
+        name: "profile-relay-runtimes", title: "Profile provider interface addresses",
+        routes: &["GET /v2/profiles", "GET|PATCH /v2/profiles/{profile}", "POST /v2/profiles", "GET /v2/profile-presets", "GET /v2/capabilities profile-relay-runtimes"],
+        text: include_str!("schema/export/profile-relay-runtimes.json"),
+    },
+    ExportedSchema {
+        name: "storage-cleanup", title: "Owner desktop storage cleanup",
+        routes: &["POST /v2/storage/cleanups/preview", "POST /v2/storage/cleanups", "GET /v2/storage/cleanups", "GET /v2/storage/cleanups/{runId}"],
+        text: include_str!("schema/export/storage-cleanup.json"),
+    },
+    ExportedSchema {
+        name: "fork-preview", title: "Read-only fork preview",
+        routes: &["GET /v2/sessions/{id}/fork-preview?afterTurnId=&profile="],
+        text: include_str!("schema/export/fork-preview.json"),
+    },
+    ExportedSchema {
+        name: "storage", title: "Host storage",
+        routes: &["GET /v2/storage", "POST /v2/storage/refresh", "GET /v2/storage/stores/{id}/items"],
+        text: include_str!("schema/export/storage.json"),
+    },
     ExportedSchema {
         name: "browser", title: "Browser relay v1",
         routes: &["POST /v2/browser/devices/register", "GET /v2/browser/devices/{deviceId}/commands/stream", "POST /v2/browser/devices/{deviceId}/heartbeat", "POST /v2/browser/devices/{deviceId}/commands/{requestId}/result", "POST /v2/browser/leases/grant", "POST /v2/browser/leases/{leaseId}/activate|revoke", "POST /v2/browser/commands", "GET /v2/browser/commands/{requestId}", "POST /v2/browser/commands/{requestId}/cancel", "GET /v2/browser/agents", "GET /v2/browser/turn-shots?sessionId=&turnId=", "GET /v2/browser/turn-shots/{shotId}", "GET /v2/browser/tool-item?sessionId=&turnId=&itemId=", "GET|PATCH /v2/settings browser", "PATCH /v2/profiles/{id} browserTools"],
@@ -40,6 +82,21 @@ pub const SCHEMAS: &[ExportedSchema] = &[
             "SSE cutex_management_stream_error",
         ],
         text: include_str!("schema/export/error.json"),
+    },
+    ExportedSchema {
+        name: "profile-runtime-variants",
+        title: "Profile runtime variants and stored credentials",
+        routes: &[
+            "GET /v2/profiles (items)",
+            "GET|PATCH /v2/profiles/{p}",
+            "POST /v2/profiles (kind dsh: apiKey, credential; kind kimi: kimiAccount)",
+            "POST /v2/profiles/{p}/variants",
+            "PATCH|DELETE /v2/profiles/{p}/variants/{v}",
+            "POST /v2/human/agents variantId",
+            "POST /v2/human/sessions variantId",
+            "session resource launchBinding",
+        ],
+        text: include_str!("schema/export/profile-runtime-variants.json"),
     },
     ExportedSchema {
         name: "sessions",
@@ -73,6 +130,17 @@ pub const SCHEMAS: &[ExportedSchema] = &[
         text: include_str!("schema/export/approvals.json"),
     },
     ExportedSchema {
+        name: "approval-rules",
+        title: "Owner automatic approval rules",
+        routes: &[
+            "GET|POST /v2/approval-rules",
+            "PATCH|DELETE /v2/approval-rules/{id}",
+            "POST /v2/approval-rules/confirm",
+            "GET /v2/approval-rules/audit",
+        ],
+        text: include_str!("schema/export/approval-rules.json"),
+    },
+    ExportedSchema {
         name: "asks",
         title: "Asks (delegations)",
         routes: &["GET /v2/asks", "GET /v2/asks/{id}"],
@@ -93,6 +161,17 @@ pub const SCHEMAS: &[ExportedSchema] = &[
             "POST /v2/summary/read",
         ],
         text: include_str!("schema/export/summary.json"),
+    },
+    ExportedSchema {
+        name: "project-events",
+        title: "Project log",
+        routes: &[
+            "GET /v2/projects/{projectId}/events",
+            "GET /v2/projects/{projectId}/events/stream",
+            "GET /v2/projects/{projectId}/background",
+            "host event cutex/projectEvents/appended",
+        ],
+        text: include_str!("schema/export/project-events.json"),
     },
     ExportedSchema {
         name: "pair",
@@ -156,6 +235,23 @@ pub const SCHEMAS: &[ExportedSchema] = &[
         ],
         text: include_str!("schema/export/claude-accounts.json"),
     },
+    ExportedSchema {
+        name: "kimi-accounts",
+        title: "Kimi accounts",
+        routes: &[
+            "GET /v2/kimi/accounts",
+            "POST /v2/kimi/accounts",
+            "GET /v2/kimi/accounts/{id}",
+            "PATCH /v2/kimi/accounts/{id}",
+            "DELETE /v2/kimi/accounts/{id}",
+            "POST /v2/kimi/accounts/{id}/login",
+            "GET /v2/kimi/accounts/{id}/login/{loginId}",
+            "DELETE /v2/kimi/accounts/{id}/login/{loginId}",
+            "POST /v2/kimi/accounts/{id}/logout",
+            "POST /v2/kimi/accounts/{id}/status",
+        ],
+        text: include_str!("schema/export/kimi-accounts.json"),
+    },
     super::owner_rotation_api::EXPORTED_SCHEMA,
     super::artifact_store::EXPORTED_SCHEMA,
     super::host_info::EXPORTED_SCHEMA,
@@ -167,13 +263,15 @@ pub const SCHEMAS: &[ExportedSchema] = &[
     super::clients_api::EXPORTED_SCHEMA,
     ExportedSchema {
         name: "services",
-        title: "Services, viewing tickets and leases",
+        title: "Services, viewing tickets, leases and tiles",
         routes: &[
             "GET /v2/services",
             "GET /v2/services/{slug}",
+            "GET /v2/services/{slug}/eligible-owners",
             "POST /v2/services/{slug}/view-ticket",
             "POST /v2/services/{slug}/lease",
             "POST|DELETE /v2/services/{slug}/lease/{leaseId}",
+            "GET /v2/services/{slug}/tile",
         ],
         text: include_str!("schema/export/services.json"),
     },
@@ -305,6 +403,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn guides_and_creation_provenance_schemas_match_the_additive_contract() {
+        for creator in [Value::Null, json!({"kind":"owner"}), json!({"kind":"system"}),
+            json!({"kind":"agent","cutexSessionId":"cutex.director","role":"director"}),
+            json!({"kind":"agent","cutexSessionId":"cutex.member","role":"member"})] {
+            assert_valid("sessions", "sessionCreatedBy", &creator);
+        }
+        assert!(!validator("sessions", "sessionCreatedBy").unwrap().is_valid(&json!({"kind":"agent","role":"director"})));
+        assert!(!validator("sessions", "sessionCreatedBy").unwrap().is_valid(&json!({"kind":"owner","role":"director"})));
+        assert_valid("guides-preferences", "guidesPreference", &json!({"schema":1,"skippedThrough":null,"updatedAt":null}));
+        assert_valid("guides-preferences", "guidesPreferencePut", &json!({"schema":1,"skippedThrough":"0.2.0","future":true}));
+        assert!(!validator("guides-preferences", "guidesPreferencePut").unwrap().is_valid(&json!({"schema":2,"skippedThrough":null})));
+    }
+
+    #[test]
+    fn full_avatar_style_schema_matches_canonical_profile_values() {
+        let contract = validator("profile-link", "avatarStyle").unwrap();
+        for value in [
+            Value::Null,
+            json!({"kind":"portrait","portraitThemes":["uninstalled/theme"]}),
+            json!({"kind":"emoji","emojiThemes":null}),
+            json!({"kind":"emoji","emojiThemes":["sea","cats"]}),
+            json!({"kind":"letter"}),
+        ] {
+            assert!(contract.is_valid(&value), "{value}");
+        }
+        for invalid in [
+            json!({"kind":"portrait","portraitThemes":["../theme"]}),
+            json!({"kind":"portrait","portraitThemes":[]}),
+            json!({"kind":"emoji"}), json!({"kind":"emoji","emojiThemes":["unknown"]}),
+            json!({"kind":"letter","portraitThemes":["pack/theme"]}),
+        ] {
+            assert!(!contract.is_valid(&invalid), "{invalid}");
+        }
+    }
+
+    #[test]
     fn browser_schema_snapshot_and_strict_owner_model_boundaries() {
         use sha2::{Digest,Sha256};
         let schema=SCHEMAS.iter().find(|s|s.name=="browser").unwrap();
@@ -319,6 +453,36 @@ mod tests {
         assert_valid("browser","deviceResult",&json!({"dispatchSeq":1,"target":{"hostId":"local","deviceId":"d","guestId":"g"},"operationKind":"tab.snapshot","status":"succeeded","metadataOnly":true}));
         assert_valid("browser","settings",&json!({"agentOpenApproval":"off","heartbeatMs":10000,"offlineMs":30000,"leaseIdleSecs":1800,"imageRetainSecs":120,"imageRetainBytes":67108864}));
         assert_valid("browser","profilePatch",&json!({"browserTools":false}));
+    }
+
+    #[test]
+    fn profile_relay_runtimes_schema_snapshot_matches_real_profiles_and_presets() {
+        use sha2::{Digest, Sha256};
+        let schema = SCHEMAS.iter().find(|s| s.name == "profile-relay-runtimes").unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(schema.text.as_bytes())), "b91254fa4b9e3890d2d6e94ba4b9c50634b12de3440d333eb1e7b505004be844");
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        for body in [
+            json!({"name":"ds","kind":"apiKey","preset":"deepseek"}),
+            json!({"name":"ds relay","kind":"apiKey","preset":"deepseek","baseUrl":"https://relay.example/v1"}),
+            json!({"name":"gpt","kind":"chatgpt"}),
+            json!({"name":"dsh","kind":"dsh","interfaceBaseUrls":{"deepseekNative":"https://api.deepseek.com/anthropic"}}),
+            // profile-relay-runtimes wiring: relay addresses for DSH and Kimi Code.
+            json!({"name":"dsh relay","kind":"dsh","interfaceBaseUrls":{"deepseekNative":"https://relay.example/anthropic"}}),
+            json!({"name":"ds relay dsh","kind":"apiKey","preset":"deepseek","baseUrl":"https://relay.example/v1",
+                "interfaceBaseUrls":{"deepseekNative":"https://relay.example/anthropic"}}),
+            json!({"name":"relay_profile","kind":"apiKey","preset":"moonshot","baseUrl":"https://relay.example/v1"}),
+        ] {
+            let created = super::super::profiles_api::create_from_body(&serde_json::to_vec(&body).unwrap()).unwrap();
+            assert_valid("profile-relay-runtimes", "profileFields", &created["profile"]);
+        }
+        for preset in crate::profiles::providers::presets_json().as_array().unwrap() {
+            assert_valid("profile-relay-runtimes", "presetFields", preset);
+        }
+        assert_valid("profile-relay-runtimes", "interfaceBaseUrlsWrite", &json!({"interfaceBaseUrls":{"deepseekNative":null}}));
+        assert_valid("profile-runtime-variants", "variantCreate", &json!({"runtime":"dsh","baseUrl":"https://relay.example/anthropic"}));
+        assert_valid("profile-runtime-variants", "variantPatch", &json!({"baseUrl":null}));
+        assert!(!validator("profile-relay-runtimes", "interfaceBaseUrlsWrite").unwrap()
+            .is_valid(&json!({"interfaceBaseUrls":{"chatgptLogin":"https://x.example"}})));
     }
 
     #[test]
@@ -342,6 +506,27 @@ mod tests {
             for definition in value["$defs"].as_object().unwrap().keys() {
                 validator(schema.name, definition).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn ask_handover_view_fields_are_exported_optional_and_match_real_views(){
+        use crate::asks::{model::route::{pin,Pin},store::{AskState,tests::new_ask}};
+        let mut state=AskState::default();
+        let (ask,_)=state.create_ask(new_ask("handover-schema","brief"),chrono::Utc::now()).unwrap();
+        let schema:Value=serde_json::from_str(SCHEMAS.iter().find(|s|s.name=="asks").unwrap().text).unwrap();
+        for shape in [&schema["$defs"]["askSummary"],&schema["$defs"]["askDetail"]["properties"]["ask"]]{
+            for field in ["controller","originallyRequestedBy","controlError","controlHistorical"]{
+                assert!(shape["properties"].get(field).is_some(),"exported property {field}");
+                assert!(!shape["required"].as_array().is_some_and(|required|required.iter().any(|value|value==field)),"old records need no {field}");
+            }
+        }
+        for controller in [Ok(Some("new-director".into())),Err("handover_pending_review")]{
+            pin(&ask.ask_id,Pin{controller,history:vec![],questions:None});
+            let summary=crate::asks::view::summary(&state,&ask);
+            assert_valid("asks","askSummary",&summary);
+            assert_valid("asks","askDetail",&json!({"ask":crate::asks::view::owner_view(&state,&ask)}));
+            assert!(summary.get("controller").is_some() && summary.get("originallyRequestedBy").is_some());
         }
     }
 
@@ -480,6 +665,10 @@ mod tests {
                 ended_at: None,
                 end: None,
             }),
+            risk: Some(crate::approvals::ApprovalRisk::Medium),
+            matched_rule_id: None,
+            auto_decision: false,
+            rule_revision: None,
         };
         assert_valid(
             "approvals",

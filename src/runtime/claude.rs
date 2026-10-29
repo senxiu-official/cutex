@@ -21,6 +21,7 @@ use crate::session::store::{
     cutex_sessions_path, with_locked_session_rows,
 };
 
+pub mod fork_history;
 pub mod permission_rules;
 pub mod code_sources;
 pub mod skill_catalog;
@@ -418,6 +419,13 @@ pub fn create(
 /// `allow_write` / `allow_exec`: Some = set for this session, None = follow the
 /// profile's rule (resolved again at every start, see [`effective_tools`]).
 pub fn create_profile(name:&str,cwd:&Path,model:&str,allow_write:Option<bool>,allow_exec:Option<bool>,profile:Option<String>,managed:bool,effort:Option<crate::profiles::appearance::ClaudeEffort>)->anyhow::Result<CutexSessionRecord> {
+    create_profile_with_creator(name,cwd,model,allow_write,allow_exec,profile,managed,effort,None)
+}
+
+/// The actor is supplied only by an authorized new-session path; imports and
+/// legacy callers keep None. Stamped before the first session row is persisted.
+#[allow(clippy::too_many_arguments)]
+pub fn create_profile_with_creator(name:&str,cwd:&Path,model:&str,allow_write:Option<bool>,allow_exec:Option<bool>,profile:Option<String>,managed:bool,effort:Option<crate::profiles::appearance::ClaudeEffort>,created_by:Option<crate::session::model::SessionCreatedBy>)->anyhow::Result<CutexSessionRecord> {
     ensure!(
         !name.trim().is_empty()
             && name.trim() == name
@@ -459,6 +467,7 @@ pub fn create_profile(name:&str,cwd:&Path,model:&str,allow_write:Option<bool>,al
         cwd.to_string_lossy().into_owned(),
         None,
     )?;
+    record.stamp_created_by_at_creation(created_by.as_ref())?;
     record.runtime_backend = CutexSessionRuntimeBackend::ClaudeSubscription;
     record.formal_agent_name = managed.then(||name.into());
     record.thread_name = Some(name.into());
@@ -622,25 +631,6 @@ pub fn safety_blocks(id: &str) -> anyhow::Result<Vec<Value>> {
     Ok(listed["data"].as_array().cloned().unwrap_or_default())
 }
 
-/// Optional per-profile native Claude settings. These are environment overrides,
-/// independent of SDK filesystem setting_sources and of the shared login home.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClaudeProfileRuntime {
-    auto_compact_window: u32,
-    auto_compact_percent: u8,
-}
-impl ClaudeProfileRuntime {
-    fn apply(&self, command: &mut Command) -> anyhow::Result<()> {
-        ensure!((100_000..=1_000_000).contains(&self.auto_compact_window),
-            "Claude auto_compact_window must be 100000..1000000 tokens");
-        ensure!((1..=100).contains(&self.auto_compact_percent),
-            "Claude auto_compact_percent must be 1..100");
-        command.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", self.auto_compact_window.to_string())
-            .env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", self.auto_compact_percent.to_string());
-        Ok(())
-    }
-}
 /// Applies the profile's native runtime overrides and returns its
 /// AskUserQuestion mode and file checkpointing policy (default on).
 fn apply_profile_runtime(record: &CutexSessionRecord, command: &mut Command) -> anyhow::Result<(AgentTurnQuestions, bool)> {
@@ -652,16 +642,15 @@ fn apply_profile_runtime(record: &CutexSessionRecord, command: &mut Command) -> 
         .context("Claude launch profile missing")?;
     let questions = account.options.agent_turn_questions.unwrap_or_default();
     let checkpointing = account.options.claude_file_checkpointing.unwrap_or(default_checkpointing);
-    let path = crate::profiles::materialize::materialized_profiles_dir()?
-        .join(&account.id).join("claude-runtime.json");
-    let raw = match std::fs::read(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((questions, checkpointing)),
-        Err(e) => return Err(e).with_context(|| format!("Read Claude profile runtime {}", path.display())),
-    };
-    let settings: ClaudeProfileRuntime = serde_json::from_slice(&raw)
-        .with_context(|| format!("Invalid Claude profile runtime {}", path.display()))?;
-    settings.apply(command)?;
+    // claude-compaction: `claude-runtime.json` (profiles/claude_compaction.rs).
+    if let Some(settings) = crate::profiles::claude_compaction::read_id(&account.id)? {
+        command.envs(settings.envs());
+    }
+    // claude-compaction-models: the per-model table for the adapter (claude-r24+; older ones ignore it).
+    if let Some(table) = crate::profiles::claude_compaction::read_models_id(&account.id)? {
+        command.env(crate::profiles::claude_compaction::MODELS_ENV,
+            crate::profiles::claude_compaction::models_json(&table).to_string());
+    }
     Ok((questions, checkpointing))
 }
 
@@ -808,17 +797,25 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
     // key only to this session's Claude Code process.
     let api_config = session.state_dir.join(super::claude_accounts::API_ACCOUNT_CONFIG_FILE);
     match super::claude_accounts::api_launch_config(&session.deployment.claude_home)? {
-        Some(config) => {
+        Some(mut config) => {
             ensure!(
                 features["apiAccounts"] == true,
                 "this session's Claude account is an API account; its adapter does not declare features.apiAccounts (needs claude-r7 or newer: cutex human claude repin)"
             );
+            // r265 key rotation: this runtime keeps the key it started with.
+            // The adapter's key helper re-reads `keyFile`, so point it at a
+            // per-launch private copy instead of the account's mutable file.
+            super::claude_accounts::bind_launch_key(&mut config, &session.state_dir)?;
             write_private_pretty_json_atomic(&api_config, &config, "Claude API account")?;
             command.arg("--api-account-config").arg(&api_config);
         }
         None => {
             if api_config.exists() {
                 std::fs::remove_file(&api_config)?;
+            }
+            let bound = session.state_dir.join(super::claude_accounts::BOUND_API_KEY_FILE);
+            if bound.exists() {
+                std::fs::remove_file(&bound)?;
             }
         }
     }
@@ -983,12 +980,14 @@ pub fn start(id: &str) -> anyhow::Result<Value> {
 }
 
 pub fn start_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Result<Value> {
+    let lane = crate::management::v2::user_input::session_input_lock(id)?;
+    let _operation = lane.reserve()?;
     let initial = record(id)?;
     let _lock = lock(initial.claude_session.as_ref().unwrap())?;
     let record = record(id)?;
     check_generation(&record, expected_generation)?;
     ensure!(
-        !record.is_retired(),
+        !crate::agent_management::agent_execution_blocked(&record),
         "restore the archived agent before starting it"
     );
     // A re-pin requested while the session was online takes effect here,
@@ -1102,10 +1101,15 @@ pub fn close(id: &str) -> anyhow::Result<Value> {
 }
 
 pub fn close_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Result<Value> {
+    let lane = crate::management::v2::user_input::session_input_lock(id)?;
+    let _operation = lane.reserve()?;
     let initial = record(id)?;
     let _lock = lock(initial.claude_session.as_ref().unwrap())?;
     let record = record(id)?;
-    check_generation(&record, expected_generation)?;
+    check_generation(&record, expected_generation.or(Some(initial.runtime_generation)))?;
+    ensure!(record.claude_session == initial.claude_session,
+        "Claude configuration changed before close; owner unchanged");
+    crate::session::runtime_stop::RequestedStop::run(id, record.runtime_generation, || {
     let session = record.claude_session.as_ref().unwrap();
     if record.runtime_pid.is_none() {
         return Ok(json!({"threadId":session.thread_id,"state":"offline"}));
@@ -1144,7 +1148,9 @@ pub fn close_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
     let path = cutex_sessions_path()?;
     crate::session::store::update_session_row(&path, id, |current| {
         ensure!(
-            current.claude_session.as_ref() == Some(session),
+            current.claude_session.as_ref() == Some(session)
+                && current.runtime_generation == record.runtime_generation
+                && current.runtime_pid == record.runtime_pid,
             "Claude configuration changed during close; reload this session"
         );
         current.runtime_pid = None;
@@ -1155,6 +1161,7 @@ pub fn close_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
     .context("session removed during close")?;
     client.handle().request("claude/server/shutdown", json!({"runtimeId":ready.runtime_id}))?;
     Ok(status)
+    }, |_| true)
 }
 
 /// Clear the runtime claim of a Claude session whose recorded adapter is
@@ -1200,6 +1207,14 @@ pub(crate) fn clear_dead_adapter_claim(
 /// offline, so its stale claim is cleared and it stops being observed.
 /// Skipped while a Start / Close holds the controller lock.
 pub fn reconcile_dead_adapter(id: &str) -> anyhow::Result<bool> {
+    let lane = crate::management::v2::user_input::session_input_lock(id)?;
+    let _operation = match lane.try_lock() {
+        Ok(reservation) => reservation,
+        // Observer callbacks must not block a lifecycle operation that joins
+        // them. The next observer poll retries reconciliation.
+        Err(crate::management::v2::session_coordination::ReservationError::WouldBlock) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     let initial = record(id)?;
     let Some(pid) = initial.runtime_pid else {
         return Ok(false);
@@ -1343,12 +1358,28 @@ pub struct ClaudeObservation {
     pub diagnostic_path: PathBuf,
 }
 
+/// A confirmed inactive occurrence must wait for Start or a new runtime identity,
+/// rather than repeatedly probing a stale cached session claim.
+#[derive(Debug)]
+pub enum ClaudeObservationOffline {
+    RuntimeOffline,
+    OccurrenceOffline,
+}
+impl std::fmt::Display for ClaudeObservationOffline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RuntimeOffline => "Claude runtime is offline",
+            Self::OccurrenceOffline => "Claude native occurrence is not online",
+        })
+    }
+}
+impl std::error::Error for ClaudeObservationOffline {}
+
 pub fn observation(id: &str) -> anyhow::Result<ClaudeObservation> {
     let record = record(id)?;
-    ensure!(
-        !record.is_retired() && record.runtime_pid.is_some(),
-        "Claude runtime is offline"
-    );
+    if crate::agent_management::agent_execution_blocked(&record) || record.runtime_pid.is_none() {
+        return Err(ClaudeObservationOffline::RuntimeOffline.into());
+    }
     let session = record.claude_session.as_ref().unwrap();
     let (client, ready) = connect(session)?;
     let status = client.handle().request(
@@ -1356,14 +1387,7 @@ pub fn observation(id: &str) -> anyhow::Result<ClaudeObservation> {
         json!({"threadId":session.thread_id}),
     )?;
     validate_status(session, &status)?;
-    ensure!(
-        matches!(
-            status["state"].as_str(),
-            Some("waiting" | "working" | "interrupting")
-        ) && status["connectionId"].as_str() == session.connection_id.as_deref()
-            && record.runtime_pid == Some(ready.pid),
-        "Claude native occurrence is not online"
-    );
+    validate_observation_occurrence(session.connection_id.as_deref(), record.runtime_pid, ready.pid, &status)?;
     let endpoint = AppServerEndpoint::LoopbackWebSocket {
         url: ready.endpoint,
         bearer_token: Some(
@@ -1396,6 +1420,26 @@ pub fn observation(id: &str) -> anyhow::Result<ClaudeObservation> {
         diagnostic_path: session.state_dir.join("management-events.jsonl"),
         record,
     })
+}
+
+fn validate_observation_occurrence(
+    connection_id: Option<&str>, recorded_pid: Option<u32>, adapter_pid: u32, status: &Value,
+) -> anyhow::Result<()> {
+    // Reconnect only the recorded occurrence, never adopt a replacement.
+    if status["connectionId"].as_str() != connection_id || recorded_pid != Some(adapter_pid) {
+        return Err(ClaudeObservationOffline::OccurrenceOffline.into());
+    }
+    match status["state"].as_str() {
+        Some("waiting" | "working" | "interrupting") => Ok(()),
+        // The SDK can replace a failed child under this same adapter lease.
+        // Suspending here permanently strands a recovered, still-live runtime:
+        // the observer only reactivates a suspended entry on identity change.
+        Some("starting" | "reconnecting") => anyhow::bail!(
+            "Claude native occurrence is temporarily {}: {}",
+            status["state"].as_str().unwrap(), status["lastError"].as_str().unwrap_or("recovery in progress")
+        ),
+        _ => Err(ClaudeObservationOffline::OccurrenceOffline.into()),
+    }
 }
 
 pub fn attach(id: &str) -> anyhow::Result<()> {attach_status(id).map(|_|())}
@@ -1459,6 +1503,38 @@ pub fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observer_retries_transient_recovery_without_losing_the_occurrence_fence() {
+        use super::*;
+        use crate::management::v2::claude_observer::{ObserverState, RuntimeIdentity};
+        let identity = RuntimeIdentity { generation: 16, pid: 42, connection_id: Some("same".into()) };
+        let now = std::time::Instant::now();
+        let mut schedule = ObserverState::default();
+        schedule.activate("agent", identity.clone(), now);
+        for state in ["starting", "reconnecting"] {
+            let status = json!({"state":state,"connectionId":"same","lastError":"socket reset"});
+            let error = validate_observation_occurrence(Some("same"), Some(42), 42, &status).unwrap_err();
+            assert!(error.downcast_ref::<ClaudeObservationOffline>().is_none(), "transient recovery must not suspend observation");
+            assert!(error.to_string().contains("socket reset"));
+            schedule.complete("agent", &identity, Some(("observe", &error.to_string())), now);
+        }
+        let later = now + Duration::from_secs(10);
+        assert!(schedule.due("agent", later));
+        let recovered = json!({"state":"waiting","connectionId":"same"});
+        validate_observation_occurrence(Some("same"), Some(42), 42, &recovered).unwrap();
+        schedule.complete("agent", &identity, None, later);
+        assert_eq!(schedule.snapshot(later)["sessions"][0]["state"], "observing");
+        for status in [
+            json!({"state":"closed","connectionId":"same"}),
+            json!({"state":"reconnecting","connectionId":"different"}),
+        ] {
+            assert!(validate_observation_occurrence(Some("same"), Some(42), 42, &status)
+                .unwrap_err().downcast_ref::<ClaudeObservationOffline>().is_some());
+        }
+        assert!(validate_observation_occurrence(Some("same"), Some(41), 42, &recovered)
+            .unwrap_err().downcast_ref::<ClaudeObservationOffline>().is_some());
+    }
+
     #[test]
     fn approval_wait_only_for_adapters_that_declare_it() {
         let path = std::path::Path::new("/x/cutex-mcp");
@@ -1709,20 +1785,20 @@ mod tests {
 
     #[test]
     fn profile_compaction_validates_and_passes_native_environment() {
-        let settings: ClaudeProfileRuntime = serde_json::from_str(
+        use crate::profiles::claude_compaction::ClaudeCompaction;
+        let settings: ClaudeCompaction = serde_json::from_str(
             r#"{"auto_compact_window":300000,"auto_compact_percent":80}"#).unwrap();
+        settings.validate().unwrap();
         let mut command = Command::new("unused-test-command");
-        settings.apply(&mut command).unwrap();
+        command.envs(settings.envs());
         let env: std::collections::BTreeMap<_, _> = command.get_envs()
             .map(|(k,v)| (k.to_str().unwrap(),v.unwrap().to_str().unwrap())).collect();
         assert_eq!(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "300000");
         assert_eq!(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "80");
         for (window,percent) in [(99999,80),(1000001,80),(300000,0),(300000,101)] {
-            assert!(ClaudeProfileRuntime { auto_compact_window:window, auto_compact_percent:percent }
-                .apply(&mut command).is_err());
+            assert!(ClaudeCompaction { auto_compact_window:window, auto_compact_percent:percent }.validate().is_err());
         }
     }
-
 
     #[test]
     fn checkpointing_flag_defaults_on_and_is_compatible_with_old_adapters() {

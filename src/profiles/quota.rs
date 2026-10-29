@@ -28,6 +28,13 @@ pub struct Config {
     /// stale gauge. Absent = false (older binaries keep it in `extra`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub optional: bool,
+    /// The label shown to people (any printable text, at most
+    /// [`DISPLAY_LABEL_COLUMNS`] columns, CJK = 2, e.g. 「余额」). `label`
+    /// stays the 1–6 ASCII letters/digits every release validates when it
+    /// reads a quota (r249 / r250 would fail the gauge on a non-ASCII
+    /// `label`); they keep this field in `extra` and show `label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
     /// Fields a newer cutex wrote (kept on save; persistence is not
     /// `deny_unknown_fields`, RFC backend-auto-update §6.2).
     #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
@@ -227,22 +234,59 @@ impl Default for Config {
             reset_format: ResetFormat::Rfc3339,
             window_label: None,
             optional: false,
+            display_label: None,
             extra: Default::default(),
         }
     }
 }
+/// Display width limit of [`Config::display_label`] (CJK characters count 2).
+pub const DISPLAY_LABEL_COLUMNS: usize = 6;
+
+fn ascii_label(label: &str) -> bool {
+    !label.is_empty() && label.len() <= 6 && label.bytes().all(|c| c.is_ascii_alphanumeric())
+}
+
 impl Config {
+    /// Make a client's labels storable: a non-ASCII `label` without a
+    /// `display_label` becomes the display label; an empty display label is
+    /// none; `label` (when not 1–6 ASCII letters/digits) is derived from the
+    /// display label's ASCII letters/digits, else `Q` (a reader's default
+    /// label replaces `Q` when resolved).
+    pub fn normalize_labels(&mut self) {
+        if self.display_label.is_none() && !ascii_label(&self.label) && !self.label.trim().is_empty() {
+            self.display_label = Some(self.label.clone());
+        }
+        self.display_label = self.display_label.take().map(|text| text.trim().to_string()).filter(|text| !text.is_empty());
+        if let Some(display) = &self.display_label {
+            if !ascii_label(&self.label) {
+                let derived: String = display.chars().filter(char::is_ascii_alphanumeric).take(6).collect();
+                self.label = if derived.is_empty() { "Q".into() } else { derived };
+            }
+        }
+    }
+
+    /// What people see: the display label, else `label`.
+    pub fn shown_label(&self) -> &str {
+        self.display_label.as_deref().unwrap_or(&self.label)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(
             (10..=86400).contains(&self.refresh_seconds),
             "Refresh interval must be 10–86400 seconds"
         );
         ensure!(
-            !self.label.is_empty()
-                && self.label.len() <= 6
-                && self.label.bytes().all(|c| c.is_ascii_alphanumeric()),
-            "Quota label must be 1–6 ASCII letters/digits"
+            ascii_label(&self.label),
+            "Quota label must be 1–6 ASCII letters/digits (use display_label for other text)"
         );
+        if let Some(display) = &self.display_label {
+            ensure!(
+                !display.trim().is_empty()
+                    && unicode_width::UnicodeWidthStr::width(display.as_str()) <= DISPLAY_LABEL_COLUMNS
+                    && !display.chars().any(char::is_control),
+                "Display label must be 1–{DISPLAY_LABEL_COLUMNS} columns of printable text (CJK characters count 2)"
+            );
+        }
         if let Some(window) = &self.window_label {
             ensure!(
                 !window.trim().is_empty()
@@ -975,6 +1019,8 @@ pub const MAX_EXTRA_QUOTAS: usize = 8;
 pub struct Gauge {
     pub id: String,
     pub label: String,
+    /// The quota's `display_label` (show it instead of `label` when set).
+    pub display_label: Option<String>,
     /// `window` (percentage with optional reset) or `balance`.
     pub kind: &'static str,
     pub remaining_percent: Option<f64>,
@@ -1078,6 +1124,7 @@ fn gauges_in(
         Ok(d) => Gauge {
             id,
             label: d.label,
+            display_label: c.display_label.clone(),
             kind: gauge_kind(c),
             remaining_percent: d.remaining_percent,
             balance: d.balance,
@@ -1092,6 +1139,7 @@ fn gauges_in(
         Err(error) => Gauge {
             id,
             label: c.label.clone(),
+            display_label: c.display_label.clone(),
             kind: gauge_kind(c),
             remaining_percent: None,
             balance: None,
@@ -1189,6 +1237,9 @@ pub fn update_config(
     preset.apply(&mut candidate);
     candidate.options.quota = primary;
     candidate.options.quotas = extras;
+    for config in std::iter::once(&mut candidate.options.quota).chain(candidate.options.quotas.iter_mut()) {
+        config.normalize_labels();
+    }
     // Primary: an enabled reader is checked through its resolution (the
     // stored URL may legitimately be empty); otherwise validate as stored.
     if candidate.options.quota.enabled {
@@ -1270,7 +1321,8 @@ pub fn command(
         .find(|a| a.id == profile || a.name == profile)
         .context("Profile not found")?;
     if let Some(file) = file {
-        let c: Config = serde_json::from_slice(&std::fs::read(file)?)?;
+        let mut c: Config = serde_json::from_slice(&std::fs::read(file)?)?;
+        c.normalize_labels();
         c.validate()?;
         a.options.quota = c;
     }
@@ -1288,6 +1340,134 @@ pub fn command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_labels_take_printable_text_up_to_six_columns() {
+        let with = |display: &str| Config { label: "DS".into(), display_label: Some(display.into()), ..Config::default() };
+        for ok in ["余额", "DS ¥88", "余额ab", "残高", "Solde"] {
+            assert!(with(ok).validate().is_ok(), "{ok}");
+        }
+        for bad in ["余额余额", "1234567", " ", "a\u{7}b", "余\n额"] {
+            assert!(with(bad).validate().is_err(), "{bad:?}");
+        }
+        // `label` itself stays ASCII (r249 / r250 validate it on every read).
+        let ascii = Config { label: "余额".into(), ..Config::default() };
+        assert!(ascii.validate().is_err());
+    }
+
+    #[test]
+    fn labels_normalize_to_an_ascii_label_and_a_display_label() {
+        let normalized = |label: &str, display: Option<&str>| {
+            let mut c = Config { label: label.into(), display_label: display.map(str::to_string), ..Config::default() };
+            c.normalize_labels();
+            (c.label, c.display_label)
+        };
+        // A non-ASCII label moves to the display label.
+        assert_eq!(normalized("余额", None), ("Q".into(), Some("余额".into())));
+        assert_eq!(normalized("DS余额", None), ("DS".into(), Some("DS余额".into())));
+        // Only a display label: `label` derived from its ASCII letters/digits.
+        assert_eq!(normalized("", Some(" DS ¥88 ")), ("DS88".into(), Some("DS ¥88".into())));
+        // Both given: kept; an empty display label is none.
+        assert_eq!(normalized("DS", Some("余额")), ("DS".into(), Some("余额".into())));
+        assert_eq!(normalized("DS", Some("")), ("DS".into(), None));
+        assert_eq!(normalized("Q", None), ("Q".into(), None));
+        let c = Config { display_label: Some("余额".into()), ..Config::default() };
+        assert_eq!((c.shown_label(), Config::default().shown_label()), ("余额", "Q"));
+    }
+
+    /// The quota config as r249 (b54585c) and r250 (6be946d) define it: no
+    /// `display_label`, unknown fields kept in `extra`, `label` checked by
+    /// `validate()` whenever a quota is read.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(default)]
+    struct R249Config {
+        enabled: bool,
+        url: String,
+        auth: Auth,
+        label: String,
+        refresh_seconds: u64,
+        mode: Mode,
+        value_pointer: String,
+        limit_pointer: String,
+        reset_pointer: String,
+        reset_format: ResetFormat,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        window_label: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optional: bool,
+        #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+        extra: serde_json::Map<String, serde_json::Value>,
+    }
+    impl Default for R249Config {
+        fn default() -> Self {
+            let c = Config::default();
+            Self {
+                enabled: c.enabled,
+                url: c.url,
+                auth: c.auth,
+                label: c.label,
+                refresh_seconds: c.refresh_seconds,
+                mode: c.mode,
+                value_pointer: c.value_pointer,
+                limit_pointer: c.limit_pointer,
+                reset_pointer: c.reset_pointer,
+                reset_format: c.reset_format,
+                window_label: c.window_label,
+                optional: c.optional,
+                extra: c.extra,
+            }
+        }
+    }
+
+    #[test]
+    fn an_r249_reader_keeps_the_display_label_and_still_validates_the_label() {
+        let mut current = Config { enabled: true, url: "https://api.example.com/balance".into(), label: "余额".into(), mode: Mode::Balance, ..Config::default() };
+        current.normalize_labels();
+        current.validate().unwrap();
+        let stored = serde_json::to_value(&current).unwrap();
+        assert_eq!((stored["label"].as_str(), stored["display_label"].as_str()), (Some("Q"), Some("余额")));
+        // r249 / r250 load it: the display label lands in `extra`, the label
+        // passes their ASCII rule (same check as `ascii_label`).
+        let old: R249Config = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(old.extra.get("display_label"), Some(&serde_json::json!("余额")));
+        assert!(!old.label.is_empty() && old.label.len() <= 6 && old.label.bytes().all(|c| c.is_ascii_alphanumeric()));
+        // An r249 save keeps it; this release reads it back.
+        let saved_by_old = serde_json::to_value(&old).unwrap();
+        assert_eq!(saved_by_old, stored);
+        let back: Config = serde_json::from_value(saved_by_old).unwrap();
+        assert_eq!(back, current);
+        assert!(back.extra.is_empty());
+        // A record without the field (written by r249) is unchanged.
+        let plain: Config = serde_json::from_value(serde_json::to_value(R249Config::default()).unwrap()).unwrap();
+        assert_eq!(plain, Config::default());
+    }
+
+    #[test]
+    fn gauges_carry_the_display_label() {
+        let dir = std::env::temp_dir().join(format!("cutex-quota-display-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut a: StoredAccount = serde_json::from_value(
+            serde_json::json!({"id":uuid::Uuid::new_v4().to_string(),"name":"fixture"}),
+        )
+        .unwrap();
+        a.options.quota = Config {
+            enabled: true,
+            url: "https://quota.example.com/v1/balance".into(),
+            auth: Auth::None,
+            label: "DS".into(),
+            display_label: Some("余额".into()),
+            mode: Mode::Balance,
+            value_pointer: "/balance".into(),
+            limit_pointer: String::new(),
+            reset_pointer: String::new(),
+            ..Config::default()
+        };
+        let gauges = gauges_in(&a, true, &dir, |_, _| Ok(serde_json::json!({"balance": "88.08"}))).unwrap();
+        let json = serde_json::to_value(&gauges[0]).unwrap();
+        assert_eq!((json["label"].as_str(), json["displayLabel"].as_str()), (Some("DS"), Some("余额")), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cache_reuses_success_retains_stale_data_and_invalidates_mapping() {
         let dir = std::env::temp_dir().join(format!("cutex-quota-test-{}", uuid::Uuid::new_v4()));

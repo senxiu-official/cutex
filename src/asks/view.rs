@@ -16,6 +16,44 @@ pub fn requester_value(requester: &Requester) -> Value {
     value
 }
 
+/// Who controls the ask when a handover moved it (design 044 §4.2): the
+/// original requester stays `requester`; `controller` is who decides now.
+/// `None` while the original requester controls it (the r253 shape), and
+/// `controller: null` when the handover state is unknown (fail closed).
+pub fn control_value(ask: &AskRecord) -> Option<Value> {
+    if !ask.is_open(){
+        if let Ok(Some(controller))=crate::director_address::Store::open_default().and_then(|store|store.closed_controller(ask)){
+            return Some(json!({"originallyRequestedBy":ask.requester.session(),"controller":controller,"controlHistorical":true}));
+        }
+    }
+    match ask.controller() {
+        Ok(controller) if controller.as_deref() == ask.requester.session() => None,
+        Ok(controller) => Some(json!({"originallyRequestedBy": ask.requester.session(), "controller": controller})),
+        Err(error) => Some(json!({"originallyRequestedBy": ask.requester.session(), "controller": null, "controlError": error.code})),
+    }
+}
+
+fn insert_control(value: &mut Value, ask: &AskRecord, snake: bool) {
+    insert_control_value(value, control_value(ask), snake);
+}
+
+fn insert_control_value(value: &mut Value, control: Option<Value>, snake: bool) {
+    let (Some(object), Some(control)) = (value.as_object_mut(), control) else { return };
+    for (key, field) in control.as_object().into_iter().flatten() {
+        let key = if snake {
+            match key.as_str() {
+                "originallyRequestedBy" => "originally_requested_by",
+                "controlError" => "control_error",
+                "controlHistorical" => "control_historical",
+                other => other,
+            }
+        } else {
+            key.as_str()
+        };
+        object.insert(key.to_string(), field.clone());
+    }
+}
+
 /// The current attempt for clients (`AskSummary.attempt`, r208).
 pub fn attempt_summary(attempt: &AttemptRecord) -> Value {
     json!({
@@ -56,17 +94,56 @@ pub fn jobs_summary(ask: &AskRecord) -> Value {
 
 /// Revisions for lists (no text).
 pub fn revisions_summary(ask: &AskRecord) -> Value {
-    json!(ask
-        .revisions
-        .iter()
-        .map(|revision| json!({
-            "id": revision.id,
-            "level": revision.level,
-            "supersedes": revision.supersedes,
-            "sentAt": revision.sent_at,
-            "acknowledgedAt": revision.acknowledged_at,
-        }))
-        .collect::<Vec<_>>())
+    revisions_summary_with_receipts(ask, &Default::default())
+}
+
+pub fn revisions_summary_with_receipts(
+    ask: &AskRecord,
+    receipts: &super::receipt_uncertainty::read_views::ReceiptReadContext,
+) -> Value {
+    json!(ask.revisions.iter().map(|revision|
+        super::revisions::read_summary_with_context(revision, receipts)).collect::<Vec<_>>())
+}
+
+/// Decorate an OWNED response only. Keeps full-detail revisions, original
+/// levels, receipt fields, ack timestamps and text byte-for-byte unchanged.
+/// The caller prepares `receipts` after its AskStore snapshot guard closes.
+pub fn with_receipt_projections(
+    mut value: Value,
+    ask: &AskRecord,
+    receipts: &super::receipt_uncertainty::read_views::ReceiptReadContext,
+) -> Value {
+    if let Some(revisions) = value.get_mut("revisions").and_then(Value::as_array_mut) {
+        for revision in revisions {
+            if let Some(record) = revision.get("id").and_then(Value::as_str)
+                .and_then(|id| ask.revisions.iter().find(|record| record.id == id))
+            {
+                revision["receiptProjection"] = super::receipt_uncertainty::read_views::revision_projection(record, receipts);
+            }
+        }
+    }
+    value
+}
+
+pub fn summary_with_receipts(
+    state: &AskState, ask: &AskRecord,
+    receipts: &super::receipt_uncertainty::read_views::ReceiptReadContext,
+) -> Value {
+    with_receipt_projections(summary(state, ask), ask, receipts)
+}
+
+pub fn owner_view_with_receipts(
+    state: &AskState, ask: &AskRecord,
+    receipts: &super::receipt_uncertainty::read_views::ReceiptReadContext,
+) -> Value {
+    with_receipt_projections(owner_view(state, ask), ask, receipts)
+}
+
+pub fn requester_view_with_receipts(
+    state: &AskState, ask: &AskRecord,
+    receipts: &super::receipt_uncertainty::read_views::ReceiptReadContext,
+) -> Value {
+    with_receipt_projections(requester_view(state, ask), ask, receipts)
 }
 
 /// The wait for clients (`{jobs, until, resume, since, timeoutAt, note}`).
@@ -100,6 +177,27 @@ pub fn ask_requester(ask: &AskRecord) -> Value {
     if let Some(i)=&ask.peer_inbound { v["claimedCaps"]=json!(i.request.requester.caps); }
     v
 }
+
+/// Routing review and capability escalation use independent approval stores.
+/// Keep the old capability-only approval_id and expose typed references so
+/// clients can load and decide the correct resource without guessing.
+fn insert_review_refs(value: &mut Value, state: &AskState, ask: &AskRecord) {
+    let mut refs = Vec::new();
+    let routing = ask.routing_approval_id.as_ref().and_then(|id| state.routing.approvals.get(id));
+    if let Some(approval) = routing {
+        refs.push(json!({"kind":"routing", "approvalId":approval.id, "projectId":approval.project_id}));
+    }
+    if let Some(id) = ask.gate.as_ref().and_then(|gate| gate.approval_id.as_deref()) {
+        refs.push(json!({"kind":"capability", "approvalId":id, "projectId":ask.project_id}));
+    }
+    value["reviewRef"] = refs.first().cloned().unwrap_or(Value::Null);
+    value["reviewRefs"] = json!(refs);
+    value["reviewDenialReason"] = routing
+        .filter(|approval| approval.state == super::routing_policy::ApprovalState::Denied)
+        .map(|approval| json!(approval.decision_note.as_deref().filter(|note| !note.trim().is_empty())
+            .unwrap_or("Project delegation routing review was denied")))
+        .unwrap_or(Value::Null);
+}
 pub fn owner_view(state: &AskState, ask: &AskRecord) -> Value {
     let mut value = serde_json::to_value(ask).unwrap_or(Value::Null);
     if let Some(object) = value.as_object_mut() {
@@ -131,12 +229,14 @@ pub fn owner_view(state: &AskState, ask: &AskRecord) -> Value {
             .collect();
         object.insert("questions".into(), json!(questions));
     }
+    insert_review_refs(&mut value, state, ask);
+    insert_control(&mut value, ask, false);
     value
 }
 
 /// Compact list row (`GET /v2/asks`, `agent_list`).
 pub fn summary(state: &AskState, ask: &AskRecord) -> Value {
-    json!({
+    let mut value = json!({
         "askId": ask.ask_id,
         "hops": ask.hops,
         "lateAnswer": ask.remote.as_ref().and_then(|r|r.late_answer.as_ref()),
@@ -173,14 +273,23 @@ pub fn summary(state: &AskState, ask: &AskRecord) -> Value {
         "jobs": jobs_summary(ask),
         "revisions": revisions_summary(ask),
         "supersededBy": ask.superseded_by,
-    })
+    });
+    insert_review_refs(&mut value, state, ask);
+    insert_control(&mut value, ask, false);
+    value
 }
 
 /// The requester's view in tool results: state, hold, the activity of the
 /// current attempt only (§5.5), never other turns.
 pub fn requester_view(state: &AskState, ask: &AskRecord) -> Value {
+    requester_view_with_control(state, ask, control_value(ask))
+}
+
+/// List rendering uses the same checked controller as its visibility filter,
+/// without reopening ownership/authority stores while materializing each row.
+pub(crate) fn requester_view_with_control(state: &AskState, ask: &AskRecord, control: Option<Value>) -> Value {
     let attempt = ask.current_attempt();
-    json!({
+    let mut value = json!({
         "ask_id": ask.ask_id,
         "action_id": ask.action_id,
         "target": ask.target_name.clone().unwrap_or_else(|| ask.target_cutex_session_id.clone()),
@@ -203,7 +312,10 @@ pub fn requester_view(state: &AskState, ask: &AskRecord) -> Value {
         "jobs": jobs_summary(ask),
         "revisions": revisions_summary(ask),
         "superseded_by": ask.superseded_by,
-    })
+    });
+    insert_review_refs(&mut value, state, ask);
+    insert_control_value(&mut value, control, true);
+    value
 }
 
 #[cfg(test)]

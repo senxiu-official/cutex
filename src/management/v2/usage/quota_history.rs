@@ -5,6 +5,9 @@
 //! `observedAt`) to `<runtime>/management-v2/usage-quota-history/YYYY-MM.jsonl`.
 //! Append-only, newline-prefixed lines (a torn tail never corrupts the next
 //! line), private permissions; unreadable lines are skipped on read.
+//! Nothing is ever deleted (owner decision 2026-10-23, design 041): readers
+//! open only the month files they need (the newest two, or the months of the
+//! asked range), so old months cost disk space, not time.
 
 use std::collections::HashMap;
 use std::fs;
@@ -89,6 +92,19 @@ pub fn record_quota_gauges(
     if let Err(error) = result {
         eprintln!("\x1b[33mwarning:\x1b[0m failed to record quota history: {error:#}");
     }
+}
+
+/// Snapshots observed at or after `since` (unix seconds) from the two newest
+/// month files, oldest first (design 041 reads the last hour's slope).
+pub fn read_since(since: i64) -> anyhow::Result<Vec<QuotaSnapshot>> {
+    read_since_at(&history_root()?, since)
+}
+
+pub(super) fn read_since_at(root: &Path, since: i64) -> anyhow::Result<Vec<QuotaSnapshot>> {
+    let mut snapshots = read_recent(root)?;
+    snapshots.retain(|snapshot| snapshot.ts >= since);
+    sort_and_dedup(&mut snapshots);
+    Ok(snapshots)
 }
 
 /// Append the snapshots that are at least `SNAPSHOT_INTERVAL_SECS` newer than
@@ -234,11 +250,51 @@ pub fn read_quota_history_at(
                 })
                 .unwrap_or(false)
     });
+    sort_and_dedup(&mut all);
+    Ok(all)
+}
+
+/// Independent quota readers may append the same upstream observation in separate processes.
+/// Both history APIs must expose that observation once, preserving the first stored value.
+fn sort_and_dedup(all: &mut Vec<QuotaSnapshot>) {
     all.sort_by(|a, b| {
         a.ts.cmp(&b.ts)
             .then_with(|| a.profile_id.cmp(&b.profile_id))
             .then_with(|| a.gauge_id.cmp(&b.gauge_id))
     });
     all.dedup_by(|a, b| a.ts == b.ts && a.profile_id == b.profile_id && a.gauge_id == b.gauge_id);
-    Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_history_deduplicates_upstream_observations_like_range_history() {
+        let root = std::env::temp_dir().join(format!("cutex-quota-dedup-{}", uuid::Uuid::new_v4()));
+        let at = DateTime::parse_from_rfc3339("2026-10-24T01:00:00Z").unwrap().with_timezone(&Utc);
+        let snapshot = QuotaSnapshot {
+            ts: at.timestamp(), profile_id: "p1".into(), profile: "one".into(), gauge_id: "weekly".into(),
+            label: None, kind: None, remaining_percent: Some(70.0), balance: None, reset_at: None,
+        };
+        append_snapshot(&root, &snapshot).unwrap();
+        // Another process can record the same observation with different display metadata.
+        let mut duplicate = snapshot.clone();
+        duplicate.profile = "renamed".into();
+        duplicate.remaining_percent = Some(69.0);
+        append_snapshot(&root, &duplicate).unwrap();
+        let mut other_gauge = snapshot.clone();
+        other_gauge.gauge_id = "daily".into();
+        append_snapshot(&root, &other_gauge).unwrap();
+        let mut other_profile = snapshot.clone();
+        other_profile.profile_id = "p2".into();
+        append_snapshot(&root, &other_profile).unwrap();
+        let recent = read_since_at(&root, at.timestamp()).unwrap();
+        let range = read_quota_history_at(&root, at.date_naive(), at.date_naive(), None, &|t| t.date_naive()).unwrap();
+        assert_eq!(recent, range);
+        assert_eq!(recent.len(), 3, "only identical timestamp/profile-id/gauge-id observations collapse");
+        assert!(recent.contains(&snapshot), "keep the first stored observation, as the range API does");
+        assert!(read_since_at(&root, at.timestamp() + 1).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

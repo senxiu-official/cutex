@@ -33,7 +33,7 @@ pub fn update_cutex_session_routing_by_key(
     let record = store.sessions.get_mut(key).ok_or_else(|| {
         anyhow::anyhow!("cutex session disappeared while updating routing: {key}")
     })?;
-    if record.is_retired() {
+    if crate::agent_management::agent_execution_blocked(&record) {
         anyhow::bail!("cutex session is retired: {key}");
     }
     if patch.exposed_to_backend == Some(true)

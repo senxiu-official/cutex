@@ -8,7 +8,7 @@ use cutex::session::projection::runtime_backend_short_label;
 use cutex::session::service::{
     adopt_cutex_session, cutex_session_key_for_user_id, expose_cutex_session, hide_cutex_session,
     normalize_cutex_session_managed_cwd_path, persist_cutex_session_store_and_im_record,
-    set_cutex_session_profile_by_key, set_cutex_session_quick_action, unmanage_cutex_session,
+    set_cutex_session_profile_by_key, set_cutex_session_quick_action,
     update_cutex_session_groups, CutexSessionAdoptOptions, CutexSessionEnsureSeed,
 };
 use cutex::session::store::load_cutex_session_store;
@@ -89,6 +89,8 @@ pub(crate) fn cmd_session_adopt(
             groups,
             expose_to_im,
             pin,
+            model_defaults: None,
+            reasoning_defaults: None,
         },
     )?;
     persist_cutex_session_store_and_im_record(&store, &outcome.key)?;
@@ -156,15 +158,88 @@ pub(crate) fn cmd_session_hide(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `unmanage` only drops management metadata; it never removes the record.
+/// It writes one row under the store lock (a whole-store save raced every
+/// daemon commit: "session store revision conflict"), and refuses where the
+/// change would not hold or would not do what is asked:
+/// - a live runtime: its Agent Bus registration refresh (about every 30 s,
+///   `reconcile_cutex_session_store_from_agent`) turns the record back into
+///   an Agent within seconds;
+/// - a durable Agent of the Agent Management roster: the roster would keep
+///   it (archive or delete it instead);
+/// - an already local session (e.g. a quick chat): nothing would change, and
+///   it stays listed; `session delete` removes it.
 pub(crate) fn cmd_session_unmanage(id: &str) -> anyhow::Result<()> {
-    let mut store = load_cutex_session_store()?;
-    let outcome = unmanage_cutex_session(&mut store, id)?;
-    persist_cutex_session_store_and_im_record(&store, &outcome.key)?;
+    let path = cutex::session::store::cutex_sessions_path()?;
+    let (key, record) = {
+        let store = cutex::session::store::load_cutex_session_store_shared()?;
+        let key = cutex_session_key_for_user_id(&store, id)
+            .ok_or_else(|| anyhow!("cutex session is not known: {id}"))?;
+        let record = store
+            .sessions
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow!("cutex session disappeared while unmanaging: {key}"))?;
+        (key, record)
+    };
+    let in_roster = cutex::role_revision::CutexSessionId::new(key.clone())
+        .ok()
+        .map(|exact| -> anyhow::Result<bool> {
+            let roster = cutex::agent_management::AgentManagementStore::open_default()?.snapshot()?;
+            Ok(roster
+                .agents
+                .get(&exact)
+                .is_some_and(|agent| agent.retired_at.is_none()))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let live = super::management_archive::runtime_registration_live(&record)?;
+    if let Some(reason) = unmanage_refusal(&record, &key, in_roster, live) {
+        anyhow::bail!(reason);
+    }
+    cutex::session::store::update_session_row(&path, &key, |current| {
+        anyhow::ensure!(
+            current.durable_revision() == record.durable_revision()
+                && current.runtime_generation == record.runtime_generation,
+            "cutex session {key} changed while unmanaging; nothing was changed, retry"
+        );
+        cutex::session::service::apply_unmanage(current)
+    })?
+    .ok_or_else(|| anyhow!("cutex session disappeared while unmanaging: {key}"))?;
+    let store = cutex::session::store::load_cutex_session_store_shared()?;
+    cutex::session::im_bridge::persist_cutex_session_im_record(&store, &key)?;
     println!(
-        "{YELLOW}Unmanaged{RESET} cutex session {BOLD}{}{RESET}; history and any running runtime were left untouched",
-        outcome.session_id
+        "{YELLOW}Unmanaged{RESET} cutex session {BOLD}{}{RESET}; history was left untouched (the record stays; `cutex human session delete` removes it)",
+        record.codex_session_id.as_deref().unwrap_or(id)
     );
     Ok(())
+}
+
+fn unmanage_refusal(
+    record: &cutex::session::model::CutexSessionRecord,
+    key: &str,
+    in_roster: bool,
+    live: bool,
+) -> Option<String> {
+    let local = record.registration_class
+        == cutex::agent_bus::model::AgentRegistrationClass::LocalOnly
+        && !record.agent_enabled;
+    if local {
+        return Some(format!(
+            "{key} is already a local session (not managed); unmanage would change nothing and never removes a record. To remove it permanently: cutex human session delete {key}"
+        ));
+    }
+    if in_roster {
+        return Some(format!(
+            "{key} is a durable Agent of Agent Management; unmanage would leave it on the roster. Archive it (cutex human session retire {key}) or delete it (cutex human session delete {key})"
+        ));
+    }
+    if live {
+        return Some(format!(
+            "{key} has a running runtime; its Agent Bus registration would turn it back into an Agent within seconds. Stop it first (cutex human session offline {key}), then unmanage"
+        ));
+    }
+    None
 }
 
 pub(crate) fn cmd_session_quick(command: SessionQuickCommand) -> anyhow::Result<()> {
@@ -239,6 +314,8 @@ pub(crate) fn cmd_session_profile(command: SessionProfileCommand) -> anyhow::Res
     }
     cutex::runtime::claude_accounts::check_profile_change(record, requested_profile.as_deref())
         .map_err(|mismatch| anyhow!("{}: {mismatch}", cutex::runtime::claude_accounts::MISMATCH_CODE))?;
+    let provider_family = super::management_context::check_codex_profile_family(record, requested_profile.as_deref())
+        .map_err(|error| anyhow!("{}: {}", error.code, error.message))?;
     let mut claude_model = None;
     let profile = if record.claude_session.is_some() {
         requested_profile.as_deref()
@@ -248,7 +325,9 @@ pub(crate) fn cmd_session_profile(command: SessionProfileCommand) -> anyhow::Res
     } else if record.explicit_launch.is_some() {
         let mut candidate = record.clone();
         candidate.profile = requested_profile.clone();
-        cutex::launch::stock::current_configuration(&candidate)?;
+        if requested_profile.is_some() {
+            cutex::launch::stock::current_configuration(&candidate)?;
+        }
         requested_profile
     } else {
         requested_profile
@@ -258,6 +337,7 @@ pub(crate) fn cmd_session_profile(command: SessionProfileCommand) -> anyhow::Res
             .map(|resolved| resolved.account.name)
     };
     let outcome = set_cutex_session_profile_by_key(&mut store, &key, profile.clone())?;
+    store.sessions.get_mut(&key).expect("profile-updated session").provider_family = provider_family;
     if let Some(model) = claude_model {
         let record = store.sessions.get_mut(&key).expect("profile-updated session");
         record.claude_session.as_mut().expect("Claude session").model = model.clone();
@@ -281,6 +361,71 @@ mod tests {
     use cutex::session::model::CutexSessionRecord;
     use cutex::session::store::save_cutex_session_store;
     use std::fs;
+
+    fn unmanage_record(id: &str) -> CutexSessionRecord {
+        let mut record = CutexSessionRecord::new_at(
+            id.into(),
+            None,
+            current_host_name(),
+            "/work".into(),
+            None,
+            "2026-10-01T00:00:00Z".into(),
+        )
+        .unwrap();
+        record.registration_class = cutex::agent_bus::model::AgentRegistrationClass::Persistent;
+        record.agent_enabled = true;
+        record.exposed_to_backend = true;
+        record
+    }
+
+    #[test]
+    fn unmanage_refuses_what_would_not_hold_or_change_nothing() {
+        let agent = unmanage_record("cutex.agent");
+        assert_eq!(unmanage_refusal(&agent, "cutex.agent", false, false), None);
+        let live = unmanage_refusal(&agent, "cutex.agent", false, true).unwrap();
+        assert!(live.contains("running runtime") && live.contains("offline"), "{live}");
+        let roster = unmanage_refusal(&agent, "cutex.agent", true, false).unwrap();
+        assert!(roster.contains("retire") && roster.contains("delete"), "{roster}");
+        let mut local = agent.clone();
+        local.registration_class = cutex::agent_bus::model::AgentRegistrationClass::LocalOnly;
+        local.agent_enabled = false;
+        let already = unmanage_refusal(&local, "cutex.agent", false, false).unwrap();
+        assert!(already.contains("already a local session") && already.contains("session delete"), "{already}");
+    }
+
+    /// The write is one row under the store lock: an unrelated commit between
+    /// the command's read and its write (a daemon heartbeat) no longer fails
+    /// it with "session store revision conflict".
+    #[test]
+    fn unmanage_writes_one_row_despite_unrelated_concurrent_commits() {
+        let _home = IsolatedTestHome::new("unmanage-row").unwrap();
+        let mut store = cutex::session::model::CutexSessionStore::default();
+        for id in ["cutex.target", "cutex.other"] {
+            store.sessions.insert(id.into(), unmanage_record(id));
+        }
+        save_cutex_session_store(&store).unwrap();
+        // A stale whole-store copy, as the old command held it.
+        let mut stale = cutex::session::store::load_cutex_session_store().unwrap();
+        let path = cutex::session::store::cutex_sessions_path().unwrap();
+        cutex::session::store::update_session_row(&path, "cutex.other", |record| {
+            record.last_seen_at = Some("2026-10-20T00:00:00Z".into());
+            Ok(())
+        })
+        .unwrap();
+        let old_way = cutex::session::service::unmanage_cutex_session(&mut stale, "cutex.target")
+            .and_then(|_| save_cutex_session_store(&stale));
+        assert!(format!("{:#}", old_way.unwrap_err()).contains("revision conflict"));
+
+        cmd_session_unmanage("cutex.target").unwrap();
+        let after = cutex::session::store::load_cutex_session_store().unwrap();
+        let target = &after.sessions["cutex.target"];
+        assert_eq!(target.registration_class, cutex::agent_bus::model::AgentRegistrationClass::LocalOnly);
+        assert!(!target.agent_enabled && !target.exposed_to_backend);
+        assert_eq!(after.sessions["cutex.other"].last_seen_at.as_deref(), Some("2026-10-20T00:00:00Z"));
+        assert!(after.sessions["cutex.other"].agent_enabled, "the other record is untouched");
+        let again = cmd_session_unmanage("cutex.target").unwrap_err().to_string();
+        assert!(again.contains("already a local session"), "{again}");
+    }
 
     #[test]
     fn claude_profile_commands_and_management_share_account_gate_and_persist_model() {
@@ -399,7 +544,9 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: format!("{name}-id"),
             name: name.to_string(),
             email: None,
@@ -417,6 +564,7 @@ mod tests {
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         }
     }
 
@@ -447,6 +595,49 @@ mod tests {
         let mut store = load_cutex_session_store().expect("load session store");
         store.sessions.insert(id.to_string(), record);
         save_cutex_session_store(&store).expect("save session store");
+    }
+
+    #[test]
+    fn cli_profile_set_checks_frozen_and_legacy_launch_families_before_mutating() {
+        let _home = IsolatedTestHome::new("cli-profile-family").unwrap();
+        let alpha = profile("alpha"); let beta = profile("beta");
+        save_resolvable_profile(&alpha); save_resolvable_profile(&beta);
+        fs::write(materialized_account_files(&alpha).unwrap().config_path, r#"model_provider = "deepseek"
+model = "test"
+"#).unwrap();
+        save_store(&AccountsStore { version: 3, accounts: vec![alpha, beta], active_account_id: None }).unwrap();
+        let id = "cutex.cli-family";
+        save_session(id, current_host_name());
+        for frozen in [false, true] {
+            let mut store = load_cutex_session_store().unwrap();
+            let record = store.sessions.get_mut(id).unwrap();
+            record.profile = None;
+            record.provider_family = frozen.then(|| "deepseek".into());
+            record.app_server_runtime = Some(serde_json::from_value(serde_json::json!({
+                "transport":"unix_socket", "endpoint":"fake", "pid":1, "runtime_dir":"fake",
+                "launched_profile":"alpha", "diagnostic_journal_path":"fake", "schema_version":"v2",
+                "schema_sha256":"fake", "started_at":"2026-10-24T00:00:00Z"
+            })).unwrap());
+            let before = record.clone();
+            save_cutex_session_store(&store).unwrap();
+            let error = cmd_session_profile(SessionProfileCommand::Set { id: id.into(), profile: "beta".into() }).unwrap_err();
+            assert!(error.to_string().contains("provider_family_mismatch"), "{error:#}");
+            assert_eq!(load_cutex_session_store().unwrap().sessions[id], before);
+        }
+        let mut record = load_cutex_session_store().unwrap().sessions[id].clone();
+        record.provider_family = None;
+        cutex::session::runtime_reconciliation::clear_runtime_fields(&mut record, false);
+        assert!(record.app_server_runtime.is_none());
+        assert_eq!(record.provider_family.as_deref(), Some("deepseek"));
+        let mut config = cutex::config::store::load_codez_config_checked().unwrap();
+        config.default_profile = Some("deleted-default".into());
+        cutex::config::store::save_codez_config(&config).unwrap();
+        let error = super::super::management_context::check_codex_profile_family(&record, None).unwrap_err();
+        assert!(error.message.contains("cannot clear profile") && error.message.contains("no longer exists"));
+        config.default_profile = None;
+        cutex::config::store::save_codez_config(&config).unwrap();
+        assert_eq!(super::super::management_context::check_codex_profile_family(&record, None).unwrap().as_deref(), Some("deepseek"));
+
     }
 
     #[test]

@@ -17,5 +17,7 @@ pub mod session_online;
 pub mod stop;
 
 pub mod claude;
+pub mod dsh;
+pub mod kimi;
 pub mod claude_accounts;
 pub mod claude_pin;

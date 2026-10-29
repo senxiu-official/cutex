@@ -8,7 +8,8 @@ pub const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub const MIN_MAX_BYTES: u64 = 64 * 1024;
 /// The Management HTTP layer refuses bodies above 16 MiB anyway.
 pub const MAX_MAX_BYTES: u64 = 16 * 1024 * 1024;
-pub const DEFAULT_RETENTION_DAYS: u32 = 30;
+/// 0 = keep (owner decision 2026-10-23; was 30 before r252).
+pub const DEFAULT_RETENTION_DAYS: u32 = 0;
 pub const MAX_RETENTION_DAYS: u32 = 3650;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,8 +17,10 @@ pub const MAX_RETENTION_DAYS: u32 = 3650;
 pub struct AttachmentSettings {
     /// Largest accepted upload in bytes.
     pub max_bytes: u64,
-    /// Uploaded files older than this are removed (0 keeps them until the
-    /// session is deleted).
+    /// Releases before r252 removed uploaded files older than this (0 keeps
+    /// them until the session is deleted). Since r252 it is stored and shown
+    /// but not applied: an attachment stays while its session (and the
+    /// transcript referring to it) exists.
     pub retention_days: u32,
 }
 
@@ -63,5 +66,20 @@ impl AttachmentSettings {
                 defaults.retention_days
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachments_are_kept_by_default() {
+        assert_eq!(AttachmentSettings::default().retention_days, 0);
+        assert_eq!(AttachmentSettings::default().effective().retention_days, 0);
+        // A value written by an older release still parses and validates.
+        let older: AttachmentSettings = serde_json::from_str(r#"{"max_bytes":8388608,"retention_days":30}"#).unwrap();
+        assert!(older.validate().is_ok());
+        assert!(!older.is_default());
     }
 }

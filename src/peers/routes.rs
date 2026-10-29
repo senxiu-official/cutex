@@ -227,7 +227,7 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
                         super::asks::receive(&asks, &peer, id, create)
                     }
                     ("GET", "") => {
-                        let s = asks.snapshot()?;
+                        let s = asks.lookup_snapshot(&[id])?;
                         let a = super::asks::authorized(&s, &peer, id)?;
                         Ok(serde_json::to_value(super::wire::WireSnapshotV1::from(
                             &super::asks::wire_snapshot(
@@ -246,7 +246,7 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
                             return Err(Error::new("remote_unsupported", 400));
                         }
                         super::asks::receive_op(&asks, &peer, id, op)?;
-                        let s = asks.snapshot()?;
+                        let s = asks.lookup_snapshot(&[id])?;
                         if s.peer_cancellations
                             .get(id)
                             .is_some_and(|(owner, _)| owner == &peer.peer_id)

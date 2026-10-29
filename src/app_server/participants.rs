@@ -29,7 +29,7 @@ pub fn participant_metadata_from_store(
     let Some(record) = store
         .sessions
         .values()
-        .find(|record| record.cutex_session_id == cutex_session_id && record.is_active())
+        .find(|record| record.cutex_session_id == cutex_session_id && !crate::agent_management::agent_execution_blocked(&record))
     else {
         return canonical_participant(cutex_session_id);
     };
@@ -82,6 +82,8 @@ fn runtime_backend(backend: CutexSessionRuntimeBackend) -> &'static str {
         CutexSessionRuntimeBackend::CuteAlden => "cute_alden",
         CutexSessionRuntimeBackend::ClaudeSubscription => "claude",
         CutexSessionRuntimeBackend::Future => "future",
+        CutexSessionRuntimeBackend::Dsh => "dsh",
+        CutexSessionRuntimeBackend::Kimi => "kimi",
     }
 }
 

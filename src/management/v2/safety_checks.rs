@@ -18,7 +18,8 @@
 //! - `cutex/safetyCheck/grant {blockId}`: the adapter stores a grant for
 //!   exactly that (thread, tool, input), used once, valid 30 minutes; cutex
 //!   then hands the agent one owner input
-//!   「主人已批准一次：<command>（30 分钟内有效，仅此一次）」.
+//!   「主人已批准一次：<command>（30 分钟内有效，仅此一次）」 (`auto`: a busy
+//!   agent reads it at its running turn's next step).
 //! - `cutex/safetyCheck/dismiss {blockId}`: closes the item, no grant.
 //!
 //! `GET /v2/safety-checks?state=open|all&agentId=&limit=` lists the notices
@@ -333,7 +334,8 @@ pub(super) fn dispatch_with(
     root: bool,
     store: &OwnerNotifyStore,
     cutex_session_id: &str,
-    session: &Value,
+    // The session no longer decides the strategy (busy or idle: `auto`).
+    _session: &Value,
     request: &ValidatedCutexRequest,
     call_runtime: impl FnOnce(&SafetyBlock, &str, Value) -> Result<Value, RuntimeCallError>,
     submit: impl FnOnce(&ValidatedCutexRequest) -> Result<Value, UserInputExecutionError>,
@@ -403,16 +405,19 @@ pub(super) fn dispatch_with(
         .0;
     let mut result = json!({ "notification": notification, "block": decided });
     if grant {
-        // The agent learns of the grant as the owner's next message (busy:
-        // after the current turn, never steered into it).
-        let busy = session.pointer("/runtime/activeTurnId").is_some_and(|turn| !turn.is_null());
+        // The agent learns of the grant at once: idle, a turn now; busy, the
+        // note joins the running turn at its next step (`auto` steers, as a
+        // busy wake past its wait is read at the next step). The agent that
+        // hit the block is usually still in that turn and waiting for it; an
+        // after-turn queue (本回合结束后送达) left it without the grant.
+        // A runtime that cannot steer keeps it in the Management queue.
         let input = ValidatedCutexRequest {
             request_id: request.request_id.clone(),
             method: "cutex/userInput/submit".into(),
             params: json!({
                 "clientUserMessageId": format!("safety-grant-{id}"),
                 "origin": {"kind": "other", "clientId": CLIENT_ID},
-                "strategy": if busy { "queue" } else { "auto" },
+                "strategy": "auto",
                 "input": [{"type": "text", "text": grant_text(&decided), "text_elements": []}],
                 "startIfOffline": true,
             }),

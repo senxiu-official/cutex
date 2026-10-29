@@ -84,6 +84,43 @@ fn is_tool_item(map: &serde_json::Map<String, Value>) -> bool {
             .is_some_and(|kind| TOOL_ITEM_TYPES.contains(&kind))
 }
 
+/// Cut every string over `max` bytes inside a tool item anywhere in
+/// `value` (media were replaced first: `media_refs`); the item gets
+/// `truncated: true`. Returns how many items were cut.
+pub fn cap_tool_strings(value: &mut Value, max: usize) -> usize {
+    fn cap(value: &mut Value, max: usize) -> bool {
+        match value {
+            Value::String(text) if text.len() > max => {
+                *text = cut_utf8(text, max).to_string();
+                true
+            }
+            Value::Array(items) => items.iter_mut().fold(false, |cut, item| cap(item, max) | cut),
+            Value::Object(map) => map
+                .iter_mut()
+                .filter(|(key, _)| !KEPT_KEYS.contains(&key.as_str()))
+                .fold(false, |cut, (_, item)| cap(item, max) | cut),
+            _ => false,
+        }
+    }
+    match value {
+        Value::Object(map) if is_tool_item(map) => {
+            let mut cut = false;
+            for (key, item) in map.iter_mut() {
+                if !KEPT_KEYS.contains(&key.as_str()) {
+                    cut |= cap(item, max);
+                }
+            }
+            if cut {
+                map.insert("truncated".to_string(), Value::Bool(true));
+            }
+            usize::from(cut)
+        }
+        Value::Object(map) => map.values_mut().map(|item| cap_tool_strings(item, max)).sum(),
+        Value::Array(items) => items.iter_mut().map(|item| cap_tool_strings(item, max)).sum(),
+        _ => 0,
+    }
+}
+
 /// Compact every tool item anywhere in `value`; returns how many were cut.
 pub fn compact_items(value: &mut Value) -> usize {
     match value {

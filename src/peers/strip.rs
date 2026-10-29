@@ -111,8 +111,48 @@ fn export_at(runtime: &Path, ports: &[u16], out: Option<&Path>) -> anyhow::Resul
     asks_lock
         .try_lock_exclusive()
         .context("ask store is in use")?;
+    let database = runtime
+        .join("management-v2")
+        .join(crate::management::v2::hot_store::DATABASE_FILE);
     let store_path = asks_dir.join("asks-v1.json");
-    let original = std::fs::read(&store_path).context("read original ask store")?;
+    let loaded = crate::management::v2::hot_store::verified_rows(&database, "asks")?;
+    let (original, original_state, generation) = if let Some(loaded) = loaded {
+        let state = crate::asks::store::ask_state_from_rows(&loaded.rows)?;
+        (
+            serde_json::to_vec_pretty(&state)?,
+            Some(state),
+            loaded.generation,
+        )
+    } else if crate::management::v2::hot_store::has_store(&database, "asks")? {
+        // rollback-export made JSON authoritative; re-import it before the
+        // second conversion so old-binary changes cannot be lost.
+        let loaded = crate::management::v2::hot_store::load_or_migrate(
+            &database,
+            "asks",
+            &store_path,
+            |bytes| {
+                let state: AskState =
+                    serde_json::from_slice(bytes).context("parse handed-off ask store")?;
+                crate::asks::store::ask_state_rows(&state)
+            },
+            |rows| crate::asks::store::ask_state_from_rows(rows).map(|_| ()),
+        )?;
+        let state = crate::asks::store::ask_state_from_rows(&loaded.rows)?;
+        (
+            serde_json::to_vec_pretty(&state)?,
+            Some(state),
+            loaded.generation,
+        )
+    } else {
+        // A genuinely pre-SQLite peer store can contain fields that current
+        // AskState deliberately no longer parses. `convert` validates the
+        // stripped representation before the first SQLite commit below.
+        (
+            std::fs::read(&store_path).context("read original ask store")?,
+            None,
+            0,
+        )
+    };
     let value: Value = serde_json::from_slice(&original).context("parse original ask store")?;
     ensure_peer_targets_stopped(&value, &crate::session::store::load_cutex_session_store()?)?;
     let now = chrono::Utc::now();
@@ -173,7 +213,35 @@ fn export_at(runtime: &Path, ports: &[u16], out: Option<&Path>) -> anyhow::Resul
     }
     write_private_bytes_atomic(&out.join("README.txt"), list.as_bytes())?;
     // Last fallible state-changing step: every backup/export is durable first.
-    write_private_pretty_json_atomic(&store_path, &stripped, "stripped asks")?;
+    // Commit the converted state to SQLite, then replace the legacy rollback
+    // view from that verified commit.
+    let stripped_state: crate::asks::store::AskState = serde_json::from_value(stripped)?;
+    let changes = if let Some(original_state) = original_state.as_ref() {
+        crate::asks::store::ask_state_changes(original_state, &stripped_state)?
+    } else {
+        crate::asks::store::ask_state_rows(&stripped_state)?
+            .into_iter()
+            .map(
+                |((collection, key), value)| crate::management::v2::hot_store::RowChange::Put {
+                    collection,
+                    key,
+                    value,
+                },
+            )
+            .collect()
+    };
+    let generation =
+        crate::management::v2::hot_store::commit(&database, "asks", generation, changes)
+            .context("commit stripped ask store")?;
+    write_private_pretty_json_atomic(&store_path, &stripped_state, "stripped asks")?;
+    let checked: crate::asks::store::AskState =
+        serde_json::from_slice(&std::fs::read(&store_path)?)?;
+    anyhow::ensure!(
+        checked == stripped_state,
+        "stripped ask JSON verification failed"
+    );
+    crate::management::v2::hot_store::handoff_to_legacy(&database, "asks", generation)
+        .context("hand off stripped ask store to the legacy JSON reader")?;
     Ok(report)
 }
 
@@ -486,6 +554,45 @@ mod tests {
         assert_eq!(
             stripped.asks["ask-outgoing"].execution,
             ExecutionState::Interrupted
+        );
+        assert!(crate::management::v2::hot_store::verified_rows(
+            &root
+                .join("management-v2")
+                .join(crate::management::v2::hot_store::DATABASE_FILE),
+            "asks"
+        )
+        .unwrap()
+        .is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rollback_export_then_strip_reimports_and_hands_off_again() {
+        let root =
+            std::env::temp_dir().join(format!("cutex-strip-handoff-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("asks")).unwrap();
+        let (current, _, _) = convert(fixture(), chrono::Utc::now()).unwrap();
+        std::fs::write(
+            root.join("asks/asks-v1.json"),
+            serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        let store = crate::asks::store::AskStore::at_runtime(&root);
+        store.snapshot().unwrap();
+        assert!(store.export_legacy_json().unwrap());
+
+        let report = export_at(&root, &[], Some(&root.join("export"))).unwrap();
+        let mut legacy: AskState =
+            serde_json::from_slice(&std::fs::read(&report.store).unwrap()).unwrap();
+        legacy.next_seq = 77;
+        write_private_pretty_json_atomic(&report.store, &legacy, "simulated old ask store")
+            .unwrap();
+        let reopened = crate::asks::store::AskStore::at_runtime(&root)
+            .snapshot()
+            .unwrap();
+        assert_eq!(
+            reopened.next_seq, 77,
+            "roll-forward imports changes made by the old binary"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

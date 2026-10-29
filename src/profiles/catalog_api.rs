@@ -154,6 +154,12 @@ pub fn model_view(row: &Value, snapshot: &CodexProfileConfigSnapshot, discovered
 }
 
 pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
+    if account.cli_kind == CliKind::Dsh {
+        return Ok(super::dsh::models_resource(account));
+    }
+    if account.cli_kind == CliKind::Kimi {
+        return Ok(super::kimi::models_resource(account));
+    }
     let follows_upstream = overlay::uses_overlay(account);
     if follows_upstream {
         // One-time conversion of a legacy snapshot; retried while upstream is unavailable.
@@ -170,6 +176,8 @@ pub fn models_resource(account: &StoredAccount) -> anyhow::Result<Value> {
     // aliases; see `native_models`.
     let selected_model = match account.cli_kind {
         CliKind::Claude => claude_selected_model(account),
+        CliKind::Dsh => Some(account.options.dsh.model.clone()),
+        CliKind::Kimi => crate::profiles::kimi::profile_selected_model(account, &crate::profiles::kimi::profile_catalog(account)),
         CliKind::Codex => state.snapshot.model.clone(),
     };
     let mut unavailable = Vec::new();
@@ -349,7 +357,22 @@ pub(crate) fn api_key(account: &StoredAccount) -> anyhow::Result<String> {
 /// Re-fetch `/models` with the profile's key and effective proxy; cache it in
 /// `discovered-models.json`; with `apply`, merge into the catalog (existing
 /// rows keep their metadata; new IDs get the native template) and select it.
-pub fn discover(account: &StoredAccount, apply: bool) -> anyhow::Result<()> {
+fn edits_path(account: &StoredAccount) -> anyhow::Result<PathBuf> {
+    Ok(profile_dir(account)?.join("model-edits.json"))
+}
+
+/// The owner-edit record (`model-edits.json`); None before the first refresh or edit.
+pub fn load_edits(account: &StoredAccount) -> Option<model_discovery::ModelEdits> {
+    serde_json::from_slice(&std::fs::read(edits_path(account).ok()?).ok()?).ok()
+}
+
+fn save_edits(account: &StoredAccount, edits: &model_discovery::ModelEdits) -> anyhow::Result<()> {
+    write_private_pretty_json_atomic(&edits_path(account)?, edits, "model edits")
+}
+
+/// Rediscovery; with `apply`, also refreshes provider-owned fields of the
+/// existing rows (docs/design/028 (a)) and returns what changed.
+pub fn discover(account: &StoredAccount, apply: bool) -> anyhow::Result<Vec<crate::profiles::known_models::FieldChange>> {
     ensure!(discovery_supported(account), "model discovery requires an API-key custom profile");
     let base = account_model_api_base(account).context("profile has no API base URL")?;
     let key = api_key(account)?;
@@ -357,12 +380,63 @@ pub fn discover(account: &StoredAccount, apply: bool) -> anyhow::Result<()> {
     let catalog = model_discovery::fetch(&base, &key, &proxy)?;
     crate::profiles::materialize::ensure_materialized_account_dir(&materialized_account_files(account)?)?;
     write_private_pretty_json_atomic(&discovered_path(account)?, &catalog, "discovered models")?;
-    if apply {
-        let state = load(account)?;
-        let preset = model_discovery::preset(&catalog, state.catalog.as_ref(), state.snapshot.model.as_deref());
-        select_catalog(account, &preset)?;
+    if !apply {
+        return Ok(Vec::new());
     }
-    Ok(())
+    let state = load(account)?;
+    let edits = load_edits(account).unwrap_or_else(|| model_discovery::ModelEdits::starting_from(state.catalog.as_ref()));
+    let (preset, changes) = model_discovery::preset_refreshed(&catalog, state.catalog.as_ref(), state.snapshot.model.as_deref(), Some(&edits));
+    select_catalog(account, &preset)?;
+    save_edits(account, &edits)?;
+    Ok(changes)
+}
+
+/// Startup correction (design 028 (e), r250): in every custom catalog,
+/// known-model rows get the values their provider rejects corrected (effort
+/// levels it does not offer, a default outside them) with the conservative
+/// refresh; owner-edited fields (model-edits.json) and everything else stay.
+/// Converges every start (nothing to do once correct). Returns the changes.
+pub fn correct_known_rows() -> anyhow::Result<Vec<(String, crate::profiles::known_models::FieldChange)>> {
+    let store = crate::profiles::settings_api::load_store()?;
+    let mut all = Vec::new();
+    for account in &store.accounts {
+        if !catalog_supported(account) || overlay::uses_overlay(account) {
+            continue;
+        }
+        let Ok(state) = load(account) else { continue };
+        let Some(mut catalog) = state.catalog else { continue };
+        let edits = load_edits(account);
+        let mut changes = Vec::new();
+        if let Some(rows) = catalog.get_mut("models").and_then(Value::as_array_mut) {
+            for row in rows {
+                let slug = row["slug"].as_str().unwrap_or_default().to_owned();
+                let pinned = edits.as_ref().map(|edits| edits.pinned_fields(&slug)).unwrap_or_default();
+                changes.extend(crate::profiles::known_models::refresh_row(row, &pinned, false));
+            }
+        }
+        if changes.is_empty() {
+            continue;
+        }
+        select_catalog(account, &catalog)?;
+        all.extend(changes.into_iter().map(|change| (account.name.clone(), change)));
+    }
+    Ok(all)
+}
+
+/// [`correct_known_rows`] at daemon start: logged, never fatal.
+pub fn correct_known_rows_on_startup(component: &str) {
+    match std::panic::catch_unwind(correct_known_rows) {
+        Ok(Ok(changes)) => {
+            for (profile, change) in changes {
+                eprintln!(
+                    "cutex catalog correction: profile {profile}: {} {}: {} -> {}",
+                    change.model, change.field, change.from, change.to
+                );
+            }
+        }
+        Ok(Err(error)) => eprintln!("cutex catalog correction: {component}: not run on this start: {error:#}"),
+        Err(_) => eprintln!("cutex catalog correction: {component}: panicked, not run on this start"),
+    }
 }
 
 /// Native template row for a model ID unknown to the catalog.
@@ -537,6 +611,10 @@ pub fn update_model(account: &StoredAccount, id: &str, patch: &ModelPatch) -> an
     let created = crate::profiles::model_variants::patch_row(rows, id, patch, !discovery_supported(account))?;
     if catalog != before {
         select_catalog(account, &catalog)?;
+        // A rediscovery never overwrites what the owner set (docs/design/028).
+        let mut edits = load_edits(account).unwrap_or_else(|| model_discovery::ModelEdits::starting_from(Some(&before)));
+        edits.pin(id, &pinned_keys(patch));
+        save_edits(account, &edits)?;
     }
     Ok(created)
 }
@@ -556,7 +634,12 @@ pub fn reset_model(account: &StoredAccount, id: &str) -> anyhow::Result<()> {
     }
     let mut catalog = crate::profiles::model_variants::catalog_for_edit(account, &state)?;
     crate::profiles::model_variants::reset_catalog_row(account, &state, id, &mut catalog)?;
-    select_catalog(account, &catalog)
+    select_catalog(account, &catalog)?;
+    if let Some(mut edits) = load_edits(account) {
+        edits.forget(id);
+        save_edits(account, &edits)?;
+    }
+    Ok(())
 }
 
 fn remove_row(catalog: &mut Value, id: &str) -> anyhow::Result<()> {
@@ -582,7 +665,12 @@ pub fn remove_model(account: &StoredAccount, id: &str) -> anyhow::Result<()> {
     }
     let mut catalog = crate::profiles::model_variants::catalog_for_edit(account, &state)?;
     remove_row(&mut catalog, id)?;
-    select_catalog(account, &catalog)
+    select_catalog(account, &catalog)?;
+    if let Some(mut edits) = load_edits(account) {
+        edits.forget(id);
+        save_edits(account, &edits)?;
+    }
+    Ok(())
 }
 
 pub fn path_display(path: &Path) -> String {
@@ -591,6 +679,25 @@ pub fn path_display(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dsh_models_resource_has_product_source_without_config_or_catalog_files() {
+        let mut account: StoredAccount = serde_json::from_value(json!({
+            "id":"dsh-model-source", "name":"DSH", "cli_kind":"dsh",
+            "options":{"dsh":{"model":"deepseek-custom", "reasoningEffort":"off"}}
+        })).unwrap();
+        account.model_display_names.insert("deepseek-custom".into(), "My DeepSeek".into());
+        let resource = models_resource(&account).unwrap();
+        assert_eq!(resource["modelsSource"], json!({"kind":"dsh"}));
+        assert_eq!(resource["selectedModel"], "deepseek-custom");
+        assert_eq!(resource["catalogSupported"], false);
+        assert_eq!(resource["discoverySupported"], false);
+        let selected = resource["models"].as_array().unwrap().iter()
+            .find(|model| model["id"] == "deepseek-custom").unwrap();
+        assert_eq!(selected["isDefault"], true);
+        assert_eq!(selected["entryDisplayName"], "My DeepSeek");
+        assert_eq!(selected["defaultReasoningEffort"], "off");
+    }
+
     use super::*;
 
     #[test]
@@ -681,5 +788,38 @@ mod tests {
         assert_eq!(claude_default_effort(&older, None), Value::Null);
         assert_eq!(claude_default_effort(&json!({"supportedReasoningEfforts": []}), Some("high")), Value::Null);
         assert_eq!(claude_default_effort(&json!({}), Some("high")), Value::Null);
+    }
+
+    /// Design 028 (e): a Zooey-like catalog written by an older release
+    /// (glm-5.3 low/medium/high, default medium, 500000) is corrected at
+    /// startup to what the provider accepts; context and owner edits stay.
+    #[test]
+    fn startup_correction_fixes_rejected_known_row_values_only() {
+        let (_home, _chatgpt, _bundle, _native) = crate::profiles::model_variants::store_tests::fixture();
+        let account = crate::profiles::lifecycle::create_profile(&crate::profiles::lifecycle::NewProfile {
+            name: "Zooey".into(),
+            kind: crate::profiles::lifecycle::NewProfileKind::ApiKey,
+            preset: crate::profiles::providers::find_preset("zai"),
+            base_url: None,
+            model: Some("glm-5.3".into()),
+            api_key: None,
+        })
+        .unwrap();
+        let mut stale = load(&account).unwrap().catalog.unwrap();
+        let rows = stale["models"].as_array_mut().unwrap();
+        let glm = rows.iter_mut().find(|row| row["slug"] == "glm-5.3").expect("preset row");
+        glm["supported_reasoning_levels"] = crate::profiles::known_models::effort_levels(&["low", "medium", "high"]);
+        glm["default_reasoning_level"] = json!("medium");
+        glm["context_window"] = json!(500000);
+        select_catalog(&account, &stale).unwrap();
+        let changes = correct_known_rows().unwrap();
+        assert!(changes.iter().any(|(p, c)| p == "Zooey" && c.field == "supported_reasoning_levels"), "{changes:?}");
+        let row = load(&account).unwrap().catalog.unwrap()["models"].as_array().unwrap()
+            .iter().find(|row| row["slug"] == "glm-5.3").cloned().unwrap();
+        let efforts: Vec<_> = row["supported_reasoning_levels"].as_array().unwrap().iter().map(|l| l["effort"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(efforts, ["low", "high", "max"]);
+        assert_eq!(row["default_reasoning_level"], "max");
+        assert_eq!(row["context_window"], 500000, "legacy context is left to 重置 / 恢复智能配置");
+        assert!(correct_known_rows().unwrap().is_empty(), "converges");
     }
 }

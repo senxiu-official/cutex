@@ -54,6 +54,11 @@ pub fn profile_launch_envs(
     context: &LaunchEnvContext<'_>,
 ) -> Vec<(String, String)> {
     let mut envs = match account.cli_kind {
+        // Managed DSH builds a restricted environment in runtime::dsh.
+        // This legacy CLI helper must not read auth files or add bus credentials.
+        CliKind::Dsh => return Vec::new(),
+        // r266: managed Kimi launches build their own environment (kimi-runtime).
+        CliKind::Kimi => return Vec::new(),
         CliKind::Claude => claude_launch_envs(account, context.global_config),
         CliKind::Codex => codex_specific_launch_envs(
             account,
@@ -223,7 +228,7 @@ pub fn materialized_claude_config_dir(account: &StoredAccount) -> PathBuf {
     base.join("profiles").join(&account.id).join("claude")
 }
 
-fn codex_api_key_from_auth_file(path: &Path) -> Option<String> {
+pub(crate) fn codex_api_key_from_auth_file(path: &Path) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     let json: Value = serde_json::from_str(&raw).ok()?;
     json.get("OPENAI_API_KEY")
@@ -236,6 +241,21 @@ fn codex_api_key_from_auth_file(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dsh_legacy_launch_does_not_read_auth_or_inject_bus_env() {
+        let account: StoredAccount = serde_json::from_value(serde_json::json!({
+            "id":"dsh-profile","name":"DSH","cli_kind":"dsh"
+        })).unwrap();
+        let config = CodezConfig { agent_bus_enabled:true, ..Default::default() };
+        let context = LaunchEnvContext {
+            global_config:&config, desktop_notify_url:None,
+            agent_bus_url:"http://127.0.0.1:1".into(), host_id:"test-host".into(),
+        };
+        let envs = profile_launch_envs(&account, "/unused/auth", "/unused/config", "/unused/status",
+            None, Some(Path::new("/unused/auth")), true, &["test".into()], &context);
+        assert!(envs.is_empty(), "DSH environments belong to the managed product runtime");
+    }
+
     use super::*;
 
     #[test]

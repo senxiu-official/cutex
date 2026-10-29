@@ -53,7 +53,7 @@ pub fn adoption_candidate(
     current_host: &str,
     process_is_live: impl Fn(&CutexSessionRecord, u32) -> bool,
 ) -> Option<RuntimeOccurrence> {
-    if record.is_retired()
+    if crate::agent_management::agent_execution_blocked(&record)
         || record.claude_session.is_some()
         || !crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, current_host)
         || record

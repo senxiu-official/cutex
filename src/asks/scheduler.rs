@@ -34,6 +34,9 @@ use super::model::*;
 use super::render::{self, RequesterLabel};
 use super::store::{AskError, AskState, AskStore, RuntimeCommand};
 use crate::management::v2::admission::AdmissionSnapshot;
+use crate::management::v2::control_timing::{
+    Path as ControlPath, Stage as ControlStage, Trace as ControlTrace,
+};
 use super::{new_id, now_rfc3339};
 use crate::approvals::ApprovalStore;
 
@@ -113,7 +116,9 @@ impl Submission {
                 event_type: self.event_type.to_string(),
                 // r217h2: a results event for a busy requester is `soon` (read at
                 // its next step); submit and status rebuild the same key from its id.
-                delivery: if super::returns::is_next_step_event(&self.message_id) {
+                delivery: if super::returns::is_owner_note(&self.message_id) {
+                    Delivery::Passive
+                } else if super::returns::is_next_step_event(&self.message_id) {
                     Delivery::Soon
                 } else {
                     Delivery::AfterTurn
@@ -354,6 +359,15 @@ pub enum RespondOutcome {
 
 /// The management process's runtime connections, as asks need them.
 pub trait AskRuntime {
+    /// The live runtime's owner-input lane. Acquire it before freezing result
+    /// outbox state; isolated/single-threaded runtime implementations need none.
+    fn result_admission_lane(&self, _session: &str) -> anyhow::Result<Option<std::sync::Arc<crate::management::v2::session_coordination::OperationLane>>> {
+        Ok(None)
+    }
+    /// Existing runtime/session activity; absent for legacy adapters/test worlds.
+    fn result_window_context(&self, _session: &str) -> Option<super::result_coalescing::Context> {
+        None
+    }
     fn target_status(&self, session: &str) -> TargetStatus;
     /// N1 submit. Implementations re-check owner input under the session's
     /// input lock and answer `Busy` when the owner got there first.
@@ -361,6 +375,11 @@ pub trait AskRuntime {
     fn message_status(&self, session: &str, generation: u64, submission: &Submission) -> NativeMessageStatus;
     /// N2: interrupt the turn without closing the native external-input gate.
     fn interrupt_keep_gate(&self, session: &str, turn_id: &str) -> anyhow::Result<()>;
+    /// Implement only when the transport binds to the supplied generation.
+    /// A status check followed by an unbound interrupt is not an exact fence.
+    fn interrupt_exact(&self, _session: &str, _generation: u64, _turn_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("exact_interrupt_unsupported")
+    }
     /// N2: reopen the native gate without a human turn.
     fn resume_gate(&self, session: &str) -> anyhow::Result<()>;
     /// A turn of the thread from history (`thread/read` with turns):
@@ -384,11 +403,22 @@ pub trait AskRuntime {
     fn reconnect(&self, session: &str) -> anyhow::Result<()> {
         anyhow::bail!("reconnect is not available for {session}")
     }
-    /// Steer a short note into the running turn (`soon`), not a new turn:
-    /// the compaction reminder (r208). Default: unsupported.
+    /// Queue a normal next-step result (`soon`). It can survive the end of
+    /// the active turn; callers must not use it for a turn-scoped reminder.
+    /// Default: unsupported.
     fn steer_note(&self, session: &str, generation: u64, submission: &Submission) -> SubmitOutcome {
         let _ = (session, generation, submission);
         SubmitOutcome::Unsupported("steer".into())
+    }
+    /// A best-effort compaction reminder may only enter this exact active
+    /// turn, atomically checked by the receiver. Never fall back to `soon`:
+    /// it can queue across completion and start a new turn. Current native
+    /// transports lack that fence, so omit the reminder but keep the recorded
+    /// compaction and normal delegation/result delivery. A sender-side status
+    /// probe alone cannot supply this guarantee.
+    fn steer_compaction_reminder(&self, session: &str, generation: u64, turn_id: &str, submission: &Submission) -> SubmitOutcome {
+        let _ = (session, generation, turn_id, submission);
+        SubmitOutcome::Unsupported("runtime cannot confine a reminder to one active turn".into())
     }
     /// r217h2: the runtime of `session` takes native `soon` (delegation
     /// results for a busy requester read at its next step). Claude adapters
@@ -419,6 +449,18 @@ pub trait AskRuntime {
 
 /// Directory, gate inputs and approvals for one tick; tests replace them.
 pub trait SchedulerWorld {
+    /// Explicit synthetic roster/policy facts for isolated old fixtures only.
+    /// This method and its support type do not exist in production builds.
+    #[cfg(test)]
+    fn routing_fixture(&self) -> Option<super::routing_policy::test_support::AuthorityFixture> { None }
+    /// Legacy test worlds predate the real roster/routing contract. Production
+    /// also rechecks project asks without captured origin (lineage stays unknown).
+    fn route_legacy_project_asks(&self) -> bool { false }
+    /// Current authenticated project Director used for bounded-budget notices.
+    fn continuation_director(&self, _ask: &AskRecord) -> Option<String> { None }
+    fn result_coalescing(&self) -> crate::config::result_coalescing::ResultCoalescing {
+        crate::config::result_coalescing::ResultCoalescing::default()
+    }
     fn directory(&self) -> Result<Directory, AskError>;
     fn gate_inputs(&self, requester: Option<&str>, target: &str) -> Result<GateInputs, AskError>;
     fn approvals(&self) -> Option<&ApprovalStore>;
@@ -479,6 +521,13 @@ impl HostWorld {
 }
 
 impl SchedulerWorld for HostWorld {
+    fn route_legacy_project_asks(&self) -> bool { true }
+    fn continuation_director(&self, ask: &AskRecord) -> Option<String> {
+        super::continuation::runtime::current_director(ask)
+    }
+    fn result_coalescing(&self) -> crate::config::result_coalescing::ResultCoalescing {
+        crate::config::agent_bus::current().result_coalescing
+    }
     fn directory(&self) -> Result<Directory, AskError> {
         Directory::load()
     }
@@ -564,6 +613,7 @@ pub fn admission_hold(state: &AskState, target: &str, status: &TargetStatus, hea
 
 fn ask_eligible(state: &AskState, target: &str, ask: &AskRecord) -> bool {
     !state.pauses.contains_key(target)
+        && !super::agent_pause::is_paused(state, target)
         && (ask.execution == ExecutionState::Queued || ask.resume_pending())
         && matches!(ask.hold, None | Some(Hold::TargetBusy { .. }))
 }
@@ -590,7 +640,8 @@ fn admission_position(status: &TargetStatus, ask_id: &str) -> Option<usize> {
 
 /// Only the head owner item may start a turn; a fresh input follows all waiting items.
 pub fn owner_may_flush(state: &AskState, session: &str, admission: &AdmissionSnapshot, queue_id: Option<&str>) -> bool {
-    if state.leases.contains_key(session) || admission.next_step.iter().any(|item| item.eligible) {
+    if super::agent_pause::is_paused(state, session)
+        || state.leases.contains_key(session) || admission.next_step.iter().any(|item| item.eligible) {
         return false;
     }
     match (admissible_head(state, session, admission), queue_id) {
@@ -673,6 +724,16 @@ pub fn attempt_submission(store: &AskStore, ask: &AskRecord, attempt: &AttemptRe
 /// What one tick did (tests and diagnostics).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TickReport {
+    pub targets_considered: usize,
+    pub paused_targets_skipped: usize,
+    pub targets_scanned: usize,
+    pub queue_projections: usize,
+    pub targets_deferred: usize,
+    pub queue_capacity_targets: usize,
+    pub yielded_for_results: bool,
+    pub result_waits: std::collections::BTreeMap<String, String>,
+    /// Actual policy waits observed this pass, separate from scan deferral.
+    pub waits: std::collections::BTreeMap<String, String>,
     pub admitted: Vec<String>,
     pub reviewed: Vec<String>,
     pub requeued: Vec<String>,
@@ -753,6 +814,11 @@ fn review_pending(world: &dyn SchedulerWorld, store: &AskStore, report: &mut Tic
         .cloned()
         .collect();
     for ask in pending {
+        // A handover under review / reconcile (044) decides nothing: it stays
+        // pendingReview until the controller is known, never failed.
+        if ask.controller().is_err() {
+            continue;
+        }
         let inputs = match crate::peers::asks::gate_inputs(world, &ask) {
             Ok(inputs) => inputs,
             Err(error) => {
@@ -765,13 +831,21 @@ fn review_pending(world: &dyn SchedulerWorld, store: &AskStore, report: &mut Tic
             continue; // fail closed: stays pendingReview
         };
         let verdict = super::gate::check(approvals, &ask, &inputs, false, now)?;
-        if matches!(&verdict, GateVerdict::Review { gate, created: false, .. }
+        let routing_required = has_routing(&ask) || (world.route_legacy_project_asks() && ask.project_id.is_some());
+        if !routing_required && matches!(&verdict, GateVerdict::Review { gate, created: false, .. }
             if ask.gate.as_ref() == Some(gate) && ask.hold.is_none())
         {
             continue;
         }
-        store.with_state(|state| apply_review_verdict(state, &ask.ask_id, verdict, now))?;
-        report.reviewed.push(ask.ask_id.clone());
+        let reviewed=with_admission_state(world, store, |state, authority, controllers, host| {
+            if routing_pass_in(state, authority, controllers, host, &ask.ask_id, routing_required, false, now) {
+                apply_review_verdict(state, &ask.ask_id, verdict, now);
+                true
+            } else {
+                false
+            }
+        })?;
+        if reviewed {report.reviewed.push(ask.ask_id.clone());}
     }
     Ok(())
 }
@@ -827,28 +901,40 @@ fn reconcile_submitting(
     report: &mut TickReport,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let state = store.snapshot()?;
     let LeaseHolder::Ask { ask_id, attempt } = &lease.holder else {
         return Ok(());
     };
-    let Some(ask) = state.asks.get(ask_id) else {
+    // Project only a due submission. Normal Running/Event leases never copy
+    // the store, and neither the shared generation nor its lock crosses RPC.
+    let pending = store.inspect(|state| {
+        let ask = state.asks.get(ask_id)?;
+        Some((|| {
+            let record = ask.attempts.iter().find(|record| record.n == *attempt)?;
+            if record.state != AttemptState::Submitting || !submit_retry_due(ask, now) {
+                return None;
+            }
+            Some((record.event_artifact.clone()?, Submission {
+                message_id: record.native_message_id.clone(),
+                source_agent: ask.requester.session().map(str::to_string),
+                event_type: render::ASK_EVENT,
+                text: String::new(),
+                asks: vec![ask.ask_id.clone()],
+                attempt: Some(record.n),
+                view: record.view.clone(),
+            }))
+        })())
+    })?;
+    let Some(pending) = pending else {
         store.with_state(|state| state.leases.remove(&lease.cutex_session_id))?;
         return Ok(());
     };
-    let Some(record) = ask.attempts.iter().find(|record| record.n == *attempt) else {
+    let Some((artifact, mut submission)) = pending else {
         return Ok(());
     };
-    if record.state != AttemptState::Submitting {
-        return Ok(());
-    }
-    // Backoff after failed status queries (the first query after a failed
-    // submit is due at once).
-    if !submit_retry_due(ask, now) {
-        return Ok(());
-    }
-    let Some(submission) = attempt_submission(store, ask, record) else {
+    let Some((_, bytes)) = store.read_artifact(&artifact, None).ok().flatten() else {
         return Ok(());
     };
+    submission.text = String::from_utf8_lossy(&bytes).into_owned();
     let ask_id = ask_id.clone();
     let attempt = *attempt;
     // The runtime restarted since the submit: the old occurrence can no
@@ -971,7 +1057,7 @@ fn reconcile_submitting(
 /// status and terminal history. A completed turn is captured from history;
 /// otherwise the attempt ends `interrupted{runtimeRestart|outcomeUnknown}`
 /// with the partial message. Never re-run silently.
-fn reconcile_bound(
+pub(crate) fn reconcile_bound(
     runtime: &dyn AskRuntime,
     store: &AskStore,
     lease: &AdmissionLease,
@@ -981,6 +1067,17 @@ fn reconcile_bound(
     let (Some(turn_id), LeaseHolder::Ask { ask_id, attempt }) = (&lease.turn_id, &lease.holder) else {
         return Ok(());
     };
+    if crate::management::v2::model_overload_retry::holds_default(&lease.cutex_session_id, Some(turn_id)) {
+        // A delegation stop can originate from its requester, outside the
+        // target's owner HTTP lane. Never let the retry hold swallow it.
+        let stopped = store.inspect(|state| state.asks.get(ask_id).is_none_or(|ask|
+            !ask.is_open() || ask.attempts.iter().find(|r|r.n==*attempt)
+                .is_none_or(|r|r.stop_requested || r.state.is_terminal())))?;
+        if stopped {
+            crate::management::v2::model_overload_retry::cancel_default(&lease.cutex_session_id,"stopped")?;
+        }
+        return Ok(());
+    }
     let status = runtime.target_status(&lease.cutex_session_id);
     if !status.online {
         return Ok(());
@@ -996,19 +1093,19 @@ fn reconcile_bound(
     }
     let state = store.snapshot()?;
     let Some(ask) = state.asks.get(ask_id) else {
-        store.with_state(|state| state.leases.remove(&lease.cutex_session_id))?;
+        store.with_state(|state| { if state.leases.get(&lease.cutex_session_id) == Some(lease) { state.leases.remove(&lease.cutex_session_id); } })?;
         return Ok(());
     };
     let Some(record) = ask.attempts.iter().find(|record| record.n == *attempt).cloned() else {
         return Ok(());
     };
     if record.state.is_terminal() {
-        store.with_state(|state| state.leases.remove(&lease.cutex_session_id))?;
+        store.with_state(|state| { if state.leases.get(&lease.cutex_session_id) == Some(lease) { state.leases.remove(&lease.cutex_session_id); } })?;
         return Ok(());
     }
     match runtime.read_turn(&lease.cutex_session_id, turn_id) {
         Some(turn) if turn.get("status").and_then(Value::as_str) != Some("inProgress") => {
-            super::observe::finalize(store, &lease.cutex_session_id, ask_id, *attempt, &turn, Some(InterruptReason::RuntimeRestart), now)?;
+            super::observe::finalize_fenced(store, &lease.cutex_session_id, ask_id, *attempt, &turn, Some(InterruptReason::RuntimeRestart), now, lease)?;
             report.interrupted.push(ask_id.clone());
         }
         Some(_) if !restarted => {} // still running per history
@@ -1021,20 +1118,21 @@ fn reconcile_bound(
                     {
                         // The bound turn ended before the item reached
                         // context: native dropped it; admitting again is safe.
-                        store.with_state(|state| refuse_attempt(state, &lease.cutex_session_id, ask_id, *attempt, None, now))?;
+                        store.with_state(|state| { if state.leases.get(&lease.cutex_session_id) == Some(lease) { refuse_attempt(state, &lease.cutex_session_id, ask_id, *attempt, None, now); } })?;
                         report.requeued.push(ask_id.clone());
                         return Ok(());
                     }
                 }
             }
-            super::observe::finalize(
+            super::observe::finalize_fenced(
                 store,
                 &lease.cutex_session_id,
                 ask_id,
                 *attempt,
-                &json!({"status": "interrupted"}),
+                &json!({"id":turn_id,"status": "interrupted"}),
                 Some(if restarted { InterruptReason::RuntimeRestart } else { InterruptReason::OutcomeUnknown }),
                 now,
+                lease,
             )?;
             report.interrupted.push(ask_id.clone());
         }
@@ -1182,6 +1280,7 @@ pub fn bind_receipt(state: &mut AskState, session: &str, ask_id: &str, attempt: 
         }
     }
     state.update_ask(ask_id, now, |ask| {
+        super::continuation::runtime::accepted(ask, attempt, turn_id);
         if let Some(record) = ask.attempts.iter_mut().find(|record| record.n == attempt) {
             if record.state == AttemptState::Submitting {
                 record.state = AttemptState::Admitted;
@@ -1209,6 +1308,7 @@ fn refuse_attempt(state: &mut AskState, session: &str, ask_id: &str, attempt: u3
         state.leases.remove(session);
     }
     state.update_ask(ask_id, now, |ask| {
+        super::continuation::runtime::refused(ask, attempt);
         if let Some(record) = ask.attempts.iter_mut().find(|record| record.n == attempt) {
             record.state = AttemptState::Refused;
             record.ended_at = Some(now_rfc3339(now));
@@ -1223,15 +1323,67 @@ fn refuse_attempt(state: &mut AskState, session: &str, ask_id: &str, attempt: u3
 
 const NATIVE_BUSY_RETRY_PREFIX: &str = "native busy: ";
 
+fn has_routing(ask: &AskRecord) -> bool {
+    ask.routing_request.is_some() || ask.routing_approval_id.is_some() || ask.routing_grant_id.is_some()
+}
+
+/// Lock order is authority fence -> AskStore. Runtime IO stays outside. A
+/// caller already holding the authority fence must use the inner `_in` API,
+/// never this wrapper; the scheduler invokes this only at its own boundary.
+fn with_admission_state<T: Default>(
+    world: &dyn SchedulerWorld, store: &AskStore,
+    run: impl FnOnce(&mut AskState, &crate::agent_management::AgentManagementSnapshot,
+        &super::routing_policy::integration::ControllerView<'_>, &str) -> T,
+) -> anyhow::Result<T> {
+    let host=super::routing_policy::integration::local_host_id();
+    // Always try the current lifecycle/authority fence, even when no pause was
+    // visible on the previous snapshot. A lifecycle action may be joining this
+    // worker: contention defers without taking AskStore or running callbacks.
+    super::routing_policy::integration::try_with_authority_for_world(world, |snapshot| {
+            let controllers=super::routing_policy::integration::ControllerView::load(snapshot)?;
+            store.with_state(|state| {
+                let projects: Vec<_> = state.project_control.projects.values()
+                    .filter(|control| control.pause_id.is_some()).map(|control| control.project_id.clone()).collect();
+                for project in projects {
+                    // Same canonical membership helper as owner pause HTTP;
+                    // refreshed under the roster fence before pause checks.
+                    let membership = crate::management::v2::delegations::membership(snapshot, &project);
+                    super::project_control::reconcile(state, &project, &membership);
+                }
+                run(state, snapshot, &controllers, &host)
+            })
+                .map_err(|e| AskError::new("persistence_unavailable", format!("admission store: {e:#}")))
+        }).map(|result|result.unwrap_or_default()).map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn routing_pass_in(
+    state: &mut AskState, snapshot: &crate::agent_management::AgentManagementSnapshot,
+    controllers: &super::routing_policy::integration::ControllerView<'_>,
+    host: &str,
+    ask_id: &str, required: bool, consume: bool, now: DateTime<Utc>,
+) -> bool {
+    if super::lineage::check_admission(state,host,ask_id).is_err(){return false;}
+    let Some(ask) = state.asks.get(ask_id) else { return false };
+    if snapshot.agents.values().any(|a|a.cutex_session_id.as_str()==ask.target_cutex_session_id
+        &&a.retired_at.is_some()) {return false;}
+    // Production requires this for historical project asks too. Their missing
+    // lineage remains unknown; it never manufactures reviewer-grant evidence.
+    if !required && !has_routing(ask) { return true; }
+    matches!(super::routing_policy::integration::check_admission(state, snapshot, ask_id,
+        host, consume, now,controllers),
+        Ok(super::routing_policy::RouteVerdict::Pass(_)))
+}
+
 /// These replies prove nothing was accepted, but root idle status does not
 /// expose their gate/draining condition. Probe again after five seconds rather
 /// than rewriting the attempt and entire store on every scheduler tick. Zero
 /// failures keeps this wait separate from the uncertain-submit failure budget.
 fn refuse_busy_attempt(state: &mut AskState, session: &str, ask_id: &str, attempt: u32, reason: &str, generation: u64, now: DateTime<Utc>) {
     refuse_attempt(state, session, ask_id, attempt, Some(busy_hold(reason)), now);
-    if reason == super::control::NATIVE_GATE_CLOSED {
+    if reason == super::control::NATIVE_GATE_CLOSED && !super::control::gate_resume_queued(state, session) {
         // Only the owner reopens a closed gate: show it as a pause instead of
-        // probing it every few seconds behind the owner's own input.
+        // probing it every few seconds behind the owner's own input. A
+        // queued resume (owner, or a quota reset) runs before the retry.
         super::control::runtime_gate_pause(state, session, generation, now);
     }
     if matches!(reason, "gate_closed" | "server_draining") {
@@ -1307,6 +1459,20 @@ fn planned_hold(state: &AskState, target: &str, status: &TargetStatus, ask: &Ask
     })
 }
 
+fn target_wait_reason(state: &AskState, target: &str, status: &TargetStatus, ask: &AskRecord, selected: Option<&str>, now: DateTime<Utc>) -> Option<String> {
+    let hold = planned_hold(state, target, status, ask, selected, now);
+    if hold.is_none() && selected == Some(ask.ask_id.as_str()) && ridealongs_first(state, target, status, &ask.ask_id) {
+        return Some("resultPriority".into());
+    }
+    hold.map(|hold| match hold {
+        Hold::Blocked { by } => match by {
+            BlockedReason::Budget => "autoWakeBudget", BlockedReason::RuntimeDown => "runtimeDown",
+            BlockedReason::Login => "login", BlockedReason::Quota => "quota",
+        }.into(),
+        other => serde_json::to_value(other).ok().and_then(|value| value["reason"].as_str().map(str::to_owned)).unwrap_or_else(|| "held".into()),
+    })
+}
+
 fn plan_target(state: &mut AskState, target: &str, status: &TargetStatus, now: DateTime<Utc>) -> Option<String> {
     let (queued, selected) = target_plan(state, target, status)?;
     for ask in &queued {
@@ -1352,14 +1518,23 @@ fn admit(
     if !submit_retry_due(&ask, now) {
         return Ok(());
     }
+    // Design 044: a handover still under review or reconcile (or unknown)
+    // decides nothing yet; the ask stays queued (no attempt, no failure) until
+    // the current Director accepts it or the owner decides. Afterwards the
+    // controller's reach and caps admit it, never a retired requester's.
+    let controller = match ask.controller() {
+        Ok(controller) => controller,
+        Err(_) => return Ok(()),
+    };
     // A woken continuation / reopened delegation: same ask, next attempt;
-    // boundary and gate were checked when it was first admitted.
+    // boundary and gate were checked when it was first admitted (a handover
+    // changes neither: only the controller may reopen / resume it).
     let resume = if ask.resume_pending() { ask.resume.clone() } else { None };
     if let Some(resume) = resume {
         return admit_continuation(world, runtime, store, directory, target, status, &ask, &resume, report, now);
     }
     // Boundary at admission: a link revoked while queued fails the ask.
-    if let Some(requester) = ask.requester.session() {
+    if let Some(requester) = controller.as_deref() {
         if !directory.may_interact(requester, target) {
             store.with_state(|state| fail_ask(state, ask_id, "recipient_outside_boundary", now))?;
             report.failed.push(ask_id.to_string());
@@ -1451,19 +1626,26 @@ fn admit(
     let ask_view = super::views::ask_view(&ask, attempt_n, gate.required);
     let target_info = directory.get(target);
     // Take the lease and write the attempt before the native submit.
+    let mut timing = ControlTrace::new(ControlPath::AsksDispatch);
+    timing.stage(ControlStage::StoreWrite);
     let queue = store.queue_repository()?;
-    let taken = store.with_state(|state| {
+    let routing_required = has_routing(&ask) || (world.route_legacy_project_asks() && ask.project_id.is_some());
+    let taken = match with_admission_state(world, store, |state, authority, controllers, host| {
+        report.queue_projections += 1;
         let at_head = queue.admission_with_state(target, state).ok()
             .filter(|order| state.asks.get(ask_id).is_some_and(|ask| ask.resume_pending())
                 || crate::management::v2::admission::owner_priority(target)
                 || !order.next_step.iter().any(|item| item.eligible))
             .and_then(|order| admissible_head(state, target, &order).cloned())
             .is_some_and(|item| item.kind == "ask" && item.id == ask_id);
-        if !at_head || state.pauses.contains_key(target) || state.leases.contains_key(target)
+        if !at_head || state.pauses.contains_key(target) || super::agent_pause::is_paused(state, target) || state.leases.contains_key(target)
             || state.asks.get(ask_id).is_none_or(|ask| ask.execution != ExecutionState::Queued)
         {
             return false;
         }
+        if state.asks.get(ask_id).is_none_or(|current|current.revision!=ask.revision
+            || controllers.controller(current).ok()!=Some(controller.clone())) {return false;}
+        if !routing_pass_in(state, authority, controllers, host, ask_id, routing_required, true, now) { return false; }
         state.leases.insert(
             target.to_string(),
             AdmissionLease {
@@ -1491,8 +1673,15 @@ fn admit(
             ask.hold = None;
         });
         true
-    })?;
+    }) {
+        Ok(taken) => taken,
+        Err(error) => {
+            timing.status(500);
+            return Err(error);
+        }
+    };
     if !taken {
+        timing.status(409);
         return Ok(());
     }
     let submission = Submission {
@@ -1504,8 +1693,17 @@ fn admit(
         attempt: Some(attempt_n),
         view: Some(ask_view),
     };
+    timing.stage(ControlStage::Dispatch);
     let outcome = runtime.submit_exclusive(target, status.runtime_generation, &submission);
-    store.with_state(|state| match outcome {
+    timing.status(match &outcome {
+        SubmitOutcome::Started { .. } => 200,
+        SubmitOutcome::Busy { .. } | SubmitOutcome::Refused(_) => 409,
+        SubmitOutcome::Unsupported(_) => 422,
+        SubmitOutcome::TooLarge { .. } => 413,
+        SubmitOutcome::Uncertain(_) => 503,
+    });
+    timing.stage(ControlStage::StoreWrite);
+    if let Err(error) = store.with_state(|state| match outcome {
         SubmitOutcome::Started { turn_id } => {
             bind_receipt(state, target, ask_id, attempt_n, &turn_id, now);
             report.admitted.push(ask_id.to_string());
@@ -1536,7 +1734,10 @@ fn admit(
                 }
             });
         }
-    })?;
+    }) {
+        timing.status(500);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -1623,21 +1824,60 @@ fn admit_continuation(
     let view = super::views::continuation_view(ask, attempt_n, gated, resume);
     let target_info = directory.get(target);
     let continuation = Continuation {
+        bounded_wake_id: super::continuation::runtime::bounded_wake(ask),
         reason: resume.reason,
         of: resume.from_attempt,
         jobs: resume.jobs.clone(),
         by: resume.by,
         note: resume.note.clone(),
     };
+    let bounded_director = continuation.bounded_wake_id.as_ref().and_then(|_| world.continuation_director(ask));
+    // Boundary/capability checks may read profiles and ownership. Run outside
+    // AskStore, then bind this result to the exact current revision/controller
+    // under the final authority fence. No such I/O in the reservation closure.
+    let continuation_controller=ask.controller().ok();
+    let continuation_permitted=super::continuation::runtime::admission_permission(world,Some(directory),ask);
+    let mut timing = ControlTrace::new(ControlPath::AsksDispatch);
+    timing.stage(ControlStage::StoreWrite);
     let queue = store.queue_repository()?;
-    let taken = store.with_state(|state| {
+    let routing_required = has_routing(ask) || (world.route_legacy_project_asks() && ask.project_id.is_some());
+    let taken = match with_admission_state(world, store, |state, authority, controllers, host| {
+        report.queue_projections += 1;
         let at_head = queue.admission_with_state(target, state).ok()
             .filter(|order| state.asks.get(ask_id).is_some_and(|ask| ask.resume_pending())
                 || crate::management::v2::admission::owner_priority(target)
                 || !order.next_step.iter().any(|item| item.eligible))
             .and_then(|order| admissible_head(state, target, &order).cloned())
             .is_some_and(|item| item.kind == "ask" && item.id == ask_id);
-        if !at_head || state.pauses.contains_key(target) || state.leases.contains_key(target) || state.asks.get(ask_id).is_none_or(|ask| !ask.resume_pending()) {
+        if !at_head || state.pauses.contains_key(target) || super::agent_pause::is_paused(state, target) || state.leases.contains_key(target) || state.asks.get(ask_id).is_none_or(|ask| !ask.resume_pending()) {
+            return false;
+        }
+        if !continuation_permitted || state.asks.get(ask_id).is_none_or(|current|current.revision!=ask.revision
+            || controllers.controller(current).ok()!=continuation_controller) {return false;}
+        if !routing_pass_in(state, authority, controllers, host, ask_id, routing_required, false, now) { return false; }
+        if let Some(wake_id) = &continuation.bounded_wake_id {
+            let Some(current) = state.asks.get(ask_id) else { return false };
+            // Rendering and the queue snapshot may have raced a declaration,
+            // pause, stop or another admission. Bind the original snapshot CAS.
+            if current.revision != ask.revision {
+                return false;
+            }
+            let guards = super::continuation::runtime::guards_for(state, current, status,
+                directory.get(target).is_none_or(|info| info.archived), true);
+            let revision = current.bounded_continuation.current.as_ref().map(|r| r.revision).unwrap_or(0);
+            let reserved = state.update_ask(ask_id, now, |ask| ask.bounded_continuation.reserve_admission(
+                revision, wake_id, &format!("{ask_id}#{attempt_n}"), status.runtime_generation,
+                &message_id, guards, now, bounded_director.as_deref()));
+            if !matches!(reserved, Some(Ok(true))) { return false; }
+        }
+        // Spend only after every continuation gate/CAS passed, immediately
+        // before the actual attempt/lease commit. No recursive authority fence.
+        if !routing_pass_in(state, authority, controllers, host, ask_id, routing_required, true, now) {
+            if let Some(wake_id) = &continuation.bounded_wake_id {
+                state.update_ask(ask_id, now, |ask| {
+                    let _ = ask.bounded_continuation.admission_definitely_refused(wake_id, &message_id);
+                });
+            }
             return false;
         }
         state.leases.insert(
@@ -1668,8 +1908,15 @@ fn admit_continuation(
             ask.hold = None;
         });
         true
-    })?;
+    }) {
+        Ok(taken) => taken,
+        Err(error) => {
+            timing.status(500);
+            return Err(error);
+        }
+    };
     if !taken {
+        timing.status(409);
         return Ok(());
     }
     let submission = Submission {
@@ -1681,8 +1928,17 @@ fn admit_continuation(
         attempt: Some(attempt_n),
         view: Some(view),
     };
+    timing.stage(ControlStage::Dispatch);
     let outcome = runtime.submit_exclusive(target, status.runtime_generation, &submission);
-    store.with_state(|state| match outcome {
+    timing.status(match &outcome {
+        SubmitOutcome::Started { .. } => 200,
+        SubmitOutcome::Busy { .. } | SubmitOutcome::Refused(_) => 409,
+        SubmitOutcome::Unsupported(_) => 422,
+        SubmitOutcome::TooLarge { .. } => 413,
+        SubmitOutcome::Uncertain(_) => 503,
+    });
+    timing.stage(ControlStage::StoreWrite);
+    if let Err(error) = store.with_state(|state| match outcome {
         SubmitOutcome::Started { turn_id } => {
             bind_receipt(state, target, ask_id, attempt_n, &turn_id, now);
             report.admitted.push(ask_id.to_string());
@@ -1705,13 +1961,17 @@ fn admit_continuation(
         }
         SubmitOutcome::Uncertain(error) => {
             state.update_ask(ask_id, now, |ask| {
+                super::continuation::runtime::unknown(ask);
                 let failures = note_submit_failure(ask, &error, now);
                 if let Some(record) = ask.current_attempt_mut() {
                     record.last_error = Some(retry_note(&error, failures));
                 }
             });
         }
-    })?;
+    }) {
+        timing.status(500);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -1843,9 +2103,9 @@ pub fn event_compaction_reminder_text(state: &AskState, event: &EventOutboxRecor
         .asks
         .values()
         .filter(|ask| {
-            ask.requester_session() == Some(event.cutex_session_id.as_str())
-                && ask.is_open()
+            ask.is_open()
                 && ask.review == Some(ReviewState::AwaitingAcceptance)
+                && ask.controlled_by(&event.cutex_session_id).unwrap_or(false)
         })
         .collect();
     awaiting.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.ask_id.cmp(&b.ask_id)));
@@ -1888,6 +2148,29 @@ pub fn fit_note(budget: &crate::app_server::external_input::size::Budget, messag
     fits(first).then(|| first.to_string())
 }
 
+/// Whether the leased turn is the one running now. A compaction reminder is
+/// only useful inside that turn; steered into an idle agent (the turn ended,
+/// its `turn/completed` not handled yet) it starts a new turn just to repeat
+/// the brief. host-b 2026-10-15..22: 187 of 199 reminder turns made at most
+/// two model requests, each re-reading a 100k+ context (token audit).
+fn reminder_turn_running(status: &TargetStatus, lease: &AdmissionLease) -> bool {
+    status.runtime_generation == lease.runtime_generation
+        && matches!((&status.active_turn_id, &lease.turn_id), (Some(active), Some(leased)) if active == leased)
+}
+
+fn pending_attempt_reminder(state: &AskState, lease: &AdmissionLease) -> bool {
+    let LeaseHolder::Ask { ask_id, attempt } = &lease.holder else { return false; };
+    // Most ticks have no compaction. Check the pending flag before the
+    // answer-store guard so ordinary running asks do not scan old answers.
+    state.asks.get(ask_id).is_some_and(|ask| {
+            ask.execution.in_runtime() && ask.current_attempt().is_some_and(|record| {
+                record.n == *attempt && record.compaction_reminder_pending
+                    && !record.stop_requested && record.last_message_artifact.is_none()
+            })
+        })
+        && super::observe::attempt_open(state, ask_id, *attempt)
+}
+
 /// Steer one reminder per observed compaction into a requester turn that
 /// carries an ANSWER/QUESTION event (r210 backstop for natives before r50).
 fn send_event_compaction_reminders(runtime: &dyn AskRuntime, store: &AskStore, margin_percent: u8) -> anyhow::Result<()> {
@@ -1910,8 +2193,12 @@ fn send_event_compaction_reminders(runtime: &dyn AskRuntime, store: &AskStore, m
             .collect();
         asks.sort();
         asks.dedup();
+        let status = runtime.target_status(&lease.cutex_session_id);
+        if !reminder_turn_running(&status, lease) {
+            continue; // the turn ended: its completion releases the lease
+        }
         let message_id = new_id("cutex-ask-reminder");
-        let budget = runtime.target_status(&lease.cutex_session_id).receiver_limit.budget(margin_percent);
+        let budget = status.receiver_limit.budget(margin_percent);
         let Some(text) = fit_note(&budget, &message_id, render::REMINDER_EVENT, &event_compaction_reminder_text(&state, event)) else {
             eprintln!("asks: compaction reminder for event {event_id} not sent: {} (even its first line)", super::EVENT_TOO_LARGE);
             let event_id = event_id.clone();
@@ -1931,7 +2218,15 @@ fn send_event_compaction_reminders(runtime: &dyn AskRuntime, store: &AskStore, m
             attempt: None,
             view: None,
         };
-        let outcome = runtime.steer_note(&lease.cutex_session_id, lease.runtime_generation, &submission);
+        // Status can block on native I/O. The observer may have finished the
+        // event during it; never act on the snapshot from before that probe.
+        let current = store.shared()?;
+        if current.leases.get(&lease.cutex_session_id) != Some(lease)
+            || !current.events.get(event_id).is_some_and(|event| event.compaction_reminder_pending)
+        {
+            continue;
+        }
+        let outcome = runtime.steer_compaction_reminder(&lease.cutex_session_id, lease.runtime_generation, lease.turn_id.as_deref().expect("matched running turn"), &submission);
         if matches!(outcome, SubmitOutcome::Busy { .. }) {
             continue; // try again next tick
         }
@@ -1963,14 +2258,15 @@ fn send_compaction_reminders(runtime: &dyn AskRuntime, store: &AskStore, margin_
         let Some(ask) = state.asks.get(ask_id) else {
             continue;
         };
-        let Some(record) = ask.attempts.iter().find(|record| record.n == *attempt) else {
-            continue;
-        };
-        if !record.compaction_reminder_pending || record.state.is_terminal() {
+        if !pending_attempt_reminder(&state, lease) {
             continue;
         }
+        let status = runtime.target_status(&lease.cutex_session_id);
+        if !reminder_turn_running(&status, lease) {
+            continue; // the turn ended: its completion settles the attempt
+        }
         let message_id = new_id("cutex-ask-reminder");
-        let budget = runtime.target_status(&lease.cutex_session_id).receiver_limit.budget(margin_percent);
+        let budget = status.receiver_limit.budget(margin_percent);
         let text = fit_note(&budget, &message_id, render::REMINDER_EVENT, &compaction_reminder_text(ask));
         let Some(text) = text else {
             eprintln!("asks: compaction reminder for {ask_id} not sent: {} (even its first line)", super::EVENT_TOO_LARGE);
@@ -1993,7 +2289,13 @@ fn send_compaction_reminders(runtime: &dyn AskRuntime, store: &AskStore, margin_
             attempt: Some(*attempt),
             view: None,
         };
-        let outcome = runtime.steer_note(&lease.cutex_session_id, lease.runtime_generation, &submission);
+        let current = store.shared()?;
+        if current.leases.get(&lease.cutex_session_id) != Some(lease)
+            || !pending_attempt_reminder(&current, lease)
+        {
+            continue;
+        }
+        let outcome = runtime.steer_compaction_reminder(&lease.cutex_session_id, lease.runtime_generation, lease.turn_id.as_deref().expect("matched running turn"), &submission);
         if matches!(outcome, SubmitOutcome::Busy { .. }) {
             continue; // try again next tick
         }
@@ -2023,13 +2325,15 @@ fn send_compaction_reminders(runtime: &dyn AskRuntime, store: &AskStore, margin_
 /// status lookup can connect to native and wait for an RPC; holding the store
 /// during it blocks owner input and unrelated sessions too.
 fn fall_through_questions(store: &AskStore, offline: impl Fn(&str) -> bool, now: DateTime<Utc>) -> anyhow::Result<()> {
-    let (has_open_questions, requesters) = store.inspect(|state| {
+    let (has_open_questions, requesters) = store.project_snapshot(|state| {
         let mut requesters = std::collections::BTreeSet::new();
         let mut has_open_questions = false;
         for question in state.questions.values().filter(|question| question.state == QuestionState::Open && question.routed_to_owner_at.is_none()) {
             has_open_questions = true;
-            if let Some(requester) = state.asks.get(&question.ask_id).and_then(|ask| ask.requester.session()) {
-                requesters.insert(requester.to_owned());
+            // The session the question goes to now (design 044), not the
+            // original requester.
+            if let Some(requester) = state.asks.get(&question.ask_id).and_then(|ask| super::model::route::question_recipient(ask).ok().flatten()) {
+                requesters.insert(requester);
             }
         }
         (has_open_questions, requesters)
@@ -2047,15 +2351,99 @@ fn fall_through_questions(store: &AskStore, offline: impl Fn(&str) -> bool, now:
     Ok(())
 }
 
-/// One scheduler pass over every target with waiting asks or a lease.
+#[derive(Default)]
+struct ScanDiagnostics { samples: u64, total_ns: u64, last: Value }
+fn scan_diagnostics() -> &'static std::sync::Mutex<ScanDiagnostics> {
+    static STATS: std::sync::OnceLock<std::sync::Mutex<ScanDiagnostics>> = std::sync::OnceLock::new();
+    STATS.get_or_init(Default::default)
+}
+/// Bounded, process-local aggregates for normal control diagnostics. No IDs,
+/// paths, or cached admission decisions; counts describe successful passes.
+pub fn diagnostics() -> Value {
+    let stats = scan_diagnostics().lock().unwrap_or_else(|e| e.into_inner());
+    json!({"schema":1,"samples":stats.samples,"totalNs":stats.total_ns,"lastPass":stats.last})
+}
+fn record_scan_diagnostics(report: &TickReport, now: DateTime<Utc>, elapsed: std::time::Duration) {
+    let counts = |waits: &std::collections::BTreeMap<String, String>| {
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for reason in waits.values() { *counts.entry(reason.clone()).or_default() += 1; }
+        counts
+    };
+    let elapsed_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+    let row = json!({"schema":1,"timestamp":now.to_rfc3339(),"elapsedNs":elapsed_ns,
+        "targets":report.targets_considered,"pausedSkipped":report.paused_targets_skipped,
+        "targetsScanned":report.targets_scanned,"queueProjections":report.queue_projections,
+        "scanDeferred":report.targets_deferred,"yieldedForResults":report.yielded_for_results,
+        "events":report.events.len(),"admitted":report.admitted.len(),
+        "waitCounts":counts(&report.waits),"resultWaitCounts":counts(&report.result_waits),
+        "queueCapacityTargets":report.queue_capacity_targets});
+    if std::env::var_os("CUTEX_SCHEDULER_DIAGNOSTICS").is_some_and(|value| value == "1") {
+        eprintln!("cutex-scheduler-pass {row}");
+    }
+    let mut stats = scan_diagnostics().lock().unwrap_or_else(|e| e.into_inner());
+    stats.samples = stats.samples.saturating_add(1);
+    stats.total_ns = stats.total_ns.saturating_add(elapsed_ns);
+    stats.last = row;
+}
+
+// Bound expensive target probes/projections per tick. Results and recovery
+// run every tick. The cursor stores no permission/FIFO decision: restart or
+// bounded-cache eviction only changes where the next scan begins.
+const TARGETS_PER_TICK: usize = 32;
+fn scan_cursor(store: &AskStore, set: Option<&str>) -> Option<String> {
+    static CURSORS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, String>>> = std::sync::OnceLock::new();
+    let mut cursors = CURSORS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(target) = set {
+        if !cursors.contains_key(store.dir()) && cursors.len() >= 64 { cursors.clear(); }
+        cursors.insert(store.dir().to_path_buf(), target.to_owned());
+        None
+    } else { cursors.get(store.dir()).cloned() }
+}
+
+/// Pause dominates queue order/runtime state. Derive from durable state, not
+/// a timed cache. Changed/new asks retain plan_target's hold/fail transitions.
+fn paused_target(store: &AskStore, snapshot: &AskState, target: &str, ids: &[String], now: DateTime<Utc>) -> anyhow::Result<bool> {
+    let Some(pause) = snapshot.pauses.get(target) else { return Ok(false); };
+    let hold = super::control::pause_hold(pause);
+    let changed = ids.iter().filter_map(|id| snapshot.asks.get(id)).any(|ask|
+        ask.hold.as_ref() != Some(&hold) || ask.options.if_busy == IfBusy::Fail);
+    if changed {
+        store.with_state(|state| {
+            let Some(pause) = state.pauses.get(target) else { return; };
+            let hold = super::control::pause_hold(pause);
+            for id in ids {
+                let Some(ask) = state.asks.get(id) else { continue; };
+                if ask.target_cutex_session_id != target || ask.remote.is_some()
+                    || !(ask.execution == ExecutionState::Queued || ask.resume_pending()) { continue; }
+                if ask.options.if_busy == IfBusy::Fail { fail_ask(state, id, "busy", now); continue; }
+                if ask.hold.as_ref() == Some(&hold) { continue; }
+                state.update_ask(id, now, |ask| ask.hold = Some(hold.clone()));
+                if hold.wakes_waiters() {
+                    if let Some(ask) = state.asks.get(id).cloned() {
+                        super::delivery::record_state_delivery(state, &ask, "held", now);
+                    }
+                }
+            }
+        })?;
+    }
+    Ok(true)
+}
+
+/// One bounded scheduler pass; recovery and results run on every pass.
 pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskStore, now: DateTime<Utc>) -> anyhow::Result<TickReport> {
+    // A scheduler pass is not an HTTP request, so status intentionally stays
+    // unset. AsksDispatch traces below carry logical outcome classes.
+    let started = std::time::Instant::now();
+    let mut timing = ControlTrace::new(ControlPath::AsksAdmission);
     let mut report = TickReport::default();
+    timing.stage(ControlStage::Dispatch);
     run_commands(runtime, store, now)?;
     end_stale_runtime_gates(runtime, store, now)?;
     // Questions fall through to the owner after the timeout or when the
     // requester is offline (§5.9).
     fall_through_questions(store, |requester| !runtime.target_status(requester).online, now)?;
     review_pending(world, store, &mut report, now)?;
+    timing.stage(ControlStage::StoreRead);
     let state = store.shared()?;
     for lease in state.leases.values() {
         reconcile_submitting(runtime, store, lease, &mut report, now)?;
@@ -2067,25 +2455,37 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
     if super::awaits::any_due(&*store.shared()?, now) {
         store.with_state(|state| super::awaits::wake_due(state, now))?;
     }
+    super::continuation::runtime::tick_due(world, runtime, store, now)?;
     super::revisions::reconcile(world, store, now)?;
+    timing.stage(ControlStage::StoreRead);
     let pending = store.shared()?;
     // Existing ridealongs run first. Otherwise deliver results generated by
     // this pass at its end; never reconcile the same uncertain send twice.
-    let results_first = !super::delivery::requesters_with_pending(&pending).is_empty()
+    let pending_delivery_ids: std::collections::HashSet<String> = pending.deliveries.iter()
+        .filter(|(_, delivery)| !delivery.passive && super::delivery::actionable(&pending, delivery)
+            && super::delivery::recipient(&pending, delivery).is_some())
+        .map(|(id, _)| id.clone()).collect();
+    let results_first = !pending_delivery_ids.is_empty()
         || pending.leases.values().any(|lease| matches!(lease.holder, LeaseHolder::Event { .. }))
         || !pending.next_step_leases.is_empty();
     if results_first {
+        timing.stage(ControlStage::Fanout);
         super::returns::admit_events(world, runtime, store, &mut report, now)?;
     }
+    timing.stage(ControlStage::StoreRead);
     let state = store.shared()?;
-    let mut targets: Vec<String> = state
-        .asks
-        .values()
-        .filter(|ask| ask.remote.is_none() && (ask.execution == ExecutionState::Queued || ask.resume_pending()))
-        .map(|ask| ask.target_cutex_session_id.clone())
-        .collect();
-    targets.sort();
-    targets.dedup();
+    let mut by_target = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for ask in state.asks.values().filter(|ask| ask.remote.is_none()
+        && (ask.execution == ExecutionState::Queued || ask.resume_pending())) {
+        by_target.entry(ask.target_cutex_session_id.clone()).or_default().push(ask.ask_id.clone());
+    }
+    let mut waiting_counts = std::collections::BTreeMap::<&str, usize>::new();
+    for ask in state.asks.values().filter(|ask| ask.remote.is_none()
+        && matches!(ask.execution, ExecutionState::Queued | ExecutionState::PendingReview)) {
+        *waiting_counts.entry(&ask.target_cutex_session_id).or_default() += 1;
+    }
+    report.queue_capacity_targets = waiting_counts.values().filter(|count| **count >= super::MAX_QUEUED_PER_TARGET).count();
+    let mut targets: Vec<String> = by_target.keys().cloned().collect();
     // A target with nothing queued blocks nobody any more: forget who was
     // told it needs the owner, so a later block notifies again (the online
     // path below only runs for targets that still have queued asks).
@@ -2097,15 +2497,39 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
         .filter(|target| targets.binary_search(target).is_err())
         .collect();
     if !unblocked.is_empty() {
+        timing.stage(ControlStage::StoreWrite);
         store.with_state(|state| {
             for target in &unblocked {
                 super::wake::clear_owner_action(state, target);
             }
         })?;
     }
+    timing.stage(ControlStage::ContextRead);
     let directory = if targets.is_empty() { None } else { world.directory().ok() };
     let mut provenance = None;
-    for target in targets {
+    if let Some(last) = scan_cursor(store, None) {
+        let start = targets.partition_point(|target| target <= &last);
+        let len = targets.len();
+        if len > 0 { targets.rotate_left(start % len); }
+    }
+    for (index, target) in targets.iter().cloned().enumerate() {
+        // Newly actionable results preempt the bulk scan after the current
+        // target. Existing coalescing/policy waits do not preempt repeatedly.
+        // Never reconcile an uncertain result receipt twice in one tick.
+        if report.targets_scanned > 0 && report.targets_scanned < TARGETS_PER_TICK
+            && !state.pauses.contains_key(&target) {
+            let current = store.shared()?;
+            let fresh = !std::sync::Arc::ptr_eq(&current, &pending)
+                && current.deliveries.iter().any(|(id, delivery)| !pending_delivery_ids.contains(id)
+                    && !delivery.passive && super::delivery::actionable(&current, delivery)
+                    && super::delivery::recipient(&current, delivery).is_some());
+            if fresh {
+                report.yielded_for_results = true;
+                report.targets_deferred += targets[index..].iter().filter(|target| !state.pauses.contains_key(*target)).count();
+                break;
+            }
+        }
+        report.targets_considered += 1;
         let Some(directory) = directory.as_ref() else {
             break;
         };
@@ -2124,9 +2548,26 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
             report.failed.extend(ids);
             continue;
         }
+        if paused_target(store, &state, &target, &by_target[&target], now)? {
+            report.paused_targets_skipped += 1;
+            let pause = &state.pauses[&target];
+            report.waits.insert(target.clone(), if pause.origin.as_deref() == Some(super::control::ORIGIN_RUNTIME_GATE) {
+                "runtimeGate"
+            } else if pause.stop_hold { "ownerStop" } else { "delegationPaused" }.into());
+            continue;
+        }
+        if report.targets_scanned >= TARGETS_PER_TICK {
+            report.targets_deferred += 1;
+            continue;
+        }
+        scan_cursor(store, Some(&target));
+        report.targets_scanned += 1;
+        timing.stage(ControlStage::ContextRead);
         let mut status = runtime.target_status(&target);
         let queue = store.queue_repository()?;
+        timing.stage(ControlStage::StoreRead);
         let snapshot = store.shared()?;
+        report.queue_projections += 1;
         status.admission = Some(if status.online {
             queue.admission_with_state(&target, &snapshot)?
         } else {
@@ -2138,6 +2579,8 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
             ask.hold != hold || (ask.options.if_busy == IfBusy::Fail && hold.is_some())
         });
         let head = if changed {
+            report.queue_projections += 1;
+            timing.stage(ControlStage::StoreWrite);
             store.with_state(|state| -> anyhow::Result<_> {
                 status.admission = Some(if status.online {
                     queue.admission_with_state(&target, state)?
@@ -2147,30 +2590,71 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
                 Ok(plan_target(state, &target, &status, now))
             })??
         } else {
-            selected.filter(|id| !ridealongs_first(&snapshot, &target, &status, id))
+            selected.clone().filter(|id| !ridealongs_first(&snapshot, &target, &status, id))
         };
         if let Some(ask_id) = head {
+            timing.stage(ControlStage::Dispatch);
             admit(world, runtime, store, directory, &target, &status, &ask_id, &mut report, now)?;
         } else {
+            if let Some(ask) = selected.as_deref().and_then(|id| planned.iter().find(|ask| ask.ask_id == id)).or_else(|| planned.first()) {
+                if let Some(reason) = target_wait_reason(&snapshot, &target, &status, ask, selected.as_deref(), now) {
+                    report.waits.insert(target.clone(), reason);
+                }
+            }
             if status.online && state.owner_action.contains_key(&target) {
+                timing.stage(ControlStage::StoreWrite);
                 store.with_state(|state| super::wake::clear_owner_action(state, &target))?;
             }
             if !status.online && status.reconnectable {
+                timing.stage(ControlStage::Dispatch);
                 if let Err(error) = runtime.reconnect(&target) {
                     eprintln!("asks: reconnect of {target} failed: {error:#}");
                 }
                 continue;
             }
-            maybe_wake(world, runtime, store, directory, &target, &status, &mut provenance, now)?;
+            timing.stage(ControlStage::Dispatch);
+            maybe_wake(world, runtime, store, directory, &target, &status, &mut provenance, &mut report, now)?;
         }
     }
     if !results_first {
+        timing.stage(ControlStage::Fanout);
         super::returns::admit_events(world, runtime, store, &mut report, now)?;
     }
+    record_scan_diagnostics(&report, now, started.elapsed());
     Ok(report)
 }
 
 /// The head ask of an offline target may auto-wake it (§8.4).
+fn reserve_auto_wake(
+    world: &dyn SchedulerWorld, store: &AskStore, target: &str,
+    head: &AskRecord, domain: &str, online_budget: usize, now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    // The policy/provenance calculation may read sidecars; bind its controller
+    // and ask revision before entering the final pure AskStore reservation.
+    let expected_controller=head.controller().ok();
+    if expected_controller.is_none() {return Ok(false);}
+    let routing_required=has_routing(head)||(world.route_legacy_project_asks()&&head.project_id.is_some());
+    with_admission_state(world,store,|state,authority,controllers,host| {
+        let Some(current)=state.asks.get(&head.ask_id) else {return false};
+        if current.revision!=head.revision || current.target_cutex_session_id!=target
+            || !(current.execution==ExecutionState::Queued||current.resume_pending())
+            || controllers.controller(current).ok()!=expected_controller
+            || authority.agents.values().any(|a|a.cutex_session_id.as_str()==target&&a.retired_at.is_some())
+            || state.pauses.contains_key(target)||super::agent_pause::is_paused(state,target)
+            || state.leases.contains_key(target)||super::wake::recently_woken(state,target,now)
+            || (matches!(expected_controller,Some(Some(_)))&&state.owner_offline.contains(target)) {
+            return false;
+        }
+        let running=state.woken.iter().filter(|(session,(woken_domain,_))|woken_domain==domain
+            &&state.presence.get(*session).is_some_and(|p|p.online)).count();
+        if running>=online_budget {return false;}
+        if !routing_pass_in(state,authority,controllers,host,&head.ask_id,routing_required,false,now) {return false;}
+        super::wake::record_wake(state,target,domain,now);
+        state.update_ask(&head.ask_id,now,|ask|ask.hold=Some(Hold::Blocked{by:BlockedReason::RuntimeDown}));
+        true
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn maybe_wake(
     world: &dyn SchedulerWorld,
@@ -2180,6 +2664,7 @@ fn maybe_wake(
     target: &str,
     status: &TargetStatus,
     provenance: &mut Option<std::collections::BTreeMap<String, super::children::Provenance>>,
+    report: &mut TickReport,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     if status.online || status.blocked.is_some() {
@@ -2231,30 +2716,25 @@ fn maybe_wake(
     let head = head.clone();
     match decision {
         super::wake::WakeDecision::Wake { domain } => {
-            store.with_state(|state| {
-                super::wake::record_wake(state, target, &domain, now);
-                state.update_ask(&head.ask_id, now, |ask| ask.hold = Some(Hold::Blocked { by: BlockedReason::RuntimeDown }));
-            })?;
+            if !reserve_auto_wake(world,store,target,&head,&domain,limits.agent_started_online_per_domain,now)? {return Ok(());}
+            report.waits.insert(target.into(), "runtimeStarting".into());
             if let Err(error) = runtime.wake(target) {
                 eprintln!("asks: auto-wake of {target} failed: {error:#}");
             }
         }
         super::wake::WakeDecision::RelaunchReviewed { domain, requester } => {
-            store.with_state(|state| {
-                super::wake::record_wake(state, target, &domain, now);
-                // The owner's `reviewedRelaunch` notice is recorded by the
-                // runtime once a launch actually ran (not when the owner's
-                // own start got there first).
-                state.update_ask(&head.ask_id, now, |ask| ask.hold = Some(Hold::Blocked { by: BlockedReason::RuntimeDown }));
-            })?;
+            if !reserve_auto_wake(world,store,target,&head,&domain,limits.agent_started_online_per_domain,now)? {return Ok(());}
+            report.waits.insert(target.into(), "reviewedRelaunch".into());
             if let Err(error) = runtime.relaunch_reviewed(target, &requester, &head.ask_id) {
                 eprintln!("asks: reviewed relaunch of {target} for {requester} failed: {error:#}");
             }
         }
         super::wake::WakeDecision::OverBudget { domain } => {
+            report.waits.insert(target.into(), "autoWakeBudget".into());
             store.with_state(|state| super::wake::hold_over_budget(state, &head.ask_id, &domain, now))?;
         }
         super::wake::WakeDecision::Never(reason) => {
+            report.waits.insert(target.into(), reason.into());
             // The owner paused it (and is told by the pause) or archived it
             // (the tick fails those asks); otherwise only the owner can help.
             let known = state.owner_action.get(target);
@@ -2277,6 +2757,10 @@ pub fn describe_target(state: &AskState, target: &str) -> Value {
         "lease": state.leases.get(target),
         "pause": state.pauses.get(target),
         "waiting": state.waiting_for_target(target).iter().map(|ask| &ask.ask_id).collect::<Vec<_>>(),
+        // Capacity refuses NEW asks; it does not hold an already queued ask.
+        "queueCapacity": {"waiting":state.waiting_for_target(target).len(),
+            "limit":super::MAX_QUEUED_PER_TARGET,
+            "full":state.waiting_for_target(target).len() >= super::MAX_QUEUED_PER_TARGET},
     })
 }
 
@@ -2290,6 +2774,53 @@ pub(crate) mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn final_admission_always_defers_on_lifecycle_even_without_visible_routing_or_pause() {
+        let _home=crate::profiles::lifecycle::tests::TestHome::new();
+        let (world,root)=world("admission-try-all");
+        let (store,store_root)=temp_store("admission-try-all");
+        let roster=crate::agent_management::AgentManagementStore::open_default().unwrap();
+        let fence=roster.lock_mutations().unwrap();
+        let before=store.snapshot().unwrap();
+        let admitted=with_admission_state(&world,&store,|_,_,_,_|->bool {
+            panic!("unconditional final admission ran behind a lifecycle mutation")
+        }).unwrap();
+        assert!(!admitted);
+        assert_eq!(store.snapshot().unwrap(),before);
+        drop(fence);
+        assert!(with_admission_state(&world,&store,|_,_,_,_|true).unwrap());
+        let _=std::fs::remove_dir_all(root);
+        let _=std::fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn final_auto_wake_sees_a_pause_committed_after_the_planning_snapshot() {
+        use crate::asks::{project_control as control,routing_policy::{integration as route,RoutingActor}};
+        let _home=crate::profiles::lifecycle::tests::TestHome::new();
+        let (world,root)=world("wake-final-pause");
+        let (store,store_root)=temp_store("wake-final-pause");
+        let now=Utc::now();
+        let host=route::local_host_id();
+        let head=store.with_state(|s|s.create_ask(new_ask("wake-final-pause","queued work"),now).unwrap().0).unwrap();
+        let paused=route::try_with_authority_for_world(&world,|snapshot| {
+            let ctx=route::trusted_context(snapshot,"alpha",RoutingActor::Owner,&host)?;
+            store.with_state(|s|control::pause(s,&ctx,&control::PauseRequest{action_id:"wake-pause".into(),expected_epoch:0,
+                mode:control::Mode::AfterTurn,scope:control::Scope::Members},&control::Membership{revision:1,members:[TARGET.into()].into(),excluded:Default::default()},&host,now)).unwrap()
+        }).unwrap().unwrap();
+        assert!(!reserve_auto_wake(&world,&store,TARGET,&head,"project:alpha",10,now).unwrap());
+        assert!(!store.snapshot().unwrap().woken.contains_key(TARGET));
+        route::try_with_authority_for_world(&world,|snapshot| {
+            let ctx=route::trusted_context(snapshot,"alpha",RoutingActor::Owner,&host)?;
+            store.with_state(|s|control::resume(s,&ctx,&control::ResumeRequest{action_id:"wake-resume".into(),expected_epoch:1,
+                pause_id:paused["runControl"]["pauseId"].as_str().unwrap().into()},&host,now)).unwrap()
+        }).unwrap().unwrap();
+        assert!(reserve_auto_wake(&world,&store,TARGET,&head,"project:alpha",10,now).unwrap());
+        assert!(store.snapshot().unwrap().woken.contains_key(TARGET));
+        assert!(!reserve_auto_wake(&world,&store,TARGET,&head,"project:alpha",10,now).unwrap(),"same wake cannot reserve twice");
+        let _=std::fs::remove_dir_all(root);
+        let _=std::fs::remove_dir_all(store_root);
+    }
+
     fn pending_question(id: &str, ask_id: &str, now: DateTime<Utc>) -> QuestionRecord {
         QuestionRecord {
             question_id: id.into(), ask_id: ask_id.into(), attempt: 1, runtime_generation: 1,
@@ -2297,6 +2828,74 @@ pub(crate) mod tests {
             questions: json!([]), route: QuestionRoute::Requester, routed_to_owner_at: None,
             state: QuestionState::Open, resolution: None, created_at: now_rfc3339(now),
         }
+    }
+
+    #[test]
+    fn caller_perf_running_leases_and_unleased_events_fixture() {
+        let (store, dir) = temp_store("caller-perf");
+        let now = Utc::now();
+        let leases = store.with_state(|state| {
+            let (mut template, _) = state.create_ask(new_ask("seed", &"x".repeat(16_384)), now).unwrap();
+            state.asks.clear();
+            state.notices.clear();
+            template.execution = ExecutionState::Running;
+            let mut attempt = AttemptRecord::submitting(1, "message".into(), 1, now_rfc3339(now));
+            attempt.state = AttemptState::Running;
+            template.attempts.push(attempt);
+            let mut leases = Vec::new();
+            for n in 0..512 {
+                let mut ask = template.clone();
+                ask.ask_id = format!("fixture-{n}");
+                ask.seq = n;
+                ask.target_cutex_session_id = format!("session-{n}");
+                if n < 32 {
+                    let lease = AdmissionLease {
+                        cutex_session_id: ask.target_cutex_session_id.clone(),
+                        holder: LeaseHolder::Ask { ask_id: ask.ask_id.clone(), attempt: 1 },
+                        native_message_id: "message".into(), runtime_generation: 1,
+                        turn_id: Some("running".into()), since: now_rfc3339(now),
+                    };
+                    state.leases.insert(lease.cutex_session_id.clone(), lease.clone());
+                    leases.push(lease);
+                }
+                state.asks.insert(ask.ask_id.clone(), ask);
+            }
+            leases
+        }).unwrap();
+        // Use the store's existing thread-local counter: setup and unrelated
+        // parallel tests do not contaminate either measured interval.
+        let copies = super::super::store::whole_state_copies_on_this_thread;
+        let before = copies();
+        let start = std::time::Instant::now();
+        for lease in &leases {
+            let state = store.snapshot().unwrap();
+            let LeaseHolder::Ask { ask_id, attempt } = &lease.holder else { unreachable!() };
+            assert_ne!(state.asks[ask_id].attempts.iter().find(|r| r.n == *attempt).unwrap().state, AttemptState::Submitting);
+            let state = store.peek().unwrap().unwrap();
+            assert!(!state.leases.contains_key("unleased"));
+        }
+        let baseline = start.elapsed();
+        let baseline_copies = copies() - before;
+        let runtime = FakeRuntime::default();
+        *runtime.status_hook.borrow_mut() = Some(Box::new(|| panic!("non-submitting lease must not query runtime")));
+        let mut report = TickReport::default();
+        let before = copies();
+        let start = std::time::Instant::now();
+        for lease in &leases {
+            reconcile_submitting(&runtime, &store, lease, &mut report, now).unwrap();
+            super::super::observe::observe(&store, "unleased", "thread/tokenUsage/updated",
+                &json!({"turnId":"running","tokenUsage":{"total":123}}), now).unwrap();
+        }
+        let projected = start.elapsed();
+        let projected_copies = copies() - before;
+        assert_eq!(report, TickReport::default());
+        assert_eq!(*runtime.status_queries.borrow(), 0);
+        assert!(runtime.status_hook.borrow().is_some());
+        assert!(runtime.submitted.borrow().is_empty());
+        assert_eq!(baseline_copies, 64);
+        assert_eq!(projected_copies, 0);
+        eprintln!("CALLER_PERF asks=512 body_bytes=16384 leases=32 events=32 baseline_whole_copies={baseline_copies} projected_whole_copies={projected_copies} baseline_us={} projected_us={}", baseline.as_micros(), projected.as_micros());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2375,6 +2974,7 @@ pub(crate) mod tests {
     }
 
     pub struct FakeWorld {
+        pub result_settings: crate::config::result_coalescing::ResultCoalescing,
         pub directory: Directory,
         pub inputs: RefCell<GateInputs>,
         pub approvals: ApprovalStore,
@@ -2384,10 +2984,16 @@ pub(crate) mod tests {
     }
 
     impl SchedulerWorld for FakeWorld {
+        #[cfg(test)]
+        fn routing_fixture(&self) -> Option<super::super::routing_policy::test_support::AuthorityFixture> {
+            Some(super::super::routing_policy::test_support::for_directory(&self.directory))
+        }
+        fn result_coalescing(&self) -> crate::config::result_coalescing::ResultCoalescing { self.result_settings }
         fn directory(&self) -> Result<Directory, AskError> {
             Ok(self.directory.clone())
         }
         fn gate_inputs(&self, requester: Option<&str>, _target: &str) -> Result<GateInputs, AskError> {
+            GATE_CALLS.with(|calls| calls.borrow_mut().push(requester.map(str::to_string)));
             let mut inputs = self.inputs.borrow().clone();
             if requester.is_none() {
                 inputs.requester = None;
@@ -2410,7 +3016,10 @@ pub(crate) mod tests {
 
     #[derive(Default)]
     pub struct FakeRuntime {
+        pub result_context: RefCell<BTreeMap<String, crate::asks::result_coalescing::Context>>,
         pub status: RefCell<BTreeMap<String, TargetStatus>>,
+        pub target_probes: RefCell<Vec<String>>,
+        pub call_order: RefCell<Vec<String>>,
         pub submitted: RefCell<Vec<(String, Submission)>>,
         /// Next outcomes (default: a receipt with a fresh turn id).
         pub outcomes: RefCell<Vec<SubmitOutcome>>,
@@ -2433,11 +3042,16 @@ pub(crate) mod tests {
         /// r217h2: the runtime takes `soon` (results at the next step).
         pub next_step: std::cell::Cell<bool>,
         pub durable_next_step: std::cell::Cell<bool>,
+        pub status_hook: RefCell<Option<Box<dyn FnOnce()>>>,
+        pub read_turn_hook: RefCell<Option<Box<dyn FnOnce()>>>,
+        pub reminder_fence: std::cell::Cell<bool>,
+        pub end_before_reminder: std::cell::Cell<bool>,
     }
 
     impl FakeRuntime {
         pub fn idle(sessions: &[&str]) -> Self {
             let runtime = Self::default();
+            runtime.reminder_fence.set(true);
             for session in sessions {
                 runtime.status.borrow_mut().insert(
                     session.to_string(),
@@ -2452,13 +3066,22 @@ pub(crate) mod tests {
     }
 
     impl AskRuntime for FakeRuntime {
+        fn result_window_context(&self, session: &str) -> Option<crate::asks::result_coalescing::Context> {
+            self.result_context.borrow().get(session).copied()
+        }
         fn durable_next_step(&self, _session: &str) -> bool {
             self.durable_next_step.get()
         }
         fn target_status(&self, session: &str) -> TargetStatus {
-            self.status.borrow().get(session).cloned().unwrap_or_default()
+            self.target_probes.borrow_mut().push(session.into());
+            self.call_order.borrow_mut().push(format!("probe:{session}"));
+            let status = self.status.borrow().get(session).cloned().unwrap_or_default();
+            let hook = self.status_hook.borrow_mut().take();
+            if let Some(hook) = hook { hook(); }
+            status
         }
         fn submit_exclusive(&self, session: &str, _generation: u64, submission: &Submission) -> SubmitOutcome {
+            self.call_order.borrow_mut().push(format!("submit:{session}"));
             self.submitted.borrow_mut().push((session.to_string(), submission.clone()));
             let outcome = if self.outcomes.borrow().is_empty() {
                 SubmitOutcome::Started { turn_id: format!("turn-{}", self.submitted.borrow().len()) }
@@ -2488,6 +3111,12 @@ pub(crate) mod tests {
             self.interrupts.borrow_mut().push(format!("{session}:{turn_id}"));
             Ok(())
         }
+        fn interrupt_exact(&self, session: &str, generation: u64, turn_id: &str) -> anyhow::Result<()> {
+            let status=self.status.borrow().get(session).cloned().unwrap_or_default();
+            anyhow::ensure!(status.online&&status.runtime_generation==generation&&status.active_turn_id.as_deref()==Some(turn_id),"occurrence changed");
+            self.interrupts.borrow_mut().push(format!("{session}:{turn_id}"));
+            Ok(())
+        }
         fn resume_gate(&self, session: &str) -> anyhow::Result<()> {
             self.resumes.borrow_mut().push(session.to_string());
             Ok(())
@@ -2514,10 +3143,24 @@ pub(crate) mod tests {
                 .or_insert(NativeMessageStatus::Pending);
             SubmitOutcome::Started { turn_id: "steered".into() }
         }
+        fn steer_compaction_reminder(&self, session: &str, generation: u64, turn_id: &str, submission: &Submission) -> SubmitOutcome {
+            if !self.reminder_fence.get() {
+                return SubmitOutcome::Unsupported("no atomic active-turn fence".into());
+            }
+            if self.end_before_reminder.replace(false) {
+                self.set(session, |status| status.active_turn_id = None);
+            }
+            let status = self.target_status(session);
+            if status.runtime_generation != generation || status.active_turn_id.as_deref() != Some(turn_id) {
+                return SubmitOutcome::Refused("turn ended before reminder admission".into());
+            }
+            self.steer_note(session, generation, submission)
+        }
         fn takes_next_step(&self, _session: &str, _generation: u64) -> bool {
             self.next_step.get()
         }
         fn read_turn(&self, _session: &str, turn_id: &str) -> Option<Value> {
+            if let Some(hook) = self.read_turn_hook.borrow_mut().take() { hook(); }
             self.turns.borrow().get(turn_id).cloned()
         }
         fn respond_question(&self, session: &str, _generation: u64, _response_id: &str, request_id: &Value, result: &Value) -> RespondOutcome {
@@ -2534,9 +3177,66 @@ pub(crate) mod tests {
         }
     }
 
+    thread_local! {
+        /// The requester each gate evaluation was asked for (this thread).
+        pub static GATE_CALLS: RefCell<Vec<Option<String>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Design 044: a queued ask handed over from a retired requester is
+    /// admitted with the new controller's reach and caps; while the handover
+    /// awaits review it stays queued, neither failed nor run.
+    #[test]
+    fn handed_over_queued_ask_admits_as_the_controller_and_waits_for_review() {
+        use crate::asks::model::route::{pin, Pin};
+        const NEW: &str = "cutex.00000000-0000-0000-0000-0000000000c1";
+        let (mut world, dir) = world("handover-admit");
+        // The retired requester is outside the target's boundary now; the new Director is inside.
+        world.directory = directory(&[(REQUESTER, "Eva", Some("beta")), (NEW, "AlphaProfile", Some("alpha")), (TARGET, "Kimi", Some("alpha"))]);
+        let (store, store_dir) = temp_store("handover-admit");
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = Utc::now();
+        let ask = store.with_state(|state| state.create_ask(new_ask("a", "x"), now).unwrap().0.ask_id).unwrap();
+        pin(&ask, Pin { controller: Err("handover_pending_review"), history: vec![REQUESTER.into()], questions: None });
+        tick(&world, &runtime, &store, now).unwrap();
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.asks[&ask].execution, ExecutionState::Queued, "pending review: stays queued");
+        assert!(state.asks[&ask].attempts.is_empty() && state.asks[&ask].closed.is_none());
+        pin(&ask, Pin { controller: Ok(Some(NEW.into())), history: vec![REQUESTER.into()], questions: None });
+        GATE_CALLS.with(|calls| calls.borrow_mut().clear());
+        tick(&world, &runtime, &store, now).unwrap();
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.asks[&ask].attempts.len(), 1, "admitted under the new controller's reach");
+        assert_eq!(GATE_CALLS.with(|calls| calls.borrow().clone()), vec![Some(NEW.to_string())], "gated with the controller, not the retired requester");
+        assert_eq!(state.asks[&ask].requester.session(), Some(REQUESTER), "the request is unchanged");
+        // A pendingReview ask under handover review stays pendingReview.
+        let (store3, store_dir3) = temp_store("handover-admit-3");
+        let reviewed = store3.with_state(|state| {
+            let id = state.create_ask(new_ask("c", "z"), now).unwrap().0.ask_id;
+            state.update_ask(&id, now, |ask| ask.execution = ExecutionState::PendingReview);
+            id
+        }).unwrap();
+        pin(&reviewed, Pin { controller: Err("handover_pending_review"), history: vec![], questions: None });
+        tick(&world, &FakeRuntime::idle(&[TARGET]), &store3, now).unwrap();
+        assert_eq!(store3.snapshot().unwrap().asks[&reviewed].execution, ExecutionState::PendingReview);
+        // Nor does it wake the target on the retired requester's behalf.
+        let held = store3.snapshot().unwrap().asks[&reviewed].clone();
+        let decision = crate::asks::wake::decide(&store3.snapshot().unwrap(), &Default::default(), &held, false, 8, &|_| false);
+        assert_eq!(decision, crate::asks::wake::WakeDecision::Never("handoverPending"));
+        let _ = std::fs::remove_dir_all(store_dir3);
+        // Without the handover the retired requester's boundary still fails it (r253 rule).
+        let (store2, store_dir2) = temp_store("handover-admit-2");
+        let other = store2.with_state(|state| state.create_ask(new_ask("b", "y"), now).unwrap().0.ask_id).unwrap();
+        tick(&world, &FakeRuntime::idle(&[TARGET]), &store2, now).unwrap();
+        assert_eq!(store2.snapshot().unwrap().asks[&other].execution, ExecutionState::Failed);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(store_dir2);
+    }
+
     pub fn world(label: &str) -> (FakeWorld, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("cutex-asks-world-{label}-{}", uuid::Uuid::new_v4().simple()));
         let world = FakeWorld {
+            result_settings: Default::default(),
             directory: directory(&[(REQUESTER, "Eva", Some("alpha")), (TARGET, "Kimi", Some("alpha"))]),
             inputs: RefCell::new(inputs(
                 Some(party(REQUESTER, SandboxLevel::FullAccess, &[], "chatgpt")),
@@ -2632,10 +3332,14 @@ pub(crate) mod tests {
     }
 
     fn queued_answer(store: &AskStore, id: &str, now: DateTime<Utc>) -> String {
+        queued_answer_for(store, id, TARGET, REQUESTER, now)
+    }
+
+    fn queued_answer_for(store: &AskStore, id: &str, requester: &str, target: &str, now: DateTime<Utc>) -> String {
         store.with_state(|state| {
             let mut source = new_ask(id, "answer source");
-            source.requester = Requester::Agent { cutex_session_id: TARGET.into(), name: None };
-            source.target_cutex_session_id = REQUESTER.into();
+            source.requester = Requester::Agent { cutex_session_id: requester.into(), name: None };
+            source.target_cutex_session_id = target.into();
             let ask_id = state.create_ask(source, now).unwrap().0.ask_id;
             let ask = state.asks.get_mut(&ask_id).unwrap();
             ask.execution = ExecutionState::Answered;
@@ -2899,15 +3603,19 @@ pub(crate) mod tests {
         let mut admission = store.queue_repository().unwrap().admission(TARGET).unwrap();
         admission.next_step.push(crate::management::v2::admission::AdmissionNextStep {
             id: "pending-bus".into(), delivery_kind: "bus".into(), label: None,
-            enqueued_at: now.to_rfc3339(), timing: "afterTurn".into(), next_step_at: None, held: None, ask_id: None,
-            from: None, from_host: None, preview: None, eligible: true,
+            enqueued_at: now.to_rfc3339(), timing: "afterTurn".into(), next_step_at: None, wait_reason: None, held: None, ask_id: None,
+            from: None, from_host: None, from_cutex_session_id: None, preview: None, eligible: true, settlement: None,
         });
         status.admission = Some(admission);
         assert_eq!(store.with_state(|state| plan_target(state, TARGET, &status, now)).unwrap(), None);
         let state = store.snapshot().unwrap();
         assert_eq!(state.asks[&ask].execution, ExecutionState::Queued);
         assert_eq!(state.asks[&ask].hold, None);
+        let (_, selected) = target_plan(&state, TARGET, &status).unwrap();
+        assert_eq!(selected.as_deref(), Some(ask.as_str()));
+        assert_eq!(target_wait_reason(&state, TARGET, &status, &state.asks[&ask], selected.as_deref(), now).as_deref(), Some("resultPriority"));
         status.admission.as_mut().unwrap().next_step.clear();
+        assert_eq!(target_wait_reason(&state, TARGET, &status, &state.asks[&ask], selected.as_deref(), now), None);
         assert_eq!(store.with_state(|state| plan_target(state, TARGET, &status, now)).unwrap(), Some(ask));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3152,9 +3860,8 @@ pub(crate) mod tests {
                 for attempt in 1..=2 {
                     tick(&world, &runtime, &store, due).unwrap();
                     assert_eq!(runtime.submitted.borrow().len(), attempt);
-                    let path = store_dir.join("asks-v1.json");
-                    let bytes = std::fs::read(&path).unwrap();
-                    let stamp = crate::platform::file_stamp::FileStamp::of(&path);
+                    let path = store_dir.join(crate::management::v2::hot_store::DATABASE_FILE);
+                    let generation = crate::management::v2::hot_store::generation(&path, "asks").unwrap();
                     let before = store.snapshot().unwrap();
                     assert_eq!(before.asks[&ask].hold, Some(busy_hold(reason)));
                     assert_eq!(before.asks[&ask].submit_retry.as_ref().unwrap().failures, 0);
@@ -3162,8 +3869,11 @@ pub(crate) mod tests {
                     assert_eq!(before.asks[&ask].resume.is_some(), continuation);
                     for second in 1..super::super::SUBMIT_RETRY_BASE_SECS {
                         tick(&world, &runtime, &store, due + chrono::Duration::seconds(second)).unwrap();
-                        assert_eq!(std::fs::read(&path).unwrap(), bytes, "unchanged busy ticks must not rewrite history");
-                        assert_eq!(crate::platform::file_stamp::FileStamp::of(&path), stamp);
+                        assert_eq!(
+                            crate::management::v2::hot_store::generation(&path, "asks").unwrap(),
+                            generation,
+                            "unchanged busy ticks must not rewrite history",
+                        );
                         assert_eq!(runtime.submitted.borrow().len(), attempt);
                     }
                     due += chrono::Duration::seconds(super::super::SUBMIT_RETRY_BASE_SECS);
@@ -3226,6 +3936,49 @@ pub(crate) mod tests {
         assert_eq!(state.asks[&ask].hold, None);
         tick(&world, &runtime, &store, now + chrono::Duration::seconds(601)).unwrap();
         assert_eq!(*runtime.resumes.borrow(), vec![TARGET.to_string()]);
+        if dir.exists() { std::fs::remove_dir_all(dir).unwrap(); }
+        std::fs::remove_dir_all(store_dir).unwrap();
+    }
+
+    /// host-a 2026-10-21: a delegation failed on the Claude usage limit and
+    /// was requeued; the failed turn closed the native gate, so after the
+    /// reset its redelivery was refused and waited on a `runtimeGate` pause
+    /// until the owner resumed the agent by hand. The quota reset reopens
+    /// it (never an owner pause), and a refusal while that resume is queued
+    /// does not pause again.
+    #[test]
+    fn quota_reset_reopens_the_gate_the_failed_turn_closed() {
+        use super::super::control::{owner_pause, quota_reset_reopen, ORIGIN_RUNTIME_GATE, PAUSE_CHANGED_EVENT};
+        let (world, dir) = world("quota-gate");
+        let (store, store_dir) = temp_store("quota-gate");
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = crate::asks::parse_time(&now_rfc3339(Utc::now())).unwrap();
+        let ask = store.with_state(|state| state.create_ask(new_ask("a", "x"), now).unwrap().0.ask_id).unwrap();
+        runtime.outcomes.borrow_mut().push(SubmitOutcome::Busy { reason: "gate_closed".into() });
+        tick(&world, &runtime, &store, now).unwrap();
+        assert_eq!(store.snapshot().unwrap().pauses[TARGET].origin.as_deref(), Some(ORIGIN_RUNTIME_GATE));
+        assert!(store.with_state(|state| quota_reset_reopen(state, TARGET, now)).unwrap());
+        let state = store.snapshot().unwrap();
+        assert!(state.pauses.is_empty());
+        assert_eq!(state.asks[&ask].hold, None);
+        let notice = state.notices.iter().rev().find(|notice| notice.method == PAUSE_CHANGED_EVENT).unwrap();
+        assert_eq!(notice.params["reason"], json!("quotaReset"));
+        tick(&world, &runtime, &store, now + chrono::Duration::seconds(6)).unwrap();
+        assert_eq!(*runtime.resumes.borrow(), vec![TARGET.to_string()]);
+        assert_eq!(runtime.submitted.borrow().len(), 2, "redelivered without the owner");
+
+        // Refused while the resume is still queued: retried, not paused.
+        let mut state = AskState::default();
+        let (other, _) = state.create_ask(new_ask("b", "y"), now).unwrap();
+        quota_reset_reopen(&mut state, TARGET, now);
+        refuse_busy_attempt(&mut state, TARGET, &other.ask_id, 1, "gate_closed", 1, now);
+        assert!(state.pauses.is_empty());
+        assert!(state.asks[&other.ask_id].submit_retry.is_some());
+        // An owner pause is the owner's: left alone, no resume queued.
+        let mut state = AskState::default();
+        owner_pause(&mut state, TARGET, now);
+        assert!(!quota_reset_reopen(&mut state, TARGET, now));
+        assert!(state.pauses.contains_key(TARGET) && state.commands.is_empty());
         if dir.exists() { std::fs::remove_dir_all(dir).unwrap(); }
         std::fs::remove_dir_all(store_dir).unwrap();
     }
@@ -3456,7 +4209,7 @@ pub(crate) mod tests {
             [(REQUESTER.to_string(), "alpha".to_string()), (TARGET.to_string(), "beta".to_string())].into(),
             Default::default(),
         );
-        let world2 = FakeWorld { directory: outside, inputs: RefCell::new(world.inputs.borrow().clone()), approvals: ApprovalStore::at(dir.join("a2.json")), facts: Vec::new(), artifacts: None };
+        let world2 = FakeWorld { result_settings: Default::default(), directory: outside, inputs: RefCell::new(world.inputs.borrow().clone()), approvals: ApprovalStore::at(dir.join("a2.json")), facts: Vec::new(), artifacts: None };
         world2.inputs.borrow_mut().requester = Some(party(REQUESTER, SandboxLevel::FullAccess, &[], "chatgpt"));
         let revoked = store.with_state(|state| state.create_ask(new_ask("r", "x"), now).unwrap().0.ask_id).unwrap();
         assert_eq!(tick(&world2, &runtime, &store, now).unwrap().failed, vec![revoked.clone()]);
@@ -3920,6 +4673,170 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(store_dir);
     }
 
+    /// Token audit 2026-10-22: a compaction observed at the end of the turn
+    /// must not start a new turn for its reminder once the turn has ended
+    /// (or another turn runs); inside the running turn it is steered as before.
+    #[test]
+    fn compaction_reminder_never_starts_a_turn_on_an_idle_agent() {
+        let (world, dir) = world("compaction-idle");
+        let (store, store_dir) = temp_store("compaction-idle");
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = Utc::now();
+        let ask = store.with_state(|state| state.create_ask(new_ask("a", "Review the parser"), now).unwrap().0.ask_id).unwrap();
+        tick(&world, &runtime, &store, now).unwrap();
+        let turn = store.snapshot().unwrap().leases[TARGET].turn_id.clone().unwrap();
+        let observe = |method: &str, params: Value| crate::asks::observe::observe(&store, TARGET, method, &params, now).unwrap();
+        observe("item/completed", json!({"turnId": turn, "item": {"type": "contextCompaction", "id": "c1"}}));
+        // The turn ended; its turn/completed is not handled yet.
+        runtime.set(TARGET, |status| status.active_turn_id = None);
+        tick(&world, &runtime, &store, now).unwrap();
+        // Another turn runs on the agent: not the leased one either.
+        runtime.set(TARGET, |status| status.active_turn_id = Some("other-turn".into()));
+        tick(&world, &runtime, &store, now).unwrap();
+        assert!(runtime.steered.borrow().is_empty(), "no reminder outside the leased turn");
+        assert!(store.snapshot().unwrap().asks[&ask].attempts[0].compaction_reminder_pending);
+        // Back in the leased turn: steered once.
+        runtime.set(TARGET, |status| status.active_turn_id = Some(turn.clone()));
+        tick(&world, &runtime, &store, now).unwrap();
+        assert_eq!(runtime.steered.borrow().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    fn pending_compaction_fixture(label: &str) -> (FakeRuntime, AskStore, String, DateTime<Utc>, Vec<std::path::PathBuf>) {
+        let (world, dir) = world(label);
+        let (store, store_dir) = temp_store(label);
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = Utc::now();
+        let ask = store.with_state(|state| state.create_ask(new_ask(label, "Only remind unfinished work"), now).unwrap().0.ask_id).unwrap();
+        tick(&world, &runtime, &store, now).unwrap();
+        crate::asks::observe::observe(&store, TARGET, "item/completed", &json!({"turnId":"turn-1","item":{"type":"contextCompaction","id":"compact-1"}}), now).unwrap();
+        (runtime, store, ask, now, vec![dir, store_dir])
+    }
+
+    #[test]
+    fn final_output_cancels_reminder_before_turn_completion_and_late_compaction_does_not_rearm_it() {
+        let (runtime, store, ask, now, dirs) = pending_compaction_fixture("reminder-final-output");
+        crate::asks::observe::observe(&store, TARGET, "item/completed", &json!({"turnId":"turn-1","item":{"type":"agentMessage","phase":"final_answer","text":"The result is ready"}}), now).unwrap();
+        // Compaction can be delivered after the final item, including outside
+        // the debounce window. It is metadata, not permission to ask again.
+        crate::asks::observe::observe(&store, TARGET, "thread/compacted", &json!({"turnId":"turn-1"}), now + chrono::Duration::seconds(31)).unwrap();
+        send_compaction_reminders(&runtime, &store, 10, now).unwrap();
+        assert!(runtime.steered.borrow().is_empty());
+        let record = store.snapshot().unwrap().asks[&ask].attempts[0].clone();
+        assert!(record.compacted_mid_attempt);
+        assert!(!record.compaction_reminder_pending);
+        crate::asks::observe::observe(&store, TARGET, "turn/completed", &json!({"turn":{"id":"turn-1","status":"completed"}}), now).unwrap();
+        let state = store.snapshot().unwrap();
+        assert!(state.answers.values().find(|answer| answer.ask_id == ask).unwrap().metadata.compacted);
+        for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
+    }
+
+    #[test]
+    fn completed_answer_during_status_probe_cannot_send_a_stale_reminder_or_create_another_revision() {
+        let (runtime, store, ask, now, dirs) = pending_compaction_fixture("reminder-completion-race");
+        let concurrent_store = store.clone();
+        *runtime.status_hook.borrow_mut() = Some(Box::new(move || {
+            crate::asks::observe::observe(&concurrent_store, TARGET, "item/completed", &json!({"turnId":"turn-1","item":{"type":"agentMessage","text":"done"}}), now).unwrap();
+            crate::asks::observe::observe(&concurrent_store, TARGET, "turn/completed", &json!({"turn":{"id":"turn-1","status":"completed"}}), now).unwrap();
+        }));
+        send_compaction_reminders(&runtime, &store, 10, now).unwrap();
+        assert!(runtime.steered.borrow().is_empty(), "completion won while status was in flight");
+        // Even an old runtime's late reminder/restatement cannot manufacture
+        // another result for an already ended attempt without an explicit reopen.
+        crate::asks::observe::observe(&store, TARGET, "item/completed", &json!({"turnId":"late-reminder-turn","item":{"type":"agentMessage","text":"done again"}}), now).unwrap();
+        crate::asks::observe::observe(&store, TARGET, "turn/completed", &json!({"turn":{"id":"late-reminder-turn","status":"completed"}}), now).unwrap();
+        crate::asks::observe::finalize(&store, TARGET, &ask, 1, &json!({"id":"turn-1","status":"completed"}), None, now).unwrap();
+        let state = store.snapshot().unwrap();
+        let answers: Vec<_> = state.answers.values().filter(|answer| answer.ask_id == ask).collect();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].revision, 1);
+        assert_eq!(state.deliveries.values().filter(|delivery| delivery.ask_id == ask && delivery.kind == DeliveryKind::Answer).count(), 1);
+        assert!(!state.asks[&ask].attempts[0].compaction_reminder_pending);
+        for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
+    }
+
+    #[test]
+    fn final_output_or_replaced_lease_during_status_probe_prevents_reminder() {
+        for final_output in [true, false] {
+            let (runtime, store, _, now, dirs) = pending_compaction_fixture("reminder-status-race");
+            let concurrent_store = store.clone();
+            *runtime.status_hook.borrow_mut() = Some(Box::new(move || {
+                if final_output {
+                    crate::asks::observe::observe(&concurrent_store, TARGET, "item/completed", &json!({"turnId":"turn-1","item":{"type":"agentMessage","text":"finished"}}), now).unwrap();
+                } else {
+                    concurrent_store.with_state(|state| state.leases.get_mut(TARGET).unwrap().runtime_generation += 1).unwrap();
+                }
+            }));
+            send_compaction_reminders(&runtime, &store, 10, now).unwrap();
+            assert!(runtime.steered.borrow().is_empty());
+            for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
+        }
+    }
+
+    #[test]
+    fn reminder_requires_an_atomic_turn_fence_and_never_falls_back_to_soon() {
+        for supported in [false, true] {
+            let (runtime, store, ask, now, dirs) = pending_compaction_fixture("reminder-transport-race");
+            runtime.reminder_fence.set(supported);
+            // With a supported receiver, the native turn ends after the
+            // sender's status probe and before the atomic native admission.
+            runtime.end_before_reminder.set(supported);
+            send_compaction_reminders(&runtime, &store, 10, now).unwrap();
+            assert!(runtime.steered.borrow().is_empty());
+            assert_eq!(runtime.submitted.borrow().len(), 1, "only the original delegation may start a turn");
+            let record = store.snapshot().unwrap().asks[&ask].attempts[0].clone();
+            assert!(!record.compaction_reminder_pending);
+            assert!(record.compacted_mid_attempt);
+            assert_eq!(record.compaction_reminders, 0);
+            for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
+        }
+    }
+
+    #[test]
+    fn reminder_does_not_guess_a_missing_turn_binding_or_reuse_a_runtime_generation() {
+        for missing_turn in [true, false] {
+            let (runtime, store, _, now, dirs) = pending_compaction_fixture("reminder-binding");
+            if missing_turn {
+                store.with_state(|state| state.leases.get_mut(TARGET).unwrap().turn_id = None).unwrap();
+            } else {
+                runtime.set(TARGET, |status| status.runtime_generation += 1);
+            }
+            send_compaction_reminders(&runtime, &store, 10, now).unwrap();
+            assert!(runtime.steered.borrow().is_empty());
+            for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
+        }
+    }
+
+    #[test]
+    fn acknowledged_event_during_status_probe_cancels_its_reminder() {
+        let (store, dir) = temp_store("reminder-event-race");
+        let runtime = FakeRuntime::idle(&[REQUESTER]);
+        let now = Utc::now();
+        store.with_state(|state| {
+            state.events.insert("event".into(), EventOutboxRecord {
+                event_id: "event".into(), cutex_session_id: REQUESTER.into(), delivery_ids: vec![], native_message_id: "message".into(),
+                event_artifact: None, turn_id: Some("event-turn".into()), acknowledged: false, created_at: now_rfc3339(now), view: None,
+                compacted_at: Some(now_rfc3339(now)), compaction_reminder_pending: true,
+            });
+            state.leases.insert(REQUESTER.into(), AdmissionLease {
+                cutex_session_id: REQUESTER.into(), holder: LeaseHolder::Event { event_id: "event".into() }, native_message_id: "message".into(),
+                runtime_generation: 1, turn_id: Some("event-turn".into()), since: now_rfc3339(now),
+            });
+        }).unwrap();
+        runtime.set(REQUESTER, |status| status.active_turn_id = Some("event-turn".into()));
+        let concurrent_store = store.clone();
+        *runtime.status_hook.borrow_mut() = Some(Box::new(move || {
+            crate::asks::observe::observe(&concurrent_store, REQUESTER, "turn/completed", &json!({"turn":{"id":"event-turn","status":"completed"}}), now).unwrap();
+        }));
+        send_compaction_reminders(&runtime, &store, 10, now).unwrap();
+        assert!(runtime.steered.borrow().is_empty());
+        let state = store.snapshot().unwrap();
+        assert!(state.events["event"].acknowledged);
+        assert!(!state.events["event"].compaction_reminder_pending);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The Linux-host case: a review ask runs, its target goes offline and is
     /// retired, the requester abandons it. The interrupt can never reach
     /// the target; the archived target settles the stop at once: the ask
@@ -4098,4 +5015,9 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(world_dir);
     }
+    mod paused_scan {
+        use super::*;
+        include!("scheduler_scan_tests.rs");
+    }
+
 }

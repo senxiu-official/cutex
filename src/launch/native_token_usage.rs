@@ -24,19 +24,17 @@
 //! `updatedAt` is the rollout line's RFC 3339 `timestamp` verbatim and
 //! `turnId` is null only for histories without turn markers.
 
-use std::collections::{BTreeSet, HashMap};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::path::Path;
+use std::sync::OnceLock;
 
-use anyhow::ensure;
 use serde_json::{json, Map, Value};
 
+use super::rollout_scan::{self, LineScanner};
+#[cfg(test)]
+use super::rollout_scan::CHUNK_BYTES;
+
 /// Upper bound on rollout bytes read per derivation (all segments).
-pub const SCAN_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
-const CHUNK_BYTES: usize = 256 * 1024;
-const CACHE_ENTRIES: usize = 128;
+pub const SCAN_BUDGET_BYTES: u64 = rollout_scan::SCAN_BUDGET_BYTES;
 /// Lines that can matter; everything else is skipped without JSON parsing.
 const NEEDLES: [&str; 5] = [
     "token_count",
@@ -52,41 +50,21 @@ pub fn latest_token_usage(home: &Path, thread_id: &str) -> anyhow::Result<Option
     latest_token_usage_in_rollout(home, &current, thread_id)
 }
 
-/// As [`latest_token_usage`] for an already resolved current rollout. Results
-/// are cached per rollout until it changes (appends change its length).
+/// As [`latest_token_usage`] for an already resolved current rollout. Results are
+/// cached per rollout; after an append only the new lines are scanned
+/// (`rollout_scan`).
 pub fn latest_token_usage_in_rollout(
     home: &Path,
     current: &Path,
     thread_id: &str,
 ) -> anyhow::Result<Option<Value>> {
-    let metadata = std::fs::metadata(current)?;
-    let stamp = (metadata.len(), metadata.modified().ok());
-    let key = (current.to_path_buf(), thread_id.to_string());
-    if let Some(hit) = cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&key).filter(|entry| entry.0 == stamp).map(|entry| entry.1.clone()))
-    {
-        return Ok(hit);
-    }
-    let result = scan_chain(home, current, stamp.0, thread_id, SCAN_BUDGET_BYTES)?;
-    if let Ok(mut cache) = cache().lock() {
-        if cache.len() >= CACHE_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(key, (stamp, result.clone()));
-    }
-    Ok(result)
+    static CACHE: rollout_scan::Cache<Option<Value>> = OnceLock::new();
+    rollout_scan::latest(&CACHE, home, current, thread_id, SCAN_BUDGET_BYTES, |scanner: Scanner| {
+        scanner.finish(thread_id)
+    })
 }
 
-type CacheKey = (PathBuf, String);
-type CacheStamp = (u64, Option<SystemTime>);
-
-fn cache() -> &'static Mutex<HashMap<CacheKey, (CacheStamp, Option<Value>)>> {
-    static CACHE: OnceLock<Mutex<HashMap<CacheKey, (CacheStamp, Option<Value>)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
+#[cfg(test)]
 fn scan_chain(
     home: &Path,
     current: &Path,
@@ -94,58 +72,17 @@ fn scan_chain(
     thread_id: &str,
     budget: u64,
 ) -> anyhow::Result<Option<Value>> {
-    let mut scanner = Scanner::default();
-    let mut budget = budget;
-    let mut seen = BTreeSet::new();
-    let mut segment = Some((current.to_path_buf(), length));
-    while let Some((path, end)) = segment {
-        ensure!(seen.insert(path.clone()), "cyclic native history reference");
-        if scan_segment(&path, end, &mut scanner, &mut budget)? {
-            break;
-        }
-        segment = super::native_history::history_base(home, &path)?;
-    }
-    Ok(scanner.finish(thread_id))
+    Ok(rollout_scan::scan_full::<Scanner>(home, current, length, budget)?.finish(thread_id))
 }
 
-/// Feeds `path[..end]` to `scanner` newest line first. Returns true when the
-/// scan is complete (or the budget is spent).
-fn scan_segment(
-    path: &Path,
-    end: u64,
-    scanner: &mut Scanner,
-    budget: &mut u64,
-) -> anyhow::Result<bool> {
-    let mut file = std::fs::File::open(path)?;
-    let end = end.min(file.metadata()?.len());
-    let mut position = end;
-    // Bytes of the (possibly partial) line that ends at `position`'s tail.
-    let mut carry: Vec<u8> = Vec::new();
-    let mut chunk = vec![0u8; CHUNK_BYTES];
-    while position > 0 {
-        if *budget == 0 {
-            return Ok(true);
-        }
-        let size = (position.min(CHUNK_BYTES as u64)).min(*budget) as usize;
-        position -= size as u64;
-        *budget -= size as u64;
-        file.seek(SeekFrom::Start(position))?;
-        file.read_exact(&mut chunk[..size])?;
-        let mut tail = size;
-        while let Some(newline) = chunk[..tail].iter().rposition(|&b| b == b'\n') {
-            let mut line = chunk[newline + 1..tail].to_vec();
-            line.extend_from_slice(&carry);
-            carry.clear();
-            if scanner.line(&line) {
-                return Ok(true);
-            }
-            tail = newline;
-        }
-        let mut head = chunk[..tail].to_vec();
-        head.extend_from_slice(&carry);
-        carry = head;
+impl LineScanner for Scanner {
+    fn line(&mut self, bytes: &[u8]) -> bool {
+        Scanner::line(self, bytes)
     }
-    Ok(scanner.line(&carry))
+
+    fn neutral(&self) -> bool {
+        self.rolled_back_turns == 0 && self.found.is_none()
+    }
 }
 
 struct Found {
@@ -268,6 +205,7 @@ fn token_usage_breakdown(usage: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const THREAD: &str = "0189a000-0000-7000-8000-000000000002";
 

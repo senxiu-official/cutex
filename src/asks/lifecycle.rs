@@ -103,10 +103,20 @@ pub fn mark_reverted_default(session: &str, turn_ids: &[String]) {
         return;
     };
     if let Ok(Some(_)) = store.peek() {
-        if let Err(error) = store.with_state(|state| mark_reverted(state, session, turn_ids, Utc::now())) {
+        if let Err(error) = mark_reverted_in_store(&store,session,turn_ids,Utc::now()) {
             eprintln!("asks: could not flag reverted asks of {session}: {error:#}");
         }
     }
+}
+
+/// Explicit user revert can name a historical, already cold attempt.
+/// Inventory both locations once, then promote+mark under the same write lock.
+pub(crate) fn mark_reverted_in_store(store:&AskStore,session:&str,turn_ids:&[String],now:DateTime<Utc>)->anyhow::Result<Vec<String>> {
+    let historical=store.history_snapshot()?;
+    let ids:Vec<&str>=historical.asks.values().filter(|ask|ask.remote.is_none()&&ask.target_cutex_session_id==session&&!ask.target_reverted)
+        .filter(|ask|ask.attempts.iter().any(|attempt|attempt.turn_id.as_ref().is_some_and(|turn|turn_ids.contains(turn))))
+        .map(|ask|ask.ask_id.as_str()).collect();
+    store.with_records(&ids,|state|mark_reverted(state,session,turn_ids,now))
 }
 
 /// `session` was retired (archived): settle its open asks as **target**.
@@ -192,9 +202,7 @@ pub fn retry(state: &mut AskState, ask_id: &str, requester: Option<&str>, now: D
     let ask = state.asks.get(ask_id).cloned().ok_or_else(|| AskError::new("ask_not_found", "no such ask"))?;
     if ask.remote.is_some() { return Err(AskError::new("remote_unsupported","remote retry is unavailable in P0")); }
     if let Some(requester) = requester {
-        if ask.requester.session() != Some(requester) {
-            return Err(AskError::new("ask_not_found", "no such ask of yours"));
-        }
+        ask.require_controller(requester, "ask_not_found", "no such ask of yours")?;
     }
     if ask.execution != ExecutionState::Interrupted || !ask.is_open() {
         return Err(AskError::new("ask_not_retryable", "only an open, interrupted ask can be retried")

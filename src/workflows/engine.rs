@@ -31,7 +31,11 @@ pub const LOG_EVENT: &str = "cutex/workflow/log";
 pub const NOTICE_RESULT_BYTES: usize = 16 * 1024;
 const POLL_EVERY: Duration = Duration::from_millis(1000);
 const STOP_SETTLE: Duration = Duration::from_secs(90);
-const RETENTION_DAYS: i64 = 30;
+/// Finished runs (and their step sessions) are deleted this long after they
+/// end; `None` keeps them until the owner deletes them (owner decision
+/// 2026-10-23: user data is not deleted on a timer; was 30 days). The
+/// storage page will make this a setting.
+pub const FINISHED_RUN_RETENTION_DAYS: Option<i64> = None;
 const PROVIDER_BLOCK_GRACE: Duration = Duration::from_secs(120);
 const ALLOWED_OPTS: &[&str] = &["label", "phase", "schema", "profile", "model", "effort"];
 
@@ -541,8 +545,15 @@ impl WorkflowService {
 
     /// Drop finished runs older than the retention (and their step sessions).
     pub fn prune(&self) {
+        self.prune_finished_older_than(FINISHED_RUN_RETENTION_DAYS, chrono::Utc::now());
+    }
+
+    /// Delete finished runs that ended more than `days` before `now`
+    /// (`None`: keep every run).
+    pub(crate) fn prune_finished_older_than(&self, days: Option<i64>, now: chrono::DateTime<chrono::Utc>) {
+        let Some(days) = days else { return };
         let Ok(runs) = self.store.runs(&RunFilter { open: Some(false), limit: 10_000, ..Default::default() }) else { return };
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(RETENTION_DAYS);
+        let cutoff = now - chrono::Duration::days(days);
         for run in runs {
             let ended = run.ended_at.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
             if ended.is_some_and(|t| t.with_timezone(&chrono::Utc) < cutoff) {
@@ -954,7 +965,7 @@ fn effective_limits(request: &LimitsRequest, settings: &WorkflowSettings) -> Res
 
 
 /// The digest binds the approval to the exact plan (§3.4).
-fn approval_request(run: &RunRecord, profiles: &[ProfileFact]) -> ApprovalRequest {
+pub(crate) fn approval_request(run: &RunRecord, profiles: &[ProfileFact]) -> ApprovalRequest {
     let claude: Vec<&str> = profiles.iter().filter(|p| p.runtime == "claude").map(|p| p.name.as_str()).collect();
     let bound = json!({
         "runId": run.run_id, "scriptSha256": run.script_sha256, "argsSha256": run.args_sha256,

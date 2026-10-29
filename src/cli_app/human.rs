@@ -102,10 +102,16 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
                 } => {
                     let cwd = cwd.unwrap_or(std::env::current_dir()?);
                     serde_json::to_value(match profile {
-                        None => claude::create(&name, &cwd, &model, allow_write, allow_exec)?,
-                        Some(profile) => {
-                            claude::create_profile(&name, &cwd, &model, allow_write.then_some(true), allow_exec.then_some(true), Some(profile), true, None)?
-                        }
+                        None => claude::create_profile_with_creator(
+                            &name, &cwd, &model, Some(allow_write), Some(allow_exec),
+                            None, true, None,
+                            Some(cutex::session::model::SessionCreatedBy::Owner),
+                        )?,
+                        Some(profile) => claude::create_profile_with_creator(
+                            &name, &cwd, &model, allow_write.then_some(true), allow_exec.then_some(true),
+                            Some(profile), true, None,
+                            Some(cutex::session::model::SessionCreatedBy::Owner),
+                        )?,
                     })?
                 }
                 ClaudeCommand::Account { command } => super::claude_account_cli::run(command)?,

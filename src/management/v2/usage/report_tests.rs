@@ -56,6 +56,7 @@ fn sample(
         token_source: UsageTokenSource::NativeLast,
         model_context_window: Some(400_000),
         compaction_count: None,
+        model_requests: None,
         cumulative_total: tokens.clone(),
         tokens,
     }))

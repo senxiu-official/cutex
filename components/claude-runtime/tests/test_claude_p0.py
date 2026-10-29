@@ -136,3 +136,26 @@ async def test_refresh_lock_retry_can_be_disabled(ph, monkeypatch):
     await ph.drain()
     assert ph.store.turn(turn)['status'] == 'failed' and client.query_count == 1
     assert not [m for m in ph.out if m.get('method') == 'error']
+
+
+async def test_turn_usage_reports_the_sdk_steps_as_model_requests(ph):
+    """Token audit 2026-10-22: cutex counts a Claude turn's model requests (SDK steps) to show
+    tokens per step; the turn's final usage update carries them as `modelRequests`."""
+    tid = await ph.thread()
+    await ph.engine.start_runtime(tid)
+    client = ph.sdk.clients[0]
+
+    async def query(prompt):
+        sid = ph.engine.session(tid)['session_id']
+        await client.events.put({'type': 'assistant', 'session_id': sid, 'model': 'claude-sonnet-5-5',
+                                 'content': [{'type': 'text', 'text': 'done in seven steps'}]})
+        await client.events.put({'type': 'result', 'session_id': sid, 'subtype': 'success', 'is_error': False,
+                                 'num_turns': 7, 'usage': {'input_tokens': 3, 'cache_read_input_tokens': 700, 'output_tokens': 2}})
+    client.query = query
+    turn = await ph.turn(tid, 'work in several steps')
+    await ph.drain()
+    assert ph.store.turn(turn)['status'] == 'completed'
+    usage = [m['params']['tokenUsage'] for m in ph.out
+             if m.get('method') == 'thread/tokenUsage/updated' and m['params'].get('turnId') == turn][-1]
+    assert usage['modelRequests'] == 7
+    assert usage['total']['cachedInputTokens'] == 700

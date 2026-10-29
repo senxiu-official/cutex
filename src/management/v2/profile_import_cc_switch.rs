@@ -79,12 +79,16 @@ fn normalize_url(url: &str) -> String {
 
 /// (app, base URL, model) of every cutex profile, for `existingProfile`.
 fn profile_signatures(store: &AccountsStore) -> Vec<(App, String, Option<String>, String)> {
-    let registry = claude_accounts::load().unwrap_or_default();
+    let registry = store.accounts.iter().any(|account| account.cli_kind == CliKind::Claude)
+        .then(|| claude_accounts::load().unwrap_or_default());
     store
         .accounts
         .iter()
         .filter_map(|account| {
             let (app, base, model) = match account.cli_kind {
+                // CC Switch imports Codex and Claude accounts only. A DSH
+                // env reference must not match a Codex DeepSeek provider.
+                CliKind::Dsh | CliKind::Kimi => return None,
                 CliKind::Codex => (
                     App::Codex,
                     crate::profiles::inspect::account_model_api_base(account)?,
@@ -92,7 +96,7 @@ fn profile_signatures(store: &AccountsStore) -> Vec<(App, String, Option<String>
                 ),
                 CliKind::Claude => {
                     let id = account.claude_account.as_deref()?;
-                    let base = registry.find(id)?.api.as_ref()?.base_url.clone()?;
+                    let base = registry.as_ref()?.find(id)?.api.as_ref()?.base_url.clone()?;
                     (App::Claude, base, Some(account.options.claude.model.clone()).filter(|model| !model.is_empty()))
                 }
             };
@@ -300,7 +304,7 @@ fn create(body: Value, provider: &Provider) -> Result<Value, Failure> {
 
 fn import_one(scan: &Scan, item: &Item) -> Result<Value, Failure> {
     if let Some(error) = &scan.error {
-        let code = if error.code == "unreadable" { "provider_gone" } else { "unsupported" };
+        let code = if error.code == "unreadable" { "provider_gone" } else { error.code };
         return Err(Failure::new(code, error.message.clone()));
     }
     let Some(provider) = scan.find(&item.id, item.app) else {
@@ -367,6 +371,17 @@ fn import_one(scan: &Scan, item: &Item) -> Result<Value, Failure> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dsh_env_profiles_cannot_match_cc_switch_codex_or_claude_accounts() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let account: crate::profiles::model::StoredAccount = serde_json::from_value(json!({
+            "id":"dsh-signature","name":"DSH","cli_kind":"dsh",
+            "options":{"dsh":{"model":"deepseek-v4-flash","apiKeyEnv":"DEEPSEEK_API_KEY"}}
+        })).unwrap();
+        let store = AccountsStore { accounts:vec![account], ..Default::default() };
+        assert!(profile_signatures(&store).is_empty());
+    }
+
     use super::*;
     use crate::profiles::cc_switch::tests::{write_fixture_db, LocationsOverride, CLAUDE_KEY, CODEX_KEY};
 
@@ -419,14 +434,14 @@ mod tests {
         let empty = json_of(&body);
         assert_eq!((empty["found"].as_bool(), &empty["source"], &empty["error"]), (Some(false), &Value::Null, &Value::Null));
 
-        write_fixture_db(&home.join(cc_switch::DIR_NAME), 20);
+        write_fixture_db(&home.join(cc_switch::DIR_NAME), 23);
         let (status, body) = call("GET", "");
         assert_eq!(status, 200, "{body}");
         assert!(!body.contains(CLAUDE_KEY) && !body.contains(CODEX_KEY), "listing carries no key: {body}");
         let list = json_of(&body);
         assert_eq!(list["found"], true);
         assert_eq!(list["source"]["format"], "sqlite");
-        assert_eq!(list["source"]["schemaVersion"], 20);
+        assert_eq!(list["source"]["schemaVersion"], 23);
         let row = |id: &str| list["providers"].as_array().unwrap().iter().find(|row| row["id"] == id).unwrap().clone();
         let kimi = row("kimi");
         assert_eq!(kimi["app"], "claude");
@@ -501,15 +516,34 @@ mod tests {
         assert_eq!(again["failed"][0]["code"], "profile_exists", "{again}");
         assert_eq!(again["created"][0]["profile"]["name"], "Kimi K2 (2)", "{again}");
 
-        // A newer CC Switch: listed as an error, imports refused.
+        // A future additive schema still lists/imports known provider fields.
         let dir = home.join(cc_switch::DIR_NAME);
-        std::fs::remove_dir_all(&dir).unwrap();
-        write_fixture_db(&dir, 21);
+        let connection = rusqlite::Connection::open(dir.join(cc_switch::DB_FILE)).unwrap();
+        connection.execute_batch("PRAGMA user_version=999;
+            ALTER TABLE providers ADD COLUMN future_field TEXT;
+            CREATE TABLE future_table (id TEXT);").unwrap();
+        drop(connection);
+        let list = json_of(&call("GET", "").1);
+        assert_eq!(list["source"]["schemaVersion"], 999);
+        assert!(list["error"].is_null());
+        let (_, body) = call("POST", r#"{"items":[{"id":"relay","app":"codex","name":"Future Relay"}]}"#);
+        assert!(!body.contains(CLAUDE_KEY) && !body.contains(CODEX_KEY));
+        let result = json_of(&body);
+        assert_eq!(result["created"].as_array().unwrap().len(), 1);
+        assert_eq!(result["created"][0]["profile"]["name"], "Future Relay");
+        assert_eq!(result["failed"], json!([]));
+
+        // Only a changed required layout is refused. GET and POST retain the
+        // same stable compatibility code so the client can translate it.
+        let connection = rusqlite::Connection::open(dir.join(cc_switch::DB_FILE)).unwrap();
+        connection.execute_batch("ALTER TABLE providers RENAME COLUMN settings_config TO future_config").unwrap();
+        drop(connection);
         let list = json_of(&call("GET", "").1);
         assert_eq!(list["error"]["code"], "unsupported_version");
         assert_eq!(list["providers"], json!([]));
         let (_, body) = call("POST", r#"{"items":[{"id":"kimi","app":"claude"}]}"#);
-        assert_eq!(json_of(&body)["failed"][0]["code"], "unsupported");
+        assert_eq!(json_of(&body)["failed"][0]["code"], "unsupported_version");
+        assert!(!body.contains(CLAUDE_KEY) && !body.contains(CODEX_KEY));
         assert_eq!(call("DELETE", "").0, 405);
     }
 

@@ -113,6 +113,84 @@ pub struct Settings {
     /// ignore it). Absent keeps the original reviewed serialization exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_schema_compat: Option<String>,
+    /// r250 reviewed the profile imageHistoryTrim keys here, and launch
+    /// receipts persist these settings, which r249 and older refuse
+    /// (`deny_unknown_fields`: rollback hazard H1). Still read, then
+    /// dropped and never written again: the trim is a launch-time override
+    /// ([`ImageHistoryTrimArgs`]).
+    #[serde(default, skip_serializing, rename = "generated_image_history_max_inline")]
+    pub r250_image_history_max_inline: Dropped,
+    #[serde(default, skip_serializing, rename = "generated_image_history_keep")]
+    pub r250_image_history_keep: Dropped,
+}
+/// A persisted field read only so that older records still load; its value
+/// is discarded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dropped;
+impl<'de> Deserialize<'de> for Dropped {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer).map(|_| Dropped)
+    }
+}
+/// Profile imageHistoryTrim (design 027 C) as native `-c` overrides, read
+/// from the profile's `config.toml` each time the native is spawned (the
+/// setting applies from an agent's next launch). Never part of the reviewed
+/// [`Settings`]: launch receipts persist those, and r249 and older refuse
+/// unknown keys there. A lone key is forwarded as is (the native decides).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageHistoryTrimArgs {
+    pub max_inline: Option<u64>,
+    pub keep: Option<u64>,
+}
+impl ImageHistoryTrimArgs {
+    /// The keys of a profile `config.toml` (other keys are not looked at).
+    pub fn from_toml(raw: &str) -> anyhow::Result<Self> {
+        use crate::profiles::codex_profile::{IMAGE_HISTORY_KEEP_KEY, IMAGE_HISTORY_MAX_INLINE_KEY};
+        let root: toml::Table = toml::from_str(raw).context("invalid profile config.toml")?;
+        let key = |name: &str| -> anyhow::Result<Option<u64>> {
+            root.get(name)
+                .map(|value| {
+                    value.as_integer().and_then(|v| u64::try_from(v).ok()).with_context(|| format!("invalid profile {name}"))
+                })
+                .transpose()
+        };
+        let trim = Self { max_inline: key(IMAGE_HISTORY_MAX_INLINE_KEY)?, keep: key(IMAGE_HISTORY_KEEP_KEY)? };
+        trim.validate()?;
+        Ok(trim)
+    }
+    /// The keys of the materialized profile `profile_id` (no file: none).
+    pub fn of_profile(profile_id: &str) -> anyhow::Result<Self> {
+        ensure!(uuid::Uuid::parse_str(profile_id).is_ok(), "invalid profile ID");
+        let path = crate::profiles::materialize::materialized_profiles_dir()?.join(profile_id).join("config.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => Self::from_toml(&raw),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error).context("profile config.toml unreadable"),
+        }
+    }
+    /// Each key in its API range; together max_inline must exceed keep.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.keep.is_none_or(|v| crate::profiles::codex_profile::IMAGE_HISTORY_KEEP_RANGE.contains(&v)),
+            "invalid generated image history keep"
+        );
+        ensure!(
+            self.max_inline.is_none_or(|v| {
+                (2..=crate::profiles::codex_profile::IMAGE_HISTORY_MAX_INLINE_MAX).contains(&v)
+                    && self.keep.is_none_or(|keep| v > keep)
+            }),
+            "invalid generated image history max inline"
+        );
+        Ok(())
+    }
+    pub fn args(&self) -> Vec<String> {
+        use crate::profiles::codex_profile::{IMAGE_HISTORY_KEEP_KEY, IMAGE_HISTORY_MAX_INLINE_KEY};
+        [(IMAGE_HISTORY_MAX_INLINE_KEY, self.max_inline), (IMAGE_HISTORY_KEEP_KEY, self.keep)]
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|v| ["-c".to_owned(), format!("{key}={v}")]))
+            .flatten()
+            .collect()
+    }
 }
 /// Only the profile-scoped native tool switches; other `tools` keys stay in
 /// the shared native config (the `-c tools=...` layer merges into it).
@@ -239,6 +317,8 @@ pub struct Config {
     pub tools: Option<Tools>,
     pub web_search: Option<String>,
     pub tool_schema_compat: Option<String>,
+    pub generated_image_history_max_inline: Option<u64>,
+    pub generated_image_history_keep: Option<u64>,
     #[serde(default)]
     pub model_providers: BTreeMap<String, ApiProvider>,
     #[serde(default)]
@@ -268,7 +348,8 @@ const KNOWN_ROOT_KEYS: &[&str] = &[
     "cutex_provider_mode", "model", "model_provider", "model_reasoning_effort", "cli_auth_credentials_store",
     "approvals_reviewer", "service_tier", "shell_environment_policy", "projects", "memories",
     "model_auto_compact_token_limit", "model_catalog_json", "skills", "tui", "notice", "plugins", "tools",
-    "web_search", "tool_schema_compat", "model_providers", "mcp_servers",
+    "web_search", "tool_schema_compat", "generated_image_history_max_inline", "generated_image_history_keep",
+    "model_providers", "mcp_servers",
 ];
 const KNOWN_PROVIDER_KEYS: &[&str] =
     &["name", "base_url", "wire_api", "requires_openai_auth", "env_key", "capabilities"];
@@ -423,7 +504,10 @@ impl Config {
             .cloned()
             .or(self.model)
             .context("effective selected model missing")?;
-        let effort = selected_effort.cloned().or(self.model_reasoning_effort);
+        // An explicit effort must be offered by the model (validate_model
+        // refuses it with the offered list); the profile default falls back
+        // instead (docs/design/028), so a stale default never blocks a create.
+        let profile_default = self.model_reasoning_effort.clone();
         let catalog = self
             .model_catalog_json
             .map(|path| -> anyhow::Result<VerifiedFile> {
@@ -437,6 +521,10 @@ impl Config {
                 })
             })
             .transpose()?;
+        let effort = match selected_effort {
+            Some(explicit) => Some(explicit.clone()),
+            None => default_effort_for(&model, profile_default, catalog.as_ref())?,
+        };
         validate_model(&route, &model, effort.as_deref(), catalog.as_ref())?;
         ensure!(
             self.mcp_servers.keys().all(|k| k == "cutex_job"),
@@ -474,8 +562,17 @@ impl Config {
             tools: Tools::projected(self.tools),
             web_search: self.web_search,
             tool_schema_compat: self.tool_schema_compat,
+            r250_image_history_max_inline: Dropped,
+            r250_image_history_keep: Dropped,
         };
         settings.validate()?;
+        // Applied at spawn ([`ImageHistoryTrimArgs::of_profile`]); a bad
+        // value still fails the review.
+        ImageHistoryTrimArgs {
+            max_inline: self.generated_image_history_max_inline,
+            keep: self.generated_image_history_keep,
+        }
+        .validate()?;
         let auth = review_auth(&auth_path, &route)?;
         Ok((
             Projection {
@@ -600,6 +697,97 @@ pub(super) fn supported_effort(effort: &str) -> bool {
     )
 }
 
+/// A new agent's effort fell back from the profile default the model does
+/// not offer (docs/design/028 (b)); reported in the agent_create reply.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EffortFallback {
+    pub model: String,
+    pub requested: String,
+    pub used: String,
+    /// `not_offered_by_model`.
+    pub reason: String,
+}
+
+impl EffortFallback {
+    /// Some when no effort was selected and the reviewed effort differs from
+    /// the profile default (default_effort_for chose another level).
+    pub fn of(model: &str, selected: Option<&String>, profile_default: Option<String>, used: Option<&str>) -> Option<Self> {
+        let selected = selected.filter(|r| !crate::profiles::reasoning::is_default(r));
+        let (None, Some(requested), Some(used)) = (selected, profile_default, used) else { return None };
+        (requested != used).then(|| Self {
+            model: model.to_owned(),
+            requested,
+            used: used.to_owned(),
+            reason: "not_offered_by_model".into(),
+        })
+    }
+}
+
+/// The catalog row of `model` (exactly one), from a reviewed catalog file.
+fn catalog_row(catalog: &VerifiedFile, model: &str) -> anyhow::Result<Option<serde_json::Value>> {
+    catalog.validate()?;
+    let bytes = bounded_asset(&catalog.path)?;
+    use sha2::Digest;
+    ensure!(format!("{:x}", sha2::Sha256::digest(&bytes)) == catalog.sha256.as_str(), "catalog changed during projection");
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid model catalog"))?;
+    let models = v["models"].as_array().context("catalog models missing")?;
+    let mut matched = models.iter().filter(|m| m["slug"].as_str() == Some(model));
+    Ok(match (matched.next(), matched.next()) {
+        (Some(row), None) => Some(row.clone()),
+        _ => None,
+    })
+}
+
+/// The efforts a catalog row offers, in its order.
+pub fn row_efforts(row: &serde_json::Value) -> Vec<String> {
+    row["supported_reasoning_levels"]
+        .as_array()
+        .map(|levels| levels.iter().filter_map(|l| l["effort"].as_str().map(str::to_owned)).collect())
+        .unwrap_or_default()
+}
+
+/// The effort a new agent runs with when the creator chose none: the
+/// profile default when the model offers it (or the catalog lists no levels
+/// / there is no catalog), else the row's own default, else its highest
+/// level. Never refuses for a stale default (docs/design/028 (b)).
+pub fn default_effort_for(
+    model: &str,
+    profile_default: Option<String>,
+    catalog: Option<&VerifiedFile>,
+) -> anyhow::Result<Option<String>> {
+    let (Some(default), Some(catalog)) = (profile_default.clone(), catalog) else {
+        return Ok(profile_default);
+    };
+    let Some(row) = catalog_row(catalog, model)? else {
+        return Ok(Some(default));
+    };
+    Ok(Some(fallback_effort(&row, &default)))
+}
+
+/// `default` when `row` offers it (or offers nothing), else the row's
+/// default level, else its highest level.
+pub fn fallback_effort(row: &serde_json::Value, default: &str) -> String {
+    let offered = row_efforts(row);
+    if offered.is_empty() || offered.iter().any(|e| e == default) {
+        return default.to_owned();
+    }
+    // GLM: the documented mapping (medium → high, xhigh / ultra → max, …).
+    let glm = row["slug"].as_str().is_some_and(|slug| slug.starts_with("glm-"));
+    let chosen = glm
+        .then(|| crate::profiles::known_models::glm_effort(default))
+        .flatten()
+        .filter(|mapped| offered.iter().any(|e| e == mapped))
+        .map(str::to_owned)
+        .or_else(|| row["default_reasoning_level"].as_str().filter(|d| offered.iter().any(|e| e == d)).map(str::to_owned))
+        .or_else(|| {
+            const ORDER: [&str; 8] = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+            offered.iter().max_by_key(|e| ORDER.iter().position(|o| o == e)).cloned()
+        })
+        .unwrap_or_else(|| default.to_owned());
+    eprintln!("selected profile: the profile default effort {default} is not offered by {}; using {chosen}", row["slug"].as_str().unwrap_or("?"));
+    chosen
+}
+
 pub fn validate_model(
     route: &Route,
     model: &str,
@@ -643,7 +831,16 @@ pub fn validate_model(
                             || (a.is_empty() && effort.is_none_or(supported_effort)))) || a
                             .iter()
                             .any(|v| v["effort"].as_str() == effort || (effort.is_none() && *route != Route::GlmApiKey))),
-                "catalog model/effort missing or ambiguous"
+                "{}",
+                if matched.len() == 1 {
+                    format!(
+                        "reasoning effort {} is not offered by model {model}; choose one of: {}",
+                        effort.unwrap_or("(default)"),
+                        row_efforts(matched[0]).join(", ")
+                    )
+                } else {
+                    format!("catalog model/effort missing or ambiguous (model {model})")
+                }
             );
         }
     }
@@ -1106,6 +1303,122 @@ trust_level = "untrusted"
     }
 
     #[test]
+    fn profile_image_history_trim_is_a_launch_override_not_a_reviewed_setting() {
+        let base = "cutex_provider_mode='selected_profile_v2'\n";
+        let raw = format!("{base}generated_image_history_max_inline=12\ngenerated_image_history_keep=4\n");
+        let config = Config::parse(&raw).unwrap();
+        assert!(config.ignored_keys.is_empty(), "{:?}", config.ignored_keys);
+        assert_eq!((config.generated_image_history_max_inline, config.generated_image_history_keep), (Some(12), Some(4)));
+        let trim = ImageHistoryTrimArgs::from_toml(&raw).unwrap();
+        assert_eq!(trim, ImageHistoryTrimArgs { max_inline: Some(12), keep: Some(4) });
+        assert_eq!(
+            trim.args(),
+            ["-c", "generated_image_history_max_inline=12", "-c", "generated_image_history_keep=4"]
+        );
+        // A lone key is forwarded as is; none = no override.
+        assert_eq!(
+            ImageHistoryTrimArgs::from_toml(&format!("{base}generated_image_history_keep=4\n")).unwrap().args(),
+            ["-c", "generated_image_history_keep=4"]
+        );
+        assert!(ImageHistoryTrimArgs::from_toml(base).unwrap().args().is_empty());
+        for (max_inline, keep) in [(Some(4), Some(4)), (Some(501), Some(4)), (Some(12), Some(0)), (Some(80), Some(51)), (Some(1), None)] {
+            assert!(ImageHistoryTrimArgs { max_inline, keep }.validate().is_err(), "{max_inline:?} {keep:?}");
+        }
+        for bad in ["generated_image_history_keep='4'", "generated_image_history_keep=-1", "generated_image_history_max_inline=4\ngenerated_image_history_keep=4"] {
+            assert!(ImageHistoryTrimArgs::from_toml(&format!("{base}{bad}\n")).is_err(), "{bad}");
+        }
+        assert!(Config::parse(&format!("{base}generated_image_history_keep='4'\n")).is_err());
+        assert!(Config::parse(&format!("{base}generated_image_history_keep=-1\n")).is_err());
+    }
+
+    /// The reviewed `Settings` of r249 (b54585c), the oldest rollback target:
+    /// its field names, `deny_unknown_fields`. Values are not checked here.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct R249Settings {
+        windows: Option<serde::de::IgnoredAny>,
+        forced_login_method: Option<serde::de::IgnoredAny>,
+        model_context_window: Option<serde::de::IgnoredAny>,
+        model_reasoning_summary: Option<serde::de::IgnoredAny>,
+        model_supports_reasoning_summaries: Option<serde::de::IgnoredAny>,
+        model_verbosity: Option<serde::de::IgnoredAny>,
+        plan_mode_reasoning_effort: Option<serde::de::IgnoredAny>,
+        review_model: Option<serde::de::IgnoredAny>,
+        approvals_reviewer: Option<serde::de::IgnoredAny>,
+        service_tier: Option<serde::de::IgnoredAny>,
+        shell_environment_policy: Option<serde::de::IgnoredAny>,
+        projects: Option<serde::de::IgnoredAny>,
+        memories: Option<serde::de::IgnoredAny>,
+        model_auto_compact_token_limit: Option<serde::de::IgnoredAny>,
+        skills: Option<serde::de::IgnoredAny>,
+        tui: Option<serde::de::IgnoredAny>,
+        notice: Option<serde::de::IgnoredAny>,
+        plugins: Option<serde::de::IgnoredAny>,
+        tools: Option<serde::de::IgnoredAny>,
+        web_search: Option<serde::de::IgnoredAny>,
+        tool_schema_compat: Option<serde::de::IgnoredAny>,
+    }
+
+    #[test]
+    fn receipts_keep_the_r249_settings_shape_and_r250_records_still_load() {
+        // What a review of a profile with every projected key (and the
+        // trim) persists: r249 must read it.
+        let config = Config::parse(concat!(
+            "cutex_provider_mode='selected_profile_v2'\n",
+            "forced_login_method='chatgpt'\nmodel_context_window=200000\nmodel_reasoning_summary='auto'\n",
+            "model_supports_reasoning_summaries=true\nmodel_verbosity='low'\nplan_mode_reasoning_effort='high'\n",
+            "review_model='gpt-5'\napprovals_reviewer='user'\nservice_tier='fast'\n",
+            "model_auto_compact_token_limit=100000\nweb_search='disabled'\ntool_schema_compat='strict'\n",
+            "generated_image_history_max_inline=20\ngenerated_image_history_keep=5\n",
+            "[windows]\nsandbox='unelevated'\n[shell_environment_policy]\nexclude=['X']\n",
+            "[projects.'/w']\ntrust_level='trusted'\n[notice]\nhide_rate_limit_model_nudge=true\n",
+            "[plugins.'p@x']\nenabled=true\n[tools.update_plan]\nenabled=false\n",
+        ))
+        .unwrap();
+        let settings = Settings {
+            windows: config.windows,
+            forced_login_method: config.forced_login_method,
+            model_context_window: config.model_context_window,
+            model_reasoning_summary: config.model_reasoning_summary,
+            model_supports_reasoning_summaries: config.model_supports_reasoning_summaries,
+            model_verbosity: config.model_verbosity,
+            plan_mode_reasoning_effort: config.plan_mode_reasoning_effort,
+            review_model: config.review_model,
+            approvals_reviewer: config.approvals_reviewer,
+            service_tier: config.service_tier,
+            shell_environment_policy: config.shell_environment_policy,
+            projects: config.projects,
+            model_auto_compact_token_limit: config.model_auto_compact_token_limit,
+            notice: config.notice,
+            plugins: config.plugins,
+            tools: Tools::projected(config.tools),
+            web_search: config.web_search,
+            tool_schema_compat: config.tool_schema_compat,
+            ..Default::default()
+        };
+        settings.validate().unwrap();
+        let written = serde_json::to_value(&settings).unwrap();
+        assert!(written.get("generated_image_history_max_inline").is_none(), "{written}");
+        assert!(written.get("generated_image_history_keep").is_none(), "{written}");
+        serde_json::from_value::<R249Settings>(written.clone()).expect("r249 reads the receipt settings");
+        assert_eq!(serde_json::from_value::<Settings>(written).unwrap(), settings);
+        // r250 wrote the trim into receipts: still loaded, the keys dropped,
+        // equal to a fresh review, and written back in the r249 shape.
+        let mut r250 = serde_json::to_value(&settings).unwrap();
+        r250["generated_image_history_max_inline"] = serde_json::json!(20);
+        r250["generated_image_history_keep"] = serde_json::json!(5);
+        assert!(serde_json::from_value::<R249Settings>(r250.clone()).is_err(), "the r249 replica must deny unknown keys");
+        let loaded: Settings = serde_json::from_value(r250).unwrap();
+        assert_eq!(loaded, settings);
+        serde_json::from_value::<R249Settings>(serde_json::to_value(&loaded).unwrap()).unwrap();
+        // Other unknown keys are still refused.
+        let mut unknown = serde_json::to_value(&settings).unwrap();
+        unknown["future_key"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<Settings>(unknown).is_err());
+    }
+
+    #[test]
     fn native_windows_options_are_accepted_and_preserved() {
         let config = Config::parse("cutex_provider_mode='selected_profile_v2'\n[windows]\nsandbox='unelevated'\n").unwrap();
         let settings = Settings { windows: config.windows, ..Default::default() };
@@ -1263,6 +1576,52 @@ trust_level = "untrusted"
             validate_model(&Route::GlmApiKey, "missing-model", Some("max"), Some(&file)).is_err()
         );
         assert!(validate_model(&Route::GlmApiKey, "glm-next", Some("high"), Some(&file)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn effort_fallback_is_only_reported_for_a_replaced_default() {
+        let of = |selected: Option<&str>, default: Option<&str>, used: Option<&str>| {
+            EffortFallback::of("glm-5.3", selected.map(str::to_owned).as_ref(), default.map(str::to_owned), used)
+        };
+        assert_eq!(of(None, Some("max"), Some("high")).unwrap().reason, "not_offered_by_model");
+        assert_eq!(of(Some("default"), Some("max"), Some("high")).unwrap().used, "high");
+        assert!(of(None, Some("high"), Some("high")).is_none());
+        assert!(of(Some("high"), Some("max"), Some("high")).is_none());
+        assert!(of(None, None, Some("high")).is_none());
+    }
+
+    /// Zooey (10-22): profile default `max`, glm-5.3 offers low / medium /
+    /// high. No explicit effort → the row's default, never a refusal; an
+    /// explicit unsupported effort is refused with the offered list.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_stale_profile_default_effort_falls_back_but_an_explicit_one_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("selected-effort-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("catalog.json");
+        std::fs::write(&path, br#"{"models":[
+            {"slug":"glm-5.3","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]},
+            {"slug":"glm-5.3-flash","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},
+            {"slug":"plain","supported_reasoning_levels":[]}]}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let file = VerifiedFile { sha256: crate::agent_management::file_sha256(&path).unwrap(), path };
+        let fall = |model: &str, default: Option<&str>| default_effort_for(model, default.map(str::to_owned), Some(&file)).unwrap();
+        assert_eq!(fall("glm-5.3", Some("max")).as_deref(), Some("medium"));
+        // GLM mapping first: xhigh → max is not offered here, so the row default.
+        assert_eq!(fall("glm-5.3", Some("xhigh")).as_deref(), Some("medium"));
+        assert_eq!(fall("glm-5.3-flash", Some("medium")).as_deref(), Some("high"));
+        assert_eq!(fall("glm-5.3-flash", Some("minimal")).as_deref(), Some("low"));
+        assert_eq!(fall("glm-5.3-flash", Some("max")).as_deref(), Some("high"));
+        assert_eq!(fall("glm-5.3", Some("high")).as_deref(), Some("high"));
+        assert_eq!(fall("plain", Some("max")).as_deref(), Some("max"));
+        assert_eq!(fall("unknown", Some("max")).as_deref(), Some("max"));
+        assert_eq!(fall("glm-5.3", None), None);
+        assert!(validate_model(&Route::ApiKey, "glm-5.3", Some("medium"), Some(&file)).is_ok());
+        let refused = validate_model(&Route::ApiKey, "glm-5.3", Some("max"), Some(&file)).unwrap_err().to_string();
+        assert!(refused.contains("not offered by model glm-5.3") && refused.contains("low, medium, high"), "{refused}");
         std::fs::remove_dir_all(root).unwrap();
     }
 

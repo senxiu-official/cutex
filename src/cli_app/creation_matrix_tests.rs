@@ -259,6 +259,34 @@ fn claude_sessions_follow_the_profile_rules_at_the_next_start() {
 }
 
 #[test]
+fn default_profile_browser_tools_survive_owner_creation_without_project() {
+    let fixture=Fixture::new();
+    fixture.set_default_profile(CLAUDE);
+    let mut profiles=super::account_store::load_store().unwrap();
+    profiles.accounts.iter_mut().find(|a|a.name==CLAUDE).unwrap().browser_tools=true;
+    cutex::profiles::store::save_store(&profiles).unwrap();
+    for (route,body) in [
+        ("/v2/human/sessions",json!({"requestId":"default-browser-chat","cwd":fixture.work()})),
+        ("/v2/human/agents",json!({"requestId":"default-browser-agent","name":"Default Browser Agent","cwd":fixture.work()})),
+    ] {
+        let (status,body)=root_request("POST",route,body);
+        let id=created_id(status,&body).unwrap();
+        let record=session_record(&id);
+        assert_eq!(record.profile.as_deref(),Some(CLAUDE),"omitted request profile is materialized at creation");
+        assert!(cutex::agent_bus::tool_policy::browser_tools_for_record(&record));
+        assert!(cutex::agent_bus::tool_policy::cutex_mcp_enabled(&record));
+        let listed=cutex::agent_bus::tool_policy::tools_list_for_session(&id);
+        assert!(listed["tools"].as_array().unwrap().iter().any(|tool|tool["name"]=="browser_read"));
+    }
+    let (status,body)=root_request("POST","/v2/human/sessions",json!({"requestId":"explicit-browser-off","profile":CLAUDE_UNSET,"cwd":fixture.work()}));
+    let id=created_id(status,&body).unwrap();let record=session_record(&id);
+    assert!(!cutex::agent_bus::tool_policy::browser_tools_for_record(&record));
+    assert!(!cutex::agent_bus::tool_policy::cutex_mcp_enabled(&record));
+    let listed=cutex::agent_bus::tool_policy::tools_list_for_session(&id);
+    assert!(!listed["tools"].as_array().unwrap().iter().any(|tool|tool["name"].as_str().is_some_and(cutex::agent_bus::mcp_browser::is_tool)));
+}
+
+#[test]
 fn every_creation_path_supports_or_explicitly_refuses_each_runtime_kind() {
     let fixture = Fixture::new();
     let work = fixture.work();
@@ -292,6 +320,7 @@ fn every_creation_path_supports_or_explicitly_refuses_each_runtime_kind() {
     .unwrap();
     let record = session_record(&id);
     assert!(record.agent_enabled && !record.is_owned_session());
+    assert_eq!(record.created_by, Some(cutex::session::model::SessionCreatedBy::Owner));
     assert_eq!(record.formal_agent_name.as_deref(), Some("claude-agent"));
     assert!(record.exposed_to_backend);
     let claude = record.claude_session.as_ref().unwrap();
@@ -323,6 +352,7 @@ fn every_creation_path_supports_or_explicitly_refuses_each_runtime_kind() {
     run("human session × Codex", Expect::CodexCreator, session("chat-codex", CODEX, Value::Null));
     let chat = run("human session × Claude", Expect::Claude, session("chat-claude", CLAUDE, Value::Null)).unwrap();
     assert!(session_record(&chat).is_owned_session());
+    assert_eq!(session_record(&chat).created_by, Some(cutex::session::model::SessionCreatedBy::Owner));
     assert_tools(&chat, (true, false), "human session × Claude");
     let chat_unset = run("human session × Claude (rules unset)", Expect::Claude, session("chat-unset", CLAUDE_UNSET, Value::Null)).unwrap();
     assert_tools(&chat_unset, (true, true), "human session × Claude (rules unset)");
@@ -364,6 +394,26 @@ fn every_creation_path_supports_or_explicitly_refuses_each_runtime_kind() {
     let created = run("agent_create × Claude", Expect::Claude, created).unwrap();
     // agent_create follows the profile's rules too (it used to force both on).
     assert_tools(&created, (true, false), "agent_create × Claude");
+    assert_eq!(session_record(&created).created_by, None, "generic compatibility hook never guesses");
+    let actor = cutex::session::model::SessionCreatedBy::Agent {
+        cutex_session_id: cutex::role_revision::CutexSessionId::new("cutex.actual-director").unwrap(),
+        role: Some(cutex::session::model::SessionCreatorRole::Director),
+    };
+    let stamped_thread = super::agent_management::bootstrap_with_creator_for_test(&spec("claude-stamped", CLAUDE), Some(&actor)).unwrap();
+    let first_store = cutex::session::store::load_cutex_session_store().unwrap();
+    let stamped = first_store.sessions.values().find(|r|r.app_server_thread_id()==Some(stamped_thread.as_str())).unwrap();
+    assert_eq!(stamped.created_by.as_ref(), Some(&actor), "Claude bootstrap first save has actual actor");
+    for (name, profile) in [("owner-cli-plain", None), ("owner-cli-profile", Some(CLAUDE.to_string()))] {
+        super::human::run_command(cutex::cli::args::HumanCommand::Claude {
+            command: cutex::cli::args::ClaudeCommand::New {
+                name: name.into(), cwd: Some(std::path::PathBuf::from(&work)), model: "sonnet".into(),
+                allow_write: false, allow_exec: false, profile,
+            },
+        }).unwrap();
+        let saved = cutex::session::store::load_cutex_session_store().unwrap();
+        let record = saved.sessions.values().find(|r|r.formal_agent_name.as_deref()==Some(name)).unwrap();
+        assert_eq!(record.created_by, Some(cutex::session::model::SessionCreatedBy::Owner), "{name}: first CLI save");
+    }
     let mut narrowed = spec("claude-narrow", CLAUDE);
     narrowed.sandbox_mode = "workspace-write".into();
     run(

@@ -47,6 +47,8 @@
     "cutex/agentBus/wake",
     "cutex/asks/pause",
     "cutex/asks/resume",
+    "cutex/agent/pause",
+    "cutex/agent/resume",
     "cutex/ownerNotify/ack",
     "cutex/ownerNotify/reply",
     "cutex/ownerNotify/dismiss",

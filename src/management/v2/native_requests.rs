@@ -55,6 +55,10 @@ const SESSION_THREAD_METHODS: &[&str] = &[
     // schema: [`validate_search_occurrences`] checks its narrow shape.
     "thread/searchOccurrences",
     "claude/model/status",
+    // Capability `claude-task-stop`: stop one running background task (a
+    // background subagent or command, Claude adapter claude-r23) of the bound
+    // thread; [`validate_claude_task_stop`] checks its narrow shape.
+    "claude/tasks/stop",
     "turn/start",
     "turn/steer",
     "turn/interrupt",
@@ -270,6 +274,9 @@ pub(super) fn validate_pinned_client_request_schema(
     if matches!(native_message["method"].as_str(), Some("claude/models/catalog" | "claude/model/status")) {
         return validate_claude_model_read(native_message);
     }
+    if native_message["method"] == "claude/tasks/stop" {
+        return validate_claude_task_stop(native_message);
+    }
     if native_message["method"] == "thread/searchOccurrences" {
         return validate_search_occurrences(native_message);
     }
@@ -307,6 +314,24 @@ fn validate_claude_model_read(message: &Value) -> Result<(), NativeRequestValida
         return Err(invalid());
     }
     Ok(())
+}
+
+/// `claude/tasks/stop {threadId, taskId}`: only these two fields.
+fn validate_claude_task_stop(message: &Value) -> Result<(), NativeRequestValidationError> {
+    let invalid = || NativeRequestValidationError::Invalid("claude/tasks/stop accepts only {threadId, taskId}".into());
+    let object = message.as_object().ok_or_else(invalid)?;
+    if object.keys().any(|key| !matches!(key.as_str(), "id" | "method" | "params" | "jsonrpc"))
+        || object.get("jsonrpc").is_some_and(|value| value != "2.0") {
+        return Err(invalid());
+    }
+    let params = object.get("params").and_then(Value::as_object).ok_or_else(invalid)?;
+    if params.keys().any(|key| !matches!(key.as_str(), "threadId" | "taskId")) {
+        return Err(invalid());
+    }
+    match params.get("taskId").and_then(Value::as_str) {
+        Some(task) if !task.is_empty() && task.len() <= 256 => Ok(()),
+        _ => Err(invalid()),
+    }
 }
 
 /// `thread/searchOccurrences` (native 0.160+, Claude adapter r8+): a
@@ -401,6 +426,25 @@ mod tests {
         }
         assert!(matches!(validate("claude/model/status", json!({})), Err(NativeRequestValidationError::MissingThreadId)));
         assert!(matches!(validate("claude/model/set", json!({"threadId": "bound"})), Err(NativeRequestValidationError::MethodDenied(_))));
+    }
+
+    #[test]
+    fn claude_task_stop_is_narrow_and_bound_to_the_current_session() {
+        let validate = |method: &str, params: Value| {
+            let body = serde_json::to_vec(&serde_json::json!({"requestId": "stop", "native": {
+                "message": {"id": 1, "method": method, "params": params}
+            }})).unwrap();
+            validate_native_request(&body, "bound")
+        };
+        assert!(validate("claude/tasks/stop", json!({"threadId": "bound", "taskId": "a52f24f27d7f52e86"})).is_ok());
+        assert!(matches!(validate("claude/tasks/stop", json!({"threadId": "other", "taskId": "x"})),
+            Err(NativeRequestValidationError::ForeignThread { .. })));
+        assert!(matches!(validate("claude/tasks/stop", json!({"taskId": "x"})), Err(NativeRequestValidationError::MissingThreadId)));
+        for params in [json!({"threadId": "bound"}), json!({"threadId": "bound", "taskId": ""}),
+                       json!({"threadId": "bound", "taskId": "x", "all": true})] {
+            assert!(matches!(validate("claude/tasks/stop", params), Err(NativeRequestValidationError::Invalid(_))));
+        }
+        assert!(matches!(validate("claude/tasks/list", json!({"threadId": "bound"})), Err(NativeRequestValidationError::MethodDenied(_))));
     }
 
     #[test]

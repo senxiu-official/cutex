@@ -493,20 +493,60 @@ fn restart_recovery_continues_runs_whose_steps_are_alive() {
 
 #[test]
 fn restart_with_a_lost_step_stops_the_run_as_interrupted() {
-    let fake = Fake::new(|_, _| None);
+    let fake = Fake::new(|_, _| Some("done".into()));
     let h = harness(fake.clone());
     let run = h.service.submit(agent_request("return await agent('one')")).unwrap().run;
     approve(&h, &run);
-    wait_steps_running(&h, &run.run_id, 1);
-    h.service.drivers.lock().unwrap().clear();
+    // Build the restart journal only after the original driver has exited (finished also waits idle).
+    // Clearing the driver map did not stop its thread: it could see the missing ask, return null to
+    // the script and overwrite recovery's Stopped(Interrupted) with Completed.
+    let mut run = finished(&h, &run.run_id);
+    let mut step = h.service.store().steps(&run.run_id).unwrap().remove(0);
+    step.state = StepState::Running;
+    step.result = None;
+    step.ended_at = None;
+    h.service.store().save_step(&step).unwrap();
+    run.state = RunState::Running;
+    run.result = None;
+    run.ended_at = None;
+    run.notified = false;
+    run.counts = run_counts(std::slice::from_ref(&step));
+    h.service.store().save_run(&mut run).unwrap();
     // The step's ask vanished with the restart.
-    fake.state.lock().unwrap().asks.clear();
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.asks.clear();
+        state.notices.clear();
+    }
+    let starts = fake.starts();
     let second = new_service(&h.dir, fake.clone(), None, Arc::new(Mutex::new(Vec::new())));
     second.recover();
     let run = second.store().run(&run.run_id).unwrap().unwrap();
     assert_eq!(run.state, RunState::Stopped);
     assert_eq!(run.stop_reason, Some(StopReason::Interrupted));
+    assert_eq!(fake.starts(), starts, "recovery must not start another step for the lost ask");
     assert!(fake.state.lock().unwrap().notices.iter().any(|(_, t)| t.contains("resume_from_run_id")));
+}
+
+#[test]
+fn finished_runs_are_kept_past_the_old_30_day_limit() {
+    let h = harness(Fake::new(|p, _| Some(format!("ok:{p}"))));
+    let run = finished(&h, &h.service.submit(owner_request("return await agent('one')")).unwrap().run.run_id);
+    assert_eq!(run.state, RunState::Completed, "{run:?}");
+    let released = h.fake.state.lock().unwrap().released.len();
+    // Owner decision 2026-10-23: no timed deletion by default.
+    assert_eq!(FINISHED_RUN_RETENTION_DAYS, None);
+    let much_later = chrono::Utc::now() + chrono::Duration::days(400);
+    h.service.prune_finished_older_than(FINISHED_RUN_RETENTION_DAYS, much_later);
+    h.service.prune();
+    assert!(h.service.store().run(&run.run_id).unwrap().is_some(), "the run survives");
+    assert_eq!(h.service.store().steps(&run.run_id).unwrap().len(), 1, "its steps too");
+    assert_eq!(h.fake.state.lock().unwrap().released.len(), released, "no step session released by a prune");
+    // An explicit retention (a future storage-page setting) still applies.
+    h.service.prune_finished_older_than(Some(30), chrono::Utc::now());
+    assert!(h.service.store().run(&run.run_id).unwrap().is_some(), "not old enough");
+    h.service.prune_finished_older_than(Some(30), much_later);
+    assert!(h.service.store().run(&run.run_id).unwrap().is_none());
 }
 
 #[test]

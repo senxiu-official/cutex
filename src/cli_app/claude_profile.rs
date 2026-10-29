@@ -36,9 +36,22 @@ pub(super) fn create(
     defaults: cutex::profiles::appearance::ClaudeDefaults,
     tools: (Option<bool>, Option<bool>),
 ) -> anyhow::Result<cutex::session::model::CutexSessionRecord> {
+    create_with_creator(account, name, cwd, managed, defaults, tools,
+        cutex::session::model::SessionCreatedBy::Owner)
+}
+
+pub(super) fn create_with_creator(
+    account: &StoredAccount,
+    name: &str,
+    cwd: &std::path::Path,
+    managed: bool,
+    defaults: cutex::profiles::appearance::ClaudeDefaults,
+    tools: (Option<bool>, Option<bool>),
+    creator: cutex::session::model::SessionCreatedBy,
+) -> anyhow::Result<cutex::session::model::CutexSessionRecord> {
     // `tools`: write / exec set for this session; None follows the profile
     // (`defaults.allow_*` are the profile's rules, resolved at each start).
-    cutex::runtime::claude::create_profile(
+    cutex::runtime::claude::create_profile_with_creator(
         name,
         cwd,
         &defaults.model,
@@ -47,6 +60,7 @@ pub(super) fn create(
         Some(account.name.clone()),
         managed,
         defaults.effort,
+        Some(creator),
     )
 }
 

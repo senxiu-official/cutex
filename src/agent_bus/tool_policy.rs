@@ -22,6 +22,8 @@ pub enum Audience {
     Everyone,
     /// Project Directors and delegated Agent Operators.
     ProjectManagers,
+    /// Current project Directors only, not delegated operators.
+    ProjectDirectors,
     /// Agents that talk to the owner: Directors and agents not created by
     /// another agent (owner decision 2026-10-08). Subject to the owner's
     /// `ownerNotify.toolAudience` knob ([`owner_notify_admits`]).
@@ -50,9 +52,16 @@ pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
     rule("browser_release", Audience::Everyone),
     rule("browser_open", Audience::Everyone),
     rule("browser_claim", Audience::Everyone),
+    rule("browser_visit", Audience::Everyone),
     // Delegations (委托, asks design §6.3): every role, inside the boundary.
     // delegation_wait is also subject to the profile's delegationWait.
+    rule("director_handover_review", Audience::ProjectDirectors),
+    rule("director_start_review", Audience::ProjectDirectors),
+    rule("director_start_read", Audience::ProjectDirectors),
     rule("agent_list", Audience::Everyone),
+    rule("action_status", Audience::Everyone),
+    rule("agent_pause", Audience::ProjectDirectors),
+    rule("agent_resume", Audience::ProjectDirectors),
     rule("agent_delegate", Audience::Everyone),
     rule("delegation_wait", Audience::Everyone),
     rule("delegation_stop", Audience::Everyone),
@@ -64,6 +73,7 @@ pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
     rule("delegation_await", Audience::Everyone),
     rule("delegation_resume", Audience::Everyone),
     rule("delegation_reopen", Audience::Everyone),
+    rule("delegation_routing", Audience::ProjectDirectors),
     // The full text of an overlength message (doc- id; message tool family).
     rule("read_overlength_content", Audience::Everyone),
     // Artifacts (results for the owner and other agents; own project and
@@ -93,6 +103,7 @@ pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
     // Project management (members, lifecycle): Director and operators.
     rule("agent_create", Audience::ProjectManagers),
     rule("agent_archive", Audience::ProjectManagers),
+    rule("agent_restore", Audience::ProjectManagers),
     rule("member_runtime", Audience::ProjectManagers),
     rule("member_replace", Audience::ProjectManagers),
     // Agent → owner messages (docs/research/owner-notify.md).
@@ -133,6 +144,7 @@ impl Audience {
         match self {
             Self::Everyone => true,
             Self::ProjectManagers => roles.director || roles.operator,
+            Self::ProjectDirectors => roles.director,
             Self::OwnerFacing => owner_notify_admits(roles, "ownerFacing"),
         }
     }
@@ -248,28 +260,44 @@ pub fn browser_tools_for_record(record: &crate::session::model::CutexSessionReco
 /// owner's own quick chats (owned sessions, `POST /v2/human/sessions`).
 /// A quick chat gets the browser tools only, never the agent tools.
 pub fn browser_eligible_session(record: &crate::session::model::CutexSessionRecord) -> bool {
-    !record.is_retired() && (record.agent_enabled || record.is_owned_session())
+    !crate::agent_management::agent_execution_blocked(&record) && (record.agent_enabled || record.is_owned_session())
 }
 
 /// [`browser_tools_for_record`] against an already loaded profile store:
-/// an eligible session whose existing profile opted in. Missing profile,
-/// unknown profile or retired session: off.
+/// an eligible session whose effective launch Profile opted in. Unknown or
+/// deleted runtime identities and retired sessions fail closed.
 pub fn browser_tools_for_record_in(
     record: &crate::session::model::CutexSessionRecord,
     profiles: &crate::profiles::model::AccountsStore,
 ) -> bool {
     if !browser_eligible_session(record) { return false; }
-    let Some(profile) = record.profile.as_deref() else { return false; };
-    crate::profiles::settings_api::find(profiles, profile).is_some_and(crate::profiles::settings_api::browser_tools)
+    crate::profiles::session_profile::effective(record, profiles).is_some_and(crate::profiles::settings_api::browser_tools)
+}
+
+/// Before spawn, use the reviewed selection rather than a previous occurrence's
+/// binding or a default that may have changed since review.
+pub fn cutex_mcp_enabled_for_launch(record: &crate::session::model::CutexSessionRecord, profile_id: &str) -> bool {
+    if !record.is_owned_session() { return true; }
+    let Ok(profiles) = crate::profiles::settings_api::load_store() else { return false; };
+    let mut rows = profiles.accounts.iter().filter(|account| account.id == profile_id);
+    let Some(account) = rows.next() else { return false; };
+    rows.next().is_none() && owned_mcp_for_profile(record, account)
 }
 
 /// Whether a launch configures the `cutex` MCP server enabled: always for
 /// agents; for an owned session (quick chat) only to serve its browser tools
 /// or `web_search`.
 pub fn cutex_mcp_enabled(record: &crate::session::model::CutexSessionRecord) -> bool {
-    !record.is_owned_session()
-        || browser_tools_for_record(record)
-        || crate::agent_bus::web_search::enabled_for_record(record)
+    if !record.is_owned_session() { return true; }
+    let Ok(profiles) = crate::profiles::settings_api::load_store() else { return false; };
+    crate::profiles::session_profile::effective(record, &profiles)
+        .is_some_and(|profile| owned_mcp_for_profile(record, profile))
+}
+
+fn owned_mcp_for_profile(record: &crate::session::model::CutexSessionRecord, profile: &crate::profiles::model::StoredAccount) -> bool {
+    browser_eligible_session(record) && (crate::profiles::settings_api::browser_tools(profile)
+        || (record.runtime_backend != crate::session::model::CutexSessionRuntimeBackend::ClaudeSubscription
+            && crate::profiles::settings_api::search_tool(profile)))
 }
 
 fn owned_session(cutex_session_id: &str) -> bool {
@@ -383,7 +411,7 @@ mod tests {
         assert!(!browser_tools_enabled("cutex.browser-missing"));
         for runtime in [crate::asks::tools::ToolRuntime::Codex,crate::asks::tools::ToolRuntime::Claude] {
             let mut listed=crate::agent_bus::mcp::tools_for(runtime,true);
-            assert_eq!(listed["tools"].as_array().unwrap().iter().filter(|t| t["name"].as_str().is_some_and(crate::agent_bus::mcp_browser::is_tool)).count(),9);
+            assert_eq!(listed["tools"].as_array().unwrap().iter().filter(|t| t["name"].as_str().is_some_and(crate::agent_bus::mcp_browser::is_tool)).count(),crate::agent_bus::mcp_browser::TOOLS.len());
             crate::agent_bus::mcp_browser::filter_listing(&mut listed,false);
             assert_eq!(listed["tools"].as_array().unwrap().iter().filter(|t| t["name"].as_str().is_some_and(crate::agent_bus::mcp_browser::is_tool)).count(),0);
         }
@@ -484,6 +512,73 @@ mod tests {
     }
 
     #[test]
+    fn inherited_default_profile_tools_match_listing_mcp_and_explicit_opt_out() {
+        use crate::config::instance::{set_test_selection, Selection};
+        let previous=crate::config::instance::selected().unwrap();
+        let path=std::env::temp_dir().join(format!("default-profile-tools-{}",uuid::Uuid::new_v4()));
+        set_test_selection(Selection::Custom(path.clone()));
+        let mut config=crate::config::store::load_codez_config_checked().unwrap();
+        config.default_profile=Some("Browsing".into());
+        crate::config::store::save_codez_config(&config).unwrap();
+        let mut store=profiles(true);
+        store.accounts[0].source=Some("api-key".into());
+        store.accounts[0].search_tool=true;
+        let mut disabled=store.accounts[0].clone();
+        disabled.id="off-id".into(); disabled.name="Disabled".into(); disabled.browser_tools=false; disabled.search_tool=false;
+        store.accounts.push(disabled);
+        crate::profiles::store::save_store(&store).unwrap();
+        let mut quick=quick_chat_record(); quick.profile=None;
+        let mut agent=quick.clone(); agent.cutex_session_id="cutex.default-no-project".into(); agent.agent_enabled=true;
+        agent.agent_groups.clear(); agent.registration_class=crate::agent_bus::model::AgentRegistrationClass::Persistent;
+        let mut sessions=crate::session::model::CutexSessionStore::default();
+        for record in [&quick,&agent] { sessions.sessions.insert(record.cutex_session_id.clone(),record.clone()); }
+        crate::session::store::save_cutex_session_store(&sessions).unwrap();
+        for record in [&quick,&agent] {
+            assert!(browser_tools_for_record_in(record,&store));
+            assert!(crate::agent_bus::web_search::enabled_for_record_in(record,&store));
+            assert!(cutex_mcp_enabled(record));
+            let listing=tools_list_for_session(&record.cutex_session_id);
+            let tools=listing["tools"].as_array().unwrap();
+            assert!(tools.iter().any(|tool|tool["name"]=="web_search"));
+            for name in crate::agent_bus::mcp_browser::TOOLS { assert!(tools.iter().any(|tool|tool["name"]==*name),"{name}"); }
+            let mut opted_out=record.clone(); opted_out.profile=Some("Disabled".into());
+            assert!(!browser_tools_for_record_in(&opted_out,&store));
+            assert!(!crate::agent_bus::web_search::enabled_for_record_in(&opted_out,&store));
+            if opted_out.is_owned_session() { assert!(!cutex_mcp_enabled(&opted_out)); }
+            sessions.sessions.insert(opted_out.cutex_session_id.clone(),opted_out.clone());
+            crate::session::store::save_cutex_session_store(&sessions).unwrap();
+            let denied=tools_list_for_session(&opted_out.cutex_session_id);
+            assert!(!denied["tools"].as_array().unwrap().iter().any(|tool|tool["name"]=="web_search"
+                || tool["name"].as_str().is_some_and(crate::agent_bus::mcp_browser::is_tool)));
+        }
+        assert!(cutex_mcp_enabled_for_launch(&quick,"browsing-id"));
+        assert!(!cutex_mcp_enabled_for_launch(&quick,"off-id"));
+        assert!(!cutex_mcp_enabled_for_launch(&quick,"missing-id"));
+        let mut running=quick.clone();
+        running.app_server_runtime=Some(serde_json::from_value(serde_json::json!({
+            "transport":"loopback_web_socket","endpoint":"ws://127.0.0.1:1","pid":1,"runtime_dir":"/tmp",
+            "launched_profile_id":"browsing-id","launched_profile":"old-name",
+            "diagnostic_journal_path":"/tmp/log","schema_version":"test","schema_sha256":"a".repeat(64),"started_at":"2026-10-24T00:00:00Z",
+        })).unwrap());
+        config.default_profile=Some("Disabled".into());
+        crate::config::store::save_codez_config(&config).unwrap();
+        assert!(browser_tools_for_record_in(&running,&store));
+        assert!(crate::agent_bus::web_search::enabled_for_record_in(&running,&store));
+        assert!(cutex_mcp_enabled(&running));
+        running.app_server_runtime.as_mut().unwrap().launched_profile_id=Some("off-id".into());
+        running.profile=Some("Browsing".into());
+        assert!(!browser_tools_for_record_in(&running,&store));
+        assert!(!crate::agent_bus::web_search::enabled_for_record_in(&running,&store));
+        assert!(!cutex_mcp_enabled(&running));
+        assert!(cutex_mcp_enabled_for_launch(&running,"browsing-id"),"new launch uses reviewed selection, not stale occurrence");
+        running.app_server_runtime.as_mut().unwrap().launched_profile_id=Some("missing-id".into());
+        assert!(!browser_tools_for_record_in(&running,&store));
+        assert!(!crate::agent_bus::web_search::enabled_for_record_in(&running,&store));
+        set_test_selection(previous);
+        let _=std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn web_search_is_listed_only_for_a_profile_with_search_tool() {
         use crate::config::instance::{set_test_selection, Selection};
         let previous = crate::config::instance::selected().unwrap();
@@ -572,6 +667,11 @@ mod tests {
         }
         let director = tool_names_for(AgentRoles { director: true, ..AgentRoles::default() });
         for tool in management {
+            assert!(director.contains(&tool), "{tool}");
+        }
+        for tool in ["agent_pause", "agent_resume"] {
+            assert!(!member.contains(&tool), "{tool}");
+            assert!(!operator.contains(&tool), "{tool}");
             assert!(director.contains(&tool), "{tool}");
         }
         // r219: director_rotate was removed; no role lists it.

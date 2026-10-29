@@ -57,10 +57,49 @@ use crate::platform::host::current_host_name;
 use crate::platform::now_epoch_secs;
 use crate::role_revision::RuntimeAgentId;
 use crate::session::store::load_cutex_session_store_shared;
+use crate::management::v2::control_timing::{Path as ControlPath, Stage as ControlStage, Trace as ControlTrace};
 
 const RESET: &str = "\x1b[0m";
 const YELLOW: &str = "\x1b[33m";
 const MAX_POLL_WAIT: Duration = Duration::from_secs(5);
+
+// Borrow only fixed-name metadata; never copy/retain arguments for tracing.
+// Large requests are still measured, under the bounded `control_other` label.
+fn control_request_path(body: &[u8], management: bool) -> ControlPath {
+    #[derive(serde::Deserialize)]
+    struct Metadata<'a> {
+        #[serde(default, borrow)] tool: Option<&'a str>,
+        #[serde(default, borrow)] operation: Option<&'a str>,
+    }
+    if body.len() > 1024 * 1024 { return ControlPath::ControlOther; }
+    let Ok(metadata) = serde_json::from_slice::<Metadata<'_>>(body) else { return ControlPath::ControlOther; };
+    if management {
+        if metadata.operation == Some("create") { ControlPath::McpAgentCreate } else { ControlPath::ControlOther }
+    } else {
+        ControlPath::from_tool(metadata.tool.unwrap_or(""))
+    }
+}
+
+fn write_control_response(stream: &mut TcpStream, trace: &mut ControlTrace, value: &Value) -> anyhow::Result<()> {
+    trace.stage(ControlStage::ResponseWrite);
+    trace.status(500);
+    write_json_response(stream, 200, "OK", value)?;
+    // Logical tool outcome, distinct from the Bus's HTTP-200 envelope.
+    let refused = value["ok"] == false || value["http_status"].as_u64().is_some_and(|status| status >= 400)
+        || matches!(value["outcome"]["status"].as_str(), Some("no_write" | "owner_action_required" | "response_uncertain" | "approval_required"));
+    trace.status(if refused { 400 } else { 200 });
+    Ok(())
+}
+
+// Delivery is nested under tool dispatch. Give its actual persistence/wake
+// work a separate fixed path rather than counting a second logical tool call.
+fn timed_fanout<T>(operation: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let mut trace = ControlTrace::new(ControlPath::BusFanout);
+    trace.stage(ControlStage::Fanout);
+    let result = operation();
+    trace.status(if result.is_ok() { 200 } else { 500 });
+    result
+}
 
 struct AgentBusPollSignal {
     generation: Mutex<u64>,
@@ -86,7 +125,12 @@ pub fn notify_agent_bus_message_available() {
 
 #[derive(Clone, Copy)]
 pub struct AgentBusRequestHandlers {
-    pub reconcile_registration_agent: fn(&mut AgentBusAgent) -> anyhow::Result<()>,
+    pub managed_archive: fn(&AgentManagementInvocation, &crate::agent_management::ManagedAgentArchiveRequest)
+        -> Result<crate::agent_management::AgentArchiveReceipt, crate::agent_management::AgentManagementError>,
+    pub reconcile_registration_agent: fn(
+        &mut AgentBusAgent,
+        &mut RegistrationCommit<'_>,
+    ) -> anyhow::Result<RegistrationDisposition>,
     pub reconcile_agent: fn(&AgentBusAgent) -> anyhow::Result<()>,
     pub redrive_ordinary_messages: fn(&Arc<Mutex<AgentBusState>>) -> anyhow::Result<usize>,
     pub send_payload_response:
@@ -108,6 +152,18 @@ pub struct AgentBusRequestHandlers {
     /// Agent Management start messages just ACKed (delivered, or finished
     /// undelivered): tells the requester when one ended undelivered.
     pub management_start_acked: fn(&Arc<Mutex<AgentBusState>>, &[String]),
+}
+
+/// Roster publication continuation. Registration reconciliation invokes it
+/// while any borrowed session reservation is still alive.
+pub type RegistrationCommit<'a> = dyn FnMut(&AgentBusAgent) -> anyhow::Result<()> + 'a;
+
+/// Whether reconciliation published this occurrence or declined it without
+/// changing either the durable session store or the Agent Bus roster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistrationDisposition {
+    Committed,
+    Deferred,
 }
 
 pub fn handle_agent_bus_request(
@@ -164,6 +220,12 @@ pub fn handle_agent_bus_request(
         .unwrap_or(request.path.as_str());
     match (request.method.as_str(), path_only) {
         ("GET", "/") => write_http_response(stream, 200, "OK", "text/plain", b"ok"),
+        ("GET", "/api/diagnostics/control") => {
+            if !matches!(request.caller(), crate::agent_bus::agent_auth::BusCaller::Root) {
+                return write_http_response(stream, 403, "Forbidden", "text/plain", b"root credential required");
+            }
+            write_json_response(stream, 200, "OK", &serde_json::json!({"scope":"agent_bus_process","timing":crate::management::v2::control_timing::snapshot()}))
+        }
         ("GET", "/api/agents") => {
             require_service_bridge_token(&request, token, "Agent Bus")?;
             if let Some(invocation) = validate_mcp_caller_fence(&request, state)? {
@@ -238,14 +300,42 @@ pub fn handle_agent_bus_request(
         }
         // Asks (委托) MCP tools (asks design §6): the fence gives the caller.
         ("POST", crate::asks::tools::PATH | crate::asks::short_ids::PATH) => {
+            let mut timing = ControlTrace::new(if path_only == crate::asks::short_ids::PATH {
+                ControlPath::McpResolveIds
+            } else { control_request_path(&request.body, false) });
+            timing.stage(ControlStage::Validation);
+            timing.status(401);
             require_service_bridge_token(&request, token, "Agent Bus")?;
+            timing.status(0);
+            timing.stage(ControlStage::ContextRead);
             let result = match validate_mcp_caller_fence(&request, state) {
                 Ok(Some(invocation)) => {
                     let caller = invocation.caller_cutex_session.as_str().to_string();
                     let runtime = invocation.caller_runtime_agent_id.clone();
+                    if request.path == crate::asks::tools::PATH
+                        && request.headers.get(crate::agent_bus::mcp::action_receipts::HEADER).is_some_and(|v| v == "async-v1") {
+                        let body: Value = serde_json::from_slice(&request.body)?;
+                        if body["tool"] == "agent_delegate" {
+                            let action_id = body["arguments"]["action_id"].as_str()
+                                .or_else(|| body["action_id"].as_str()).unwrap_or("").to_owned();
+                            let query = crate::agent_bus::mcp::action_receipts::Query { action_id, tool:"agent_delegate".into() };
+                            let digest = crate::approvals::request_digest(&body);
+                            let state = Arc::clone(state);
+                            let response = crate::agent_bus::mcp::action_receipts::start(&caller,query,digest,move || {
+                                let invocation = validate_mcp_caller_fence(&request,&state)?
+                                    .ok_or_else(|| anyhow!("MCP occurrence no longer valid"))?;
+                                let facade = crate::asks::tools::facade_level(request.headers.get(crate::asks::tools::FACADE_HEADER).map(String::as_str));
+                                crate::agent_bus::mcp::action_receipts::dispatch::delegate(
+                                    invocation.caller_cutex_session.as_str(),&request.body,facade)
+                            });
+                            return write_control_response(stream,&mut timing,&response);
+                        }
+                    }
+                    timing.stage(ControlStage::StoreRead);
                     match crate::asks::store::AskStore::open_default() {
                         Ok(store) => {
                             let world = crate::asks::scheduler::HostWorld::load();
+                            timing.stage(ControlStage::Dispatch);
                             let send = |tell: &crate::asks::tools::TellSend<'_>| -> anyhow::Result<serde_json::Value> {
                                 let payload = crate::agent_bus::model::AgentBusSendRequest {
                                     to: tell.to.to_string(),
@@ -274,7 +364,7 @@ pub fn handle_agent_bus_request(
                                     external_message_id: Some(tell.external_id.to_string()),
                                     sender_facts: Some(tell.facts.clone()),
                                 };
-                                (handlers.send_payload_response)(state, payload)
+                                timed_fanout(|| (handlers.send_payload_response)(state, payload))
                             };
                             let wake_chain = |from: &str, to: &str, turn: &str| {
                                 crate::management::v2::agent_bus_state::agent_bus_message_repository()
@@ -305,6 +395,7 @@ pub fn handle_agent_bus_request(
                                 ),
                             };
                             if request.path == crate::asks::short_ids::PATH {
+                                timing.stage(ControlStage::ContextRead);
                                 crate::asks::short_ids::handle(&ctx, &request.body)
                             } else {
                                 crate::asks::tools::handle(&ctx, &request.body)
@@ -319,7 +410,7 @@ pub fn handle_agent_bus_request(
                 _ => serde_json::json!({"ok": false, "status": "no_write", "code": "unauthorized",
                     "detail": "delegation tools require the current persistent agent runtime"}),
             };
-            write_json_response(stream, 200, "OK", &result)
+            write_control_response(stream, &mut timing, &result)
         }
         // web_search (profile-search-tool): one search-only request to the
         // caller's own profile provider. Agents and the owner's quick chats.
@@ -367,14 +458,28 @@ pub fn handle_agent_bus_request(
                 .agents
                 .get(&agent.id)
                 .is_some_and(|known| known.pid == agent.pid);
-            register_agent_with_reconciliation(
+            let disposition = register_agent_transaction(
                 state,
                 agent,
                 handlers.reconcile_registration_agent,
                 save_agent_bus_registry_locked,
             )?;
+            if disposition == RegistrationDisposition::Deferred {
+                return write_json_response(
+                    stream,
+                    409,
+                    "Conflict",
+                    &serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": "registration_busy",
+                            "message": "the durable session is settling another operation; retry registration"
+                        }
+                    }),
+                );
+            }
             if registration_redrive_due(refresh, now) {
-                if let Err(error) = (handlers.redrive_ordinary_messages)(state) {
+                if let Err(error) = timed_fanout(|| (handlers.redrive_ordinary_messages)(state)) {
                     eprintln!("warning: durable ordinary-message redrive failed: {error:#}");
                 }
             }
@@ -518,7 +623,7 @@ pub fn handle_agent_bus_request(
                     payload.all_groups = true;
                 }
             }
-            let response = match (handlers.send_payload_response)(state, payload) {
+            let response = match timed_fanout(|| (handlers.send_payload_response)(state, payload)) {
                 Ok(response) => response,
                 Err(error) => {
                     if let Some(response) = write_agent_target_resolution_error(stream, &error) {
@@ -591,7 +696,7 @@ pub fn handle_agent_bus_request(
         }
         ("POST", "/api/messages/redrive") => {
             require_service_bridge_token(&request, token, "Agent Bus")?;
-            let redriven = (handlers.redrive_ordinary_messages)(state)?;
+            let redriven = timed_fanout(|| (handlers.redrive_ordinary_messages)(state))?;
             write_json_response(
                 stream,
                 200,
@@ -672,15 +777,27 @@ pub fn handle_agent_bus_request(
             let response = (handlers.job_service_completion_query)(&principal, payload)?;
             write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
         }
+        ("POST", crate::agent_bus::mcp::archive_mcp::PATH) => {
+            require_agent_management_bridge_token(&request, token)?;
+            if request.body.len() > AGENT_MANAGEMENT_MAX_BODY_BYTES { return write_json_response(stream,413,"Payload Too Large",&serde_json::json!({"ok":false,"status":"no_write"})); }
+            let payload: crate::agent_management::ManagedAgentArchiveRequest = serde_json::from_slice(&request.body)?;
+            let invocation = match validate_mcp_caller_fence(&request, state) {
+                Ok(Some(invocation)) => invocation,
+                _ => return write_json_response(stream,403,"Forbidden",&serde_json::json!({"ok":false,"action_id":payload.action_id,"status":"no_write","outcomeUnknown":false,"error":{"code":"stale_or_missing_mcp_occurrence"}})),
+            };
+            let response = crate::agent_bus::mcp::archive_mcp::response(&payload, (handlers.managed_archive)(&invocation, &payload));
+            write_json_response(stream, 200, "OK", &response)
+        }
         ("POST", "/api/agent-management/v1/actions") => {
-            let route_started = std::time::Instant::now();
+            let mut timing = ControlTrace::new(control_request_path(&request.body, true));
+            timing.stage(ControlStage::Validation);
             if request.body.len() > AGENT_MANAGEMENT_MAX_BODY_BYTES {
                 let response = agent_management_no_write(
                     AgentActionId::new("invalid-body").expect("fixed action ID"),
                     "body_too_large",
                     "Agent Management request exceeds route limit",
                 );
-                return write_json_response(stream, 200, "OK", &serde_json::to_value(response)?);
+                return write_control_response(stream, &mut timing, &serde_json::to_value(response)?);
             }
             // Sparse agent_create / member_replace (P2): resolved into the full
             // request below, once the MCP caller is known.
@@ -695,10 +812,7 @@ pub fn handle_agent_bus_request(
                             "invalid_arguments",
                             &bounded_detail(format!("invalid agent arguments: {error}")),
                         );
-                        return write_json_response(
-                            stream,
-                            200,
-                            "OK",
+                        return write_control_response(stream, &mut timing,
                             &serde_json::to_value(response)?,
                         );
                     }
@@ -719,10 +833,7 @@ pub fn handle_agent_bus_request(
                         "invalid_body",
                         "strict Agent Management request parsing failed",
                     );
-                    return write_json_response(
-                        stream,
-                        200,
-                        "OK",
+                    return write_control_response(stream, &mut timing,
                         &serde_json::to_value(response)?,
                     );
                 }
@@ -733,14 +844,34 @@ pub fn handle_agent_bus_request(
                     "unauthorized",
                     "Agent Management requires authenticated Agent Bus access",
                 );
-                return write_json_response(stream, 200, "OK", &serde_json::to_value(response)?);
+                return write_control_response(stream, &mut timing, &serde_json::to_value(response)?);
             }
             // An agent on an older facade may still send director_rotate.
             if let Some(response) = removed_agent_management_operation(&payload) {
-                return write_json_response(stream, 200, "OK", &serde_json::to_value(response)?);
+                return write_control_response(stream, &mut timing, &serde_json::to_value(response)?);
             }
+            timing.stage(ControlStage::ContextRead);
             match validate_mcp_caller_fence(&request, state) {
                 Ok(Some(invocation)) => {
+                    timing.stage(ControlStage::Dispatch);
+                    if crate::agent_bus::mcp::action_receipts::dispatch::is_create(&payload,sparse.as_ref())
+                        && request.headers.get(crate::agent_bus::mcp::action_receipts::HEADER).is_some_and(|v| v == "async-v1") {
+                        let query = crate::agent_bus::mcp::action_receipts::Query {
+                            action_id:payload.action_id.as_str().to_owned(), tool:"agent_create".into() };
+                        let caller = invocation.caller_cutex_session.as_str().to_owned();
+                        let digest = crate::approvals::request_digest(&serde_json::from_slice::<Value>(&request.body)?);
+                        let state = Arc::clone(state);
+                        let response = crate::agent_bus::mcp::action_receipts::start(&caller,query,digest,move || {
+                            let invocation = validate_mcp_caller_fence(&request,&state)?
+                                .ok_or_else(|| anyhow!("MCP occurrence no longer valid"))?;
+                            let facade = crate::asks::tools::facade_level(request.headers.get(crate::asks::tools::FACADE_HEADER).map(String::as_str));
+                            crate::agent_bus::mcp::action_receipts::dispatch::create(
+                                &state,invocation,payload,sparse,handlers,facade,
+                                |invocation,payload| agent_launch_policy_refusal(invocation,payload,None,&mut None)
+                                    .map(|response| serde_json::to_value(response).expect("serializable policy response")))
+                        });
+                        return write_control_response(stream,&mut timing,&response);
+                    }
                     if !matches!(
                         payload.operation,
                         crate::agent_management::AgentOperation::QueryManaged
@@ -751,10 +882,7 @@ pub fn handle_agent_bus_request(
                             | crate::agent_management::AgentOperation::Close { .. }
                             | crate::agent_management::AgentOperation::Replace { .. }
                     ) {
-                        return write_json_response(
-                            stream,
-                            200,
-                            "OK",
+                        return write_control_response(stream, &mut timing,
                             &serde_json::to_value(agent_management_no_write(
                                 payload.action_id.clone(),
                                 "unauthorized",
@@ -781,10 +909,7 @@ pub fn handle_agent_bus_request(
                                     refusal.code,
                                     &bounded_detail(refusal.detail),
                                 );
-                                return write_json_response(
-                                    stream,
-                                    200,
-                                    "OK",
+                                return write_control_response(stream, &mut timing,
                                     &serde_json::to_value(response)?,
                                 );
                             }
@@ -794,19 +919,18 @@ pub fn handle_agent_bus_request(
                     let waiter = approval_waiter(&request, stream, &invocation);
                     // Q21: the owner approved this launch while the call held.
                     let mut approval_note = None;
+                    timing.stage(ControlStage::ApprovalWait);
                     if let Some(refusal) = agent_launch_policy_refusal(
                         &invocation,
                         &payload,
                         waiter.as_ref(),
                         &mut approval_note,
                     ) {
-                        return write_json_response(
-                            stream,
-                            200,
-                            "OK",
+                        return write_control_response(stream, &mut timing,
                             &serde_json::to_value(refusal)?,
                         );
                     }
+                    timing.stage(ControlStage::Dispatch);
                     // Only façades whose result parser takes the note get it
                     // (older ones refuse unknown fields on a receipt).
                     let approval_note = approval_note.filter(|_| {
@@ -820,7 +944,7 @@ pub fn handle_agent_bus_request(
                     let Some(sparse_sha256) = sparse_sha256 else {
                         let mut response = (handlers.agent_management)(state, invocation, payload)?;
                         attach_launch_approval_note(&mut response, approval_note);
-                        return write_json_response(stream, 200, "OK", &response);
+                        return write_control_response(stream, &mut timing, &response);
                     };
                     let full_sha256 = crate::agent_management::full_sha256(&payload);
                     // agent-create-task-delegation: the task goes to the new
@@ -844,9 +968,13 @@ pub fn handle_agent_bus_request(
                                     .get(crate::asks::tools::FACADE_HEADER)
                                     .map(String::as_str),
                             ),
-                            route_started,
                         );
                     }
+                    // Design 041: why this profile was picked for "auto:<provider>".
+                    crate::management::v2::profile_auto_pick::attach_to_reply(
+                        &mut response,
+                        action_id.as_str(),
+                    );
                     // The caller binds the receipt to the request it sent.
                     if let Some(digest) = response.pointer_mut("/outcome/receipt/request_sha256") {
                         if full_sha256.is_some_and(|full| digest.as_str() == Some(full.as_str())) {
@@ -854,13 +982,10 @@ pub fn handle_agent_bus_request(
                         }
                     }
                     attach_launch_approval_note(&mut response, approval_note);
-                    return write_json_response(stream, 200, "OK", &response);
+                    return write_control_response(stream, &mut timing, &response);
                 }
                 Err(_) => {
-                    return write_json_response(
-                        stream,
-                        200,
-                        "OK",
+                    return write_control_response(stream, &mut timing,
                         &serde_json::to_value(agent_management_no_write(
                             payload.action_id.clone(),
                             "unauthorized",
@@ -877,7 +1002,7 @@ pub fn handle_agent_bus_request(
                     "unauthorized",
                     "sparse agent arguments require the cutex MCP tools",
                 );
-                return write_json_response(stream, 200, "OK", &serde_json::to_value(response)?);
+                return write_control_response(stream, &mut timing, &serde_json::to_value(response)?);
             }
             let sender = match agent_management_sender(&request, state) {
                 Ok(sender) => sender,
@@ -887,10 +1012,7 @@ pub fn handle_agent_bus_request(
                         "unauthorized",
                         "Agent Bus sender authentication failed",
                     );
-                    return write_json_response(
-                        stream,
-                        200,
-                        "OK",
+                    return write_control_response(stream, &mut timing,
                         &serde_json::to_value(response)?,
                     );
                 }
@@ -903,16 +1025,14 @@ pub fn handle_agent_bus_request(
                         error.code(),
                         error.detail(),
                     );
-                    return write_json_response(
-                        stream,
-                        200,
-                        "OK",
+                    return write_control_response(stream, &mut timing,
                         &serde_json::to_value(response)?,
                     );
                 }
             };
+            timing.stage(ControlStage::Dispatch);
             let response = (handlers.agent_management)(state, invocation, payload)?;
-            write_json_response(stream, 200, "OK", &response)
+            write_control_response(stream, &mut timing, &response)
         }
         ("GET", "/api/messages/poll") => {
             require_service_bridge_token(&request, token, "Agent Bus")?;
@@ -1183,7 +1303,7 @@ fn session_for_declared_runtime(
     };
     let sessions = load_cutex_session_store_shared()?;
     let mut matches = sessions.sessions.values().filter(|record| {
-        record.is_active() && record.current_runtime_agent_id.as_deref() == Some(runtime.as_str())
+        !crate::agent_management::agent_execution_blocked(&record) && record.current_runtime_agent_id.as_deref() == Some(runtime.as_str())
     });
     Ok(match (matches.next(), matches.next()) {
         (Some(record), None) => Some(record.cutex_session_id.clone()),
@@ -1234,6 +1354,38 @@ fn attach_launch_approval_note(response: &mut serde_json::Value, note: Option<se
         if response.pointer("/outcome/status").and_then(serde_json::Value::as_str) == Some("complete") {
             crate::approvals::attach_approval_note(response, note);
         }
+    }
+}
+
+pub(crate) fn agent_profile_approval_request(
+    requester_cutex_session_id: &str,
+    requester_name: Option<String>,
+    project_id: Option<String>,
+    operation: &str,
+    spec: &crate::agent_management::ManagedAgentSpec,
+    profile: &str,
+    request_sha256: String,
+) -> crate::approvals::ApprovalRequest {
+    crate::approvals::ApprovalRequest {
+        kind: crate::approvals::ApprovalKind::AgentProfile,
+        reason: "profile_requires_approval".into(),
+        requester_cutex_session_id: requester_cutex_session_id.to_string(),
+        requester_name,
+        project_id,
+        summary: format!(
+            "{operation} agent {} with profile {profile} ({} / {})",
+            spec.name, spec.sandbox_mode, spec.approval_policy
+        ),
+        details: serde_json::json!({
+            "operation": operation,
+            "name": spec.name,
+            "profile": profile,
+            "model": spec.model,
+            "cwd": spec.cwd,
+            "sandboxMode": spec.sandbox_mode,
+            "approvalPolicy": spec.approval_policy,
+        }),
+        request_sha256,
     }
 }
 
@@ -1338,30 +1490,15 @@ fn agent_launch_policy_refusal(
     let gate = crate::approvals::ApprovalStore::open_default().and_then(|store| {
         crate::approvals::gate_with_wait(
             &store,
-            crate::approvals::ApprovalRequest {
-                kind: crate::approvals::ApprovalKind::AgentProfile,
-                reason: "profile_requires_approval".into(),
-                requester_cutex_session_id: invocation.caller_cutex_session.as_str().to_string(),
-                requester_name: caller.formal_agent_name.clone(),
-                project_id: request
-                    .project_id
-                    .as_ref()
-                    .map(|id| id.as_str().to_string()),
-                summary: format!(
-                    "{operation} agent {} with profile {profile} ({} / {})",
-                    spec.name, spec.sandbox_mode, spec.approval_policy
-                ),
-                details: serde_json::json!({
-                    "operation": operation,
-                    "name": spec.name,
-                    "profile": profile,
-                    "model": spec.model,
-                    "cwd": spec.cwd,
-                    "sandboxMode": spec.sandbox_mode,
-                    "approvalPolicy": spec.approval_policy,
-                }),
-                request_sha256: digest,
-            },
+            agent_profile_approval_request(
+                invocation.caller_cutex_session.as_str(),
+                caller.formal_agent_name.clone(),
+                request.project_id.as_ref().map(|id| id.as_str().to_string()),
+                operation,
+                spec,
+                profile,
+                digest,
+            ),
             waiter,
             |record| crate::management::v2::approvals::publish_changed(record, "requested"),
             crate::management::v2::approvals::queue_decision_notice,
@@ -1423,6 +1560,7 @@ fn approval_waiter(
         secs,
         Some(thread),
         turn,
+        Some(generation),
         move || connection_open(&peer),
         move || caller_still_current(&session, &runtime, generation, &fence_thread),
     ))
@@ -1456,7 +1594,7 @@ fn caller_still_current(session: &str, runtime: &str, generation: u64, thread: &
             record.runtime_generation == generation
                 && record.current_runtime_agent_id.as_deref() == Some(runtime)
                 && record.app_server_thread_id() == Some(thread)
-                && !record.is_retired()
+                && !crate::agent_management::agent_execution_blocked(&record)
         })
     })
 }
@@ -1534,7 +1672,7 @@ fn validate_mcp_caller_fence_for(
         || generation == 0
         || record.runtime_generation != generation
         || record.current_runtime_agent_id.as_deref() != Some(sender.runtime_agent_id.as_str())
-        || record.is_retired()
+        || crate::agent_management::agent_execution_blocked(&record)
         || (record.explicit_launch.is_some() && record.app_server_launch_claim_id.is_some())
         || !(persistent_agent_occurrence(record, &roster)
             || (owned_sessions && owned_session_occurrence(record, &roster)))
@@ -1679,15 +1817,40 @@ fn registration_redrive_due_at(last: &AtomicU64, refresh: bool, now_epoch_secs: 
     .is_ok()
 }
 
+#[cfg(test)]
 fn register_agent_with_reconciliation(
     state: &Arc<Mutex<AgentBusState>>,
-    mut agent: AgentBusAgent,
+    agent: AgentBusAgent,
     reconcile_registration_agent: impl FnOnce(&mut AgentBusAgent) -> anyhow::Result<()>,
     persist_registry: impl FnOnce(&AgentBusState) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    // The registration callback does not re-enter Agent Bus. Keeping the state
-    // lock across its store CAS and roster persistence prevents unregister or
-    // roster observation from entering the post-CAS/pre-visibility gap.
+    register_agent_transaction(
+        state,
+        agent,
+        |agent, commit| {
+            reconcile_registration_agent(agent)?;
+            commit(agent)?;
+            Ok(RegistrationDisposition::Committed)
+        },
+        persist_registry,
+    )?;
+    Ok(())
+}
+
+fn register_agent_transaction(
+    state: &Arc<Mutex<AgentBusState>>,
+    mut agent: AgentBusAgent,
+    reconcile_registration_agent: impl FnOnce(
+        &mut AgentBusAgent,
+        &mut RegistrationCommit<'_>,
+    ) -> anyhow::Result<RegistrationDisposition>,
+    persist_registry: impl FnOnce(&AgentBusState) -> anyhow::Result<()>,
+) -> anyhow::Result<RegistrationDisposition> {
+    // The registration callback does not re-enter Agent Bus except through the
+    // one-shot commit continuation. Keeping the state lock across its store CAS
+    // and roster persistence prevents unregister or roster observation from
+    // entering the post-CAS/pre-visibility gap. The continuation also lets a
+    // borrowed session reservation remain alive through both commits.
     #[cfg(feature = "stock-launch-test-hook")]
     crate::app_server::private_restart_phase("bus.register.lock.begin");
     let mut state = state
@@ -1695,14 +1858,27 @@ fn register_agent_with_reconciliation(
         .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
     #[cfg(feature = "stock-launch-test-hook")]
     crate::app_server::private_restart_phase("bus.register.reconcile.begin");
-    reconcile_registration_agent(&mut agent)?;
+    let mut committed = false;
+    let mut persist_registry = Some(persist_registry);
+    let mut commit = |agent: &AgentBusAgent| {
+        anyhow::ensure!(!committed, "registration roster commit called more than once");
+        state.agents.insert(agent.id.clone(), agent.clone());
+        persist_registry
+            .take()
+            .expect("registration persistence is called once")(&state)?;
+        committed = true;
+        Ok(())
+    };
+    let disposition = reconcile_registration_agent(&mut agent, &mut commit)?;
     #[cfg(feature = "stock-launch-test-hook")]
     crate::app_server::private_restart_phase("bus.register.reconcile.end");
-    state.agents.insert(agent.id.clone(), agent.clone());
-    persist_registry(&state)?;
+    anyhow::ensure!(
+        committed == (disposition == RegistrationDisposition::Committed),
+        "registration reconciliation returned an inconsistent commit disposition"
+    );
     #[cfg(feature = "stock-launch-test-hook")]
     crate::app_server::private_restart_phase("bus.register.persist.end");
-    Ok(())
+    Ok(disposition)
 }
 
 fn poll_wait_duration(path: &str) -> Duration {
@@ -1788,6 +1964,33 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
+    fn control_timing_metadata_has_only_fixed_labels() {
+        assert_eq!(control_request_path(br#"{"tool":"agent_delegate","arguments":{"text":"private request"}}"#, false), ControlPath::McpAgentDelegate);
+        assert_eq!(control_request_path(br#"{"operation":"create","spec":{"name":"private agent"}}"#, true), ControlPath::McpAgentCreate);
+        assert_eq!(control_request_path(br#"{"operation":"restart"}"#, true), ControlPath::ControlOther);
+        assert_eq!(control_request_path(br#"{"tool":"agent_list/private-id"}"#, false), ControlPath::Other);
+        assert_eq!(control_request_path(b"invalid secret", false), ControlPath::ControlOther);
+        assert_eq!(control_request_path(&vec![b'x'; 1024 * 1024 + 1], false), ControlPath::ControlOther);
+    }
+
+    #[test]
+    fn control_timing_diagnostics_are_root_only_and_process_scoped() {
+        let state = route_state();
+        let agent = crate::agent_bus::agent_auth::agent_credential("route-token", "runtime-test", "cutex.test");
+        for credential in [None, Some("wrong"), Some(agent.as_str()), Some("route-token")] {
+            let auth = credential.map(|value| format!("Authorization: Bearer {value}\r\n")).unwrap_or_default();
+            let raw = format!("GET /api/diagnostics/control HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}X-Cutex-Agent-Id: runtime-test\r\nConnection: close\r\n\r\n");
+            let response = invoke_route(raw.into_bytes(), Arc::clone(&state));
+            if credential == Some("route-token") {
+                assert!(response.starts_with(b"HTTP/1.1 200 "));
+                let body = http_json(&response);
+                assert_eq!(body["scope"], "agent_bus_process");
+                assert_eq!(body["timing"]["scope"], "process");
+            } else { assert!(!response.starts_with(b"HTTP/1.1 200 ")); }
+        }
+    }
+
+    #[test]
     fn launch_results_carry_the_approved_after_wait_note_only_when_complete() {
         let note = serde_json::json!({"decision":"approved","waitedSecs":3,"approvalId":"a",
             "detail":"The owner approved this request after 3 s; it has been carried out."});
@@ -1842,6 +2045,58 @@ mod tests {
         // A clock step backwards does not block redrives forever.
         assert!(registration_redrive_due_at(&last, true, 500));
         assert!(!registration_redrive_due_at(&last, true, 520));
+    }
+
+    #[test]
+    fn registration_try_admission_defers_during_native_cycle_and_holds_until_roster_commit() {
+        use crate::management::v2::session_coordination::{
+            OperationLane, ReservationError,
+        };
+
+        let state = Arc::new(Mutex::new(AgentBusState::default()));
+        let lane = Arc::new(OperationLane::new());
+        let native_cycle = lane.reserve().expect("reserve native cycle");
+        let started = Instant::now();
+        let disposition = register_agent_transaction(
+            &state,
+            test_agent("target"),
+            |_, _| match lane.try_lock() {
+                Err(ReservationError::WouldBlock) => Ok(RegistrationDisposition::Deferred),
+                other => panic!("busy registration must not be admitted: {other:?}"),
+            },
+            |_| panic!("deferred registration must not persist the roster"),
+        )
+        .expect("busy registration defers");
+        assert_eq!(disposition, RegistrationDisposition::Deferred);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(state.lock().expect("agent bus state").agents.is_empty());
+
+        drop(native_cycle);
+        let persist_probe = Arc::clone(&lane);
+        let disposition = register_agent_transaction(
+            &state,
+            test_agent("target"),
+            |agent, commit| {
+                let _registration = lane.try_lock().expect("admit registration retry");
+                commit(agent)?;
+                Ok(RegistrationDisposition::Committed)
+            },
+            move |_| {
+                assert_eq!(
+                    persist_probe.try_lock().expect_err("reservation spans persistence"),
+                    ReservationError::WouldBlock
+                );
+                Ok(())
+            },
+        )
+        .expect("registration retry commits");
+        assert_eq!(disposition, RegistrationDisposition::Committed);
+        assert!(state
+            .lock()
+            .expect("agent bus state")
+            .agents
+            .contains_key("target"));
+        assert!(lane.try_lock().is_ok(), "commit released the reservation");
     }
 
     #[test]
@@ -2613,18 +2868,68 @@ mod tests {
     /// Management or the Job Service lane.
     fn route_test_handlers() -> AgentBusRequestHandlers {
         AgentBusRequestHandlers {
-            reconcile_registration_agent: |agent| counted_noop_reconcile(agent),
+            reconcile_registration_agent: |agent, commit| {
+                counted_noop_reconcile(agent)?;
+                commit(agent)?;
+                Ok(RegistrationDisposition::Committed)
+            },
             reconcile_agent: counted_noop_reconcile,
             redrive_ordinary_messages: |_| Ok(0),
             send_payload_response: counted_unreachable_send,
             agent_management: counted_unreachable_agent_management,
+            managed_archive: |_, _| panic!("unexpected managed archive"),
             job_service_completion: |_, _, _| anyhow::bail!("unreachable Job Service submit"),
             job_service_completion_query: |_, _| anyhow::bail!("unreachable Job Service query"),
             management_start_acked: |_, _| {},
         }
     }
 
+    fn deferred_registration(
+        _agent: &mut AgentBusAgent,
+        _commit: &mut RegistrationCommit<'_>,
+    ) -> anyhow::Result<RegistrationDisposition> {
+        Ok(RegistrationDisposition::Deferred)
+    }
+
+    #[test]
+    fn deferred_registration_is_retryable_conflict_with_no_roster_write() {
+        let state = route_state();
+        let before = route_no_write_observer(&state);
+        let mut handlers = route_test_handlers();
+        handlers.reconcile_registration_agent = deferred_registration;
+        let body = serde_json::json!({
+            "id": "runtime-deferred",
+            "name": "runtime-deferred",
+            "sessionId": "018e0000-0000-7000-8000-0000b0009ae4",
+            "profile": "default",
+            "cwd": "/tmp",
+            "pid": 42,
+            "hostId": "host",
+            "groups": [],
+            "registrationClass": "persistent"
+        })
+        .to_string();
+        let response = invoke_route_with_handlers(
+            raw_route_request(
+                "/api/agents/register",
+                "route-token",
+                "runtime-deferred",
+                body.as_bytes(),
+            ),
+            Arc::clone(&state),
+            handlers,
+        );
+        assert!(response.starts_with(b"HTTP/1.1 409 Conflict\r\n"));
+        let value = http_json(&response);
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "registration_busy");
+        assert_route_no_write_observer(&state, &before, "deferred registration");
+    }
+
     /// In-memory bus state of a route test (no Task Service or other store).
+    mod archive_bus_http_tests { include!("archive_bus_http_tests.rs"); }
+    mod receipt_preflight_http_tests { include!("receipt_preflight_http_tests.rs"); }
+
     fn route_state() -> Arc<Mutex<AgentBusState>> {
         Arc::new(Mutex::new(AgentBusState::default()))
     }

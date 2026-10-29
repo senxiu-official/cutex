@@ -47,6 +47,29 @@ use crate::profiles::settings_api::{self, ApiKey, ProfileApiPatch, MAX_API_KEY_B
 use crate::profiles::transfer;
 
 pub const PRESETS_PATH: &str = "/v2/profile-presets";
+pub const PROFILES_CHANGED_EVENT: &str = "cutex/profiles/changed";
+
+/// A host-stream invalidation after durable style persistence. Host events
+/// already have owner-only visibility; no style, identity or credential data
+/// is copied into this event. Clients re-read the canonical Profile resource.
+pub(crate) fn publish_avatar_style_change(profile_id: &str) {
+    let result = (|| -> anyhow::Result<()> {
+        let repository = super::repository::management_v2_repository()?;
+        super::server::append_cutex_event(
+            repository,
+            super::services::HOST_EVENT_SESSION_ID,
+            super::model::EventCorrelation::default(),
+            PROFILES_CHANGED_EVENT,
+            json!({"profileId":profile_id,"fields":["avatarStyle"],
+                "updatedAt":chrono::Utc::now().to_rfc3339()}),
+        )
+    })();
+    if let Err(error) = result {
+        // Persistence succeeded. Do not report a failed save or roll it back
+        // because the refresh hint could not be appended; GET stays canonical.
+        eprintln!("profile avatar style saved, change notification unavailable: {error:#}");
+    }
+}
 
 pub fn is_list_path(path: &str) -> bool {
     path == "/v2/profiles"
@@ -93,6 +116,7 @@ pub const IMPORT_PATH: &str = "/v2/profiles/import";
 
 pub fn is_profiles_path(path: &str) -> bool {
     is_list_path(path)
+        || super::profile_variants_api::parse_path(path).is_some()
         || path == PRESETS_PATH
         || parse_item_path(path).is_some()
         || parse_duplicate_path(path).is_some()
@@ -105,15 +129,36 @@ pub fn is_profiles_path(path: &str) -> bool {
 fn with_images(mut item: Value, profile_id: &str, images: &profile_avatar::State) -> Value {
     item["avatarEtag"] = json!(images.etag(ImageKind::Avatar, profile_id));
     item["introPortraitEtag"] = json!(images.etag(ImageKind::IntroPortrait, profile_id));
+    item["appearanceRevisions"]["avatar"] = images.revision(ImageKind::Avatar, profile_id);
+    item["appearanceRevisions"]["introPortrait"] = images.revision(ImageKind::IntroPortrait, profile_id);
     item
 }
 
-fn detail_item(account: &crate::profiles::model::StoredAccount) -> Value {
-    with_images(
-        settings_api::profile_item(account, &load_codez_config(), true),
+pub(crate) fn detail_item(account: &crate::profiles::model::StoredAccount) -> Value {
+    let config = load_codez_config();
+    let mut links = super::profile_link::owner_full().then(crate::profiles::account_link::LinkContext::new);
+    let mut item = with_link(with_images(
+        settings_api::profile_item(account, &config, true),
         &account.id,
         &profile_avatar::default_snapshot(),
-    )
+    ), account, &config, true, &mut links);
+    crate::profiles::runtime_variants::augment_item(&mut item, account, &crate::profiles::runtime_variants::Usage::load());
+    item
+}
+
+fn with_link(mut item: Value, account: &crate::profiles::model::StoredAccount, config: &crate::profiles::model::CodezConfig, detail: bool, links:&mut Option<crate::profiles::account_link::LinkContext>) -> Value {
+    if super::profile_link::owner_full() {
+        if let Some(link) = links.as_mut().and_then(|context|context.profile_link(account, config)) {
+            item["link"] = link;
+        }
+        item["accountLinkState"] = json!(match account.options.account_link.as_deref() {
+            Some("none") => "disabled",
+            Some(_) => "manual",
+            None => "auto",
+        });
+        if detail { item["accountLink"] = json!(account.options.account_link); }
+    }
+    item
 }
 
 fn profile_body(account: &crate::profiles::model::StoredAccount) -> Value {
@@ -126,7 +171,7 @@ fn profile_body(account: &crate::profiles::model::StoredAccount) -> Value {
 /// An error answer not yet written (shared by `POST /v2/profiles` and the
 /// profile imports, which report it per item).
 #[derive(Debug)]
-pub(super) struct CreateFailure {
+pub(crate) struct CreateFailure {
     pub status: u16,
     pub reason: &'static str,
     pub code: &'static str,
@@ -201,9 +246,11 @@ fn lifecycle_error(stream: &mut TcpStream, profile: &str, failure: LifecycleErro
 
 /// `POST /v2/profiles`: parse, create, attach the Claude account; the 201
 /// body (`ProfileDetail` + created / kind / credentialsPresent).
-pub(super) fn create_from_body(body: &[u8]) -> Result<Value, CreateFailure> {
+pub(crate) fn create_from_body(body: &[u8]) -> Result<Value, CreateFailure> {
     let create = parse_create(body).map_err(CreateFailure::invalid)?;
     let claude_account = parse_create_claude_account(body).map_err(CreateFailure::invalid)?;
+    let options_body = object_body(body).map_err(CreateFailure::invalid)?;
+    let dsh = parse_dsh_options(options_body.get("options")).map_err(CreateFailure::invalid)?;
     if let Some(id) = &claude_account {
         match crate::runtime::claude_accounts::load() {
             Ok(registry) if registry.find(id).is_some() => {}
@@ -211,7 +258,56 @@ pub(super) fn create_from_body(body: &[u8]) -> Result<Value, CreateFailure> {
             Err(error) => return Err(CreateFailure::store(&error)),
         }
     }
+    // r265: a DSH key / credential source is applied by the DSH patch below
+    // (the key goes to the private key file, never into the store).
+    let mut create = create;
+    let dsh_key = if create.kind == NewProfileKind::Dsh { create.api_key.take() } else { None };
+    let dsh_credential = optional(&options_body, "credential", credential_choice).map_err(CreateFailure::invalid)?;
+    let dsh_key_present = dsh_key.is_some();
     let account = lifecycle::create_profile(&create).map_err(|failure| lifecycle_failure(&create.name, failure))?;
+    let account = if dsh.is_some() || dsh_key.is_some() || dsh_credential.is_some() {
+        let patch = ProfileApiPatch {
+            dsh: dsh.map(ConfigValueUpdate::Set).unwrap_or_default(),
+            api_key: dsh_key,
+            credential: dsh_credential,
+            ..Default::default()
+        };
+        match settings_api::update_profile(&account.id, &patch) {
+            Ok((account, _)) => account,
+            Err(error) => {
+                let _ = lifecycle::delete_profile(&account.id);
+                return Err(CreateFailure::invalid(format!("{error:#}")));
+            }
+        }
+    } else { account };
+    // r266: the Kimi account of a Kimi-kind profile.
+    let kimi_account = object_body(body).ok().and_then(|body| optional(&body, "kimiAccount", kimi_account_id).ok().flatten());
+    let account = match &kimi_account {
+        Some(id) if create.kind == NewProfileKind::Kimi => {
+            let patch = ProfileApiPatch { kimi_account: ConfigValueUpdate::Set(id.clone()), ..Default::default() };
+            match settings_api::update_profile(&account.id, &patch) {
+                Ok((account, _)) => account,
+                Err(error) => {
+                    let _ = lifecycle::delete_profile(&account.id);
+                    return Err(CreateFailure::invalid(format!("{error:#}")));
+                }
+            }
+        }
+        _ => account,
+    };
+    // profile-relay-runtimes: the per-interface addresses, checked against
+    // the created profile (which interfaces it stores, relay acceptance).
+    let interfaces = interface_base_urls(&options_body).map_err(CreateFailure::invalid)?;
+    let account = if interfaces.is_empty() { account } else {
+        let patch = ProfileApiPatch { interface_base_urls: interfaces, ..Default::default() };
+        match settings_api::update_profile(&account.id, &patch) {
+            Ok((account, _)) => account,
+            Err(error) => {
+                let _ = lifecycle::delete_profile(&account.id);
+                return Err(CreateFailure::invalid(format!("{error:#}")));
+            }
+        }
+    };
     let account = match &claude_account {
         None => account,
         Some(id) => {
@@ -231,7 +327,7 @@ pub(super) fn create_from_body(body: &[u8]) -> Result<Value, CreateFailure> {
     let mut body = profile_body(&account);
     body["created"] = json!(true);
     body["kind"] = json!(create.kind.as_str());
-    body["credentialsPresent"] = json!(create.api_key.is_some());
+    body["credentialsPresent"] = json!(create.api_key.is_some() || dsh_key_present);
     Ok(body)
 }
 
@@ -263,13 +359,19 @@ pub fn list_resource() -> anyhow::Result<Value> {
     let store = settings_api::load_store()?;
     let config = load_codez_config();
     let images = profile_avatar::default_snapshot();
+    let mut links = super::profile_link::owner_full().then(crate::profiles::account_link::LinkContext::new);
+    let usage = crate::profiles::runtime_variants::Usage::load();
     Ok(json!({
         "contractVersion": 2,
         "defaultProfile": config.default_profile,
         "profiles": store
             .accounts
             .iter()
-            .map(|account| with_images(settings_api::profile_item(account, &config, false), &account.id, &images))
+            .map(|account| {
+                let mut item = with_link(with_images(settings_api::profile_item(account, &config, false), &account.id, &images), account, &config, false, &mut links);
+                crate::profiles::runtime_variants::augment_item(&mut item, account, &usage);
+                item
+            })
             .collect::<Vec<_>>(),
     }))
 }
@@ -277,6 +379,9 @@ pub fn list_resource() -> anyhow::Result<Value> {
 pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: &str) -> anyhow::Result<()> {
     if super::profile_import_cc_switch::is_path(path) {
         return super::profile_import_cc_switch::handle(stream, request);
+    }
+    if let Some(route) = super::profile_variants_api::parse_path(path) {
+        return super::profile_variants_api::handle(stream, request, route);
     }
     if path == PRESETS_PATH {
         if request.method != "GET" {
@@ -356,21 +461,40 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: 
             if patch.proxy.is_some() && !super::settings_api::proxy_editable() {
                 return super::settings_api::proxy_owner_required(stream);
             }
+            // Serialize precondition, rename and settings writes with owner saves.
+            let _profile_guard = lifecycle::lock();
             let account_id = match settings_api::load_store() {
                 Ok(store) => match settings_api::find(&store, &profile) {
-                    Some(account) => account.id.clone(),
+                    Some(account) => {
+                        if settings_api::avatar_style_import_conflicts(account, &patch) {
+                            // This expected conflict must not write even a diagnostic log.
+                            return write_json_response(stream, 409, "Conflict", &json!({
+                                "contractVersion": 2,
+                                "error": {
+                                    "code": "avatar_style_already_set",
+                                    "message": "The profile avatar style has already been chosen",
+                                    "retryable": false,
+                                    "details": {
+                                        "avatarStyle": account.options.avatar_style,
+                                        "appearanceRevision": settings_api::appearance_revisions(account)["avatarStyle"],
+                                    },
+                                },
+                            }));
+                        }
+                        account.id.clone()
+                    },
                     None => return not_found(stream, &profile),
                 },
                 Err(error) => return store_unavailable(stream, &error),
             };
             let renamed = match &rename {
-                Some(name) => match lifecycle::rename_profile(&account_id, name) {
+                Some(name) => match lifecycle::rename_profile_locked(&account_id, name) {
                     Ok(outcome) => outcome.changed.then(|| (outcome.old_name, outcome.account.name)),
                     Err(failure) => return lifecycle_error(stream, &profile, failure),
                 },
                 None => None,
             };
-            match settings_api::update_profile(&account_id, &patch) {
+            match settings_api::update_profile_locked(&account_id, &patch) {
                 Ok((account, changed)) => {
                     let item = detail_item(&account);
                     write_json_response(
@@ -389,7 +513,7 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, path: 
                 Err(error) => {
                     // Keep PATCH all-or-nothing: undo the rename.
                     if let Some((from, _)) = &renamed {
-                        if let Err(revert) = lifecycle::rename_profile(&account_id, from) {
+                        if let Err(revert) = lifecycle::rename_profile_locked(&account_id, from) {
                             eprintln!("profile PATCH: could not revert rename of {account_id} to {from}: {revert}");
                         }
                     }
@@ -698,7 +822,7 @@ pub(super) fn parse_import_body(body: &[u8]) -> Result<(Value, String), String> 
     Ok((bundle, name))
 }
 
-const CREATE_FIELDS: &[&str] =&["name", "kind", "preset", "baseUrl", "model", "apiKey", "claudeAccount"];
+const CREATE_FIELDS: &[&str] =&["name", "kind", "preset", "baseUrl", "model", "apiKey", "claudeAccount", "options", "credential", "kimiAccount", "interfaceBaseUrls"];
 
 fn object_body(body: &[u8]) -> Result<Map<String, Value>, String> {
     let value: Value =
@@ -734,7 +858,7 @@ fn api_key_value(value: &Value) -> Result<ApiKey, String> {
 /// `POST /v2/profiles` body. `kind` defaults to `apiKey` (with `preset`
 /// defaulting to `custom`), so the legacy `{name}` body creates an empty
 /// custom API-key profile to fill in afterwards.
-pub(super) fn parse_create(body: &[u8]) -> Result<NewProfile, String> {
+pub(crate) fn parse_create(body: &[u8]) -> Result<NewProfile, String> {
     let body = object_body(body)?;
     if let Some(unknown) = body.keys().find(|key| !CREATE_FIELDS.contains(&key.as_str())) {
         return Err(format!("unsupported field: {unknown}"));
@@ -749,7 +873,7 @@ pub(super) fn parse_create(body: &[u8]) -> Result<NewProfile, String> {
         value
             .as_str()
             .and_then(NewProfileKind::parse)
-            .ok_or_else(|| "must be one of chatgpt, claude, apiKey".to_string())
+            .ok_or_else(|| "must be one of chatgpt, claude, dsh, apiKey, kimi".to_string())
     })?
     .unwrap_or(NewProfileKind::ApiKey);
     let preset = optional(&body, "preset", |value| {
@@ -768,16 +892,51 @@ pub(super) fn parse_create(body: &[u8]) -> Result<NewProfile, String> {
     let base_url = optional(&body, "baseUrl", http_url)?;
     let model = optional(&body, "model", visible_string(200))?;
     let api_key = optional(&body, "apiKey", api_key_value)?;
-    if kind != NewProfileKind::ApiKey && (preset.is_some() || base_url.is_some() || api_key.is_some()) {
+    if kind != NewProfileKind::ApiKey && (preset.is_some() || base_url.is_some() || (api_key.is_some() && kind != NewProfileKind::Dsh)) {
         return Err(format!(
-            "preset, baseUrl and apiKey are only valid for kind \"apiKey\" (got \"{}\")",
+            "preset, baseUrl and apiKey are only valid for kind \"apiKey\" (apiKey also for \"dsh\"; got \"{}\")",
             kind.as_str()
         ));
+    }
+    let credential = optional(&body, "credential", credential_choice)?;
+    if kind != NewProfileKind::Dsh && credential.is_some() {
+        return Err("credential applies to DSH profiles only".into());
+    }
+    if api_key.is_some() && matches!(credential, Some(crate::profiles::runtime_variants::CredentialChoice::Env(_))) {
+        return Err("apiKey cannot be stored with credential source env".into());
+    }
+    if kind != NewProfileKind::Kimi && body.get("kimiAccount").is_some_and(|value| !value.is_null()) {
+        return Err(format!("kimiAccount is only valid for kind \"kimi\" (got \"{}\")", kind.as_str()));
+    }
+    if kind == NewProfileKind::Kimi {
+        optional(&body, "kimiAccount", kimi_account_id)?;
+        if let Some(model) = &model {
+            crate::profiles::kimi::validate_model(model).map_err(|error| format!("model: {error}"))?;
+        }
     }
     if kind != NewProfileKind::Claude && body.get("claudeAccount").is_some_and(|value| !value.is_null()) {
         return Err(format!("claudeAccount is only valid for kind \"claude\" (got \"{}\")", kind.as_str()));
     }
+    let dsh = parse_dsh_options(body.get("options"))?;
+    if kind != NewProfileKind::Dsh && dsh.is_some() {
+        return Err("options.dsh applies to DSH profiles only".into());
+    }
+    if !interface_base_urls(&body)?.is_empty() && !matches!(kind, NewProfileKind::ApiKey | NewProfileKind::Dsh) {
+        return Err(format!("interfaceBaseUrls is only valid for kind \"apiKey\" or \"dsh\" (got \"{}\")", kind.as_str()));
+    }
     Ok(NewProfile { name, kind, preset, base_url, model, api_key })
+}
+
+fn parse_dsh_options(value: Option<&Value>) -> Result<Option<crate::profiles::dsh::DshOptions>, String> {
+    let Some(value) = value else { return Ok(None); };
+    let options = value.as_object().ok_or("options must be an object")?;
+    if options.keys().any(|key| key != "dsh") { return Err("unsupported options field".into()); }
+    options.get("dsh").map(|value| {
+        let options: crate::profiles::dsh::DshOptions = serde_json::from_value(value.clone())
+            .map_err(|error| format!("options.dsh: {error}"))?;
+        options.validate().map_err(|error| format!("options.dsh: {error}"))?;
+        Ok(options)
+    }).transpose()
 }
 
 /// `claudeAccount` of a `POST /v2/profiles` body (kind `claude`; checked by
@@ -840,6 +999,7 @@ fn method_not_allowed(stream: &mut TcpStream, message: &str) -> anyhow::Result<(
 }
 
 const PATCH_FIELDS: &[&str] = &[
+    "options",
     // Rename (handled by `parse_name_field` + `lifecycle::rename_profile`).
     "name",
     "model",
@@ -850,6 +1010,7 @@ const PATCH_FIELDS: &[&str] = &[
     "updatePlanEnabled",
     "webSearch",
     "toolSchemaCompat",
+    "imageHistoryTrim",
     "modelContextWindow",
     "modelAutoCompactTokenLimit",
     "providerName",
@@ -866,7 +1027,10 @@ const PATCH_FIELDS: &[&str] = &[
     "color",
     "providerCategory",
     "avatarThemes",
+    "avatarStyle",
+    "avatarStyleImportIfUnset",
     "introGreeting",
+    "accountLink",
     "allowSessionSwitch",
     "nativeSubagents",
     "delegationWait",
@@ -874,9 +1038,12 @@ const PATCH_FIELDS: &[&str] = &[
     "proxy",
     "searchTool",
     "privateChatgptAuthFile",
+    "autoPick",
     "agentUseRequiresApproval",
     "agentTurnQuestions",
     "claudeFileCheckpointing",
+    "claudeCompaction",
+    "claudeCompactionModels",
     "claudeSettingSources",
     "claudeAiConnectors",
     "claudeAllowWrite",
@@ -884,10 +1051,65 @@ const PATCH_FIELDS: &[&str] = &[
     "planLabel",
     "claudeAccount",
     "modelDisplayNames",
+    "interfaceBaseUrls",
     "apiKey",
+    // r265 profile-runtime-variants.
+    "credential",
+    "defaultVariant",
+    // r266 kimi-runtime-profiles.
+    "kimiAccount",
 ];
 
 /// Tri-state read: absent = Unchanged, `null` = Clear, value = Set.
+/// `claudeCompaction: {window: 100000..1000000, percent: 1..100}`.
+fn claude_compaction(value: &Value) -> Result<crate::profiles::claude_compaction::ClaudeCompaction, String> {
+    let object = value.as_object().ok_or("must be {window, percent} or null")?;
+    if let Some(unknown) = object.keys().find(|key| !matches!(key.as_str(), "window" | "percent")) {
+        return Err(format!("unknown field {unknown}"));
+    }
+    let number = |key: &str| object.get(key).and_then(Value::as_u64).ok_or(format!("{key} must be a whole number"));
+    let window = number("window")?;
+    let percent = number("percent")?;
+    let parsed = crate::profiles::claude_compaction::ClaudeCompaction {
+        auto_compact_window: u32::try_from(window).map_err(|_| "window must be 100000..1000000".to_string())?,
+        auto_compact_percent: u8::try_from(percent).map_err(|_| "percent must be 1..100".to_string())?,
+    };
+    if !crate::profiles::claude_compaction::WINDOW_RANGE.contains(&parsed.auto_compact_window) {
+        return Err("window must be 100000..1000000".into());
+    }
+    if !crate::profiles::claude_compaction::PERCENT_RANGE.contains(&parsed.auto_compact_percent) {
+        return Err("percent must be 1..100".into());
+    }
+    Ok(parsed)
+}
+
+/// `claudeCompactionModels: {"<model id>": {window, percent}}` (`{}` = none).
+fn claude_compaction_models(value: &Value) -> Result<crate::profiles::claude_compaction::ModelTable, String> {
+    use crate::profiles::claude_compaction::{valid_model_id, MAX_MODELS};
+    let object = value.as_object().ok_or("must be {\"<model id>\": {window, percent}} or null")?;
+    if object.len() > MAX_MODELS {
+        return Err(format!("at most {MAX_MODELS} models"));
+    }
+    object.iter().map(|(model, entry)| {
+        if !valid_model_id(model) {
+            return Err(format!("invalid model ID {model:?}"));
+        }
+        claude_compaction(entry).map(|parsed| (model.clone(), parsed)).map_err(|message| format!("{model}: {message}"))
+    }).collect()
+}
+
+/// `imageHistoryTrim: {maxInline: (keep+1)..500, keep: 1..50}`.
+fn image_history_trim(value: &Value) -> Result<crate::profiles::codex_profile::ImageHistoryTrim, String> {
+    let object = value.as_object().ok_or("must be {maxInline, keep} or null")?;
+    if let Some(unknown) = object.keys().find(|key| !matches!(key.as_str(), "maxInline" | "keep")) {
+        return Err(format!("unknown field {unknown}"));
+    }
+    let number = |key: &str| object.get(key).and_then(Value::as_u64).ok_or(format!("{key} must be a whole number"));
+    let parsed = crate::profiles::codex_profile::ImageHistoryTrim { max_inline: number("maxInline")?, keep: number("keep")? };
+    parsed.validate()?;
+    Ok(parsed)
+}
+
 pub(super) fn tri_state<T>(
     body: &Map<String, Value>,
     key: &str,
@@ -973,6 +1195,13 @@ fn agent_turn_questions(value: &Value) -> Result<AgentTurnQuestions, String> {
 }
 
 /// `default` or an added account id (existence is checked on apply).
+fn kimi_account_id(value: &Value) -> Result<String, String> {
+    let text = value.as_str().ok_or("must be a Kimi account id (ka-…) or null")?.trim();
+    crate::profiles::kimi_accounts::validate_id(text)
+        .map(|()| text.to_string())
+        .map_err(|_| "must be a Kimi account id (ka-…) or null".to_string())
+}
+
 fn claude_account_id(value: &Value) -> Result<String, String> {
     let text = value.as_str().ok_or("must be a Claude account id, \"default\" or null")?.trim();
     if text == crate::runtime::claude_accounts::DEFAULT_ACCOUNT_ID {
@@ -1009,6 +1238,36 @@ fn model_display_names(
                 _ => return Err(format!("modelDisplayNames[{id}]: must be a string or null")),
             };
             Ok((id.clone(), name))
+        })
+        .collect()
+}
+
+/// profile-relay-runtimes: `interfaceBaseUrls {kind: url | null}`; which
+/// kinds a profile stores is checked when the patch is applied.
+fn interface_base_urls(
+    body: &Map<String, Value>,
+) -> Result<std::collections::BTreeMap<String, Option<String>>, String> {
+    use crate::profiles::interface_urls::{normalize_base_url, InterfaceKind};
+    let Some(value) = body.get("interfaceBaseUrls") else {
+        return Ok(Default::default());
+    };
+    let object = value
+        .as_object()
+        .ok_or("interfaceBaseUrls: must be an object {interfaceKind: url | null}")?;
+    object
+        .iter()
+        .map(|(kind, url)| {
+            if !InterfaceKind::parse(kind).is_some_and(InterfaceKind::has_address) {
+                return Err(format!("interfaceBaseUrls: unknown interface kind {kind:?}"));
+            }
+            let url = match url {
+                Value::Null => None,
+                Value::String(text) => Some(
+                    normalize_base_url(text).map_err(|message| format!("interfaceBaseUrls.{kind}: {message}"))?,
+                ),
+                _ => return Err(format!("interfaceBaseUrls.{kind}: must be a string or null")),
+            };
+            Ok((kind.clone(), url))
         })
         .collect()
 }
@@ -1090,7 +1349,7 @@ fn color(value: &Value) -> Result<String, String> {
         .ok_or_else(|| "must be #RRGGBB or null".to_string())
 }
 
-pub(super) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
+pub(crate) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
     let value: Value =
         serde_json::from_slice(body).map_err(|error| format!("JSON object body required: {error}"))?;
     let body = value.as_object().ok_or("JSON object body required")?;
@@ -1111,9 +1370,35 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
             }
             Some(ApiKey(key.to_string()))
         }
-        Some(_) => return Err("apiKey: must be a string (clearing is not supported)".into()),
+        // r265: DSH stored keys only (checked by the update).
+        Some(Value::Null) => None,
+        Some(_) => return Err("apiKey: must be a string or null".into()),
     };
+    let api_key_clear = body.get("apiKey") == Some(&Value::Null);
+    let credential = optional(body, "credential", credential_choice)?;
+    let default_variant = tri_state(body, "defaultVariant", variant_id_value)?;
+    let avatar_style_import_if_unset = match body.get("avatarStyleImportIfUnset") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err("avatarStyleImportIfUnset: must be a boolean".into()),
+    };
+    if avatar_style_import_if_unset && !body.contains_key("avatarStyle") {
+        return Err("avatarStyleImportIfUnset: avatarStyle is required".into());
+    }
     Ok(ProfileApiPatch {
+        dsh: match body.get("options") {
+            None => ConfigValueUpdate::Unchanged,
+            Some(value) => {
+                let object = value.as_object().ok_or("options must be an object")?;
+                if object.get("dsh") == Some(&Value::Null) {
+                    if object.len() != 1 { return Err("unsupported options field".into()); }
+                    ConfigValueUpdate::Clear
+                } else {
+                    parse_dsh_options(Some(value))?.map(ConfigValueUpdate::Set).unwrap_or_default()
+                }
+            }
+        },
+        avatar_style_import_if_unset,
         codex_config: CodexProfileConfigPatch {
             model: tri_state(body, "model", visible_string(200))?,
             model_provider: tri_state(body, "modelProvider", token(64, "_.-"))?,
@@ -1138,6 +1423,7 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
             update_plan_enabled: tri_state(body, "updatePlanEnabled", boolean)?,
             web_search: tri_state(body, "webSearch", one_of(WEB_SEARCH_VALUES))?,
             tool_schema_compat: tri_state(body, "toolSchemaCompat", one_of(TOOL_SCHEMA_COMPAT_VALUES))?,
+            image_history_trim: tri_state(body, "imageHistoryTrim", image_history_trim)?,
             supports_websockets: tri_state(body, "supportsWebsockets", boolean)?,
             provider_instructions_field: tri_state(body, "providerInstructionsField", boolean)?,
             ..CodexProfileConfigPatch::default()
@@ -1145,7 +1431,12 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
         color: tri_state(body, "color", color)?,
         provider_category: tri_state(body, "providerCategory", provider_category)?,
         avatar_themes: tri_state(body, "avatarThemes", avatar_themes)?,
+        avatar_style: tri_state(body, "avatarStyle", crate::profiles::avatar::parse_avatar_style)?,
         intro_greeting: tri_state(body, "introGreeting", intro_greeting)?,
+        account_link: tri_state(body, "accountLink", |value| {
+            crate::profiles::account_link::validate_manual(value.as_str().ok_or("must be a string or null")?)
+                .map_err(|_| "must be none or m- followed by a base64url 16-byte group id".to_string())
+        })?,
         allow_session_switch: tri_state(body, "allowSessionSwitch", boolean)?,
         native_subagents: tri_state(body, "nativeSubagents", boolean)?,
         delegation_wait: tri_state(body, "delegationWait", boolean)?,
@@ -1170,6 +1461,11 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
             Some(Value::Bool(value)) => Some(*value),
             Some(_) => return Err("privateChatgptAuthFile: must be a boolean".into()),
         },
+        auto_pick: match body.get("autoPick") {
+            None => None,
+            Some(Value::Bool(value)) => Some(*value),
+            Some(_) => return Err("autoPick: must be a boolean".into()),
+        },
         agent_use_requires_approval: match body.get("agentUseRequiresApproval") {
             None => None,
             Some(Value::Bool(value)) => Some(*value),
@@ -1177,6 +1473,8 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
         },
         agent_turn_questions: tri_state(body, "agentTurnQuestions", agent_turn_questions)?,
         claude_file_checkpointing: tri_state(body, "claudeFileCheckpointing", boolean)?,
+        claude_compaction: tri_state(body, "claudeCompaction", claude_compaction)?,
+        claude_compaction_models: tri_state(body, "claudeCompactionModels", claude_compaction_models)?,
         claude_setting_sources: tri_state(body, "claudeSettingSources", setting_sources)?,
         claude_ai_connectors: match body.get("claudeAiConnectors") {
             None => None,
@@ -1187,13 +1485,206 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
         claude_allow_exec: tri_state(body, "claudeAllowExec", boolean)?,
         plan_label: tri_state(body, "planLabel", plan_label)?,
         claude_account: tri_state(body, "claudeAccount", claude_account_id)?,
+        kimi_account: tri_state(body, "kimiAccount", kimi_account_id)?,
         model_display_names: model_display_names(body)?,
+        interface_base_urls: interface_base_urls(body)?,
         api_key,
+        api_key_clear,
+        credential,
+        default_variant,
     })
+}
+
+/// r265 `credential {source: stored|env, envName?}` (DSH profiles).
+fn credential_choice(value: &Value) -> Result<crate::profiles::runtime_variants::CredentialChoice, String> {
+    use crate::profiles::runtime_variants::CredentialChoice;
+    let object = value.as_object().ok_or("must be an object")?;
+    if let Some(unknown) = object.keys().find(|key| !["source", "envName"].contains(&key.as_str())) {
+        return Err(format!("unsupported field: {unknown}"));
+    }
+    match (object.get("source").and_then(Value::as_str), object.get("envName")) {
+        (Some("stored"), None | Some(Value::Null)) => Ok(CredentialChoice::Stored),
+        (Some("env"), Some(Value::String(name))) => {
+            crate::profiles::stored_keys::validate_env_source_name(name).map_err(|error| format!("envName: {error:#}"))?;
+            Ok(CredentialChoice::Env(name.clone()))
+        }
+        (Some("env"), _) => Err("envName: required string for source env (no implicit default)".into()),
+        (Some("stored"), _) => Err("envName applies to source env only".into()),
+        _ => Err("source must be stored or env".into()),
+    }
+}
+
+fn variant_id_value(value: &Value) -> Result<String, String> {
+    let id = value.as_str().ok_or("must be a string")?;
+    crate::profiles::runtime_variants::validate_variant_id(id).map_err(|error| error.to_string())?;
+    Ok(id.to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dsh_profile_create_patch_roundtrip_and_boundaries() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let created = create_from_body(br#"{"name":"DSH test","kind":"dsh","options":{"dsh":{"reasoningEffort":"max","apiKeyEnv":"DSH_TEST_KEY"}}}"#).unwrap();
+        assert_eq!(created["contractVersion"], 2);
+        assert_eq!(created["created"], true);
+        assert_eq!(created["kind"], "dsh");
+        assert_eq!(created["credentialsPresent"], false);
+        let profile = &created["profile"];
+        assert_eq!(profile["cliKind"], "dsh");
+        assert_eq!(profile["model"], crate::profiles::dsh::DEFAULT_MODEL);
+        assert_eq!(profile["options"]["dsh"]["apiKeyEnv"], "DSH_TEST_KEY");
+        assert_eq!(profile["modelReasoningEffort"], "max");
+        let id = profile["id"].as_str().unwrap();
+        let patch = parse_patch(br#"{"options":{"dsh":{"model":"deepseek-custom","reasoningEffort":"off"}}}"#).unwrap();
+        let (account, changed) = settings_api::update_profile(id, &patch).unwrap();
+        assert!(changed);
+        assert_eq!(account.cli_kind, crate::profiles::model::CliKind::Dsh);
+        assert_eq!(account.options.dsh.model, "deepseek-custom");
+        let files = crate::profiles::materialize::materialized_account_files(&account).unwrap();
+        assert!(!files.auth_path.exists());
+        assert!(!files.config_path.exists());
+        let models = crate::profiles::catalog_api::models_resource(&account).unwrap();
+        assert_eq!(models["modelsSource"]["kind"], "dsh", "DSH models resource: {models}");
+        assert_eq!(models["models"][0]["supportedReasoningEfforts"], json!(["off","low","high","max"]));
+        assert_eq!(models["selectedModel"], "deepseek-custom");
+        for body in [
+            br#"{"privateChatgptAuthFile":false}"#.as_slice(),
+            br#"{"claudeAccount":"default"}"#,
+            br#"{"claudeAllowWrite":true}"#,
+            br#"{"claudeAiConnectors":false}"#,
+            br#"{"providerEnvKey":"OTHER_KEY"}"#,
+        ] {
+            let patch = parse_patch(body).unwrap();
+            assert!(settings_api::update_profile(id, &patch).is_err());
+        }
+        let copy = lifecycle::duplicate_profile(id, "DSH copy").unwrap();
+        assert_eq!(copy.cli_kind, crate::profiles::model::CliKind::Dsh);
+        assert_eq!(copy.options.dsh, account.options.dsh);
+        let exported = crate::profiles::transfer::export_profile(id, false).unwrap();
+        assert!(!exported.credentials_included);
+        let imported = crate::profiles::transfer::import_profile(&exported.bundle, "DSH imported").unwrap();
+        assert_eq!(imported.account.cli_kind, crate::profiles::model::CliKind::Dsh);
+        assert_eq!(imported.account.options.dsh, account.options.dsh);
+        let renamed = lifecycle::rename_profile(&copy.id, "DSH renamed").unwrap();
+        assert_eq!(renamed.account.cli_kind, crate::profiles::model::CliKind::Dsh);
+        lifecycle::delete_profile(&copy.id).unwrap();
+
+        let wire = serde_json::to_value(&account).unwrap();
+        assert_eq!(wire["cli_kind"], "dsh");
+        let decoded: crate::profiles::model::StoredAccount = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.cli_kind, crate::profiles::model::CliKind::Dsh);
+    }
+
+    #[test]
+    fn interface_base_urls_create_patch_and_views() {
+        use crate::profiles::interface_urls::{BASE_URL_MISSING, DEEPSEEK_ANTHROPIC_BASE_URL};
+        // Body checks: known address-bearing kinds, plain http(s) URLs,
+        // only for apiKey / dsh creates.
+        assert!(parse_patch(br#"{}"#).unwrap().interface_base_urls.is_empty());
+        let patch = parse_patch(br#"{"interfaceBaseUrls":{"deepseekNative":" https://relay.example/anthropic ","kimiNative":null}}"#).unwrap();
+        assert_eq!(patch.interface_base_urls.get("deepseekNative"), Some(&Some("https://relay.example/anthropic".into())));
+        assert_eq!(patch.interface_base_urls.get("kimiNative"), Some(&None));
+        for body in [
+            r#"{"interfaceBaseUrls":[]}"#,
+            r#"{"interfaceBaseUrls":{"chatgptLogin":null}}"#,
+            r#"{"interfaceBaseUrls":{"deepseekAnthropic":null}}"#,
+            r#"{"interfaceBaseUrls":{"deepseekNative":1}}"#,
+            r#"{"interfaceBaseUrls":{"deepseekNative":"https://k:s@relay.example"}}"#,
+        ] {
+            assert!(parse_patch(body.as_bytes()).is_err(), "{body}");
+        }
+        for kind in ["chatgpt", "claude"] {
+            let body = json!({"name":"x","kind":kind,"interfaceBaseUrls":{"deepseekNative":DEEPSEEK_ANTHROPIC_BASE_URL}});
+            assert!(parse_create(&serde_json::to_vec(&body).unwrap()).is_err(), "{kind}");
+        }
+
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let (status, presets) = call("GET", PRESETS_PATH, "", false);
+        assert_eq!(status, 200);
+        let deepseek = presets["presets"].as_array().unwrap().iter().find(|row| row["id"] == "deepseek").unwrap();
+        assert_eq!(deepseek["providerInterfaces"][1]["baseUrlDefault"], DEEPSEEK_ANTHROPIC_BASE_URL);
+
+        // A relay DSH address is accepted at create (DSH reads it: B4).
+        let relay = json!({"name":"ds relay addr","kind":"apiKey","preset":"deepseek","baseUrl":"https://relay.example/v1",
+            "interfaceBaseUrls":{"deepseekNative":"https://relay.example/anthropic"}});
+        let (status, created) = call("POST", "/v2/profiles", &relay.to_string(), false);
+        assert_eq!(status, 201, "{created}");
+        let interfaces = &created["profile"]["providerInterfaces"];
+        assert_eq!(interfaces[1]["baseUrl"], "https://relay.example/anthropic");
+        assert_eq!((interfaces[1]["official"].clone(), interfaces[1]["relayAccepted"].clone()), (json!(false), json!(true)));
+        // ... and on a DSH-kind profile.
+        let (status, dsh) = call("POST", "/v2/profiles",
+            r#"{"name":"dsh relay","kind":"dsh","interfaceBaseUrls":{"deepseekNative":"http://127.0.0.1:9/anthropic"}}"#, false);
+        assert_eq!(status, 201, "{dsh}");
+        assert_eq!(dsh["profile"]["providerInterfaces"][0]["baseUrl"], "http://127.0.0.1:9/anthropic");
+        for name in ["ds relay addr", "dsh relay"] {
+            let (status, _) = call("DELETE", &format!("/v2/profiles/{}", name.replace(' ', "%20")), "", false);
+            assert!(status == 200 || status == 204, "{name}: {status}");
+        }
+
+        let (status, created) = call("POST", "/v2/profiles", r#"{"name":"ds relay","kind":"apiKey","preset":"deepseek","baseUrl":"https://relay.example/v1"}"#, false);
+        assert_eq!(status, 201, "{created}");
+        let interfaces = &created["profile"]["providerInterfaces"];
+        assert_eq!(interfaces[0]["official"], false);
+        assert_eq!(interfaces[1]["kind"], "deepseekNative");
+        assert_eq!(interfaces[1]["baseUrl"], Value::Null);
+        let id = created["profile"]["id"].as_str().unwrap().to_string();
+        let path = format!("/v2/profiles/{id}");
+        // Variants API (B5): adding DSH without its address is refused; with
+        // `baseUrl` it is stored as the profile's deepseekNative address.
+        let (status, refused) = call("POST", &format!("{path}/variants"), r#"{"runtime":"dsh"}"#, false);
+        assert_eq!(status, 409, "{refused}");
+        assert!(refused.to_string().contains(BASE_URL_MISSING), "{refused}");
+        let (status, added) = call("POST", &format!("{path}/variants"), r#"{"runtime":"dsh","baseUrl":"https://relay.example/anthropic"}"#, false);
+        assert_eq!(status, 201, "{added}");
+        assert_eq!(added["profile"]["providerInterfaces"][1]["baseUrl"], "https://relay.example/anthropic");
+        let (status, patched) = call("PATCH", &format!("{path}/variants/dsh"), r#"{"baseUrl":"https://relay2.example/anthropic"}"#, false);
+        assert_eq!(status, 200, "{patched}");
+        assert_eq!(patched["profile"]["providerInterfaces"][1]["baseUrl"], "https://relay2.example/anthropic");
+        let (status, refused) = call("PATCH", &format!("{path}/variants/codex"), r#"{"baseUrl":"https://relay2.example/anthropic"}"#, false);
+        assert_eq!(status, 400, "the cute-codex address is providerBaseUrl: {refused}");
+        let (status, _) = call("PATCH", &format!("{path}/variants/dsh"), r#"{"baseUrl":"ftp://x"}"#, false);
+        assert_eq!(status, 400);
+        let (status, _) = call("DELETE", &format!("{path}/variants/dsh"), "", false);
+        assert_eq!(status, 200);
+        let (status, patched) = call("PATCH", &path, r#"{"interfaceBaseUrls":{"deepseekNative":"https://relay.example/anthropic"}}"#, false);
+        assert_eq!(status, 200, "{patched}");
+        assert_eq!(patched["profile"]["providerInterfaces"][1]["official"], false);
+        let (status, patched) = call("PATCH", &path, &json!({"interfaceBaseUrls":{"deepseekNative":DEEPSEEK_ANTHROPIC_BASE_URL}}).to_string(), false);
+        assert_eq!(status, 200, "{patched}");
+        assert_eq!(patched["changed"], true);
+        assert_eq!(patched["profile"]["providerInterfaces"][1]["baseUrl"], DEEPSEEK_ANTHROPIC_BASE_URL);
+        assert_eq!(patched["profile"]["providerInterfaces"][1]["official"], true);
+        // The main address back to official keeps the stored DSH address.
+        let (status, patched) = call("PATCH", &path, r#"{"providerBaseUrl":"https://api.deepseek.com/"}"#, false);
+        assert_eq!(status, 200, "{patched}");
+        assert_eq!(patched["profile"]["providerInterfaces"][0]["official"], true);
+        let (_, patched) = call("PATCH", &path, r#"{"interfaceBaseUrls":{"deepseekNative":null}}"#, false);
+        assert_eq!(patched["profile"]["providerInterfaces"][1]["baseUrl"], DEEPSEEK_ANTHROPIC_BASE_URL);
+        assert!(settings_api::load_store().unwrap().accounts.iter().all(|account| account.interface_base_urls.is_empty()));
+
+        // Profiles without a stored interface refuse the field.
+        let (_, gpt) = call("POST", "/v2/profiles", r#"{"name":"gpt","kind":"chatgpt"}"#, false);
+        let (status, _) = call("PATCH", &format!("/v2/profiles/{}", gpt["profile"]["id"].as_str().unwrap()),
+            &json!({"interfaceBaseUrls":{"deepseekNative":DEEPSEEK_ANTHROPIC_BASE_URL}}).to_string(), false);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn dsh_profile_create_rejects_foreign_options_and_secrets() {
+        assert_eq!(parse_create(br#"{"name":"d","kind":"dsh"}"#).unwrap().kind, NewProfileKind::Dsh);
+        for body in [
+            // r265: a top-level apiKey is the write-only stored key (accepted);
+            // keys inside options stay refused.
+            json!({"name":"d","kind":"dsh","claudeAccount":"default"}),
+            json!({"name":"d","kind":"dsh","options":{"dsh":{"apiKey":"never"}}}),
+            json!({"name":"d","kind":"dsh","options":{"dsh":{"reasoningEffort":"medium"}}}),
+            json!({"name":"d","kind":"dsh","options":{"dsh":{"apiKeyEnv":"sk-not-env"}}}),
+            json!({"name":"d","kind":"claude","options":{"dsh":{}}}),
+        ] { assert!(parse_create(&serde_json::to_vec(&body).unwrap()).is_err(), "{body}"); }
+    }
+
     use super::*;
 
     #[test]
@@ -1364,7 +1855,8 @@ mod tests {
             r#"{"forcedLoginMethod":"oauth"}"#,
             r#"{"color":"red"}"#,
             r#"{"modelProvider":"bad provider"}"#,
-            r#"{"apiKey":null}"#,
+            // r265: `apiKey: null` parses (DSH stored-key clear; refused by the update elsewhere).
+            r#"{"apiKey":1}"#,
             r#"{"apiKey":"has space"}"#,
             r#"{"allowSessionSwitch":"yes"}"#,
             r#"{"modelReasoningSummary":"verbose"}"#,
@@ -1450,6 +1942,42 @@ mod tests {
     }
 
     #[test]
+    fn image_history_trim_patch() {
+        use crate::profiles::codex_profile::ImageHistoryTrim;
+        assert_eq!(parse_patch(br#"{}"#).unwrap().codex_config.image_history_trim, ConfigValueUpdate::Unchanged);
+        assert_eq!(
+            parse_patch(br#"{"imageHistoryTrim":null}"#).unwrap().codex_config.image_history_trim,
+            ConfigValueUpdate::Clear
+        );
+        for (max_inline, keep) in [(12, 4), (2, 1), (500, 50), (51, 50)] {
+            let body = format!(r#"{{"imageHistoryTrim":{{"maxInline":{max_inline},"keep":{keep}}}}}"#);
+            assert_eq!(
+                parse_patch(body.as_bytes()).unwrap().codex_config.image_history_trim,
+                ConfigValueUpdate::Set(ImageHistoryTrim { max_inline, keep })
+            );
+        }
+        for bad in [
+            r#"{"imageHistoryTrim":{"maxInline":12,"keep":0}}"#,
+            r#"{"imageHistoryTrim":{"maxInline":100,"keep":51}}"#,
+            r#"{"imageHistoryTrim":{"maxInline":4,"keep":4}}"#,
+            r#"{"imageHistoryTrim":{"maxInline":3,"keep":4}}"#,
+            r#"{"imageHistoryTrim":{"maxInline":501,"keep":4}}"#,
+            r#"{"imageHistoryTrim":{"maxInline":12}}"#,
+            r#"{"imageHistoryTrim":{"keep":4}}"#,
+            r#"{"imageHistoryTrim":{"maxInline":12.5,"keep":4}}"#,
+            r#"{"imageHistoryTrim":{"maxInline":-12,"keep":4}}"#,
+            r#"{"imageHistoryTrim":{"maxInline":"12","keep":4}}"#,
+            r#"{"imageHistoryTrim":{"maxInline":12,"keep":4,"extra":1}}"#,
+            r#"{"imageHistoryTrim":12}"#,
+            r#"{"imageHistoryTrim":true}"#,
+            r#"{"imageHistoryTrim":[12,4]}"#,
+        ] {
+            let error = parse_patch(bad.as_bytes()).unwrap_err();
+            assert!(error.starts_with("imageHistoryTrim: "), "{bad}: {error}");
+        }
+    }
+
+    #[test]
     fn update_plan_enabled_patch() {
         for value in [true, false] {
             let body = format!(r#"{{"updatePlanEnabled":{value}}}"#);
@@ -1471,6 +1999,52 @@ mod tests {
         ] {
             let error = parse_patch(bad.as_bytes()).unwrap_err();
             assert!(error.starts_with("updatePlanEnabled: "), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn claude_compaction_models_patch() {
+        use crate::profiles::claude_compaction::ClaudeCompaction;
+        assert_eq!(parse_patch(br#"{}"#).unwrap().claude_compaction_models, ConfigValueUpdate::Unchanged);
+        assert_eq!(parse_patch(br#"{"claudeCompactionModels":null}"#).unwrap().claude_compaction_models, ConfigValueUpdate::Clear);
+        assert_eq!(
+            parse_patch(br#"{"claudeCompactionModels":{"claude-sonnet-5-5":{"window":233000,"percent":100}}}"#).unwrap().claude_compaction_models,
+            ConfigValueUpdate::Set([("claude-sonnet-5-5".to_string(), ClaudeCompaction { auto_compact_window: 233_000, auto_compact_percent: 100 })].into())
+        );
+        assert_eq!(parse_patch(br#"{"claudeCompactionModels":{}}"#).unwrap().claude_compaction_models, ConfigValueUpdate::Set(Default::default()));
+        for bad in [
+            r#"{"claudeCompactionModels":{"claude-sonnet-5-5":{"window":99999,"percent":100}}}"#,
+            r#"{"claudeCompactionModels":{"has space":{"window":233000,"percent":100}}}"#,
+            r#"{"claudeCompactionModels":{"":{"window":233000,"percent":100}}}"#,
+            r#"{"claudeCompactionModels":{"m":{"window":233000}}}"#,
+            r#"{"claudeCompactionModels":[]}"#,
+        ] {
+            assert!(parse_patch(bad.as_bytes()).is_err(), "{bad}");
+        }
+        let many: serde_json::Map<String, Value> = (0..33).map(|i| (format!("m{i}"), json!({"window":233000,"percent":100}))).collect();
+        assert!(parse_patch(json!({"claudeCompactionModels": many}).to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn claude_compaction_patch() {
+        use crate::profiles::claude_compaction::ClaudeCompaction;
+        assert_eq!(parse_patch(br#"{}"#).unwrap().claude_compaction, ConfigValueUpdate::Unchanged);
+        assert_eq!(parse_patch(br#"{"claudeCompaction":null}"#).unwrap().claude_compaction, ConfigValueUpdate::Clear);
+        assert_eq!(
+            parse_patch(br#"{"claudeCompaction":{"window":533000,"percent":100}}"#).unwrap().claude_compaction,
+            ConfigValueUpdate::Set(ClaudeCompaction { auto_compact_window: 533_000, auto_compact_percent: 100 })
+        );
+        for bad in [
+            r#"{"claudeCompaction":{"window":99999,"percent":100}}"#,
+            r#"{"claudeCompaction":{"window":1000001,"percent":100}}"#,
+            r#"{"claudeCompaction":{"window":500000,"percent":0}}"#,
+            r#"{"claudeCompaction":{"window":500000,"percent":101}}"#,
+            r#"{"claudeCompaction":{"window":500000}}"#,
+            r#"{"claudeCompaction":{"window":500000.5,"percent":90}}"#,
+            r#"{"claudeCompaction":{"window":500000,"percent":90,"models":{}}}"#,
+            r#"{"claudeCompaction":500000}"#,
+        ] {
+            assert!(parse_patch(bad.as_bytes()).is_err(), "{bad}");
         }
     }
 
@@ -1681,6 +2255,142 @@ mod tests {
     }
 
     #[test]
+    fn avatar_style_conditional_import_requires_boolean_and_explicit_value() {
+        for body in [
+            r#"{"avatarStyleImportIfUnset":true}"#,
+            r#"{"avatarStyleImportIfUnset":null,"avatarStyle":null}"#,
+            r#"{"avatarStyleImportIfUnset":"true","avatarStyle":null}"#,
+            r#"{"avatarStyleImportIfUnset":1,"avatarStyle":null}"#,
+        ] {
+            assert!(parse_patch(body.as_bytes()).is_err(), "{body}");
+        }
+        assert!(!parse_patch(br#"{"avatarStyleImportIfUnset":false}"#).unwrap().avatar_style_import_if_unset);
+        assert!(parse_patch(br#"{"avatarStyleImportIfUnset":true,"avatarStyle":null}"#).unwrap().avatar_style_import_if_unset);
+    }
+
+    #[test]
+    fn stale_avatar_import_cannot_overwrite_owner_choice_or_rename() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        for (name, owner_choice) in [("OwnerSave", json!({"kind":"letter"})), ("OwnerClear", Value::Null)] {
+            let (status, _) = call("POST", "/v2/profiles", &json!({"name":name,"kind":"apiKey","preset":"glm"}).to_string(), false);
+            assert_eq!(status, 201);
+            let path = format!("/v2/profiles/{name}");
+            let (_, before) = call("GET", &path, "", false);
+            assert!(before["profile"]["appearance"]["avatarStyle"].is_null());
+            let (status, owner) = call("PATCH", &path, &json!({"avatarStyle":owner_choice}).to_string(), false);
+            assert_eq!(status, 200, "{owner}");
+            let accounts_path = crate::config::paths::accounts_path().unwrap();
+            let diagnostic_path = crate::config::paths::runtime_dir().unwrap().join("service-logs/management-errors.jsonl");
+            let diagnostic_before = std::fs::read(&diagnostic_path).ok();
+            let bytes = std::fs::read(&accounts_path).unwrap();
+            let modified = std::fs::metadata(&accounts_path).unwrap().modified().unwrap();
+            let (status, rejected) = call("PATCH", &path, &json!({
+                "name":format!("{name}Renamed"), "color":"#abcdef",
+                "avatarStyle":{"kind":"emoji","emojiThemes":null}, "avatarStyleImportIfUnset":true,
+            }).to_string(), false);
+            assert_eq!(status, 409, "{rejected}");
+            assert_eq!(rejected["error"]["code"], "avatar_style_already_set");
+            assert_eq!(rejected["error"]["details"]["avatarStyle"], owner_choice);
+            assert_eq!(rejected["error"]["details"]["appearanceRevision"], owner["profile"]["appearanceRevisions"]["avatarStyle"]);
+            assert_eq!(std::fs::read(&accounts_path).unwrap(), bytes);
+            assert_eq!(std::fs::metadata(&accounts_path).unwrap().modified().unwrap(), modified);
+            assert_eq!(std::fs::read(&diagnostic_path).ok(), diagnostic_before);
+            let (status, current) = call("GET", &path, "", false);
+            assert_eq!(status, 200);
+            assert_eq!(current["profile"]["name"], name);
+        }
+    }
+
+    #[test]
+    fn null_avatar_import_claims_clock_and_combines_with_other_patch_fields() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let (status, _) = call("POST", "/v2/profiles", r#"{"name":"ImportDefault","kind":"apiKey","preset":"glm"}"#, false);
+        assert_eq!(status, 201);
+        let (status, saved) = call("PATCH", "/v2/profiles/ImportDefault", r##"{"name":"ImportedDefault","color":"#abcdef","avatarStyle":null,"avatarStyleImportIfUnset":true}"##, false);
+        assert_eq!(status, 200, "{saved}");
+        assert_eq!(saved["profile"]["name"], "ImportedDefault");
+        assert_eq!(saved["profile"]["appearance"]["color"], "#ABCDEF");
+        assert!(saved["profile"]["appearanceRevisions"]["avatarStyle"]["updatedAt"].is_string());
+        let (status, rejected) = call("PATCH", "/v2/profiles/ImportedDefault", r#"{"avatarStyle":null,"avatarStyleImportIfUnset":true}"#, false);
+        assert_eq!(status, 409, "{rejected}");
+    }
+
+    #[test]
+    fn avatar_style_patch_is_strict_and_tri_state() {
+        use crate::profiles::avatar::AvatarStyle;
+        assert_eq!(parse_patch(br#"{}"#).unwrap().avatar_style, ConfigValueUpdate::Unchanged);
+        assert_eq!(parse_patch(br#"{"avatarStyle":null}"#).unwrap().avatar_style, ConfigValueUpdate::Clear);
+        assert_eq!(parse_patch(br#"{"avatarStyle":{"kind":"letter"}}"#).unwrap().avatar_style, ConfigValueUpdate::Set(AvatarStyle::Letter));
+        assert_eq!(parse_patch(br#"{"avatarStyle":{"kind":"emoji","emojiThemes":null}}"#).unwrap().avatar_style, ConfigValueUpdate::Set(AvatarStyle::Emoji { emoji_themes: None }));
+        for style in [json!({"kind":"emoji"}), json!({"kind":"portrait","portraitThemes":[]}), json!({"kind":"letter","extra":1}), json!("letter"), json!({"kind":"unknown"})] {
+            let body = json!({"avatarStyle":style}).to_string();
+            assert!(parse_patch(body.as_bytes()).unwrap_err().starts_with("avatarStyle:"), "{body}");
+        }
+    }
+
+    #[test]
+    fn profile_avatar_style_routes_round_trip_keep_sessions_and_legacy_choices() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let create = |name: &str| call("POST", "/v2/profiles", &json!({"name":name,"kind":"apiKey","preset":"glm","apiKey":"synthetic-style-fixture"}).to_string(), false);
+        let (status, created) = create("Style");
+        assert_eq!(status, 201, "{created}");
+        let id = created["profile"]["id"].as_str().unwrap().to_string();
+        assert!(created["profile"]["appearance"]["avatarStyle"].is_null());
+        assert_eq!(created["profile"]["detail"]["editable"]["avatarStyle"], true);
+
+        // An actual fixed session must survive every Profile style save unchanged.
+        let mut sessions = crate::session::model::CutexSessionStore::default();
+        let session_id = format!("cutex.{}", uuid::Uuid::new_v4());
+        let mut session = crate::session::model::CutexSessionRecord::new(session_id.clone(), None, "synthetic-host".into(), crate::config::paths::config_dir().unwrap().to_string_lossy().into_owned(), Some("Style".into())).unwrap();
+        session.avatar = Some(serde_json::from_value(json!({"kind":"emoji","value":"🐱"})).unwrap());
+        sessions.sessions.insert(session_id, session);
+        crate::session::store::save_cutex_session_store(&sessions).unwrap();
+        let before_sessions = serde_json::to_value(crate::session::store::load_cutex_session_store().unwrap()).unwrap();
+        for (requested, expected) in [
+            (json!({"kind":"portrait","portraitThemes":["uninstalled/theme"]}), json!({"kind":"portrait","portraitThemes":["uninstalled/theme"]})),
+            (json!({"kind":"emoji","emojiThemes":["cats","sea"]}), json!({"kind":"emoji","emojiThemes":["sea","cats"]})),
+            (json!({"kind":"emoji","emojiThemes":null}), json!({"kind":"emoji","emojiThemes":null})),
+            (json!({"kind":"letter"}), json!({"kind":"letter"})),
+        ] {
+            let body = json!({"avatarStyle":requested}).to_string();
+            let (status, saved) = call("PATCH", "/v2/profiles/Style", &body, false);
+            assert_eq!(status, 200, "{saved}");
+            assert_eq!(saved["profile"]["appearance"]["avatarStyle"], expected);
+            assert!(saved["profile"]["appearance"]["avatarThemes"].is_null(), "no automatic emoji mirror");
+            let (status, detail) = call("GET", &format!("/v2/profiles/{id}"), "", true);
+            assert_eq!(status, 200, "{detail}");
+            assert_eq!(detail["profile"]["appearance"]["avatarStyle"], expected);
+            let (status, list) = call("GET", "/v2/profiles", "", true);
+            assert_eq!(status, 200);
+            let row = list["profiles"].as_array().unwrap().iter().find(|row| row["id"] == id).unwrap();
+            assert_eq!(row["appearance"]["avatarStyle"], expected);
+            let (_, unchanged) = call("PATCH", "/v2/profiles/Style", "{}", false);
+            assert_eq!(unchanged["changed"], false);
+            assert_eq!(unchanged["profile"]["appearance"]["avatarStyle"], expected);
+            assert_eq!(serde_json::to_value(crate::session::store::load_cutex_session_store().unwrap()).unwrap(), before_sessions);
+        }
+        let (_, legacy) = call("PATCH", "/v2/profiles/Style", r#"{"avatarThemes":["cats"]}"#, false);
+        assert_eq!(legacy["profile"]["appearance"]["avatarStyle"], json!({"kind":"letter"}));
+        assert_eq!(legacy["profile"]["appearance"]["avatarThemes"], json!(["cats"]));
+        let (_, cleared) = call("PATCH", "/v2/profiles/Style", r#"{"avatarStyle":null}"#, false);
+        assert!(cleared["profile"]["appearance"]["avatarStyle"].is_null());
+        assert_eq!(cleared["profile"]["appearance"]["avatarThemes"], json!(["cats"]));
+        assert_eq!(serde_json::to_value(crate::session::store::load_cutex_session_store().unwrap()).unwrap(), before_sessions);
+        let (status, failed) = call("PATCH", "/v2/profiles/Style", r#"{"name":"BadRename","avatarStyle":{"kind":"letter","extra":true}}"#, false);
+        assert_eq!(status, 400, "{failed}");
+        assert_eq!(call("GET", "/v2/profiles/Style", "", false).0, 200);
+        assert_eq!(call("GET", "/v2/profiles/BadRename", "", false).0, 404);
+        let (_, renamed) = call("PATCH", "/v2/profiles/Style", r#"{"name":"Renamed","avatarStyle":{"kind":"portrait","portraitThemes":["future-pack/theme"]}}"#, false);
+        assert_eq!(renamed["profile"]["id"], id);
+        assert_eq!(renamed["profile"]["appearance"]["avatarStyle"]["kind"], "portrait");
+        assert_eq!(call("DELETE", "/v2/profiles/Renamed", "", false).0, 200);
+        let (status, recreated) = create("Renamed");
+        assert_eq!(status, 201, "{recreated}");
+        assert_ne!(recreated["profile"]["id"], id);
+        assert!(recreated["profile"]["appearance"]["avatarStyle"].is_null());
+    }
+
+    #[test]
     fn profile_avatar_routes_round_trip_rename_and_delete() {
         let _home = crate::profiles::lifecycle::tests::TestHome::new();
         let created = call(
@@ -1752,6 +2462,52 @@ mod tests {
         assert_eq!(call("DELETE", "/v2/profiles/Picture", "", false).0, 200);
         let images = profile_avatar::ProfileAvatarStore::open_default().unwrap().snapshot().unwrap();
         assert!(images.avatars.is_empty() && images.intro_portraits.is_empty());
+    }
+
+    #[test]
+    fn account_links_round_trip_manual_undo_and_are_hidden_from_narrowed_devices() {
+        use base64::Engine;
+        use crate::management::{client_tokens::{DeviceScope,VerifiedClientToken},listeners};
+        struct Reset;
+        impl Drop for Reset {fn drop(&mut self){listeners::set_current_client_token(None);}}
+        let _reset=Reset;
+        let _home=crate::profiles::lifecycle::tests::TestHome::new();
+        let (status,created)=call("POST","/v2/profiles", &json!({"name":"Linked","kind":"apiKey","preset":"glm","apiKey":"synthetic-profile-link-key"}).to_string(),false);
+        assert_eq!(status,201,"{created}");
+        assert!(created["profile"].get("link").is_none());
+        let home=crate::config::paths::config_dir().unwrap();
+        use sha2::Digest;
+        crate::profiles::account_link::put_secret(&home,&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(b"synthetic-profile-link-API-secret"))).unwrap();
+        let automatic=call("GET","/v2/profiles/Linked","",false).1["profile"].clone();
+        assert_eq!(automatic["link"]["basis"],"api-key");
+        assert_eq!(automatic["accountLinkState"],"auto");
+        assert_eq!(automatic["accountLink"],Value::Null);
+        super::super::schema_export::assert_valid("profile-link","profileMetadata",&automatic);
+        let manual=format!("m-{}",base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([42u8;16]));
+        let (status,patched)=call("PATCH","/v2/profiles/Linked",&json!({"accountLink":manual}).to_string(),false);
+        assert_eq!(status,200,"{patched}");assert_eq!(patched["profile"]["link"]["basis"],"manual");
+        assert_eq!(patched["profile"]["accountLink"],manual);
+        let mut token=VerifiedClientToken::test_token("narrowed-owner");
+        for scope in [DeviceScope::Read,DeviceScope::Chat] {
+            token.scope=scope;listeners::set_current_client_token(Some(token.clone()));
+            let list=call("GET","/v2/profiles","",false).1;
+            for item in list["profiles"].as_array().unwrap() {
+                assert!(item.get("link").is_none());assert!(item.get("accountLinkState").is_none());assert!(item.get("accountLink").is_none());
+            }
+            let detail=call("GET","/v2/profiles/Linked","",false).1;
+            assert!(detail["profile"].get("link").is_none());assert!(detail["profile"].get("accountLink").is_none());
+        }
+        listeners::set_current_client_token(None);
+        let disabled=call("PATCH","/v2/profiles/Linked",r#"{"accountLink":"none"}"#,false).1;
+        assert!(disabled["profile"].get("link").is_none());assert_eq!(disabled["profile"]["accountLinkState"],"disabled");
+        let cleared=call("PATCH","/v2/profiles/Linked",r#"{"accountLink":null}"#,false).1;
+        assert_eq!(cleared["profile"]["link"],automatic["link"]);
+        assert_eq!(call("PATCH","/v2/profiles/Linked",r#"{"accountLink":"invalid"}"#,false).0,400);
+        let restored=call("PATCH","/v2/profiles/Linked",&json!({"accountLink":manual}).to_string(),false).1;
+        assert_eq!(restored["profile"]["link"],patched["profile"]["link"]);
+        let account=settings_api::load_store().unwrap().accounts.into_iter().find(|a|a.name=="Linked").unwrap();
+        let generic=settings_api::profile_item(&account,&load_codez_config(),true);
+        assert!(generic.get("link").is_none());assert!(generic.get("accountLink").is_none());
     }
 
     #[test]

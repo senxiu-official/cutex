@@ -234,6 +234,11 @@ fn durable_target_requested(target: &str, sessions: Option<&CutexSessionStore>) 
 }
 
 fn roster_agent_matches_session(agent: &AgentBusAgent, record: &CutexSessionRecord) -> bool {
+    if let Some(session) = &record.dsh_session {
+        return agent.session_id.as_deref() == Some(session.thread_id.as_str())
+            && record.current_runtime_agent_id.as_deref() == Some(agent.id.as_str())
+            && record.runtime_pid == Some(agent.pid);
+    }
     if let Some(session) = &record.claude_session {
         return agent.session_id.as_deref() == Some(session.thread_id.as_str())
             && record.current_runtime_agent_id.as_deref() == Some(agent.id.as_str())
@@ -261,7 +266,7 @@ fn resolve_durable_target(
                 let runtime_id = record
                     .current_runtime_agent_id
                     .as_deref()
-                    .filter(|_| record.is_active() && record.runtime_generation > 0);
+                    .filter(|_| !crate::agent_management::agent_execution_blocked(&record) && record.runtime_generation > 0);
                 let Some(runtime_id) = runtime_id else {
                     return Err(AgentTargetResolutionError::new(
                         AgentTargetResolutionCode::TargetUnavailable,
@@ -322,16 +327,40 @@ pub fn project_current_durable_session_ids(
     agents: &mut [AgentBusAgent],
     sessions: &CutexSessionStore,
 ) {
+    project_current_durable_session_ids_with_authority(
+        agents,
+        sessions,
+        crate::agent_management::archive_authority_snapshot,
+    );
+}
+
+fn project_current_durable_session_ids_with_authority(
+    agents: &mut [AgentBusAgent],
+    sessions: &CutexSessionStore,
+    mut load_authority: impl FnMut() -> Result<
+        crate::agent_management::AgentManagementSnapshot,
+        crate::agent_management::AgentManagementError,
+    >,
+) {
+    // One consistent view for this roster, including a cached read failure.
+    // Do not read authority at all for offline/stale/unrelated occurrences.
+    let authority = std::cell::OnceCell::new();
     for agent in agents {
         agent.cutex_session_id = None;
         let records = sessions
             .sessions
             .values()
             .filter(|record| {
-                record.is_active()
-                    && record.runtime_generation > 0
+                record.runtime_generation > 0
                     && record.current_runtime_agent_id.as_deref() == Some(agent.id.as_str())
                     && roster_agent_matches_session(agent, record)
+                    && !record.is_retired()
+                    && authority
+                        .get_or_init(&mut load_authority)
+                        .as_ref()
+                        .is_ok_and(|state| {
+                            !crate::agent_management::agent_execution_blocked_in(state, record)
+                        })
             })
             .collect::<Vec<_>>();
         let [record] = records.as_slice() else {
@@ -426,6 +455,7 @@ pub fn normalize_agent_bus_session_id(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("roster_projection_tests.rs");
     use crate::agent_bus::delivery::AgentDeliveryMode;
     use crate::agent_bus::model::AgentBusEnvelopeKind;
     use crate::agent_bus::model::AgentMessageKind;

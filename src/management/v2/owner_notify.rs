@@ -215,7 +215,7 @@ pub(super) fn dispatch_with(
     root: bool,
     store: &OwnerNotifyStore,
     cutex_session_id: &str,
-    session: &Value,
+    _session: &Value,
     request: &ValidatedCutexRequest,
     submit: impl FnOnce(&ValidatedCutexRequest) -> Result<Value, UserInputExecutionError>,
 ) -> Result<Value, UserInputExecutionError> {
@@ -265,15 +265,16 @@ pub(super) fn dispatch_with(
                 .check_reply(cutex_session_id, id)
                 .map_err(owner_error)?;
             let client_user_message_id = format!("owner-notify-reply-{id}");
-            // Busy: after the current turn (never steered into it). Idle: now.
-            let busy = session.pointer("/runtime/activeTurnId").is_some_and(|turn| !turn.is_null());
+            // The owner's own words: `auto` like typed input (023 Q2). Busy: read at
+            // the next step (Codex steer; Claude same-turn steering, else after the
+            // turn on older adapters). Idle: now.
             let input = ValidatedCutexRequest {
                 request_id: request.request_id.clone(),
                 method: "cutex/userInput/submit".into(),
                 params: json!({
                     "clientUserMessageId": client_user_message_id,
                     "origin": {"kind": "other", "clientId": CLIENT_ID},
-                    "strategy": if busy { "queue" } else { "auto" },
+                    "strategy": "auto",
                     "input": [{"type": "text", "text": reply_text(&record, text), "text_elements": []}],
                     "startIfOffline": true,
                 }),
@@ -358,7 +359,8 @@ mod tests {
         assert_eq!(replied["notification"]["reply"]["text"], "Use v2");
         let input = seen.unwrap();
         assert_eq!(input.method, "cutex/userInput/submit");
-        assert_eq!(input.params["strategy"], "queue");
+        // Busy requester (activeTurnId set): still `auto`, read at its next step (023 Q2).
+        assert_eq!(input.params["strategy"], "auto");
         assert_eq!(input.params["clientUserMessageId"], format!("owner-notify-reply-{id}"));
         let text = input.params["input"][0]["text"].as_str().unwrap();
         assert!(text.starts_with(&format!("Owner reply to your owner_notify message {id} (\"Need a decision on the schema\"):\n")));

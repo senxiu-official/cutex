@@ -132,6 +132,33 @@ fn reset_boundaries(ledger: &UsageLedger) -> Vec<&UsageResetBoundary> {
 }
 
 #[test]
+fn deleted_session_late_events_cannot_recreate_baseline_or_duplicate_ledger() {
+    let root = TestRoot::new("deleted-late-event");
+    let initial = envelope("first", 1, 1, "2026-08-13T01:00:00Z", "thread/tokenUsage/updated",
+        token_params(breakdown(100, 80, 0, 0, 20, 0), Some(breakdown(100, 80, 0, 0, 20, 0)), "turn-1"));
+    record_usage_event_at(root.path(), &initial, Some("work")).unwrap();
+    let before = store::load_usage_ledger_at(root.path()).unwrap();
+    store::forget_deleted_session_at(root.path(), "cutex.session-a").unwrap();
+    let revision = store::load_usage_state_snapshot_at(root.path()).unwrap().revision;
+    for generation in [1, 2, 100] {
+        let late = envelope("late", generation + 10, generation, "2026-10-13T01:00:00Z", "thread/tokenUsage/updated",
+            token_params(breakdown(200, 160, 0, 0, 40, 0), Some(breakdown(100, 80, 0, 0, 20, 0)), "turn-late"));
+        record_usage_event_at(root.path(), &late, Some("work")).unwrap();
+    }
+    let snapshot = store::load_usage_state_snapshot_at(root.path()).unwrap();
+    let persisted: Value = serde_json::from_slice(&fs::read(store::state_path(root.path())).unwrap()).unwrap();
+    assert!(persisted["sessions"].get("cutex.session-a").is_none());
+    assert_eq!(snapshot.revision, revision);
+    assert_eq!(store::load_usage_ledger_at(root.path()).unwrap().entries.len(), before.entries.len());
+    // Unrelated sessions continue recording normally.
+    let mut other = initial;
+    other.cutex_session_id = "cutex.session-b".into();
+    record_usage_event_at(root.path(), &other, Some("work")).unwrap();
+    let persisted: Value = serde_json::from_slice(&fs::read(store::state_path(root.path())).unwrap()).unwrap();
+    assert!(persisted["sessions"].get("cutex.session-b").is_some());
+}
+
+#[test]
 fn token_usage_baselines_then_records_native_last_with_attribution() {
     let root = TestRoot::new("native-last");
     record_usage_event_at(
@@ -586,6 +613,7 @@ fn pending_entries_recover_after_interrupted_append_and_reader_deduplicates() {
         token_source: UsageTokenSource::CumulativeDelta,
         model_context_window: None,
         compaction_count: None,
+        model_requests: None,
         tokens: TokenUsageBreakdown {
             total_tokens: 10,
             input_tokens: 8,
@@ -715,15 +743,16 @@ fn claude_adapter_usage_counts_the_cumulative_delta_not_context_occupancy() {
     .expect("baseline");
     record_usage_event_at(
         root.path(),
-        &claude(
-            "usage-2",
-            2,
-            token_params(
+        &claude("usage-2", 2, {
+            let mut params = token_params(
                 breakdown(1_430, 1_310, 900, 0, 120, 0),
                 Some(breakdown(410, 410, 0, 0, 0, 0)),
                 "turn-b",
-            ),
-        ),
+            );
+            // The turn's SDK steps (token audit 2026-10-22).
+            params["tokenUsage"]["modelRequests"] = json!(2);
+            params
+        }),
         Some("deepseek"),
     )
     .expect("record turn");
@@ -735,4 +764,5 @@ fn claude_adapter_usage_counts_the_cumulative_delta_not_context_occupancy() {
     assert_eq!(samples[0].tokens.input_tokens, 410);
     assert_eq!(samples[0].tokens.cached_input_tokens, 300);
     assert_eq!(samples[0].tokens.output_tokens, 20);
+    assert_eq!(samples[0].model_requests, Some(2), "the turn's SDK steps are kept");
 }

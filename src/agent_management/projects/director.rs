@@ -259,11 +259,13 @@ impl AgentManagementProvider {
                 "rotate_director_requires_authority_epoch",
             ));
         }
-        self.store().with_state(true, |mut state| {
+        let hook = self.authority_hook();
+        let receipt = self.store().with_state(true, |mut state| {
             if let Some(replay) = existing_receipt(&state, request, &digest) {
                 return replay.map(|receipt| (state, receipt, false));
             }
             reject_project_action_id_domain_collision(&state, &request.action_id)?;
+            let before = state.projects.get(&request.project_id).cloned();
             let receipt = match &request.operation {
                 HumanManagementProjectMutationKind::CreateProject {
                     presentation,
@@ -290,8 +292,42 @@ impl AgentManagementProvider {
                 } => rotate_director(&mut state, request, &digest, successor_cutex_session_id)?,
                 _ => return Err(AgentManagementError::InvalidStore),
             };
+            // r254 (design 044 §6.1): an owner seat change goes through the
+            // same Director-address hook as an authority bind: the prepared
+            // sidecar intent is durable BEFORE this transaction persists (an
+            // error refuses the mutation); finalize runs after it, from the
+            // durable mutation record. Lock order as for a bind: provider
+            // execution, mutation lock (both held by the caller), roster,
+            // then the sidecar.
+            let after = state.projects.get(&request.project_id).cloned();
+            if let Some(hook) = hook.as_ref().filter(|_| before != after) {
+                hook.prepare(
+                    &crate::agent_management::AuthorityTransitionIntent {
+                        action_id: request.action_id.clone(),
+                        request_sha256: digest.clone(),
+                        project_id: request.project_id.clone(),
+                        previous: before,
+                        next: after,
+                    },
+                    &state,
+                )?;
+            }
             Ok((state, receipt, true))
-        })
+        })?;
+        if let Some(hook) = &hook {
+            match self.store().snapshot() {
+                Ok(snapshot) => {
+                    if let Err(error) = hook.finalize_owner_change(&request.action_id, &snapshot) {
+                        eprintln!(
+                            "director-address finalize of {} deferred to recovery: {error:?}",
+                            request.action_id.as_str()
+                        );
+                    }
+                }
+                Err(error) => eprintln!("director-address finalize: roster snapshot unavailable: {error:?}"),
+            }
+        }
+        Ok(receipt)
     }
 }
 

@@ -91,6 +91,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delegation_control_receipt_and_invalidation_events_match_the_wire_schema() {
+        let mut state=crate::asks::store::AskState::default();
+        let result=crate::asks::operations::execute(&mut state,"owner","project.pause","wire-1",
+            &json!({"expectedEpoch":0}),chrono::Utc::now(),|_|Ok((json!({"changed":true}),crate::asks::operations::EffectState::Committed))).unwrap();
+        validator_for_definition("delegationOperationReceipt").validate(&result["receipt"]).unwrap();
+        for method in ["cutex/delegation/routingApprovalChanged","cutex/delegation/lineageChanged","cutex/delegation/continuationChanged"] {
+            let mut event=json!({"method":method,"params":{"projectId":"p","resourceId":"ask-a","revision":2}});
+            validate_cutex_event_message(&event).unwrap();
+            event["params"]["hiddenParentId"]=json!("private");
+            assert!(validate_cutex_event_message(&event).is_err());
+        }
+        validate_cutex_event_message(&json!({"method":"cutex/project/runControlChanged","params":{"projectId":"p","epoch":1}})).unwrap();
+    }
+
+    #[test]
+    fn owner_join_is_strict_and_additive_for_direct_and_queue_requests() {
+        let join = json!({"askId": "ask-1", "attempt": 1, "expectedTurnId": "turn-1", "runtimeGeneration": 7});
+        for (method, mut params) in [
+            ("cutex/userInput/submit", json!({"clientUserMessageId":"m", "origin":{"kind":"other","clientId":"desktop"},"strategy":"auto","input":[{"type":"text","text":"owner"}]})),
+            ("cutex/userInput/queue/steer", json!({"queueId":"q", "expectedRevision":1, "ifIdle":"fail"})),
+        ] {
+            params["joinDelegation"] = join.clone();
+            validate_cutex_request(&json!({"requestId":"join", "method":method, "params":params})).unwrap();
+            for invalid in [json!(null), json!({"askId":"ask-1"}), json!({"askId":"ask-1","attempt":0,"expectedTurnId":"turn-1","runtimeGeneration":7})] {
+                params["joinDelegation"] = invalid;
+                assert!(validate_cutex_request(&json!({"requestId":"join", "method":method, "params":params})).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn runtime_event_validation_is_exact() {
         validate_cutex_event_message(&json!({
             "method": "cutex/runtime/online",
@@ -141,6 +172,38 @@ mod tests {
             }
         }))
         .is_err());
+    }
+
+    #[test]
+    fn user_input_blob_references_are_event_only() {
+        let blob = json!({
+            "type":"cutexBlob", "blobId":"a".repeat(64), "sha256":"a".repeat(64),
+            "mime":"image/png", "size":65537,
+            "url":format!("cutex-blob:cutex.a/{}", "a".repeat(64))
+        });
+        let input = json!([{"type":"image", "url":blob}]);
+        validate_cutex_event_message(&json!({
+            "method":"cutex/userInput/routeAccepted",
+            "params":{
+                "managementRequestId":"request-1", "clientUserMessageId":"message-1",
+                "origin":{"kind":"other", "clientId":"desktop-test"}, "input":input,
+                "strategy":"auto", "state":"routed_to_cutex", "acceptedAt":"2026-10-25T00:00:00Z"
+            }
+        })).expect("durable events may refer to externalized media");
+        validate_cutex_request(&json!({
+            "requestId":"request-1", "method":"cutex/userInput/submit",
+            "params":{
+                "clientUserMessageId":"message-1", "origin":{"kind":"other", "clientId":"desktop-test"},
+                "strategy":"auto", "input":[{"type":"image", "url":"data:image/png;base64,AA=="}]
+            }
+        })).expect("clients may submit image URLs as strings");
+        assert!(validate_cutex_request(&json!({
+            "requestId":"request-1", "method":"cutex/userInput/submit",
+            "params":{
+                "clientUserMessageId":"message-1", "origin":{"kind":"other", "clientId":"desktop-test"},
+                "strategy":"auto", "input":input
+            }
+        })).is_err(), "clients must still submit image URLs as strings");
     }
 
     #[test]
@@ -458,3 +521,8 @@ mod tests {
         .expect("restore event");
     }
 }
+    #[test]
+    fn nullable_badge_tint_matches_request_and_resource_contracts() {
+        validate_cutex_request(&serde_json::json!({"requestId":"badge-null","method":"cutex/session/metadata/update","params":{"expectedRevision":1,"badge":{"text":"A","tint":null}}})).unwrap();
+        crate::management::v2::schema_export::assert_valid("sessions","badge",&serde_json::json!({"text":"A","tint":null}));
+    }

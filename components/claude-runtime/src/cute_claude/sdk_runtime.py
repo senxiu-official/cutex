@@ -253,6 +253,8 @@ class Control:
     permission_mode: str | None = None
     arguments: dict | None = None
     fast: bool | None = None
+    # Model / effort / fast mode go to the running child (live_settings); False = replace the child.
+    live: bool = False
 
 
 @dataclass
@@ -281,6 +283,9 @@ class RuntimeOwner:
         # Loop-time end of an autonomous turn's quiet window (None: none seen),
         # the inputs held behind it and when the first of them stops waiting.
         self.autonomous_until: float | None = None
+        # A task notification seen while an adapter turn ran: Claude Code may start its
+        # own notification turn right after that turn's Result (claude-r23).
+        self.notified_in_turn = False
         self.deferred: list[Run] = []
         self.deferred_until: float | None = None
         self.client = self.bridge = self.reader = self.process = self.lease = None
@@ -391,13 +396,13 @@ class RuntimeOwner:
         await self.mailbox.put(Control('model', future, model=model))
         await asyncio.shield(future)
 
-    async def set_model_effort(self, model: str, effort: str | None, fast: bool | None = None) -> None:
+    async def set_model_effort(self, model: str, effort: str | None, fast: bool | None = None, *, live: bool = False) -> None:
         await asyncio.shield(self.ready)
         if not self.accepting or self.task.done():
             raise ProviderError('Runtime is offline; start it before changing effort')
         future = asyncio.get_running_loop().create_future()
         future.add_done_callback(self._observe)
-        await self.mailbox.put(Control('model_effort', future, model=model, effort=effort, fast=fast))
+        await self.mailbox.put(Control('model_effort', future, model=model, effort=effort, fast=fast, live=live))
         await asyncio.shield(future)
 
     async def interrupt(self, turn_id: str) -> None:
@@ -415,6 +420,44 @@ class RuntimeOwner:
         # official transport warns raw asyncio cancellation can skip reaping.
         await asyncio.shield(self.task)
         return self.snapshot()
+
+    async def _apply_live(self, command: Control) -> None:
+        """Model / effort / fast mode (and the model's auto-compaction) on the running child, also while a
+        turn runs: Claude Code uses them from its next model request (live_settings)."""
+        engine, tid = self.engine, self.tid
+        current, effort = engine.store.thread(tid)['model'], engine.thread_effort(tid)
+        settings: dict = {'effortLevel': command.effort}
+        if command.fast is not None:
+            settings['fastMode'] = command.fast
+        compaction = getattr(engine, 'compaction', None)
+        env = compaction.switch_env(current, command.model) if compaction is not None else None
+        if env:
+            settings['env'] = env
+        stage = 'set_model'
+        try:
+            async with asyncio.timeout(self.driver.control_timeout):
+                if command.model != current:
+                    await self.client.set_model(command.model)
+                    engine.save_model_effort(tid, command.model, effort)
+                    self.model_selection_id = str(uuid.uuid4())
+                stage = 'apply_flag_settings'
+                await self.client._query._send_control_request({'subtype': 'apply_flag_settings', 'settings': settings})
+        except TimeoutError:
+            # The child may or may not have applied it: replace it, as a failed set_model does.
+            error = safe_error(TimeoutError(), stage)
+            command.future.set_exception(error)
+            raise OutcomeUncertain(str(error)) from None
+        except Exception as exc:
+            # Claude Code answered with an error: nothing after `stage` was applied.
+            command.future.set_exception(safe_error(exc, stage))
+            return
+        if command.fast is None:
+            engine.save_model_effort(tid, command.model, command.effort)
+        else:
+            engine.save_model_effort(tid, command.model, command.effort, command.fast)
+        command.future.set_result(None)
+        if not self.active:
+            await self.status('waiting')
 
     async def _read(self) -> None:
         """The only application reader for this client. No ResultMessage break."""
@@ -446,12 +489,16 @@ class RuntimeOwner:
         extend the quiet window; its Result closes it. Subagent frames and rate
         limits never open it: they are routed by other means, not to an input.
         """
-        if self.active is not None or field(message, 'parent_tool_use_id'):
+        from .runtime_tasks import TYPES
+        if field(message, 'parent_tool_use_id'):
+            return
+        if self.active is not None:
+            if TYPES.get(typ, field(message, 'subtype')) == 'task_notification':
+                self.notified_in_turn = True
             return
         if typ in {'ResultMessage', 'result'}:
             self.autonomous_until = None
             return
-        from .runtime_tasks import TYPES
         if typ in {'StreamEvent', 'stream_event', 'AssistantMessage', 'assistant', 'UserMessage', 'user'}:
             window = AUTONOMOUS_QUIET_SECONDS
         elif TYPES.get(typ, field(message, 'subtype')) == 'task_notification':
@@ -546,6 +593,10 @@ class RuntimeOwner:
                     raise
             await self.bridge.end_turn()
             self.active = None
+            if self.notified_in_turn:
+                # The next input waits like after an idle notification (start window).
+                self.notified_in_turn = False
+                self.autonomous_until = asyncio.get_running_loop().time() + AUTONOMOUS_START_SECONDS
             self.reconnect_attempts = 0
             self.interrupt_deadline = None
             await self.status('waiting')
@@ -642,6 +693,12 @@ class RuntimeOwner:
                 if not command.future.done():
                     command.future.set_exception(ProviderError(f'Metrics unavailable ({type(exc).__name__})'))
             return True
+        if command.kind == 'model_effort' and command.live:
+            if not self.accepting:
+                command.future.set_exception(ProviderError('Runtime is offline; start it before changing effort'))
+                return True
+            await self._apply_live(command)
+            return True
         if command.kind == 'model_effort':
             if self.active or not self.accepting or self.engine.store.user_turn_busy(self.tid):
                 command.future.set_exception(ProviderError('Finish or interrupt the current turn before changing effort'))
@@ -657,6 +714,7 @@ class RuntimeOwner:
                 if self.process is None or self.process.returncode is None:
                     raise ProviderError('Prior Claude child exit is unverified; effort was not changed')
                 await self.bridge.end_turn()
+                await self.tasks.lost('The Claude runtime restarted to change the model or effort while it ran.')
                 queued = []
                 while not self.mailbox.empty():
                     item = self.mailbox.get_nowait()
@@ -681,6 +739,7 @@ class RuntimeOwner:
                 self.connected_at = int(time.time() * 1000)
                 # The replaced child's autonomous turn ended with it.
                 self.autonomous_until = None
+                self.notified_in_turn = False
                 self.reader = asyncio.create_task(self._read(), name=f'claude-sdk-reader:{self.tid}')
                 await self.status('waiting')
                 command.future.set_result(None)
@@ -778,6 +837,8 @@ class RuntimeOwner:
             raise OutcomeUncertain('Prior native child exit is unverified; supervised reconnect refused, input not replayed.')
         self.process_exit_confirmed = True
         await self.bridge.end_turn()
+        # Background subagents and commands ended with the child (claude-r23).
+        await self.tasks.lost('The Claude Code process ended and was restarted while it ran.')
         self.tasks.disconnected()
         if not self.accepting:
             raise failure
@@ -785,6 +846,7 @@ class RuntimeOwner:
         # Inputs already queued in this mailbox are failed, never replayed.
         self._fail_deferred(failure)
         self.autonomous_until = None
+        self.notified_in_turn = False
         controls = []
         while not self.mailbox.empty():
             pending = self.mailbox.get_nowait()
@@ -929,6 +991,11 @@ class RuntimeOwner:
                     record_cleanup(exc, 'disconnect')
             if self.process is not None:
                 self.process_exit_confirmed = self.process_observation()[1] is not None
+            if self.client:
+                try:
+                    await self.tasks.lost('The Claude runtime was closed while it ran.')
+                except BaseException as exc:
+                    record_cleanup(exc, 'background-tasks')
             if self.bridge:
                 try:
                     await self.bridge.end_turn()

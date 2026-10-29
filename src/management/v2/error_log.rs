@@ -6,7 +6,11 @@ static LOCK:Mutex<()>=Mutex::new(());
 pub struct Scope(Value);
 impl Drop for Scope {fn drop(&mut self){REQUEST.with(|r|*r.borrow_mut()=self.0.take());}}
 pub fn scope(request:&crate::http::server::SimpleHttpRequest)->Scope {
-    let body:Value=serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+    // This endpoint carries the owner's linking secret. Even malformed
+    // requests must never copy body values into diagnostic identifier fields.
+    let body:Value=if request.path.split('?').next()==Some(super::profile_link::SECRET_PATH) {
+        Value::Null
+    } else {serde_json::from_slice(&request.body).unwrap_or(Value::Null)};
     let mut ids=serde_json::Map::new();
     for key in ["action_id","actionId","requestId","cutex_session_id","session_id","threadId","native_id"] {
         if let Some(value)=body.get(key).and_then(Value::as_str){ids.insert(key.into(),json!(value.chars().take(200).collect::<String>()));}

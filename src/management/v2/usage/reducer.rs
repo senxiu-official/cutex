@@ -52,6 +52,7 @@ pub(super) enum UsageEvent {
         last: Option<TokenUsageBreakdown>,
         model_context_window: Option<u64>,
         compaction_count: Option<u64>,
+        model_requests: Option<u64>,
     },
     Settings {
         thread_id: String,
@@ -180,6 +181,8 @@ pub(super) fn parse_usage_event(envelope: &EventEnvelope) -> anyhow::Result<Opti
                     "tokenUsage",
                 )?,
                 compaction_count: optional_u64(token_usage, "compactionCount", "tokenUsage")?,
+                // The Claude adapter reports a turn's SDK steps at its end.
+                model_requests: optional_u64(token_usage, "modelRequests", "tokenUsage")?.filter(|n| *n > 0),
             }))
         }
         "thread/settings/updated" => {
@@ -233,6 +236,9 @@ pub(super) fn reduce_usage_event(
     mut event: UsageEvent,
     runtime: Option<&super::UsageRuntimeContext>,
 ) -> anyhow::Result<UsageMutation> {
+    if state.deleted_sessions.contains(&envelope.cutex_session_id) {
+        return Ok(UsageMutation::default());
+    }
     // Adapters may learn the actual model during a turn. Only native runtimes
     // with captured bootstrap evidence use a frozen turn attribution.
     if matches!(&event, UsageEvent::TurnStarted { .. }) && runtime.is_none() {
@@ -293,6 +299,7 @@ pub(super) fn reduce_usage_event(
             last,
             model_context_window,
             compaction_count,
+            model_requests,
         } => reduce_token(
             state,
             envelope,
@@ -303,6 +310,7 @@ pub(super) fn reduce_usage_event(
             last,
             model_context_window,
             compaction_count,
+            model_requests,
         ),
         UsageEvent::Settings { thread_id, patch } => {
             reduce_settings(state, envelope, profile, thread_id, patch)
@@ -329,6 +337,7 @@ fn reduce_token(
     last: Option<TokenUsageBreakdown>,
     model_context_window: Option<u64>,
     compaction_count: Option<u64>,
+    model_requests: Option<u64>,
 ) -> anyhow::Result<UsageMutation> {
     total.validate()?;
     if let Some(last) = &last {
@@ -432,6 +441,7 @@ fn reduce_token(
             token_source,
             model_context_window,
             compaction_count,
+            model_requests,
             tokens,
             cumulative_total: total,
         }

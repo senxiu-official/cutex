@@ -372,7 +372,15 @@ fn private_acl(sid: PSID, directory: bool) -> Result<Vec<u8>, PrivateFsError> {
     Ok(acl)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: how many times this thread wrote a security descriptor.
+    static SECURITY_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn secure_owned_handle(file: &File, directory: bool) -> Result<(), PrivateFsError> {
+    #[cfg(test)]
+    SECURITY_WRITES.with(|count| count.set(count.get() + 1));
     let sid = current_user_sid()?;
     let sid_pointer = sid.as_ptr() as PSID;
     validate_owner(file)?;
@@ -394,6 +402,17 @@ fn secure_owned_handle(file: &File, directory: bool) -> Result<(), PrivateFsErro
         return Err(io::Error::from_raw_os_error(status as i32).into());
     }
     Ok(())
+}
+
+/// Owned by the token user itself (not merely an accepted owner) with the
+/// private DACL `secure_owned_handle` writes: nothing to change.
+fn private_and_user_owned(file: &File, directory: bool) -> Result<bool, PrivateFsError> {
+    let user = current_user_sid()?;
+    let (owner, _, _descriptor) = security_info(file)?;
+    if owner.is_null() || unsafe { EqualSid(owner, user.as_ptr() as PSID) } == 0 {
+        return Ok(false);
+    }
+    Ok(validate_private_acl(file, directory).is_ok())
 }
 
 fn validate_private_acl(file: &File, directory: bool) -> Result<(), PrivateFsError> {
@@ -458,7 +477,15 @@ pub fn secure_directory(path: &Path) -> Result<(File, FileIdentity), PrivateFsEr
         true,
     )?;
     validate_type(&file, true)?;
-    secure_owned_handle(&file, true)?;
+    // Written only when it is not already exactly what it would write: setting a
+    // directory's DACL makes Windows re-propagate the inherited entries to every
+    // descendant (about 20 s for a runtime directory of ~166k files, at every
+    // daemon and bus start). Anything else — another owner (Administrators left
+    // by elevation included), extra or deny entries, inherited access, a fresh
+    // directory — is secured as before.
+    if !private_and_user_owned(&file, true)? {
+        secure_owned_handle(&file, true)?;
+    }
     validate_private_acl(&file, true)?;
     let identity = identity(&file)?;
     Ok((file, identity))
@@ -787,6 +814,67 @@ mod tests {
         }
         open_validated_directory(&fixture.0).unwrap();
         validate_private_file(&child).unwrap();
+    }
+
+    fn security_writes() -> usize {
+        SECURITY_WRITES.with(|count| count.get())
+    }
+
+    fn icacls(path: &Path, args: &[&str]) {
+        let output = Command::new("icacls").arg(path).args(args).output().unwrap();
+        assert!(output.status.success(), "icacls {args:?} failed: {output:?}");
+    }
+
+    #[test]
+    fn a_fresh_directory_is_secured() {
+        let fixture = TestRoot::new("fresh");
+        let fresh = fixture.0.join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        // Created inside a private root it still only inherits: not protected.
+        assert!(open_validated_directory(&fresh).is_err());
+        let before = security_writes();
+        secure_directory(&fresh).unwrap();
+        assert_eq!(security_writes(), before + 1);
+        open_validated_directory(&fresh).unwrap();
+    }
+
+    #[test]
+    fn an_already_private_directory_is_not_rewritten() {
+        let fixture = TestRoot::new("already");
+        secure_directory(&fixture.0).unwrap();
+        let before = security_writes();
+        let (_, first) = secure_directory(&fixture.0).unwrap();
+        let (_, second) = secure_directory(&fixture.0).unwrap();
+        assert_eq!(security_writes(), before);
+        assert_eq!(first, second);
+        open_validated_directory(&fixture.0).unwrap();
+    }
+
+    #[test]
+    fn a_directory_that_is_not_private_is_fixed() {
+        let fixture = TestRoot::new("not-private");
+        secure_directory(&fixture.0).unwrap();
+        // An extra entry for Everyone.
+        icacls(&fixture.0, &["/grant", "*S-1-1-0:(OI)(CI)R"]);
+        assert!(open_validated_directory(&fixture.0).is_err());
+        let before = security_writes();
+        secure_directory(&fixture.0).unwrap();
+        assert_eq!(security_writes(), before + 1);
+        open_validated_directory(&fixture.0).unwrap();
+        // Inherited access again (protection removed).
+        icacls(&fixture.0, &["/inheritance:e"]);
+        assert!(open_validated_directory(&fixture.0).is_err());
+        let before = security_writes();
+        secure_directory(&fixture.0).unwrap();
+        assert_eq!(security_writes(), before + 1);
+        open_validated_directory(&fixture.0).unwrap();
+        // A deny entry (here for Guests) is not private either.
+        icacls(&fixture.0, &["/deny", "*S-1-5-32-546:(OI)(CI)R"]);
+        assert!(open_validated_directory(&fixture.0).is_err());
+        let before = security_writes();
+        secure_directory(&fixture.0).unwrap();
+        assert_eq!(security_writes(), before + 1);
+        open_validated_directory(&fixture.0).unwrap();
     }
 
     #[test]

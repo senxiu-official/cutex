@@ -67,6 +67,10 @@ pub struct HumanCreateAgentRequest {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// r265 (`profile-runtime-variants`): a runtime variant of the profile;
+    /// absent = the profile's default variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
     #[serde(default)]
     pub start: bool,
     /// Optional per-thread launch overrides (sandbox, approval, network,
@@ -95,6 +99,11 @@ impl HumanCreateAgentRequest {
         if let Some(profile) = &self.profile {
             if profile.trim().is_empty() || profile.chars().any(char::is_control) {
                 return Err(validation_error("profile must be a non-empty string"));
+            }
+        }
+        if let Some(variant) = &self.variant_id {
+            if crate::profiles::runtime_variants::validate_variant_id(variant).is_err() {
+                return Err(validation_error("variantId must be 1-32 characters of a-z, 0-9 and -"));
             }
         }
         if let Some(project_id) = &self.project_id {
@@ -258,7 +267,14 @@ pub(super) fn run_idempotent_create(
             )
         }
     };
-    match execute() {
+    crate::launch::stock::clear_effort_fallback();
+    super::profile_auto_pick::clear_thread_pick();
+    let result = execute();
+    // Design 041: the executor auto-picked the profile ("auto:<provider>").
+    let profile_pick = super::profile_auto_pick::take_thread_pick();
+    // Design 028 (b): the profile default effort was not offered by the model.
+    let effort_fallback = crate::launch::stock::take_effort_fallback();
+    match result {
         Ok(cutex_session_id) => {
             let registry = (context.load_registry)()?;
             let session = super::session::session_resource_including_hidden(
@@ -270,12 +286,23 @@ pub(super) fn run_idempotent_create(
             .ok()
             .flatten()
             .unwrap_or(Value::Null);
-            let response = json!({
+            let mut response = json!({
                 "contractVersion": 2,
                 "requestId": request_id,
                 "cutexSessionId": cutex_session_id,
                 "session": session,
             });
+            if let Some(pick) = profile_pick {
+                response["profilePick"] = serde_json::to_value(pick)?;
+            }
+            if let Some(fallback) = effort_fallback {
+                response["effortFallback"] = json!({
+                    "model": fallback.model,
+                    "requested": fallback.requested,
+                    "used": fallback.used,
+                    "reason": fallback.reason,
+                });
+            }
             if let Err(error) = idempotency.complete(&claim, 200, "OK", response.clone()) {
                 let _ = idempotency.mark_outcome_unknown(&claim);
                 eprintln!("human {noun} idempotency completion failed: {error:#}");

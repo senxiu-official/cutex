@@ -277,6 +277,7 @@ fn codex_skips_cutex_threads_and_fresh_lines() {
         token_source: UsageTokenSource::NativeLast,
         model_context_window: None,
         compaction_count: None,
+        model_requests: None,
         tokens: TokenUsageBreakdown { total_tokens: 3, input_tokens: 2, output_tokens: 1, ..Default::default() },
         cumulative_total: TokenUsageBreakdown::default(),
     }));

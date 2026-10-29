@@ -294,7 +294,10 @@ impl LocalDeployment {
             }
         }
         bundle.launch_config_sha256 = None; // User configuration is not an immutable artifact.
-        std::fs::write(materialization.join("config.toml"), config)?;
+        crate::config::atomic::write_private_bytes_atomic(
+            &materialization.join("config.toml"),
+            config.as_bytes(),
+        )?;
         bundle.version = 4;
         bundle.shared_config = super::stock::VerifiedFile {
             path: destination.join("config.toml"),
@@ -468,7 +471,10 @@ fn materialize_v3_home(
             )?;
         }
     }
-    std::fs::write(materialization.join("config.toml"), config)?;
+    crate::config::atomic::write_private_bytes_atomic(
+        &materialization.join("config.toml"),
+        config.as_bytes(),
+    )?;
     ensure!(
         !destination.try_exists()?,
         "v4 migration destination appeared during materialization"

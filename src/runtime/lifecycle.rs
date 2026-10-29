@@ -238,7 +238,7 @@ pub fn finalize_session_online_launch(
                 resume_plan.codex_session_id
             )
         }
-        CutexSessionRuntimeBackend::ClaudeSubscription => {
+        CutexSessionRuntimeBackend::Dsh | CutexSessionRuntimeBackend::Kimi | CutexSessionRuntimeBackend::ClaudeSubscription => {
             anyhow::bail!("Claude sessions use the Claude runtime controller, not Codex resume")
         }
         CutexSessionRuntimeBackend::Docker | CutexSessionRuntimeBackend::Future => {
@@ -361,7 +361,9 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: "account-live-remote-tui".to_string(),
             name: "live-remote-tui".to_string(),
             email: None,
@@ -379,6 +381,7 @@ mod tests {
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         }
     }
 

@@ -636,7 +636,7 @@ fn validate_activation(
         "explicit launch already activated; no downgrade API"
     );
     anyhow::ensure!(
-        !record.is_retired()
+        !crate::agent_management::agent_execution_blocked(&record)
             && record.agent_enabled
             && record.codex_session_id.as_deref() == Some(contract.native_id.as_str()),
         "active exact adopted identity required"

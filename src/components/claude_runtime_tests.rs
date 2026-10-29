@@ -1,4 +1,12 @@
 use super::*;
+
+#[test]
+fn bundled_source_install_uses_the_published_release_label() {
+    let handler = ClaudeRuntime::default();
+    let features: serde_json::Value = serde_json::from_str(include_str!("../../components/claude-runtime/src/cute_claude/features.json")).unwrap();
+    assert_eq!(handler.metadata().version, "claude-r32");
+    assert_eq!(features["release"], handler.metadata().version);
+}
 use crate::profiles::lifecycle::tests::TestHome;
 
 #[test]
@@ -38,8 +46,15 @@ fn layout_needs_the_files_cutex_runs() {
     let root = temp_root("layout");
     std::fs::create_dir_all(root.join("src/cute_claude")).unwrap();
     assert!(check_layout(Path::new("relative")).is_err());
-    assert!(check_layout(&root).unwrap_err().to_string().contains("__main__.py"));
+    assert!(check_layout(&root).unwrap_err().to_string().contains("component.json"));
     fake_runtime(&root);
+    check_layout(&root).unwrap();
+    std::fs::write(root.join("component.json"), r#"{"version":"claude-r28"}"#).unwrap();
+    assert!(check_layout(&root).unwrap_err().to_string().contains(BUNDLED_PYTHON_METADATA));
+    std::fs::write(root.join(BUNDLED_PYTHON_METADATA), "{}").unwrap();
+    assert!(check_layout(&root).unwrap_err().to_string().contains(BUNDLED_PYTHON_PAYLOAD));
+    std::fs::write(root.join(BUNDLED_PYTHON_PAYLOAD), "fixture").unwrap();
+    std::fs::write(root.join(BUNDLED_PYTHON_LICENSE), "PSF license fixture").unwrap();
     check_layout(&root).unwrap();
     std::fs::remove_file(root.join(LOCK_FILE)).unwrap();
     assert!(check_layout(&root).unwrap_err().to_string().contains(LOCK_FILE));
@@ -53,6 +68,142 @@ fn a_missing_claude_cli_is_a_user_step() {
     let step = error.downcast_ref::<NeedsUser>().expect("NeedsUser");
     assert_eq!(step.code, "claude_cli_missing");
     assert!(step.steps.iter().any(|s| s.contains("claude.ai/install")), "{:?}", step.steps);
+}
+
+fn fake_claude_cli(dir: &Path, name: &str, version: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    #[cfg(windows)]
+    let path = dir.join(format!("{name}.cmd"));
+    #[cfg(not(windows))]
+    let path = dir.join(name);
+    #[cfg(windows)]
+    std::fs::write(&path, format!("@echo {version}\r\n")).unwrap();
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+#[test]
+fn bundled_cli_is_default_and_environment_override_wins() {
+    let root = temp_root("cli-choice");
+    fake_runtime(&root);
+    std::fs::write(
+        root.join("component.json"),
+        r#"{"schema":"cutex/component/v1","name":"claude-runtime","version":"claude-r28","platforms":[]}"#,
+    )
+    .unwrap();
+    let bundled = fake_claude_cli(&root.join("prepared/venv/Lib/site-packages/claude_agent_sdk/_bundled"), "claude", "1.2.3 (Claude Code)");
+    let system = fake_claude_cli(&root.join("system"), "claude", "9.9.9 (Claude Code)");
+    std::fs::write(
+        prepared_dir(&root).join(PREPARE_RECEIPT),
+        serde_json::to_vec(&json!({"bundledClaudeCli": bundled})).unwrap(),
+    )
+    .unwrap();
+
+    let options = Options { claude_cli_choice: Some(crate::config::claude::ClaudeCliChoice::Bundled), ..Options::default() };
+    let selected = resolve_claude_cli(&root, &options).unwrap();
+    assert_eq!(selected.0, bundled);
+    assert_eq!(selected.1, "1.2.3 (Claude Code)");
+    assert_eq!(selected.2["selected"], "bundled");
+    assert_eq!(selected.2["override"], false);
+
+    let options = Options {
+        claude_cli: Some(system.clone()),
+        claude_cli_choice: Some(crate::config::claude::ClaudeCliChoice::Bundled),
+        ..Options::default()
+    };
+    let selected = resolve_claude_cli(&root, &options).unwrap();
+    assert_eq!(selected.0, system);
+    assert_eq!(selected.1, "9.9.9 (Claude Code)");
+    assert_eq!(selected.2["selected"], "system");
+    assert_eq!(selected.2["override"], true);
+    assert_eq!(selected.2["bundled"]["version"], "1.2.3 (Claude Code)");
+    assert_eq!(selected.2["system"]["version"], "9.9.9 (Claude Code)");
+
+    // A damaged non-selected bundled binary is diagnostic only: the explicit
+    // environment/system override must still win.
+    #[cfg(windows)]
+    std::fs::write(&bundled, "@exit /b 1\r\n").unwrap();
+    #[cfg(not(windows))]
+    std::fs::write(&bundled, "#!/bin/sh\nexit 1\n").unwrap();
+    let selected = resolve_claude_cli(&root, &options).unwrap();
+    assert_eq!(selected.0, system);
+    assert_eq!(selected.2["selected"], "system");
+    assert!(selected.2["bundled"].is_null());
+    assert!(selected.2["bundledError"].as_str().is_some());
+    let bundled_only = Options {
+        claude_cli_choice: Some(crate::config::claude::ClaudeCliChoice::Bundled),
+        ..Options::default()
+    };
+    assert!(resolve_claude_cli(&root, &bundled_only).is_err(), "a selected damaged bundle fails closed");
+
+    // An invalid explicit override wins and fails, but leaves a complete
+    // status record instead of stale/null diagnostics.
+    let invalid_override = Options {
+        claude_cli: Some(root.join("missing-system-cli")),
+        ..Options::default()
+    };
+    assert!(resolve_claude_cli(&root, &invalid_override).is_err());
+    let status = read_cli_status(&root);
+    assert_eq!(status["selected"], "system");
+    assert!(status["systemError"].as_str().is_some());
+    assert!(status["bundledError"].as_str().is_some(), "the damaged bundle is still diagnosed");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn component_cli_choice_wire_is_bounded_and_does_not_expose_paths_or_diagnostics() {
+    let raw = json!({
+        "selected": "system",
+        "override": true,
+        "bundled": {"path": "/private/bundled", "version": " 2.1.301 "},
+        "bundledError": null,
+        "system": {"path": "/private/system", "version": "2.1.299"},
+        "systemError": null,
+    });
+    assert_eq!(
+        cli_choice_wire(&raw),
+        json!({
+            "selected": "system",
+            "bundled": {"version": "2.1.301"},
+            "system": {"version": "2.1.299"},
+        })
+    );
+    assert_eq!(
+        cli_choice_wire(&json!({"bundled": {"version": null}, "system": null})),
+        json!({"selected": "bundled", "bundled": {"version": null}, "system": null})
+    );
+    assert!(
+        cli_choice_wire(&json!({"selected": "system", "bundled": {}, "system": null})).is_null()
+    );
+    assert!(
+        cli_choice_wire(&json!({"selected": "bundled", "bundled": null, "system": null})).is_null()
+    );
+    assert_eq!(
+        cli_choice_wire(&json!({"selected": "bundled", "bundled": {"version": "bad\nheader"}}))["bundled"]["version"],
+        Value::Null
+    );
+}
+
+#[test]
+fn r29_release_policy_bundles_an_unmodified_cli_by_default_and_keeps_the_off_switch_and_notices() {
+    let build = include_str!("../../components/claude-runtime/build.sh");
+    assert!(build.contains(r#"${CUTEX_CLAUDE_BUNDLE_CLI:-1}"#));
+    assert!(build.contains("0) ;;"));
+    assert!(build.contains("CUTEX_CLAUDE_BUNDLE_CLI must be 0 or 1"));
+
+    let vendor = include_str!("../../components/claude-runtime/scripts/vendor_wheels.py");
+    assert!(vendor.contains("actual != expected_sha256"));
+    assert!(vendor.contains("if bundled != [expected_cli]"));
+    assert!(vendor.contains("shutil.copyfile(wheel, target)"));
+
+    let notices = include_str!("../../components/claude-runtime/scripts/wheel_notices.py");
+    assert!(notices.contains("https://www.anthropic.com/legal/commercial-terms"));
+    assert!(notices.contains("https://code.claude.com/docs/en/legal-and-compliance"));
 }
 
 #[test]
@@ -76,9 +227,10 @@ fn fake_runtime(dir: &Path) {
     std::fs::create_dir_all(dir.join("src/claude_agent_sdk")).unwrap();
     std::fs::create_dir_all(dir.join("scripts")).unwrap();
     std::fs::create_dir_all(dir.join(WHEELS_DIR)).unwrap();
+    std::fs::write(dir.join("component.json"), r#"{"schema":"cutex/component/v1","name":"claude-runtime","version":"claude-r27","platforms":[]}"#).unwrap();
     std::fs::write(dir.join("src/cute_claude/__init__.py"), "__version__ = '9.9.9'\n").unwrap();
     std::fs::write(dir.join("src/cute_claude/__main__.py"), "def main():\n    pass\n").unwrap();
-    std::fs::write(dir.join("src/cute_claude/features.json"), r#"{"version":1,"release":"claude-r99","features":{}}"#).unwrap();
+    std::fs::write(dir.join("src/cute_claude/features.json"), r#"{"version":1,"release":"claude-r27","features":{}}"#).unwrap();
     std::fs::write(dir.join("src/claude_agent_sdk/__init__.py"), "__version__ = '0.0.0-fake'\n").unwrap();
     std::fs::write(dir.join("scripts/connect_tui.py"), "").unwrap();
     std::fs::write(dir.join(LOCK_FILE), "# python-versions: 3.11 3.12 3.13 3.14\n").unwrap();
@@ -417,4 +569,152 @@ fn a_missing_python_is_a_user_step_with_steps() {
     assert!(steps.iter().any(|s| s.contains(PYTHON_ENV)), "{steps:?}");
     drop(home);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Report from a colleague's install: a `<version>/prepared/needs-user.json` written into a version
+/// dir that was never unpacked would leave a half dir that every later fetch refuses. A user step is
+/// only recorded into an unpacked version (receipt.json); probe / select / prepare never create the
+/// version dir, and a dry run of a version not downloaded yet is not refused.
+#[test]
+fn a_user_step_never_creates_a_version_dir_that_was_not_unpacked() {
+    let home = TestHome::new();
+    let root = temp_root("not-unpacked");
+    let layout = Layout::at(root.join("base"));
+    let dir = super::super::version_dir(&layout, NAME, "claude-r98");
+    let step = || needs_user("python_missing", "no Python", python_steps(false));
+    let out = user_step_or(&dir, step(), |step| json!({"needsUser": step})).unwrap();
+    assert_eq!(out["needsUser"]["code"], "python_missing");
+    assert!(!dir.exists(), "no marker, no prepared/ in a dir that was not unpacked");
+    // Same for a dir that exists but has no receipt (an unpack that never finished).
+    std::fs::create_dir_all(&dir).unwrap();
+    user_step_or(&dir, step(), |step| step).unwrap();
+    assert!(!prepared_dir(&dir).exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let exec = crate::upgrade::service::RealExec;
+    let runtime = ClaudeRuntime { options: Some(Options { python: Some(root.join("no-python")), ..Options::default() }), ..ClaudeRuntime::default() };
+    let ctx = |dry_run| Context { layout: &layout, dir: dir.clone(), version: "claude-r98".into(), exec: &exec, previous: None, dry_run };
+    assert!(format!("{:#}", runtime.prepare(&ctx(false)).unwrap_err()).contains("component.json"));
+    assert!(runtime.select(&ctx(false)).is_err());
+    let entry = Entry { selected: "claude-r98".into(), origin: "signed".into(), installed_at: String::new(), last_error: None };
+    let probe = runtime.probe(&layout, &entry);
+    assert_eq!(probe["state"], states::DEGRADED, "{probe}");
+    assert!(probe["problem"].as_str().unwrap().contains("cutex component install claude-runtime"), "{probe}");
+    let dry = runtime.prepare(&ctx(true)).unwrap();
+    assert_eq!(dry["unpacked"], false, "{dry}");
+    assert!(!dir.exists(), "nothing above created the version dir");
+
+    // An unpacked version still records the step (probe reads it).
+    fake_runtime(&dir);
+    write_receipt(&dir, "claude-r98");
+    user_step_or(&dir, step(), |step| step).unwrap();
+    assert_eq!(recorded_needs_user(&dir).unwrap()["code"], "python_missing");
+    // Files missing from an unpacked version: degraded with the repair hint, not the stale step.
+    std::fs::remove_file(dir.join("src/cute_claude/__main__.py")).unwrap();
+    let probe = runtime.probe(&layout, &entry);
+    assert_eq!(probe["state"], states::DEGRADED, "{probe}");
+    assert!(probe["problem"].as_str().unwrap().contains("__main__.py"), "{probe}");
+    drop(home);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn needs_user_marker_is_written_atomically() {
+    use crate::config::atomic::test_hook::{self, Stage};
+    let dir = temp_root("needs-user-atomic");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(crate::components::RECEIPT_FILE), "{}").unwrap();
+    let marker = prepared_dir(&dir).join(NEEDS_USER_FILE);
+    let stages = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = stages.clone();
+    let expected = marker.clone();
+    let guard = test_hook::observe(move |stage, tmp| {
+        assert_eq!(tmp.parent(), expected.parent(), "temp marker sits next to the marker");
+        assert!(!expected.exists(), "the marker appears only by the rename");
+        seen.borrow_mut().push(stage);
+    });
+    let step = NeedsUser { code: "claude_cli_missing", message: "install".into(), steps: vec!["a".into()] };
+    record_needs_user(&dir, Some(&step));
+    drop(guard);
+    assert_eq!(*stages.borrow(), vec![Stage::Created, Stage::Written]);
+    assert_eq!(recorded_needs_user(&dir).unwrap()["code"], "claude_cli_missing");
+    let names: Vec<_> = std::fs::read_dir(prepared_dir(&dir)).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, vec![std::ffi::OsString::from(NEEDS_USER_FILE)], "no temp file left");
+    record_needs_user(&dir, None);
+    assert!(!marker.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explicit_python_override_precedes_the_bundled_interpreter() {
+    let Ok(host) = find_python(&Options::default()) else { return };
+    let root = temp_root("python-override");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(BUNDLED_PYTHON_METADATA), "{}").unwrap();
+    let selected = find_base_python(&root, &Options { python: Some(host.path.clone()), ..Options::default() }).unwrap();
+    assert_eq!(selected.source, "override");
+    assert_eq!(selected.path, host.path);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Real release archive, real standalone Python and real offline wheel install. Run alone with a
+/// platform-matching archive; PATH is emptied so this cannot silently fall back to host Python.
+#[test]
+#[ignore]
+fn e2e_release_archive_prepares_with_bundled_python_and_cli_offline() {
+    let archive = PathBuf::from(std::env::var("CUTEX_E2E_CLAUDE_ARCHIVE").expect("set CUTEX_E2E_CLAUDE_ARCHIVE"));
+    let home = PathBuf::from(std::env::var("CUTEX_TEST_PRIVATE_HOME").expect("set CUTEX_TEST_PRIVATE_HOME"));
+    assert_eq!(std::env::var_os("HOME").map(PathBuf::from), Some(home.clone()));
+    assert!(home.join(".cutex-test-private-home").is_file());
+    let version = ClaudeRuntime::default().metadata().version.clone();
+    let root = home.join(format!("{version}-offline-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    let layout = Layout::at(root.join("install-base"));
+    let dir = super::super::version_dir(&layout, NAME, &version);
+    crate::upgrade::archive::unpack_tar_gz_file(&archive, &dir).unwrap();
+    write_receipt(&dir, &version);
+
+    struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match self.1.take() {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+    }
+    let empty_path = root.join("empty-path");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    let restore_path = RestoreEnv("PATH", std::env::var_os("PATH"));
+    let restore_appdata = RestoreEnv("APPDATA", std::env::var_os("APPDATA"));
+    unsafe {
+        std::env::set_var("PATH", &empty_path);
+        std::env::set_var("APPDATA", &empty_path);
+    }
+
+    let exec = crate::upgrade::service::RealExec;
+    let ctx = Context { layout: &layout, dir: dir.clone(), version: version.into(), exec: &exec, previous: None, dry_run: false };
+    let tui = root.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+    std::fs::write(&tui, b"").unwrap();
+    let runtime = ClaudeRuntime {
+        options: Some(Options { tui_binary: Some(tui), ..Options::default() }),
+        ..ClaudeRuntime::default()
+    };
+    let prepared = runtime.prepare(&ctx).unwrap();
+    assert_eq!(prepared["venvCreated"], true, "{prepared}");
+    assert_eq!(prepared["receipt"]["basePythonSource"], "bundled", "{prepared}");
+    assert_eq!(prepared["receipt"]["basePythonVersion"], "3.13.17", "{prepared}");
+    assert!(venv_python(&dir).is_file());
+    assert!(bundled_python_path(&dir).is_file());
+    let selected = runtime.select(&ctx).unwrap();
+    assert_eq!(selected["selected"], true, "{selected}");
+    assert_eq!(selected["claudeCli"]["selected"], "bundled", "{selected}");
+    assert_eq!(selected["claudeCli"]["override"], false, "{selected}");
+    assert_eq!(selected["claudeCli"]["system"], Value::Null, "{selected}");
+    assert_eq!(selected["claudeCliVersion"], "2.1.299 (Claude Code)", "{selected}");
+    assert!(ClaudeDeployment::selected().unwrap().claude_cli.to_string_lossy().contains("_bundled"));
+    drop(restore_appdata);
+    drop(restore_path);
+    let _ = std::fs::remove_dir_all(root);
 }

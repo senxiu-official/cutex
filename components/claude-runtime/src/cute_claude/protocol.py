@@ -27,6 +27,7 @@ from .errors import RpcError, require, text
 from .provider import ProviderError
 from .store import COMPACT_EVENT, Store, dump, identifier
 from .model_config import ModelConfig
+from .live_settings import live_supported
 from .model_catalog import FAST_TIER, ModelCatalog, fast_mode_supported, native_models
 from .approvals import Approvals
 from .history import PROVIDER, History, thread_wire
@@ -233,7 +234,10 @@ class Server:
                     # cutex agent messaging v2 (0.4.0): `view` param, passive notes,
                     # `external_event` timeline items keyed by message id.
                     "views": True, "deliveryModes": ["after-turn", "passive"] + (["soon"] if subscription else []),
-                    "durableNextStepResults": subscription, "itemProjection": True},
+                    "durableNextStepResults": subscription, "itemProjection": True,
+                    # claude-r23: background subagents run on after their turn; a finished
+                    # one adds `notifyParent` to claude/task/updated (docs/BUSY_DELIVERY.md).
+                    "backgroundSubagents": subscription},
                 "history": "paginated", "tools": {"python": True, "httpJson": True, "mcp": subscription, "externalMcpServerRequired": False,
                     "nativePreset": "claude_code" if subscription else None,
                     "nativeInventoryMethod": "claude/tools/list" if subscription else None,
@@ -261,7 +265,7 @@ class Server:
         if self.settings.backend != "subscription":
             native = {"imageInput", "reasoning", "commandItems", "fileChangeItems", "turnDiff", "approvals",
                       "userInputRequests", "agentTurnQuestions", "planMode", "planChecklist", "compact", "effort", "rateLimits",
-                      "historyRevert", "fork", "threadDelete", "subagents", "subagentTranscripts", "autoReconnect", "backgroundTerminals", "mcpStatus", "fileRewind",
+                      "historyRevert", "fork", "threadDelete", "subagents", "subagentTranscripts", "backgroundSubagents", "autoReconnect", "backgroundTerminals", "mcpStatus", "fileRewind",
                       "versionedModelCatalog", "modelObservation", "safetyGrants", "fastMode", "sideChat", "forkWhileBusy",
                       "turnSteer", "permissionRules"}
             features.update({name: False for name in native})
@@ -332,6 +336,14 @@ class Server:
     def _effort(self, tid):
         return self.engine.thread_effort(tid) if self.settings.backend == 'subscription' else self.settings.effort
 
+    async def _live_settings(self) -> bool:
+        """Model / effort / fast mode go to the running Claude Code (live_settings): its version, read
+        with the model catalog's bounded probe."""
+        if self.settings.backend != 'subscription':
+            return False
+        cli = getattr(getattr(self.engine, 'driver', None), 'cli', None)
+        return live_supported(await self.model_catalog.probe.read(cli))
+
     def _validate_launch(self, params: dict) -> None:
         require(params.get("historyMode") in (None, "legacy", "paginated"), "unsupported historyMode")
         require(params.get("modelProvider") in (None, PROVIDER), "select modelProvider=cute-claude")
@@ -399,7 +411,8 @@ class Server:
             peer.initialized, peer.extensions, peer.opted_out = True, bool(caps.get("claudeExtensions")), set(opt)
             return {"userAgent": f"cute-claude-app-server/{__version__}", "codexHome": str(self.settings.state_dir),
                     "presentationVersion": 1, "platformFamily": "windows" if sys.platform == "win32" else "unix", "platformOs": platform.system().lower(),
-                    **self.external_inputs.capabilities()}, None
+                    **self.external_inputs.capabilities(),
+                    "fullTextItemTerminal": self.features().get("fullTextItemTerminal") is True}, None
         require(peer.initialized and peer.ready, "initialize and initialized are required", -32002)
         if method in EXTERNAL_INPUT_METHODS:
             return await self.external_inputs.dispatch(peer, method, params)
@@ -627,13 +640,15 @@ class Server:
             if fast is not None and fast == self._fast(tid):
                 fast = None
             if model != self.store.thread(tid)['model'] or desired_effort != self._effort(tid) or fast is not None:
-                # Permission mode and plan mode may change while a turn runs (Claude
-                # Code's shift+tab); a model, effort or fast mode change needs an idle thread.
-                require(not self.store.user_turn_busy(tid), "Finish or interrupt the current turn before changing Claude settings", -32009)
+                # Permission mode and plan mode may change while a turn runs (Claude Code's
+                # shift+tab). So do model, effort and fast mode on a CLI that takes them live
+                # (from its next model request); an older CLI replaces its child, idle only.
+                live = await self._live_settings()
+                require(live or not self.store.user_turn_busy(tid), "Finish or interrupt the current turn before changing Claude settings", -32009)
                 if fast is None:
-                    await self.engine.set_model_effort(tid, model, desired_effort)
+                    await self.engine.set_model_effort(tid, model, desired_effort, live=live)
                 else:
-                    await self.engine.set_model_effort(tid, model, desired_effort, fast)
+                    await self.engine.set_model_effort(tid, model, desired_effort, fast, live=live)
             requested = requested_mode(params, self.approvals.mode(tid))
             if requested is not None and requested != self.approvals.mode(tid):
                 await self.approvals.configure(tid, requested)
@@ -657,7 +672,7 @@ class Server:
                 skills=self.skills, cwd=self.store.thread(tid)['cwd'])
             require(not params.get("toolOutput"), "arbitrary tool-output injection is unsupported")
             if self.settings.backend == "subscription" and params.get("model"):
-                await self.engine.set_model(tid, params["model"])
+                await self.engine.set_model(tid, params["model"], live=await self._live_settings())
                 require(not self.store.user_turn_busy(tid), "thread became busy while changing model", -32009)
             if params.get('collaborationMode'):
                 await self.approvals.set_plan(tid, params['collaborationMode']['mode'] == 'plan')

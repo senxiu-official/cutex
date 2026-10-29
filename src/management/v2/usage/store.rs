@@ -38,6 +38,19 @@ pub(super) struct UsageMutation {
     pub entries: Vec<UsageLedgerEntry>,
 }
 
+pub(super) fn forget_deleted_session_at(root: &Path, id: &str) -> anyhow::Result<()> {
+    with_usage_store_lock(root, |state_path, ledger_dir| {
+        let mut state = load_usage_state(state_path)?;
+        flush_pending_entries(state_path, ledger_dir, &mut state)?;
+        let removed = state.sessions.remove(id).is_some();
+        if state.deleted_sessions.insert(id.to_string()) || removed {
+            state.mark_changed(&chrono::Utc::now().to_rfc3339())?;
+            write_usage_state(state_path, &state)?;
+        }
+        Ok(())
+    })
+}
+
 pub(super) fn update_usage_state_at(
     root: &Path,
     received_at: &str,
@@ -458,4 +471,31 @@ pub(super) fn secure_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 pub(super) fn state_path(root: &Path) -> std::path::PathBuf {
     root.join(USAGE_STATE_FILE)
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    #[test]
+    fn deleted_projection_keeps_other_sessions_and_ledger() {
+        let root = std::env::temp_dir().join(format!("usage-cleanup-{}", uuid::Uuid::new_v4()));
+        with_usage_store_lock(&root, |path, ledger| {
+            let mut state = UsageStateFile::default();
+            state.sessions.insert("gone".into(), Default::default());
+            state.sessions.insert("keep".into(), Default::default());
+            fs::create_dir_all(ledger)?;
+            fs::write(ledger.join("2026-10.jsonl"), b"ledger fixture")?;
+            write_usage_state(path, &state)
+        }).unwrap();
+        forget_deleted_session_at(&root, "gone").unwrap();
+        let loaded = load_usage_state(&state_path(&root)).unwrap();
+        assert!(!loaded.sessions.contains_key("gone"));
+        assert!(loaded.sessions.contains_key("keep"));
+        assert!(loaded.deleted_sessions.contains("gone"));
+        // Deleting a session that never received usage must fence its first late event too.
+        forget_deleted_session_at(&root, "not-yet-observed").unwrap();
+        assert!(load_usage_state(&state_path(&root)).unwrap().deleted_sessions.contains("not-yet-observed"));
+        assert_eq!(fs::read(root.join(USAGE_LEDGER_DIR).join("2026-10.jsonl")).unwrap(), b"ledger fixture");
+        fs::remove_dir_all(root).unwrap();
+    }
 }

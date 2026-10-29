@@ -1,9 +1,6 @@
-use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -56,7 +53,6 @@ const SSE_EVENT_NAME: &str = "cutex_management_event_v2";
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub(super) const SSE_SUBSCRIBER_CAPACITY: usize = 1024;
 
-static CUTEX_REQUEST_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 pub fn handle_v2_request(
     stream: &mut TcpStream,
@@ -71,8 +67,18 @@ pub fn handle_v2_request(
         .split('?')
         .next()
         .unwrap_or(request.path.as_str());
+    if path == "/v2/diagnostics/control" {
+        return handle_control_diagnostics(stream, request, agent_management_admin_token);
+    }
     if crate::browser_relay::http::is_path(path) {
         return crate::browser_relay::http::handle(stream,request,agent_management_admin_token,context);
+    }
+    if path == super::dsh_spike::PATH {
+        if !authenticated_root_request(request, agent_management_admin_token)
+            || crate::management::users::current_principal().is_some_and(|p| !p.is_owner()) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized", "owner credential required", false, json!({}));
+        }
+        return super::dsh_spike::handle(stream, request);
     }
     // Removed routes answer before authentication and before any state access.
     if let Some(message) = removed_v2_route(path) {
@@ -115,6 +121,30 @@ pub fn handle_v2_request(
                 "the Management root credential is required for services", false, json!({}));
         }
         return super::services::handle(stream, request);
+    }
+    if super::director::is_path(path) {
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream,401,"Unauthorized","unauthorized","The Management root credential is required for Director review",false,json!({}));
+        }
+        return super::director::handle(stream,request);
+    }
+    if let Some(route) = super::delegations::parse_path(path) {
+        if !authenticated_root_request(request, agent_management_admin_token)
+            || crate::management::users::current_principal().is_some_and(|p| !p.is_owner())
+            || (request.method != "GET" && crate::management::listeners::current_client_token().is_some_and(|token|
+                token.scope != crate::management::client_tokens::DeviceScope::Full)) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized", "human owner credential required", false, json!({}));
+        }
+        return super::delegations::handle(stream, request, route);
+    }
+    if super::fork_preview::is_path(path) {
+        if !authenticated_root_request(request, agent_management_admin_token)
+            || crate::management::users::current_principal().is_some_and(|p| !p.is_owner())
+        {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management owner credential is required for fork preview", false, json!({}));
+        }
+        return super::fork_preview::handle(stream, request);
     }
     if super::identity_api::is_path(path) {
         // Person identity: any authenticated principal, pending included
@@ -163,6 +193,12 @@ pub fn handle_v2_request(
         if !authenticated_root_request(request, agent_management_admin_token) { return write_v2_error(stream, 401, "Unauthorized", "unauthorized", "the Management root credential is required", false, json!({})); }
         return crate::peers::routes::handle_v2(stream, request);
     }
+    // Saved local media is owner-only, including owner-bound client tokens.
+    if super::media_refs::parse_path(path).is_some()
+        && crate::management::users::current_principal().is_some_and(|p| !p.is_owner())
+    {
+        return write_v2_error(stream, 403, "Forbidden", "forbidden", "only the owner may read history media", false, json!({}));
+    }
     // Remote-client routes (root credential or a Management client token,
     // which `management::client_tokens` has already mapped to root).
     if is_remote_client_root_path(path) {
@@ -179,6 +215,9 @@ pub fn handle_v2_request(
         if super::host_files::is_host_files_path(path) {
             return super::host_files::handle(stream, request);
         }
+        if super::file_transfer::is_host_path(path) {
+            return super::file_transfer::handle(stream, request, None);
+        }
         return super::host_dirs::handle(stream, request);
     }
     if super::runtime_packages::is_runtime_packages_path(path) {
@@ -189,6 +228,20 @@ pub fn handle_v2_request(
                 "the Management root credential is required for runtime packages", false, json!({}));
         }
         return super::runtime_packages::handle(stream, request, context);
+    }
+    if path == super::stop_idle::IDLE_PATH || path == super::stop_idle::STOP_PATH {
+        // Stopping idle agents is the owner's action: root only (before the
+        // /v2/runtimes/ prefix below).
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required to stop idle agents", false, json!({}));
+        }
+        return match (request.method.as_str(), path) {
+            ("GET", super::stop_idle::IDLE_PATH) => super::stop_idle::handle_idle(stream, request, context),
+            ("POST", super::stop_idle::STOP_PATH) => super::stop_idle::handle_stop(stream, request, context),
+            _ => write_v2_error(stream, 405, "Method Not Allowed", "method_not_allowed",
+                "use GET /v2/runtimes/idle or POST /v2/runtimes/stop-idle", false, json!({})),
+        };
     }
     if super::runtime_restore_api::is_path(path) {
         // Restore candidates after an unclean stop: root, incl. client /
@@ -236,6 +289,14 @@ pub fn handle_v2_request(
         }
         return super::claude_skills_import::handle(stream, request);
     }
+    if super::kimi_accounts_api::is_path(path) {
+        // r266 Kimi accounts (subscription logins of the owner): root only.
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for Kimi accounts", false, json!({}));
+        }
+        return super::kimi_accounts_api::handle(stream, request);
+    }
     if super::claude_accounts_api::is_path(path) {
         // Claude accounts (logins / API keys of the owner): root, incl.
         // client / device tokens.
@@ -245,6 +306,13 @@ pub fn handle_v2_request(
         }
         return super::claude_accounts_api::handle(stream, request);
     }
+    if super::approval_rules::is_path(path) {
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for approval rules", false, json!({}));
+        }
+        return super::approval_rules::handle(stream, request);
+    }
     if super::approvals::is_approvals_path(path) {
         // Deciding owner approvals is the Human owner's action: root only.
         if !authenticated_root_request(request, agent_management_admin_token) {
@@ -252,6 +320,12 @@ pub fn handle_v2_request(
                 "the Management root credential is required for approvals", false, json!({}));
         }
         return super::approvals::handle(stream, request);
+    }
+    if super::model_overload_retry::is_path(path) {
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized", "the Management root credential is required", false, json!({}));
+        }
+        return super::model_overload_retry::handle(stream, request);
     }
     if super::quota_continue::is_path(path) {
         // Claude quota auto-continue switch / pending continuation: root,
@@ -400,6 +474,15 @@ pub fn handle_v2_request(
         return super::health::handle(stream, request, context);
     }
     if super::agent_bus_stuck::is_path(path) {
+        if path == super::agent_bus_stuck::CLOSE_PATH
+            && (!authenticated_root_request(request, agent_management_admin_token)
+                || crate::management::users::current_principal().is_some_and(|p| !p.is_owner())
+                || crate::management::listeners::current_client_token().is_some_and(|token|
+                    token.scope != crate::management::client_tokens::DeviceScope::Full))
+        {
+            return write_v2_error(stream, 403, "Forbidden", "forbidden",
+                "the Management owner credential with full device scope is required to close a message", false, json!({}));
+        }
         // Listing and discarding stuck Agent Bus messages is the owner's
         // action: root (incl. device / client tokens).
         if !authenticated_root_request(request, agent_management_admin_token) {
@@ -457,6 +540,7 @@ pub(super) fn is_remote_client_root_path(path: &str) -> bool {
         || super::attachments::is_attachments_path(path)
         || super::host_dirs::is_host_dirs_path(path)
         || super::host_files::is_host_files_path(path)
+        || super::file_transfer::is_host_path(path)
 }
 
 /// True only when a dedicated Management root credential is configured and
@@ -525,6 +609,7 @@ fn v2_required_token<'a>(
 }
 
 fn agent_management_admin_path(path: &str) -> bool {
+    if super::director::is_path(path) {return true}
     matches!(
         path,
         "/v2/agent-management/authority"
@@ -534,10 +619,13 @@ fn agent_management_admin_path(path: &str) -> bool {
             | "/v2/agent-management/durable-candidates"
             | "/v2/agent-management/durable-import"
             | "/v2/agent-management/archive-review"
+            | super::archive::api::REVIEW
+            | super::archive::api::EXECUTE
             | "/v2/agent-management/adopt-saved-native"
             | "/v2/agent-management/archive-actions"
             | "/v2/agent-management/legacy-director-ownership-import"
             | "/v2/agent-management/reservation-reconciliation"
+            | "/v2/agent-management/create-abandon"
             | "/v2/agent-management/projects"
             | "/v2/agent-management/project-presentation"
             | "/v2/agent-management/operator-actions"
@@ -560,9 +648,14 @@ fn agent_management_admin_path(path: &str) -> bool {
             | "/v2/human/sessions"
     ) || management_project_id_from_path(path).is_some()
         || super::profile_quota::parse_path(path).is_some()
+        || path == super::profile_auto_pick::PATH
+        || path == super::profile_link::SECRET_PATH
+        || path == super::guides_preferences::PATH
+        || super::profile_reset_credits::parse_path(path).is_some()
         || super::profiles_api::is_profiles_path(path)
         || super::profile_login::parse_path(path).is_some()
         || super::profile_models::parse_path(path).is_some()
+        || super::storage::is_path(path)
         || path == super::settings_api::PATH
         || super::notification_levels::is_path(path)
         || path == super::user_instructions::PATH
@@ -571,6 +664,8 @@ fn agent_management_admin_path(path: &str) -> bool {
         || super::scoped_mcp::parse_path(path).is_some()
         || history_session_id_from_path(path).is_some()
         || history_turn_path(path).is_some()
+        || super::media_refs::parse_path(path).is_some()
+        || super::event_blobs::parse_path(path).is_some()
 }
 
 pub(super) fn materialize_active_stream_reset(
@@ -616,6 +711,9 @@ fn handle_v2_request_with_repository(
         }
         ("POST", "/v2/agent-management/legacy-director-ownership-import") => {
             handle_legacy_director_ownership_import(stream, request, context)
+        }
+        ("POST", "/v2/agent-management/create-abandon") => {
+            handle_agent_create_abandon(stream, request, context)
         }
         ("POST", "/v2/agent-management/reservation-reconciliation") => {
             handle_agent_reservation_reconciliation(stream, request, context)
@@ -714,6 +812,9 @@ fn handle_v2_request_with_repository(
                 Err(error) => write_agent_management_control_error(stream, error),
             }
         }
+        ("POST", super::archive::api::REVIEW | super::archive::api::EXECUTE) => {
+            super::archive::api::handle(stream, &request, context.owner_archive_action)
+        }
         ("POST", "/v2/agent-management/archive-review") => {
             let payload = match serde_json::from_slice(&request.body) {
                 Ok(payload) => payload,
@@ -805,10 +906,18 @@ fn handle_v2_request_with_repository(
             super::human_config::handle(stream, request)
         }
         ("GET", "/v2/host") => write_json_response(stream, 200, "OK", &super::host_info::host_resource()),
+        (_, super::profile_auto_pick::PATH) => super::profile_auto_pick::handle(stream, request),
+        (_, super::profile_link::SECRET_PATH) => super::profile_link::handle(stream, request),
+        (_, super::guides_preferences::PATH) => super::guides_preferences::handle(stream, request),
         (_, path) if super::profile_quota::parse_path(path).is_some() => {
             let (profile, route) =
                 super::profile_quota::parse_path(path).expect("matched profile quota path");
             super::profile_quota::handle(stream, request, &profile, route)
+        }
+        (_, path) if super::profile_reset_credits::parse_path(path).is_some() => {
+            let (profile, route) =
+                super::profile_reset_credits::parse_path(path).expect("matched reset credits path");
+            super::profile_reset_credits::handle(stream, request, &profile, route)
         }
         (_, path) if super::profile_models::parse_path(path).is_some() => {
             let (profile, route) =
@@ -823,6 +932,7 @@ fn handle_v2_request_with_repository(
         (_, path) if super::profiles_api::is_profiles_path(path) => {
             super::profiles_api::handle(stream, request, path)
         }
+        (_, path) if super::storage::is_path(path) => super::storage::handle(stream, request),
         (_, super::settings_api::PATH) => super::settings_api::handle(stream, request),
         (_, path) if super::notification_levels::is_path(path) => super::notification_levels::handle(stream, request),
         (_, super::user_instructions::PATH) => super::user_instructions::handle(stream, request),
@@ -896,6 +1006,17 @@ fn handle_v2_request_with_repository(
             let cutex_session_id =
                 history_session_id_from_path(path).expect("matched history path");
             handle_session_history(stream, request, context, repository, &cutex_session_id)
+        }
+        ("GET", path) if super::media_refs::parse_path(path).is_some() => {
+            let (session_id, sha) = super::media_refs::parse_path(path).expect("matched media path");
+            handle_session_media(stream, &session_id, &sha)
+        }
+        ("GET", path) if super::event_blobs::parse_path(path).is_some() => {
+            let (session_id,sha)=super::event_blobs::parse_path(path).expect("matched event blob path");
+            match super::event_blobs::EventBlobStore::open_default()?.get(&session_id,&sha) {
+                Some((mime,bytes))=>crate::http::server::write_http_response(stream,200,"OK",&mime,&bytes),
+                None=>write_v2_error(stream,404,"Not Found","blob_not_found","blob unavailable for this session",false,json!({})),
+            }
         }
         ("GET", path) if history_turn_path(path).is_some() => {
             let (session_id, turn_id) = history_turn_path(path).expect("matched history turn path");
@@ -977,22 +1098,34 @@ fn handle_v2_request_with_repository(
         }
         ("GET", super::summary::SUMMARY_EVENTS_PATH) => super::summary::handle_events(stream, request),
         ("POST", super::summary::SUMMARY_READ_PATH) => super::summary::handle_read(stream, request),
+        ("GET", path) if super::project_events::parse_route(path).is_some() => {
+            match super::project_events::parse_route(path).expect("matched above") {
+                super::project_events::Route::Background(project) => {
+                    super::project_events::handle_background(stream, context, &project, &mut |_| true, true)
+                }
+                route => super::project_events::handle(stream, request, &route, &mut |_| true),
+            }
+        }
         ("GET", "/v2/events/stream") => {
             let query = match replay_query(request, true) {
                 Ok(query) => query,
                 Err(error) => return write_replay_error(stream, error),
             };
-            let subscription =
+            let mut subscription =
                 match repository.page_and_subscribe(query.clone(), SSE_SUBSCRIBER_CAPACITY) {
                     Ok(subscription) => subscription,
                     Err(error) => return write_replay_error(stream, error),
                 };
+            if enable_live_deltas(repository, request, &query, &mut subscription).is_err() {
+                return write_live_capacity_error(stream);
+            }
             write_sse_headers(stream)?;
+            let watch = crate::management::listeners::RevocationWatch::for_stream(stream)?;
             stream_events(
                 stream,
                 subscription,
                 &query,
-                crate::management::listeners::RevocationWatch::for_current_request(),
+                watch,
             )
         }
         _ => write_v2_error(
@@ -1069,6 +1202,29 @@ fn handle_legacy_director_ownership_import(
             }
         };
     let response = (context.import_legacy_director_ownership)(payload);
+    write_json_response(stream, 200, "OK", &response)
+}
+
+fn handle_agent_create_abandon(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+    context: ManagementRequestContext,
+) -> anyhow::Result<()> {
+    let payload: crate::agent_management::CreateAbandonRequest = match serde_json::from_slice(&request.body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return write_v2_error(
+                stream,
+                400,
+                "Bad Request",
+                "invalid_request",
+                &format!("strict create abandon request {{action_id, dry_run?}} required: {error}"),
+                false,
+                json!({}),
+            )
+        }
+    };
+    let response = (context.abandon_agent_create)(payload);
     write_json_response(stream, 200, "OK", &response)
 }
 
@@ -1210,7 +1366,7 @@ fn handle_management_project_mutation(
     }
 }
 
-fn write_agent_management_control_error(
+pub(crate) fn write_agent_management_control_error(
     stream: &mut TcpStream,
     error: crate::agent_management::AgentManagementError,
 ) -> anyhow::Result<()> {
@@ -1270,6 +1426,12 @@ fn handle_bootstrap(
             )
         }
     };
+    let media = match super::media_refs::parse_media(request) {
+        Ok(media) => media,
+        Err(message) => {
+            return write_v2_error(stream, 400, "Bad Request", "invalid_request", &message, false, json!({}));
+        }
+    };
     let turn_limit = match super::history::parse_bootstrap_turn_limit(request) {
         Ok(turn_limit) => turn_limit,
         Err(message) => {
@@ -1284,6 +1446,10 @@ fn handle_bootstrap(
             )
         }
     };
+    // Capture the complete replay boundary BEFORE projection can arrange a
+    // terminal stop event. No repository lock spans projection or native RPC.
+    // An early cursor allows duplicates, never a permanently missing terminal.
+    let checkpoint = repository.checkpoint()?;
     let registry = (context.load_registry)()?;
     let Some(session) = owner_session_resource(
         cutex_session_id,
@@ -1303,10 +1469,18 @@ fn handle_bootstrap(
             json!({ "cutexSessionId": cutex_session_id }),
         );
     };
-    match build_bootstrap_resource(
+    let saved_files = media && super::media_refs::session_supports_saved_images(cutex_session_id);
+    let store = media
+        .then(super::media_refs::MediaStore::open_default)
+        .and_then(|store| store.map_err(|error| eprintln!("history media: cache unavailable: {error:#}")).ok());
+    let mut shaper = store
+        .as_ref()
+        .map(|store| super::history_turns::TurnShaper::new(cutex_session_id, store, compact).with_saved_files(saved_files));
+    match build_bootstrap_resource_shaped(
         &session,
-        repository,
+        checkpoint,
         turn_limit,
+        shaper.as_mut(),
         |message| {
             (context.forward_native_request)(cutex_session_id, message)
                 .map_err(|error| format!("{error:?}"))
@@ -1327,8 +1501,18 @@ fn handle_bootstrap(
         },
     ) {
         Ok(mut response) => {
+            super::native_errors::annotate_history_response(&mut response);
+            super::event_blobs::EventBlobStore::open_default()?
+                .externalize_media(cutex_session_id,&mut response)?;
+            if let Some(shaper) = &shaper {
+                shaper.finish_body(&mut response);
+                return write_json_response(stream, 200, "OK", &response);
+            }
             if compact {
                 super::compact::compact_items(&mut response);
+            }
+            if media {
+                super::media_refs::apply_default_with_saved_files(&mut response, cutex_session_id, saved_files);
             }
             write_json_response(stream, 200, "OK", &response)
         }
@@ -1384,6 +1568,12 @@ fn handle_session_history_read(
     turn_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let compact = super::compact::parse_compact(request);
+    let media = match super::media_refs::parse_media(request) {
+        Ok(media) => media,
+        Err(message) => {
+            return write_v2_error(stream, 400, "Bad Request", "invalid_request", &message, false, json!({}));
+        }
+    };
     let parsed = if turn_id.is_some() {
         super::history::parse_turn_query(request)
             .map(|()| super::history::HistoryQuery { limit: 1, cursor: None })
@@ -1430,18 +1620,29 @@ fn handle_session_history_read(
             json!({ "cutexSessionId": cutex_session_id }),
         );
     };
+    let saved_files = media && super::media_refs::session_supports_saved_images(cutex_session_id);
+    // media=ref pages shape their turns while reading (history_turns).
+    let store = (media && turn_id.is_none())
+        .then(super::media_refs::MediaStore::open_default)
+        .and_then(|store| store.map_err(|error| eprintln!("history media: cache unavailable: {error:#}")).ok());
+    let mut shaper = store
+        .as_ref()
+        .map(|store| super::history_turns::TurnShaper::new(cutex_session_id, store, compact == Ok(true)).with_saved_files(saved_files));
     let mut response = if let Some(turn_id) = turn_id {
         super::history::respond_turn(
             cutex_session_id, &session, turn_id,
             context.forward_native_request, context.open_offline_history,
         )
     } else {
-        super::history::respond(
-            cutex_session_id, &session, &query,
+        super::history::respond_shaped(
+            cutex_session_id, &session, &query, shaper.as_mut(),
             context.forward_native_request, context.open_offline_history,
         )
     };
     if response.is_success() {
+        super::native_errors::annotate_history_response(&mut response.body);
+        super::event_blobs::EventBlobStore::open_default()?
+            .externalize_media(cutex_session_id,&mut response.body)?;
         if turn_id.is_none() {
             super::history::attach_cutex_state(
                 &mut response.body,
@@ -1449,11 +1650,18 @@ fn handle_session_history_read(
                 (context.load_latest_token_usage)(cutex_session_id),
             );
         }
+        if let Some(shaper) = &shaper {
+            shaper.finish_body(&mut response.body);
+            return write_json_response(stream, 200, "OK", &response.body);
+        }
         if compact == Ok(true) {
             let count = super::compact::compact_items(&mut response.body);
             if turn_id.is_some() && count > 0 {
                 response.body["complete"] = json!(false);
             }
+        }
+        if media {
+            super::media_refs::apply_default_with_saved_files(&mut response.body, cutex_session_id, saved_files);
         }
         return write_json_response(stream, 200, "OK", &response.body);
     }
@@ -1468,6 +1676,27 @@ fn handle_session_history_read(
     )
 }
 
+/// `GET /v2/sessions/{id}/media/{sha256}` (history-media-refs): a media
+/// payload `?media=ref` replaced in this session's history.
+fn handle_session_media(stream: &mut TcpStream, cutex_session_id: &str, sha: &str) -> anyhow::Result<()> {
+    let saved_files = super::media_refs::session_supports_saved_images(cutex_session_id);
+    let found = super::event_blobs::EventBlobStore::open_default().ok()
+        .and_then(|store| store.get(cutex_session_id, sha))
+        .or_else(|| super::media_refs::MediaStore::open_default().ok().and_then(|store| store.get_with_saved_files(cutex_session_id, sha, saved_files)));
+    match found {
+        Some((mime, bytes)) => crate::http::server::write_http_response(stream, 200, "OK", &mime, &bytes),
+        None => write_v2_error(
+            stream,
+            404,
+            "Not Found",
+            "media_not_found",
+            "media unavailable: missing, changed, linked, oversized, unauthorized, or unsupported by this session runtime",
+            false,
+            json!({ "cutexSessionId": cutex_session_id, "sha256": sha }),
+        ),
+    }
+}
+
 #[derive(Debug)]
 enum BootstrapBuildError {
     Native { message: String, details: Value },
@@ -1477,10 +1706,25 @@ enum BootstrapBuildError {
 /// `turn_limit` (history-pages, `?turnLimit=`): read only the newest turns
 /// with `thread/turns/list` and report the page as `historyPage`; `None` keeps
 /// the full `thread/read includeTurns` snapshot (and no `historyPage` key).
+#[cfg(test)]
 fn build_bootstrap_resource(
     session: &Value,
     repository: &EventRepository,
     turn_limit: Option<u32>,
+    forward_native: impl FnMut(Value) -> Result<Value, String>,
+    load_state: impl FnOnce(u64) -> anyhow::Result<Value>,
+) -> Result<Value, BootstrapBuildError> {
+    let checkpoint = repository.checkpoint().map_err(BootstrapBuildError::State)?;
+    build_bootstrap_resource_shaped(session, checkpoint, turn_limit, None, forward_native, load_state)
+}
+
+/// `shaper` (`media=ref`): the `turnLimit` page's turns come back shaped
+/// (`history_turns`); finish with `TurnShaper::finish_body`.
+fn build_bootstrap_resource_shaped(
+    session: &Value,
+    checkpoint: super::model::EventCheckpoint,
+    turn_limit: Option<u32>,
+    mut shaper: Option<&mut super::history_turns::TurnShaper>,
     mut forward_native: impl FnMut(Value) -> Result<Value, String>,
     load_state: impl FnOnce(u64) -> anyhow::Result<Value>,
 ) -> Result<Value, BootstrapBuildError> {
@@ -1492,9 +1736,6 @@ fn build_bootstrap_resource(
         .pointer("/native/threadId")
         .and_then(Value::as_str)
         .filter(|thread_id| !thread_id.is_empty());
-    let checkpoint = repository
-        .checkpoint()
-        .map_err(BootstrapBuildError::State)?;
     let app_server_connected = session
         .pointer("/runtime/appServerConnected")
         .and_then(Value::as_bool)
@@ -1509,9 +1750,14 @@ fn build_bootstrap_resource(
         };
         if let Some(limit) = turn_limit {
             let query = super::history::HistoryQuery { limit, cursor: None };
-            let mut page = super::history::read_history_page(
+            let key = super::history::index_key(cutex_session_id, session, "live");
+            if let Some(shaper) = shaper.as_deref_mut() {
+                shaper.begin(&key, true);
+            }
+            let mut page = super::history::read_history_page_shaped(
                 thread_id,
                 &query,
+                shaper,
                 &mut super::history::rpc_call(&mut forward_native),
             )
             .map_err(|error| match error {
@@ -1526,7 +1772,7 @@ fn build_bootstrap_resource(
                     }
                 }
             })?;
-            super::history::annotate_bootstrap(&super::history::index_key(cutex_session_id, session, "live"), &mut page);
+            super::history::annotate_bootstrap(&key, &mut page);
             history_page = super::history::page_json(limit, None, &page);
             json!({
                 "method": "thread/read",
@@ -1542,7 +1788,8 @@ fn build_bootstrap_resource(
                 message: "the native thread snapshot could not be read".to_string(),
                 details: json!({ "diagnostic": diagnostic }),
             })?;
-            let Some(native_result) = native_response.get("result").cloned() else {
+            let mut native_response = native_response;
+            let Some(native_result) = native_response.get_mut("result").map(Value::take) else {
                 return Err(BootstrapBuildError::Native {
                     message: "thread/read returned a native error".to_string(),
                     details: json!({ "native": { "message": native_response } }),
@@ -2139,6 +2386,30 @@ fn handle_native_request_for_session(
             );
         }
     };
+    if matches!(native_request.method.as_str(), "turn/start" | "turn/steer") {
+        let paused = match crate::asks::store::AskStore::open_default().and_then(|store| {
+            store.inspect(|state| crate::asks::agent_pause::is_paused(state, cutex_session_id))
+        }) {
+            Ok(paused) => paused,
+            Err(_) => {
+                return write_v2_request_error(
+                    stream,
+                    503,
+                    "Service Unavailable",
+                    Some(&native_request.request_id),
+                    "agent_pause_persistence_unavailable",
+                    "the agent pause state could not be read",
+                    true,
+                    json!({ "cutexSessionId": cutex_session_id }),
+                );
+            }
+        };
+        if paused {
+            return write_v2_request_error(stream, 409, "Conflict", Some(&native_request.request_id),
+                "agent_paused", "the agent is paused; resume it before sending native input", true,
+                json!({ "cutexSessionId": cutex_session_id }));
+        }
+    }
     if !session
         .pointer("/runtime/appServerConnected")
         .and_then(Value::as_bool)
@@ -2214,7 +2485,9 @@ fn handle_native_request_for_session(
                 json!({ "retryAfterMs": 250 }),
             );
         }
-        Ok(BeginRequest::Completed(response)) => {
+        Ok(BeginRequest::Completed(mut response)) => {
+            super::event_blobs::EventBlobStore::open_default()?
+                .externalize_media(cutex_session_id,&mut response.body)?;
             return write_json_response(stream, response.status, &response.reason, &response.body);
         }
         Ok(BeginRequest::Conflict) => {
@@ -2254,7 +2527,15 @@ fn handle_native_request_for_session(
     };
 
     match forward_native_request(cutex_session_id, native_request.native_message) {
-        Ok(native_response) => {
+        Ok(mut native_response) => {
+            if let Err(error) = super::event_blobs::EventBlobStore::open_default()
+                .and_then(|store| store.externalize_media(cutex_session_id,&mut native_response)) {
+                // Forwarding already happened. Do not label this request safe
+                // to replay merely because media publication failed afterward.
+                idempotency.mark_outcome_unknown(&claim)?;
+                return write_request_outcome_unknown(stream,&native_request.request_id,
+                    json!({"resyncRequired":true,"diagnostic":format!("native response media could not be stored: {error:#}")}));
+            }
             let response = json!({
                 "contractVersion": 2,
                 "requestId": native_request.request_id,
@@ -2373,7 +2654,7 @@ enum SubmitStage {
 /// Only slow, validated submit requests emit a bounded metadata-only line.
 /// These are monotonic call durations, not the SQLite receipt's wall-clock
 /// timestamps: complete() includes its actual UPDATE/commit/checkpoint wait.
-struct SlowSubmitTrace {
+struct SlowSubmitTrace<'lock> {
     started: Instant,
     stage_started: Instant,
     stage: SubmitStage,
@@ -2381,9 +2662,27 @@ struct SlowSubmitTrace {
     ids: Option<(String, String)>,
     status: u16,
     finished: Option<Instant>,
+    request_guard: Option<super::session_coordination::OperationReservation<'lock>>,
+    control: Option<super::control_timing::Trace>,
 }
 
-impl SlowSubmitTrace {
+fn handle_control_diagnostics(stream: &mut TcpStream, request: &SimpleHttpRequest, root: Option<&str>) -> anyhow::Result<()> {
+    if !authenticated_root_request(request, root)
+        || crate::management::users::current_principal().is_some_and(|principal| !principal.is_owner()) {
+        return write_v2_error(stream, 401, "Unauthorized", "unauthorized", "the owner credential is required", false, json!({}));
+    }
+    if request.method != "GET" {
+        return write_v2_error(stream, 405, "Method Not Allowed", "method_not_allowed", "use GET", false, json!({}));
+    }
+    write_json_response(stream, 200, "OK", &json!({"contractVersion":2,
+        "scope":"management_process", "timing":super::control_timing::snapshot(),
+        "asksStoreLocks":crate::asks::store::diagnostics::snapshot(),
+        "capacity":super::control_capacity::snapshot(),
+        "queues":{"repository":super::repository::queue_diagnostics(),
+            "nativeEvents":crate::app_server::client::event_queue_diagnostics()}}))
+}
+
+impl<'lock> SlowSubmitTrace<'lock> {
     fn new() -> Self {
         let now = Instant::now();
         Self {
@@ -2394,6 +2693,8 @@ impl SlowSubmitTrace {
             ids: None,
             status: 500,
             finished: None,
+            request_guard: None,
+            control: None,
         }
     }
 
@@ -2419,6 +2720,21 @@ impl SlowSubmitTrace {
     }
 
     fn advance_at(&mut self, stage: SubmitStage, now: Instant) {
+        if matches!(stage, SubmitStage::ResponseWrite) {
+            // The operation and its durable receipt are finished. A slow
+            // reader must not hold this session's business serialization.
+            self.request_guard.take();
+        }
+        if let Some(control) = self.control.as_mut() {
+            use super::control_timing::Stage;
+            control.stage(match stage {
+                SubmitStage::SessionMutex => Stage::LockWait,
+                SubmitStage::SessionResource => Stage::StoreRead,
+                SubmitStage::IdempotencyBegin | SubmitStage::IdempotencyComplete => Stage::StoreWrite,
+                SubmitStage::Dispatch => Stage::Dispatch,
+                SubmitStage::ResponseWrite => Stage::ResponseWrite,
+            });
+        }
         self.elapsed[self.stage as usize] += now.duration_since(self.stage_started);
         self.stage_started = now;
         self.stage = stage;
@@ -2429,6 +2745,7 @@ impl SlowSubmitTrace {
         if response.is_err() {
             self.status = 0;
         } // no complete HTTP response
+        if let Some(control) = self.control.as_mut() { control.status(self.status); }
         response
     }
 
@@ -2448,8 +2765,10 @@ impl SlowSubmitTrace {
     }
 }
 
-impl Drop for SlowSubmitTrace {
+impl Drop for SlowSubmitTrace<'_> {
     fn drop(&mut self) {
+        self.request_guard.take();
+        if let Some(control) = self.control.as_mut() { control.status(self.status); }
         if let Some(line) = self.line_at(Instant::now()) {
             // Best effort; no new file, fsync, or diagnostic repository lock.
             let _ = writeln!(std::io::stderr().lock(), "{line}");
@@ -2465,12 +2784,7 @@ fn handle_cutex_request(
     cutex_session_id: &str,
     owner: Option<&crate::management::control_plane::HumanManagementPrincipal>,
 ) -> anyhow::Result<()> {
-    let mut trace = SlowSubmitTrace::new();
     let request_lock = cutex_request_lock(cutex_session_id)?;
-    let _request_guard = request_lock
-        .lock()
-        .map_err(|_| anyhow::anyhow!("management v2 cutex request lock was poisoned"))?;
-    trace.advance(SubmitStage::SessionResource);
     let request_id_hint = request_id_hint(&request.body);
     let cutex_request = match validate_cutex_request_body(&request.body) {
         Ok(request) => request,
@@ -2478,9 +2792,6 @@ fn handle_cutex_request(
             return write_cutex_request_validation_error(stream, request_id_hint.as_deref(), error);
         }
     };
-    if cutex_request.method == "cutex/userInput/submit" {
-        trace.enable(&cutex_request.request_id, cutex_session_id);
-    }
     // Safety grants are the owner's: refused before any state is read.
     if super::safety_checks::is_command(&cutex_request.method) && owner.is_none() {
         return write_v2_request_error(
@@ -2494,8 +2805,40 @@ fn handle_cutex_request(
             json!({ "cutexSessionId": cutex_session_id }),
         );
     }
+    // Start the lock clock after pure validation, so the legacy lock-wait
+    // field does not accidentally include JSON parsing or permission checks.
+    let mut trace = SlowSubmitTrace::new();
+    if cutex_request.method == "cutex/userInput/submit" {
+        trace.enable(&cutex_request.request_id, cutex_session_id);
+    }
+    use super::control_timing::{Path as ControlPath, Stage as ControlStage, Trace as ControlTrace};
+    let mut control = ControlTrace::new(if cutex_request.method == "cutex/userInput/submit" { ControlPath::UserInput } else { ControlPath::ControlOther });
+    control.stage(ControlStage::LockWait);
+    trace.control = Some(control);
+    // Pure reads observe repository snapshots without waiting for a native
+    // mutation. Mutations retain an execution capability through durable
+    // settlement, but no coordinator mutex during reads, RPC or fanout.
+    if super::request_idempotency::method_needs_idempotency(&cutex_request.method) {
+        trace.request_guard = Some(request_lock.reserve()?);
+    }
+    trace.advance(SubmitStage::SessionResource);
     let registry = (context.load_registry)()?;
-    let session = if matches!(
+    // Online input only needs its bound native thread and connected runtime.
+    // Keep UI projections and their shared activity/pending/cache reads out
+    // of this session's serialized submit path. A changing/offline binding
+    // falls back to the existing full resource used by offline start plans.
+    let online_submit = if matches!(cutex_request.method.as_str(),"cutex/userInput/queue/list"|"cutex/focus/get") {
+        super::session::read_route_resource(cutex_session_id,&registry,
+            !request_may_resolve_hidden_session(&cutex_request.method,owner.is_some()))?
+    } else if cutex_request.method == "cutex/userInput/submit" {
+        super::session::online_submit_resource(
+            cutex_session_id, &registry, context.load_runtime_status,
+            !request_may_resolve_hidden_session(&cutex_request.method, owner.is_some()),
+        )?
+    } else { None };
+    let session = if let Some(session) = online_submit {
+        Some(session)
+    } else if matches!(
         cutex_request.method.as_str(),
         "cutex/session/retire" | "cutex/session/restore" | super::session_delete::METHOD
     ) {
@@ -2544,11 +2887,11 @@ fn handle_cutex_request(
         &cutex_request.request_id,
         &canonical_body,
     );
-    trace.advance(SubmitStage::ResponseWrite);
     let claim = match begin {
         Ok(BeginRequest::Forward(claim)) => claim,
         Ok(BeginRequest::InProgress) => {
             trace.status = 202;
+            trace.advance(SubmitStage::ResponseWrite);
             return trace.finish_response(write_v2_request_error(
                 stream,
                 202,
@@ -2562,6 +2905,7 @@ fn handle_cutex_request(
         }
         Ok(BeginRequest::Completed(response)) => {
             trace.status = response.status;
+            trace.advance(SubmitStage::ResponseWrite);
             return trace.finish_response(write_json_response(
                 stream,
                 response.status,
@@ -2571,6 +2915,7 @@ fn handle_cutex_request(
         }
         Ok(BeginRequest::Conflict) => {
             trace.status = 409;
+            trace.advance(SubmitStage::ResponseWrite);
             return trace.finish_response(write_v2_request_error(
                 stream,
                 409,
@@ -2584,6 +2929,7 @@ fn handle_cutex_request(
         }
         Ok(BeginRequest::OutcomeUnknown) => {
             trace.status = 409;
+            trace.advance(SubmitStage::ResponseWrite);
             return trace.finish_response(write_request_outcome_unknown(
                 stream,
                 &cutex_request.request_id,
@@ -2592,6 +2938,7 @@ fn handle_cutex_request(
         }
         Ok(BeginRequest::CapacityExceeded(full)) => {
             trace.status = 503;
+            trace.advance(SubmitStage::ResponseWrite);
             return trace.finish_response(write_idempotency_capacity_exceeded(
                 stream,
                 &cutex_request.request_id,
@@ -2600,6 +2947,7 @@ fn handle_cutex_request(
         }
         Err(error) => {
             trace.status = 503;
+            trace.advance(SubmitStage::ResponseWrite);
             return trace.finish_response(write_v2_request_error(
                 stream,
                 503,
@@ -2614,7 +2962,10 @@ fn handle_cutex_request(
     };
 
     trace.advance(SubmitStage::Dispatch);
-    let operation = if cutex_request.method == "cutex/runtime/online" {
+    // Safety cancellation preflight uses try-locks and latches retry disabled on
+    // failure. The original dispatcher below keeps its native concurrency guard;
+    // errors still converge through normal operation/idempotency settlement.
+    let operation = super::model_overload_retry::dispatch_after_cancel_with_reservation(cutex_session_id, &cutex_request.method, trace.request_guard.as_ref(), || { if cutex_request.method == "cutex/runtime/online" {
         dispatch_owner_runtime_online(
             event_repository,
             |id, _method, params| (context.online_session)(owner, id, params),
@@ -2751,7 +3102,7 @@ fn handle_cutex_request(
             &session,
             &cutex_request,
         )
-    };
+    } });
     trace.advance(SubmitStage::IdempotencyComplete);
     if operation.is_ok() {
         // The owner acted on the agent: a pending quota continuation ends.
@@ -2791,6 +3142,7 @@ fn handle_cutex_request(
             &cutex_request.request_id,
             error,
             Some(&mut trace),
+            Some(&cutex_request.params),
         ),
     }
 }
@@ -2861,7 +3213,7 @@ fn write_cutex_operation_error(
     request_id: &str,
     error: super::user_input::UserInputExecutionError,
 ) -> anyhow::Result<()> {
-    write_cutex_operation_error_traced(stream, idempotency, claim, request_id, error, None)
+    write_cutex_operation_error_traced(stream, idempotency, claim, request_id, error, None, None)
 }
 
 fn write_cutex_operation_error_traced(
@@ -2871,7 +3223,11 @@ fn write_cutex_operation_error_traced(
     request_id: &str,
     error: super::user_input::UserInputExecutionError,
     mut trace: Option<&mut SlowSubmitTrace>,
+    correlation: Option<&Value>,
 ) -> anyhow::Result<()> {
+    let diagnostic = super::request_idempotency::UnknownDiagnostic::new(&error.code, &error.stage)
+        .with_correlation(&error.details)
+        .with_correlation(correlation.unwrap_or(&Value::Null));
     let status = cutex_operation_error_status(&error.code, error.outcome_unknown);
     let reason = http_reason(status);
     let outcome_unknown = error.outcome_unknown;
@@ -2906,7 +3262,7 @@ fn write_cutex_operation_error_traced(
         }
     });
     if outcome_unknown {
-        if let Err(mark_error) = idempotency.mark_outcome_unknown(claim) {
+        if let Err(mark_error) = idempotency.mark_outcome_unknown_diagnostic(claim, &diagnostic) {
             body.pointer_mut("/error/details")
                 .and_then(Value::as_object_mut)
                 .expect("outcome-unknown details are an object")
@@ -2947,7 +3303,10 @@ fn write_post_cutex_operation_outcome_unknown_traced(
         "originalCode": "response_persistence_failed",
         "diagnostic": format!("{persistence_error:#}"),
     });
-    if let Err(mark_error) = idempotency.mark_outcome_unknown(claim) {
+    let diagnostic = super::request_idempotency::UnknownDiagnostic::new(
+        "response_persistence_failed", "response_persistence",
+    );
+    if let Err(mark_error) = idempotency.mark_outcome_unknown_diagnostic(claim, &diagnostic) {
         details
             .as_object_mut()
             .expect("outcome-unknown details are an object")
@@ -3002,15 +3361,11 @@ fn request_may_resolve_hidden_session(method: &str, authenticated_owner: bool) -
     authenticated_owner || method == "cutex/session/visibility/show"
 }
 
-fn cutex_request_lock(cutex_session_id: &str) -> anyhow::Result<Arc<Mutex<()>>> {
-    let mut locks = CUTEX_REQUEST_LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| anyhow::anyhow!("management v2 cutex request lock registry was poisoned"))?;
-    Ok(locks
-        .entry(cutex_session_id.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone())
+fn cutex_request_lock(cutex_session_id: &str) -> anyhow::Result<Arc<super::session_coordination::OperationLane>> {
+    // One lane for HTTP mutations, native input/queue, asks, ingress and
+    // revert: an independent outer gate could let a lifecycle change cross
+    // an already authorized native send. Nested calls retain the same token.
+    super::user_input::session_input_lock(cutex_session_id)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3749,7 +4104,7 @@ pub const SESSION_NOTE_MAX_CHARS: usize = 280;
 pub const SESSION_AVATAR_VALUE_MAX_CHARS: usize = 64;
 
 /// Validate `cutex/session/metadata/update` params beyond the JSON schema.
-/// Each of displayName / note / avatar is tri-state: omitted = unchanged,
+/// Each of displayName / note / avatar / avatarMode is tri-state: omitted = unchanged,
 /// null = clear, value = set. At least one must be present.
 pub(super) fn validate_session_metadata_params(
     params: &Value,
@@ -3757,16 +4112,31 @@ pub(super) fn validate_session_metadata_params(
     let object = params
         .as_object()
         .ok_or_else(|| invalid_user_input_error("params must be an object"))?;
-    let allowed = ["expectedRevision", "displayName", "note", "avatar"];
+    let allowed = ["expectedRevision", "displayName", "note", "avatar", "avatarMode", "badge"];
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(invalid_user_input_error(
-            "metadata params accept only expectedRevision, displayName, note, avatar",
+            "metadata params accept only expectedRevision, displayName, note, avatar, avatarMode, badge",
         ));
     }
     optional_safe_integer_param(object, "expectedRevision")?;
+    if object.contains_key("avatarMode") {
+        if object.get("expectedRevision").and_then(Value::as_u64).is_none() {
+            return Err(invalid_user_input_error("avatarMode changes require expectedRevision"));
+        }
+        if !matches!(object.get("avatarMode"), Some(Value::Null))
+            && !object.get("avatarMode").and_then(Value::as_str).is_some_and(|mode| matches!(mode, "fixed" | "inherit"))
+        {
+            return Err(invalid_user_input_error("avatarMode must be fixed, inherit or null"));
+        }
+        if object.get("avatarMode").and_then(Value::as_str) == Some("inherit")
+            && object.get("avatar").is_some_and(|value| !value.is_null())
+        {
+            return Err(invalid_user_input_error("avatarMode inherit cannot include a non-null avatar"));
+        }
+    }
     if object.keys().filter(|key| key.as_str() != "expectedRevision").count() < 1 {
         return Err(invalid_user_input_error(
-            "metadata update requires at least one of displayName, note, avatar",
+            "metadata update requires at least one of displayName, note, avatar, avatarMode, badge",
         ));
     }
     match object.get("displayName") {
@@ -3799,6 +4169,11 @@ pub(super) fn validate_session_metadata_params(
             }
         }
         Some(_) => return Err(invalid_user_input_error("note must be a string or null")),
+    }
+    if let Some(value) = object.get("badge").filter(|v| !v.is_null()) {
+        let badge = serde_json::from_value(value.clone())
+            .map_err(|_| invalid_user_input_error("badge must be {text, tint?} or null"))?;
+        crate::session::model::validate_session_badge(&badge).map_err(invalid_user_input_error)?;
     }
     match object.get("avatar") {
         None | Some(Value::Null) => {}
@@ -3837,15 +4212,12 @@ fn dispatch_session_metadata_update(
     event_repository: &EventRepository,
     mutate_session: ManagementSessionMutationHandler,
     cutex_session_id: &str,
-    session: &Value,
+    _session: &Value,
     request: &ValidatedCutexRequest,
 ) -> Result<Value, super::user_input::UserInputExecutionError> {
     validate_session_metadata_params(&request.params)?;
-    let object = request
-        .params
-        .as_object()
-        .expect("validated metadata params are an object");
-    require_session_revision(session, object)?;
+    // `expectedRevision` is checked by the store mutation, per field: a
+    // revision moved only by writes to other fields still applies (r252).
     let result = mutate_session(cutex_session_id, &request.method, request.params.clone())?;
     let revision = result
         .get("revision")
@@ -3859,6 +4231,8 @@ fn dispatch_session_metadata_update(
         "displayNameOverride": field("displayNameOverride"),
         "note": field("note"),
         "avatar": field("avatar"),
+        "avatarMode": field("avatarMode"),
+        "badge": field("badge"),
     });
     append_cutex_event(
         event_repository,
@@ -3874,6 +4248,8 @@ fn dispatch_session_metadata_update(
             "displayNameOverride": metadata["displayNameOverride"],
             "note": metadata["note"],
             "avatar": metadata["avatar"],
+            "avatarMode": metadata["avatarMode"],
+            "badge": metadata["badge"],
             "updatedAt": chrono::Utc::now().to_rfc3339(),
         }),
     )
@@ -4141,6 +4517,11 @@ pub(super) fn dispatch_user_input_submit(
     });
     match execution {
         Ok(execution) => {
+            let image_delivery = super::user_input::image_steering::accepted_delivery(
+                &params.input,
+                session.pointer("/runtime/backend").and_then(Value::as_str) == Some("claude_subscription"),
+                &execution,
+            );
             if execution.disposition == UserInputDisposition::Queued {
                 let queue = execution
                     .queue
@@ -4183,7 +4564,8 @@ pub(super) fn dispatch_user_input_submit(
                         ..Default::default()
                     },
                     "cutex/userInput/submitted",
-                    json!({
+                    {
+                        let mut submitted = json!({
                         "managementRequestId": request.request_id,
                         "clientUserMessageId": params.client_user_message_id,
                         "origin": params.origin,
@@ -4194,7 +4576,10 @@ pub(super) fn dispatch_user_input_submit(
                         "turnId": execution.turn_id,
                         "appServerAccepted": true,
                         "submittedAt": chrono::Utc::now().to_rfc3339(),
-                    }),
+                        });
+                        if let Some(mode) = image_delivery { submitted["imageDelivery"] = json!(mode); }
+                        submitted
+                    },
                 )
                 .map_err(post_operation_persistence_error)?;
             }
@@ -4206,10 +4591,12 @@ pub(super) fn dispatch_user_input_submit(
                 "turnId": execution.turn_id,
                 "queue": execution.queue,
             });
+            if let Some(mode) = image_delivery { result["imageDelivery"] = json!(mode); }
             // Capability `queue-idle-start`: whether a queued item is held by
             // a queue pause (only with `queue`).
             if execution.queue.is_some() {
                 result["paused"] = json!(execution.queue_paused);
+                if let Some(reason) = &execution.join_refusal { result["joinRefusal"] = json!(reason); }
             }
             Ok(result)
         }
@@ -4622,7 +5009,12 @@ pub(super) fn cutex_operation_error_status(code: &str, outcome_unknown: bool) ->
         "workspace_root_required"
         | "cwd_required"
         | "unsupported_profile"
-        | "unsupported_launch_option" => 400,
+        | "unsupported_launch_option"
+        | "provider_required"
+        | "unknown_provider" => 400,
+        "no_auto_pick_candidate" | "auto_pick_unavailable" => 409,
+        // profile-relay-runtimes: the profile has no usable address for the runtime.
+        "variant_base_url_missing" | "relay_runtime_unavailable" => 409,
         "queue_item_not_found" | "admission_item_not_found" => 404,
         // An earlier submit of the clientUserMessageId is unresolved (C-010).
         "user_input_in_progress" => 202,
@@ -4641,6 +5033,8 @@ pub(super) fn cutex_operation_error_status(code: &str, outcome_unknown: bool) ->
         | "profile_switch_disallowed"
         | "profile_switch_cli_mismatch"
         | "provider_family_mismatch"
+        | "profile_fork_disallowed"
+        | "fork_history_signature_rejected"
         | "claude_account_mismatch"
         | "history_changed"
         | "history_revert_unsupported"
@@ -4739,6 +5133,11 @@ pub(super) fn history_turn_path(path: &str) -> Option<(String, String)> {
 
 pub(super) fn session_id_from_path(path: &str) -> Option<String> {
     let encoded = path.strip_prefix("/v2/sessions/")?;
+    decode_session_id(encoded)
+}
+
+/// One percent-decoded path segment (no `/`).
+pub(super) fn decode_path_segment(encoded: &str) -> Option<String> {
     decode_session_id(encoded)
 }
 
@@ -5056,6 +5455,23 @@ pub(super) fn write_sse_headers(stream: &mut impl Write) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) fn enable_live_deltas(
+    repository: &EventRepository,
+    request: &SimpleHttpRequest,
+    query: &ReplayQuery,
+    subscription: &mut super::repository::EventSubscription,
+) -> Result<(),super::live_deltas::LiveCapacityError> {
+    if query_parameter(&request.path, "liveDeltas").ok().flatten().as_deref() == Some("true") {
+        repository.enable_live(subscription,query.cutex_session_id.clone())?;
+    }
+    Ok(())
+}
+
+pub(super) fn write_live_capacity_error(stream:&mut TcpStream)->anyhow::Result<()> {
+    write_v2_error(stream,429,"Too Many Requests","live_delta_capacity_exceeded",
+        "live delta subscriber capacity is full; retry the subscription",true,json!({"retryAfterMs":1000}))
+}
+
 fn write_sse_event(stream: &mut impl Write, event: &EventEnvelope) -> anyhow::Result<()> {
     let data = serde_json::to_string(event)?;
     write!(
@@ -5063,6 +5479,12 @@ fn write_sse_event(stream: &mut impl Write, event: &EventEnvelope) -> anyhow::Re
         "id: {}\nevent: {SSE_EVENT_NAME}\ndata: {data}\n\n",
         event.cursor
     )?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn write_live_delta(stream: &mut impl Write, json: &str) -> anyhow::Result<()> {
+    write!(stream, "event: live_delta\ndata: {json}\n\n")?;
     stream.flush()?;
     Ok(())
 }
@@ -5077,7 +5499,7 @@ pub(super) fn stream_events(
     query: &ReplayQuery,
     watch: crate::management::listeners::RevocationWatch,
 ) -> anyhow::Result<()> {
-    stream_events_filtered(stream, subscription, query, watch, &mut |_| true)
+    stream_events_filtered(stream, subscription, query, watch, &mut |_| true, &mut |_| true)
 }
 
 /// `stream_events` that writes only the events `visible` accepts (a
@@ -5089,26 +5511,35 @@ pub(super) fn stream_events_filtered(
     query: &ReplayQuery,
     mut watch: crate::management::listeners::RevocationWatch,
     visible: &mut dyn FnMut(&EventEnvelope) -> bool,
+    live_visible: &mut dyn FnMut(&str) -> bool,
 ) -> anyhow::Result<()> {
     let subscribed_stream_id = subscription.page.stream_id.clone();
     let mut last_cursor = query.after.clone();
+    let mut delivered_sequence = 0;
     for event in subscription.page.events {
         if visible(&event) {
             write_sse_event(stream, &event)?;
         }
         last_cursor = Some(event.cursor.clone());
+        delivered_sequence = delivered_sequence.max(event.sequence);
+    }
+    // Replay may be an empty page after a supplied cursor. Its checkpoint is
+    // only safe when replay has been exhausted, never when has_more is true.
+    if !subscription.page.has_more {
+        delivered_sequence = delivered_sequence.max(subscription.page.checkpoint.sequence);
     }
     let mut last_write = std::time::Instant::now();
     loop {
+        let wake_version=subscription.wake.version();
+        let mut progressed=false;
+        if watch.disconnected()? { return Ok(()); }
         if let Some(token_id) = watch.revoked() {
             crate::management::listeners::write_revoked_frame(stream, &token_id)?;
             return Ok(());
         }
-        match subscription
-            .receiver
-            .recv_timeout(crate::management::listeners::STREAM_TICK)
-        {
+        match subscription.receiver.try_recv() {
             Ok(event) => {
+                progressed=true;
                 if event.stream_id != subscribed_stream_id {
                     write_sse_stream_changed(
                         stream,
@@ -5128,15 +5559,16 @@ pub(super) fn stream_events_filtered(
                     last_write = std::time::Instant::now();
                 }
                 last_cursor = Some(event.cursor.clone());
+                delivered_sequence = delivered_sequence.max(event.sequence);
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if last_write.elapsed() >= SSE_KEEPALIVE_INTERVAL {
                     stream.write_all(b": keepalive\n\n")?;
                     stream.flush()?;
                     last_write = std::time::Instant::now();
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 if subscription
                     .lagged
                     .load(std::sync::atomic::Ordering::SeqCst)
@@ -5146,6 +5578,27 @@ pub(super) fn stream_events_filtered(
                 return Ok(());
             }
         }
+        // Durable/control always gets the first scheduling opportunity. Keep
+        // this batch bounded so revocation and durable arrivals are not starved.
+        if let Some(live) = subscription.live_deltas.as_ref() {
+            let mut live_bytes = 0;
+            for _ in 0..16 {
+                let Some(delivery) = live.pop_ready(&subscribed_stream_id,delivered_sequence) else { break; };
+                progressed=true;
+                let frame = delivery.frame();
+                let anchored = if frame.kind=="gap" {
+                    frame.anchor.as_ref().is_none_or(|a|a.stream_id==subscribed_stream_id)
+                } else {frame.anchor.as_ref().is_some_and(|a|
+                    a.stream_id == subscribed_stream_id && a.sequence <= delivered_sequence)};
+                if anchored && live_visible(&frame.cutex_session_id) {
+                    write_live_delta(stream, delivery.json())?;
+                    last_write = std::time::Instant::now();
+                    live_bytes += delivery.json().len();
+                    if live_bytes >= 64 * 1024 { break; }
+                }
+            }
+        }
+        if !progressed { subscription.wake.wait(wake_version,crate::management::listeners::STREAM_TICK); }
     }
 }
 
@@ -5211,6 +5664,256 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    fn safety_http_context() -> ManagementRequestContext {
+    // Denied and gate-answered requests never reach native runtime callbacks.
+    ManagementRequestContext {
+        explicit_launch_action: |_, _| panic!("unexpected runtime action"),
+        adopt_saved_native: |_, _| panic!("unexpected native adoption"),
+        review_agent_archive: |_, _| panic!("unexpected archive review"),
+        owner_archive_action: |_, _| panic!("unexpected permanent archive"),
+        execute_agent_archive: |_, _| panic!("unexpected archive"),
+        durable_agent_candidates: |_| panic!("unexpected agent candidates"),
+        import_durable_agent: |_, _| panic!("unexpected agent import"),
+        load_registry: || Ok(crate::im::registry::ImRegistry::default()),
+        load_runtime_status: |_| Ok(None),
+        forward_native_request: |_, _| panic!("unexpected native request"),
+        respond_native_server_request: |_, _, _| panic!("unexpected native response"),
+        handle_user_input: |_| panic!("unexpected user input"),
+        flush_user_input_queue: |_, _, _| panic!("unexpected queue flush"),
+        steer_user_input_queue: |_, _, _| panic!("unexpected queue steer"),
+        interrupt_active_turn: |_, _| panic!("unexpected interrupt"),
+        load_bootstrap_state: |_, _| panic!("unexpected bootstrap"),
+        load_latest_plan: |_| panic!("unexpected plan"),
+        load_latest_token_usage: |_| panic!("unexpected usage"),
+        revert_session_history: |_, _, _| panic!("unexpected revert"),
+        delete_session: |_, _| panic!("unexpected session delete"),
+        fork_session: |_, _, _| panic!("unexpected fork"),
+        side_chat: |_, _, _| panic!("unexpected side chat"),
+        open_offline_history: |_| panic!("unexpected history"),
+        mutate_session: |id, method, params| {
+            assert_eq!(method, "cutex/runtime/offline");
+            assert_eq!(params["expectedRuntimeGeneration"], 7);
+            let lane = super::super::session_coordination::session_lane(id).unwrap();
+            let nested = lane.reserve().unwrap();
+            assert!(nested.is_current_for(&lane).unwrap(), "HTTP owner thread retains its capability");
+            let other = lane.clone();
+            assert!(std::thread::spawn(move || other.try_lock().is_err()).join().unwrap(),
+                "another execution thread cannot enter during the native callback");
+            let retry = super::super::model_overload_retry::Store::open_default().unwrap();
+            let state = retry.snapshot().unwrap();
+            let entry = &state.sessions[id];
+            assert!(entry.plan.is_none());
+            assert_eq!(entry.blocked_generation, Some(7));
+            let cancelled = entry.settlement.as_ref().unwrap();
+            assert_eq!(cancelled.plan.thread_id, "retry-thread");
+            assert_eq!(cancelled.plan.runtime_generation, 7);
+            assert_eq!(cancelled.plan.binding_turn_id.as_deref(), Some("accepted-retry-turn"));
+            assert!(!retry.is_disabled());
+            Ok(json!({"runtimeGeneration":7,"runtimeAgentId":null,"status":"offline"}))
+        },
+        online_session: |_, _, _| panic!("unexpected online request"),
+        bind_project_authority: |_| panic!("unexpected project bind"),
+        import_legacy_director_ownership: |_| panic!("unexpected ownership import"),
+        reconcile_agent_reservation: |_| panic!("unexpected reservation"),
+        abandon_agent_create: |_| panic!("unexpected reservation"),
+        list_management_projects: |_| panic!("unexpected project list"),
+        read_management_project: |_, _| panic!("unexpected project read"),
+        update_management_project_presentation: |_, _| panic!("unexpected project update"),
+        execute_management_operator_action: |_, _| panic!("unexpected operator action"),
+        execute_management_project_mutation: |_, _| panic!("unexpected project mutation"),
+        create_human_agent: |_, _| panic!("unexpected agent create"),
+        create_human_session: |_, _| panic!("unexpected session create"),
+    }
+}
+
+
+    #[test]
+    fn settlement_http_owner_auth_and_method_gate() {
+        use crate::management::client_tokens::{DeviceScope, VerifiedClientToken};
+        use crate::management::users::{self, Principal};
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                users::set_current_principal(None);
+                crate::management::listeners::set_current_client_token(None);
+            }
+        }
+        let _reset = Reset;
+        let send = |bearer: Option<&str>, method: &str, body: &[u8]| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (mut server, _) = listener.accept().unwrap();
+            let mut headers = HashMap::new();
+            if let Some(bearer) = bearer {
+                headers.insert("authorization".into(), format!("Bearer {bearer}"));
+            }
+            let request = SimpleHttpRequest { method: method.into(),
+                path: format!("{}?test=1", super::super::agent_bus_stuck::CLOSE_PATH),
+                headers, body: body.to_vec() };
+            handle_v2_request(&mut server, &request, Some("agent-secret"), Some("owner-secret"), safety_http_context()).unwrap();
+            drop(server);
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            response
+        };
+        for bearer in [None, Some("wrong"), Some("agent-secret")] {
+            assert!(send(bearer, "POST", b"{}").starts_with("HTTP/1.1 403"));
+        }
+        for principal in [Principal::Pending, Principal::User {
+            id: "other-user".into(), name: "Other".into(), grant: Default::default(),
+        }] {
+            users::set_current_principal(Some(principal));
+            assert!(send(Some("owner-secret"), "POST", b"{}").starts_with("HTTP/1.1 403"));
+        }
+        users::set_current_principal(Some(Principal::Owner));
+        for scope in [DeviceScope::Chat, DeviceScope::Read] {
+            let mut token = VerifiedClientToken::test_token("scoped-owner");
+            token.scope = scope;
+            crate::management::listeners::set_current_client_token(Some(token));
+            assert!(send(Some("owner-secret"), "POST", b"{}").starts_with("HTTP/1.1 403"));
+        }
+        for token in [None, Some(VerifiedClientToken::test_token("full-owner"))] {
+            crate::management::listeners::set_current_client_token(token);
+            assert!(send(Some("owner-secret"), "GET", b"").starts_with("HTTP/1.1 405"));
+            assert!(send(Some("owner-secret"), "POST", b"{}").starts_with("HTTP/1.1 400"));
+            assert!(send(Some("owner-secret"), "POST", br#"{"messageId":"m","expectedEvidenceToken":"t","requestId":"r","reason":"reviewed","actor":"forged-owner"}"#)
+                .starts_with("HTTP/1.1 400"));
+        }
+    }
+
+    #[test]
+    fn delegation_controls_require_owner_and_full_mutation_scope() {
+        use crate::management::client_tokens::{DeviceScope,VerifiedClientToken};
+        use crate::management::users::{self,Principal};
+        struct Reset;
+        impl Drop for Reset {fn drop(&mut self){users::set_current_principal(None);crate::management::listeners::set_current_client_token(None);}}
+        let _reset=Reset;
+        let send=|path:&str,bearer:&str|{
+            let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (mut server,_)=listener.accept().unwrap();
+            let request=SimpleHttpRequest{method:"POST".into(),path:path.into(),headers:HashMap::from([("authorization".into(),format!("Bearer {bearer}"))]),body:br#"{"actor":"owner"}"#.to_vec()};
+            handle_v2_request(&mut server,&request,Some("agent-secret"),Some("owner-secret"),safety_http_context()).unwrap();
+            drop(server);let mut response=String::new();client.read_to_string(&mut response).unwrap();response
+        };
+        for path in ["/v2/projects/p/pause","/v2/projects/p/resume","/v2/delegations/d/stop","/v2/delegations/d/resume-continuation","/v2/projects/p/delegation-grants"] {
+            assert!(send(path,"agent-secret").starts_with("HTTP/1.1 401"));
+            users::set_current_principal(Some(Principal::Pending));
+            assert!(send(path,"owner-secret").starts_with("HTTP/1.1 401"));
+            users::set_current_principal(Some(Principal::Owner));
+            for scope in [DeviceScope::Chat,DeviceScope::Read] {
+                let mut token=VerifiedClientToken::test_token("scoped-owner");token.scope=scope;
+                crate::management::listeners::set_current_client_token(Some(token));
+                assert!(send(path,"owner-secret").starts_with("HTTP/1.1 401"));
+            }
+            crate::management::listeners::set_current_client_token(None);
+            users::set_current_principal(None);
+        }
+    }
+
+    #[test]
+    fn http_safety_stop_reuses_outer_reservation_without_disabling_retry() {
+        const CHILD: &str = "CUTEX_HTTP_SAFETY_LANE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let parent = std::path::PathBuf::from(std::env::var_os("CUTEX_TEST_PRIVATE_HOME").unwrap());
+            let home = parent.join(format!("http-safety-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join(".cutex-test-private-home"), b"private HTTP regression").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "management::v2::server::tests::http_safety_stop_reuses_outer_reservation_without_disabling_retry", "--nocapture"])
+                .env("HOME", &home).env("CUTEX_TEST_PRIVATE_HOME", &home).env(CHILD, "1")
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("OVERLOAD_RETRY_DISABLE_NOT_DURABLE"));
+            std::fs::remove_dir_all(home).unwrap();
+            return;
+        }
+        use super::super::model_overload_retry::{Store, Phase};
+        let id = "cutex.http-safety";
+        let home = std::env::var("CUTEX_TEST_PRIVATE_HOME").unwrap();
+        let mut record = crate::session::model::CutexSessionRecord::new(id.into(), Some("retry-thread".into()),
+            crate::platform::host::current_host_name(), home, None).unwrap();
+        record.registration_class = crate::agent_bus::model::AgentRegistrationClass::Persistent;
+        record.runtime_generation = 7;
+        let mut sessions = crate::session::model::CutexSessionStore::default();
+        sessions.sessions.insert(id.into(), record);
+        crate::session::store::save_cutex_session_store(&sessions).unwrap();
+        let retry = Store::open_default().unwrap();
+        retry.update(|state| {
+            state.terminal(id, "retry-thread", 7, &json!({"id":"failed-turn","status":"failed",
+                "error":{"codexErrorInfo":"serverOverloaded"}}), None, chrono::Utc::now());
+            let plan = state.sessions.get_mut(id).unwrap().plan.as_mut().unwrap();
+            plan.phase = Phase::Binding;
+            plan.binding_turn_id = Some("accepted-retry-turn".into());
+        }).unwrap();
+        let path = format!("/v2/sessions/{id}/cutex/requests");
+        let send = |request_id: &str, generation: u64, token: &str| {
+            let request = SimpleHttpRequest { method:"POST".into(), path:path.clone(),
+                headers: [("authorization".into(), format!("Bearer {token}"))].into_iter().collect(),
+                body:serde_json::to_vec(&json!({"requestId":request_id,"method":"cutex/runtime/offline",
+                    "params":{"expectedRuntimeGeneration":generation,"force":false}})).unwrap() };
+            capture_http_response(|stream| handle_v2_request(stream, &request, Some("bridge-test"), Some("root-test"), safety_http_context()))
+        };
+        let denied = send("denied",7,"wrong");
+        assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+        assert!(retry.snapshot().unwrap().sessions[id].plan.is_some());
+        let response = send("owner-stop",7,"root-test");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("offline"));
+        assert!(!retry.is_disabled());
+        assert!(!crate::config::paths::runtime_dir().unwrap().join("model-overload-retry/state-v1.disabled").exists());
+        assert_eq!(retry.snapshot().unwrap().sessions[id].blocked_generation, Some(7));
+        assert!(super::super::session_coordination::session_lane(id).unwrap().try_lock().is_ok());
+        let stale = send("stale-stop",6,"root-test");
+        assert!(stale.contains("revision_conflict"), "{stale}");
+        assert!(!retry.is_disabled());
+    }
+
+    #[test]
+    fn request_lock_protects_durable_completion_but_not_response_io() {
+        let lock = super::super::session_coordination::OperationLane::new();
+        let mut trace = SlowSubmitTrace::new();
+        trace.request_guard = Some(lock.lock().unwrap());
+        for stage in [SubmitStage::SessionResource, SubmitStage::IdempotencyBegin,
+            SubmitStage::Dispatch, SubmitStage::IdempotencyComplete] {
+            trace.advance(stage);
+            assert!(matches!(lock.try_lock(), Err(super::super::session_coordination::ReservationError::WouldBlock)));
+        }
+        trace.advance(SubmitStage::ResponseWrite);
+        assert!(lock.try_lock().is_ok(), "socket writes must not serialize the next operation");
+    }
+
+    #[test]
+    fn request_lock_is_released_on_early_failure() {
+        let lock = super::super::session_coordination::OperationLane::new();
+        {
+            let mut trace = SlowSubmitTrace::new();
+            trace.request_guard = Some(lock.lock().unwrap());
+            trace.advance(SubmitStage::Dispatch);
+        }
+        assert!(lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn control_diagnostics_requires_root_and_reports_process_scope() {
+        let mut request = request("/v2/diagnostics/control");
+        let rejected = capture_http_response(|stream| handle_control_diagnostics(stream, &request, Some("test-root")));
+        assert!(rejected.starts_with("HTTP/1.1 401"));
+        request.headers.insert("authorization".into(), "Bearer test-root".into());
+        let accepted = capture_http_response(|stream| handle_control_diagnostics(stream, &request, Some("test-root")));
+        let value = response_json(&accepted);
+        assert_eq!(value["scope"], "management_process");
+        assert_eq!(value["timing"]["scope"], "process");
+        assert_eq!(value["capacity"]["controlConnectionReserve"], 32);
+        assert!(value["queues"]["repository"]["available"].is_boolean());
+        assert!(value["queues"]["nativeEvents"]["outstandingEvents"].is_number());
+        request.method = "POST".into();
+        let rejected = capture_http_response(|stream| handle_control_diagnostics(stream, &request, Some("test-root")));
+        assert!(rejected.starts_with("HTTP/1.1 405"));
+    }
 
     #[test]
     fn service_tier_patch_accepts_known_tiers_on_codex_sessions_only() {
@@ -5403,6 +6106,14 @@ mod tests {
     }
 
     #[test]
+    fn relay_address_refusals_are_conflicts_not_500() {
+        for code in ["variant_base_url_missing", "relay_runtime_unavailable"] {
+            assert_eq!(human_agent_error_status(code), 409, "{code}");
+            assert_eq!(cutex_operation_error_status(code, false), 409, "{code}");
+        }
+    }
+
+    #[test]
     fn removed_release_rotation_routes_cover_the_whole_prefix_only() {
         for path in [
             "/v2/release-rotation",
@@ -5514,6 +6225,10 @@ mod tests {
             "/v2/sessions/s/history/turns/t/more", "/v2/sessions/s/history/turns/%zz"] {
             assert!(history_turn_path(path).is_none(), "{path}");
         }
+        // Design 025: history media read back like history (root only).
+        let media = format!("/v2/sessions/cutex%2Esession/media/{}", "0".repeat(64));
+        assert!(agent_management_admin_path(&media));
+        assert!(session_id_from_path(&media).is_none() && history_turn_path(&media).is_none());
     }
 
     #[test]
@@ -5537,12 +6252,20 @@ mod tests {
     #[test]
     fn human_management_projects_jobs_and_writes_require_the_dedicated_root_credential() {
         for path in [
+            "/v2/projects/project/director",
+            "/v2/projects/project/director/handover",
+            "/v2/projects/project/director/scopes",
+            "/v2/projects/project/director/scopes/candidates",
+            "/v2/projects/project/director/start-reviews",
+            "/v2/projects/project/director/start-reviews/review/accept",
+            "/v2/projects/project/director/start-reviews/review/content",
             "/v2/agent-management/native-recovery",
             "/v2/agent-management/human-config",
             "/v2/agent-management/durable-candidates",
             "/v2/agent-management/durable-import",
             "/v2/agent-management/legacy-director-ownership-import",
             "/v2/agent-management/reservation-reconciliation",
+            "/v2/agent-management/create-abandon",
             "/v2/agent-management/projects",
             "/v2/agent-management/projects/cutex-stack-main",
             "/v2/agent-management/project-presentation",
@@ -5650,6 +6373,7 @@ mod tests {
         assert_eq!(command.management_request_id, "management-input-1");
         assert_eq!(command.params.origin.client_id, "device-1");
         Ok(super::super::user_input::UserInputSubmitExecution {
+            join_refusal: None,
             disposition: UserInputDisposition::Started,
             app_server_accepted: true,
             native_request_id: Some(json!("native-input-1")),
@@ -5732,7 +6456,42 @@ mod tests {
             "displayNameOverride": params["displayName"],
             "note": params.get("note").cloned().unwrap_or(Value::Null),
             "avatar": params.get("avatar").cloned().unwrap_or(Value::Null),
+            "avatarMode": params.get("avatarMode").cloned().unwrap_or(Value::Null),
+            "badge": params.get("badge").cloned().unwrap_or(Value::Null),
         }))
+    }
+
+    #[test]
+    fn avatar_mode_metadata_requires_cas_and_round_trips_response_and_event() {
+        for mode in [json!("fixed"), json!("inherit"), Value::Null] {
+            let params=json!({"expectedRevision":7,"avatarMode":mode});
+            validate_session_metadata_params(&params).unwrap();
+            let body=json!({"requestId":"avatar-mode","method":"cutex/session/metadata/update","params":params});
+            let request=validate_cutex_request_body(&serde_json::to_vec(&body).unwrap()).unwrap();
+            let root=std::env::temp_dir().join(format!("cutex-avatar-mode-dispatch-{}",uuid::Uuid::new_v4()));
+            let repository=EventRepository::open(&root,crate::platform::host::current_host_name()).unwrap();
+            let result=dispatch_session_metadata_update(&repository,execute_test_metadata_mutation,"cutex-session-1",&json!({"revision":7}),&request).unwrap();
+            assert_eq!(result["avatarMode"],mode);
+            super::super::contract_validation::validate_cutex_response(&json!({
+                "contractVersion":2,"requestId":"avatar-mode","cutexSessionId":"cutex-session-1",
+                "cutex":{"method":"cutex/session/metadata/update","result":result},
+            })).unwrap();
+            let page=repository.page(ReplayQuery::default()).unwrap();
+            let event=page.events.iter().filter_map(|event|event.cutex.as_ref()).find(|event|event.method=="cutex/session/metadataUpdated").unwrap();
+            assert_eq!(event.params["avatarMode"],mode);
+            super::super::contract_validation::validate_cutex_event_message(&json!({"method":event.method,"params":event.params})).unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            let unfenced=json!({"requestId":"avatar-mode-bad","method":"cutex/session/metadata/update","params":{"avatarMode":mode}});
+            assert!(validate_session_metadata_params(&unfenced["params"]).is_err());
+            assert!(validate_cutex_request_body(&serde_json::to_vec(&unfenced).unwrap()).is_err());
+        }
+        for bad in [json!({"expectedRevision":7,"avatarMode":"dynamic"}),json!({"expectedRevision":7,"avatarMode":true}),
+            json!({"expectedRevision":null,"avatarMode":"fixed"}),json!({"expectedRevision":-1,"avatarMode":"fixed"}),
+            json!({"expectedRevision":7,"avatarMode":"inherit","avatar":{"kind":"emoji","value":"🦊"}})] {
+            assert!(validate_session_metadata_params(&bad).is_err());
+        }
+        validate_session_metadata_params(&json!({"expectedRevision":7,"avatarMode":"inherit","avatar":null})).unwrap();
+        validate_session_metadata_params(&json!({"avatar":null})).unwrap();
     }
 
     #[test]
@@ -5828,18 +6587,42 @@ mod tests {
         let repository =
             EventRepository::open(&root, crate::platform::host::current_host_name())
                 .expect("open event repository");
+        // The fence belongs to the store mutation (per field, r252): a
+        // snapshot at another revision is not refused here, and the
+        // mutation's conflict comes back without an event.
+        fn conflicting_metadata_mutation(
+            _: &str,
+            _: &str,
+            params: Value,
+        ) -> Result<Value, super::super::user_input::UserInputExecutionError> {
+            assert_eq!(params["expectedRevision"], 7);
+            Err(super::super::user_input::UserInputExecutionError {
+                stage: "route".to_string(),
+                code: "revision_conflict".to_string(),
+                message: "session revision conflict: expected 7, current 9".to_string(),
+                retryable: true,
+                details: json!({ "expectedRevision": 7, "currentRevision": 9, "resyncRequired": true }),
+                outcome_unknown: false,
+            })
+        }
         let stale = json!({ "revision": 6, "native": { "threadId": "thread-1" } });
         let conflict = dispatch_cutex_request(
             &repository,
             execute_test_user_input,
             flush_test_user_input_queue,
-            execute_test_metadata_mutation,
+            conflicting_metadata_mutation,
             "cutex-session-1",
             &stale,
             &validated,
         )
         .expect_err("stale revision");
         assert_eq!(conflict.code, "revision_conflict");
+        assert!(repository
+            .page(ReplayQuery::default())
+            .expect("events")
+            .events
+            .iter()
+            .all(|event| event.cutex.as_ref().is_none_or(|cutex| cutex.method != "cutex/session/metadataUpdated")));
 
         let session = json!({ "revision": 7, "native": { "threadId": "thread-1" } });
         let result = dispatch_cutex_request(
@@ -6146,6 +6929,22 @@ mod tests {
             BeginRequest::OutcomeUnknown
         ));
 
+        // Unknown metadata is diagnostic only: it must not contain the error
+        // message/details, nor change the repeat outcome asserted above.
+        let connection = rusqlite::Connection::open(
+            root.join(super::super::request_idempotency::IDEMPOTENCY_DB_FILE),
+        ).expect("open diagnostic evidence");
+        let stored: String = connection.query_row(
+            "SELECT response_body FROM requests WHERE request_id = ?1",
+            ["retire-uncertain-1"], |row| row.get(0),
+        ).expect("persisted unknown diagnostic");
+        let diagnostic: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(diagnostic["originalCode"], "persistence_uncertain");
+        assert_eq!(diagnostic["stage"], "persistence");
+        assert_eq!(diagnostic["schema"], "cutex.request-unknown-diagnostic.v1");
+        assert!(!stored.contains("archive mutation"));
+        assert!(!stored.contains("store_replace"));
+        drop(connection);
         drop(idempotency);
         std::fs::remove_dir_all(root).expect("remove outcome-unknown test root");
     }
@@ -6185,6 +6984,35 @@ mod tests {
         assert_eq!(body["error"]["details"]["retryAfterMs"], 1_000);
         drop(idempotency);
         std::fs::remove_dir_all(root).expect("remove full-store test root");
+    }
+
+    #[test]
+    fn native_response_images_are_externalized_before_receipt_and_replay() {
+        use base64::Engine;
+        static IMAGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn forward(_: &str, message: Value) -> Result<Value, ManagementNativeForwardError> {
+            IMAGE_CALLS.fetch_add(1,Ordering::SeqCst);
+            Ok(json!({"id":message["id"],"result":{"image":{"type":"imageGeneration","result":base64::engine::general_purpose::STANDARD.encode(vec![8;1024*1024])}}}))
+        }
+        IMAGE_CALLS.store(0,Ordering::SeqCst);
+        let root=std::env::temp_dir().join(format!("image-receipt-{}",uuid::Uuid::new_v4()));
+        let store=RequestIdempotencyRepository::open(&root,"test".into()).unwrap();
+        let session=json!({"native":{"threadId":"thread-1"},"runtime":{"appServerConnected":true}});
+        let session_id=format!("cutex.image-{}",uuid::Uuid::new_v4());
+        let request=SimpleHttpRequest { method:"POST".into(),path:format!("/v2/sessions/{session_id}/app-server/requests"),headers:HashMap::new(),body:serde_json::to_vec(&json!({"requestId":"image-receipt","native":{"message":{"id":"image","method":"thread/name/set","params":{"threadId":"thread-1","name":"image"}}}})).unwrap() };
+        let first=capture_http_response(|stream|handle_native_request_for_session(stream,&request,forward,&session_id,&session,&store));
+        assert!(first.starts_with("HTTP/1.1 200 OK"),"{first}");
+        let body=response_json(&first);
+        assert!(serde_json::to_vec(&body).unwrap().len()<4096);
+        let blob=&body["native"]["message"]["result"]["image"]["result"];
+        assert_eq!(blob["type"],"cutexBlob");
+        let second=capture_http_response(|stream|handle_native_request_for_session(stream,&request,forward,&session_id,&session,&store));
+        assert_eq!(response_json(&second),body);
+        assert_eq!(IMAGE_CALLS.load(Ordering::SeqCst),1);
+        let blobs=super::super::event_blobs::EventBlobStore::open_default().unwrap();
+        assert!(blobs.get(&session_id,blob["blobId"].as_str().unwrap()).is_some());
+        assert!(blobs.get("cutex.other",blob["blobId"].as_str().unwrap()).is_none());
+        drop(store); std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6931,6 +7759,95 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_early_checkpoint_replays_terminal_before_and_after_snapshot_barrier() {
+        let _home = crate::config::paths::test_home_env_lock();
+        use crate::session::runtime_stop::{RequestedStop, StopState};
+        use std::sync::{Arc, Barrier};
+        let repository = super::super::repository::management_v2_repository().unwrap();
+        // 0: terminal before projection read; 1: read closing then terminal
+        // before builder; 2: terminal after builder. No scheduling sleeps decide
+        // the interleaving: barriers gate the stop owner and event publication.
+        for ordering in 0..3 {
+            let id = format!("cutex.bootstrap-stop-{ordering}-{}", uuid::Uuid::new_v4());
+            let stop = RequestedStop::begin(&id, 7).unwrap();
+            let checkpoint = repository.checkpoint().unwrap();
+            super::super::native_events::observe_stop_from_snapshot(&id, 7, "host", None).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let peer = barrier.clone();
+            let worker_id = id.clone();
+            let worker = std::thread::spawn(move || {
+                peer.wait();
+                stop.finish(true).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while super::super::native_events::stop_test_events(&worker_id).is_empty() {
+                    assert!(std::time::Instant::now() < deadline, "terminal event missing");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                peer.wait();
+            });
+            if ordering == 0 { barrier.wait(); barrier.wait(); }
+            // This value is precisely the read that can go stale during projection.
+            let captured = crate::session::runtime_stop::state(&id, 7).unwrap();
+            assert_eq!(captured, if ordering == 0 { StopState::Offline } else { StopState::Closing });
+            if ordering == 1 { barrier.wait(); barrier.wait(); }
+            let session = json!({ "cutexSessionId": id, "hostId": crate::platform::host::current_host_name(),
+                "revision": 1, "runtime": {"status": if captured == StopState::Closing {"closing"} else {"offline"},
+                    "runtimeGeneration": 7, "appServerConnected": false}, "management": {} });
+            let bootstrap = build_bootstrap_resource_shaped(&session, checkpoint.clone(), None, None,
+                |_| panic!("offline snapshot cannot call native"),
+                |_| Ok(json!({"userInputQueue":[], "pendingServerRequests":[], "agentBusMessages":[]}))).unwrap();
+            if ordering == 2 { barrier.wait(); barrier.wait(); }
+            worker.join().unwrap();
+            assert_eq!(bootstrap["checkpoint"], serde_json::to_value(&checkpoint).unwrap(),
+                "streamId/sequence/cursor are one unchanged early checkpoint");
+            let query = ReplayQuery { stream_id: Some(checkpoint.stream_id.clone()), after: checkpoint.cursor.clone(),
+                cutex_session_id: Some(id.clone()), ..Default::default() };
+            let replay = repository.page(query.clone()).unwrap();
+            assert_eq!(replay.events.len(), 1);
+            let terminal = &replay.events[0];
+            assert!(terminal.sequence > checkpoint.sequence);
+            assert_eq!(terminal.cutex.as_ref().unwrap().method, "cutex/runtime/offline");
+            assert_eq!(terminal.cutex.as_ref().unwrap().params["runtimeGeneration"], 7);
+            // Early cursors intentionally duplicate a terminal already reflected
+            // in the snapshot. Replay is read-only, with stable event identity.
+            let again = repository.page(query).unwrap();
+            assert_eq!(again.events, replay.events);
+            assert_eq!(crate::session::runtime_stop::state(&id, 7), Some(StopState::Offline));
+            let newer = RequestedStop::begin(&id, 8).unwrap();
+            let _ = repository.page(ReplayQuery { stream_id: Some(checkpoint.stream_id), after: checkpoint.cursor,
+                cutex_session_id: Some(id.clone()), ..Default::default() }).unwrap();
+            assert_eq!(crate::session::runtime_stop::state(&id, 8), Some(StopState::Closing));
+            newer.finish(true).unwrap();
+        }
+    }
+
+    #[test]
+    fn bootstrap_keeps_complete_early_checkpoint_on_stream_reset() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("bootstrap-stop-reset-{}", uuid::Uuid::new_v4()));
+        let host = crate::platform::host::current_host_name();
+        let repository = EventRepository::open(&root, host.clone()).unwrap();
+        repository.append(super::super::model::PendingEvent {
+            cutex_session_id: "cutex.reset-test".into(), host_id: host.clone(),
+            source: super::super::model::EventSource::Cutex, schema: None, native: None,
+            correlation: Default::default(), cutex: Some(super::super::model::CutexMessage {
+                method: "cutex/test/beforeReset".into(), params: json!({}) }) }).unwrap();
+        let checkpoint = repository.checkpoint().unwrap();
+        let mut journal = std::fs::OpenOptions::new().append(true).open(root.join("events.jsonl")).unwrap();
+        journal.write_all(b"{broken").unwrap(); journal.sync_all().unwrap(); drop(journal);
+        let reopened = EventRepository::open(&root, host.clone()).unwrap();
+        assert_ne!(reopened.checkpoint().unwrap().stream_id, checkpoint.stream_id);
+        let session = json!({"cutexSessionId":"cutex.reset-test", "hostId":host,
+            "runtime":{"status":"offline", "runtimeGeneration":7,"appServerConnected":false}});
+        let result = build_bootstrap_resource_shaped(&session, checkpoint.clone(), None, None,
+            |_| panic!("no native RPC"),
+            |_| Ok(json!({"userInputQueue":[],"pendingServerRequests":[],"agentBusMessages":[]}))).unwrap();
+        assert_eq!(result["checkpoint"], serde_json::to_value(&checkpoint).unwrap());
+        assert!(reopened.page(ReplayQuery { stream_id: Some(checkpoint.stream_id), after: checkpoint.cursor,
+            ..Default::default() }).is_err(), "old stream follows existing replay resync error, never hybrid cursor");
+    }
+
+    #[test]
     fn bootstrap_checkpoint_precedes_events_racing_with_thread_read() {
         let root =
             std::env::temp_dir().join(format!("cutex-v2-bootstrap-race-{}", uuid::Uuid::new_v4()));
@@ -7124,6 +8041,83 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove bootstrap repository");
     }
 
+    /// The desktop's steer check (`?turnLimit=10&media=ref`): shaped turns
+    /// give the same bytes as the whole-body pass, and a second check reads
+    /// only the live newest turn in full.
+    #[test]
+    fn media_ref_bootstrap_pages_reuse_shaped_turns() {
+        use base64::Engine;
+        let root = std::env::temp_dir().join(format!("cutex-v2-bootstrap-shaped-{}", uuid::Uuid::new_v4()));
+        let media_dir = root.join("media");
+        let host_id = crate::platform::host::current_host_name();
+        let repository = EventRepository::open(&root, host_id.clone()).expect("open repository");
+        let id = format!("cutex.{}", uuid::Uuid::new_v4());
+        let session = json!({
+            "contractVersion": 2, "cutexSessionId": id, "hostId": host_id, "revision": 1,
+            "native": { "threadId": "thread-1", "schema": null },
+            "runtime": { "status": "online", "runtimeGeneration": 2, "appServerConnected": true },
+            "focus": null, "management": {}
+        });
+        let state = |_: u64| -> anyhow::Result<Value> {
+            Ok(json!({ "userInputQueue": [], "pendingServerRequests": [], "agentBusMessages": [],
+                       "latestPlan": null, "latestTokenUsage": null }))
+        };
+        let turns: Vec<Value> = (0..4u8)
+            .map(|n| {
+                let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+                png.extend(std::iter::repeat_n(n, super::super::media_refs::INLINE_MAX));
+                let image = base64::engine::general_purpose::STANDARD.encode(png);
+                json!({ "id": format!("turn-{n}"), "status": "completed", "error": null, "itemsView": "full",
+                        "items": [{ "type": "imageGeneration", "id": format!("ig{n}"), "status": "completed",
+                                    "result": image, "savedPath": format!("C:/img/{n}.png") },
+                                  { "type": "agentMessage", "id": format!("a{n}"), "text": "done" }] })
+            })
+            .collect();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let native = |request: Value| -> Result<Value, String> {
+            let params = &request["params"];
+            let result = match request["method"].as_str().unwrap() {
+                "thread/read" => json!({ "thread": { "id": "thread-1", "preview": "p", "turns": [] } }),
+                "thread/turns/list" => {
+                    let view = params["itemsView"].as_str().unwrap();
+                    calls.borrow_mut().push((view.to_string(), params["limit"].as_u64().unwrap()));
+                    let limit = params["limit"].as_u64().unwrap() as usize;
+                    let data: Vec<Value> = turns.iter().rev().take(limit).map(|turn| {
+                        let mut turn = turn.clone();
+                        if view == "notLoaded" {
+                            turn["items"] = json!([]);
+                            turn["itemsView"] = json!("notLoaded");
+                        }
+                        turn
+                    }).collect();
+                    json!({ "data": data, "nextCursor": "c1" })
+                }
+                other => panic!("unexpected {other}"),
+            };
+            Ok(json!({ "id": request["id"].clone(), "result": result }))
+        };
+        let store = super::super::media_refs::MediaStore::at(&media_dir, super::super::media_refs::CACHE_MAX_BYTES);
+        let mut expected = build_bootstrap_resource(&session, &repository, Some(3), native, state).unwrap();
+        super::super::media_refs::apply(&mut expected, &id, &store);
+        assert_eq!(expected["mediaRefs"], 3);
+        let shaped = |calls: &std::cell::RefCell<Vec<(String, u64)>>| {
+            calls.borrow_mut().clear();
+            let mut shaper = super::super::history_turns::TurnShaper::new(&id, &store, false);
+            let mut body =
+                build_bootstrap_resource_shaped(&session, repository.checkpoint().unwrap(), Some(3), Some(&mut shaper), native, state)
+                    .unwrap();
+            shaper.finish_body(&mut body);
+            (serde_json::to_vec(&body).unwrap(), calls.borrow().clone())
+        };
+        let full = |limit| ("full".to_string(), limit);
+        let listing = |limit| ("notLoaded".to_string(), limit);
+        let expected = serde_json::to_vec(&expected).unwrap();
+        assert_eq!(shaped(&calls), (expected.clone(), vec![listing(3), full(3)]));
+        assert_eq!(shaped(&calls), (expected, vec![listing(3), full(1)]));
+        super::super::history_turns::invalidate(&id);
+        std::fs::remove_dir_all(root).expect("remove bootstrap repository");
+    }
+
     #[test]
     fn offline_bootstrap_keeps_checkpoint_and_cutex_state_without_native_snapshot() {
         let root = std::env::temp_dir().join(format!(
@@ -7282,3 +8276,7 @@ mod tests {
         .expect("parse response JSON")
     }
 }
+
+#[cfg(test)]
+#[path = "model_overload_retry_server_tests.rs"]
+mod model_overload_retry_server_tests;

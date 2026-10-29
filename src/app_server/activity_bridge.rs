@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -1451,7 +1450,7 @@ impl ActivityProjectorLeaderLock {
             })?;
         match file.try_lock_exclusive() {
             Ok(()) => Ok(Some(Self { file })),
-            Err(error) if activity_projector_lock_contended(&error) => Ok(None),
+            Err(error) if crate::platform::file_lock::lock_contended(&error) => Ok(None),
             Err(error) => Err(error).with_context(|| {
                 format!(
                     "failed to acquire activity projector lock {}",
@@ -1462,18 +1461,6 @@ impl ActivityProjectorLeaderLock {
     }
 }
 
-fn activity_projector_lock_contended(error: &std::io::Error) -> bool {
-    if error.kind() == ErrorKind::WouldBlock {
-        return true;
-    }
-    // LockFileEx reports ERROR_LOCK_VIOLATION for a competing byte-range lock.
-    // std does not currently normalize that Windows code to WouldBlock.
-    #[cfg(windows)]
-    if error.raw_os_error() == Some(33) {
-        return true;
-    }
-    false
-}
 
 impl Drop for ActivityProjectorLeaderLock {
     fn drop(&mut self) {

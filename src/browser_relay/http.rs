@@ -357,7 +357,9 @@ fn stream_events(
     stream.write_all(crate::http::server::sse_response_head().as_bytes())?;
     stream.flush()?;
     let mut written = Instant::now();
+    let mut watch = crate::management::listeners::RevocationWatch::for_stream(stream)?;
     loop {
+        if watch.disconnected()? { break; }
         sweep_authenticated(relay);
         if relay.check_binding_cached(binding).is_err() {
             break;
@@ -422,11 +424,69 @@ mod tests {
         sync::Arc,
     };
     const TEST_ROOT: &str = "browser-test-root-not-a-real-credential";
+    #[test]
+    fn browser_authorization_uses_default_and_launched_profile_without_project() {
+        use crate::config::instance::{set_test_selection, Selection};
+        use crate::session::model::*;
+        let previous=crate::config::instance::selected().unwrap();
+        let path=std::env::temp_dir().join(format!("browser-default-auth-{}",uuid::Uuid::new_v4()));
+        set_test_selection(Selection::Custom(path.clone()));
+        let mut config=crate::config::store::load_codez_config_checked().unwrap();
+        config.default_profile=Some("Enabled".into());
+        crate::config::store::save_codez_config(&config).unwrap();
+        let profiles:crate::profiles::model::AccountsStore=serde_json::from_value(json!({
+            "version":crate::profiles::model::STORE_VERSION,"active_account_id":null,
+            "accounts":[{"id":"on-id","name":"Enabled","browser_tools":true},{"id":"off-id","name":"Disabled"}],
+        })).unwrap();
+        crate::profiles::store::save_store(&profiles).unwrap();
+        let native="018e0000-0000-7000-8000-0000b0009ae6";
+        let mut quick=CutexSessionRecord::new_at("cutex.browser-default-auth".into(),Some(native.into()),"host".into(),"/tmp".into(),None,"2026-10-24T00:00:00Z".into()).unwrap();
+        quick.explicit_launch=Some(crate::agent_management::ExplicitLaunchContract {
+            version:999,migration_action_id:None,native_id:native.into(),native_home:"/unavailable".into(),bundle_manifest:"/unavailable/manifest".into(),
+            bundle_sha256:crate::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        });
+        quick.runtime_generation=7;quick.current_runtime_agent_id=Some("browser-test-runtime".into());
+        quick.app_server_runtime=Some(serde_json::from_value(json!({"transport":"loopback_web_socket","endpoint":"ws://127.0.0.1:1","pid":1,
+            "runtime_dir":"/tmp","launched_profile_id":"on-id","launched_profile":"Enabled","diagnostic_journal_path":"/tmp/log",
+            "schema_version":"test","schema_sha256":"a".repeat(64),"started_at":"2026-10-24T00:00:00Z"})).unwrap());
+        let mut context=unused_context();
+        context.load_runtime_status=|session|Ok(Some(crate::app_server::manager::AppServerManagedRuntimeStatus {
+            cutex_session_id:session.into(),thread_id:"018e0000-0000-7000-8000-0000b0009ae6".into(),runtime_generation:7,connected:true,
+            active_turn_id:None,active_turn_observed_at:None,thread_status:None,thread_status_observed_at:None,
+            thread_settings:None,thread_settings_source:None,thread_settings_complete:false,thread_settings_observed_at:None,
+            runtime_workspace_roots:None,instruction_sources:None,resume_snapshot_observed_at:None,event_method_counts:Default::default(),
+            initialized_user_agent:None,last_event_at:None,last_error:None,
+        }));
+        let mut sessions=CutexSessionStore::default();
+        for agent in [false,true] {
+            let mut record=quick.clone();record.agent_enabled=agent;
+            if agent {record.registration_class=crate::agent_bus::model::AgentRegistrationClass::Persistent;}
+            assert!(record.agent_groups.is_empty(),"no Project/group required");
+            sessions.sessions.insert(record.cutex_session_id.clone(),record.clone());
+            crate::session::store::save_cutex_session_store(&sessions).unwrap();
+            assert!(super::super::owner::agent(context,&record.cutex_session_id).is_ok());
+            record.profile=Some("Disabled".into());
+            record.app_server_runtime=None;
+            sessions.sessions.insert(record.cutex_session_id.clone(),record.clone());
+            crate::session::store::save_cutex_session_store(&sessions).unwrap();
+            assert_eq!(super::super::owner::agent(context,&record.cutex_session_id).err().unwrap().code,"browser_disabled");
+            record.app_server_runtime=quick.app_server_runtime.clone();
+            sessions.sessions.insert(record.cutex_session_id.clone(),record.clone());
+            crate::session::store::save_cutex_session_store(&sessions).unwrap();
+            assert!(super::super::owner::agent(context,&record.cutex_session_id).is_ok(),"running identity wins over future configured opt-out");
+            record.app_server_runtime.as_mut().unwrap().launched_profile_id=Some("deleted-id".into());
+            sessions.sessions.insert(record.cutex_session_id.clone(),record.clone());
+            crate::session::store::save_cutex_session_store(&sessions).unwrap();
+            assert_eq!(super::super::owner::agent(context,&record.cutex_session_id).err().unwrap().code,"browser_disabled");
+        }
+        set_test_selection(previous);let _=std::fs::remove_dir_all(path);
+    }
     fn unused_context() -> ManagementRequestContext {
         ManagementRequestContext {
             explicit_launch_action: |_, _| panic!("owner auth precedes callback"),
             adopt_saved_native: |_, _| panic!("unused"),
             review_agent_archive: |_, _| panic!("unused"),
+            owner_archive_action: |_, _| panic!("unexpected permanent archive"),
             execute_agent_archive: |_, _| panic!("unused"),
             durable_agent_candidates: |_| panic!("unused"),
             import_durable_agent: |_, _| panic!("unused"),
@@ -451,6 +511,7 @@ mod tests {
             bind_project_authority: |_| panic!("unused"),
             import_legacy_director_ownership: |_| panic!("unused"),
             reconcile_agent_reservation: |_| panic!("unused"),
+            abandon_agent_create: |_| panic!("unused"),
             list_management_projects: |_| panic!("unused"),
             read_management_project: |_, _| panic!("unused"),
             update_management_project_presentation: |_, _| panic!("unused"),

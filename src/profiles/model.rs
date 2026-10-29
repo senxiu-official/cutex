@@ -35,11 +35,14 @@ impl fmt::Debug for ManagementApiToken {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CliKind {
     Codex,
     Claude,
+    Dsh,
+    /// r266 Kimi Code CLI (`kimi acp`; docs/development/r266-kimi-profiles.md).
+    Kimi,
 }
 
 impl Default for CliKind {
@@ -53,6 +56,8 @@ impl std::fmt::Display for CliKind {
         match self {
             CliKind::Codex => write!(f, "codex"),
             CliKind::Claude => write!(f, "claude"),
+            CliKind::Dsh => write!(f, "dsh"),
+            CliKind::Kimi => write!(f, "kimi"),
         }
     }
 }
@@ -63,8 +68,10 @@ impl std::str::FromStr for CliKind {
         match s.to_ascii_lowercase().as_str() {
             "codex" => Ok(CliKind::Codex),
             "claude" => Ok(CliKind::Claude),
+            "dsh" => Ok(CliKind::Dsh),
+            "kimi" => Ok(CliKind::Kimi),
             _ => Err(anyhow!(
-                "unknown CLI kind: {s} (expected 'codex' or 'claude')"
+                "unknown CLI kind: {s} (expected 'codex', 'claude', 'dsh' or 'kimi')"
             )),
         }
     }
@@ -145,6 +152,13 @@ pub struct StoredAccount {
     /// (`deny_unknown_fields`), so an older binary ignores it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub model_display_names: std::collections::BTreeMap<String, String>,
+    /// profile-relay-runtimes: the owner's address of a provider interface
+    /// that has no other home (interface kind -> base URL, e.g.
+    /// `deepseekNative` -> a relay's Anthropic-compatible root). Absent =
+    /// the interface's official default (`profiles::interface_urls`). Top
+    /// level for the same reason as `browser_tools`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub interface_base_urls: std::collections::BTreeMap<String, String>,
     /// Explicit quota reader (`profile-generic-switches`): a named reader the
     /// owner picked (`quota::Reader`), resolved from the profile's base URL /
     /// fixed official endpoint. Absent = the custom `options.quota`. The
@@ -162,11 +176,21 @@ pub struct StoredAccount {
     /// (the reviewed auth in the launch configuration already carries it).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub private_chatgpt_auth_file: bool,
+    /// 「参与自动选择」 (design 041, `profile-auto-pick`): the owner lets
+    /// `profile: "auto:<providerFamily>"` pick this profile for a new
+    /// agent. Default off. Top level for the same reason as
+    /// `browser_tools`; an older binary drops it on save (back to off).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_pick: bool,
     /// Claude profiles: Claude Code settings sources and claude.ai
     /// connectors (`profiles::claude_code`). Top level for the same reason
     /// as `browser_tools`.
     #[serde(default, skip_serializing_if = "super::claude_code::ClaudeCodeOptions::is_empty")]
-    pub claude_code: super::claude_code::ClaudeCodeOptions,
+    pub claude_code: super::claude_code::ClaudeCodeOptions,    /// r265 runtime variants and credential source/version
+    /// (`profiles::runtime_variants`). Flattened top-level additive fields,
+    /// each omitted when unset, so legacy profiles serialize unchanged.
+    #[serde(flatten)]
+    pub variants: super::runtime_variants::VariantState,
 }
 
 impl StoredAccount {
@@ -177,7 +201,9 @@ impl StoredAccount {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: Uuid::new_v4().to_string(),
             name,
             email: snapshot.email.clone(),
@@ -195,6 +221,7 @@ impl StoredAccount {
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         }
     }
 }
@@ -298,8 +325,25 @@ impl QueueSettings {
     }
 }
 
+/// Preserve an explicitly present JSON null as well as objects/scalars. An
+/// ordinary Option<Value> decoder would turn null into absence on the next save.
+fn deserialize_raw_asks<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CodezConfig {
+    /// Raw delegation settings (`asks.limits`). AskLimits owns lenient parsing
+    /// and defaults; typed config saves must retain this extension verbatim as
+    /// a JSON value, including unknown fields and invalid values. Do not make
+    /// malformed asks settings invalidate the unrelated typed configuration.
+    #[serde(default, deserialize_with = "deserialize_raw_asks", skip_serializing_if = "Option::is_none")]
+    pub asks: Option<serde_json::Value>,
+    #[serde(default)]
+    pub image_input: crate::management::v2::user_input::image_steering::ImageInputSettings,
     #[serde(default, skip_serializing_if = "QueueSettings::is_default")]
     pub queue: QueueSettings,
     #[serde(default)]
@@ -313,6 +357,10 @@ pub struct CodezConfig {
     pub custom_status_items: Vec<CustomStatusItemCatalogEntry>,
     #[serde(default)]
     pub proxy: Option<ProxyConfig>,
+    /// Claude Code CLI for new Claude sessions. The bundled CLI is the
+    /// self-contained default; `CUTEX_CLAUDE_CLI` still overrides it.
+    #[serde(default, skip_serializing_if = "crate::config::claude::ClaudeCliChoice::is_default")]
+    pub claude_cli: crate::config::claude::ClaudeCliChoice,
     #[serde(default = "default_session_config")]
     pub session: SessionConfig,
     /// Claude usage polls use the app-server control plane; apply to newly launched runtimes.
@@ -492,6 +540,10 @@ pub struct CodezConfig {
     /// older ignore and drop it.
     #[serde(default, skip_serializing_if = "crate::config::agent_harness::AgentHarnessSettings::is_default")]
     pub agent_harness: crate::config::agent_harness::AgentHarnessSettings,
+    /// Opt-in stable Responses prompt cache key for native agent launches
+    /// (design 034, `promptCacheKey` in `/v2/settings`). Default off.
+    #[serde(default, skip_serializing_if = "crate::config::prompt_cache_key::PromptCacheKeySettings::is_default")]
+    pub prompt_cache_key: crate::config::prompt_cache_key::PromptCacheKeySettings,
     #[serde(default, skip_serializing_if = "crate::config::health::HealthSettings::is_default")]
     pub health: crate::config::health::HealthSettings,
     #[serde(default, skip_serializing_if = "crate::short_ids::Settings::is_default")]
@@ -511,15 +563,18 @@ pub struct CodezConfig {
 impl Default for CodezConfig {
     fn default() -> Self {
         Self {
+            asks: None,
             appearance: Default::default(),
             docker_use_sudo: false,
             custom_status_items: Vec::new(),
             proxy: None,
+            claude_cli: Default::default(),
             session: default_session_config(),
             claude_usage_refresh_minutes: default_claude_usage_refresh_minutes(),
             profile_quota_refresh_minutes: default_profile_quota_refresh_minutes(),
             archive_delete_empty: default_archive_delete_empty(),
             queue: QueueSettings::default(),
+            image_input: Default::default(),
             auto_thread_titles: true,
             codex_config_follow_shared: true,
             thread_title_model: None,
@@ -571,6 +626,7 @@ impl Default for CodezConfig {
             notification_levels: Default::default(),
             session_store: Default::default(),
             agent_harness: Default::default(),
+            prompt_cache_key: Default::default(),
             health: Default::default(),
             agent_short_ids: Default::default(),
             artifacts: Default::default(),
@@ -782,6 +838,28 @@ mod tests {
     }
 
     #[test]
+    fn dsh_profile_defaults_are_omitted_and_nondefaults_roundtrip() {
+        for kind in ["codex", "claude", "dsh"] {
+            let mut account: StoredAccount = serde_json::from_value(serde_json::json!({
+                "id":"dsh-default-compat", "name":"compat", "cli_kind":kind
+            })).unwrap();
+            let saved = serde_json::to_value(&account).unwrap();
+            assert!(saved["options"].get("dsh").is_none());
+            let restored: StoredAccount = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.options.dsh, super::super::dsh::DshOptions::default());
+            account.options.dsh.model = "deepseek-custom".into();
+            account.options.dsh.reasoning_effort = Some("max".into());
+            account.options.dsh.api_key_env = "MY_DEEPSEEK_KEY".into();
+            let saved = serde_json::to_value(&account).unwrap();
+            assert_eq!(saved["options"]["dsh"], serde_json::json!({
+                "model":"deepseek-custom", "reasoningEffort":"max", "apiKeyEnv":"MY_DEEPSEEK_KEY"
+            }));
+            let restored: StoredAccount = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.options.dsh, account.options.dsh);
+        }
+    }
+
+    #[test]
     fn browser_opt_in_store_is_readable_by_pre_browser_accounts_parser() {
         for kind in ["codex", "claude"] {
             let mut account: StoredAccount = serde_json::from_value(serde_json::json!({
@@ -858,7 +936,9 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: "0b2f6987-6b65-4aac-8e0f-e14b9e0a4d63".to_string(),
             name: "compat".to_string(),
             email: None,
@@ -876,6 +956,7 @@ mod tests {
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         };
 
         let serialized = serde_json::to_value(&account).unwrap();

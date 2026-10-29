@@ -43,10 +43,10 @@ fn failed(step: &str, error_text: impl std::fmt::Display) -> UserInputExecutionE
 
 /// Why a session is not "empty" (never received input), or `None` if it is.
 /// Empty = a Codex session whose native thread has no turns and whose
-/// Management input queue holds nothing. Claude sessions, sessions without a
+/// Management input queue holds nothing. DSH/Claude sessions, sessions without a
 /// bound thread and unreadable threads are never empty.
 pub(crate) fn not_empty_reason(record: &CutexSessionRecord) -> Option<&'static str> {
-    if record.claude_session.is_some() {
+    if record.claude_session.is_some() || record.runtime_backend.is_acp() {
         return Some("unsupported");
     }
     let Some(thread) = record.codex_session_id.as_deref() else {
@@ -140,7 +140,11 @@ fn references(key: &str) -> Result<Value, UserInputExecutionError> {
         .map_err(|error| failed("reading the services registry", error.message))?
         .services
         .values()
-        .filter(|service| service.owner_cutex_session_id.as_deref() == Some(key))
+        // Project services outlive their registrant (services-project-scope):
+        // the delete clears the registrant instead.
+        .filter(|service| {
+            service.owner_cutex_session_id.as_deref() == Some(key) && service.owner_scope.is_session()
+        })
         .map(|service| service.slug.clone())
         .collect::<Vec<_>>();
     if !found.blocks_delete() && services.is_empty() {
@@ -184,6 +188,33 @@ fn recovery_directory(key: &str) -> anyhow::Result<PathBuf> {
     Ok(directory)
 }
 
+/// Create abandon (docs/design/028): the native thread of an unfinished
+/// create that has no durable session. Moves its rollout (and the history copy
+/// `adopt_from` made under `runtime/light/agents/<thread>`) into a recovery
+/// directory; returns one line per moved item. Nothing found is not an error.
+pub(crate) fn move_abandoned_native_thread(action_id: &str, thread: &str) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(uuid::Uuid::parse_str(thread).is_ok(), "native thread id is not a UUID");
+    let directory = recovery_directory(&format!("abandon-{action_id}"))?;
+    let mut moved = Vec::new();
+    let home = cutex::launch::local_deployment::LocalDeployment::source_home()?;
+    if let Ok(rollout) = cutex::launch::native_history::current(&home, thread) {
+        move_rollout_aside(&home, thread, &rollout, &directory).map_err(|error| anyhow::anyhow!("{}", error.message))?;
+        moved.push(format!("native thread {thread}: history moved to {}", directory.join("moved").display()));
+    }
+    let light = cutex::config::paths::runtime_dir()?.join("light/agents").join(thread);
+    if light.is_dir() {
+        let target = directory.join("light-agent");
+        std::fs::rename(&light, &target)?;
+        moved.push(format!("native thread {thread}: adopted history copy moved to {}", target.display()));
+    }
+    if moved.is_empty() {
+        moved.push(format!("native thread {thread}: no history found (nothing to move)"));
+    } else {
+        write_json(&directory.join("receipt.json"), &json!({"abandonedCreate": action_id, "nativeThread": thread, "moved": moved}))?;
+    }
+    Ok(moved)
+}
+
 fn write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
     cutex::config::atomic::write_private_pretty_json_atomic(path, value, "session delete recovery")
 }
@@ -217,6 +248,9 @@ enum NativeOutcome {
     Deleted,
     Moved,
     Nothing,
+    /// The native started but has no `thread/delete` (internal: the caller
+    /// falls back to moving storage, so it never reaches a receipt).
+    Unsupported,
 }
 
 impl NativeOutcome {
@@ -224,7 +258,7 @@ impl NativeOutcome {
         match self {
             Self::Deleted => "thread/delete",
             Self::Moved => "storageMove",
-            Self::Nothing => "none",
+            Self::Nothing | Self::Unsupported => "none",
         }
     }
 }
@@ -235,6 +269,17 @@ fn is_fork_reference(error: &CatalogError) -> bool {
 
 fn is_thread_not_found(error: &CatalogError) -> bool {
     matches!(error, CatalogError::Rpc { error, .. } if error.message.contains("thread not found"))
+}
+
+/// A native that predates `thread/delete` (old explicit-launch bundles, e.g.
+/// r177-era sessions): `-32601`, or the app-server's `-32600` "unknown
+/// variant" from request deserialization.
+fn is_unsupported_method(error: &CatalogError) -> bool {
+    matches!(error, CatalogError::Rpc { error, .. } if error.code == -32601
+        || (error.code == -32600 && {
+            let message = error.message.to_lowercase();
+            message.contains("unknown variant") || message.contains("unknown method")
+        }))
 }
 
 /// The left-behind copy of fork `candidate` in `home` (canonical), if it is
@@ -395,6 +440,7 @@ fn delete_thread(
         Ok(_) => return Ok(NativeOutcome::Deleted),
         Err(native) if is_fork_reference(&native) => native,
         Err(native) if is_thread_not_found(&native) => return Ok(NativeOutcome::Nothing),
+        Err(native) if is_unsupported_method(&native) => return Ok(NativeOutcome::Unsupported),
         Err(native) => return Err(failed("deleting the native thread", native)),
     };
     let copies = cutex::session::store::load_cutex_session_store()
@@ -422,25 +468,123 @@ fn delete_native(record: &CutexSessionRecord, directory: &Path) -> Result<Native
         .map_err(|error| failed("resolving the native home", error))?;
     let rollout = backup_rollouts(&home, thread, directory)
         .map_err(|error| failed("saving the recovery copy", error))?;
-    match isolated_endpoint(record) {
-        Ok(mut endpoint) => delete_thread(&mut endpoint, &home, thread, directory),
-        Err(spawn) => {
-            // No native available: move this thread's own rollout into the
-            // recovery directory (state DB rows stay; native lists skip a
-            // thread whose rollout is gone).
-            eprintln!("session delete: native unavailable for {thread} ({spawn:#}); moving storage");
-            let Some(rollout) = rollout else {
-                return Ok(NativeOutcome::Nothing);
+    let reason = match isolated_endpoint(record) {
+        Ok(mut endpoint) => match delete_thread(&mut endpoint, &home, thread, directory)? {
+            NativeOutcome::Unsupported => {
+                // Stop the private native before its storage moves.
+                drop(endpoint);
+                "the native runtime has no thread/delete".to_string()
+            }
+            outcome => return Ok(outcome),
+        },
+        Err(spawn) => format!("{spawn:#}"),
+    };
+    // No usable native (an old explicit-launch bundle that is gone, changed
+    // or predates thread/delete): move this thread's own rollout into the
+    // recovery directory (state DB rows stay; native lists skip a thread
+    // whose rollout is gone).
+    eprintln!("session delete: native unavailable for {thread} ({reason}); moving storage");
+    let Some(rollout) = rollout else {
+        return Ok(NativeOutcome::Nothing);
+    };
+    move_rollout_aside(&home, thread, &rollout, directory)
+}
+
+/// Storage-move fallback for `thread` in `home`. Without a native there is no
+/// reference index to refuse a fork that still reads this history, so the
+/// rollouts of `home` are checked here: copies earlier forks left behind (no
+/// session's history, see [`fork_leftover_copy`]) move along into
+/// `fork-copies/`; any other rollout inheriting from `thread` refuses the
+/// delete before anything moved.
+fn move_rollout_aside(
+    home: &Path,
+    thread: &str,
+    rollout: &Path,
+    directory: &Path,
+) -> Result<NativeOutcome, UserInputExecutionError> {
+    let dependants = rollouts_inheriting_from(home, thread);
+    let leftovers = if dependants.is_empty() {
+        Vec::new()
+    } else {
+        cutex::session::store::load_cutex_session_store()
+            .map(|store| fork_leftovers_referencing(home, thread, &store))
+            .unwrap_or_default()
+    };
+    let leftover_paths = leftovers
+        .iter()
+        .filter_map(|(_, path)| path.canonicalize().ok())
+        .collect::<Vec<_>>();
+    let blocking = dependants
+        .iter()
+        .filter(|path| !leftover_paths.contains(path))
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if !blocking.is_empty() {
+        return Err(referenced_error(json!({
+            "nativeForkReferences": true,
+            "message": format!("forked history still references {thread}"),
+            "rollouts": blocking,
+        })));
+    }
+    let move_file = |source: &Path, target_dir: &Path| -> Result<(), UserInputExecutionError> {
+        std::fs::create_dir_all(target_dir).map_err(|error| failed("moving storage", error))?;
+        let target = target_dir.join(source.file_name().unwrap_or_default());
+        std::fs::rename(source, &target)
+            .or_else(|_| std::fs::copy(source, &target).and_then(|_| std::fs::remove_file(source)))
+            .map_err(|error| failed("moving storage", error))
+    };
+    for leftover in &leftover_paths {
+        move_file(leftover, &directory.join("fork-copies"))?;
+    }
+    move_file(rollout, &directory.join("moved"))?;
+    Ok(NativeOutcome::Moved)
+}
+
+/// Rollouts in `home` (canonical paths) whose inherited history
+/// (`session_meta.history_base`, transitively) includes `thread`.
+fn rollouts_inheriting_from(home: &Path, thread: &str) -> Vec<PathBuf> {
+    let mut pending = vec![home.join("sessions"), home.join("archived_sessions")];
+    let mut parents = std::collections::HashMap::<String, String>::new();
+    let mut paths = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let Ok(meta) = cutex::launch::native_history::metadata(&path) else {
+                continue;
             };
-            let moved = directory.join("moved");
-            std::fs::create_dir_all(&moved).map_err(|error| failed("moving storage", error))?;
-            let target = moved.join(rollout.file_name().unwrap_or_default());
-            std::fs::rename(&rollout, &target)
-                .or_else(|_| std::fs::copy(&rollout, &target).and_then(|_| std::fs::remove_file(&rollout)))
-                .map_err(|error| failed("moving storage", error))?;
-            Ok(NativeOutcome::Moved)
+            let (Some(id), Some(base)) = (
+                meta.get("id").and_then(Value::as_str),
+                meta.pointer("/history_base/thread_id").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            parents.insert(id.to_string(), base.to_string());
+            paths.push((id.to_string(), path));
         }
     }
+    let inherits = |id: &str| {
+        let mut current = id;
+        for _ in 0..=parents.len() {
+            match parents.get(current) {
+                Some(base) if base == thread => return true,
+                Some(base) => current = base,
+                None => return false,
+            }
+        }
+        false
+    };
+    let mut found = paths
+        .into_iter()
+        .filter(|(id, _)| id != thread && inherits(id))
+        .filter_map(|(_, path)| path.canonicalize().ok())
+        .collect::<Vec<_>>();
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// Claude sessions keep their state in a private per-session directory.
@@ -456,10 +600,40 @@ fn move_claude_state(record: &CutexSessionRecord, directory: &Path) -> Result<Na
     Ok(NativeOutcome::Moved)
 }
 
+/// Clear durable service references before removing the session record. On
+/// failure the session remains addressable, so the existing delete entry can
+/// retry (native deletion already treats missing threads/storage as success).
+/// The existing recovery receipt records the unfinished stage across crashes.
+fn clear_project_service_registrant(
+    key: &str,
+    receipt_path: &Path,
+    receipt: &mut Value,
+) -> Result<(), UserInputExecutionError> {
+    receipt["status"] = json!("service_cleanup_pending");
+    write_json(receipt_path, receipt)
+        .map_err(|error| failed("recording pending service cleanup", error))?;
+    cutex::services::store::ServiceStore::open_default()
+        .map_err(|error| error.to_string())
+        .and_then(|store| store.forget_registrant(key).map_err(|error| error.message))
+        .map_err(|error_text| {
+            let mut failure = failed("clearing project service registrant", error_text);
+            failure.details["backupPath"] = json!(receipt_path.parent());
+            failure.details["nativeDeleted"] = json!(true);
+            failure
+        })?;
+    receipt["status"] = json!("services_cleaned");
+    write_json(receipt_path, receipt)
+        .map_err(|error| failed("recording completed service cleanup", error))?;
+    Ok(())
+}
+
 pub(crate) fn delete_for_management(
     cutex_session_id: &str,
     request: &SessionDeleteRequest,
 ) -> Result<Value, UserInputExecutionError> {
+    let lane = cutex::management::v2::user_input::session_input_lock(cutex_session_id)
+        .map_err(|error| failed("reserving session deletion", error))?;
+    let _operation = lane.reserve().map_err(|error| failed("reserving session deletion", error))?;
     let _guard = super::management_context::lock_session_mutations()?;
     let (key, record) = load(cutex_session_id)?;
     if let Some(expected) = request.expected_revision {
@@ -529,7 +703,13 @@ pub(crate) fn delete_for_management(
         super::management_context::stop_runtime_before_archive(&key)?;
     }
     let (_, record) = load(&key)?;
-    let native = if record.claude_session.is_some() {
+    let native = if record.dsh_session.is_some() {
+        match super::dsh_structure::move_state(&record, &directory) {
+            Ok(true) => Ok("dshState"),
+            Ok(false) => Ok(NativeOutcome::Nothing.label()),
+            Err(error) => Err(failed("moving the DSH agent state", error)),
+        }
+    } else if record.claude_session.is_some() {
         move_claude_state(&record, &directory).map(|outcome| match outcome {
             NativeOutcome::Moved => "claudeState",
             other => other.label(),
@@ -549,6 +729,8 @@ pub(crate) fn delete_for_management(
     receipt["nativeDelete"] = json!(native);
     receipt["status"] = json!("native_deleted");
     let _ = write_json(&receipt_path, &receipt);
+
+    clear_project_service_registrant(&key, &receipt_path, &mut receipt)?;
 
     let removed = cutex::session::store::remove_cutex_session_record(&record).map_err(|error| {
         UserInputExecutionError {
@@ -582,9 +764,20 @@ pub(crate) fn delete_for_management(
             eprintln!("session delete: roster cleanup failed for {key}: {error:#}");
         }
     }
+    for (label, result) in [
+        ("activity", cutex::management::v2::activity::forget_deleted_session(&key)),
+        ("usage", cutex::management::v2::usage::forget_deleted_session(&key)),
+    ] {
+        if let Err(error) = result {
+            eprintln!("session delete: {label} cleanup failed for {key}: {error:#}");
+        }
+    }
     cutex::notes::mark_session_deleted_default(&key);
     if let Err(error) = cutex::management::v2::claude_token_usage::remove(&key) {
         eprintln!("session delete: Claude token usage cleanup failed for {key}: {error:#}");
+    }
+    if let Err(error) = cutex::management::v2::claude_plan::remove(&key) {
+        eprintln!("session delete: Claude plan cleanup failed for {key}: {error:#}");
     }
     let deleted_at = chrono::Utc::now().to_rfc3339();
     receipt["status"] = json!("complete");
@@ -811,6 +1004,228 @@ mod tests {
         }
     }
 
+    /// An old "local"-scope explicit-launch session like the two on host-a:
+    /// adopted with `session_only` (local-only, not an Agent, no formal
+    /// name), contract version 4, its own native home under
+    /// `runtime/light/agents/<native id>`, pinned to the r177 bundle manifest.
+    fn local_explicit_launch(native: &str, manifest: &Path) -> CutexSessionRecord {
+        let home = cutex::config::paths::runtime_dir().unwrap().join("light/agents").join(native);
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        rollout(&home, native, None);
+        let mut record = CutexSessionRecord::new_at(
+            format!("cutex.{native}"),
+            Some(native.into()),
+            cutex::platform::host::current_host_name(),
+            home.to_string_lossy().into_owned(),
+            Some("orchid".into()),
+            "2026-09-20T00:00:00Z".into(),
+        )
+        .unwrap();
+        record.display_name_hint = Some(format!("chat {native}"));
+        record.agent_enabled = false;
+        record.registration_class = cutex::agent_bus::model::AgentRegistrationClass::LocalOnly;
+        record.explicit_launch = Some(cutex::agent_management::ExplicitLaunchContract {
+            version: 4,
+            migration_action_id: None,
+            native_id: native.into(),
+            native_home: home.canonicalize().unwrap(),
+            bundle_manifest: manifest.to_path_buf(),
+            bundle_sha256: cutex::agent_management::file_sha256(manifest).unwrap(),
+        });
+        record
+    }
+
+    #[test]
+    fn project_service_cleanup_failure_keeps_session_retryable_after_native_delete() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-service-retry").unwrap();
+        let manifest = test.root().join("bundle.json");
+        std::fs::write(&manifest, "{}").unwrap();
+        let target = local_explicit_launch(ORIGINAL, &manifest.canonicalize().unwrap());
+        let mut sessions = cutex::session::model::CutexSessionStore::default();
+        sessions.sessions.insert(target.cutex_session_id.clone(), target.clone());
+        cutex::session::store::save_cutex_session_store(&sessions).unwrap();
+        let services = cutex::services::store::ServiceStore::open_default().unwrap();
+        services.mutate(|registry| {
+            let service = serde_json::from_value(json!({
+                "slug": "board", "displayName": "Board", "host": services.host(), "port": 1,
+                "runtime": "external", "lifetime": "persistent", "ownerScope": "project",
+                "projectId": "proj", "ownerCutexSessionId": target.cutex_session_id,
+                "createdAt": "2026-10-28T00:00:00Z", "updatedAt": "2026-10-28T00:00:00Z"
+            })).unwrap();
+            registry.services.insert("board".into(), service);
+            Ok(())
+        }).unwrap();
+        assert!(references(&target.cutex_session_id).unwrap().is_null());
+        // Session services still block deletion, including alongside project services.
+        services.mutate(|registry| {
+            let mut personal = registry.services["board"].clone();
+            personal.slug = "personal".into();
+            personal.owner_scope = cutex::services::store::ServiceOwnerScope::Session;
+            registry.services.insert("personal".into(), personal);
+            Ok(())
+        }).unwrap();
+        let request = SessionDeleteRequest {
+            expected_revision: Some(target.durable_revision()), only_if_empty: false,
+        };
+        assert_eq!(delete_for_management(&target.cutex_session_id, &request).unwrap_err().code, "session_referenced");
+        services.remove("personal", &cutex::services::store::Caller::Owner).unwrap();
+
+        // Exercise the actual post-native stage, then simulate registry I/O failure.
+        let directory = recovery_directory(&target.cutex_session_id).unwrap();
+        assert!(matches!(delete_native(&target, &directory).unwrap(), NativeOutcome::Moved));
+        let mut receipt = json!({"cutexSessionId": target.cutex_session_id, "status": "native_deleted"});
+        let receipt_path = directory.join("receipt.json");
+        let registry_bytes = std::fs::read(services.registry_path()).unwrap();
+        std::fs::write(services.registry_path(), "not json").unwrap();
+        let failure = clear_project_service_registrant(&target.cutex_session_id, &receipt_path, &mut receipt).unwrap_err();
+        assert!(failure.retryable);
+        assert_eq!(failure.details["nativeDeleted"], true);
+        assert!(cutex::session::store::load_cutex_session_store().unwrap().sessions.contains_key(&target.cutex_session_id));
+        let saved: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        assert_eq!(saved["status"], "service_cleanup_pending");
+        std::fs::write(services.registry_path(), registry_bytes).unwrap();
+
+        // Retry through the public deletion path: missing native storage is OK.
+        let result = delete_for_management(&target.cutex_session_id, &request).unwrap();
+        assert_eq!(result["deleted"], true);
+        let board = services.get("board").unwrap();
+        assert_eq!(board.owner_cutex_session_id, None);
+        assert_eq!(board.owner_scope, cutex::services::store::ServiceOwnerScope::Project);
+        assert_eq!(board.project_id.as_deref(), Some("proj"));
+        assert!(!cutex::session::store::load_cutex_session_store().unwrap().sessions.contains_key(&target.cutex_session_id));
+        let backup = PathBuf::from(result["backupPath"].as_str().unwrap());
+        let completed: Value = serde_json::from_slice(&std::fs::read(backup.join("receipt.json")).unwrap()).unwrap();
+        assert_eq!(completed["status"], "complete");
+    }
+
+    #[test]
+    fn local_explicit_launch_session_with_an_unstartable_old_bundle_is_deleted_by_storage_move() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-local-r177").unwrap();
+        let bundles = test.root().join("releases/r177");
+        std::fs::create_dir_all(&bundles).unwrap();
+        // The r177 manifest is still there but its natives are not (pruned
+        // releases): the pinned native cannot start.
+        let manifest = bundles.join("bundle-r177.json");
+        std::fs::write(&manifest, r#"{"version":4,"natives":"pruned"}"#).unwrap();
+        let manifest = manifest.canonicalize().unwrap();
+        let target = local_explicit_launch(ORIGINAL, &manifest);
+        let other = local_explicit_launch(FORK, &manifest);
+        assert!(target.is_owned_session(), "the host-a shape is a local owned session");
+        let mut store = cutex::session::model::CutexSessionStore::default();
+        for record in [&target, &other] {
+            store.sessions.insert(record.cutex_session_id.clone(), record.clone());
+        }
+        cutex::session::store::save_cutex_session_store(&store).unwrap();
+        let target_home = target.explicit_launch.as_ref().unwrap().native_home.clone();
+        let other_home = other.explicit_launch.as_ref().unwrap().native_home.clone();
+
+        let receipt = delete_for_management(
+            &target.cutex_session_id,
+            &SessionDeleteRequest { expected_revision: Some(target.durable_revision()), only_if_empty: false },
+        )
+        .unwrap();
+        assert_eq!(receipt["deleted"], true);
+        assert_eq!(receipt["nativeDelete"], "storageMove");
+        assert_eq!(receipt["threadId"], ORIGINAL);
+        let backup = PathBuf::from(receipt["backupPath"].as_str().unwrap());
+        assert!(backup.starts_with(cutex::config::paths::runtime_dir().unwrap().join("session-deletes")));
+        let saved: Value = serde_json::from_slice(&std::fs::read(backup.join("record.json")).unwrap()).unwrap();
+        assert_eq!(saved["cutex_session_id"], target.cutex_session_id.as_str());
+        assert_eq!(walk(&backup.join("rollouts")).len(), 1, "rollout copied before anything moved");
+        assert_eq!(walk(&backup.join("moved")).len(), 1, "rollout moved aside");
+        assert!(walk(&target_home.join("sessions")).is_empty());
+        let receipt_file: Value = serde_json::from_slice(&std::fs::read(backup.join("receipt.json")).unwrap()).unwrap();
+        assert_eq!(receipt_file["status"], "complete");
+
+        let after = cutex::session::store::load_cutex_session_store().unwrap();
+        assert!(!after.sessions.contains_key(&target.cutex_session_id));
+        assert_eq!(after.sessions.get(&other.cutex_session_id), Some(&other), "the other session is untouched");
+        assert_eq!(walk(&other_home.join("sessions")).len(), 1);
+        assert!(manifest.is_file(), "the pinned bundle is not touched");
+    }
+
+    #[test]
+    fn local_explicit_launch_session_whose_bundle_is_gone_is_deleted_too() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-local-gone").unwrap();
+        let manifest = test.root().join("bundle-r177.json");
+        std::fs::write(&manifest, "{}").unwrap();
+        let manifest = manifest.canonicalize().unwrap();
+        let target = local_explicit_launch(ORIGINAL, &manifest);
+        std::fs::remove_file(&manifest).unwrap();
+        let mut store = cutex::session::model::CutexSessionStore::default();
+        store.sessions.insert(target.cutex_session_id.clone(), target.clone());
+        cutex::session::store::save_cutex_session_store(&store).unwrap();
+        let receipt = delete_for_management(
+            &target.cutex_session_id,
+            &SessionDeleteRequest { expected_revision: None, only_if_empty: false },
+        )
+        .unwrap();
+        assert_eq!(receipt["nativeDelete"], "storageMove");
+        assert!(cutex::session::store::load_cutex_session_store().unwrap().sessions.is_empty());
+    }
+
+    /// A native that starts but predates `thread/delete`.
+    struct OldNative;
+
+    impl CatalogEndpoint for OldNative {
+        fn request(&mut self, method: &str, _: Value) -> Result<Value, CatalogError> {
+            Err(CatalogError::Rpc {
+                method: method.into(),
+                error: cutex::app_server::protocol::RpcError {
+                    code: -32600,
+                    message: format!("Invalid request: unknown variant `{method}`, expected one of `initialize`"),
+                    data: None,
+                },
+            })
+        }
+
+        fn notify(&mut self, _: &str, _: Option<Value>) -> Result<(), CatalogError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_native_without_thread_delete_falls_back_to_the_storage_move() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-old-native").unwrap();
+        let source = shared_home(&test);
+        rollout(&source, ORIGINAL, None);
+        let outcome = delete_thread(&mut OldNative, &source, ORIGINAL, &test.root().join("recovery")).unwrap();
+        assert!(matches!(outcome, NativeOutcome::Unsupported));
+        assert!(is_unsupported_method(&rpc("Invalid request: unknown variant `thread/delete`")));
+        assert!(!is_unsupported_method(&rpc("thread not found: 019a")));
+    }
+
+    #[test]
+    fn storage_move_never_breaks_a_fork_that_still_reads_the_history() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-move-fork").unwrap();
+        let source = shared_home(&test);
+        rollout(&source, ORIGINAL, None);
+        rollout(&source, IN_HOME_FORK, Some(ORIGINAL));
+        rollout(&source, FORK_OF_FORK, Some(IN_HOME_FORK));
+        let recovery = test.root().join("recovery");
+        let current = cutex::launch::native_history::current(&source, ORIGINAL).unwrap();
+        let refusal = move_rollout_aside(&source, ORIGINAL, &current, &recovery).err().unwrap();
+        assert_eq!(refusal.code, "session_referenced");
+        assert_eq!(refusal.details["rollouts"].as_array().unwrap().len(), 2, "direct and transitive forks");
+        assert_eq!(walk(&source.join("sessions")).len(), 3, "nothing moved");
+        assert!(!recovery.join("moved").exists());
+    }
+
+    #[test]
+    fn storage_move_takes_left_behind_fork_copies_along() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-move-leftover").unwrap();
+        let source = shared_home(&test);
+        rollout(&source, ORIGINAL, None);
+        rollout(&source, FORK, Some(ORIGINAL));
+        adopted_fork(FORK, &source);
+        let recovery = test.root().join("recovery");
+        let current = cutex::launch::native_history::current(&source, ORIGINAL).unwrap();
+        assert!(matches!(move_rollout_aside(&source, ORIGINAL, &current, &recovery).unwrap(), NativeOutcome::Moved));
+        assert!(walk(&source.join("sessions")).is_empty());
+        assert_eq!(walk(&recovery.join("fork-copies")).len(), 1);
+        assert_eq!(walk(&recovery.join("moved")).len(), 1);
+    }
+
     #[test]
     fn native_refusals_are_classified() {
         assert!(is_fork_reference(&rpc(
@@ -870,6 +1285,18 @@ mod tests {
             connection_id: None,
             initial_permission_mode: None,
         });
+        assert_eq!(not_empty_reason(&record), Some("unsupported"));
+    }
+
+    #[test]
+    fn dsh_sessions_never_probe_codex_for_empty_delete() {
+        let mut record = CutexSessionRecord::new_at(
+            "cutex.dsh-empty-probe".into(), None, "host".into(), "/tmp".into(), None,
+            "2026-10-25T00:00:00Z".into(),
+        ).unwrap();
+        record.runtime_backend = cutex::session::model::CutexSessionRuntimeBackend::Dsh;
+        assert_eq!(not_empty_reason(&record), Some("unsupported"));
+        record.codex_session_id = Some(uuid::Uuid::new_v4().to_string());
         assert_eq!(not_empty_reason(&record), Some("unsupported"));
     }
 }

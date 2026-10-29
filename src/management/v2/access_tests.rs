@@ -88,6 +88,9 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("GET", "/v2/summary/events", Class::Scoped(SummaryEvents)),
         ("GET", "/v2/agent-management/projects", Class::Scoped(ProjectList)),
         ("GET", "/v2/agent-management/projects/p1", Class::Scoped(ProjectRead)),
+        ("GET", "/v2/projects/p1/events", Class::Scoped(ProjectEvents)),
+        ("GET", "/v2/projects/p1/events/stream", Class::Scoped(ProjectEvents)),
+        ("GET", "/v2/projects/p1/background", Class::Scoped(ProjectEvents)),
         ("GET", "/v2/asks", Class::Scoped(AskList)),
         ("GET", "/v2/asks/ask-abc", Class::Scoped(AskRead)),
         ("GET", "/v2/asks/ask-abc/answer", Class::Scoped(AskAnswer)),
@@ -126,6 +129,9 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("DELETE", "/v2/sessions/s1"),
         ("GET", "/v2/sessions/s1/app-server/requests"),
         ("POST", "/v2/summary/read"),
+        ("POST", "/v2/projects/p1/events"),
+        ("GET", "/v2/projects/p1/events/x"),
+        ("POST", "/v2/projects/p1/background"),
         ("POST", "/v2/summary"),
         ("POST", "/v2/capabilities"),
         ("GET", "/v2/asks/provenance"),
@@ -165,6 +171,8 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("GET", "/v2/settings"),
         ("GET", "/v2/profiles"),
         ("GET", "/v2/claude/accounts"),
+        ("GET", "/v2/kimi/accounts"),
+        ("POST", "/v2/kimi/accounts/ka-x/login"),
         ("GET", "/v2/peers"),
         ("POST", "/v2/peers/invites"),
         ("GET", "/v2/fs/file"),
@@ -196,6 +204,8 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("GET", "/v2/owner-notifications"),
         ("GET", "/v2/services"),
         ("POST", "/v2/services/web/view-ticket"),
+        ("GET", "/v2/services/web/tile"),
+        ("GET", "/v2/services/web/tile/image"),
         ("GET", "/v2/browser/agents"),
         ("GET", "/v2/usage"),
         ("GET", "/v2/runtimes"),
@@ -266,6 +276,8 @@ fn cutex_and_native_method_tables_are_reviewed_snapshots() {
             "cutex/agentBus/wake",
             "cutex/asks/pause",
             "cutex/asks/resume",
+            "cutex/agent/pause",
+            "cutex/agent/resume",
             "cutex/ownerNotify/ack",
             "cutex/ownerNotify/reply",
             "cutex/ownerNotify/dismiss",
@@ -390,6 +402,35 @@ fn summary_and_project_filters_keep_only_the_grant() {
     assert!(!summary_event_visible("cutex/summary/messageToOwner", &json!({"id": "n"}), &scope));
     assert!(summary_event_visible("cutex/summary/resync", &json!({}), &scope));
 
+    // Project log rows: granted project, visible agent (or no agent); no workflows.
+    let asks = AskVisibility::default();
+    let row = |project: &str, session: Option<&str>, kind: &str| super::super::project_events::ProjectEvent {
+        project_id: project.into(),
+        cutex_session_id: session.map(str::to_string),
+        kind: kind.into(),
+        ..Default::default()
+    };
+    assert!(project_event_visible(&row("p1", Some("a1"), "turn.completed"), &scope, &asks));
+    assert!(project_event_visible(&row("p1", None, "member.joined"), &scope, &asks));
+    assert!(!project_event_visible(&row("p1", Some("a2"), "turn.completed"), &scope, &asks));
+    assert!(!project_event_visible(&row("p2", Some("a1"), "turn.completed"), &scope, &asks));
+    assert!(!project_event_visible(&row("p1", Some("a1"), "workflow.run"), &scope, &asks));
+    let ping = |project: &str| -> super::super::model::EventEnvelope {
+        serde_json::from_value(json!({
+            "contractVersion": 2, "eventId": "e", "cursor": "c2:x", "streamId": "s", "sequence": 1,
+            "receivedAt": "2026-10-23T00:00:00Z", "cutexSessionId": HOST_EVENTS, "hostId": "h", "source": "cutex",
+            "sensitivity": "owner", "correlation": {},
+            "cutex": {"method": super::super::project_events::APPENDED_EVENT, "params": {"projectId": project, "cursor": "pe:1"}}
+        }))
+        .unwrap()
+    };
+    assert!(event_visible(&ping("p1"), &scope, &asks, Some("u1")));
+    assert!(!event_visible(&ping("p2"), &scope, &asks, Some("u1")));
+    let mut profile_changed = ping("p1");
+    profile_changed.cutex.as_mut().unwrap().method = super::super::profiles_api::PROFILES_CHANGED_EVENT.into();
+    profile_changed.cutex.as_mut().unwrap().params = json!({"profileId":"profile-a","fields":["avatarStyle"],"updatedAt":"2026-10-24T00:00:00Z"});
+    assert!(!event_visible(&profile_changed, &scope, &asks, Some("u1")), "Profile invalidations remain owner host events");
+
     let mut projects = json!({
         "schema": "cutex/human-management-projects/v1",
         "projects": [{"project_id": "p1"}, {"project_id": "p2"}],
@@ -428,7 +469,7 @@ fn device_scope_needs_per_route_class() {
     let none = |_: &str, _: &Value| None;
     let need = |method: &str, path: &str, body: Value| scope_need(method, path, &body, Some("mct-self"), none);
     // Reads: any GET (owner routes included), public / host routes, identity.
-    for path in ["/v2/settings", "/v2/users", "/v2/events/stream", "/v2/sessions/s/bootstrap", "/v2/client-tokens"] {
+    for path in ["/v2/settings", "/v2/users", "/v2/events/stream", "/v2/sessions/s/bootstrap", "/v2/client-tokens", "/v2/services/web/tile", "/v2/services/web/tile/image"] {
         assert_eq!(need("GET", path, Value::Null), ScopeNeed::Read, "{path}");
     }
     assert_eq!(need("POST", "/v2/pair", Value::Null), ScopeNeed::Read);

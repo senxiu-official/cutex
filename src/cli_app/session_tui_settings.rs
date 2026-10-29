@@ -1957,6 +1957,7 @@ impl GlobalSettingsDraft {
             }
         };
         Ok(GlobalConfigPatch {
+            image_input: None,
             appearance: self.appearance.clone(),
             docker_use_sudo: self.docker_sudo,
             terminal_truecolor: self.terminal_truecolor,
@@ -1985,6 +1986,8 @@ impl GlobalSettingsDraft {
             agent_security: None,
             attachments: None,
             proxy,
+            // Management /v2/settings only.
+            claude_cli: None,
             notify_service_url: self.notify_service_url.clone(),
             notify_service_token: self.notify_service_token.clone(),
             notify_service_idle_timeout_secs: self.notify_idle_timeout.clone(),

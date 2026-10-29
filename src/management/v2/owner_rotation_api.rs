@@ -485,6 +485,7 @@ impl RotationEffects for DaemonEffects {
             project_id: Some(rotation.project_id.clone()),
             cwd: Some(spec.cwd.clone()),
             profile: spec.profile.clone(),
+            variant_id: None,
             start: false,
             launch: (!launch.is_empty()).then_some(launch),
         };
@@ -584,3 +585,7 @@ impl RotationEffects for DaemonEffects {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "owner_rotation_api_tests.rs"]
+mod tests;

@@ -14,6 +14,23 @@ use super::{
 
 static EXECUTION: Mutex<()> = Mutex::new(());
 
+/// An `applied` journal holds the before-images of the files a revert
+/// overwrote: the only copy of that work. Kept until the owner removes it
+/// (`None`; owner decision 2026-10-23, was 7 days).
+pub const APPLIED_JOURNAL_RETENTION_DAYS: Option<i64> = None;
+/// A `rolledBack` journal's before-images were restored to disk, so it
+/// holds nothing that is not on disk: removed after 7 days.
+pub const ROLLED_BACK_JOURNAL_RETENTION_DAYS: i64 = 7;
+
+fn finished_journal_expired(status: &State, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let days = match status.state.as_str() {
+        "applied" => APPLIED_JOURNAL_RETENTION_DAYS,
+        "rolledBack" => Some(ROLLED_BACK_JOURNAL_RETENTION_DAYS),
+        _ => None,
+    };
+    days.is_some_and(|days| now.signed_duration_since(status.updated_at).num_days() >= days)
+}
+
 pub struct ExecutionLock {
     _local: MutexGuard<'static, ()>,
     _file: File,
@@ -474,12 +491,7 @@ pub fn recover(home: &Path) -> Result<Vec<String>, Failure> {
                     });
                 }
             }
-        } else if matches!(status.state.as_str(), "applied" | "rolledBack")
-            && chrono::Utc::now()
-                .signed_duration_since(status.updated_at)
-                .num_days()
-                >= 7
-        {
+        } else if finished_journal_expired(&status, chrono::Utc::now()) {
             // Only an immediate, ordinary directory from this verified home.
             fs::remove_dir_all(&dir).map_err(|e| Failure::io(e, Some(dir)))?;
         }
@@ -490,6 +502,20 @@ pub fn recover(home: &Path) -> Result<Vec<String>, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Owner decision 2026-10-23: the before-images of an applied revert
+    /// are kept; a rolled-back journal (restored to disk) still goes.
+    #[test]
+    fn applied_journals_are_kept_and_rolled_back_ones_expire() {
+        let now = chrono::Utc::now();
+        let old = |state: &str| State { state: state.into(), updated_at: now - chrono::Duration::days(400) };
+        let fresh = State { state: "rolledBack".into(), updated_at: now - chrono::Duration::days(1) };
+        assert!(!finished_journal_expired(&old("applied"), now));
+        assert!(finished_journal_expired(&old("rolledBack"), now));
+        assert!(!finished_journal_expired(&fresh, now));
+        assert!(!finished_journal_expired(&old("prepared"), now));
+    }
+
     fn setup() -> (PathBuf, PathBuf, Plan) {
         let root =
             std::env::temp_dir().join(format!("cutex-files-journal-{}", uuid::Uuid::new_v4()));

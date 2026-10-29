@@ -943,7 +943,7 @@ fn profile_ref(account: &StoredAccount) -> Value {
 
 fn supported_login_types(account: &StoredAccount) -> Vec<&'static str> {
     match account.cli_kind {
-        CliKind::Claude => Vec::new(),
+        CliKind::Claude | CliKind::Dsh | CliKind::Kimi => Vec::new(),
         // Third-party API-key profiles route through a custom provider; a
         // ChatGPT credential would not launch on them.
         CliKind::Codex if account.source.as_deref() == Some("api-key") => vec!["apiKey"],
@@ -953,6 +953,7 @@ fn supported_login_types(account: &StoredAccount) -> Vec<&'static str> {
 
 /// Profile auth file + child overrides for a login app-server.
 pub(super) fn login_target(account: &StoredAccount) -> anyhow::Result<LoginTarget> {
+    anyhow::ensure!(account.cli_kind == CliKind::Codex, "account login is only available for Codex profiles");
     let files = crate::profiles::materialize::materialized_account_files(account)?;
     let directory = files
         .auth_path
@@ -1175,6 +1176,18 @@ fn login_not_found(stream: &mut TcpStream, login_id: &str) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dsh_profile_has_no_login_target_or_auth_directory() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let account: StoredAccount = serde_json::from_value(serde_json::json!({
+            "id":"dsh-login-refusal","name":"DSH","cli_kind":"dsh"
+        })).unwrap();
+        assert!(supported_login_types(&account).is_empty());
+        assert!(login_target(&account).is_err());
+        let files = crate::profiles::materialize::materialized_account_files(&account).unwrap();
+        assert!(!files.auth_path.parent().unwrap().exists());
+    }
+
     use super::*;
     use crate::app_server::protocol::RpcError;
     use std::collections::VecDeque;

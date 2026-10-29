@@ -66,6 +66,10 @@ pub struct SparseAgentSpec {
     pub expose_to_im: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pin: bool,
+    /// r265 (additive): a runtime variant of the profile (e.g. `dsh` on a
+    /// DeepSeek API-key profile). Default: the profile's default variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
 }
 
 /// How a sparse create / replace hands over its `task`.
@@ -275,11 +279,17 @@ pub struct CallerDefaults {
 }
 
 /// One profile as a sparse request needs it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProfileFacts {
     /// Canonical profile name (requests may name a profile by id).
     pub name: String,
     pub claude: bool,
+    /// r265: the resolved variant runs on DSH (runtime backend `dsh`).
+    pub dsh: bool,
+    /// r266: the resolved variant runs on Kimi Code (runtime backend `kimi`).
+    pub kimi: bool,
+    /// DSH / Kimi: the variant's default effort (off / low / high / max), if any.
+    pub default_reasoning: Option<String>,
     pub default_model: Option<String>,
 }
 
@@ -318,9 +328,41 @@ pub fn resolve_spec(
             )
         })?,
     };
-    let reasoning = given(&agent.reasoning)
-        .unwrap_or(crate::profiles::reasoning::DEFAULT)
-        .to_string();
+    let reasoning = if facts.kimi {
+        // Kimi efforts are off / low / medium / high / max; "default" is the model's.
+        match given(&agent.reasoning).filter(|effort| *effort != crate::profiles::reasoning::DEFAULT) {
+            Some(effort) if crate::profiles::kimi::EFFORTS.contains(&effort) => effort.to_string(),
+            Some(effort) => {
+                return Err(refuse(
+                    "invalid_reasoning",
+                    format!("Kimi reasoning '{effort}' is not one of: {}. Omit it for the model's default.", crate::profiles::kimi::EFFORTS.join(", ")),
+                ))
+            }
+            None => facts.default_reasoning.clone().unwrap_or_default(),
+        }
+    } else if facts.dsh {
+        // DSH efforts are off / low / high / max; "default" is the variant's.
+        match given(&agent.reasoning).filter(|effort| *effort != crate::profiles::reasoning::DEFAULT) {
+            Some(effort) if crate::profiles::dsh::EFFORTS.contains(&effort) => effort.to_string(),
+            Some(effort) => {
+                return Err(refuse(
+                    "invalid_reasoning",
+                    format!("DSH reasoning '{effort}' is not one of: {}. Omit it for the profile's default.", crate::profiles::dsh::EFFORTS.join(", ")),
+                ))
+            }
+            None => facts.default_reasoning.clone().unwrap_or_default(),
+        }
+    } else {
+        given(&agent.reasoning)
+            .unwrap_or(crate::profiles::reasoning::DEFAULT)
+            .to_string()
+    };
+    if facts.kimi {
+        crate::profiles::kimi::validate_model(&model).map_err(|error| refuse("invalid_model", error.to_string()))?;
+    }
+    if facts.dsh {
+        crate::profiles::dsh::validate_catalog_model(&model).map_err(|error| refuse("invalid_model", error.to_string()))?;
+    }
     let sandbox = match given(&agent.sandbox) {
         Some(value) => SandboxLevel::parse(value).ok_or_else(|| {
             refuse(
@@ -375,6 +417,10 @@ pub fn resolve_spec(
         profile: Some(facts.name),
         runtime_backend: if facts.claude {
             "claude_subscription"
+        } else if facts.dsh {
+            "dsh"
+        } else if facts.kimi {
+            "kimi"
         } else {
             "host"
         }
@@ -600,7 +646,17 @@ pub fn admit(
     sparse: &SparseAgentManagementRequest,
 ) -> Result<AdmittedSparse, SparseRefusal> {
     let store = super::AgentManagementStore::open_default().map_err(|_| unavailable())?;
-    admit_with(
+    // Design 041: "auto:<provider>" picks the profile when the request is
+    // first resolved; the stored resolution (and so every retry) carries the
+    // picked name, the explanation is kept beside it.
+    let agent = sparse.operation.agent();
+    let variant = agent.variant.as_deref().map(str::trim).filter(|variant| !variant.is_empty());
+    let spend = crate::management::v2::profile_auto_pick::Spend::new(
+        agent.model.as_deref(),
+        agent.reasoning.as_deref(),
+    );
+    let mut pick = None;
+    let admitted = admit_with(
         &store,
         caller,
         sparse,
@@ -611,8 +667,49 @@ pub fn admit(
                 refuse("stale_runtime_identity", "the calling agent has no durable session")
             })
         },
-        live_profile_facts,
-    )
+        |requested| {
+            let resolve = |requested: &str| {
+                crate::management::v2::profile_auto_pick::resolve_live(requested, &spend, true)
+            };
+            auto_profile_facts(requested, resolve, &mut pick, |name| live_profile_facts_variant(name, variant))
+        },
+    )?;
+    // A concurrent identical call that stored first decided the profile.
+    let stored_profile = match &admitted.request.operation {
+        AgentOperation::Create { spec, .. } | AgentOperation::Replace { successor: spec, .. } => {
+            spec.profile.as_deref()
+        }
+        _ => None,
+    };
+    if let Some(pick) = pick.filter(|pick| stored_profile == Some(pick.picked.as_str())) {
+        crate::management::v2::profile_auto_pick::record(sparse.action_id.as_str(), &pick);
+    }
+    Ok(admitted)
+}
+
+/// `profile` facts of `requested`, picking the profile first when it is
+/// `auto:<provider>` (`pick` receives the explanation).
+fn auto_profile_facts(
+    requested: &str,
+    resolve: impl FnOnce(
+        &str,
+    ) -> Result<
+        crate::management::v2::profile_auto_pick::Resolution,
+        crate::management::v2::profile_auto_pick::PickRefusal,
+    >,
+    pick: &mut Option<crate::management::v2::profile_auto_pick::ProfilePick>,
+    facts: impl FnOnce(&str) -> Result<ProfileFacts, SparseRefusal>,
+) -> Result<ProfileFacts, SparseRefusal> {
+    use crate::management::v2::profile_auto_pick::Resolution;
+    match resolve(requested) {
+        Ok(Resolution::Profile) => facts(requested),
+        Ok(Resolution::Picked(picked)) => {
+            let resolved = facts(&picked.picked)?;
+            *pick = Some(picked);
+            Ok(resolved)
+        }
+        Err(refused) => Err(refuse(refused.code, refused.detail)),
+    }
 }
 
 fn admit_with(
@@ -785,8 +882,16 @@ fn payload_conflict(action_id: &AgentActionId) -> SparseRefusal {
     )
 }
 
-/// Profile facts from the live profile store and new-session defaults.
+#[cfg(test)]
 fn live_profile_facts(requested: &str) -> Result<ProfileFacts, SparseRefusal> {
+    live_profile_facts_variant(requested, None)
+}
+
+/// Profile facts from the live profile store and new-session defaults, for
+/// `variant` (None: the profile's default variant). r265: a DSH variant
+/// (a DSH profile, or `dsh` on a DeepSeek API-key profile) launches on DSH;
+/// a variant whose runtime is not available here is refused by name.
+fn live_profile_facts_variant(requested: &str, variant: Option<&str>) -> Result<ProfileFacts, SparseRefusal> {
     let store = crate::profiles::settings_api::load_store().map_err(|_| unavailable())?;
     let account = crate::profiles::settings_api::find(&store, requested.trim()).ok_or_else(|| {
         refuse(
@@ -797,6 +902,38 @@ fn live_profile_facts(requested: &str) -> Result<ProfileFacts, SparseRefusal> {
             ),
         )
     })?;
+    let plan = crate::profiles::runtime_variants::plan(account, variant)
+        .map_err(|refusal| refuse(refusal.code, refusal.message))?;
+    if plan.runtime() == &crate::profiles::model::CliKind::Kimi {
+        let (status, reason) = crate::profiles::runtime_variants::compatibility(account, &crate::profiles::model::CliKind::Kimi);
+        if status != crate::profiles::runtime_variants::Status::Supported {
+            return Err(refuse(
+                "variant_runtime_unavailable",
+                format!("Kimi Code is not available on this host ({}); nothing was created", reason.unwrap_or(status.as_str())),
+            ));
+        }
+        let (model, reasoning) = plan.kimi_options();
+        return Ok(ProfileFacts { name: account.name.clone(), kimi: true, default_model: model, default_reasoning: reasoning, ..Default::default() });
+    }
+    if plan.runtime() == &crate::profiles::model::CliKind::Dsh {
+        // `plan` checked a secondary's availability; a DSH primary needs the
+        // installed component too (as the owner's new-agent path).
+        let (status, reason) = crate::profiles::runtime_variants::compatibility(account, &crate::profiles::model::CliKind::Dsh);
+        if status != crate::profiles::runtime_variants::Status::Supported {
+            return Err(refuse(
+                "variant_runtime_unavailable",
+                format!("DSH is not available on this host ({}); nothing was created", reason.unwrap_or(status.as_str())),
+            ));
+        }
+        let options = plan.dsh_options();
+        return Ok(ProfileFacts {
+            name: account.name.clone(),
+            dsh: true,
+            default_model: Some(options.model),
+            default_reasoning: options.reasoning_effort,
+            ..Default::default()
+        });
+    }
     let configured = crate::config::store::load_codez_config_checked()
         .ok()
         .and_then(|config| config.new_session_defaults.get(&account.name).and_then(|d| d.model.clone()));
@@ -811,11 +948,47 @@ fn live_profile_facts(requested: &str) -> Result<ProfileFacts, SparseRefusal> {
         name: account.name.clone(),
         claude: account.cli_kind == crate::profiles::model::CliKind::Claude,
         default_model,
+        ..Default::default()
     })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dsh_sparse_creation_is_refused_by_name_when_dsh_is_not_installed() {
+        // r265: agent tools create DSH agents; without the dsh-runtime component
+        // the refusal names the runtime instead of falling back to cute-codex.
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let account = crate::profiles::lifecycle::create_profile(&crate::profiles::lifecycle::NewProfile {
+            name:"DSH sparse".into(), kind:crate::profiles::lifecycle::NewProfileKind::Dsh,
+            preset:None, base_url:None, model:None, api_key:None,
+        }).unwrap();
+        for profile in [&account.id, &account.name] {
+            let failure = live_profile_facts(profile).unwrap_err();
+            assert_eq!(failure.code, "variant_runtime_unavailable");
+            let agent = SparseAgentSpec { name:"child".into(), profile:Some(profile.clone()), ..Default::default() };
+            let failure = resolve_spec(&agent, &caller(), live_profile_facts).unwrap_err();
+            assert_eq!(failure.code, "variant_runtime_unavailable");
+            let failure = live_profile_facts_variant(profile, Some("codex")).unwrap_err();
+            assert_eq!(failure.code, "unknown_variant");
+        }
+    }
+
+    #[test]
+    fn dsh_facts_resolve_to_the_dsh_backend_with_catalog_model_and_effort() {
+        let facts = |_: &str| Ok(ProfileFacts { name: "DS".into(), dsh: true, default_model: Some("deepseek-flash".into()), default_reasoning: Some("high".into()), ..Default::default() });
+        let agent = SparseAgentSpec { name: "child".into(), profile: Some("DS".into()), ..Default::default() };
+        let spec = resolve_spec(&agent, &caller(), facts).unwrap();
+        assert_eq!((spec.runtime_backend.as_str(), spec.model.as_str(), spec.reasoning.as_str()), ("dsh", "deepseek-flash", "high"));
+        let pro = SparseAgentSpec { model: Some("deepseek-v4-pro".into()), reasoning: Some("max".into()), variant: Some("dsh".into()), ..agent.clone() };
+        let spec = resolve_spec(&pro, &caller(), facts).unwrap();
+        assert_eq!((spec.model.as_str(), spec.reasoning.as_str()), ("deepseek-v4-pro", "max"));
+        let bad_effort = SparseAgentSpec { reasoning: Some("medium".into()), ..agent.clone() };
+        assert_eq!(resolve_spec(&bad_effort, &caller(), facts).unwrap_err().code, "invalid_reasoning");
+        let bad_model = SparseAgentSpec { model: Some("deepseek-chat".into()), ..agent };
+        assert_eq!(resolve_spec(&bad_model, &caller(), facts).unwrap_err().code, "invalid_model");
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -836,6 +1009,7 @@ mod tests {
             name: if name == "zephyr-id" { "Zephyr".into() } else { name.into() },
             claude: name == "Claude",
             default_model: Some(format!("{name}-model")),
+            ..Default::default()
         })
     }
 
@@ -931,7 +1105,7 @@ mod tests {
         let check = |agent: serde_json::Value, defaults: CallerDefaults, code: &str| {
             let error = resolve_request(&sparse(json!({"operation":"create","agent":agent})), &defaults, |name| {
                 if name == "nomodel" {
-                    Ok(ProfileFacts { name: name.into(), claude: false, default_model: None })
+                    Ok(ProfileFacts { name: name.into(), claude: false, default_model: None, ..Default::default() })
                 } else if name == "ghost" {
                     Err(refuse("unknown_profile", "Profile not found"))
                 } else {
@@ -1052,7 +1226,7 @@ mod tests {
         // The same call later replays the stored request, even though the
         // profile's default model changed meanwhile.
         let replay = resolve_with(&store, &caller, &request, || panic!("caller not read on replay"), |name| {
-            Ok(ProfileFacts { name: name.into(), claude: false, default_model: Some("new-default".into()) })
+            Ok(ProfileFacts { name: name.into(), claude: false, default_model: Some("new-default".into()), ..Default::default() })
         })
         .unwrap();
         assert!(!replay.new);
@@ -1118,6 +1292,7 @@ mod tests {
             bundle_manifest: "bundle.json".into(),
             bundle_sha256: sha("b"),
             configuration: crate::launch::stock::StockConfiguration {
+                effort_fallback: None,
                 selected_projection: None,
                 private_chatgpt_auth: None,
                 profile_name: "Zephyr".into(),
@@ -1281,12 +1456,66 @@ mod tests {
             crate::approvals::request_digest(&json!({"project_id": request.project_id, "operation": request.operation}))
         };
         let retry = admit_with(&store, &director, &request, || panic!("frozen: caller not read"), |name| {
-            Ok(ProfileFacts { name: name.into(), claude: false, default_model: Some("changed-default".into()) })
+            Ok(ProfileFacts { name: name.into(), claude: false, default_model: Some("changed-default".into()), ..Default::default() })
         })
         .unwrap();
         assert_eq!(retry.request, first.request);
         assert_eq!(retry.sparse_sha256, first.sparse_sha256);
         assert_eq!(approval_digest(&retry.request), approval_digest(&first.request));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Design 041: "auto:<provider>" is picked once; the stored resolution
+    /// (what a retry replays and an older release reads) names the picked
+    /// profile, never "auto:…", and a refused pick binds nothing.
+    #[test]
+    fn an_auto_profile_is_picked_once_and_stored_by_name() {
+        use crate::management::v2::profile_auto_pick::{PickRefusal, ProfilePick, Resolution};
+        let director = session("d1");
+        let (root, store, _) = project_store(&director);
+        let request = sparse(json!({"action_id":"auto-1","operation":"create","agent":{"name":"numbat","profile":"auto:anthropic"}}));
+        let explanation = ProfilePick {
+            requested: "auto:anthropic".into(),
+            provider: "anthropic".into(),
+            picked: "AlphaProfile".into(),
+            picked_id: "id-alpha-profile".into(),
+            rule: "only_candidate".into(),
+            reason: "AlphaProfile: the only candidate".into(),
+            model: None,
+            effort: None,
+            candidates: Vec::new(),
+            excluded: Vec::new(),
+            at: "2026-10-23T00:00:00+00:00".into(),
+        };
+        let mut pick = None;
+        let first = admit_with(&store, &director, &request, || Ok(creator(&director)), |requested| {
+            assert_eq!(requested, "auto:anthropic");
+            auto_profile_facts(requested, |_| Ok(Resolution::Picked(explanation.clone())), &mut pick, codex)
+        })
+        .unwrap();
+        assert_eq!(pick.as_ref().map(|pick| pick.picked.as_str()), Some("AlphaProfile"));
+        let AgentOperation::Create { spec, .. } = &first.request.operation else { panic!() };
+        assert_eq!(spec.profile.as_deref(), Some("AlphaProfile"));
+        let stored = serde_json::to_string(&store.snapshot().unwrap().sparse_requests[&AgentActionId::new("auto-1").unwrap()]).unwrap();
+        assert!(stored.contains("\"AlphaProfile\"") && !stored.contains("auto:anthropic"), "{stored}");
+        // The retry replays the stored pick: no new pick, no profile read.
+        let retry = admit_with(&store, &director, &request, || panic!("frozen"), |_| panic!("not re-picked")).unwrap();
+        assert_eq!(retry.request, first.request);
+        // Bare "auto" (and any refused pick) binds nothing.
+        let bare = sparse(json!({"action_id":"auto-2","operation":"create","agent":{"name":"wombat","profile":"auto"}}));
+        let mut none = None;
+        let refused = admit_with(&store, &director, &bare, || Ok(creator(&director)), |requested| {
+            let refuse_bare = |_: &str| Err(PickRefusal { code: "provider_required", detail: "pass auto:<provider>".into() });
+            auto_profile_facts(requested, refuse_bare, &mut none, codex)
+        })
+        .unwrap_err();
+        assert_eq!(refused.code, "provider_required");
+        assert!(none.is_none());
+        assert!(!store.snapshot().unwrap().sparse_requests.contains_key(&AgentActionId::new("auto-2").unwrap()));
+        // An ordinary name is looked up as before.
+        let mut ordinary = None;
+        let facts = auto_profile_facts("Zephyr", |_| Ok(Resolution::Profile), &mut ordinary, codex).unwrap();
+        assert_eq!((facts.name.as_str(), ordinary.is_none()), ("Zephyr", true));
         std::fs::remove_dir_all(root).unwrap();
     }
 

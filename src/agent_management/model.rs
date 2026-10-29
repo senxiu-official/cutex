@@ -290,6 +290,8 @@ pub enum AgentOperation {
     Restart {
         cutex_session_id: CutexSessionId,
     },
+    /// Legacy wire name: reversible soft archive since r264. Permanent
+    /// retirement is a separate owner-only request, never an AgentOperation.
     Close {
         cutex_session_id: CutexSessionId,
     },
@@ -771,6 +773,10 @@ pub struct AgentActionRecord {
     pub operation: AgentOperationKind,
     pub project_id: ProjectId,
     pub caller_cutex_session: CutexSessionId,
+    /// Frozen when this new action is authorized. None on legacy actions stays
+    /// unknown on recovery; never recompute the creator's role after handover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<crate::session::model::SessionCreatedBy>,
     pub phase: AgentActionPhase,
     #[serde(default)]
     pub phase_sequence: u64,
@@ -889,6 +895,11 @@ pub struct AgentManagementReceipt {
     pub project_id: ProjectId,
     pub completed_at: Rfc3339,
     pub result: AgentManagementResult,
+    /// Archive disposition of the lifecycle target (Replace: predecessor).
+    #[serde(default, rename = "archiveKind", skip_serializing_if = "Option::is_none")]
+    pub archive_kind: Option<super::AgentArchiveKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restorable: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

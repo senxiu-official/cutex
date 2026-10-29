@@ -217,6 +217,38 @@ fn creation_defaults(record: &CutexSessionRecord) -> Option<cutex::agent_managem
     })
 }
 
+fn fork_creation_defaults(
+    record: &CutexSessionRecord,
+    target: Option<&cutex::profiles::model::StoredAccount>,
+) -> anyhow::Result<Option<cutex::agent_management::HumanCreationDefaults>> {
+    match target {
+        None => Ok(creation_defaults(record)),
+        Some(target) => {
+            let configuration =
+                cutex::launch::stock::local_configuration_with_profile(Some(&target.name))?;
+            Ok(Some(target_creation_defaults(
+                record,
+                &target.name,
+                &configuration.model,
+                configuration.reasoning.clone(),
+            )))
+        }
+    }
+}
+fn target_creation_defaults(
+    record: &CutexSessionRecord,
+    profile: &str,
+    model: &str,
+    reasoning: Option<String>,
+) -> cutex::agent_management::HumanCreationDefaults {
+    cutex::agent_management::HumanCreationDefaults {
+        profile: profile.into(),
+        model: model.into(),
+        reasoning,
+        permissions: launch_permissions(record).filter(|p| p.validate_shape().is_ok()),
+    }
+}
+
 fn durable_agent(record: &CutexSessionRecord) -> bool {
     record.agent_enabled
         && record.registration_class == cutex::agent_bus::model::AgentRegistrationClass::Persistent
@@ -359,6 +391,10 @@ pub(crate) fn fork_for_management(
     cutex_session_id: &str,
     request: &SessionForkRequest,
 ) -> Result<Value, UserInputExecutionError> {
+    let lane = cutex::management::v2::user_input::session_input_lock(cutex_session_id)
+        .map_err(|error| failed("reserving fork source", error, json!({})))?;
+    let _operation = lane.reserve()
+        .map_err(|error| failed("reserving fork source", error, json!({})))?;
     let store = cutex::session::store::load_cutex_session_store()
         .map_err(|e| failed("loading the session store", e, json!({})))?;
     let key = cutex::session::service::cutex_session_key_for_user_id(&store, cutex_session_id).ok_or_else(|| {
@@ -370,8 +406,16 @@ pub(crate) fn fork_for_management(
         )
     })?;
     let source = store.sessions[&key].clone();
+    if source.dsh_session.is_some() {
+        return super::dsh_structure::fork(principal, &source, request);
+    }
+    let target = request
+        .profile
+        .as_deref()
+        .map(|profile| cutex::management::v2::profile_switch::fork_target(&source, profile))
+        .transpose()?;
     if source.claude_session.is_some() {
-        return super::claude_structure::fork(principal, &source, request);
+        return super::claude_structure::fork(principal, &source, request, target.as_ref());
     }
     if source.is_retired() {
         return Err(unsupported("restore the archived session before forking it"));
@@ -431,6 +475,13 @@ pub(crate) fn fork_for_management(
         None
     };
 
+    // Resolve the target model/effort before producing any native history.
+    let defaults = fork_creation_defaults(&source, target.as_ref())
+        .map_err(|e| failed("resolving target profile defaults", e, json!({})))?;
+    let target_profile = target
+        .as_ref()
+        .map(|p| p.name.as_str())
+        .or(source.profile.as_deref());
     let forked = fork_native(&source, &source_thread, request.after_turn_id.as_deref())?;
     let thread = forked.thread.clone();
     let partial = |step: &str, message: String, id: Option<&str>| {
@@ -450,20 +501,47 @@ pub(crate) fn fork_for_management(
         }
     }
     let adopt_request = cutex::agent_management::HumanAdoptRequest {
+        owner_created_native: true,
         session_only: !agent,
-        creation_defaults: creation_defaults(&source),
+        creation_defaults: defaults,
         action_id: cutex::agent_management::AgentActionId::new(format!("session-fork-{thread}"))
             .map_err(|e| partial("adoption", e.to_string(), None))?,
         native_id: thread.clone(),
         cwd: forked.cwd.clone(),
         formal_name: name.clone(),
     };
-    let adopted = super::management_context::adopt_forked_native(principal, &adopt_request, &forked.home, source.profile.as_deref())
-        .map_err(|e| partial("adoption", e.to_string(), None))?;
+    let adopted = super::management_context::adopt_forked_native(
+        principal,
+        &adopt_request,
+        &forked.home,
+        target_profile,
+        &source,
+    )
+    .map_err(|e| partial("adoption", e.to_string(), None))?;
     let new_id = adopted.adopted.record.cutex_session_id.clone();
     if let Some(message) = &adopted.error {
         return Err(partial("roster import", message.clone(), Some(&new_id)));
     }
+    let new_record = &adopted.adopted.record;
+    let home = new_record
+        .explicit_launch
+        .as_ref()
+        .map(|launch| launch.native_home.as_path())
+        .unwrap_or(&forked.home);
+    let (history_bytes, size_warning) = cutex::session::fork::optional_history_bytes(
+        cutex::session::fork::codex_history_bytes(home, &thread),
+    );
+    let origin = cutex::session::fork::ForkOrigin {
+        source_session_id: key.clone(),
+        source_profile: source.profile.clone(),
+        target_profile: target_profile.map(str::to_owned),
+        history_bytes: history_bytes.unwrap_or(0),
+        cold_cache: target
+            .as_ref()
+            .is_some_and(|target| Some(target.name.as_str()) != source.profile.as_deref()),
+    };
+    cutex::session::fork::save(&new_id, &origin)
+        .map_err(|e| partial("saving fork boundary", format!("{e:#}"), Some(&new_id)))?;
     // Adopted into a home of its own (step 5): drop the source-home copy.
     super::session_delete::release_fork_copy(&source, &forked.home, &thread);
     follow_up(&new_id, "cutex/session/visibility/show", json!({}))
@@ -507,6 +585,8 @@ pub(crate) fn fork_for_management(
         "threadId": thread,
         "forkedThroughTurnId": forked.through_turn_id,
         "name": name,
+        "profile":target_profile,"sourceProfile":source.profile,"historyBytes":history_bytes,"coldCache":origin.cold_cache,"forkBoundaryNote":origin.boundary_note(),
+        "warnings":size_warning.into_iter().collect::<Vec<_>>(),
     }))
 }
 
@@ -514,10 +594,63 @@ pub(crate) fn fork_for_management(
 mod tests {
     use super::*;
 
+    #[test]
+    fn adopted_codex_fork_measurement_failure_is_a_warning_not_an_error() {
+        let missing=std::env::temp_dir().join(format!("fork-measure-{}",uuid::Uuid::new_v4()));
+        let (bytes,warning)=cutex::session::fork::optional_history_bytes(cutex::session::fork::codex_history_bytes(&missing,&uuid::Uuid::new_v4().to_string()));
+        assert!(bytes.is_none());
+        assert_eq!(warning.unwrap()["code"],"fork_history_size_unavailable");
+    }
+
     fn turns(spec: &[(&str, bool)]) -> Vec<TurnSummary> {
         spec.iter()
             .map(|(id, in_progress)| TurnSummary { id: id.to_string(), in_progress: *in_progress })
             .collect()
+    }
+
+    #[test]
+    fn target_adoption_uses_target_defaults_and_source_permissions() {
+        let mut source = CutexSessionRecord::new_at(
+            "cutex.source".into(),
+            None,
+            "host".into(),
+            "/tmp".into(),
+            Some("source-profile".into()),
+            "2026-10-24T00:00:00Z".into(),
+        )
+        .unwrap();
+        source.model_defaults = Some("source-model".into());
+        source.reasoning_defaults = Some("max".into());
+        source.sandbox_mode = Some("workspace-write".into());
+        source.approval_policy = Some("on-request".into());
+        source.sandbox_network_access = Some(true);
+        let defaults = target_creation_defaults(
+            &source,
+            "target-profile",
+            "target-model",
+            Some("low".into()),
+        );
+        let request = cutex::agent_management::HumanAdoptRequest {
+            owner_created_native: false,
+            session_only: false,
+            creation_defaults: Some(defaults),
+            action_id: cutex::agent_management::AgentActionId::new("fork-adoption-test").unwrap(),
+            native_id: uuid::Uuid::new_v4().to_string(),
+            cwd: source.cwd.clone(),
+            formal_name: "fork".into(),
+        };
+        let defaults = request.creation_defaults.unwrap();
+        assert_eq!(
+            (
+                defaults.profile.as_str(),
+                defaults.model.as_str(),
+                defaults.reasoning.as_deref()
+            ),
+            ("target-profile", "target-model", Some("low"))
+        );
+        assert_eq!(defaults.permissions.unwrap().sandbox, "workspace-write");
+        assert_eq!(source.profile.as_deref(), Some("source-profile"));
+        assert_eq!(source.model_defaults.as_deref(), Some("source-model"));
     }
 
     #[test]

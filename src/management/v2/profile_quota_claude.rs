@@ -127,6 +127,7 @@ impl ClaudeQuotaSnapshot {
                 balance: None,
                 reset_at: window.reset_at,
                 window_label: Some(window.label.clone()),
+                display_label: None,
                 observed_at: Some(fetched_at),
                 stale,
                 error: None,

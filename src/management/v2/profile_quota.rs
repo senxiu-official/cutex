@@ -94,6 +94,45 @@ fn refresh_requested(path: &str) -> Result<bool, String> {
     Ok(refresh)
 }
 
+/// The gauges of one profile, as `GET /v2/profiles/{p}/quota` reports them.
+pub struct ProfileGauges {
+    pub gauges: Vec<quota::Gauge>,
+    pub native_quota: Option<serde_json::Value>,
+    /// `quotaConfig` | `native` | `claude` | `claudeApi` | None.
+    pub source: Option<&'static str>,
+}
+
+/// Read a profile's gauges (`refresh` = force an upstream read now).
+pub fn read_gauges(account: &crate::profiles::model::StoredAccount, refresh: bool) -> anyhow::Result<ProfileGauges> {
+    // Precedence: an enabled quota-config (HTTP reader) wins; native
+    // rate limits serve ChatGPT-login profiles without one.
+    let native = super::profile_quota_native::native_quota_applies(account);
+    let claude = super::profile_quota_claude::claude_quota_applies(account);
+    // Claude: the profile's Claude account decides (subscription
+    // windows = "claude", API usage totals = "claudeApi").
+    let mut claude_source = "claude";
+    let (gauges, native_quota) = if native {
+        super::profile_quota_native::quota_view(account, refresh).map(|(gauges, meta)| (gauges, Some(meta)))?
+    } else if claude {
+        super::profile_quota_claude::quota_view(account, refresh).map(|(gauges, meta, source)| {
+            claude_source = source;
+            (gauges, Some(meta))
+        })?
+    } else {
+        (quota::gauges(account, refresh)?, None)
+    };
+    let source = if native {
+        Some("native")
+    } else if claude {
+        Some(claude_source)
+    } else if super::profile_quota_native::has_explicit_quota_config(account) {
+        Some("quotaConfig")
+    } else {
+        None
+    };
+    Ok(ProfileGauges { gauges, native_quota, source })
+}
+
 pub(super) fn handle(
     stream: &mut TcpStream,
     request: &SimpleHttpRequest,
@@ -132,35 +171,8 @@ pub(super) fn handle(
                 Ok(refresh) => refresh,
                 Err(message) => return bad_request(stream, &message),
             };
-            // Precedence: an enabled quota-config (HTTP reader) wins; native
-            // rate limits serve ChatGPT-login profiles without one.
-            let native = super::profile_quota_native::native_quota_applies(&account);
-            let claude = super::profile_quota_claude::claude_quota_applies(&account);
-            // Claude: the profile's Claude account decides (subscription
-            // windows = "claude", API usage totals = "claudeApi").
-            let mut claude_source = "claude";
-            let read = if native {
-                super::profile_quota_native::quota_view(&account, refresh)
-                    .map(|(gauges, meta)| (gauges, Some(meta)))
-            } else if claude {
-                super::profile_quota_claude::quota_view(&account, refresh).map(|(gauges, meta, source)| {
-                    claude_source = source;
-                    (gauges, Some(meta))
-                })
-            } else {
-                quota::gauges(&account, refresh).map(|gauges| (gauges, None))
-            };
-            let source = if native {
-                Some("native")
-            } else if claude {
-                Some(claude_source)
-            } else if super::profile_quota_native::has_explicit_quota_config(&account) {
-                Some("quotaConfig")
-            } else {
-                None
-            };
-            match read {
-                Ok((gauges, native_quota)) => write_json_response(
+            match read_gauges(&account, refresh) {
+                Ok(ProfileGauges { gauges, native_quota, source }) => write_json_response(
                     stream,
                     200,
                     "OK",
@@ -271,5 +283,9 @@ mod tests {
         assert_eq!(nested.unknown_field().as_deref(), Some("secret"));
         let extras: QuotaConfigUpdate = serde_json::from_value(json!({ "extras": [{}, { "x": 1 }] })).unwrap();
         assert_eq!(extras.unknown_field().as_deref(), Some("x"));
+        // display_label is a known field (r250 refuses it as unknown).
+        let display: QuotaConfigUpdate = serde_json::from_value(json!({ "primary": { "label": "DS", "display_label": "余额" } })).unwrap();
+        assert_eq!(display.unknown_field(), None);
+        assert_eq!(display.primary.unwrap().display_label.as_deref(), Some("余额"));
     }
 }

@@ -60,12 +60,16 @@ pub(super) fn revert(
             revert_params(before, rewind_files),
         )?;
         drop(guard);
-        // Bootstrap's latestTokenUsage must not describe a removed turn.
+        // Bootstrap's latestTokenUsage / latestPlan must not describe a removed turn.
         let removed: Vec<&str> = result["removedTurnIds"].as_array().into_iter().flatten()
             .filter_map(Value::as_str).collect();
         if let Err(error) = cutex::management::v2::claude_token_usage::forget_removed_turns(id, &removed) {
             eprintln!("Claude latest token usage for {id} not reset after revert: {error:#}");
         }
+        if let Err(error) = cutex::management::v2::claude_plan::forget_removed_turns(id, &removed) {
+            eprintln!("Claude latest plan for {id} not reset after revert: {error:#}");
+        }
+        super::session_history::forget_reverted_activity(id, &removed);
         refresh_observer(record, &result["runtime"])?;
         let current = cutex::session::store::load_cutex_session_store()?;
         let generation = current
@@ -114,16 +118,91 @@ fn fork_facts(source: &CutexSessionRecord, id: &str, thread: &str, name: &str, f
         "warnings": warnings})
 }
 
+/// A new identity may use another account, while an in-place switch remains frozen.
+fn fork_template(
+    source: &CutexSessionRecord,
+    target: Option<&cutex::profiles::model::StoredAccount>,
+) -> anyhow::Result<CutexSessionRecord> {
+    let mut record = source.clone();
+    if let Some(target) = target {
+        let binding = record
+            .claude_session
+            .as_mut()
+            .context("Claude source missing")?;
+        ensure!(cutex::runtime::claude::adapter_features(&binding.deployment.adapter_source)["forkProfileDefaults"]==true,
+            "cross-profile fork requires a Claude runtime with forkProfileDefaults; install and repin the source to the new Claude runtime first");
+        let registry = cutex::runtime::claude_accounts::load()?;
+        let source_account = cutex::runtime::claude_accounts::session_account_id(&registry, source);
+        let target_account = target
+            .claude_account
+            .as_deref()
+            .unwrap_or(cutex::runtime::claude_accounts::DEFAULT_ACCOUNT_ID);
+        if source_account.as_deref() != Some(target_account) {
+            let selected = cutex::runtime::claude::ClaudeDeployment::selected()?;
+            let (_, home) = cutex::runtime::claude_accounts::home_for_profile(
+                Some(&target.name),
+                &selected.claude_home,
+            )?;
+            binding.deployment.claude_home = home;
+        }
+        let config = cutex::config::store::load_codez_config_checked()?;
+        let defaults = config.new_session_defaults.get(&target.name);
+        binding.model = defaults
+            .and_then(|d| d.model.clone())
+            .unwrap_or_else(|| target.options.claude.model.clone());
+        binding.effort = match defaults.and_then(|d| d.reasoning.as_deref()) {
+            Some(effort) => cutex::profiles::appearance::ClaudeEffort::parse(effort)?,
+            None => target.options.claude.effort,
+        };
+        ensure!(
+            !binding.model.trim().is_empty(),
+            "target Claude profile has no model"
+        );
+        record.profile = Some(target.name.clone());
+        record.model_defaults = Some(binding.model.clone());
+        record.reasoning_defaults = binding.effort.map(|e| e.as_str().to_string());
+    }
+    Ok(record)
+}
+
+fn fork_history_facts(
+    source_home: &std::path::Path,
+    target_home: &std::path::Path,
+    native: &str,
+    empty: bool,
+) -> anyhow::Result<(Option<u64>, bool, Option<Value>)> {
+    // Same-account forks retain their native transcript; size inspection is
+    // optional and must not create an orphan after the SDK already forked.
+    let account_changes = source_home != target_home
+        && match (source_home.canonicalize(), target_home.canonicalize()) {
+            (Ok(source), Ok(target)) => source != target,
+            _ => true,
+        };
+    let inspect = || -> anyhow::Result<u64> {
+        match cutex::runtime::claude::fork_history::locate_fork_transcript(source_home, native)? {
+            Some(transcript) if account_changes => Ok(cutex::runtime::claude::fork_history::copy_fork_history(source_home, target_home, native, &transcript)?.total_bytes),
+            Some(transcript) => cutex::runtime::claude::fork_history::measure_fork_history(source_home, native, &transcript),
+            None if empty => Ok(0),
+            None => anyhow::bail!("forked transcript is missing"),
+        }
+    };
+    if account_changes { return Ok((Some(inspect()?), true, None)); }
+    let (bytes, warning)=cutex::session::fork::optional_history_bytes(inspect());
+    Ok((bytes, false, warning))
+}
+
 pub(super) fn fork(
     principal: &HumanManagementPrincipal,
     source: &CutexSessionRecord,
     request: &SessionForkRequest,
+    target_profile: Option<&cutex::profiles::model::StoredAccount>,
 ) -> Result<Value, UserInputExecutionError> {
     let run = || -> anyhow::Result<Value> {
         ensure!(
             !source.is_retired(),
             "restore the archived agent before forking"
         );
+        let template = fork_template(source, target_profile)?;
         let path = cutex::session::store::cutex_sessions_path()?;
         let store = cutex::session::store::load_cutex_session_store()?;
         let taken = |name: &str| {
@@ -149,12 +228,47 @@ pub(super) fn fork(
         let guard = input_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session input lock poisoned"))?;
+        let mut params = json!({"lastTurnId": request.after_turn_id, "targetThreadId": thread, "targetStateDir": target, "name": name});
+        if target_profile.is_some() {
+            let session = template.claude_session.as_ref().unwrap();
+            params["launchDefaults"] =
+                json!({"model":session.model,"effort":session.effort.map(|e|e.as_str())});
+        }
         let facts = cutex::runtime::claude::structure::request(
             &source.cutex_session_id,
             "claude/thread/fork",
-            json!({"lastTurnId": request.after_turn_id, "targetThreadId": thread, "targetStateDir": target, "name": name}),
+            params,
         )?;
-        let record = cutex::runtime::claude::structure::fork_record(source, &id, &name, &facts)?;
+        drop(guard);
+        refresh_observer(source, &facts["sourceRuntime"])?;
+        let record = cutex::runtime::claude::structure::fork_record_with_creator(
+            &template, &id, &name, &facts, Some(cutex::session::model::SessionCreatedBy::Owner),
+        )?;
+        let source_home = &source
+            .claude_session
+            .as_ref()
+            .unwrap()
+            .deployment
+            .claude_home;
+        let target_home = &record
+            .claude_session
+            .as_ref()
+            .unwrap()
+            .deployment
+            .claude_home;
+        let native = facts["nativeSessionId"]
+            .as_str()
+            .context("fork omitted native session id")?;
+        let (copied, cold_cache, size_warning) = fork_history_facts(source_home, target_home, native, facts["forkedThroughTurnId"].is_null())
+            .with_context(||format!("fork {id} native session {native} exists at {}; transcript transfer incomplete; source copy preserved",target.display()))?;
+        let origin = cutex::session::fork::ForkOrigin {
+            source_session_id: source.cutex_session_id.clone(),
+            source_profile: source.profile.clone(),
+            target_profile: record.profile.clone(),
+            history_bytes: copied.unwrap_or(0),
+            cold_cache,
+        };
+        cutex::session::fork::save(&id, &origin)?;
         cutex::session::store::with_locked_session_rows(&path, |rows| {
             ensure!(
                 !rows
@@ -171,8 +285,7 @@ pub(super) fn fork(
                 target.display()
             )
         })?;
-        drop(guard);
-        refresh_observer(source, &facts["sourceRuntime"])?;
+
         if source.agent_enabled {
             import_and_assign(principal, source, &id, &name).with_context(|| {
                 format!("fork {id} exists; roster import or project assignment incomplete")
@@ -184,7 +297,17 @@ pub(super) fn fork(
                 cutex::config::store::load_codez_config_checked()?.new_session_notification,
             ),
         )?;
-        Ok(fork_facts(source, &id, &thread, &name, &facts))
+        let mut result = fork_facts(source, &id, &thread, &name, &facts);
+        result["profile"] = json!(record.profile);
+        result["sourceProfile"] = json!(source.profile);
+        result["historyBytes"] = json!(copied);
+        if let Some(warning) = size_warning {
+            let warnings=result["warnings"].as_array_mut().expect("fork facts include warnings");
+            warnings.push(warning);
+        }
+        result["coldCache"] = json!(origin.cold_cache);
+        result["forkBoundaryNote"] = json!(origin.boundary_note());
+        Ok(result)
     };
     run().map_err(|e| failure("session_fork_failed", e))
 }
@@ -192,6 +315,16 @@ pub(super) fn fork(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_profile_fork_succeeds_when_history_measurement_fails() {
+        let missing=std::env::temp_dir().join(format!("fork-unmeasurable-{}",uuid::Uuid::new_v4()));
+        let native=uuid::Uuid::new_v4().to_string();
+        let (bytes,cold_cache,warning)=fork_history_facts(&missing,&missing,&native,false).expect("same-account fork must continue after measurement failure");
+        assert!(bytes.is_none()); assert!(!cold_cache);
+        assert_eq!(warning.unwrap()["code"],"fork_history_size_unavailable");
+        assert!(fork_history_facts(&missing,&missing.join("another-account"),&native,false).is_err(),"cross-account history transfer is still required");
+    }
 
     #[test]
     fn structural_rpc_failure_preserves_recovery_receipt_and_uncertainty() {
@@ -366,7 +499,7 @@ pub(super) fn import_claude_agent(
     Ok(())
 }
 
-fn import_and_assign(
+pub(super) fn import_and_assign(
     principal: &HumanManagementPrincipal,
     source: &CutexSessionRecord,
     id: &str,

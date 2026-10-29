@@ -29,10 +29,16 @@ class R8Protocol:
             tid = text(params.get('threadId'), 'threadId', limit=256)
             if method.endswith('/fork'):
                 require(set(params) <= {'threadId', 'lastTurnId', 'beforeTurnId', 'excludeTurns', 'name',
-                                        'targetThreadId', 'targetStateDir'}, 'unsupported fork fields')
+                                        'targetThreadId', 'targetStateDir', 'launchDefaults'}, 'unsupported fork fields')
                 require(type(params.get('excludeTurns', False)) is bool, 'excludeTurns must be a boolean')
                 require(method == 'claude/thread/fork' or not any(key in params for key in ('targetThreadId', 'targetStateDir')),
                         'cross-state export requires claude/thread/fork')
+                if 'launchDefaults' in params:
+                    require(method == 'claude/thread/fork' and params.get('targetStateDir'), 'fork launch defaults require a new Cutex session')
+                    launch = params['launchDefaults']
+                    require(type(launch) is dict and set(launch) == {'model', 'effort'}, 'launchDefaults must contain model and effort')
+                    text(launch['model'], 'launchDefaults.model', limit=256)
+                    require(launch['effort'] in (None, 'low', 'medium', 'high', 'xhigh', 'max'), 'invalid fork effort')
                 facts = await self.sessions.fork(tid, params)
                 if params.get('targetStateDir') is not None:
                     return facts, None

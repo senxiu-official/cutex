@@ -22,6 +22,7 @@ pub struct GlobalConfigPatch {
     pub profile_quota_refresh_minutes: Option<u8>,
     pub archive_delete_empty: Option<bool>,
     pub queue_owner_may_pass_asks: Option<bool>,
+    pub image_input: Option<crate::management::v2::user_input::image_steering::ImageInputSettings>,
     pub auto_thread_titles: Option<bool>,
     pub codex_config_follow_shared: Option<bool>,
     pub thread_title_model: ConfigValueUpdate<String>,
@@ -38,6 +39,7 @@ pub struct GlobalConfigPatch {
     pub new_session_notification: Option<crate::notify::session::Level>,
     pub new_thread_defaults: Option<crate::config::new_thread::NewThreadDefaults>,
     pub proxy: ConfigValueUpdate<ProxyConfig>,
+    pub claude_cli: Option<crate::config::claude::ClaudeCliChoice>,
     pub notify_service_url: ConfigValueUpdate<String>,
     pub notify_service_token: ConfigValueUpdate<String>,
     pub notify_service_idle_timeout_secs: ConfigValueUpdate<u64>,
@@ -103,6 +105,10 @@ pub fn apply_global_config_patch(
         documents.validate()?;
     }
     let mut changed = false;
+    if let Some(image_input) = patch.image_input {
+        changed |= config.image_input != image_input;
+        config.image_input = image_input;
+    }
     if let Some(security) = &patch.agent_security {
         changed |= config.agent_security != *security;
         config.agent_security = security.clone();
@@ -163,6 +169,7 @@ pub fn apply_global_config_patch(
         config.new_thread_defaults = defaults.clone();
     }
     changed |= apply_optional_update(&mut config.proxy, &patch.proxy);
+    changed |= apply_value_update(&mut config.claude_cli, patch.claude_cli);
     changed |= apply_optional_update(&mut config.notify_service_url, &patch.notify_service_url);
     changed |= apply_optional_update(
         &mut config.notify_service_token,

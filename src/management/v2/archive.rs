@@ -1,5 +1,10 @@
 //! Management v2 archive query and Retire/Restore dispatch.
 
+#[path = "archive_api.rs"]
+pub mod api;
+#[path = "archive_projection.rs"]
+pub mod projection;
+
 use std::net::TcpStream;
 
 use serde_json::json;
@@ -330,7 +335,8 @@ fn validate_archive_transition_result(
         "status",
         "retiredAt",
     ];
-    if object.keys().any(|key| !required.contains(&key.as_str()))
+    if object.keys().any(|key| !required.contains(&key.as_str())
+        && !matches!(key.as_str(), "archiveKind" | "restorable"))
         || required.iter().any(|key| !object.contains_key(*key))
         || object.get("cutexSessionId").and_then(Value::as_str) != Some(expected_cutex_session_id)
         || object
@@ -357,6 +363,23 @@ fn validate_archive_transition_result(
             "restore mutation must clear retiredAt",
         ));
     }
+    // Legacy receipts omit both fields. New receipts supply the pair and
+    // must agree with the durable lifecycle; never infer soft from "retired".
+    match (object.get("archiveKind"), object.get("restorable")) {
+        (None, None) => {},
+        (Some(kind), Some(restorable)) => {
+            let valid = match (expected_lifecycle, kind.as_str(), restorable.as_bool()) {
+                ("active", Some("active"), Some(false))
+                | ("retired", Some("soft"), Some(true))
+                | ("retired", Some("permanent"), Some(false)) => true,
+                _ => false,
+            };
+            if !valid {
+                return Err(invalid_archive_receipt("archive disposition contradicts lifecycle"));
+            }
+        },
+        _ => return Err(invalid_archive_receipt("archive disposition requires both fields")),
+    }
     Ok(())
 }
 
@@ -368,6 +391,28 @@ fn invalid_archive_receipt(message: &str) -> UserInputExecutionError {
 mod tests {
     use super::super::repository::ReplayQuery;
     use super::*;
+
+    #[test]
+    fn r264_archive_receipt_disposition_pair_is_additive_and_consistent() {
+        for (lifecycle, kind, restorable) in [
+            ("active", "active", false), ("retired", "soft", true),
+            ("retired", "permanent", false),
+        ] {
+            let mut receipt = json!({"cutexSessionId":"cutex.test", "revision":1,
+                "runtimeGeneration":0, "lifecycle":lifecycle, "status":"offline",
+                "retiredAt": if lifecycle == "active" { Value::Null } else { json!("2026-10-26T00:00:00Z") }});
+            assert!(validate_archive_transition_result(&receipt, "cutex.test", lifecycle).is_ok());
+            receipt["archiveKind"] = json!(kind);
+            assert!(validate_archive_transition_result(&receipt, "cutex.test", lifecycle).is_err());
+            receipt["restorable"] = json!(restorable);
+            assert!(validate_archive_transition_result(&receipt, "cutex.test", lifecycle).is_ok());
+            receipt["restorable"] = json!(!restorable);
+            assert!(validate_archive_transition_result(&receipt, "cutex.test", lifecycle).is_err());
+            receipt["restorable"] = json!(restorable);
+            receipt["archiveKind"] = json!("unknown");
+            assert!(validate_archive_transition_result(&receipt, "cutex.test", lifecycle).is_err());
+        }
+    }
 
     fn retire_transition(
         cutex_session_id: &str,

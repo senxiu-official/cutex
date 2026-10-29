@@ -21,12 +21,11 @@ pub fn next_id(ask: &AskRecord) -> String {
     format!("v{}", ask.revisions.len() + 2)
 }
 
-/// Check a revision of `ask` by its requester (before sending it).
+/// Check a revision of `ask` by its controller (before sending it; the
+/// original requester only while it still controls the ask, design 044).
 pub fn check(ask: &AskRecord, requester: &str, supersedes: Option<&str>) -> Result<String, AskError> {
     if ask.remote.is_some() { return Err(AskError::new("remote_unsupported","remote brief revisions are unavailable in P0")); }
-    if ask.requester.session() != Some(requester) {
-        return Err(AskError::new("ask_not_found", "no such delegation of yours"));
-    }
+    ask.require_controller(requester, "ask_not_found", "no such delegation of yours")?;
     if !ask.is_open() {
         return Err(AskError::new("ask_closed", "it is already closed; send a follow-up with agent_delegate instead").with(json!({"closed": ask.closed})));
     }
@@ -116,27 +115,33 @@ pub fn raise(revision: &mut RevisionRecord, level: RevisionLevel, turn_id: Optio
     true
 }
 
-/// The level a bus message reached (from an `AgentBusMessageSnapshot` as
-/// JSON) and the turn it went into.
+/// Canonical bus snapshot read used by SchedulerWorld::message_level.
+/// Preserve actual receipt evidence; diagnostic delivery/terminal labels alone
+/// cannot establish positive progress. Uncertainty is a separate read view.
 pub fn level_of_snapshot(snapshot: &Value) -> (RevisionLevel, Option<String>) {
-    if let Some(turn) = snapshot.pointer("/a4Receipt/turnId").and_then(Value::as_str) {
-        return (RevisionLevel::InContext, Some(turn.to_string()));
-    }
-    let delivery = snapshot.pointer("/externalInputLastObserved/deliveryState").and_then(Value::as_str);
-    let turn = snapshot
-        .pointer("/externalInputLastObserved/turnId")
-        .or_else(|| snapshot.pointer("/externalInputLastObserved/receipt/turnId"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    if snapshot.get("state").and_then(Value::as_str) == Some("delivered")
-        || matches!(delivery, Some("contextPersisted" | "context_persisted" | "consumed" | "inContext"))
-    {
-        return (RevisionLevel::InContext, turn);
-    }
-    if delivery.is_some() || snapshot.get("externalInputReceipt").is_some_and(|receipt| !receipt.is_null()) {
-        return (RevisionLevel::Delivered, None);
-    }
-    (RevisionLevel::Sent, None)
+    super::receipt_uncertainty::integration::snapshot_level(snapshot)
+}
+
+/// Read-only revision view for management/bus responses. Callers supply their
+/// request-scoped canonical snapshot and exact trusted evidence; no store or
+/// runtime is opened here. Missing occurrence proof stays unknown.
+pub fn read_summary(
+    revision: &RevisionRecord,
+    snapshot: Option<&crate::management::v2::agent_bus_state::AgentBusMessageSnapshot>,
+    evidence: super::receipt_uncertainty::integration::ReadEvidence<'_>,
+) -> Value {
+    super::receipt_uncertainty::integration::revision_summary(revision, snapshot, evidence)
+}
+
+/// Production response projection over a request-scoped, already loaded map.
+/// No repository/runtime reads and no durable revision-level changes.
+pub fn read_summary_with_context(
+    revision: &RevisionRecord,
+    context: &super::receipt_uncertainty::read_views::ReceiptReadContext,
+) -> Value {
+    let mut value = read_summary(revision, None, Default::default());
+    value["receiptProjection"] = super::receipt_uncertainty::read_views::revision_projection(revision, context);
+    value
 }
 
 /// Scheduler pass: raise revisions below `inContext` from the bus records.
@@ -231,9 +236,12 @@ mod tests {
         assert!(state.notices.iter().any(|notice| notice.method == "cutex/ask/updated"));
         // Snapshot levels.
         assert_eq!(level_of_snapshot(&json!({"state": "pending"})).0, RevisionLevel::Sent);
-        assert_eq!(level_of_snapshot(&json!({"state": "pending", "externalInputLastObserved": {"deliveryState": "pending"}})).0, RevisionLevel::Delivered);
+        assert_eq!(level_of_snapshot(&json!({"state": "pending", "externalInputLastObserved": {"deliveryState": "pending"}})).0, RevisionLevel::Sent);
         assert_eq!(
-            level_of_snapshot(&json!({"state": "delivered", "a4Receipt": {"turnId": "turn-9"}})),
+            level_of_snapshot(&json!({"messageId":"msg-1", "toCutexSessionId":TARGET,
+                "deliveryMode":"passive", "content":"note", "state": "delivered",
+                "a4Receipt": {"turnId": "turn-9", "receiptId":"a4-original",
+                    "responseItemId":"msg-1", "rolloutOrdinal":1}})),
             (RevisionLevel::InContext, Some("turn-9".into()))
         );
         // Rise only.

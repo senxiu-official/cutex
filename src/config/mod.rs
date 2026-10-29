@@ -2,14 +2,17 @@
 //! persistence helpers.
 
 pub mod agent_bus;
+pub mod result_coalescing;
 pub mod agent_bus_audit;
 pub mod agent_harness;
+pub mod prompt_cache_key;
 pub mod health;
 pub mod agent_security;
 pub mod artifacts;
 pub mod atomic;
 pub mod attachments;
 pub mod browser;
+pub mod claude;
 pub mod documents;
 pub mod env;
 pub mod fresh_agent_permissions;

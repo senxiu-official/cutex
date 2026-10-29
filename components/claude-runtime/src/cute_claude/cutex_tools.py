@@ -2,6 +2,8 @@
 import asyncio
 import json
 import os
+import hashlib
+import uuid
 from pathlib import Path
 
 from .tools import ToolContext, ToolResult
@@ -18,6 +20,28 @@ DELEGATION_WAIT_SECS = 120
 # Slack for the façade, the Bus and the action itself after a hold.
 HOLD_SLACK_SECS = 30
 
+RECEIPT_TOOLS = frozenset({'agent_create', 'agent_delegate'})
+
+
+def receipt_arguments(name: str, arguments: dict, context) -> dict:
+    """Allocate before launch/timeout; native call identity survives facade restarts.
+
+    Never include the payload in the key: a changed payload on the same call
+    must hit the daemon's idempotency conflict instead of creating new work.
+    """
+    if name not in RECEIPT_TOOLS or arguments.get('action_id') is not None:
+        return arguments
+    call = getattr(context, 'call_id', None) or uuid.uuid4().hex
+    identity = [context.thread_id, getattr(context, 'turn_id', None), call, name]
+    key = hashlib.sha256(json.dumps(identity, separators=(',', ':')).encode()).hexdigest()
+    return {**arguments, 'action_id': 'call-' + key[:48]}
+
+
+def uncertain_result(name: str, arguments: dict, code: str) -> ToolResult:
+    return ToolResult(json.dumps({'status': 'response_uncertain', 'code': code,
+        'action_id': arguments['action_id'], 'tool': name, 'outcomeUnknown': True,
+        'detail': 'Query this action_id before retrying; no replacement action was submitted.'}), False)
+
 
 def approval_wait_secs(config: dict) -> int | None:
     """The hold cutex opted this adapter in to (descriptor `approvalWaitSecs`, cutex
@@ -31,8 +55,12 @@ def approval_wait_secs(config: dict) -> int | None:
 def tool_timeout(name: str, wait: int | None, default: float | None) -> float | None:
     """A per-tool timeout for cutex tools that may block on the Bus; None keeps the default."""
     floor = 0
+    if name in RECEIPT_TOOLS:
+        # Rust: preflight 10s + create 120s / asks 150s; leave 20s
+        # for spawning, serialization and reading the structured receipt.
+        floor = (150 + (wait or 0)) if name == 'agent_create' else 180
     if wait and name in HOLDING_TOOLS:
-        floor = wait + HOLD_SLACK_SECS
+        floor = max(floor, wait + HOLD_SLACK_SECS)
     if name == DELEGATION_WAIT:
         floor = DELEGATION_WAIT_SECS + HOLD_SLACK_SECS
     if not floor:
@@ -48,6 +76,7 @@ def load(registry, descriptor: Path) -> None:
     default_timeout = getattr(getattr(registry, 'settings', None), 'tool_timeout', None)
     for tool in config['tools']:
         async def invoke(arguments: dict, context: ToolContext, name=tool['name']):
+            arguments = receipt_arguments(name, arguments, context)
             binding = json.loads(binding_path.read_text())
             if binding['threadId'] != context.thread_id:
                 raise ValueError('Cutex MCP thread binding mismatch')
@@ -90,11 +119,17 @@ def load(registry, descriptor: Path) -> None:
                         raise ValueError('MCP response exceeds transport budget')
                 await proc.wait()
                 if proc.returncode:
+                    if name in RECEIPT_TOOLS:
+                        return uncertain_result(name, arguments, 'mcp_process_failed')
                     return ToolResult('Cutex MCP unavailable; the action may be uncertain. Query its stable action/message ID before retrying.', False)
                 response = json.loads(output)
                 if response.get('id') != 1:
+                    if name in RECEIPT_TOOLS:
+                        return uncertain_result(name, arguments, 'mcp_response_mismatch')
                     return ToolResult('Cutex MCP response ID mismatch; outcome unknown. Inspect the action by its stable ID.', False)
                 if 'error' in response:
+                    if name in RECEIPT_TOOLS:
+                        return uncertain_result(name, arguments, 'mcp_rpc_error')
                     error = response['error']
                     return ToolResult(f"Cutex MCP error {error.get('code', 'unknown')}: {str(error.get('message', 'Request failed'))[:2048]}", False)
                 result = response['result']
@@ -102,6 +137,10 @@ def load(registry, descriptor: Path) -> None:
                     return ToolResult.from_mcp(result.get('content'), not result.get('isError', False))
                 text = '\n'.join(block['text'] for block in result.get('content', []) if block.get('type') == 'text')
                 return ToolResult(text, not result.get('isError', False))
+            except (ValueError, KeyError, OSError):
+                if name in RECEIPT_TOOLS:
+                    return uncertain_result(name, arguments, 'mcp_response_unavailable')
+                raise
             finally:
                 if proc.returncode is None:
                     proc.kill()

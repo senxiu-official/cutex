@@ -24,7 +24,11 @@
         "note": { "type": "string" },
         "decidedBy": { "$ref": "#/$defs/approvalDecider" },
         "consumedAt": { "type": "string" },
-        "wait": { "$ref": "#/$defs/approvalWait" }
+        "wait": { "$ref": "#/$defs/approvalWait" },
+        "risk": { "enum": ["low", "medium", "high"] },
+        "matchedRuleId": { "type": "string" },
+        "autoDecision": { "type": "boolean" },
+        "ruleRevision": { "type": "integer", "minimum": 1 }
       }
     },
     "approvalDecider": {

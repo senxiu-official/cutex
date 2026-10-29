@@ -51,8 +51,16 @@ record and unit / supervisor state.
 
 - **Linux**: systemd user units `cutex-agent-bus.service`,
   `cutex-management-api.service` (marker comment first line; a unit without
-  the marker is refused unless `--force`), `KillMode=process` so native
-  app-servers survive a daemon restart, `Environment=CUTEX_SERVICE_MANAGER=systemd`.
+  the marker is refused unless `--force`), `KillMode=process` on both units so
+  the agent runtimes either daemon started (Codex app-servers, Claude adapters
+  with Claude Code and their tools, which live in that unit's cgroup) survive a
+  daemon restart, `Environment=CUTEX_SERVICE_MANAGER=systemd`. Units written
+  before r248 had it on the Management API only, so stopping the bus killed the
+  runtimes it had started: the upgrade runner's stop and `cutex human service
+  stop|restart` of the bus first add `KillMode=process` (+ `TimeoutStopSec=30`)
+  to a bus unit that carries the marker and sets no `KillMode`, then
+  `systemctl --user daemon-reload` (`upgrade::service::keep_bus_children`), so
+  that very stop already keeps them; `cutex service install` writes the new text.
   With `--unit-dir` the units are only written (no `systemctl` at all — this
   is what tests use). A linger hint is printed when `Linger=no`. Units of an
   independent instance carry `Environment=CUTEX_HOME=…`.

@@ -1,0 +1,6 @@
+{
+  "schema": "cutex/component/v1",
+  "name": "dsh-runtime",
+  "version": "dsh-r2",
+  "platforms": ["linux-x64", "windows-x64"]
+}

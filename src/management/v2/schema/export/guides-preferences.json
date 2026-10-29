@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:guides-preferences",
+  "title": "Owner-user guide preferences",
+  "description": "Capability guides.preferences. A single record per current owner user per host, shared across devices; individual seen tips remain device-local. No expiry, deletion, or cross-host replication.",
+  "anyOf": [{ "$ref": "#/$defs/guidesPreference" }, { "$ref": "#/$defs/guidesPreferencePut" }],
+  "$defs": {
+    "skippedThrough": { "type": ["string", "null"], "maxLength": 64, "description": "Semantic version of the desktop whose guides were answered; null resets the shared answered-through flag." },
+    "guidesPreference": {
+      "type": "object", "additionalProperties": false, "required": ["schema", "skippedThrough", "updatedAt"],
+      "properties": {
+        "schema": { "const": 1 }, "skippedThrough": { "$ref": "#/$defs/skippedThrough" },
+        "updatedAt": { "type": ["string", "null"], "format": "date-time", "description": "Authoritative host write time; null when never saved." }
+      }
+    },
+    "guidesPreferencePut": {
+      "type": "object", "additionalProperties": true, "required": ["schema", "skippedThrough"],
+      "description": "Owner-full write. Unknown fields and client updatedAt are ignored; the server supplies updatedAt. Cannot select another user.",
+      "properties": { "schema": { "const": 1 }, "skippedThrough": { "$ref": "#/$defs/skippedThrough" } }
+    }
+  }
+}

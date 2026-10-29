@@ -7,9 +7,13 @@
 //!    answers, questions, deliveries, brief / answer texts), then removed.
 //! 2. Finished Agent Bus messages past the same retention are archived
 //!    with their documents, then removed.
+//! 2b. Owner notifications the owner replied to, final past the same
+//!    retention, are archived (kind `ownerNotification`), then removed from
+//!    the owner notify store (since r252: replies are kept, never deleted).
 //! 3. Documents whose source is gone (archived, removed) are deleted; a
 //!    document whose source never existed is kept `uploadGraceHours`.
-//! 4. Archive months past `archiveRetentionDays` are deleted (0 keeps).
+//! 4. Archive months past `archiveRetentionDays` are deleted (0, the default
+//!    since r252, keeps them).
 //! 5. One owner reminder per open delegation idle `idleReminderDays`.
 //!
 //! Each run appends one line to `<documents>/sweep.log` and publishes the
@@ -36,6 +40,9 @@ pub const SWEEP_EVENT: &str = "cutex/documents/sweep";
 pub struct SweepReport {
     pub archived_asks: usize,
     pub archived_messages: usize,
+    /// Owner notifications the owner replied to, moved into the archive
+    /// (kind `ownerNotification`; since r252).
+    pub archived_owner_replies: usize,
     pub deleted_documents: usize,
     pub freed_bytes: u64,
     pub pruned_archive_months: usize,
@@ -53,6 +60,8 @@ pub struct SweepStores<'a> {
     pub archive: &'a RecordArchive,
     /// `None`: no Agent Bus state (tests of asks only).
     pub messages: Option<&'a crate::management::v2::agent_bus_state::AgentBusMessageRepository>,
+    /// `None`: no owner notify store (tests of asks only).
+    pub owner_notify: Option<&'a crate::owner_notify::store::OwnerNotifyStore>,
 }
 
 /// Whether the store is full enough to sweep before the interval ends.
@@ -60,11 +69,10 @@ pub fn nearly_full(documents: &DocumentStore, settings: &DocumentSettings) -> bo
     documents.usage().is_ok_and(|usage| usage.used_bytes.saturating_mul(10) >= settings.quota_bytes.saturating_mul(9))
 }
 
-fn text_of_artifact(asks: &AskStore, artifact: &str) -> Option<String> {
-    asks.read_artifact(artifact, None)
-        .ok()
-        .flatten()
-        .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
+fn text_of_artifact(asks: &AskStore, artifact: &str) -> anyhow::Result<String> {
+    let (_, bytes) = asks.read_artifact(artifact, None)?
+        .ok_or_else(|| anyhow::anyhow!("artifact {artifact} is missing; live source retained"))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn parse_time(text: &str) -> Option<DateTime<Utc>> {
@@ -84,12 +92,21 @@ pub fn run(stores: &SweepStores<'_>, settings: &DocumentSettings, now: DateTime<
             report.errors.push(format!("messages: {error:#}"));
         }
     }
+    if let Some(owner_notify) = stores.owner_notify {
+        if let Err(error) = archive_owner_replies(stores.archive, owner_notify, cutoff, now, &mut report) {
+            report.errors.push(format!("owner notify: {error:#}"));
+        }
+    }
     if let Err(error) = delete_orphaned_documents(stores, settings, now, &mut report) {
         report.errors.push(format!("documents: {error:#}"));
     }
-    match stores.archive.prune(settings.archive_retention_days, now) {
-        Ok((months, _)) => report.pruned_archive_months = months,
-        Err(error) => report.errors.push(format!("archive: {error:#}")),
+    // Existing gzip months can contain historical asks and other kinds.
+    // Never delete mixed user data when permanent asks archival is enabled.
+    if !stores.asks.archive_configured().unwrap_or(true) {
+        match stores.archive.prune(settings.archive_retention_days, now) {
+            Ok((months, _)) => report.pruned_archive_months = months,
+            Err(error) => report.errors.push(format!("archive: {error:#}")),
+        }
     }
     if settings.idle_reminder_days > 0 {
         match idle_reminders(stores.asks, settings.idle_reminder_days, now) {
@@ -105,15 +122,24 @@ pub fn run(stores: &SweepStores<'_>, settings: &DocumentSettings, now: DateTime<
 }
 
 fn archive_asks(stores: &SweepStores<'_>, retention_days: i64, now: DateTime<Utc>, report: &mut SweepReport) -> anyhow::Result<()> {
+    // r262's permanent rows must not pass through the timed gzip/month or
+    // orphan-blob deletion path. Move only safe closed records, without loss.
+    if stores.asks.archive_configured()? {
+        let moved=stores.asks.archive_before(None,now)?;
+        report.archived_asks+=moved.asks;
+        return Ok(());
+    }
     let state = stores.asks.snapshot()?;
     let expired = state.closed_before(retention_days, now);
     if expired.is_empty() {
         // Housekeeping (idempotency records, waits, orphaned artifacts).
         return stores.asks.prune_with(None, now);
     }
+    let mut archived = Vec::new();
     for ask_id in &expired {
+        let result = (|| -> anyhow::Result<()> {
         let Some(ask) = state.asks.get(ask_id) else {
-            continue;
+            return Ok(());
         };
         let answers: Vec<&crate::asks::model::AnswerRecord> = state.answers.values().filter(|answer| &answer.ask_id == ask_id).collect();
         let questions: Vec<Value> = state
@@ -138,19 +164,20 @@ fn archive_asks(stores: &SweepStores<'_>, retention_days: i64, now: DateTime<Utc
             .chain(answers.iter().filter_map(|answer| answer.artifact_id.as_deref()))
             .collect();
         for artifact in artifacts {
-            if let Some(text) = text_of_artifact(stores.asks, artifact) {
-                texts.push(json!({"artifactId": artifact, "bytes": text.len(), "text": text}));
-            }
+            let text = text_of_artifact(stores.asks, artifact)?;
+            texts.push(json!({"artifactId": artifact, "bytes": text.len(), "text": text}));
         }
         let documents: Vec<Value> = stores
             .documents
             .of_source("ask", ask_id)?
             .into_iter()
-            .filter_map(|record| {
-                let text = stores.documents.read(&record.document_id, None).ok().flatten().map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned());
-                Some(json!({"documentId": record.document_id, "title": record.title, "bytes": record.bytes, "text": text?}))
+            .map(|record| -> anyhow::Result<Value> {
+                let (_, bytes) = stores.documents.read(&record.document_id, None)?
+                    .ok_or_else(|| anyhow::anyhow!("document {} is missing; live source retained", record.document_id))?;
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                Ok(json!({"documentId": record.document_id, "title": record.title, "bytes": record.bytes, "text": text}))
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let participants: Vec<String> = ask.requester.session().into_iter().map(str::to_string).chain([ask.target_cutex_session_id.clone()]).collect();
         stores.archive.append(
             NewArchiveRecord {
@@ -158,7 +185,7 @@ fn archive_asks(stores: &SweepStores<'_>, retention_days: i64, now: DateTime<Utc
                 kind: "ask".into(),
                 title: ask.title.clone(),
                 participants,
-                closed_at: ask.closed_at.as_deref().and_then(parse_time).unwrap_or(now),
+                closed_at: ask.closed_at.as_deref().and_then(parse_time).or_else(|| parse_time(&ask.created_at)).unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
                 record: json!({
                     "ask": ask,
                     "answers": answers,
@@ -170,10 +197,23 @@ fn archive_asks(stores: &SweepStores<'_>, retention_days: i64, now: DateTime<Utc
             },
             now,
         )?;
-        report.archived_asks += 1;
+        archived.push(ask.clone());
+        Ok(())
+        })();
+        if let Err(error) = result { report.errors.push(format!("ask {ask_id}: {error:#}")); }
     }
-    // Everything expired is in the archive: remove it from the live store.
-    stores.asks.prune_with(Some(retention_days), now)
+    // Remove only successfully archived records that have not changed while IO ran.
+    report.archived_asks = stores.asks.with_state(|current| {
+        let mut removed = 0;
+        for ask in &archived {
+            if current.asks.get(&ask.ask_id) == Some(ask) {
+                current.asks.remove(&ask.ask_id);
+                removed += 1;
+            }
+        }
+        removed
+    })?;
+    stores.asks.prune_with(None, now)
 }
 
 fn archive_messages(
@@ -186,15 +226,18 @@ fn archive_messages(
     let finished = messages.finished_before(cutoff)?;
     let mut archived = Vec::new();
     for message in finished {
+        let result = (|| -> anyhow::Result<()> {
         let documents: Vec<Value> = stores
             .documents
             .of_source("message", &message.message_id)?
             .into_iter()
-            .filter_map(|record| {
-                let text = stores.documents.read(&record.document_id, None).ok().flatten().map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned());
-                Some(json!({"documentId": record.document_id, "title": record.title, "bytes": record.bytes, "text": text?}))
+            .map(|record| -> anyhow::Result<Value> {
+                let (_, bytes) = stores.documents.read(&record.document_id, None)?
+                    .ok_or_else(|| anyhow::anyhow!("document {} is missing; live source retained", record.document_id))?;
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                Ok(json!({"documentId": record.document_id, "title": record.title, "bytes": record.bytes, "text": text}))
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let content = message.record.pointer("/snapshot/content").and_then(Value::as_str).unwrap_or_default();
         let title = crate::app_server::external_input::size::preview(content.lines().next().unwrap_or_default(), 120).to_string();
         let participants: Vec<String> = message.from_cutex_session_id.iter().cloned().chain([message.to_cutex_session_id.clone()]).collect();
@@ -210,20 +253,60 @@ fn archive_messages(
             },
             now,
         )?;
-        archived.push(message.message_id);
+        archived.push(message.message_id.clone());
+        Ok(())
+        })();
+        if let Err(error) = result { report.errors.push(format!("message {}: {error:#}", message.message_id)); }
     }
     report.archived_messages = messages.remove_finished(&archived, cutoff)?;
     Ok(())
 }
 
+fn archive_owner_replies(
+    archive: &RecordArchive,
+    owner_notify: &crate::owner_notify::store::OwnerNotifyStore,
+    cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
+    report: &mut SweepReport,
+) -> anyhow::Result<()> {
+    let due = owner_notify.snapshot()?.replied_final_before(cutoff);
+    if due.is_empty() {
+        return Ok(());
+    }
+    let mut archived = Vec::new();
+    for record in &due {
+        let result = (|| -> anyhow::Result<()> {
+        let title = crate::app_server::external_input::size::preview(record.text.lines().next().unwrap_or_default(), 120).to_string();
+        archive.append(
+            NewArchiveRecord {
+                record_id: record.notification_id.clone(),
+                kind: "ownerNotification".into(),
+                title,
+                participants: vec![record.agent_id.clone()],
+                closed_at: record.final_at().or_else(|| parse_time(&record.created_at)).unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
+                record: record.to_json(),
+                documents: Vec::new(),
+            },
+            now,
+        )?;
+        archived.push(record.clone());
+        Ok(())
+        })();
+        if let Err(error) = result { report.errors.push(format!("owner notification {}: {error:#}", record.notification_id)); }
+    }
+    // Only what is in the archive (and unchanged since) leaves the store.
+    report.archived_owner_replies = owner_notify.with_state(|state| state.remove_archived(&archived))?;
+    Ok(())
+}
+
 fn delete_orphaned_documents(stores: &SweepStores<'_>, settings: &DocumentSettings, now: DateTime<Utc>, report: &mut SweepReport) -> anyhow::Result<()> {
-    let asks = stores.asks.snapshot()?;
+    let known_asks=stores.asks.all_ask_ids()?;
     let grace = now - chrono::Duration::hours(i64::from(settings.upload_grace_hours));
     let mut doomed = Vec::new();
     for record in stores.documents.all()? {
         let created = parse_time(&record.created_at).unwrap_or(now);
         let alive = match record.source.kind.as_str() {
-            "ask" => asks.asks.contains_key(&record.source.id),
+            "ask" => known_asks.contains(&record.source.id),
             "message" => match stores.messages {
                 Some(messages) => messages.snapshot_by_message_id(&record.source.id)?.is_some(),
                 None => true,
@@ -293,7 +376,8 @@ pub fn run_default(settings: &DocumentSettings) -> anyhow::Result<SweepReport> {
     let documents = DocumentStore::open_default()?;
     let archive = RecordArchive::open_default()?;
     let messages = crate::management::v2::agent_bus_state::agent_bus_message_repository().ok();
-    let report = run(&SweepStores { asks: &asks, documents: &documents, archive: &archive, messages }, settings, Utc::now());
+    let owner_notify = crate::owner_notify::store::OwnerNotifyStore::open_default().ok();
+    let report = run(&SweepStores { asks: &asks, documents: &documents, archive: &archive, messages, owner_notify: owner_notify.as_ref() }, settings, Utc::now());
     crate::management::v2::documents::publish_host_event(SWEEP_EVENT, serde_json::to_value(&report).unwrap_or(Value::Null));
     Ok(report)
 }
@@ -302,6 +386,41 @@ pub fn run_default(settings: &DocumentSettings) -> anyhow::Result<SweepReport> {
 mod tests {
     use super::*;
     use crate::asks::store::tests::{new_ask, temp_store};
+
+    #[test]
+    fn failed_month_keeps_its_original_and_does_not_block_later_records() {
+        let (asks, dir) = temp_store("sweep-isolation");
+        let (documents, docs_dir) = crate::documents::tests::temp_store("sweep-isolation");
+        let archive = RecordArchive::at(dir.join("archive"));
+        let old = DateTime::parse_from_rfc3339("2026-06-15T00:00:00Z").unwrap().with_timezone(&Utc);
+        let later = old + chrono::Duration::days(35);
+        let (broken, healthy) = asks.with_state(|state| {
+            let broken = state.create_ask(new_ask("broken", "broken month"), old).unwrap().0.ask_id;
+            let healthy = state.create_ask(new_ask("healthy", "healthy month"), later).unwrap().0.ask_id;
+            for (id, at) in [(&broken, old), (&healthy, later)] {
+                let ask = state.asks.get_mut(id).unwrap();
+                ask.closed = Some(crate::asks::model::CloseOutcome::Abandoned);
+                ask.closed_at = Some(crate::asks::now_rfc3339(at));
+            }
+            (broken, healthy)
+        }).unwrap();
+        // A permanently unreadable month must not suppress other months or remove its source.
+        std::fs::create_dir_all(archive.dir().join("records-2026-06.jsonl.gz")).unwrap();
+        let stores = SweepStores { asks: &asks, documents: &documents, archive: &archive, messages: None, owner_notify: None };
+        let now = later + chrono::Duration::days(80);
+        let report = run(&stores, &DocumentSettings::default(), now);
+        assert_eq!(report.archived_asks, 1, "{report:?}");
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        let state = asks.snapshot().unwrap();
+        assert!(state.asks.contains_key(&broken));
+        assert!(!state.asks.contains_key(&healthy));
+        assert!(archive.get(&healthy).unwrap().is_some());
+        let again = run(&stores, &DocumentSettings::default(), now + chrono::Duration::days(35));
+        assert_eq!(again.archived_asks, 0, "{again:?}");
+        assert!(asks.snapshot().unwrap().asks.contains_key(&broken));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(docs_dir);
+    }
 
     #[test]
     fn closed_asks_are_archived_then_removed_and_idle_ones_reminded_once() {
@@ -327,7 +446,7 @@ mod tests {
         documents.put(doc, 1 << 30, long_ago).unwrap();
         let settings = DocumentSettings::default();
         let now = Utc::now();
-        let stores = SweepStores { asks: &asks, documents: &documents, archive: &archive, messages: None };
+        let stores = SweepStores { asks: &asks, documents: &documents, archive: &archive, messages: None, owner_notify: None };
         let report = run(&stores, &settings, now);
         assert_eq!((report.archived_asks, report.idle_reminders, report.deleted_documents), (1, 1, 1), "{report:?}");
         let state = asks.snapshot().unwrap();
@@ -340,6 +459,59 @@ mod tests {
         let again = run(&stores, &settings, now);
         assert_eq!((again.archived_asks, again.idle_reminders), (0, 0));
         assert!(std::fs::read_to_string(docs_dir.join("sweep.log")).unwrap().lines().count() == 2);
+        // The archive is kept by default (owner decision 2026-10-23), even
+        // long past the old 365-day limit.
+        let much_later = run(&stores, &settings, now + chrono::Duration::days(4000));
+        assert_eq!(much_later.pruned_archive_months, 0, "{much_later:?}");
+        assert_eq!(archive.get(&closed).unwrap().unwrap()["record"]["ask"]["askId"], json!(closed));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(docs_dir);
+    }
+
+    /// Owner decision 2026-10-23: owner replies are archived, not deleted.
+    #[test]
+    fn owner_replies_move_into_the_archive() {
+        use crate::owner_notify::store::{Level, NewNotification, OwnerNotifyStore, Reply, State};
+        let (asks, dir) = temp_store("sweep-owner");
+        let (documents, docs_dir) = crate::documents::tests::temp_store("sweep-owner");
+        let archive = RecordArchive::at(dir.join("archive"));
+        let owner_notify = OwnerNotifyStore::at(dir.join("owner-notify"));
+        let long_ago = Utc::now() - chrono::Duration::days(40);
+        let new = |text: &str| NewNotification {
+            agent_id: "cutex.a".into(),
+            agent_name: None,
+            text: text.into(),
+            level: Level::Attention,
+            needs_reply: true,
+            delegation: None,
+            job: None,
+            turn_id: None,
+        };
+        let (replied, recent) = owner_notify
+            .with_state(|state| {
+                let settings = crate::config::owner_notify::OwnerNotifySettings::default();
+                let replied = state.create(new("Ship the release?"), &settings, long_ago).notification_id;
+                let recent = state.create(new("Merge it?"), &settings, Utc::now()).notification_id;
+                for id in [&replied, &recent] {
+                    let at = state.notifications[id].created_at.clone();
+                    let record = state.notifications.get_mut(id).unwrap();
+                    record.reply = Some(Reply { text: "yes".into(), replied_at: at.clone(), client_user_message_id: format!("m-{id}") });
+                    record.state = State::Answered;
+                    record.closed_at = Some(at);
+                }
+                (replied, recent)
+            })
+            .unwrap();
+        let stores = SweepStores { asks: &asks, documents: &documents, archive: &archive, messages: None, owner_notify: Some(&owner_notify) };
+        let report = run(&stores, &DocumentSettings::default(), Utc::now());
+        assert_eq!(report.archived_owner_replies, 1, "{report:?}");
+        let state = owner_notify.snapshot().unwrap();
+        assert!(!state.notifications.contains_key(&replied) && state.notifications.contains_key(&recent));
+        let record = archive.get(&replied).unwrap().unwrap();
+        assert_eq!(record["kind"], "ownerNotification");
+        assert_eq!(record["record"]["reply"]["text"], "yes");
+        assert_eq!(record["participants"], json!(["cutex.a"]));
+        assert_eq!(run(&stores, &DocumentSettings::default(), Utc::now()).archived_owner_replies, 0);
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(docs_dir);
     }

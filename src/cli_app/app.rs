@@ -159,6 +159,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         Some(CommandKind::Management { command }) => management::run_command(command)?,
         Some(CommandKind::Instance { command }) => super::instance_cli::run(command)?,
         Some(CommandKind::Upgrade { command }) => super::upgrade_cli::run_upgrade(command)?,
+        Some(CommandKind::Storage { command }) => super::storage_cli::run(command)?,
         Some(CommandKind::Service { command }) => super::upgrade_cli::run_service(command)?,
         Some(CommandKind::Component { command }) => super::upgrade_cli::run_component(command)?,
         Some(CommandKind::Human { command }) => super::human::run_command(command)?,
@@ -183,13 +184,20 @@ pub(crate) fn run() -> anyhow::Result<()> {
 }
 
 fn session_archive_requests_json(cli: &Cli) -> bool {
-    matches!(
-        cli.command.as_ref(),
-        Some(CommandKind::Session {
-            command: cutex::cli::args::SessionCommand::Retire { json: true, .. }
-                | cutex::cli::args::SessionCommand::Restore { json: true, .. }
-        })
-    )
+    use cutex::cli::args::{HumanCommand, SessionCommand};
+    let command = match cli.command.as_ref() {
+        Some(CommandKind::Session { command }) => command,
+        Some(CommandKind::Human {
+            command: HumanCommand::Session { command },
+        }) => command,
+        _ => return false,
+    };
+    match command {
+        SessionCommand::Retire { json, .. }
+        | SessionCommand::Restore { json, .. }
+        | SessionCommand::Delete { json, .. } => *json,
+        _ => false,
+    }
 }
 
 fn should_open_session_tui(cli: &Cli) -> bool {
@@ -246,6 +254,7 @@ mod tests {
             &["cutex", "upgrade", "status", "--json"],
             &["cutex", "upgrade", "history"],
             &["cutex", "service", "status"],
+            &["cutex", "storage", "rollback-export", "--target", "r256", "--daemon-stopped"],
         ] {
             assert!(skips_startup_migrations(&parsed(probe)), "{probe:?}");
         }
@@ -360,7 +369,7 @@ mod tests {
 /// otherwise mutate the live home from a binary that may never be
 /// activated. (`--version` exits inside `Cli::parse`, before both.)
 pub(crate) fn skips_startup_migrations(cli: &Cli) -> bool {
-    use cutex::cli::args::{ServiceCommand, UpgradeCommand};
+    use cutex::cli::args::{ServiceCommand, StorageCommand, UpgradeCommand};
     matches!(
         &cli.command,
         Some(CommandKind::Upgrade {
@@ -369,6 +378,9 @@ pub(crate) fn skips_startup_migrations(cli: &Cli) -> bool {
                 | UpgradeCommand::Status { .. }
                 | UpgradeCommand::History { .. }
         }) | Some(CommandKind::Service { command: ServiceCommand::Status })
+            | Some(CommandKind::Storage {
+                command: StorageCommand::RollbackExport { .. }
+            })
     )
 }
 

@@ -1,3 +1,5 @@
 /target/
+/.dsh-install/
+/.dsh-*.log
 **/.venv/
 **/.ruff_cache/

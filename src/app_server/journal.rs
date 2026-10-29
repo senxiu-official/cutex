@@ -43,6 +43,9 @@ impl Default for AppServerSchemaIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticJournalOptions {
+    /// Only this bound thread can grant session media access. Foreign/ephemeral
+    /// thread diagnostics retain the existing truncation-only behavior.
+    pub event_blob_owner: Option<(String, String)>,
     pub path: PathBuf,
     pub schema: AppServerSchemaIdentity,
     pub max_bytes: u64,
@@ -53,6 +56,7 @@ pub struct DiagnosticJournalOptions {
 impl DiagnosticJournalOptions {
     pub fn new(path: PathBuf) -> Self {
         Self {
+            event_blob_owner: None,
             path,
             schema: AppServerSchemaIdentity::default(),
             max_bytes: DEFAULT_JOURNAL_MAX_BYTES,
@@ -99,9 +103,21 @@ impl DiagnosticJournal {
             })?;
         }
 
-        let raw_bytes = serde_json::to_vec(message.raw())?.len();
-        let mut record =
-            DiagnosticJournalRecord::from_message(message, &self.options.schema, raw_bytes);
+        let raw_bytes = crate::management::v2::event_blobs::encoded_len(message.raw());
+        let bound_owner = self.options.event_blob_owner.as_ref()
+            .filter(|(_, thread)| message.correlations().thread_id.as_deref() == Some(thread.as_str()));
+        let mut raw = if bound_owner.is_some() || crate::management::v2::event_blobs::encoded_fits(message.raw(), self.options.max_record_bytes.saturating_sub(4096)) {
+            message.raw().clone()
+        } else { Value::Null };
+        if let Some((session, _)) = bound_owner {
+                crate::management::v2::event_blobs::EventBlobStore::open_default()?
+                    .normalize(session, &mut raw)?;
+        }
+        let mut record = DiagnosticJournalRecord::from_message(message, &self.options.schema, raw_bytes, raw);
+        if !crate::management::v2::event_blobs::encoded_fits(&record.raw, self.options.max_record_bytes.saturating_sub(4096)) {
+            record.raw = Value::Null;
+            record.raw_truncated = true;
+        }
         let mut encoded = serde_json::to_vec(&record)?;
         if encoded.len() > self.options.max_record_bytes {
             record.raw = Value::Null;
@@ -176,6 +192,7 @@ impl DiagnosticJournalRecord {
         message: &InboundMessage,
         schema: &AppServerSchemaIdentity,
         raw_bytes: usize,
+        raw: Value,
     ) -> Self {
         let (kind, request_id) = match message {
             InboundMessage::Response(response) => {
@@ -198,8 +215,8 @@ impl DiagnosticJournalRecord {
             request_id,
             correlation: JournalCorrelationIds::from(message.correlations()),
             raw_bytes,
-            raw_truncated: false,
-            raw: message.raw().clone(),
+            raw_truncated: raw.is_null() && !message.raw().is_null(),
+            raw,
         }
     }
 }
@@ -345,6 +362,27 @@ mod tests {
     use super::*;
     use crate::app_server::protocol::classify_inbound;
     use serde_json::json;
+
+    #[test]
+    fn bound_image_diagnostics_reference_blobs_but_foreign_images_do_not_grant_access() {
+        use base64::Engine;
+        let directory=std::env::temp_dir().join(format!("cutex-image-journal-{}",uuid::Uuid::new_v4()));
+        let session=format!("cutex.{}",uuid::Uuid::new_v4());
+        let mut options=DiagnosticJournalOptions::new(directory.join("events.jsonl"));
+        options.event_blob_owner=Some((session.clone(),"bound".into()));
+        let journal=DiagnosticJournal::new(options).unwrap();
+        let data=base64::engine::general_purpose::STANDARD.encode(vec![47;1024*1024]);
+        let bound=classify_inbound(json!({"method":"item/completed","params":{"threadId":"bound","item":{"type":"imageGeneration","result":data}}})).unwrap();
+        assert!(!journal.append(&bound).unwrap().raw_truncated);
+        let record:Value=serde_json::from_str(fs::read_to_string(journal.path()).unwrap().trim()).unwrap();
+        assert_eq!(record["raw"]["params"]["item"]["result"]["type"],"cutexBlob");
+        let foreign_data=vec![48;1024*1024];
+        let foreign_sha=format!("{:x}",<sha2::Sha256 as sha2::Digest>::digest(&foreign_data));
+        let foreign=classify_inbound(json!({"method":"item/completed","params":{"threadId":"foreign","item":{"type":"imageGeneration","result":base64::engine::general_purpose::STANDARD.encode(&foreign_data)}}})).unwrap();
+        assert!(journal.append(&foreign).unwrap().raw_truncated);
+        assert!(crate::management::v2::event_blobs::EventBlobStore::open_default().unwrap().get(&session,&foreign_sha).is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn journal_bounds_raw_payload_and_rotates() {

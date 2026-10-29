@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:kimi-accounts",
+  "title": "Kimi accounts",
+  "description": "Capability kimi-accounts (r266, docs/development/r266-kimi-profiles.md). A Kimi account is a private KIMI_CODE_HOME owned by cutex where the official kimi login (RFC 8628 device code) ran once; Kimi-kind profiles reference it (kimiAccount) and their agents share its one credential file. Management drives the login so a client can show the verification URL and user code. No token is ever in a request or response.",
+  "anyOf": [
+    { "$ref": "#/$defs/accountList" },
+    { "$ref": "#/$defs/account" },
+    { "$ref": "#/$defs/login" },
+    { "$ref": "#/$defs/removeResult" },
+    { "$ref": "#/$defs/createRequest" },
+    { "$ref": "#/$defs/patchRequest" }
+  ],
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "accountId": { "type": "string", "pattern": "^ka-[a-z0-9]{1,32}$" },
+    "loginId": { "type": "string", "pattern": "^kl-[0-9a-f]{32}$" },
+    "region": { "enum": ["mainland-cn", "global"], "description": "mainland-cn: kimi.com (Kimi's default); global: kimi.ai. Passed to kimi login --region." },
+    "createRequest": {
+      "type": "object", "description": "POST /v2/kimi/accounts. Errors: 400 invalid_request, 409 kimi_account_label_taken.",
+      "required": ["label"], "additionalProperties": false,
+      "properties": { "label": { "type": "string", "minLength": 1, "maxLength": 64 }, "region": { "$ref": "#/$defs/region" } }
+    },
+    "patchRequest": {
+      "type": "object", "description": "PATCH /v2/kimi/accounts/{id}.", "additionalProperties": false,
+      "properties": { "label": { "type": "string", "minLength": 1, "maxLength": 64 } }
+    },
+    "status": {
+      "type": "object", "required": ["state", "loggedIn", "expiresAt", "scope", "checkedAt"],
+      "description": "Local facts of the account's credential file (no network). revoked: a refresh was rejected or the account was logged out; log in again.",
+      "properties": {
+        "state": { "enum": ["loggedIn", "loggedOut", "revoked"] },
+        "loggedIn": { "type": "boolean" },
+        "expiresAt": { "$ref": "#/$defs/nullableString", "description": "Access-token expiry; Kimi processes refresh it themselves." },
+        "scope": { "$ref": "#/$defs/nullableString" },
+        "checkedAt": { "type": "string" }
+      }
+    },
+    "loginError": {
+      "type": ["object", "null"], "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "description": "kimi_login_failed | kimi_login_denied | kimi_login_timeout (open set)." },
+        "message": { "type": "string" }
+      }
+    },
+    "login": {
+      "type": "object",
+      "description": "POST /v2/kimi/accounts/{id}/login (202 new, 200 the pending one), GET|DELETE /v2/kimi/accounts/{id}/login/{loginId}. Poll every interval seconds until a final state. Errors: 404 kimi_login_not_found (finished more than 10 min ago or the daemon restarted), 409 kimi_runtime_unavailable {status, reason}.",
+      "required": ["loginId", "accountId", "state", "verificationUri", "userCode", "expiresAt", "interval", "startedAt", "finishedAt", "error"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "loginId": { "$ref": "#/$defs/loginId" },
+        "accountId": { "$ref": "#/$defs/accountId" },
+        "state": { "enum": ["starting", "pending", "succeeded", "failed", "expired", "denied", "cancelled"] },
+        "verificationUri": { "$ref": "#/$defs/nullableString", "description": "Kimi's verification_uri_complete (the code embedded); the client opens or shows it." },
+        "userCode": { "$ref": "#/$defs/nullableString" },
+        "expiresAt": { "$ref": "#/$defs/nullableString" },
+        "interval": { "type": "integer", "minimum": 1 },
+        "startedAt": { "type": "string" },
+        "finishedAt": { "$ref": "#/$defs/nullableString" },
+        "error": { "$ref": "#/$defs/loginError" }
+      }
+    },
+    "model": {
+      "type": "object", "required": ["id", "displayName", "inputModalities", "supportedReasoningEfforts", "defaultReasoningEffort", "isDefault"],
+      "properties": {
+        "id": { "type": "string", "description": "Kimi model alias (kimi-code/<id>)." },
+        "displayName": { "type": "string" },
+        "inputModalities": { "type": "array", "items": { "type": "string" } },
+        "supportedReasoningEfforts": { "type": "array", "items": { "type": "string" } },
+        "defaultReasoningEffort": { "$ref": "#/$defs/nullableString" },
+        "isDefault": { "type": "boolean" }
+      }
+    },
+    "profileRef": {
+      "type": "object", "required": ["id", "name"],
+      "properties": { "id": { "type": "string" }, "name": { "type": "string" } }
+    },
+    "account": {
+      "type": "object",
+      "description": "GET /v2/kimi/accounts/{id}, POST (201), PATCH, POST …/logout, POST …/status. Errors: 404 kimi_account_not_found, 500 kimi_accounts_failed.",
+      "required": ["id", "label", "kind", "region", "home", "createdAt", "lastLoginAt", "credentialsPresent", "status", "login", "models", "profiles", "sessions", "removable"],
+      "properties": {
+        "id": { "$ref": "#/$defs/accountId" },
+        "label": { "type": "string" },
+        "kind": { "const": "subscription" },
+        "region": { "$ref": "#/$defs/region" },
+        "home": { "$ref": "#/$defs/nullableString" },
+        "createdAt": { "type": "string" },
+        "lastLoginAt": { "$ref": "#/$defs/nullableString" },
+        "credentialsPresent": { "type": "boolean" },
+        "status": { "$ref": "#/$defs/status" },
+        "login": { "anyOf": [{ "$ref": "#/$defs/login" }, { "type": "null" }] },
+        "models": { "type": "array", "items": { "$ref": "#/$defs/model" }, "description": "The catalog kimi login provisioned (empty before the first login)." },
+        "profiles": { "type": "array", "items": { "$ref": "#/$defs/profileRef" } },
+        "sessions": {
+          "type": "object", "required": ["active", "online", "retired"],
+          "properties": { "active": { "type": "integer" }, "online": { "type": "integer" }, "retired": { "type": "integer" } }
+        },
+        "removable": { "type": "boolean" }
+      }
+    },
+    "accountList": {
+      "type": "object", "required": ["contractVersion", "accounts"],
+      "properties": { "contractVersion": { "const": 2 }, "accounts": { "type": "array", "items": { "$ref": "#/$defs/account" } } }
+    },
+    "removeResult": {
+      "type": "object", "description": "DELETE /v2/kimi/accounts/{id}[?deleteHome=true]. 409 kimi_account_in_use {profiles, sessions}.",
+      "required": ["id", "removed", "homeDeleted", "keptHome"],
+      "properties": {
+        "id": { "$ref": "#/$defs/accountId" },
+        "removed": { "const": true },
+        "homeDeleted": { "type": "boolean" },
+        "keptHome": { "$ref": "#/$defs/nullableString" }
+      }
+    }
+  }
+}

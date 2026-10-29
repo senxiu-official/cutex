@@ -107,7 +107,7 @@ pub fn alarm_view(alarm: &Alarm, names: &BTreeMap<String, String>, session: Opti
         "ownerCutexSessionId": if human { Value::Null } else { json!(alarm.owner) },
         "ownerName": if human { Value::Null } else { json!(names.get(&alarm.owner)) },
         "targetCutexSessionId": alarm.to,
-        "targetName": names.get(&alarm.to),
+        "targetName": if crate::agent_bus::alarms::is_director_alarm(alarm) {json!("Director")}else{json!(names.get(&alarm.to))},
         "at": alarm.at,
         "delaySeconds": alarm.delay_seconds,
         "state": alarm.state,
@@ -118,6 +118,12 @@ pub fn alarm_view(alarm: &Alarm, names: &BTreeMap<String, String>, session: Opti
         "messageChars": chars,
         "messageTruncated": chars > PREVIEW_CHARS,
     });
+    if let Some(role)=crate::agent_bus::alarms::director_alarm_route(alarm){
+        view["targetRef"]=json!({"kind":"projectDirector","projectId":role.project_id});
+        if let Some(target)=role.target.or_else(||crate::director_address::authority_for_project(&role.project_id).ok().map(|(_,target,_)|target)){
+            view["targetCutexSessionId"]=json!(target);
+        }
+    }
     if let Some(session) = session {
         let relation = match (alarm.owner == session, alarm.to == session) {
             (true, true) => "self",

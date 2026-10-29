@@ -8,7 +8,6 @@ use crate::asks::{
     model::*,
     store::{AskState, AskStore},
 };
-use crate::platform::file_stamp::FileStamp;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::{
@@ -24,6 +23,7 @@ struct Fixture {
     asks: AskStore,
     peer: Peer,
     template: AskRecord,
+    routing: worker::TransportRoutingFixture,
 }
 impl Fixture {
     fn new(url: &str) -> Self {
@@ -31,7 +31,8 @@ impl Fixture {
             std::env::temp_dir().join(format!("peer-review-worker-{}", uuid::Uuid::new_v4()));
         let peers = Store::at(root.join("runtime/peers"));
         let asks = AskStore::at(root.join("runtime/asks"));
-        let (_, template, mut peer) = tests::remote_record();
+        let (_, mut template, mut peer) = tests::remote_record();
+        let routing = worker::TransportRoutingFixture::new(&mut template);
         peer.urls = vec![url.into()];
         peer.last_seen_at = Some(super::now());
         peers.insert(peer.clone(), &token::generate()).unwrap();
@@ -42,6 +43,7 @@ impl Fixture {
             asks,
             peer,
             template,
+            routing,
         }
     }
     fn outgoing(&self, n: usize, pending: bool) -> AskRecord {
@@ -97,6 +99,7 @@ impl Fixture {
         self.asks
             .with_state(|s| {
                 *s = AskState::default();
+                self.routing.seed_policy(s);
                 s.asks
                     .extend(records.into_iter().map(|a| (a.ask_id.clone(), a)));
             })
@@ -226,9 +229,9 @@ fn history_only_maintenance_never_opens_a_write_transaction() {
                 })
                 .unwrap();
         }
-        let path = f.asks.dir().join("asks-v1.json");
+        let path = f.asks.dir().join(crate::management::v2::hot_store::DATABASE_FILE);
         let before = f.asks.snapshot().unwrap();
-        let stamp = FileStamp::of(&path).unwrap();
+        let generation = crate::management::v2::hot_store::generation(&path, "asks").unwrap();
         worker::take_maintenance_transactions();
         let started = Instant::now();
         for _ in 0..3 {
@@ -241,7 +244,7 @@ fn history_only_maintenance_never_opens_a_write_transaction() {
         worker::removed(&f.asks, &f.peer.peer_id).unwrap();
         assert_eq!(worker::take_maintenance_transactions(), 0, "{status}");
         assert_eq!(f.asks.snapshot().unwrap(), before, "{status}");
-        assert_eq!(FileStamp::of(&path).unwrap(), stamp, "{status}");
+        assert_eq!(crate::management::v2::hot_store::generation(&path, "asks").unwrap(), generation, "{status}");
     }
 }
 

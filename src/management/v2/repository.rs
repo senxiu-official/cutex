@@ -12,7 +12,7 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -46,26 +46,69 @@ const PENDING_RESET_FILE_NAME: &str = "pending-stream-reset.json";
 
 static MANAGEMENT_V2_REPOSITORY: super::process_repository::ProcessRepository<EventRepository> =
     super::process_repository::ProcessRepository::new();
+static DIAGNOSTIC_REPOSITORY: Mutex<Option<&'static EventRepository>> = Mutex::new(None);
 
 pub fn management_v2_repository() -> anyhow::Result<&'static EventRepository> {
-    MANAGEMENT_V2_REPOSITORY.get_or_open(
+    let repository = MANAGEMENT_V2_REPOSITORY.get_or_open(
         || Ok(runtime_dir()?.join("management-v2")),
         |dir| EventRepository::open(dir, current_host_name()),
-    )
+    )?;
+    *DIAGNOSTIC_REPOSITORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(repository);
+    Ok(repository)
 }
 
+/// Never opens storage or waits for a repository operation to finish.
+pub(crate) fn queue_diagnostics() -> serde_json::Value {
+    let repository = match DIAGNOSTIC_REPOSITORY.try_lock() {
+        Ok(slot) => *slot,
+        Err(_) => return serde_json::json!({"available":false}),
+    };
+    repository.map_or_else(|| serde_json::json!({"available":false}), EventRepository::queue_diagnostics)
+}
+
+/// Retention of the event journal (owner rule: the stream keeps at least
+/// 24 hours). A sealed file is removed once its newest event is
+/// [`RETENTION_AGE`] old, except the newest [`MIN_SEALED_FILES`]; the
+/// `retained_files` ceiling bounds the bytes whatever the age.
 #[derive(Debug, Clone, Copy)]
 pub struct RepositoryOptions {
     pub rotate_bytes: u64,
+    /// Ceiling on sealed files (`events.jsonl.1` ..= `.N`).
     pub retained_files: usize,
 }
 
 impl Default for RepositoryOptions {
     fn default() -> Self {
+        // 32 MiB × (127 + active) = 4 GiB at most; a day at the busiest
+        // host seen (host-a, ~128 MiB an hour) is ~3 GiB.
         Self {
             rotate_bytes: 32 * 1024 * 1024,
-            retained_files: 3,
+            retained_files: 127,
         }
+    }
+}
+
+pub const EVENT_MIN_RETENTION_HOURS: u64 = 24;
+const RETENTION_AGE: std::time::Duration = std::time::Duration::from_secs(EVENT_MIN_RETENTION_HOURS * 60 * 60);
+
+/// Sealed files kept whatever their age (the old fixed retention).
+const MIN_SEALED_FILES: usize = 3;
+
+/// Newest journal files (active included) whose cursors are all indexed in
+/// memory: the old 128 MiB window, so open and live paging cost what they
+/// did. Older ("cold") files are only boundary-checked at open; a cursor in
+/// one is found by a byte search, and each served page indexes its next
+/// cursor so a catch-up pages on without searching again.
+const HOT_FILES: usize = 4;
+
+impl RepositoryOptions {
+    fn slot_count(&self) -> usize {
+        self.retained_files + 1
+    }
+
+    /// First slot index (in [`EventRepository::read_paths`] order) that is hot.
+    fn hot_start(&self) -> usize {
+        self.slot_count().saturating_sub(HOT_FILES)
     }
 }
 
@@ -180,14 +223,57 @@ impl From<anyhow::Error> for ReplayError {
 
 pub struct EventSubscription {
     pub page: EventPage,
-    pub receiver: mpsc::Receiver<EventEnvelope>,
+    pub receiver: EventReceiver,
     /// Set when the subscriber was dropped because its queue was full; the
     /// receiver then drains and disconnects.
     pub lagged: Arc<AtomicBool>,
+    pub live_deltas: Option<super::live_deltas::LiveSubscription>,
+    pub(crate) wake: Arc<super::live_deltas::StreamWake>,
     _live: Arc<()>,
 }
 
-type Subscriber = (mpsc::SyncSender<EventEnvelope>, Arc<AtomicBool>, Weak<()>);
+type Subscriber = (mpsc::SyncSender<QueuedEvent>, Arc<AtomicBool>, Weak<()>, Arc<super::live_deltas::StreamWake>);
+
+#[derive(Default)]
+struct SubscriptionMetrics {
+    events: AtomicU64,
+    bytes: AtomicU64,
+}
+
+/// Charge follows the channel item, including after its sender is removed on lag.
+/// No charge survives dequeue, failed enqueue, or receiver destruction.
+struct QueuedEvent {
+    event: Option<EventEnvelope>,
+    bytes: u64,
+    metrics: Arc<SubscriptionMetrics>,
+}
+impl QueuedEvent {
+    fn new(event: EventEnvelope, bytes: usize, metrics: &Arc<SubscriptionMetrics>) -> Self {
+        metrics.events.fetch_add(1, Ordering::Relaxed);
+        metrics.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        Self { event: Some(event), bytes: bytes as u64, metrics: metrics.clone() }
+    }
+    fn into_event(mut self) -> EventEnvelope { self.event.take().expect("queued event") }
+}
+impl Drop for QueuedEvent {
+    fn drop(&mut self) {
+        self.metrics.events.fetch_sub(1, Ordering::Relaxed);
+        self.metrics.bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+pub struct EventReceiver(mpsc::Receiver<QueuedEvent>);
+impl EventReceiver {
+    pub fn try_recv(&self) -> Result<EventEnvelope, mpsc::TryRecvError> {
+        self.0.try_recv().map(QueuedEvent::into_event)
+    }
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Result<EventEnvelope, mpsc::RecvTimeoutError> {
+        self.0.recv_timeout(timeout).map(QueuedEvent::into_event)
+    }
+    pub fn try_iter(&self) -> impl Iterator<Item = EventEnvelope> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
+    }
+}
 
 pub struct EventRepository {
     root: PathBuf,
@@ -195,6 +281,11 @@ pub struct EventRepository {
     options: RepositoryOptions,
     process_lock: Mutex<()>,
     subscribers: Mutex<Vec<Subscriber>>,
+    subscription_metrics: Arc<SubscriptionMetrics>,
+    /// Highest journal event offered to this process's subscribers. Guarded by
+    /// the repository lock as well as this mutex, like local publication.
+    live_checkpoint: Mutex<Option<EventCheckpoint>>,
+    live_deltas: super::live_deltas::LiveHub,
     recovery_reset: Mutex<Option<PendingStreamReset>>,
     replay_index: Mutex<ReplayIndex>,
     stats: AppendStats,
@@ -212,6 +303,7 @@ struct CommitQueue {
     next_ticket: u64,
     waiting: Vec<(u64, PendingEvent)>,
     leader: bool,
+    active_batch_items: usize,
     done: HashMap<u64, anyhow::Result<EventEnvelope>>,
 }
 
@@ -321,6 +413,9 @@ impl EventRepository {
             options,
             process_lock: Mutex::new(()),
             subscribers: Mutex::new(Vec::new()),
+            subscription_metrics: Arc::new(SubscriptionMetrics::default()),
+            live_checkpoint: Mutex::new(None),
+            live_deltas: super::live_deltas::LiveHub::new(),
             recovery_reset: Mutex::new(None),
             replay_index: Mutex::new(ReplayIndex::default()),
             stats: AppendStats::default(),
@@ -341,10 +436,81 @@ impl EventRepository {
         Ok(repository)
     }
 
+    /// True means recognized as replaceable text traffic, including when it was
+    /// discarded for validation/budget reasons. Never fall back to append.
+    pub fn publish_live(&self, pending: PendingEvent) -> bool {
+        let mut timing = super::control_timing::Trace::metrics_only(super::control_timing::Path::LivePublish);
+        timing.stage(super::control_timing::Stage::Fanout);
+        if pending.host_id != self.host_id {
+            return super::live_deltas::is_live_pending(&pending);
+        }
+        self.live_deltas.publish(pending)
+    }
+
+    pub fn subscribe_live(&self, session: Option<String>) -> Result<super::live_deltas::LiveSubscription,super::live_deltas::LiveCapacityError> {
+        self.live_deltas.subscribe(session)
+    }
+
+    pub(crate) fn enable_live(&self, subscription:&mut EventSubscription, session:Option<String>)->Result<(),super::live_deltas::LiveCapacityError> {
+        subscription.live_deltas=Some(self.live_deltas.subscribe_woken(session,Some(subscription.wake.clone()))?);
+        Ok(())
+    }
+
+    pub fn invalidate_live(&self, session: &str, generation: u64) {
+        self.live_deltas.invalidate(session, generation);
+    }
+
+    pub fn live_delta_stats(&self) -> super::live_deltas::LiveStats {
+        self.live_deltas.stats()
+    }
+
+    fn queue_diagnostics(&self) -> serde_json::Value {
+        // Short, independent try-lock snapshots: diagnostic reads must not join
+        // the stalled operation they are intended to diagnose.
+        let commits = match self.commits.try_lock() {
+            Ok(queue) => serde_json::json!({"available":true,
+                "waitingItems":queue.waiting.len(), "activeBatchItems":queue.active_batch_items,
+                "completedResultsAwaitingCaller":queue.done.len()}),
+            Err(_) => serde_json::json!({"available":false}),
+        };
+        let subscriptions = match self.subscribers.try_lock() {
+            // Publication holds this lock through enqueue/rollback, so no
+            // failed-send reservation is exposed. Receives remain concurrent.
+            Ok(_guard) => serde_json::json!({"available":true,"approximate":true,
+                "queuedEvents":self.subscription_metrics.events.load(Ordering::Relaxed),
+                "queuedEncodedBytes":self.subscription_metrics.bytes.load(Ordering::Relaxed),
+                "byteDefinition":"compact_json_envelope_excluding_newline_per_queued_copy",
+                "excludesReplayAndDequeued":true}),
+            Err(_) => serde_json::json!({"available":false}),
+        };
+        serde_json::json!({"available":true,"commits":commits,"durableSubscriptions":subscriptions,
+            "liveSubscriptions":self.live_deltas.queue_diagnostics()})
+    }
+
     /// Appends one event and returns it once it is durable (fsynced) and
     /// published to this process's live subscribers. Concurrent appends are
     /// group-committed: see [`CommitQueue`].
-    pub fn append(&self, pending: PendingEvent) -> anyhow::Result<EventEnvelope> {
+    pub fn append(&self, mut pending: PendingEvent) -> anyhow::Result<EventEnvelope> {
+        // Fixed-cardinality diagnostics include queue/commit wait and synchronous
+        // publication. Fanout is separately timed and is nested, not additive.
+        let mut timing = super::control_timing::Trace::metrics_only(super::control_timing::Path::EventAppend);
+        timing.stage(super::control_timing::Stage::StoreWrite);
+        if super::live_deltas::is_live_pending(&pending) {
+            anyhow::bail!("text deltas are live-only; use publish_live instead of durable append");
+        }
+        pending.validate()?;
+        let blobs = super::event_blobs::EventBlobStore::at(self.root.join("event-blobs"));
+        if let Some(native) = pending.native.as_mut() {
+            super::native_errors::annotate_notification(&mut native.message);
+            blobs.normalize(&pending.cutex_session_id, &mut native.message)?;
+            crate::session::fork::annotate_native_rejection(
+                &pending.cutex_session_id,
+                &mut native.message,
+            );
+        }
+        if let Some(cutex) = pending.cutex.as_mut() {
+            blobs.normalize_cutex(&pending.cutex_session_id, &mut cutex.params)?;
+        }
         pending.validate()?;
         if pending.host_id != self.host_id {
             anyhow::bail!(
@@ -353,6 +519,7 @@ impl EventRepository {
                 self.host_id
             );
         }
+        timing.stage(super::control_timing::Stage::QueueWait);
         let mut queue = self.lock_commits();
         let ticket = queue.next_ticket;
         queue.next_ticket = queue.next_ticket.wrapping_add(1);
@@ -365,14 +532,17 @@ impl EventRepository {
                 // Lead one batch (which holds this ticket), then hand over.
                 queue.leader = true;
                 let batch = std::mem::take(&mut queue.waiting);
+                queue.active_batch_items = batch.len();
                 drop(queue);
                 let mut leadership = BatchLeadership {
                     repository: self,
                     tickets: batch.iter().map(|(ticket, _)| *ticket).collect(),
                     results: Vec::new(),
                 };
+                timing.stage(super::control_timing::Stage::StoreWrite);
                 leadership.results = self.commit_batch(batch);
                 drop(leadership);
+                timing.stage(super::control_timing::Stage::QueueWait);
                 queue = self.lock_commits();
                 continue;
             }
@@ -406,6 +576,18 @@ impl EventRepository {
         let outcome = self.with_repository_lock(|repository| {
             let (mut state, reset) = repository.load_append_state_locked()?;
             repository.record_recovery_reset(reset)?;
+            // Another process may have committed earlier events since our last
+            // append. Deliver those first; a local event must never overtake them.
+            repository.catch_up_live_locked(&state)?;
+            // Reading an unseen corrupt record can recover/reset the stream.
+            // Do not stage this append with the pre-recovery stream/sequence.
+            let recovered = repository.live_checkpoint.lock().unwrap_or_else(|e| e.into_inner())
+                .as_ref().is_some_and(|checkpoint| checkpoint.stream_id != state.stream_id);
+            if recovered {
+                let (current, reset) = repository.load_append_state_locked()?;
+                repository.record_recovery_reset(reset)?;
+                state = current;
+            }
             let stream_id = state.stream_id.clone();
             let mut writer = repository.batch_writer_locked()?;
             let mut rotated_any = false;
@@ -424,7 +606,7 @@ impl EventRepository {
                         repository.stage_locked(&mut state, reset_event(&repository.host_id, &session, &reset))?;
                     let (start, next, rotated) = repository.buffer_line_locked(&mut writer, &encoded)?;
                     rotated_any |= rotated;
-                    staged.push((envelope, start, next, rotated));
+                    staged.push((envelope, start, next, rotated, encoded.len().saturating_sub(1)));
                     reset_sessions.insert(session);
                 }
                 match repository.stage_locked(&mut state, pending) {
@@ -433,7 +615,7 @@ impl EventRepository {
                             repository.buffer_line_locked(&mut writer, &encoded)?;
                         rotated_any |= rotated;
                         results.push((ticket, Ok(staged.len())));
-                        staged.push((envelope, start, next, rotated));
+                        staged.push((envelope, start, next, rotated, encoded.len().saturating_sub(1)));
                     }
                     // A per-event refusal (validation, sequence range)
                     // consumes no sequence and fails only that append.
@@ -441,7 +623,7 @@ impl EventRepository {
                 }
             }
             repository.flush_batch_locked(&mut writer)?;
-            if let Some((last, _, _, _)) = staged.last() {
+            if let Some((last, _, _, _, _)) = staged.last() {
                 debug_assert_eq!(state.next_sequence, last.sequence.saturating_add(1));
                 // The journal is durable and authoritative; a checkpoint that
                 // could not be written only leaves the state file lagging.
@@ -449,14 +631,14 @@ impl EventRepository {
                     eprintln!("warning: management v2 stream checkpoint not written: {error:#}");
                 }
             }
-            for (envelope, start, next, rotated) in &staged {
+            for (envelope, start, next, rotated, _) in &staged {
                 repository.record_indexed_append(envelope, *rotated, *start, *next);
             }
             if !reset_sessions.is_empty() {
                 repository.mark_resets_emitted(reset_sessions)?;
             }
-            for (envelope, _, _, _) in &staged {
-                repository.publish(envelope);
+            for (envelope, _, _, _, bytes) in &staged {
+                repository.publish(envelope, Some(*bytes));
             }
             Ok((results, staged))
         });
@@ -464,7 +646,7 @@ impl EventRepository {
             Ok((results, staged)) => {
                 let mut envelopes = staged
                     .into_iter()
-                    .map(|(envelope, _, _, _)| Some(envelope))
+                    .map(|(envelope, _, _, _, _)| Some(envelope))
                     .collect::<Vec<_>>();
                 results
                     .into_iter()
@@ -518,11 +700,11 @@ impl EventRepository {
             if complete {
                 repository.clear_pending_recovery_reset_locked()?;
             }
+            // Serialize reset publication with journal following and append.
+            // The follower must not race a publication outside this lock.
+            repository.catch_up_live_locked(&state)?;
             Ok(envelopes)
         })?;
-        for envelope in &envelopes {
-            self.publish(envelope);
-        }
         Ok(envelopes)
     }
 
@@ -554,7 +736,7 @@ impl EventRepository {
         let Ok(mut subscribers) = self.subscribers.lock() else {
             return false;
         };
-        subscribers.retain(|(_, lagged, live)| live.strong_count() > 0 && !lagged.load(Ordering::SeqCst));
+        subscribers.retain(|(_, lagged, live, _)| live.strong_count() > 0 && !lagged.load(Ordering::SeqCst));
         !subscribers.is_empty()
     }
 
@@ -569,9 +751,20 @@ impl EventRepository {
             ));
         }
         self.with_replay_lock(|repository| {
+            let (state, reset) = repository.load_append_state_locked()?;
+            repository.record_recovery_reset(reset)?;
+            repository.catch_up_live_locked(&state)?;
+            let page = repository.page_locked(query)?;
+            for event in &page.events { repository.live_deltas.seed_anchor(event); }
+            // An initial/replacement subscription starts at this snapshot's
+            // boundary. Existing retained events belong to its replay page.
+            if !repository.has_live_subscribers() {
+                *repository.live_checkpoint.lock().unwrap_or_else(|e| e.into_inner()) = Some(page.checkpoint.clone());
+            }
             let (sender, receiver) = mpsc::sync_channel(capacity);
             let lagged = Arc::new(AtomicBool::new(false));
             let live = Arc::new(());
+            let wake = Arc::new(super::live_deltas::StreamWake::default());
             repository
                 .subscribers
                 .lock()
@@ -580,28 +773,70 @@ impl EventRepository {
                         "management v2 subscriber lock was poisoned"
                     ))
                 })?
-                .push((sender, lagged.clone(), Arc::downgrade(&live)));
-            match repository.page_locked(query) {
-                Ok(page) => Ok(EventSubscription {
-                    page,
-                    receiver,
-                    lagged,
-                    _live: live,
-                }),
-                Err(error) => {
-                    repository
-                        .subscribers
-                        .lock()
-                        .map_err(|_| {
-                            ReplayError::Repository(anyhow::anyhow!(
-                                "management v2 subscriber lock was poisoned"
-                            ))
-                        })?
-                        .pop();
-                    Err(error)
-                }
-            }
+                .push((sender, lagged.clone(), Arc::downgrade(&live), wake.clone()));
+            Ok(EventSubscription {
+                page,
+                receiver: EventReceiver(receiver),
+                lagged,
+                live_deltas: None,
+                wake,
+                _live: live,
+            })
         })
+    }
+
+    /// Management's journal follower. No append, side effects, model calls or
+    /// synthetic events: offer already durable external events to live readers.
+    pub fn follow_shared_journal(&self) -> anyhow::Result<usize> {
+        if !self.has_live_subscribers() { return Ok(0); }
+        self.with_repository_lock(|repository| {
+            let (state, reset) = repository.load_append_state_locked()?;
+            repository.record_recovery_reset(reset)?;
+            repository.catch_up_live_locked(&state)
+        })
+    }
+
+    fn catch_up_live_locked(&self, state: &StreamState) -> anyhow::Result<usize> {
+        if !self.has_live_subscribers() { return Ok(0); }
+        let Some(mut checkpoint) = self.live_checkpoint.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return Ok(0);
+        };
+        if checkpoint.stream_id == state.stream_id && checkpoint.sequence.saturating_add(1) == state.next_sequence {
+            return Ok(0);
+        }
+        let mut count = 0;
+        loop {
+            let query = ReplayQuery { stream_id: Some(checkpoint.stream_id.clone()), after: checkpoint.cursor.clone(), limit: 1000, cutex_session_id: None };
+            let page = match self.page_locked(query) {
+                Ok(page) => page,
+                // Let the normal SSE pump see an event in the new stream and
+                // emit its existing stream_changed frame (never invent a cursor).
+                Err(ReplayError::StreamChanged { .. }) => self.page_locked(ReplayQuery { limit: 1000, ..ReplayQuery::default() })?,
+                Err(ReplayError::CursorExpired { .. }) => {
+                    // Retention overtook the follower. Reconnect/resync rather
+                    // than silently skip the missing prefix for any reader.
+                    let mut subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+                    for (_, lagged, _, wake) in subscribers.iter() { lagged.store(true, Ordering::SeqCst); wake.notify(); }
+                    subscribers.clear();
+                    *self.live_checkpoint.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    return Ok(count);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            for envelope in &page.events {
+                self.publish(envelope, None);
+                checkpoint = EventCheckpoint { stream_id: envelope.stream_id.clone(), sequence: envelope.sequence, cursor: Some(envelope.cursor.clone()) };
+                count += 1;
+            }
+            if !self.has_live_subscribers() {
+                *self.live_checkpoint.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                return Ok(count);
+            }
+            if !page.has_more {
+                *self.live_checkpoint.lock().unwrap_or_else(|e| e.into_inner()) = Some(page.checkpoint);
+                return Ok(count);
+            }
+        }
     }
 
     pub fn recovery_reset(&self) -> anyhow::Result<Option<StreamRecoveryReset>> {
@@ -640,14 +875,17 @@ impl EventRepository {
                 "streamId is required with a nonzero after cursor".to_string(),
             ));
         }
-        match self.page_locked_once(&query, initial_cursor) {
+        let mut touched_cold = false;
+        match self.page_locked_once(&query, initial_cursor, &mut touched_cold) {
             Err(ReplayError::Repository(_)) => {
+                // A failure in a cold file (only boundary-checked at open)
+                // needs the full check to decide; hot files are always full.
                 let (_, reset) = self
-                    .load_or_recover_state_locked()
+                    .load_or_recover_state_with_locked(touched_cold)
                     .map_err(ReplayError::from)?;
                 self.record_recovery_reset(reset)
                     .map_err(ReplayError::from)?;
-                self.page_locked_once(&query, initial_cursor)
+                self.page_locked_once(&query, initial_cursor, &mut touched_cold)
             }
             result => result,
         }
@@ -657,6 +895,7 @@ impl EventRepository {
         &self,
         query: &ReplayQuery,
         initial_cursor: bool,
+        touched_cold: &mut bool,
     ) -> Result<EventPage, ReplayError> {
         let (snapshot, reset) = self.load_snapshot_locked().map_err(ReplayError::from)?;
         self.record_recovery_reset(reset)
@@ -696,20 +935,32 @@ impl EventRepository {
                         }
                     })
             } else {
-                let cursor = query.after.as_deref().unwrap_or_default();
-                Some(
-                    *index
-                        .cursors
-                        .get(cursor)
-                        .ok_or_else(|| ReplayError::CursorExpired {
-                            stream_id: stream_id.clone(),
-                            cursor: cursor.to_string(),
-                            earliest: snapshot.earliest.as_ref().map(retained_boundary),
-                            latest: snapshot.latest.as_ref().map(retained_boundary),
-                        })?,
-                )
+                index
+                    .cursors
+                    .get(query.after.as_deref().unwrap_or_default())
+                    .copied()
             }
         };
+        let start = match start {
+            None if !initial_cursor => {
+                let cursor = query.after.as_deref().unwrap_or_default();
+                *touched_cold = true;
+                let found = self
+                    .find_cold_cursor_locked(cursor, &stream_id)
+                    .map_err(ReplayError::from)?
+                    .ok_or_else(|| ReplayError::CursorExpired {
+                        stream_id: stream_id.clone(),
+                        cursor: cursor.to_string(),
+                        earliest: snapshot.earliest.as_ref().map(retained_boundary),
+                        latest: snapshot.latest.as_ref().map(retained_boundary),
+                    })?;
+                Some(found)
+            }
+            start => start,
+        };
+        if start.is_some_and(|start| start.file_index < self.options.hot_start()) {
+            *touched_cold = true;
+        }
         if let (false, Some(start)) = (initial_cursor, start) {
             self.validate_indexed_cursor_locked(
                 query.after.as_deref().unwrap_or_default(),
@@ -728,13 +979,23 @@ impl EventRepository {
         if has_more {
             scanned.truncate(query.limit);
         }
+        if let Some((event, location)) = scanned.last() {
+            // Cold cursors are not indexed: keep the one this page hands out
+            // so the next page of a catch-up needs no search.
+            if location.file_index < self.options.hot_start() {
+                if let Ok(mut index) = self.replay_index.lock() {
+                    index.cursors.entry(event.cursor.clone()).or_insert(*location);
+                }
+            }
+        }
         let next_cursor = scanned
             .last()
-            .map(|event| event.cursor.clone())
+            .map(|(event, _)| event.cursor.clone())
             .or_else(|| (!initial_cursor).then(|| query.after.clone()).flatten());
         let scanned_count = scanned.len();
         let events = scanned
             .into_iter()
+            .map(|(event, _)| event)
             .filter(|event| {
                 query
                     .cutex_session_id
@@ -783,6 +1044,8 @@ impl EventRepository {
             cutex: pending.cutex,
         };
         envelope.validate()?;
+        anyhow::ensure!(super::event_blobs::encoded_fits(&envelope, super::event_blobs::MAX_EVENT_BYTES - 1),
+            "management event metadata exceeds event size limit");
         let mut encoded =
             serde_json::to_vec(&envelope).context("Failed to serialize management v2 event")?;
         encoded.push(b'\n');
@@ -993,13 +1256,17 @@ impl EventRepository {
         &self,
         action: impl FnOnce(&Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        let mut timing = super::control_timing::Trace::metrics_only(super::control_timing::Path::EventRepositoryLock);
+        timing.stage(super::control_timing::Stage::LockWait);
         let waiting = std::time::Instant::now();
         let _process_guard = self
             .process_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("management v2 process lock was poisoned"))?;
+        timing.stage(super::control_timing::Stage::ContextRead);
         let lock_path = self.root.join(LOCK_FILE_NAME);
         let file = open_private_file(&lock_path, false)?;
+        timing.stage(super::control_timing::Stage::LockWait);
         file.lock().with_context(|| {
             format!(
                 "Failed to lock management v2 repository: {}",
@@ -1008,6 +1275,7 @@ impl EventRepository {
         })?;
         let holding = std::time::Instant::now();
         AppendStats::add(&self.stats.lock_wait_ns, (holding - waiting).as_nanos() as u64);
+        timing.stage(super::control_timing::Stage::Dispatch);
         let result = action(self);
         AppendStats::add(&self.stats.lock_hold_ns, holding.elapsed().as_nanos() as u64);
         if let Err(error) = file.unlock() {
@@ -1027,17 +1295,22 @@ impl EventRepository {
         &self,
         action: impl FnOnce(&Self) -> Result<T, ReplayError>,
     ) -> Result<T, ReplayError> {
+        let mut timing = super::control_timing::Trace::metrics_only(super::control_timing::Path::EventReplayLock);
+        timing.stage(super::control_timing::Stage::LockWait);
         let _process_guard = self.process_lock.lock().map_err(|_| {
             ReplayError::Repository(anyhow::anyhow!("management v2 process lock was poisoned"))
         })?;
+        timing.stage(super::control_timing::Stage::ContextRead);
         let lock_path = self.root.join(LOCK_FILE_NAME);
         let file = open_private_file(&lock_path, false).map_err(ReplayError::from)?;
+        timing.stage(super::control_timing::Stage::LockWait);
         file.lock().map_err(|error| {
             ReplayError::Repository(anyhow::Error::new(error).context(format!(
                 "Failed to lock management v2 repository: {}",
                 lock_path.display()
             )))
         })?;
+        timing.stage(super::control_timing::Stage::Dispatch);
         let result = action(self);
         if let Err(error) = file.unlock() {
             if result.is_ok() {
@@ -1159,6 +1432,15 @@ impl EventRepository {
     fn load_or_recover_state_locked(
         &self,
     ) -> anyhow::Result<(StreamState, Option<StreamRecoveryReset>)> {
+        self.load_or_recover_state_with_locked(false)
+    }
+
+    /// `validate_cold` also parses every cold record (after a failed replay,
+    /// so a corrupt old file resets the stream instead of failing each page).
+    fn load_or_recover_state_with_locked(
+        &self,
+        validate_cold: bool,
+    ) -> anyhow::Result<(StreamState, Option<StreamRecoveryReset>)> {
         let state_path = self.root.join(STATE_FILE_NAME);
         let mut state_parse_error = None;
         let loaded_state = match fs::read(&state_path) {
@@ -1182,7 +1464,7 @@ impl EventRepository {
             state.next_sequence = self.known_next_sequence(&state.stream_id, state.next_sequence);
             state
         });
-        let scan = match self.scan_records_locked(false) {
+        let scan = match self.scan_records_locked(false, validate_cold) {
             Ok(scan) => scan,
             Err(error) => {
                 return self.reset_uncertain_stream_locked(
@@ -1382,10 +1664,18 @@ impl EventRepository {
     }
 
     fn read_records_locked(&self) -> anyhow::Result<Vec<EventEnvelope>> {
-        Ok(self.scan_records_locked(true)?.records)
+        Ok(self.scan_records_locked(true, true)?.records)
     }
 
-    fn scan_records_locked(&self, collect_records: bool) -> anyhow::Result<JournalScan> {
+    /// Reads the retained journal and rebuilds the replay index. Hot files are
+    /// parsed and indexed whole; cold ones only boundary-checked unless
+    /// `collect_records` or `validate_cold` (repair after a failed replay).
+    fn scan_records_locked(
+        &self,
+        collect_records: bool,
+        validate_cold: bool,
+    ) -> anyhow::Result<JournalScan> {
+        let hot_start = self.options.hot_start();
         let mut records = Vec::new();
         let mut files = Vec::with_capacity(self.options.retained_files + 1);
         let mut cursors = HashMap::new();
@@ -1393,6 +1683,14 @@ impl EventRepository {
         let mut last_record = None;
         let mut expected_sequence = None;
         for (file_index, path) in self.read_paths().into_iter().enumerate() {
+            if file_index < hot_start && !(collect_records || validate_cold) {
+                let stamp = cold_file_stamp(&path, &mut stream_id, &mut expected_sequence)?;
+                if stamp.last.is_some() {
+                    last_record = stamp.last.clone();
+                }
+                files.push(stamp);
+                continue;
+            }
             let file = match File::open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1453,13 +1751,15 @@ impl EventRepository {
                 first.get_or_insert_with(|| boundary.clone());
                 last = Some(boundary.clone());
                 last_record = Some(boundary);
-                cursors
-                    .entry(event.cursor.clone())
-                    .or_insert(ReplayLocation {
-                        file_index,
-                        next_offset: offset,
-                        sequence: event.sequence,
-                    });
+                if file_index >= hot_start {
+                    cursors
+                        .entry(event.cursor.clone())
+                        .or_insert(ReplayLocation {
+                            file_index,
+                            next_offset: offset,
+                            sequence: event.sequence,
+                        });
+                }
                 if collect_records {
                     records.push(event);
                 }
@@ -1487,7 +1787,23 @@ impl EventRepository {
     }
 
     fn read_first_record_locked(&self) -> anyhow::Result<Option<EventEnvelope>> {
-        for path in self.read_paths() {
+        // One directory listing instead of failed opens of every empty slot
+        // below the oldest retained file (this runs for every page).
+        let present = match fs::read_dir(&self.root) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                .collect::<HashSet<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to list management v2 log: {}", self.root.display())
+                })
+            }
+        };
+        let paths = self.read_paths().into_iter().filter(|path| {
+            path.file_name().is_some_and(|name| present.contains(name))
+        });
+        for path in paths {
             if let Some(encoded) = read_first_complete_line(&path)? {
                 return parse_record(&path, &encoded).map(Some);
             }
@@ -1507,12 +1823,41 @@ impl EventRepository {
         Ok(None)
     }
 
-    fn ensure_replay_index_locked(&self, stream_id: &str) -> anyhow::Result<()> {
-        let paths = self.read_paths();
-        let current_files = paths
+    /// Stamps of every journal slot. Cold files change only by a rotation,
+    /// which always changes a hot sealed file, so while those match the
+    /// index the cold stamps are taken from it without touching the disk.
+    fn current_stamps_locked(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<JournalFileStamp>> {
+        let hot_start = self.options.hot_start().min(paths.len());
+        let mut stamps = paths[hot_start..]
             .iter()
             .map(|path| file_stamp(path))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        if hot_start == 0 {
+            return Ok(stamps);
+        }
+        let indexed_cold = self
+            .replay_index
+            .lock()
+            .ok()
+            .filter(|index| {
+                index.files.len() == paths.len()
+                    && index.files[hot_start..paths.len() - 1] == stamps[..stamps.len() - 1]
+            })
+            .map(|index| index.files[..hot_start].to_vec());
+        let mut cold = match indexed_cold {
+            Some(cold) => cold,
+            None => paths[..hot_start]
+                .iter()
+                .map(|path| file_stamp(path))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        };
+        cold.append(&mut stamps);
+        Ok(cold)
+    }
+
+    fn ensure_replay_index_locked(&self, stream_id: &str) -> anyhow::Result<()> {
+        let paths = self.read_paths();
+        let current_files = self.current_stamps_locked(&paths)?;
         {
             let mut index = self
                 .replay_index
@@ -1533,7 +1878,7 @@ impl EventRepository {
             }
         }
 
-        self.scan_records_locked(false)?;
+        self.scan_records_locked(false, false)?;
         let mut index = self
             .replay_index
             .lock()
@@ -1656,7 +2001,7 @@ impl EventRepository {
         start: ReplayLocation,
         limit: usize,
         stream_id: &str,
-    ) -> anyhow::Result<Vec<EventEnvelope>> {
+    ) -> anyhow::Result<Vec<(EventEnvelope, ReplayLocation)>> {
         let paths = self.read_paths();
         if start.file_index >= paths.len() {
             anyhow::bail!(
@@ -1677,6 +2022,7 @@ impl EventRepository {
                 }
             };
             let mut reader = BufReader::new(file);
+            let mut offset = if file_index == start.file_index { start.next_offset } else { 0 };
             if file_index == start.file_index {
                 reader
                     .seek(SeekFrom::Start(start.next_offset))
@@ -1696,7 +2042,7 @@ impl EventRepository {
                 if !line.ends_with('\n') {
                     anyhow::bail!("management v2 log has a partial tail: {}", path.display());
                 }
-                let event = parse_record(path, line.trim_end().as_bytes())?;
+                let mut event = parse_record(path, line.trim_end().as_bytes())?;
                 if event.stream_id != stream_id || event.sequence != expected_sequence {
                     anyhow::bail!(
                         "management v2 bounded replay expected stream {stream_id} sequence {expected_sequence}, found stream {} sequence {}",
@@ -1705,7 +2051,15 @@ impl EventRepository {
                     );
                 }
                 expected_sequence = expected_sequence.saturating_add(1);
-                records.push(event);
+                offset = offset.saturating_add(read as u64);
+                let location = ReplayLocation { file_index, next_offset: offset, sequence: event.sequence };
+                let blobs = super::event_blobs::EventBlobStore::at(self.root.join("event-blobs"));
+                if let Some(native) = &mut event.native {
+                    super::native_errors::annotate_notification(&mut native.message);
+                    blobs.normalize(&event.cutex_session_id, &mut native.message)?;
+                }
+                if let Some(cutex) = &mut event.cutex { blobs.normalize_cutex(&event.cutex_session_id, &mut cutex.params)?; }
+                records.push((event, location));
                 if records.len() == limit {
                     return Ok(records);
                 }
@@ -1750,6 +2104,39 @@ impl EventRepository {
         Ok(())
     }
 
+    /// A cursor older than the hot index: searched in the cold files, newest
+    /// first, and indexed when found. `None` means it is not retained.
+    fn find_cold_cursor_locked(
+        &self,
+        cursor: &str,
+        stream_id: &str,
+    ) -> anyhow::Result<Option<ReplayLocation>> {
+        let hot_start = self.options.hot_start();
+        if hot_start == 0 || cursor.is_empty() {
+            return Ok(None);
+        }
+        let search = ByteSearch::new(format!("\"cursor\":{}", serde_json::to_string(cursor)?).into_bytes());
+        let paths = self.read_paths();
+        for file_index in (0..hot_start).rev() {
+            let Some((event, next_offset)) = find_cursor_in_file(&paths[file_index], &search, cursor)?
+            else {
+                continue;
+            };
+            if event.stream_id != stream_id {
+                anyhow::bail!(
+                    "management v2 cold cursor {cursor} belongs to stream {}, not {stream_id}",
+                    event.stream_id
+                );
+            }
+            let location = ReplayLocation { file_index, next_offset, sequence: event.sequence };
+            if let Ok(mut index) = self.replay_index.lock() {
+                index.cursors.insert(cursor.to_string(), location);
+            }
+            return Ok(Some(location));
+        }
+        Ok(None)
+    }
+
     fn record_indexed_append(
         &self,
         envelope: &EventEnvelope,
@@ -1776,18 +2163,37 @@ impl EventRepository {
                 first: Some(boundary.clone()),
                 last: Some(boundary),
             });
-            let actual_files = match self
-                .read_paths()
+            let paths = self.read_paths();
+            let hot_start = self.options.hot_start();
+            // Cold slots: only their lengths (the rotation may have pruned
+            // expired ones, which are then empty); hot slots: full stamps.
+            let actual_files = paths
                 .iter()
-                .map(|path| file_stamp(path))
-                .collect::<anyhow::Result<Vec<_>>>()
-            {
-                Ok(files) => files,
-                Err(_) => {
-                    *index = ReplayIndex::default();
-                    return;
-                }
+                .enumerate()
+                .map(|(slot, path)| {
+                    if slot >= hot_start {
+                        return file_stamp(path);
+                    }
+                    let length = match fs::metadata(path) {
+                        Ok(metadata) => metadata.len(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                        Err(error) => return Err(error.into()),
+                    };
+                    Ok(match &shifted_files[slot] {
+                        shifted if length == shifted.length => shifted.clone(),
+                        _ => JournalFileStamp { length, first: None, last: None },
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>();
+            let Ok(actual_files) = actual_files else {
+                *index = ReplayIndex::default();
+                return;
             };
+            for (shifted, actual) in shifted_files.iter_mut().zip(&actual_files).take(hot_start) {
+                if actual.length == 0 {
+                    *shifted = actual.clone();
+                }
+            }
             // Later lines of the same batch may already follow this one in
             // the new active file; they are indexed by the calls after this.
             let active = file_count - 1;
@@ -1801,8 +2207,10 @@ impl EventRepository {
                 *index = ReplayIndex::default();
                 return;
             }
+            // Cursors of files that turned cold leave the index (a cold
+            // cursor is found by search), as do those of the dropped file.
             index.cursors.retain(|_, location| {
-                if location.file_index == 0 {
+                if location.file_index == 0 || location.file_index - 1 < hot_start {
                     false
                 } else {
                     location.file_index -= 1;
@@ -1897,6 +2305,32 @@ impl EventRepository {
                 first.display()
             )
         })?;
+        self.prune_expired_files_locked(Utc::now())
+    }
+
+    /// Removes the oldest sealed files whose newest event is at least
+    /// [`RETENTION_AGE`] old, keeping the newest [`MIN_SEALED_FILES`]. Stops
+    /// at the first file still inside the window (or one it cannot date).
+    fn prune_expired_files_locked(&self, now: chrono::DateTime<Utc>) -> anyhow::Result<()> {
+        let Ok(age) = chrono::Duration::from_std(RETENTION_AGE) else {
+            return Ok(());
+        };
+        let cutoff = now - age;
+        for index in (MIN_SEALED_FILES + 1..=self.options.retained_files).rev() {
+            let path = self.rotated_path(index);
+            let newest = match read_last_complete_line(&path) {
+                Ok(Some(encoded)) => parse_record(&path, &encoded).ok(),
+                Ok(None) => continue,
+                Err(_) => None,
+            };
+            let expired = newest
+                .and_then(|event| chrono::DateTime::parse_from_rfc3339(&event.received_at).ok())
+                .is_some_and(|received| received <= cutoff);
+            if !expired {
+                break;
+            }
+            remove_file_if_present(&path)?;
+        }
         Ok(())
     }
 
@@ -1913,20 +2347,32 @@ impl EventRepository {
         )
     }
 
-    fn publish(&self, envelope: &EventEnvelope) {
+    fn publish(&self, envelope: &EventEnvelope, encoded_bytes: Option<usize>) {
+        let mut timing = super::control_timing::Trace::metrics_only(super::control_timing::Path::EventFanout);
+        timing.stage(super::control_timing::Stage::Fanout);
+        self.live_deltas.observe(envelope);
         let Ok(mut subscribers) = self.subscribers.lock() else {
             return;
         };
-        subscribers.retain(|(sender, lagged, live)| {
+        // Local appends reuse the journal encoding. Only external follower
+        // events need a no-allocation counting writer, once per fanout.
+        let bytes = if subscribers.is_empty() { 0 } else {
+            encoded_bytes.unwrap_or_else(|| super::event_blobs::encoded_len(envelope))
+        };
+        subscribers.retain(|(sender, lagged, live, wake)| {
             if live.strong_count() == 0 { return false; }
-            match sender.try_send(envelope.clone()) {
-                Ok(()) => true,
+            match sender.try_send(QueuedEvent::new(envelope.clone(), bytes, &self.subscription_metrics)) {
+                Ok(()) => { wake.notify(); true },
                 Err(mpsc::TrySendError::Full(_)) => {
                     lagged.store(true, Ordering::SeqCst);
+                    wake.notify();
                     false
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => false,
             }
+        });
+        *self.live_checkpoint.lock().unwrap_or_else(|e| e.into_inner()) = Some(EventCheckpoint {
+            stream_id: envelope.stream_id.clone(), sequence: envelope.sequence, cursor: Some(envelope.cursor.clone()),
         });
     }
 }
@@ -1952,6 +2398,7 @@ impl Drop for BatchLeadership<'_> {
             });
         }
         queue.leader = false;
+        queue.active_batch_items = 0;
         drop(queue);
         self.repository.committed.notify_all();
     }
@@ -2084,6 +2531,143 @@ fn parse_record(path: &Path, encoded: &[u8]) -> anyhow::Result<EventEnvelope> {
         .validate()
         .with_context(|| format!("Invalid management v2 envelope in {}", path.display()))?;
     Ok(event)
+}
+
+/// Boundary check of a cold journal file at open: its first record continues
+/// the stream and its last record follows it. The lines between are checked
+/// when a replay reads them (a failure there runs the full check).
+fn cold_file_stamp(
+    path: &Path,
+    stream_id: &mut Option<String>,
+    expected_sequence: &mut Option<u64>,
+) -> anyhow::Result<JournalFileStamp> {
+    let length = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to stat management v2 log: {}", path.display()))
+        }
+    };
+    if length == 0 {
+        return Ok(JournalFileStamp { length, first: None, last: None });
+    }
+    let read = |encoded: Option<Vec<u8>>| -> anyhow::Result<EventEnvelope> {
+        let encoded = encoded.with_context(|| {
+            format!("management v2 log has no complete record: {}", path.display())
+        })?;
+        parse_record(path, &encoded)
+    };
+    let first = read(read_first_complete_line(path)?)?;
+    let last = read(read_complete_line_ending_at(path, length)?)?;
+    match (stream_id.as_deref(), *expected_sequence) {
+        (Some(expected_stream_id), Some(expected)) => {
+            if first.stream_id != expected_stream_id {
+                anyhow::bail!("retained management v2 log mixes stream ids");
+            }
+            if first.sequence != expected {
+                anyhow::bail!(
+                    "retained management v2 sequence gap: expected {expected}, found {}",
+                    first.sequence
+                );
+            }
+        }
+        _ => *stream_id = Some(first.stream_id.clone()),
+    }
+    if last.stream_id != first.stream_id || last.sequence < first.sequence {
+        anyhow::bail!("management v2 log boundaries disagree: {}", path.display());
+    }
+    *expected_sequence = Some(last.sequence.saturating_add(1));
+    Ok(JournalFileStamp {
+        length,
+        first: Some(boundary_for_event(&first)),
+        last: Some(boundary_for_event(&last)),
+    })
+}
+
+/// Horspool search for one needle over many buffers.
+struct ByteSearch {
+    needle: Vec<u8>,
+    skip: [usize; 256],
+}
+
+impl ByteSearch {
+    fn new(needle: Vec<u8>) -> Self {
+        let mut skip = [needle.len().max(1); 256];
+        for (position, byte) in needle.iter().enumerate().take(needle.len().saturating_sub(1)) {
+            skip[*byte as usize] = needle.len() - 1 - position;
+        }
+        Self { needle, skip }
+    }
+
+    fn find(&self, haystack: &[u8], from: usize) -> Option<usize> {
+        let length = self.needle.len();
+        let last = *self.needle.last()?;
+        let mut position = from;
+        while position + length <= haystack.len() {
+            let tail = haystack[position + length - 1];
+            if tail == last && haystack[position..position + length] == self.needle[..] {
+                return Some(position);
+            }
+            position += self.skip[tail as usize];
+        }
+        None
+    }
+}
+
+/// The record whose `cursor` is `cursor` in one journal file:
+/// `(record, offset after its line)`. Every byte hit is confirmed by parsing
+/// its line, since a payload may quote the same text.
+fn find_cursor_in_file(
+    path: &Path,
+    search: &ByteSearch,
+    cursor: &str,
+) -> anyhow::Result<Option<(EventEnvelope, u64)>> {
+    const CHUNK: usize = 8 * 1024 * 1024;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to open management v2 log: {}", path.display()))
+        }
+    };
+    let mut buffer = Vec::with_capacity(CHUNK);
+    // File offset of `buffer[0]`.
+    let mut base = 0_u64;
+    loop {
+        let kept = buffer.len();
+        buffer.resize(kept + CHUNK, 0);
+        let read = file
+            .read(&mut buffer[kept..])
+            .with_context(|| format!("Failed to read management v2 log: {}", path.display()))?;
+        buffer.truncate(kept + read);
+        // Only whole lines are searched; a partial one waits for the next read.
+        let complete = match buffer.iter().rposition(|byte| *byte == b'\n') {
+            Some(newline) => newline + 1,
+            None if read == 0 => return Ok(None),
+            None => continue,
+        };
+        let mut from = 0;
+        while let Some(hit) = search.find(&buffer[..complete], from) {
+            let start = buffer[..hit].iter().rposition(|byte| *byte == b'\n').map_or(0, |n| n + 1);
+            let end = hit
+                + buffer[hit..complete]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .expect("complete region ends with a newline");
+            let event = parse_record(path, &buffer[start..end])?;
+            if event.cursor == cursor {
+                return Ok(Some((event, base + end as u64 + 1)));
+            }
+            from = end + 1;
+        }
+        if read == 0 {
+            return Ok(None);
+        }
+        buffer.drain(..complete);
+        base += complete as u64;
+    }
 }
 
 fn file_stamp(path: &Path) -> anyhow::Result<JournalFileStamp> {
@@ -2225,6 +2809,420 @@ mod tests {
                 params: json!({ "value": value, "explicitNull": null }),
             }),
         }
+    }
+
+    #[test]
+    fn subscription_diagnostics_follow_receive_lag_and_drop() {
+        let root = test_root("subscription-diagnostics");
+        let repo = EventRepository::open(&root, "devbox").unwrap();
+        let sub = repo.page_and_subscribe(ReplayQuery::default(), 1).unwrap();
+        let other = repo.page_and_subscribe(ReplayQuery::default(), 2).unwrap();
+        let first = repo.append(pending("s", 1)).unwrap();
+        let bytes = serde_json::to_vec(&first).unwrap().len() as u64;
+        let snapshot = repo.queue_diagnostics();
+        assert_eq!(snapshot["durableSubscriptions"]["queuedEvents"], 2);
+        assert_eq!(snapshot["durableSubscriptions"]["queuedEncodedBytes"], bytes * 2);
+        let second = repo.append(pending("s", 2)).unwrap();
+        let second_bytes = serde_json::to_vec(&second).unwrap().len() as u64;
+        assert!(sub.lagged.load(Ordering::SeqCst));
+        // The lagged sender is gone, but its first event is still resident.
+        assert_eq!(repo.queue_diagnostics()["durableSubscriptions"]["queuedEncodedBytes"], bytes * 2 + second_bytes);
+        assert_eq!(sub.receiver.try_recv().unwrap(), first);
+        assert_eq!(repo.queue_diagnostics()["durableSubscriptions"]["queuedEvents"], 2);
+        drop(other); // request cancellation / unsubscribe drops unread channel items
+        assert_eq!(repo.queue_diagnostics()["durableSubscriptions"]["queuedEncodedBytes"], 0);
+        drop(sub);
+        let guard = repo.subscribers.lock().unwrap();
+        assert_eq!(repo.queue_diagnostics()["durableSubscriptions"]["available"], false);
+        drop(guard);
+        drop(repo);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual diagnostic overhead probe; prints timings, no timing assertions"]
+    fn subscription_diagnostics_overhead_probe() {
+        let root = test_root("diagnostics-overhead");
+        let repo = EventRepository::open(&root, "devbox").unwrap();
+        let mut event = repo.append(pending("s", 1)).unwrap();
+        event.cutex.as_mut().unwrap().params = json!({"text":"x".repeat(240 * 1024)});
+        let bytes = serde_json::to_vec(&event).unwrap().len();
+        let started = std::time::Instant::now();
+        for _ in 0..128 {
+            assert_eq!(super::super::event_blobs::encoded_len(std::hint::black_box(&event)), bytes);
+        }
+        eprintln!("diagnostics_count_writer bytes={bytes} iterations=128 elapsed_us={}", started.elapsed().as_micros());
+        let metrics = Arc::new(SubscriptionMetrics::default());
+        let (raw_tx, raw_rx) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::sync_channel(1);
+        // Interleave the two paths to reduce allocator/thermal order effects.
+        let (mut raw_ns, mut measured_ns) = (0u128, 0u128);
+        for _ in 0..1000 {
+            let started = std::time::Instant::now();
+            raw_tx.try_send(event.clone()).unwrap();
+            std::hint::black_box(raw_rx.try_recv().unwrap());
+            raw_ns += started.elapsed().as_nanos();
+            let started = std::time::Instant::now();
+            assert!(tx.try_send(QueuedEvent::new(event.clone(), bytes, &metrics)).is_ok());
+            std::hint::black_box(rx.try_recv().unwrap().into_event());
+            measured_ns += started.elapsed().as_nanos();
+        }
+        eprintln!("diagnostics_channel iterations=1000 raw_ns={raw_ns} measured_ns={measured_ns}");
+        assert_eq!(metrics.bytes.load(Ordering::Relaxed), 0);
+        drop(repo);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_diagnostics_reset_active_batch_on_unwind_and_failure() {
+        let root = test_root("commit-diagnostics");
+        let repo = EventRepository::open(&root, "devbox").unwrap();
+        {
+            let mut queue = repo.lock_commits();
+            queue.leader = true;
+            queue.active_batch_items = 1;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _leadership = BatchLeadership { repository: &repo, tickets: vec![42], results: vec![] };
+            panic!("simulated batch cancellation");
+        }));
+        assert!(result.is_err());
+        let snapshot = repo.queue_diagnostics();
+        assert_eq!(snapshot["commits"]["activeBatchItems"], 0);
+        assert_eq!(snapshot["commits"]["waitingItems"], 0);
+        assert_eq!(snapshot["commits"]["completedResultsAwaitingCaller"], 1);
+        assert!(repo.lock_commits().done.remove(&42).unwrap().is_err());
+        assert!(repo.append(pending("s", 1)).is_ok());
+        assert_eq!(repo.queue_diagnostics()["commits"]["completedResultsAwaitingCaller"], 0);
+        drop(repo);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_text_is_not_durable_and_sse_frame_has_no_cursor() {
+        use super::super::model::{AppServerSchema,AppServerSchemaChannel,NativeMessage,NativeMessageKind};
+        struct StopAfterLive(Vec<u8>);
+        impl std::io::Write for StopAfterLive {
+            fn write(&mut self,bytes:&[u8])->std::io::Result<usize>{self.0.extend_from_slice(bytes);Ok(bytes.len())}
+            fn flush(&mut self)->std::io::Result<()> {
+                if String::from_utf8_lossy(&self.0).contains("event: live_delta\n") {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                } else { Ok(()) }
+            }
+        }
+        let root=test_root("live-text-sse");
+        let repo=EventRepository::open(&root,"devbox").unwrap();
+        let first=repo.append(pending("cutex.a",1)).unwrap();
+        let before=fs::read(root.join("events.jsonl")).unwrap();
+        let mut sub=repo.page_and_subscribe(ReplayQuery::default(),16).unwrap();
+        repo.enable_live(&mut sub,Some("cutex.a".into())).unwrap();
+        let delta=PendingEvent{cutex_session_id:"cutex.a".into(),host_id:"devbox".into(),source:EventSource::AppServer,
+            schema:Some(AppServerSchema{protocol:"codex-app-server".into(),major_version:2,version:"test".into(),sha256:"0".repeat(64),
+                channel:AppServerSchemaChannel::Experimental,capabilities:json!({"features":{"fullTextItemTerminal":true}}),extensions:vec![]}),
+            correlation:EventCorrelation{runtime_generation:Some(1),thread_id:Some("thread".into()),turn_id:Some("turn".into()),item_id:Some("item".into()),..Default::default()},
+            native:Some(NativeMessage{kind:NativeMessageKind::Notification,message:json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":"你🙂"}})}),cutex:None};
+        let mut legacy=delta.clone();
+        legacy.schema.as_mut().unwrap().capabilities=json!({"features":{"fullTextItemTerminal":false}});
+        assert!(repo.append(delta.clone()).is_err());
+        assert!(repo.publish_live(delta));
+        assert_eq!(fs::read(root.join("events.jsonl")).unwrap(),before);
+        let mut out=StopAfterLive(Vec::new());
+        let result=super::super::server::stream_events(&mut out,sub,&ReplayQuery::default(),crate::management::listeners::RevocationWatch::new(None));
+        assert!(result.is_err());
+        let text=String::from_utf8(out.0).unwrap();
+        assert_eq!(text.lines().filter(|l|l.starts_with("id: ")).count(),1);
+        assert!(text.contains(&format!("id: {}",first.cursor)));
+        let live=text.split("event: live_delta\ndata: ").nth(1).unwrap();
+        let frame:serde_json::Value=serde_json::from_str(live.trim()).unwrap();
+        assert_eq!(frame["params"]["delta"],"你🙂");
+        assert_eq!(frame["anchor"]["sequence"],first.sequence);
+        assert!(frame.get("sequence").is_none() && frame.get("cursor").is_none());
+        assert_eq!(repo.page(ReplayQuery::default()).unwrap().events.len(),1);
+        assert!(!repo.publish_live(legacy.clone()));
+        let retained=repo.append(legacy).unwrap();
+        assert_eq!(retained.native.unwrap().message["params"]["delta"],"你🙂");
+        assert_eq!(repo.page(ReplayQuery::default()).unwrap().events.len(),2);
+        drop(repo); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_journal_external_then_local_are_live_ordered_and_not_duplicated() {
+        let root = test_root("shared-live-order");
+        let management = EventRepository::open(&root, "devbox").unwrap();
+        let agent_bus = EventRepository::open(&root, "devbox").unwrap();
+        let live = management.page_and_subscribe(ReplayQuery::default(), 16).unwrap();
+        let first = agent_bus.append(pending("cutex.a", 1)).unwrap();
+        let second = management.append(pending("cutex.a", 2)).unwrap();
+        assert_eq!(live.receiver.try_recv().unwrap(), first);
+        assert_eq!(live.receiver.try_recv().unwrap(), second);
+        assert_eq!(management.follow_shared_journal().unwrap(), 0);
+        assert!(live.receiver.try_recv().is_err());
+        let third = agent_bus.append(pending("cutex.a", 3)).unwrap();
+        assert_eq!(management.follow_shared_journal().unwrap(), 1);
+        assert_eq!(live.receiver.try_recv().unwrap(), third);
+        assert_eq!(management.follow_shared_journal().unwrap(), 0);
+        drop(live); drop(agent_bus); drop(management); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_journal_new_subscriber_replays_external_event_only_once() {
+        let root = test_root("shared-live-subscribe");
+        let management = EventRepository::open(&root, "devbox").unwrap();
+        let other = EventRepository::open(&root, "devbox").unwrap();
+        let old = management.page_and_subscribe(ReplayQuery::default(), 16).unwrap();
+        let first = other.append(pending("cutex.a", 1)).unwrap();
+        let new = management.page_and_subscribe(ReplayQuery::default(), 16).unwrap();
+        assert_eq!(old.receiver.try_recv().unwrap(), first);
+        assert_eq!(new.page.events, vec![first]);
+        assert_eq!(management.follow_shared_journal().unwrap(), 0);
+        assert!(new.receiver.try_recv().is_err());
+        let next = other.append(pending("cutex.a", 2)).unwrap();
+        management.follow_shared_journal().unwrap();
+        assert_eq!(old.receiver.try_recv().unwrap(), next);
+        assert_eq!(new.receiver.try_recv().unwrap(), next);
+        drop(old); drop(new); drop(other); drop(management); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_journal_follows_external_rotation_and_disconnects_on_retention_gap() {
+        let root = test_root("shared-live-rotation");
+        let options = RepositoryOptions { rotate_bytes: 1, retained_files: 4 };
+        let management = EventRepository::open_with_options(&root, "devbox", options).unwrap();
+        let other = EventRepository::open_with_options(&root, "devbox", options).unwrap();
+        let live = management.page_and_subscribe(ReplayQuery::default(), 16).unwrap();
+        let first = other.append(pending("cutex.a", 1)).unwrap();
+        management.follow_shared_journal().unwrap();
+        assert_eq!(live.receiver.try_recv().unwrap(), first);
+        for i in 2..5 { other.append(pending("cutex.a", i)).unwrap(); }
+        assert_eq!(management.follow_shared_journal().unwrap(), 3);
+        assert_eq!(live.receiver.try_iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![2,3,4]);
+        for i in 5..15 { other.append(pending("cutex.a", i)).unwrap(); }
+        management.follow_shared_journal().unwrap();
+        assert!(live.lagged.load(Ordering::SeqCst));
+        assert!(matches!(live.receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+        drop(live); drop(other); drop(management); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_journal_concurrent_writers_and_follower_preserve_one_sequence() {
+        let root = test_root("shared-live-concurrent");
+        let management = Arc::new(EventRepository::open(&root, "devbox").unwrap());
+        let other = Arc::new(EventRepository::open(&root, "devbox").unwrap());
+        let live = management.page_and_subscribe(ReplayQuery::default(), 128).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let follower = {
+            let repository = management.clone(); let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    repository.follow_shared_journal().unwrap();
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        };
+        let a = { let repository = management.clone(); thread::spawn(move || {
+            for i in 0..30 { repository.append(pending("cutex.a", i)).unwrap(); }
+        }) };
+        let b = { let repository = other.clone(); thread::spawn(move || {
+            for i in 30..60 { repository.append(pending("cutex.b", i)).unwrap(); }
+        }) };
+        a.join().unwrap(); b.join().unwrap(); stop.store(true, Ordering::SeqCst); follower.join().unwrap();
+        management.follow_shared_journal().unwrap();
+        assert_eq!(live.receiver.try_iter().map(|e| e.sequence).collect::<Vec<_>>(), (1..=60).collect::<Vec<_>>());
+        drop(live); drop(other); drop(management); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_journal_recovery_while_following_does_not_lose_the_local_append() {
+        let root = test_root("shared-live-recover-append");
+        let management = EventRepository::open(&root, "devbox").unwrap();
+        let other = EventRepository::open(&root, "devbox").unwrap();
+        let live = management.page_and_subscribe(ReplayQuery::default(), 16).unwrap();
+        let first = other.append(pending("cutex.a", 1)).unwrap();
+        other.append(pending("cutex.a", 2)).unwrap();
+        other.append(pending("cutex.a", 3)).unwrap();
+        // The append fast path sees a valid head/tail. Only catch-up reaches
+        // this broken middle record and discovers that recovery is needed.
+        let journal = fs::read_to_string(root.join(EVENTS_FILE_NAME)).unwrap();
+        let mut lines = journal.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        lines[1] = "{broken json}";
+        fs::write(root.join(EVENTS_FILE_NAME), format!("{}\n", lines.join("\n"))).unwrap();
+        let accepted = management.append(pending("cutex.a", 4)).expect("append uses the recovered stream");
+        assert_ne!(accepted.stream_id, first.stream_id);
+        assert!(live.receiver.try_iter().any(|event| event.cursor == accepted.cursor));
+        assert_eq!(value_of(&accepted), 4);
+        drop(live); drop(other); drop(management); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_events_are_small_in_journal_replay_and_live_subscribers() {
+        use base64::Engine;
+        let root = test_root("image-blobs");
+        let repository = EventRepository::open(&root, "devbox").unwrap();
+        let subscriber = repository.page_and_subscribe(ReplayQuery::default(),32).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(vec![19; 1024*1024]);
+        for i in 0..24 {
+            let mut p = pending("cutex.a", i);
+            p.cutex.as_mut().unwrap().params = json!({"item":{"type":"imageGeneration","id":format!("image{i}"),"result":data}});
+            let event = repository.append(p).unwrap();
+            assert!(serde_json::to_vec(&event).unwrap().len() < 4096);
+            let published = subscriber.receiver.try_recv().unwrap();
+            assert_eq!(event,published);
+        }
+        let page = repository.page(ReplayQuery::default()).unwrap();
+        assert_eq!(page.events.len(),24);
+        assert!(fs::metadata(root.join("events.jsonl")).unwrap().len()<24*4096);
+        let blob = &page.events[0].cutex.as_ref().unwrap().params["item"]["result"];
+        assert_eq!(blob["type"],"cutexBlob");
+        assert!(super::super::event_blobs::EventBlobStore::at(root.join("event-blobs"))
+            .get("cutex.a",blob["blobId"].as_str().unwrap()).is_some());
+        drop(subscriber); drop(repository);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn every_user_input_image_event_persists_blob_references_that_validate() {
+        use base64::Engine;
+        let root = test_root("user-input-image-blobs");
+        let repository = EventRepository::open(&root, "devbox").unwrap();
+        let data_url = format!("data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(vec![23;65_537]));
+        let origin = json!({"kind":"other", "clientId":"desktop-test"});
+        let input = json!([{"type":"image", "url":data_url, "detail":"auto"}]);
+        let at = "2026-10-25T00:00:00Z";
+        let queue_item = || json!({
+            "queueId":"queue-1", "clientUserMessageId":"message-1", "origin":origin,
+            "input":input, "position":0, "revision":1, "state":"queued",
+            "createdAt":at, "updatedAt":at
+        });
+        let cases = [
+            ("cutex/userInput/routeAccepted", json!({
+                "managementRequestId":"request-1", "clientUserMessageId":"message-1",
+                "origin":origin, "input":input, "strategy":"auto", "state":"routed_to_cutex",
+                "acceptedAt":at
+            })),
+            ("cutex/userInput/queued", queue_item()),
+            ("cutex/userInput/queueUpdated", queue_item()),
+            ("cutex/userInput/submitted", json!({
+                "managementRequestId":"request-1", "clientUserMessageId":"message-1",
+                "origin":origin, "input":input, "disposition":"started",
+                "nativeRequestId":"native-1", "nativeMethod":"turn/start",
+                "appServerAccepted":true, "submittedAt":at
+            })),
+            ("cutex/userInput/failed", json!({
+                "managementRequestId":"request-1", "clientUserMessageId":"message-1",
+                "origin":origin, "input":input, "stage":"native_request",
+                "error":{"source":"cutex", "code":"test_failure", "message":"fixture", "retryable":false},
+                "failedAt":at
+            })),
+        ];
+        for (method, params) in cases {
+            let pending = PendingEvent {
+                cutex_session_id:"cutex.a".into(), host_id:"devbox".into(), source:EventSource::Cutex,
+                schema:None, correlation:EventCorrelation::default(), native:None,
+                cutex:Some(CutexMessage { method:method.into(), params }),
+            };
+            let event = repository.append(pending).unwrap();
+            let cutex = event.cutex.as_ref().unwrap();
+            let blob = &cutex.params["input"][0]["url"];
+            assert_eq!(blob["type"], "cutexBlob", "{method}");
+            assert!(super::super::contract_validation::validate_cutex_event_message(
+                &serde_json::to_value(cutex).unwrap()).is_ok(), "{method}");
+            assert!(super::super::event_blobs::EventBlobStore::at(root.join("event-blobs"))
+                .get("cutex.a",blob["blobId"].as_str().unwrap()).is_some());
+        }
+        drop(repository);
+        let reopened = EventRepository::open(&root,"devbox").unwrap();
+        let replay = reopened.page(ReplayQuery::default()).unwrap();
+        assert_eq!(replay.events.len(),5);
+        for event in &replay.events {
+            event.validate().unwrap();
+            assert_eq!(event.cutex.as_ref().unwrap().params["input"][0]["url"]["type"],"cutexBlob");
+        }
+        drop(reopened); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_cutex_text_that_looks_like_media_stays_a_string() {
+        use base64::Engine;
+        let root = test_root("strict-cutex-data-url-text");
+        let repository = EventRepository::open(&root,"devbox").unwrap();
+        let content = format!("data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(vec![29;65_537]));
+        let event = repository.append(PendingEvent {
+            cutex_session_id:"cutex.a".into(), host_id:"devbox".into(), source:EventSource::Cutex,
+            schema:None, correlation:EventCorrelation::default(), native:None,
+            cutex:Some(CutexMessage {
+                method:"cutex/agentBus/messageSent".into(),
+                params:json!({
+                    "messageId":"message-1", "fromCutexSessionId":"cutex.a",
+                    "toCutexSessionId":"cutex.b", "deliveryMode":"after_turn",
+                    "content":content, "sentAt":"2026-10-25T00:00:00Z"
+                }),
+            }),
+        }).unwrap();
+        assert!(event.cutex.as_ref().unwrap().params["content"].is_string());
+        event.validate().unwrap();
+        drop(repository); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn google_tool_schema_error_codes_survive_persistence_and_legacy_replay() {
+        use super::super::model::{AppServerSchema, AppServerSchemaChannel, NativeMessage, NativeMessageKind};
+        let root = test_root("google-tool-schema-code");
+        let repository = EventRepository::open(&root, "devbox").unwrap();
+        let native_error = json!({"message":"Google does not support this JSON Schema enum",
+            "code":400, "codexErrorInfo":"other", "additionalDetails":"original detail"});
+        let event = repository.append(PendingEvent {
+            cutex_session_id:"cutex.a".into(), host_id:"devbox".into(), source:EventSource::AppServer,
+            schema:Some(AppServerSchema {protocol:"codex-app-server".into(), major_version:2,
+                version:"test".into(), sha256:"0".repeat(64), channel:AppServerSchemaChannel::Experimental,
+                capabilities:json!({}), extensions:vec![]}),
+            correlation:EventCorrelation {runtime_generation:Some(1), thread_id:Some("thread".into()),
+                turn_id:Some("turn".into()), ..Default::default()},
+            native:Some(NativeMessage {kind:NativeMessageKind::Notification,
+                message:json!({"method":"turn/completed", "params":{"threadId":"thread",
+                    "turn":{"id":"turn", "status":"failed", "error":native_error}}})}),
+            cutex:None,
+        }).unwrap();
+        let error = &event.native.as_ref().unwrap().message["params"]["turn"]["error"];
+        assert_eq!(error["cutexCode"], "tool_schema_rejected");
+        for (key, value) in native_error.as_object().unwrap() { assert_eq!(&error[key], value); }
+        let stored = fs::read_to_string(root.join("events.jsonl")).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(stored.trim()).unwrap();
+        assert_eq!(legacy["native"]["message"]["params"]["turn"]["error"]["cutexCode"], "tool_schema_rejected");
+        legacy["native"]["message"]["params"]["turn"]["error"].as_object_mut().unwrap().remove("cutexCode");
+        drop(repository);
+        let legacy_line = format!("{}\n", serde_json::to_string(&legacy).unwrap());
+        fs::write(root.join("events.jsonl"), &legacy_line).unwrap();
+        let reopened = EventRepository::open(&root,"devbox").unwrap();
+        let replay = reopened.page(ReplayQuery::default()).unwrap();
+        assert_eq!(replay.events.len(),1);
+        assert_eq!(replay.events[0].cursor,event.cursor);
+        assert_eq!(replay.events[0].native.as_ref().unwrap().message["params"]["turn"]["error"]["cutexCode"], "tool_schema_rejected");
+        assert_eq!(fs::read_to_string(root.join("events.jsonl")).unwrap(),legacy_line,
+            "replay does not rewrite retained native history");
+        drop(reopened); fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_inline_events_replay_as_refs_without_rewriting_cursors_or_log() {
+        use base64::Engine;
+        let root=test_root("legacy-image-blobs");
+        let repository=EventRepository::open(&root,"devbox").unwrap();
+        let first=repository.append(pending("cutex.a",0)).unwrap();
+        let mut old=serde_json::to_value(&first).unwrap();
+        old["cutex"]["params"]=json!({"item":{"type":"imageGeneration","result":base64::engine::general_purpose::STANDARD.encode(vec![7;1024*1024])}});
+        let line=format!("{}\n",serde_json::to_string(&old).unwrap());
+        drop(repository);
+        fs::write(root.join("events.jsonl"),&line).unwrap();
+        let reopened=EventRepository::open(&root,"devbox").unwrap();
+        let page=reopened.page(ReplayQuery::default()).unwrap();
+        assert_eq!(page.events[0].cursor,first.cursor);
+        assert_eq!(page.events[0].sequence,first.sequence);
+        assert!(serde_json::to_vec(&page.events[0]).unwrap().len()<4096);
+        assert_eq!(fs::read_to_string(root.join("events.jsonl")).unwrap(),line);
+        drop(reopened); fs::remove_dir_all(root).unwrap();
     }
 
     /// A streaming delta as the event worker journals it (~350 bytes).
@@ -3073,11 +4071,11 @@ mod tests {
         assert!(first.root.join(format!("{EVENTS_FILE_NAME}.1")).exists(), "batches crossed a rotation");
         assert!(first.stats().events.load(Ordering::Relaxed) > first.stats().batches.load(Ordering::Relaxed),
             "concurrent appends shared batches");
-        // Live events of this instance arrive in sequence order (other
-        // instances' appends are replayed, not pushed).
+        // The final tail may belong to the other instance. The follower now
+        // pushes every writer's events to this already-open subscription.
+        first.follow_shared_journal().expect("follow final external tail");
         let live = subscription.receiver.try_iter().map(|event| event.sequence).collect::<Vec<_>>();
-        assert_eq!(live.len(), WRITERS / 3 * 2 * PER_WRITER);
-        assert!(live.windows(2).all(|pair| pair[0] < pair[1]), "live events published out of order");
+        assert_eq!(live, (1..=(WRITERS * PER_WRITER) as u64).collect::<Vec<_>>(), "live sequence has a gap, duplicate, or reordering");
         drop(subscription);
         drop((first, second));
         fs::remove_dir_all(root).expect("remove test repository");
@@ -3553,6 +4551,232 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
+    fn journal_files(root: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(root)
+            .expect("list repository")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(EVENTS_FILE_NAME))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// Rewrites the `receivedAt` of every record in one journal file.
+    fn age_journal_file(path: &Path, at: chrono::DateTime<Utc>) {
+        const KEY: &str = "\"receivedAt\":\"";
+        let stamp = at.to_rfc3339();
+        let aged = fs::read_to_string(path)
+            .expect("read journal file")
+            .lines()
+            .map(|line| {
+                let start = line.find(KEY).expect("receivedAt") + KEY.len();
+                let end = start + line[start..].find('"').expect("receivedAt end");
+                format!("{}{stamp}{}\n", &line[..start], &line[end..])
+            })
+            .collect::<String>();
+        fs::write(path, aged).expect("age journal file");
+    }
+
+    fn page_after(
+        repository: &EventRepository,
+        stream_id: &str,
+        cursor: &str,
+        limit: usize,
+    ) -> Result<EventPage, ReplayError> {
+        repository.page(ReplayQuery {
+            stream_id: Some(stream_id.to_string()),
+            after: Some(cursor.to_string()),
+            limit,
+            cutex_session_id: None,
+        })
+    }
+
+    fn sequences(page: &EventPage) -> Vec<u64> {
+        page.events.iter().map(|event| event.sequence).collect()
+    }
+
+    /// Files past the hot window are only boundary-checked at open and not
+    /// indexed; a cursor in one is found by search, the cursor a page hands
+    /// out is indexed, and another instance's rotation is followed.
+    #[test]
+    fn cold_files_are_not_indexed_and_their_cursors_are_found_by_search() {
+        let root = test_root("cold-cursors");
+        // One record per file; 9 slots, the oldest 5 cold.
+        let options = RepositoryOptions { rotate_bytes: 300, retained_files: 8 };
+        assert_eq!(options.hot_start(), 5);
+        let writer =
+            EventRepository::open_with_options(&root, "devbox", options).expect("open writer");
+        let appended = (0..14)
+            .map(|value| writer.append(pending("cutex.session-a", value)).expect("append"))
+            .collect::<Vec<_>>();
+        assert_eq!(journal_files(&root).len(), 9);
+        let stream_id = appended[0].stream_id.clone();
+
+        let reader =
+            EventRepository::open_with_options(&root, "devbox", options).expect("open reader");
+        assert!(reader.recovery_reset().unwrap().is_none());
+        {
+            let index = reader.replay_index.lock().unwrap();
+            let indexed = |event: &EventEnvelope| index.cursors.contains_key(&event.cursor);
+            assert!(appended[..10].iter().all(|event| !indexed(event)), "cold cursors are not indexed");
+            assert!(appended[10..].iter().all(indexed), "hot cursors are");
+            assert_eq!(index.files[0].first.as_ref().unwrap().sequence, 6, "cold stamps come from boundaries");
+        }
+
+        // Sequence 7 sits in a cold file.
+        let page = page_after(&reader, &stream_id, &appended[6].cursor, 2).expect("cold cursor page");
+        assert_eq!(sequences(&page), vec![8, 9]);
+        assert!(page.has_more);
+        let next = page.next_cursor.clone().unwrap();
+        assert!(
+            reader.replay_index.lock().unwrap().cursors.contains_key(&next),
+            "a handed-out cold cursor is indexed"
+        );
+        let page = page_after(&reader, &stream_id, &next, 100).expect("continue from cold");
+        assert_eq!(sequences(&page), (10..=14).collect::<Vec<_>>());
+        assert!(!page.has_more);
+
+        // Rotated out by the ceiling, or never existed: expired, not an error.
+        for cursor in [appended[4].cursor.as_str(), "c2:00000000-0000-4000-8000-000000000000"] {
+            assert!(matches!(
+                page_after(&reader, &stream_id, cursor, 10),
+                Err(ReplayError::CursorExpired { .. })
+            ));
+        }
+
+        // Another instance rotates twice; a cold cursor still resolves.
+        for value in 14..16 {
+            writer.append(pending("cutex.session-a", value)).expect("external append");
+        }
+        let page =
+            page_after(&reader, &stream_id, &appended[8].cursor, 3).expect("after external rotation");
+        assert_eq!(sequences(&page), vec![10, 11, 12]);
+        let query = ReplayQuery {
+            stream_id: Some(stream_id.clone()),
+            after: Some(appended[8].cursor.clone()),
+            limit: 100,
+            cutex_session_id: None,
+        };
+        assert_eq!(reader.page(query.clone()).unwrap(), reference_page(&reader, &query));
+        assert!(reader.recovery_reset().unwrap().is_none());
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
+    /// Owner rule: the stream keeps at least 24 hours. A rotation removes the
+    /// oldest sealed files whose newest event is a day old, never one inside
+    /// the window, and always keeps the newest three sealed files.
+    #[test]
+    fn rotation_prunes_only_files_older_than_a_day() {
+        let root = test_root("retention");
+        let options = RepositoryOptions { rotate_bytes: 300, retained_files: 8 };
+        let repository =
+            EventRepository::open_with_options(&root, "devbox", options).expect("open");
+        let appended = (1..=7)
+            .map(|value| repository.append(pending("cutex.session-a", value)).expect("append"))
+            .collect::<Vec<_>>();
+        let stream_id = appended[0].stream_id.clone();
+        // events.jsonl.6 holds sequence 1, .5 sequence 2, .4 sequence 3.
+        let now = Utc::now();
+        let day = chrono::Duration::hours(24);
+        age_journal_file(&root.join("events.jsonl.6"), now - day - chrono::Duration::hours(1));
+        age_journal_file(&root.join("events.jsonl.5"), now - day - chrono::Duration::minutes(1));
+        age_journal_file(&root.join("events.jsonl.4"), now - day + chrono::Duration::minutes(10));
+        drop(repository);
+
+        let repository =
+            EventRepository::open_with_options(&root, "devbox", options).expect("reopen");
+        assert_eq!(
+            sequences(&repository.page(ReplayQuery::default()).unwrap()),
+            (1..=7).collect::<Vec<_>>()
+        );
+        repository.append(pending("cutex.session-a", 8)).expect("rotating append");
+        assert_eq!(
+            journal_files(&root),
+            [
+                "events.jsonl",
+                "events.jsonl.1",
+                "events.jsonl.2",
+                "events.jsonl.3",
+                "events.jsonl.4",
+                "events.jsonl.5"
+            ]
+        );
+        assert!(
+            repository.replay_index.lock().unwrap().stream_id.is_some(),
+            "the index followed the pruning rotation"
+        );
+        let page = repository.page(ReplayQuery::default()).expect("initial page");
+        assert_eq!(sequences(&page), (3..=8).collect::<Vec<_>>(), "the file inside the day stays");
+        assert_eq!(page, reference_page(&repository, &ReplayQuery::default()));
+        assert!(matches!(
+            page_after(&repository, &stream_id, &appended[0].cursor, 10),
+            Err(ReplayError::CursorExpired { earliest: Some(RetainedBoundary { sequence: 3, .. }), .. })
+        ));
+        assert_eq!(
+            sequences(&page_after(&repository, &stream_id, &appended[2].cursor, 10).unwrap()),
+            (4..=8).collect::<Vec<_>>()
+        );
+
+        // Everything sealed is old: the newest three sealed files remain.
+        for index in 1..=5 {
+            age_journal_file(&root.join(format!("events.jsonl.{index}")), now - day * 2);
+        }
+        drop(repository);
+        let repository =
+            EventRepository::open_with_options(&root, "devbox", options).expect("reopen");
+        repository.append(pending("cutex.session-a", 9)).expect("rotating append");
+        assert_eq!(
+            journal_files(&root),
+            ["events.jsonl", "events.jsonl.1", "events.jsonl.2", "events.jsonl.3"]
+        );
+        assert_eq!(
+            sequences(&repository.page(ReplayQuery::default()).unwrap()),
+            (6..=9).collect::<Vec<_>>()
+        );
+        assert!(repository.recovery_reset().unwrap().is_none());
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
+    /// A cold file is only boundary-checked at open, so a corrupt record in
+    /// its middle is found when a replay reaches it; the full check then
+    /// resets the stream as a corrupt hot file always did.
+    #[test]
+    fn corrupt_cold_record_resets_the_stream_when_a_replay_reaches_it() {
+        let probe_root = test_root("cold-corruption-probe");
+        let probe = EventRepository::open(&probe_root, "devbox").expect("open probe");
+        probe.append(pending("cutex.session-a", 10)).expect("probe append");
+        let line = fs::metadata(probe_root.join(EVENTS_FILE_NAME)).unwrap().len();
+        drop(probe);
+        fs::remove_dir_all(probe_root).ok();
+
+        let root = test_root("cold-corruption");
+        // Three records per file.
+        let options = RepositoryOptions { rotate_bytes: line * 3 + line / 2, retained_files: 8 };
+        let repository =
+            EventRepository::open_with_options(&root, "devbox", options).expect("open");
+        for value in 10..37 {
+            repository.append(pending("cutex.session-a", value)).expect("append");
+        }
+        let before = repository.stream_metadata().unwrap();
+        let cold = root.join("events.jsonl.7");
+        let mut lines =
+            fs::read_to_string(&cold).unwrap().lines().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        lines[1] = "{not-json".to_string();
+        fs::write(&cold, format!("{}\n", lines.join("\n"))).unwrap();
+        drop(repository);
+
+        let repository =
+            EventRepository::open_with_options(&root, "devbox", options).expect("reopen");
+        assert!(repository.recovery_reset().unwrap().is_none(), "boundaries are intact");
+        let page = repository.page(ReplayQuery::default()).expect("replay repairs");
+        let reset = repository.recovery_reset().unwrap().expect("corruption reset");
+        assert_ne!(page.stream_id, before.stream_id);
+        assert_eq!(page.stream_id, reset.stream_id);
         fs::remove_dir_all(root).expect("remove test repository");
     }
 }

@@ -97,6 +97,23 @@ pub struct PermissionEnvelope {
 impl PermissionEnvelope {
     /// The envelope of a durable session from its persisted launch settings.
     pub fn from_record(record: &CutexSessionRecord) -> Result<Self, String> {
+        if record.dsh_session.as_ref().is_some_and(|session| !session.spike) {
+            // A DSH product agent runs its session patch's knobs (the
+            // agent's settings, else workspace-write + ask on its cwd); DSH's
+            // own web tools reach the network.
+            let (sandbox, approval) = crate::runtime::dsh::permission_knobs(record);
+            let sandbox = SandboxLevel::parse(sandbox).ok_or("unknown DSH sandbox mode")?;
+            return Ok(Self {
+                sandbox,
+                approval: if approval == "never" { ApprovalStrictness::Never } else { ApprovalStrictness::OnRequest },
+                network_access: true,
+                writable_roots: if sandbox == SandboxLevel::WorkspaceWrite {
+                    vec![crate::session::service::cutex_session_launch_cwd(record).to_string()]
+                } else {
+                    Vec::new()
+                },
+            });
+        }
         let (sandbox, approval) = crate::runtime::args::effective_runtime_permission_defaults(record);
         let sandbox = sandbox
             .as_deref()
@@ -391,6 +408,40 @@ mod tests {
             writable_roots: None,
             cwd: abs(cwd),
         }
+    }
+
+    #[test]
+    fn dsh_product_agent_has_the_session_patch_envelope_so_peers_may_wake_it() {
+        let cwd = abs("/work/project");
+        let mut record = CutexSessionRecord::new_at("cutex.dsh-envelope".into(), None, "host".into(), cwd.clone(), None,
+            "2026-10-27T00:00:00Z".into()).unwrap();
+        record.runtime_backend = crate::session::model::CutexSessionRuntimeBackend::Dsh;
+        let session = |spike| crate::runtime::dsh::DshSession {
+            flavor: Default::default(), kimi: None,
+            thread_id: "dsh-thread".into(), state_dir: "/state".into(), node: "/node".into(), adapter: "/server.mjs".into(),
+            dsh_cli: "/dsh.js".into(), patch: "/session.yml".into(), install_root: "/install".into(), native_session_id: None,
+            deployment_version: String::new(), model: "deepseek-v4-flash".into(), reasoning_effort: None,
+            api_key_env: "DEEPSEEK_API_KEY".into(), spike,
+        };
+        record.dsh_session = Some(session(false));
+        let envelope = PermissionEnvelope::from_record(&record).unwrap();
+        assert_eq!(envelope.sandbox, SandboxLevel::WorkspaceWrite);
+        assert_eq!(envelope.approval, ApprovalStrictness::OnRequest);
+        assert!(envelope.network_access);
+        assert_eq!(envelope.writable_roots, vec![cwd]);
+        // Two DSH agents of one project have the same envelope: neither "can do more".
+        assert_eq!(PermissionEnvelope::from_record(&record).unwrap(), envelope);
+        // The agent's own settings decide the knobs.
+        record.sandbox_mode = Some("danger-full-access".into());
+        record.approval_policy = Some("never".into());
+        let full = PermissionEnvelope::from_record(&record).unwrap();
+        assert_eq!((full.sandbox, full.approval), (SandboxLevel::FullAccess, ApprovalStrictness::Never));
+        assert!(full.writable_roots.is_empty());
+        record.sandbox_mode = None;
+        record.approval_policy = None;
+        // The spike keeps the generic (explicit-permission) rule.
+        record.dsh_session = Some(session(true));
+        assert!(PermissionEnvelope::from_record(&record).is_err());
     }
 
     #[test]

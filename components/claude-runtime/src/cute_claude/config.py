@@ -67,9 +67,15 @@ def load_mcp_servers_config(path: Path) -> tuple[dict, dict]:
 # adapter input, so every tool is refused there and its reply is not shown
 # (docs/BUSY_DELIVERY.md "Autonomous turns").
 RUNTIME_LIMITS = (
-    "Runtime limits here: background subagents are refused, so run subagents in the foreground: every "
-    "Agent/Task call must pass run_in_background: false (leaving it out is refused too). When a background shell command finishes, the turn that its notification "
-    "starts cannot use tools and the user does not see it; check its result in the next turn the user starts."
+    "Runtime limits here: background subagents (Agent/Task with run_in_background true or left out) are "
+    "allowed, and preferred for long work: you stay free to read and answer the user while they run. "
+    "When one finishes (or a background shell command does), cutex sends you a visible message from "
+    "\"Claude Task\" with its result; act on it then. Claude Code also starts a short turn of its own for "
+    "each such notification: that turn cannot use tools and the user does not see it, so reply in one line "
+    "and use no tools. A background subagent cannot use cutex tools, start subagents, ask the user, or get "
+    "approval for a tool call; work that needs these belongs in the main agent or a foreground subagent "
+    "(run_in_background: false). For long commands whose output you need, prefer cutex's job service over "
+    "background shell commands."
 )
 # Claude Code's own environment block names the OS shell ("Shell: PowerShell
 # (primary); Bash tool also available") even when the profile turned command

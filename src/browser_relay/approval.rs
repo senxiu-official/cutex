@@ -28,6 +28,49 @@ pub enum Decision {
     },
 }
 
+pub(crate) fn approval_request(context: &Context<'_>, input: &AgentCommand) -> ApprovalRequest {
+    let claim = input.tool == "browser_claim";
+    let mut intent = json!({"kind":if claim{"browser_claim"}else{"browser_open"},"session":context.agent.session,"runtime":context.agent.runtime,
+        "thread":context.agent.thread,"runtimeGeneration":context.agent.generation,"device":context.device,"generation":context.generation,
+        "arguments":input.arguments});
+    if claim {
+        for key in ["arguments", "runtime", "thread", "runtimeGeneration"] {
+            intent.as_object_mut().unwrap().remove(key);
+        }
+    }
+    let digest = crate::approvals::request_digest(&intent);
+    let mut details = json!({"version":1,"cutexSessionId":context.agent.session,"agentName":context.agent_name,
+        "requestId":input.request_id,"deviceId":context.device,"hostId":context.host,"connectionGeneration":context.generation,
+        "threadId":context.agent.thread,"turnId":context.agent.turn,"runtimeGeneration":context.agent.generation,"intentDigest":digest});
+    if claim {
+        details["reason"] = input.arguments["reason"].clone();
+        if let Some(hint) = input.arguments["urlHint"].as_str() {
+            details["urlHint"] = json!(safe_url(hint));
+        }
+        details["sharesOwnerLogin"] = json!(true);
+    } else {
+        details["url"] = json!(safe_url(
+            input.arguments["url"].as_str().unwrap_or_default()
+        ));
+        details["title"] = input.arguments["title"].clone();
+    }
+    ApprovalRequest {
+        kind: if claim { ApprovalKind::BrowserClaim } else { ApprovalKind::BrowserOpen },
+        reason: if claim { "browser_owner_tab_selection" } else { "browser_agent_open" }.into(),
+        requester_cutex_session_id: context.agent.session.clone(),
+        requester_name: Some(context.agent_name.into()),
+        project_id: None,
+        summary: if claim {
+            "Select an owner browser tab (shares its login state)"
+        } else {
+            "Open a browser tab in the agent login pool"
+        }
+        .into(),
+        details,
+        request_sha256: digest,
+    }
+}
+
 pub fn gate(
     store: &ApprovalStore,
     context: &Context<'_>,
@@ -45,54 +88,7 @@ pub fn gate(
     let claim = input.tool == "browser_claim";
     // Claims are a session/device-generation request, not a new prompt for
     // every tool requestId/title/reason. Denials therefore survive retries.
-    let mut intent = json!({"kind":if claim{"browser_claim"}else{"browser_open"},"session":context.agent.session,"runtime":context.agent.runtime,
-        "thread":context.agent.thread,"runtimeGeneration":context.agent.generation,"device":context.device,"generation":context.generation,
-        "arguments":input.arguments});
-    if claim {
-        for key in ["arguments", "runtime", "thread", "runtimeGeneration"] {
-            intent.as_object_mut().unwrap().remove(key);
-        }
-    }
-    let digest = crate::approvals::request_digest(&intent);
-    let mut details = json!({"version":1,"cutexSessionId":context.agent.session,"agentName":context.agent_name,
-        "requestId":input.request_id,"deviceId":context.device,"hostId":context.host,"connectionGeneration":context.generation,
-        "threadId":context.agent.thread,"runtimeGeneration":context.agent.generation,"intentDigest":digest});
-    if claim {
-        details["reason"] = input.arguments["reason"].clone();
-        if let Some(hint) = input.arguments["urlHint"].as_str() {
-            details["urlHint"] = json!(safe_url(hint));
-        }
-        details["sharesOwnerLogin"] = json!(true);
-    } else {
-        details["url"] = json!(safe_url(
-            input.arguments["url"].as_str().unwrap_or_default()
-        ));
-        details["title"] = input.arguments["title"].clone();
-    }
-    let request = ApprovalRequest {
-        kind: if claim {
-            ApprovalKind::BrowserClaim
-        } else {
-            ApprovalKind::BrowserOpen
-        },
-        reason: if claim {
-            "browser_owner_tab_selection"
-        } else {
-            "browser_agent_open"
-        }
-        .into(),
-        requester_cutex_session_id: context.agent.session.clone(),
-        requester_name: Some(context.agent_name.into()),
-        project_id: None,
-        summary: if claim {
-            "Select an owner browser tab (shares its login state)"
-        } else {
-            "Open a browser tab in the agent login pool"
-        }
-        .into(),
-        details,
-        request_sha256: digest,
-    };
+    let request = approval_request(context, input);
     let now = chrono::Utc::now();
     if claim {
         let (record, changed) = store

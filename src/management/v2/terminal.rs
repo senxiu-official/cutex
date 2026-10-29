@@ -680,9 +680,10 @@ pub fn stream(
             super::workspace_fs::write_sse(stream, "exit", &json!({"exitCode": exit_code}))?;
             return Ok(());
         }
-        let mut watch = crate::management::listeners::RevocationWatch::for_current_request();
+        let mut watch = crate::management::listeners::RevocationWatch::for_stream(stream)?;
         let mut last_write = std::time::Instant::now();
         loop {
+            if watch.disconnected()? { return Ok(()); }
             if let Some(token_id) = watch.revoked() {
                 crate::management::listeners::write_revoked_frame(stream, &token_id)?;
                 return Ok(());

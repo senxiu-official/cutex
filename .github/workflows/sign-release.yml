@@ -8,9 +8,10 @@
 # .github/ci/cutex-release.pub before anything is uploaded, every release re-downloaded and checked
 # before it is published, channel-release uploaded last and verified.
 #
-# Order across repositories: cute-codex (when a release ships a new native), then cutex-desktop, then
-# this one. desktop_tag makes this run check first that the cutex-desktop release is public and its
-# SHA256SUMS signature verifies.
+# This is the single-repository signer. The release set's lead chooses repository order;
+# for 0.2.0 the native precedes cutex, and the desktop follows it. Leave desktop_tag empty.
+# When explicitly provided for another set, desktop_tag requires that desktop release to be public
+# and its SHA256SUMS signature to verify. channel-release is always published last in this repository.
 #
 # Secrets (the `release` environment's or the repository's): MINISIGN_SECRET_KEY = the minisign secret
 # key file, MINISIGN_PASSWORD = its passphrase; NATIVE_ARTIFACTS_TOKEN (optional) = a token with Actions
@@ -184,7 +185,11 @@ jobs:
             tail -n 80 "$RUNNER_TEMP/sign.log"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Keep the release documents
+      # The dry run uses the real release key but publishes nothing. Retain its signatures
+      # beside the signed documents so a disposable upgrade fixture can combine them with
+      # the original Build binaries artifacts and verify every byte before publication.
+      # The secret key is RUNNER_TEMP/minisign-release.key, outside all these paths.
+      - name: Keep signed documents and detached signatures for prepublication verification
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -193,8 +198,13 @@ jobs:
             ${{ runner.temp }}/sign.log
             ${{ runner.temp }}/sign/release/manifest.json
             ${{ runner.temp }}/sign/release/SHA256SUMS
+            ${{ runner.temp }}/sign/release/*.minisig
+            ${{ runner.temp }}/sign/native/**/*.minisig
+            ${{ runner.temp }}/sign/components/**/*.minisig
             ${{ runner.temp }}/sign/channel/channel.json
+            ${{ runner.temp }}/sign/channel/channel.json.minisig
             ${{ runner.temp }}/sign/capabilities/capabilities.json
+            ${{ runner.temp }}/sign/capabilities/capabilities.json.minisig
           if-no-files-found: ignore
           retention-days: 14
       - name: Delete the signing key

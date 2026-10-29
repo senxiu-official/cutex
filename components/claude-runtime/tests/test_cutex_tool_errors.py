@@ -115,7 +115,7 @@ async def test_approval_wait_descriptor_sets_the_hold_turn_and_longer_timeouts(t
     assert environments[-1]['CUTEX_MCP_APPROVAL_WAIT_SECS'] == '120'
     assert environments[-1]['CUTEX_MCP_TURN_ID'] == 'turn-9'
     assert registry.tools['service_register'].timeout == 150
-    assert registry.tools['agent_create'].timeout == 150
+    assert registry.tools['agent_create'].timeout == 270
     assert registry.tools['delegation_wait'].timeout == 150
     assert registry.tools['agent_tell'].timeout is None
 

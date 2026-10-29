@@ -16,6 +16,7 @@ use uuid::Uuid;
 use super::prices::load_price_table_at;
 use super::prices::save_price_table_at;
 use super::quota_history::read_quota_history_at;
+use super::quota_history::read_since_at;
 use super::quota_history::record_snapshots_at;
 use super::*;
 use crate::management::v2::model::EventCorrelation;
@@ -461,6 +462,55 @@ fn owner_prices_validate_estimate_and_round_trip() {
 }
 
 #[test]
+fn quota_history_keeps_every_month_and_reads_only_what_it_needs() {
+    let root = TestRoot::new("quota-keep");
+    let at = |text: &str| DateTime::parse_from_rfc3339(text).unwrap().timestamp();
+    let snapshot = |ts: i64| QuotaSnapshot {
+        ts,
+        profile_id: "id-glm".to_string(),
+        profile: "glm".to_string(),
+        gauge_id: "primary".to_string(),
+        label: None,
+        kind: Some("window".to_string()),
+        remaining_percent: Some(50.0),
+        balance: None,
+        reset_at: None,
+    };
+    let times = [
+        at("2024-01-10T00:00:00Z"),
+        at("2026-06-10T00:00:00Z"),
+        at("2026-09-20T00:00:00Z"),
+        at("2026-10-22T23:30:00Z"),
+        at("2026-10-23T00:00:00Z"),
+    ];
+    for ts in times {
+        record_snapshots_at(root.path(), &[snapshot(ts)]).unwrap();
+    }
+    // Owner decision 2026-10-23: no month file is ever deleted.
+    let mut kept: Vec<String> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, ["2024-01.jsonl", "2026-06.jsonl", "2026-09.jsonl", "2026-10.jsonl"]);
+    // Old months stay readable for the usage page.
+    let old = read_quota_history_at(
+        root.path(),
+        NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+        NaiveDate::from_ymd_opt(2024, 1, 31).unwrap(),
+        None,
+        &|at: DateTime<Utc>| at.date_naive(),
+    )
+    .unwrap();
+    assert_eq!(old.iter().map(|s| s.ts).collect::<Vec<_>>(), [times[0]]);
+    // The auto-pick slope reads the newest two months only, then filters by time.
+    let recent: Vec<i64> = read_since_at(root.path(), at("2026-01-01T00:00:00Z")).unwrap().iter().map(|s| s.ts).collect();
+    assert_eq!(recent, [times[2], times[3], times[4]]);
+    let last_hour: Vec<i64> = read_since_at(root.path(), at("2026-10-22T23:15:00Z")).unwrap().iter().map(|s| s.ts).collect();
+    assert_eq!(last_hour, [times[3], times[4]]);
+}
+
+#[test]
 fn quota_snapshots_are_throttled_per_gauge_and_filtered() {
     let root = TestRoot::new("quota");
     let snapshot = |ts: i64, profile: &str, gauge: &str, pct: f64| QuotaSnapshot {
@@ -708,4 +758,44 @@ fn model_rows_and_unpriced_models_ignore_the_model_ids_case() {
         unpriced,
         vec![(Some("glm-5.3".to_string()), 2, 220), (Some("glm-5.3-flash".to_string()), 2, 220)]
     );
+}
+
+/// Token audit 2026-10-22: rows count model requests (a Claude turn its
+/// reported SDK steps) and show the largest context one request re-read,
+/// so tokens per turn and context per step can be read off the usage page.
+#[test]
+fn rows_count_claude_steps_and_report_the_largest_request() {
+    let sample = |entry: &str, session: &str, turn: &str, input: u64, steps: Option<u64>| -> UsageLedgerEntry {
+        let mut value = json!({
+            "kind": "usage", "entryId": entry, "eventId": entry, "observedAt": "2026-10-21T03:00:00Z", "hostId": "h",
+            "cutexSessionId": session, "threadId": "t", "turnId": turn, "runtimeGeneration": 1,
+            "profile": "p", "provider": "openai", "model": "m", "tokenSource": "native_last",
+            "tokens": {"totalTokens": input, "inputTokens": input, "cachedInputTokens": input / 2, "cacheWriteInputTokens": 0, "outputTokens": 0, "reasoningOutputTokens": 0},
+            "cumulativeTotal": {"totalTokens": input, "inputTokens": input, "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 0, "reasoningOutputTokens": 0}
+        });
+        if let Some(steps) = steps {
+            value["modelRequests"] = json!(steps);
+        }
+        serde_json::from_value(value).unwrap()
+    };
+    let ledger = UsageLedger {
+        entries: vec![
+            sample("u1", "cutex.codex", "c1", 200_000, None),
+            sample("u2", "cutex.codex", "c1", 210_000, None),
+            sample("u3", "cutex.claude", "k1", 4_000_000, Some(10)),
+        ],
+        warnings: Vec::new(),
+    };
+    let query = UsageQuery { from: d("2026-10-20"), to: d("2026-10-22"), group_by: vec![UsageGroupKey::Agent] };
+    let result = aggregate_usage(&ledger, &query, &UsageLabels::default(), None, &aedt);
+    let value = serde_json::to_value(&result).unwrap();
+    assert_eq!(value["totals"]["turns"], 2);
+    assert_eq!(value["totals"]["requests"], 12, "2 Codex requests + 10 Claude steps");
+    assert_eq!(value["totals"]["maxRequestInput"], 400_000, "the Claude turn re-read 400k per step");
+    let row = |session: &str| value["rows"].as_array().unwrap().iter().find(|row| row["key"]["agent"] == session).cloned().unwrap();
+    assert_eq!(row("cutex.codex")["maxRequestInput"], 210_000);
+    assert_eq!(row("cutex.claude")["requests"], 10);
+    // A sample without the field round-trips without it.
+    let UsageLedgerEntry::Usage(codex) = &ledger.entries[0] else { unreachable!() };
+    assert!(serde_json::to_value(codex).unwrap().get("modelRequests").is_none());
 }

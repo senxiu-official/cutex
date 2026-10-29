@@ -39,7 +39,10 @@ pub const MAX_COVER_SIDE: u32 = 4096;
 pub const MAX_BIO_CHARS: usize = 200;
 pub const MAX_PINS: usize = 64;
 pub const MAX_BLOCKS: usize = 64;
-pub const PIN_KINDS: &[&str] = &["service", "artifact", "agent", "url"];
+/// `page` (capability `user-home-page-pins`): a client page, `key` =
+/// `<pageId>:<argument>` ([`valid_page_key`]), e.g. `project-view:<projectId>`.
+pub const PIN_KINDS: &[&str] = &["service", "artifact", "agent", "url", "page"];
+const MAX_PAGE_ID_CHARS: usize = 64;
 pub const PIN_SIZES: &[&str] = &["s", "m", "w", "l"];
 const MAX_SHORT_CHARS: usize = 64;
 const MAX_ID_CHARS: usize = 256;
@@ -105,6 +108,17 @@ fn short_text(value: &Value, field: &str, max: usize, nullable: bool) -> Result<
             if nullable { " or null" } else { "" }
         ))),
     }
+}
+
+/// A `page` pin's key: `<pageId>:<argument>`; the page id is 1..=64 of
+/// `[a-z0-9._-]` starting with a letter, the argument is not empty (what it
+/// means is the client's).
+pub fn valid_page_key(key: &str) -> bool {
+    let Some((id, argument)) = key.split_once(':') else { return false };
+    !argument.is_empty()
+        && id.len() <= MAX_PAGE_ID_CHARS
+        && id.starts_with(|c: char| c.is_ascii_lowercase())
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 fn boolean(value: &Value, field: &str) -> Result<(), UserError> {
@@ -179,6 +193,11 @@ pub fn validate_home(value: &Value) -> Result<Option<Map<String, Value>>, UserEr
                     return Err(invalid(format!("{field}.kind must be one of {}", PIN_KINDS.join(", "))));
                 }
                 short_text(pin.get("key").unwrap_or(&Value::Null), &format!("{field}.key"), MAX_KEY_CHARS, false)?;
+                if pin.get("kind").and_then(Value::as_str) == Some("page")
+                    && !pin.get("key").and_then(Value::as_str).is_some_and(valid_page_key)
+                {
+                    return Err(invalid(format!("{field}.key of a page pin must be <pageId>:<argument> (page id: a-z, 0-9, '.', '_', '-', starting with a letter, at most {MAX_PAGE_ID_CHARS})")));
+                }
                 if let Some(title) = pin.get("title") {
                     short_text(title, &format!("{field}.title"), MAX_TITLE_CHARS, true)?;
                 }

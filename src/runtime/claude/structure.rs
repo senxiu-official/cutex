@@ -93,6 +93,8 @@ pub(crate) fn managed_skill_roots_with(record: &CutexSessionRecord, user: Option
 }
 
 pub fn request(id: &str, method: &str, mut params: Value) -> anyhow::Result<Value> {
+    let lane = crate::management::v2::user_input::session_input_lock(id)?;
+    let _operation = lane.reserve()?;
     ensure!(
         matches!(method, "claude/thread/fork" | "claude/thread/revert"),
         "unsupported structural operation"
@@ -105,7 +107,7 @@ pub fn request(id: &str, method: &str, mut params: Value) -> anyhow::Result<Valu
             .context("Claude session missing")?,
     )?;
     let record = record(id)?;
-    ensure!(!record.is_retired(), "restore the archived agent first");
+    ensure!(!crate::agent_management::agent_execution_blocked(&record), "restore the archived agent first");
     ensure!(
         crate::runtime::lifecycle::cutex_session_host_is_local(
             &record.host_id,
@@ -262,6 +264,16 @@ pub fn fork_record(
     name: &str,
     facts: &Value,
 ) -> anyhow::Result<CutexSessionRecord> {
+    fork_record_with_creator(source, id, name, facts, None)
+}
+
+pub fn fork_record_with_creator(
+    source: &CutexSessionRecord,
+    id: &str,
+    name: &str,
+    facts: &Value,
+    creator: Option<crate::session::model::SessionCreatedBy>,
+) -> anyhow::Result<CutexSessionRecord> {
     let source_session = source
         .claude_session
         .as_ref()
@@ -324,6 +336,8 @@ pub fn fork_record(
     binding.connection_id = None;
     binding.state_dir = target;
     record.claude_session = Some(binding);
+    crate::session::fork::inherit_fork_avatar(source, &mut record);
+    record.stamp_created_by_at_creation(creator.as_ref())?;
     Ok(record)
 }
 

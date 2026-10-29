@@ -340,3 +340,11 @@ stored in its rows. Its rows already in `usage-ledger-external/<id>/` stay reada
 `GET /v2/usage` (the reader does not check the kind). Its `scan-state.json` keeps the `zcode`
 block until that cutex rewrites the state, which it never does for an unsupported source; a
 newer cutex resumes from it. No conversion is needed either way.
+
+## Requests and context per step (token audit 2026-10-22)
+
+Every `/v2/usage` row and `totals` carry `requests` (model requests; a Claude turn counts the SDK
+steps the adapter reports as `tokenUsage.modelRequests`, older adapters count 1 per turn) and
+`maxRequestInput` (the largest input one request re-read: for a Claude turn its average per step).
+Tokens per turn = `input / turns`, context per step = `input / requests`. A ledger sample stores
+`modelRequests` only when it covers more than one request.

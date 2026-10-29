@@ -23,6 +23,7 @@ struct Fixture {
     asks: AskStore,
     peer: Peer,
     template: AskRecord,
+    routing: worker::TransportRoutingFixture,
 }
 impl Fixture {
     fn new() -> Self {
@@ -30,7 +31,8 @@ impl Fixture {
             std::env::temp_dir().join(format!("peer-review2-worker-{}", uuid::Uuid::new_v4()));
         let peers = Store::at(root.join("runtime/peers"));
         let asks = AskStore::at(root.join("runtime/asks"));
-        let (_, template, mut peer) = tests::remote_record();
+        let (_, mut template, mut peer) = tests::remote_record();
+        let routing = worker::TransportRoutingFixture::new(&mut template);
         peer.urls = vec!["http://127.0.0.1:1".into()];
         peer.last_seen_at = Some(super::now());
         peers.insert(peer.clone(), &token::generate()).unwrap();
@@ -41,6 +43,7 @@ impl Fixture {
             asks,
             peer,
             template,
+            routing,
         }
     }
     fn outgoing(&self, n: usize) -> AskRecord {
@@ -87,6 +90,7 @@ impl Fixture {
         self.asks
             .with_state(|s| {
                 *s = AskState::default();
+                self.routing.seed_policy(s);
                 s.asks
                     .extend(records.into_iter().map(|a| (a.ask_id.clone(), a)));
             })

@@ -19,11 +19,10 @@ Each run:
 4. drives `cutex upgrade config --source`, `cutex component install|status|list|remove|prune
    --dry-run` and asserts the states and needsUser codes / steps.
 
-claude-runtime phases: python_too_old (--old-python) -> claude_cli_missing (no `claude` anywhere) ->
-codex_runtime_missing (a stub `claude` in <home>/.local/bin; Windows: a stub claude.exe compiled with
-rustc) -> claude_login_required (stub + CUTEX_CLAUDE_TUI_BINARY) -> optional: the real Claude Code CLI
-from npm (`claude.cmd` on Windows) -> remove (deselect only) -> prune --dry-run. Windows: with the
-`py` launcher present, the venv must come from `py -3`.
+claude-runtime covers bundled standalone Python with empty PATH, the bundled CLI default,
+CLI-free archives, explicit missing/system CLI overrides, optional npm CLI, Python-too-old
+overrides, remove and prune. Legacy archives retain system Python / `py -3` discovery checks.
+No login or model request is made (only version and unauthenticated auth-status probes).
 
 Needs: Python 3.10+ with `cryptography` (CI pins it), a debug cutex built from this checkout.
 Nothing here touches a real cutex home: the private home is created empty under --work.
@@ -42,6 +41,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 from pathlib import Path
 
@@ -53,7 +53,7 @@ PLATFORM = "windows-x64" if WINDOWS else "linux-x64"
 RELEASE = "e2e-0.0.0"
 MARKER = ".cutex-test-private-home"
 # Variables that change what the adapter / Claude CLI / cutex would do; never inherited.
-DROP_ENV = re.compile(r"^(ANTHROPIC_|CLAUDE_|CUTEX_)")
+DROP_ENV = re.compile(r"^(ANTHROPIC_|CLAUDE_|CUTEX_|PYTHON|VIRTUAL_ENV$)")
 
 failures: list[str] = []
 
@@ -185,6 +185,9 @@ class Cutex:
         env = {k: v for k, v in os.environ.items() if not DROP_ENV.match(k)}
         env.update({
             "HOME": str(self.home),
+            "USERPROFILE": str(self.home),
+            "APPDATA": str(self.home / "AppData" / "Roaming"),
+            "LOCALAPPDATA": str(self.home / "AppData" / "Local"),
             "CUTEX_TEST_PRIVATE_HOME": str(self.home),
             "CUTEX_INSTALL_BASE": str(self.base),
             "CUTEX_UPGRADE_TEST_PUBKEY": key.public_line,
@@ -301,10 +304,31 @@ def py_launcher_python() -> str | None:
     return exe if tuple(version) >= (3, 11) else None
 
 
+def bundled_payload(archives: Path, version: str) -> tuple[bool, bool]:
+    """Detect capabilities from the actual archive, including the supported CLI-free build."""
+    matches = list(archives.rglob(f"component-claude-runtime-{version}-{PLATFORM}.tar.gz"))
+    if len(matches) != 1:
+        raise SystemExit(f"expected exactly one Claude archive, found {len(matches)}")
+    with tarfile.open(matches[0], "r:gz") as archive:
+        names = {m.name.removeprefix("./") for m in archive.getmembers() if m.isfile()}
+    return "python-runtime.json" in names, "claude-cli-runtime.json" in names
+
+
+def expect_deployment(cutex: Cutex, version_dir: Path, cli: Path) -> None:
+    check(cutex.deployment.is_file(), "selected for new agents")
+    if cutex.deployment.is_file():
+        d = json.loads(cutex.deployment.read_text(encoding="utf-8"))
+        check(Path(d.get("claude_cli", "")) == cli, f"deployment uses CLI {cli}")
+        check(Path(d.get("adapter_source", "")) == version_dir, "deployment uses installed adapter")
+        check(Path(d.get("python", "")).is_file(), "deployment Python exists")
+
+
 def claude_runtime(args: argparse.Namespace, cutex: Cutex, version: str, work: Path) -> None:
     name = "claude-runtime"
     path = base_path()
     tui = {"CUTEX_CLAUDE_TUI_BINARY": str(args.cutex)}
+    bundled_python, bundled_cli = bundled_payload(args.archives, version)
+    version_dir = cutex.base / "components" / name / version
 
     _, listed, _ = cutex.run("component", "list", "--json")
     names = [c.get("name") for c in (listed or {}).get("components", [])]
@@ -323,17 +347,28 @@ def claude_runtime(args: argparse.Namespace, cutex: Cutex, version: str, work: P
         check((version_dir / "receipt.json").is_file(), f"signed archive unpacked with a receipt in {version_dir}")
         check(not cutex.deployment.exists(), "old Python: nothing selected for new agents")
 
-    log("\n== phase: no Claude Code CLI")
-    _, out, _ = cutex.run("component", "install", name, extra=tui, path=path)
+    log("\n== phase: default prepare without a system Claude CLI")
+    # An empty PATH proves that r32's prepare needs neither system Python nor system CLI.
+    # Absolute cutex/TUI paths keep the harness itself independent of PATH.
+    default_path = "" if bundled_python else path
+    _, out, _ = cutex.run("component", "install", name,
+                          extra={} if bundled_cli else tui, path=default_path)
     comp = component_of(out)
-    expect_needs_user(comp, "claude_cli_missing", "no claude")
+    expect_needs_user(comp, "codex_runtime_missing" if bundled_cli else "claude_cli_missing", "default install")
     prepare = ((out or {}).get("result") or {}).get("prepare") or {}
     receipt = prepare.get("receipt") or {}
     base_python = receipt.get("basePython")
     log(f"  venv from {base_python} {receipt.get('basePythonVersion')}")
-    check(bool(base_python), "the venv was prepared from the vendored wheels (prepare.receipt.basePython)")
+    check(bool(base_python), "venv prepared from vendored wheels")
     launcher = py_launcher_python()
-    if WINDOWS:
+    if bundled_python:
+        check(receipt.get("basePythonSource") == "bundled", "prepare uses standalone bundled Python")
+        check(Path(base_python or "").is_relative_to(version_dir / "prepared" / "python"),
+              "base Python is inside the component's prepared/python")
+        metadata = json.loads((version_dir / "python-runtime.json").read_text(encoding="utf-8"))
+        check(receipt.get("basePythonVersion") == metadata.get("pythonVersion"),
+              "prepared Python version matches the archive's pin")
+    elif WINDOWS:
         if launcher:
             check(Path(base_python or "").resolve() == Path(launcher).resolve(),
                   f"py -3 discovery: venv base {base_python} is `py -3`'s {launcher}")
@@ -343,13 +378,33 @@ def claude_runtime(args: argparse.Namespace, cutex: Cutex, version: str, work: P
     check(venv_dir.is_dir(), f"venv inside the version dir ({venv_dir})")
     check(not cutex.deployment.exists(), "no claude: nothing selected for new agents")
 
+    if bundled_cli:
+        log("\n== phase: bundled CLI + bundled Python, no system tools -> login required")
+        _, out, _ = cutex.run("component", "install", name, extra=tui, path=default_path)
+        expect_needs_user(component_of(out), "claude_login_required", "bundled CLI")
+        cli = Path(receipt.get("bundledClaudeCli") or "")
+        check(cli.is_file() and cli.is_relative_to(venv_dir), "bundled CLI is inside the prepared venv")
+        cli_metadata = json.loads((version_dir / "claude-cli-runtime.json").read_text(encoding="utf-8"))
+        check(bool(receipt.get("sdk")) and receipt.get("sdk") == cli_metadata.get("sdk"),
+              "prepared SDK carrying the bundled CLI matches the archive's pin")
+        expect_deployment(cutex, version_dir, cli)
+        check(status(cutex, name, extra=tui, path=default_path).get("state") == "needsUser",
+              "bundled status agrees: login required")
+        cutex.run("component", "remove", name)
+
+    log("\n== phase: explicit missing system CLI (must not silently fall back)")
+    missing_cli = {**tui, "CUTEX_CLAUDE_CLI": str(work / "missing-cli")}
+    _, out, _ = cutex.run("component", "install", name, extra=missing_cli, path=path)
+    expect_needs_user(component_of(out), "claude_cli_missing", "explicit missing CLI")
+
     log("\n== phase: stub claude, no Codex runtime")
     stub = make_stub_claude(cutex.home, work)
-    _, out, _ = cutex.run("component", "install", name, path=path)
+    override = {"CUTEX_CLAUDE_CLI": str(stub)}
+    _, out, _ = cutex.run("component", "install", name, extra=override, path=path)
     expect_needs_user(component_of(out), "codex_runtime_missing", "no Codex runtime")
 
     log("\n== phase: stub claude + TUI binary -> login required")
-    _, out, _ = cutex.run("component", "install", name, extra=tui, path=path)
+    _, out, _ = cutex.run("component", "install", name, extra={**tui, **override}, path=path)
     comp = component_of(out)
     expect_needs_user(comp, "claude_login_required", "stub claude")
     check(cutex.deployment.is_file(), f"selected for new agents ({cutex.deployment})")
@@ -359,14 +414,18 @@ def claude_runtime(args: argparse.Namespace, cutex: Cutex, version: str, work: P
         check(Path(d.get("adapter_source", "")) == cutex.base / "components" / name / version,
               f"deployment adapter_source is the version dir (got {d.get('adapter_source')})")
         check(Path(d.get("python", "")).is_file(), f"deployment python exists ({d.get('python')})")
-    check(status(cutex, name, extra=tui, path=path).get("state") == "needsUser", "status agrees: needsUser")
+    check(status(cutex, name, extra={**tui, **override}, path=path).get("state") == "needsUser", "status agrees: needsUser")
 
     if args.npm_claude_prefix:
         log("\n== phase: the real Claude Code CLI from npm")
         stub.unlink()
         prefix = Path(args.npm_claude_prefix)
         npm_bin = prefix if WINDOWS else prefix / "bin"
-        _, out, _ = cutex.run("component", "install", name, extra=tui, path=str(npm_bin) + os.pathsep + path)
+        # r32 defaults to bundled; explicitly select the alternative CLI under test.
+        npm_cli = npm_bin / ("claude.cmd" if WINDOWS else "claude")
+        _, out, _ = cutex.run("component", "install", name,
+                              extra={**tui, "CUTEX_CLAUDE_CLI": str(npm_cli)},
+                              path=str(npm_bin) + os.pathsep + path)
         comp = component_of(out)
         expect_needs_user(comp, "claude_login_required", "npm claude")
         select = ((out or {}).get("result") or {}).get("select") or {}

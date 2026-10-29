@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:profile-runtime-variants",
+  "title": "Profile runtime variants and stored credentials",
+  "description": "Capability profile-runtime-variants (r265, docs/development/r265-profile-variants.md); r266 kimi-runtime-profiles adds runtime kimi, Kimi-kind profiles (kimiAccount) and credential.kimiAccountId (docs/development/r266-kimi-profiles.md). A profile = provider + one credential + runtime variants. Profile items of GET /v2/profiles, GET|PATCH /v2/profiles/{p} and the variant routes carry profileRuntimeFields next to the legacy fields (cliKind/source/options.dsh stay the compatibility projection of the primary variant). Keys are write-only: no response, event, log, error or export contains a key.",
+  "anyOf": [
+    { "$ref": "#/$defs/profileRuntimeFields" },
+    { "$ref": "#/$defs/variantCreate" },
+    { "$ref": "#/$defs/variantPatch" },
+    { "$ref": "#/$defs/variantResponse" },
+    { "$ref": "#/$defs/variantDeleteResponse" },
+    { "$ref": "#/$defs/profileCredentialPatch" },
+    { "$ref": "#/$defs/newAgentVariant" },
+    { "$ref": "#/$defs/launchBinding" }
+  ],
+  "$defs": {
+    "runtime": { "enum": ["codex", "claude", "dsh", "kimi"] },
+    "variantId": { "type": "string", "pattern": "^[a-z0-9-]{1,32}$" },
+    "nullableString": { "type": ["string", "null"] },
+    "defaults": {
+      "type": "object", "required": ["model", "reasoningEffort"],
+      "properties": { "model": { "$ref": "#/$defs/nullableString" }, "reasoningEffort": { "$ref": "#/$defs/nullableString" } }
+    },
+    "providerInterface": {
+      "type": "object", "required": ["kind", "baseUrl"],
+      "properties": {
+        "kind": { "type": "string", "description": "openaiCompatible | deepseekNative | anthropicCompatible | chatgptLogin | claudeSubscription | kimiNative | kimiAccount (open set)." },
+        "baseUrl": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "credential": {
+      "type": "object", "required": ["source", "present", "envName", "claudeAccountId", "version", "writable"],
+      "description": "Never the value. present: stored key file / auth key exists, env variable set on the host now, ChatGPT login present; null for Claude subscription accounts (use /v2/claude/accounts status).",
+      "properties": {
+        "source": { "type": "string", "description": "stored | env | chatgptLogin | claudeAccount | kimiAccount | none (open set)." },
+        "present": { "type": ["boolean", "null"] },
+        "envName": { "$ref": "#/$defs/nullableString" },
+        "claudeAccountId": { "$ref": "#/$defs/nullableString" },
+        "kimiAccountId": { "$ref": "#/$defs/nullableString", "description": "r266 additive: the Kimi account of a Kimi-kind profile (source kimiAccount; present = the account has usable OAuth credentials now, see /v2/kimi/accounts); null otherwise." },
+        "version": { "type": ["integer", "null"], "minimum": 0, "description": "Stored keys: increments on each write; a write applies to runtimes started afterwards." },
+        "writable": { "type": "boolean", "description": "PATCH /v2/profiles/{p} accepts a write-only apiKey." }
+      }
+    },
+    "variant": {
+      "type": "object", "required": ["id", "runtime", "primary", "defaults", "inUse"],
+      "properties": {
+        "id": { "$ref": "#/$defs/variantId" },
+        "runtime": { "$ref": "#/$defs/runtime" },
+        "primary": { "type": "boolean", "description": "The profile's own runtime (cliKind); never removable; its defaults are the profile's model settings." },
+        "defaults": { "$ref": "#/$defs/defaults" },
+        "inUse": { "type": "integer", "minimum": 0, "description": "Non-retired sessions bound to this variant (primary: plus pre-r265 sessions of the profile)." },
+        "models": {
+          "type": ["array", "null"],
+          "description": "Additive (r265 integration). DSH variants: the models DSH's pinned catalog offers new agents (clients must not hard-code them; a running agent's live list is its model/list). r266: kimi variants of Kimi-kind profiles: the Kimi account's provisioned catalog (empty before the first login). null for other runtimes: use GET /v2/profiles/{p}/models.",
+          "items": {
+            "type": "object", "required": ["id", "displayName", "inputModalities", "supportedReasoningEfforts", "defaultReasoningEffort", "isDefault"],
+            "properties": {
+              "id": { "type": "string" },
+              "displayName": { "type": "string" },
+              "inputModalities": { "type": "array", "items": { "type": "string" } },
+              "supportedReasoningEfforts": { "type": "array", "items": { "type": "string" } },
+              "defaultReasoningEffort": { "$ref": "#/$defs/nullableString" },
+              "isDefault": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object", "required": ["runtime", "status", "reason", "variantPresent"],
+      "properties": {
+        "runtime": { "$ref": "#/$defs/runtime" },
+        "status": { "enum": ["supported", "componentNotInstalled", "unsupported"] },
+        "reason": { "type": ["string", "null"], "description": "chatgptLoginCodexOnly | claudeCredentialClaudeOnly | providerNotDeepseekNative | anthropicRouteRequired | anthropicRouteNotYetSupported | dshProfileCodexVariantNotYetSupported | providerNotKimiNative | kimiAccountKimiOnly | componentNotInstalled | platformUnsupported (open set)." },
+        "variantPresent": { "type": "boolean" }
+      }
+    },
+    "profileRuntimeFields": {
+      "type": "object",
+      "required": ["providerInterfaces", "credential", "runtimeVariants", "defaultVariant", "runtimeCompatibility"],
+      "properties": {
+        "providerInterfaces": { "type": "array", "items": { "$ref": "#/$defs/providerInterface" } },
+        "credential": { "$ref": "#/$defs/credential" },
+        "runtimeVariants": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/variant" } },
+        "defaultVariant": { "$ref": "#/$defs/variantId" },
+        "runtimeCompatibility": { "type": "array", "items": { "$ref": "#/$defs/compatibility" } },
+        "kimiAccount": { "$ref": "#/$defs/nullableString", "description": "r266 additive: Kimi-kind profiles (cliKind kimi): the Kimi account id new agents run on; null otherwise." }
+      }
+    },
+    "defaultsInput": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "model": { "type": ["string", "null"] }, "reasoningEffort": { "type": ["string", "null"] } }
+    },
+    "variantCreate": {
+      "type": "object", "description": "POST /v2/profiles/{p}/variants. r265: runtime dsh on a DeepSeek API-key profile; r266: runtime kimi on a Kimi / Moonshot API-key profile. Any base URL, relays included (profile-relay-runtimes: the provider decides, never the host). Kimi efforts: off | low | medium | high | max.", "required": ["runtime"], "additionalProperties": false,
+      "properties": { "runtime": { "$ref": "#/$defs/runtime" }, "id": { "$ref": "#/$defs/variantId" }, "defaults": { "$ref": "#/$defs/defaultsInput" },
+        "baseUrl": { "type": ["string", "null"], "description": "profile-relay-runtimes (additive): runtime dsh only, the DSH (DeepSeek Anthropic-compatible) address, stored as the profile's interfaceBaseUrls.deepseekNative. Required (409 variant_base_url_missing) when the profile's main address is a relay and no DSH address is set." } }
+    },
+    "variantPatch": {
+      "type": "object", "description": "PATCH /v2/profiles/{p}/variants/{v}; null restores the default. On the primary = PATCH /v2/profiles/{p} model/modelReasoningEffort.", "additionalProperties": false,
+      "properties": { "defaults": { "$ref": "#/$defs/defaultsInput" },
+        "baseUrl": { "type": ["string", "null"], "description": "profile-relay-runtimes (additive): a DSH variant's address (= PATCH /v2/profiles/{p} interfaceBaseUrls.deepseekNative); null restores the official default. 400 for other runtimes (they use the profile's base URL)." } }
+    },
+    "variantResponse": {
+      "type": "object", "required": ["contractVersion", "variant", "profile", "appliesTo"],
+      "properties": { "contractVersion": { "const": 2 }, "variant": { "$ref": "#/$defs/variant" }, "profile": { "$ref": "#/$defs/profileRuntimeFields" }, "appliesTo": { "const": "newAgents" } }
+    },
+    "variantDeleteResponse": {
+      "type": "object", "required": ["contractVersion", "deleted", "defaultVariant", "profile"],
+      "description": "Errors: 409 primary_variant_not_removable, 409 variant_in_use {count, sessions[<=20]}, 404 unknown_variant.",
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "deleted": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" } } },
+        "defaultVariant": { "$ref": "#/$defs/variantId" },
+        "profile": { "$ref": "#/$defs/profileRuntimeFields" }
+      }
+    },
+    "profileCredentialPatch": {
+      "type": "object",
+      "description": "Additive PATCH /v2/profiles/{p} fields. apiKey (DSH and Codex API-key profiles): write-only string; null clears a DSH stored key. credential: DSH only, env needs an explicit envName (no fallback). POST /v2/profiles kind dsh also accepts apiKey and credential.",
+      "properties": {
+        "apiKey": { "type": ["string", "null"] },
+        "credential": {
+          "type": "object", "required": ["source"], "additionalProperties": false,
+          "properties": { "source": { "enum": ["stored", "env"] }, "envName": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$" } }
+        },
+        "defaultVariant": { "anyOf": [{ "$ref": "#/$defs/variantId" }, { "type": "null" }] }
+      }
+    },
+    "newAgentVariant": {
+      "type": "object",
+      "description": "Additive POST /v2/human/agents and POST /v2/human/sessions field. Absent = the profile's defaultVariant. Errors (stage validation): 400 unknown_variant {profile, variantId, variants}, variant_runtime_unavailable {runtime, status, reason}, credential_missing.",
+      "properties": { "variantId": { "$ref": "#/$defs/variantId" } }
+    },
+    "launchBinding": {
+      "type": "object",
+      "description": "Session resource launchBinding: frozen at creation, never re-resolved; no secret. Absent on sessions created before r265.",
+      "required": ["profileId", "variantId", "runtime", "credential", "model", "reasoningEffort", "runtimePackageVersion", "boundAt"],
+      "properties": {
+        "profileId": { "type": "string" },
+        "variantId": { "type": "string" },
+        "runtime": { "type": "string" },
+        "credential": {
+          "type": "object", "required": ["source", "envName", "version"],
+          "properties": { "source": { "type": "string" }, "envName": { "$ref": "#/$defs/nullableString" }, "version": { "type": ["integer", "null"] },
+                          "kimiAccountId": { "$ref": "#/$defs/nullableString", "description": "r266 additive: source kimiAccount." } }
+        },
+        "model": { "$ref": "#/$defs/nullableString" },
+        "reasoningEffort": { "$ref": "#/$defs/nullableString" },
+        "runtimePackageVersion": { "$ref": "#/$defs/nullableString" },
+        "boundAt": { "type": "string" }
+      }
+    }
+  }
+}

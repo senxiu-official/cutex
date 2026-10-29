@@ -53,6 +53,40 @@ struct LocalResolution {
     catalog: Option<Vec<String>>,
     /// The effective effort (the profile default for `default`).
     reasoning: Option<String>,
+    /// The profile default the model does not offer, and the level used.
+    fallback: Option<cutex::launch::selected_profile::EffortFallback>,
+}
+
+thread_local! {
+    /// The effort fallback of the agent_create running on this thread
+    /// (preflight → reply; docs/design/028 (b)).
+    static EFFORT_FALLBACK: std::cell::RefCell<Option<cutex::launch::selected_profile::EffortFallback>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Start of an agent_create / replace on this thread: forget an older fallback.
+pub(super) fn clear_effort_fallback() {
+    EFFORT_FALLBACK.with(|slot| slot.borrow_mut().take());
+}
+
+/// Adds `effort_fallback: {model, requested, used, reason, note}` to a
+/// completed create / replace reply whose preflight replaced the profile
+/// default effort (the stored receipt is unchanged; capability
+/// `agent-create-effort-fallback`).
+pub(super) fn add_effort_fallback(response: &mut Value) {
+    let Some(fallback) = EFFORT_FALLBACK.with(|slot| slot.borrow_mut().take()) else { return };
+    if response["outcome"]["status"] != "complete" {
+        return;
+    }
+    let result = &mut response["outcome"]["receipt"]["result"];
+    if !matches!(result["kind"].as_str(), Some("created" | "replaced")) {
+        return;
+    }
+    let mut value = serde_json::to_value(&fallback).unwrap_or(Value::Null);
+    value["note"] = Value::String(format!(
+        "the profile's default reasoning effort {} is not offered by {}; the agent uses {}",
+        fallback.requested, fallback.model, fallback.used
+    ));
+    result["effort_fallback"] = value;
 }
 
 /// The full launch review of `spec` (model and effort included).
@@ -65,7 +99,7 @@ fn local_resolution(spec: &ManagedAgentSpec) -> anyhow::Result<LocalResolution> 
         .and_then(|catalog| std::fs::read(&catalog.path).ok())
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|catalog| reasoning::catalog_efforts(&catalog, &spec.model));
-    Ok(LocalResolution { catalog, reasoning: configuration.reasoning })
+    Ok(LocalResolution { catalog, reasoning: configuration.reasoning, fallback: configuration.effort_fallback })
 }
 
 fn resolve_local_reasoning_with(
@@ -77,6 +111,9 @@ fn resolve_local_reasoning_with(
         // Resolve the profile default; the review validates it for the model.
         let configuration = review(spec).map_err(preflight)?;
         spec.reasoning = configuration.reasoning.unwrap_or_default();
+        if let Some(fallback) = configuration.fallback {
+            EFFORT_FALLBACK.with(|slot| *slot.borrow_mut() = Some(fallback));
+        }
         return Ok(());
     }
     // An explicit effort: review exactly what was asked, never the profile
@@ -229,7 +266,7 @@ mod tests {
         };
         let effective = if reasoning::is_default(&spec.reasoning) { "high".to_string() } else { spec.reasoning.clone() };
         anyhow::ensure!(efforts.contains(&effective), "catalog model/effort missing or ambiguous");
-        Ok(LocalResolution { catalog: Some(efforts), reasoning: Some(effective) })
+        Ok(LocalResolution { catalog: Some(efforts), reasoning: Some(effective), fallback: None })
     }
 
     fn spec(model: &str, effort: &str) -> ManagedAgentSpec {
@@ -255,6 +292,36 @@ mod tests {
         assert_eq!(default.reasoning, "high");
         let error = resolve_local_reasoning_with(&mut spec("max-only", ""), review).unwrap_err();
         assert_eq!(error.code, "native_bootstrap_preflight_failed");
+    }
+
+    /// Design 028 (b): a `default` effort the review replaced (Zooey: profile
+    /// `max`, glm-5.3 low/high/max…) is stated in the create reply.
+    #[test]
+    fn a_default_effort_fallback_is_stated_in_the_reply() {
+        clear_effort_fallback();
+        let fallback = cutex::launch::selected_profile::EffortFallback {
+            model: "glm-5.3".into(), requested: "max".into(), used: "high".into(), reason: "not_offered_by_model".into(),
+        };
+        let with_fallback = |_: &ManagedAgentSpec| -> anyhow::Result<LocalResolution> {
+            Ok(LocalResolution { catalog: Some(vec!["low".into(), "high".into()]), reasoning: Some("high".into()), fallback: Some(fallback.clone()) })
+        };
+        let mut default = spec("glm-5.3", "default");
+        resolve_local_reasoning_with(&mut default, with_fallback).unwrap();
+        assert_eq!(default.reasoning, "high");
+        let mut reply = created(None);
+        add_effort_fallback(&mut reply);
+        let stated = &reply["outcome"]["receipt"]["result"]["effort_fallback"];
+        assert_eq!((stated["requested"].as_str(), stated["used"].as_str()), (Some("max"), Some("high")));
+        assert!(stated["note"].as_str().unwrap().contains("not offered by glm-5.3"));
+        // Taken once; an explicit effort never records one.
+        let mut again = created(None);
+        add_effort_fallback(&mut again);
+        assert!(again["outcome"]["receipt"]["result"].get("effort_fallback").is_none());
+        let mut explicit = spec("glm-5.3", "high");
+        resolve_local_reasoning_with(&mut explicit, with_fallback).unwrap();
+        let mut reply = created(None);
+        add_effort_fallback(&mut reply);
+        assert!(reply["outcome"]["receipt"]["result"].get("effort_fallback").is_none());
     }
 
     #[test]

@@ -16,6 +16,7 @@
         "ownerName": { "type": ["string", "null"] },
         "targetCutexSessionId": { "type": "string", "description": "The agent the alarm wakes." },
         "targetName": { "type": ["string", "null"] },
+        "targetRef": { "type": "object", "required": ["kind", "projectId"], "properties": { "kind": { "const": "projectDirector" }, "projectId": { "type": "string" } }, "description": "A delayed Director role target; the displayed concrete target is its current or already-pinned recipient." },
         "at": { "type": "string", "description": "Due time, RFC 3339 UTC." },
         "delaySeconds": { "type": ["integer", "null"], "minimum": 1 },
         "state": { "enum": ["scheduled", "queued", "cancelled"], "description": "queued = handed to the Agent Bus (delivered after the target's turn)." },

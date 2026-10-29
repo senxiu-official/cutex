@@ -28,7 +28,7 @@ pub fn side_gate(record: &CutexSessionRecord) -> Result<&ClaudeSession, SideErro
     if !supports_side(session) {
         return Err(SideError::Unsupported);
     }
-    if record.is_retired() || record.runtime_pid.is_none() {
+    if crate::agent_management::agent_execution_blocked(&record) || record.runtime_pid.is_none() {
         return Err(SideError::Offline);
     }
     Ok(session)

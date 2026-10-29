@@ -18,7 +18,9 @@
 //!   back base64 with its mime.
 //!
 //! - The host's Management root credential file (`<cutex home>/config.json`)
-//!   is a root-identity secret (owner-local-only): a paired device's token
+//!   and profile-link storage (`<cutex home>/runtime/profile-link/`, including
+//!   atomic-write staging files)
+//!   are owner-local-only secrets: a paired device's token
 //!   or a remote listener gets 403 `owner_local_only`; only owner-local
 //!   requests (`users::request_is_owner_local`: the root credential, or an
 //!   owner token issued by `client-token issue` on the host, on loopback)
@@ -50,11 +52,19 @@ pub fn read_host_file(params: &HashMap<String, String>) -> WorkspaceResult<Value
         .filter(|raw| !raw.is_empty())
         .ok_or_else(|| WorkspaceError::new(400, "invalid_path", "path is required"))?;
     if raw.chars().any(char::is_control) {
-        return Err(WorkspaceError::new(400, "invalid_path", "path contains control characters"));
+        return Err(WorkspaceError::new(
+            400,
+            "invalid_path",
+            "path contains control characters",
+        ));
     }
     let requested = PathBuf::from(raw);
     if !requested.is_absolute() {
-        return Err(WorkspaceError::new(400, "invalid_path", "path must be absolute"));
+        return Err(WorkspaceError::new(
+            400,
+            "invalid_path",
+            "path must be absolute",
+        ));
     }
     let max_bytes = super::workspace_fs::max_bytes_param(params)?;
     let canonical = std::fs::canonicalize(&requested).map_err(|error| match error.kind() {
@@ -64,39 +74,94 @@ pub fn read_host_file(params: &HashMap<String, String>) -> WorkspaceResult<Value
         std::io::ErrorKind::PermissionDenied => {
             WorkspaceError::new(403, "permission_denied", "the path cannot be read")
         }
-        _ => WorkspaceError::new(400, "invalid_path", format!("the path cannot be resolved: {error}")),
+        _ => WorkspaceError::new(
+            400,
+            "invalid_path",
+            format!("the path cannot be resolved: {error}"),
+        ),
     })?;
     refuse_root_credential_file(&canonical)?;
     let meta = std::fs::metadata(&canonical).map_err(WorkspaceError::internal)?;
     if !meta.is_file() {
-        return Err(WorkspaceError::new(400, "not_a_file", "the path is not a regular file"));
+        return Err(WorkspaceError::new(
+            400,
+            "not_a_file",
+            "the path is not a regular file",
+        ));
     }
     let display = super::workspace::display_path(&canonical);
     super::workspace_fs::file_content_value(&canonical, &display, &meta, max_bytes)
 }
 
 /// 403 `owner_local_only` (`readRootCredential`) when `path` is the root
-/// credential file and the request is not owner-local. Also used by the
+/// credential or inside profile-link storage and the request is not owner-local. Also used by the
 /// workspace file read (`workspace_fs::file_resource`): a workspace rooted
 /// at the home directory must not hand it out either.
 pub(crate) fn refuse_root_credential_file(path: &std::path::Path) -> WorkspaceResult<()> {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if is_root_credential_file(&canonical) && !crate::management::users::request_is_owner_local() {
+    if is_owner_local_secret_file(&canonical) && !crate::management::users::request_is_owner_local()
+    {
         let refused = crate::management::users::owner_local_only("readRootCredential");
         return Err(WorkspaceError::new(403, refused.code, refused.message));
     }
     Ok(())
 }
 
-/// `<cutex home>/config.json` (holds `management_api_token`).
-fn is_root_credential_file(canonical: &std::path::Path) -> bool {
-    crate::config::paths::config_path()
+/// Canonical comparison also protects alternate spellings and symlink aliases,
+/// exactly as for the root credential. No secret contents are read to classify.
+fn is_owner_local_secret_file(canonical: &std::path::Path) -> bool {
+    if crate::config::paths::config_path()
         .ok()
         .and_then(|path| std::fs::canonicalize(path).ok())
         .is_some_and(|config| config == canonical)
+    {
+        return true;
+    }
+    let Some(home) = crate::config::paths::config_dir().ok() else {
+        return false;
+    };
+    // Retain the previous final-file alias check too. The secret writer rejects
+    // linked storage, but generic file reads must not expose its linked target.
+    if std::fs::canonicalize(home.join("runtime/profile-link/secret-v1"))
+        .ok()
+        .is_some_and(|secret| secret == canonical)
+    {
+        return true;
+    }
+    canonicalize_existing_prefix(&home.join("runtime/profile-link"))
+        .is_some_and(|directory| canonical.starts_with(directory))
 }
 
-pub fn handle(stream: &mut TcpStream, request: &crate::http::server::SimpleHttpRequest) -> anyhow::Result<()> {
+/// A concurrent DELETE (or first PUT) can leave the protected leaf or directory
+/// absent after the requested path was resolved. Classify its fixed namespace
+/// anyway, resolving existing ancestors so instance-root aliases still work.
+fn canonicalize_existing_prefix(path: &std::path::Path) -> Option<PathBuf> {
+    let mut prefix = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&prefix) {
+            Ok(mut canonical) => {
+                for component in missing.into_iter().rev() {
+                    canonical.push(component);
+                }
+                return Some(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = prefix.file_name()?.to_os_string();
+                if !prefix.pop() {
+                    return None;
+                }
+                missing.push(component);
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+pub fn handle(
+    stream: &mut TcpStream,
+    request: &crate::http::server::SimpleHttpRequest,
+) -> anyhow::Result<()> {
     if request.method != "GET" {
         return super::workspace::write_error(
             stream,
@@ -113,6 +178,255 @@ pub fn handle(stream: &mut TcpStream, request: &crate::http::server::SimpleHttpR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RequestContextGuard {
+        connection: Option<crate::management::listeners::ConnectionInfo>,
+        token: Option<crate::management::client_tokens::VerifiedClientToken>,
+        principal: Option<crate::management::users::Principal>,
+    }
+
+    impl RequestContextGuard {
+        fn new() -> Self {
+            Self {
+                connection: crate::management::listeners::current_connection(),
+                token: crate::management::listeners::current_client_token(),
+                principal: crate::management::users::current_principal(),
+            }
+        }
+
+        fn request(
+            &self,
+            remote: bool,
+            issued: Option<crate::management::client_tokens::IssuedVia>,
+        ) {
+            use crate::management::{client_tokens::VerifiedClientToken, listeners, users};
+            listeners::set_current_connection(Some(listeners::ConnectionInfo {
+                remote,
+                peer: if remote {
+                    "192.0.2.1:12345"
+                } else {
+                    "127.0.0.1:12345"
+                }
+                .parse()
+                .unwrap(),
+            }));
+            let token = issued.map(|issued_via| {
+                let mut token = VerifiedClientToken::test_token("synthetic-owner-full");
+                token.issued_via = issued_via;
+                token
+            });
+            listeners::set_current_client_token(token);
+            users::set_current_principal(Some(users::Principal::Owner));
+        }
+    }
+
+    impl Drop for RequestContextGuard {
+        fn drop(&mut self) {
+            crate::management::listeners::set_current_connection(self.connection.take());
+            crate::management::listeners::set_current_client_token(self.token.take());
+            crate::management::users::set_current_principal(self.principal.take());
+        }
+    }
+
+    const SYNTHETIC_LINK_SECRET: &str = "synthetic-profile-link-secret-fixture";
+
+    fn secret_fixture() -> (
+        crate::profiles::lifecycle::tests::TestHome,
+        super::super::workspace::ResolvedRoot,
+    ) {
+        use super::super::workspace::{ResolvedRoot, Scope, ScopeKind};
+        let home = crate::profiles::lifecycle::tests::TestHome::new();
+        std::fs::write(
+            home.root().join(crate::config::paths::PRIVATE_HOME_MARKER),
+            b"",
+        )
+        .unwrap();
+        let config = crate::config::paths::config_dir().unwrap();
+        assert!(
+            config.starts_with(home.root()),
+            "fixture must resolve to its own private home"
+        );
+        std::fs::create_dir_all(config.join("runtime/profile-link")).unwrap();
+        std::fs::write(
+            config.join("runtime/profile-link/secret-v1"),
+            SYNTHETIC_LINK_SECRET,
+        )
+        .unwrap();
+        std::fs::write(config.join("ordinary-report.txt"), "synthetic report").unwrap();
+        let root = ResolvedRoot::from_dir(
+            Scope {
+                kind: ScopeKind::Project,
+                id: "synthetic-workspace".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        (home, root)
+    }
+
+    fn assert_secret_reads(
+        root: &super::super::workspace::ResolvedRoot,
+        relative: &str,
+        allowed: bool,
+    ) {
+        let file = root.canonical.join(relative);
+        let host = read_host_file(&params(file.to_str().unwrap(), None));
+        let workspace = super::super::workspace_fs::file_resource(root, &params(relative, None));
+        for result in [host, workspace] {
+            if allowed {
+                assert_eq!(result.unwrap()["content"], SYNTHETIC_LINK_SECRET);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!((error.status, error.code), (403, "owner_local_only"));
+                assert!(!error.message.contains(SYNTHETIC_LINK_SECRET));
+            }
+        }
+    }
+
+    #[test]
+    fn profile_link_secret_refuses_paired_owner_full_and_remote_reads_on_both_routes() {
+        use crate::management::client_tokens::IssuedVia;
+        let (_home, root) = secret_fixture();
+        let context = RequestContextGuard::new();
+        for (remote, issued) in [
+            (false, Some(IssuedVia::Pairing)),
+            (true, Some(IssuedVia::Pairing)),
+            (true, Some(IssuedVia::HostCli)),
+            (true, None),
+        ] {
+            context.request(remote, issued);
+            assert_secret_reads(&root, "runtime/profile-link/secret-v1", false);
+            assert_secret_reads(&root, "runtime/profile-link/./secret-v1", false);
+            assert!(read_host_file(&params(
+                root.canonical.join("ordinary-report.txt").to_str().unwrap(),
+                None
+            ))
+            .is_ok());
+            assert!(super::super::workspace_fs::file_resource(
+                &root,
+                &params("ordinary-report.txt", None)
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn profile_link_secret_keeps_local_root_and_host_cli_reads_on_both_routes() {
+        use crate::management::client_tokens::IssuedVia;
+        let (_home, root) = secret_fixture();
+        let context = RequestContextGuard::new();
+        for issued in [None, Some(IssuedVia::HostCli)] {
+            context.request(false, issued);
+            assert_secret_reads(&root, "runtime/profile-link/secret-v1", true);
+            assert_secret_reads(&root, "runtime/profile-link/./secret-v1", true);
+        }
+    }
+
+    #[test]
+    fn profile_link_staging_files_are_owner_local_on_both_routes_without_prefix_overreach() {
+        use crate::management::client_tokens::IssuedVia;
+        let (_home, root) = secret_fixture();
+        let context = RequestContextGuard::new();
+        let staging = "runtime/profile-link/.secret-v1.tmp-12345-synthetic";
+        std::fs::write(root.canonical.join(staging), SYNTHETIC_LINK_SECRET).unwrap();
+        let sibling = "runtime/profile-link-backup/report.txt";
+        std::fs::create_dir_all(root.canonical.join("runtime/profile-link-backup")).unwrap();
+        std::fs::write(root.canonical.join(sibling), SYNTHETIC_LINK_SECRET).unwrap();
+        for (remote, issued) in [
+            (false, Some(IssuedVia::Pairing)),
+            (true, Some(IssuedVia::HostCli)),
+        ] {
+            context.request(remote, issued);
+            assert_secret_reads(&root, staging, false);
+            assert_secret_reads(
+                &root,
+                "runtime/profile-link/./.secret-v1.tmp-12345-synthetic",
+                false,
+            );
+            // Path::starts_with is component-aware; a similar sibling name is
+            // an ordinary readable directory, not part of secret storage.
+            assert_secret_reads(&root, sibling, true);
+        }
+        context.request(false, None);
+        assert_secret_reads(&root, staging, true);
+    }
+
+    #[test]
+    fn profile_link_classification_survives_a_missing_leaf_and_missing_directory() {
+        use crate::management::client_tokens::IssuedVia;
+        let (_home, root) = secret_fixture();
+        let context = RequestContextGuard::new();
+        let captured =
+            std::fs::canonicalize(root.canonical.join("runtime/profile-link/secret-v1")).unwrap();
+        std::fs::remove_file(&captured).unwrap();
+        context.request(false, Some(IssuedVia::Pairing));
+        assert_eq!(
+            refuse_root_credential_file(&captured).unwrap_err().code,
+            "owner_local_only"
+        );
+        std::fs::remove_dir(root.canonical.join("runtime/profile-link")).unwrap();
+        // The directory is temporarily gone too: resolve its existing prefix
+        // and append its fixed missing component instead of dropping protection.
+        assert_eq!(
+            refuse_root_credential_file(&captured).unwrap_err().code,
+            "owner_local_only"
+        );
+        std::fs::create_dir(root.canonical.join("runtime/profile-link")).unwrap();
+        std::fs::write(&captured, SYNTHETIC_LINK_SECRET).unwrap();
+        assert_secret_reads(&root, "runtime/profile-link/secret-v1", false);
+        context.request(false, None);
+        assert_secret_reads(&root, "runtime/profile-link/secret-v1", true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_link_staging_file_and_directory_aliases_are_owner_local() {
+        use crate::management::client_tokens::IssuedVia;
+        let (_home, root) = secret_fixture();
+        let context = RequestContextGuard::new();
+        let staging = root
+            .canonical
+            .join("runtime/profile-link/.secret-v1.tmp-12345-synthetic");
+        std::fs::write(&staging, SYNTHETIC_LINK_SECRET).unwrap();
+        std::os::unix::fs::symlink(&staging, root.canonical.join("staging-alias")).unwrap();
+        std::os::unix::fs::symlink(
+            root.canonical.join("runtime/profile-link"),
+            root.canonical.join("storage-alias"),
+        )
+        .unwrap();
+        context.request(false, Some(IssuedVia::Pairing));
+        assert_secret_reads(&root, "staging-alias", false);
+        assert_secret_reads(&root, "storage-alias/.secret-v1.tmp-12345-synthetic", false);
+        context.request(false, None);
+        assert_secret_reads(&root, "staging-alias", true);
+        assert_secret_reads(&root, "storage-alias/.secret-v1.tmp-12345-synthetic", true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_link_secret_symlink_alias_uses_the_same_owner_local_guard() {
+        use crate::management::client_tokens::IssuedVia;
+        let (_home, root) = secret_fixture();
+        let context = RequestContextGuard::new();
+        std::os::unix::fs::symlink(
+            root.canonical.join("runtime/profile-link/secret-v1"),
+            root.canonical.join("secret-alias"),
+        )
+        .unwrap();
+        context.request(false, Some(IssuedVia::Pairing));
+        assert_secret_reads(&root, "secret-alias", false);
+        context.request(false, None);
+        assert_secret_reads(&root, "secret-alias", true);
+        let final_path = root.canonical.join("runtime/profile-link/secret-v1");
+        std::fs::remove_file(&final_path).unwrap();
+        let outside = root.canonical.join("synthetic-linked-target");
+        std::fs::write(&outside, SYNTHETIC_LINK_SECRET).unwrap();
+        std::os::unix::fs::symlink(&outside, final_path).unwrap();
+        context.request(false, Some(IssuedVia::Pairing));
+        assert_secret_reads(&root, "synthetic-linked-target", false);
+        context.request(false, None);
+        assert_secret_reads(&root, "synthetic-linked-target", true);
+    }
 
     fn params(path: &str, max: Option<&str>) -> HashMap<String, String> {
         let mut params = HashMap::from([("path".to_string(), path.to_string())]);
@@ -141,7 +455,8 @@ mod tests {
         assert_eq!(value["truncated"], false);
         assert_eq!(value["mime"], "text/markdown");
         assert_eq!(value["size"], 15);
-        let canonical = super::super::workspace::display_path(&std::fs::canonicalize(&file).unwrap());
+        let canonical =
+            super::super::workspace::display_path(&std::fs::canonicalize(&file).unwrap());
         assert_eq!(value["path"], canonical);
         assert!(value["modifiedAt"].is_string());
         let value = read_host_file(&params(file.to_str().unwrap(), Some("7"))).unwrap();
@@ -166,7 +481,10 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, [0u8, 1, 2, 3, 0, 255]);
         let value = read_host_file(&params(root.join("pic.png").to_str().unwrap(), None)).unwrap();
-        assert_eq!((value["encoding"].as_str(), value["mime"].as_str()), (Some("base64"), Some("image/png")));
+        assert_eq!(
+            (value["encoding"].as_str(), value["mime"].as_str()),
+            (Some("base64"), Some("image/png"))
+        );
     }
 
     /// The route sits behind the root gate in `handle_v2_request`: the root
@@ -177,8 +495,12 @@ mod tests {
     fn only_the_root_credential_or_a_client_token_passes_the_gate() {
         use crate::agent_bus::agent_auth::{agent_credential, agent_route_allowed};
         use crate::http::server::SimpleHttpRequest;
-        use crate::management::client_tokens::{authenticate_management_request_with, ClientTokenStore};
-        use crate::management::v2::server::{authenticated_root_request, is_remote_client_root_path};
+        use crate::management::client_tokens::{
+            authenticate_management_request_with, ClientTokenStore,
+        };
+        use crate::management::v2::server::{
+            authenticated_root_request, is_remote_client_root_path,
+        };
 
         assert!(is_remote_client_root_path(PATH));
         assert!(!super::super::workspace::is_workspace_path(PATH));
@@ -220,8 +542,14 @@ mod tests {
         assert!(!allowed(Some(&issued.token), None));
         let fenced = HashMap::from([
             ("x-cutex-agent-id".to_string(), "agent-1".to_string()),
-            (crate::agent_bus::mcp::THREAD_HEADER.to_string(), "t".to_string()),
-            (crate::agent_bus::mcp::GENERATION_HEADER.to_string(), "1".to_string()),
+            (
+                crate::agent_bus::mcp::THREAD_HEADER.to_string(),
+                "t".to_string(),
+            ),
+            (
+                crate::agent_bus::mcp::GENERATION_HEADER.to_string(),
+                "1".to_string(),
+            ),
         ]);
         assert!(!agent_route_allowed("GET", PATH, &fenced));
         assert!(!agent_route_allowed("POST", PATH, &fenced));
@@ -238,11 +566,23 @@ mod tests {
         assert_eq!(code("~/report.md", None), (400, "invalid_path"));
         assert_eq!(code("", None), (400, "invalid_path"));
         assert_eq!(code("/tmp/a\nb", None), (400, "invalid_path"));
-        assert_eq!(code(root.join("missing.md").to_str().unwrap(), None), (404, "path_not_found"));
-        assert_eq!(code(root.join("dir").to_str().unwrap(), None), (400, "not_a_file"));
+        assert_eq!(
+            code(root.join("missing.md").to_str().unwrap(), None),
+            (404, "path_not_found")
+        );
+        assert_eq!(
+            code(root.join("dir").to_str().unwrap(), None),
+            (400, "not_a_file")
+        );
         let file = root.join("report.md");
-        assert_eq!(code(file.to_str().unwrap(), Some("0")), (400, "invalid_request"));
-        assert_eq!(code(file.to_str().unwrap(), Some("99999999999")), (400, "invalid_request"));
+        assert_eq!(
+            code(file.to_str().unwrap(), Some("0")),
+            (400, "invalid_request")
+        );
+        assert_eq!(
+            code(file.to_str().unwrap(), Some("99999999999")),
+            (400, "invalid_request")
+        );
         assert!(read_host_file(&HashMap::new()).is_err());
     }
 }

@@ -16,9 +16,9 @@
 //! only the advertised durable result capability enables it. Acceptance and
 //! consumption are separate, and unknown outcomes retain the original id.
 //!
-//! Stop: Claude's `turn/interrupt` pauses the adapter's input queue. A
-//! requester stop resumes it right away (the N2 "keep the gate" behaviour);
-//! the owner's stop leaves it paused until the owner resumes admission.
+//! Requester stop uses the bound r8 external-input interrupt, preserving the
+//! previous queue gate. Older adapters without that capability are refused.
+//! Owner control keeps its separate stop/resume behavior.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -220,6 +220,7 @@ pub(crate) fn submit(session: &str, generation: u64, submission: &Submission) ->
     let Ok(_guard) = lock.lock() else {
         return SubmitOutcome::Unsupported("session input lock poisoned".into());
     };
+    if let Some(outcome)=super::asks_runtime::pause_admission_outcome_in_lane(session){return outcome;}
     let next_step = cutex::asks::returns::is_next_step_event(&submission.message_id);
     if next_step && (submission.source_agent.is_some() || !matches!(submission.event_type, "ANSWER" | "QUESTION")
         || submission.attempt.is_some() || submission.asks.is_empty()) {
@@ -336,6 +337,9 @@ fn next_step_status(receipt: &Value) -> NativeMessageStatus {
 }
 
 pub(crate) fn message_status(session: &str, generation: u64, submission: &Submission) -> NativeMessageStatus {
+    if cutex::asks::returns::is_owner_note(&submission.message_id) {
+        return owner_note_status(session, generation, submission);
+    }
     let Some(thread_id) = super::asks_runtime::record(session).and_then(|record| record.app_server_thread_id().map(str::to_string))
     else {
         return NativeMessageStatus::Unavailable("Claude thread missing".into());
@@ -362,6 +366,54 @@ pub(crate) fn message_status(session: &str, generation: u64, submission: &Submis
     status_outcome(result)
 }
 
+fn owner_note_envelope(session: &str, thread: &str, generation: u64, submission: &Submission)
+    -> anyhow::Result<cutex::app_server::external_input::Envelope> {
+    anyhow::ensure!(cutex::asks::returns::is_owner_note(&submission.message_id)
+        && submission.source_agent.is_none() && submission.attempt.is_none()
+        && !submission.asks.is_empty(), "owner note must carry delegation results");
+    submission.envelope(&cutex::launch::stock::ExternalInputBinding {
+        version: 1, owner_id: session.into(), thread_id: thread.into(), runtime_generation: generation,
+        canonical_byte_limit: Default::default(),
+    }, true)
+}
+
+/// Called with the owner's session lane held. Native passive inputs do not
+/// start a turn; the immediately following owner turn consumes their context.
+pub(crate) fn stage_owner_results_locked(session: &str, store: &cutex::asks::store::AskStore) -> anyhow::Result<bool> {
+    let (thread, generation, handle) = thread_and_handle(session)?;
+    if !adapter_capabilities(session, generation).is_some_and(|caps| super::claude_ingress::offers_native(&caps)) {
+        return Ok(false);
+    }
+    cutex::asks::returns::stage_owner_results(store, session, generation,
+        cutex::config::documents::current(), chrono::Utc::now(), |submission| {
+            let envelope = owner_note_envelope(session, &thread, generation, submission)?;
+            super::claude_ingress::submit(&handle, &envelope, generation)?;
+            Ok(())
+        })
+}
+
+fn owner_note_status(session: &str, generation: u64, submission: &Submission) -> NativeMessageStatus {
+    let result = (|| -> anyhow::Result<_> {
+        let record = super::asks_runtime::record(session).ok_or_else(|| anyhow::anyhow!("session missing"))?;
+        let thread = record.app_server_thread_id().ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+        let envelope = owner_note_envelope(session, thread, generation, submission)?;
+        super::claude_ingress::status(&handle(session, generation)?, &envelope, generation)
+    })();
+    match result {
+        Ok(status) => {
+            if let Some(turn_id) = super::claude_ingress::persisted_turn(&status) {
+                NativeMessageStatus::Persisted { turn_id: turn_id.into() }
+            } else if status.delivery_state == cutex::app_server::external_input::DeliveryState::Pending {
+                NativeMessageStatus::Pending
+            } else {
+                // Never infer absence or replay an owner-bound passive note.
+                NativeMessageStatus::Unavailable("owner result context receipt is unconfirmed".into())
+            }
+        }
+        Err(error) => NativeMessageStatus::Unavailable(format!("{error:#}")),
+    }
+}
+
 fn thread_and_handle(session: &str) -> anyhow::Result<(String, u64, AppServerHandle)> {
     let record = super::asks_runtime::record(session).ok_or_else(|| anyhow::anyhow!("no such session"))?;
     let thread_id = record
@@ -371,8 +423,42 @@ fn thread_and_handle(session: &str) -> anyhow::Result<(String, u64, AppServerHan
     Ok((thread_id, record.runtime_generation, handle(session, record.runtime_generation)?))
 }
 
-/// Requester stop: interrupt only that turn, then reopen the adapter's
-/// input queue (Claude pauses it on every interrupt).
+/// Exact requester stop using the pinned r8 gate-preserving bound endpoint.
+/// Capture the original handle/thread while the lifecycle lane is held; never
+/// resolve the current binding again after capture and never use legacy resume.
+pub(crate) fn interrupt_exact(session: &str, generation: u64, turn_id: &str) -> anyhow::Result<()> {
+    let lane = app_server_user_input::session_input_lock(session)?;
+    let _operation = lane.lock()?; // Same-thread nesting shares the dispatch lane.
+    let record = super::asks_runtime::record(session).ok_or_else(|| anyhow::anyhow!("no such session"))?;
+    anyhow::ensure!(record.runtime_generation == generation, "runtime_generation_changed");
+    let thread = record.app_server_thread_id().ok_or_else(|| anyhow::anyhow!("Claude thread missing"))?.to_string();
+    let status = claude_runtime::manager().status(session)?.ok_or_else(|| anyhow::anyhow!("runtime_occurrence_changed"))?;
+    anyhow::ensure!(status.connected && status.runtime_generation == generation
+        && status.active_turn_id.as_deref() == Some(turn_id), "runtime_occurrence_changed");
+    let original_handle = handle(session, generation)?;
+    let cached = capability_cache().lock().ok().and_then(|cache| cache.get(session).cloned())
+        .filter(|(known, _)| *known == generation).map(|(_, caps)| caps);
+    let capabilities = match cached {
+        Some(caps) => caps,
+        None => original_handle.request("claude/capabilities", json!({}))?,
+    };
+    interrupt_exact_bound(session, &thread, generation, turn_id, &capabilities,
+        |method, params| Ok(original_handle.request(method, params)?))
+}
+
+fn interrupt_exact_bound(session: &str, thread: &str, generation: u64, turn_id: &str,
+    capabilities: &Value, request: impl FnOnce(&str, Value) -> anyhow::Result<Value>) -> anyhow::Result<()> {
+    anyhow::ensure!(super::claude_ingress::offers_controls(capabilities),
+        "exact_interrupt_unsupported: adapter lacks bound gate-preserving controls");
+    let mut params = super::claude_ingress::binding_params(session, thread, generation);
+    params["turnId"] = json!(turn_id);
+    // external_input.py preserves the previous halted gate within this single
+    // bound RPC. No legacy turn/interrupt or separate queue/resume is allowed.
+    request("thread/externalInput/interrupt", params)?;
+    Ok(())
+}
+
+/// Legacy owner/control compatibility path. StopAttempt uses interrupt_exact.
 pub(crate) fn interrupt(session: &str, turn_id: &str) -> anyhow::Result<()> {
     let (thread_id, generation, handle) = thread_and_handle(session)?;
     if adapter_capabilities(session, generation).is_some_and(|caps| super::claude_ingress::offers_controls(&caps)) {
@@ -403,8 +489,71 @@ mod tests {
     use super::*;
     use cutex::app_server::protocol::RpcError;
 
+    fn bound_control_capabilities() -> Value {
+        json!({"externalInputVersion":1,"externalInputVersions":[1,2],
+            "externalInputDeliveries":["after_turn","passive"],"externalInputControlVersion":1})
+    }
+
+    #[test]
+    fn exact_stop_bound_request_preserves_original_binding_and_gate_without_resume() {
+        for was_halted in [false,true] {
+            let gate=std::cell::Cell::new(was_halted);
+            let calls=std::cell::Cell::new(0);
+            interrupt_exact_bound("original-owner","original-thread",17,"original-turn",
+                &bound_control_capabilities(),|method,params| {
+                    calls.set(calls.get()+1);
+                    assert_eq!(method,"thread/externalInput/interrupt");
+                    assert_eq!(params,json!({"version":1,"ownerId":"original-owner","threadId":"original-thread",
+                        "runtimeGeneration":17,"turnId":"original-turn"}));
+                    // Mock the verified adapter endpoint: interrupt leaves its
+                    // previous gate intact. A separate resume would fail here.
+                    assert_eq!(gate.get(),was_halted);
+                    Ok(json!({}))
+                }).unwrap();
+            assert_eq!(calls.get(),1);
+            assert_eq!(gate.get(),was_halted);
+        }
+    }
+
+    #[test]
+    fn exact_stop_old_adapter_is_unsupported_without_any_request() {
+        let mut caps=bound_control_capabilities();caps.as_object_mut().unwrap().remove("externalInputControlVersion");
+        let error=interrupt_exact_bound("owner","thread",17,"turn",&caps,|_,_|panic!("legacy fallback RPC")).unwrap_err();
+        assert!(error.to_string().starts_with("exact_interrupt_unsupported"));
+    }
+
+    #[test]
+    fn exact_stop_native_binding_refusal_or_response_loss_never_falls_back() {
+        let calls=std::cell::Cell::new(0);
+        let error=interrupt_exact_bound("original-owner","original-thread",17,"reused-turn",
+            &bound_control_capabilities(),|method,params| {
+                calls.set(calls.get()+1);
+                assert_eq!(method,"thread/externalInput/interrupt");
+                assert_eq!(params["runtimeGeneration"],17);
+                anyhow::bail!("external input owner/runtime binding mismatch")
+            }).unwrap_err();
+        assert!(error.to_string().contains("binding mismatch"));
+        assert_eq!(calls.get(),1);
+    }
+
     fn rpc(code: i64, message: &str, data: Option<Value>) -> Result<Value, AppServerClientError> {
         Err(AppServerClientError::Rpc(RpcError { code, message: message.into(), data }))
+    }
+
+    #[test]
+    fn owner_note_reconnect_preserves_native_key_and_passive_provenance() {
+        let submission = Submission {
+            message_id: "cutex-ask-owner-identity".into(), source_agent: None, event_type: "ANSWER",
+            text: "delegation result".into(), asks: vec!["ask-1".into()], attempt: None,
+            view: Some(json!({"schema":"cutex.delegation-results.v1","data":{"items":[]}})),
+        };
+        let old = owner_note_envelope("owner", "thread", 1, &submission).unwrap();
+        let current = owner_note_envelope("owner", "thread", 2, &submission).unwrap();
+        assert_eq!(old.key(), current.key(), "transport generation is not semantic input identity");
+        assert_eq!(old.message.delivery, cutex::app_server::external_input::Delivery::Passive);
+        assert_eq!(current.runtime_generation, 2);
+        assert_eq!(current.message.source.id, "cutex-asks");
+        assert_eq!(current.view, old.view);
     }
 
     #[test]

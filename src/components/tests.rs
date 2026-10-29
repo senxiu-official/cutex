@@ -17,6 +17,7 @@ struct World {
     running: Option<String>,
     gate_closed: bool,
     pins: BTreeMap<String, usize>,
+    pins_unavailable: bool,
     external: bool,
     by_hand: bool,
 }
@@ -96,6 +97,10 @@ impl Handler for Fake {
     fn pins(&self, _: &Layout) -> BTreeMap<String, usize> {
         world(|w| w.pins.clone())
     }
+    fn pins_checked(&self, layout: &Layout) -> anyhow::Result<BTreeMap<String, usize>> {
+        anyhow::ensure!(!world(|w| w.pins_unavailable), "pin store unavailable");
+        Ok(self.pins(layout))
+    }
     fn restart_gate(&self, _: &Layout) -> Result<(), String> {
         world(|w| if w.gate_closed { Err("1 job running".into()) } else { Ok(()) })
     }
@@ -105,6 +110,21 @@ impl Handler for Fake {
 fn register() {
     WORLD.with(|w| *w.borrow_mut() = World::default());
     TEST_HANDLER.with(|h| *h.borrow_mut() = Some(make_fake));
+}
+
+#[test]
+fn prune_refuses_unreadable_pins_before_removing_any_version() {
+    register();
+    let layout = installed_layout("0.1.1", 50);
+    let version = version_dir(&layout, FAKE, "0.0.1");
+    std::fs::create_dir_all(&version).unwrap();
+    std::fs::write(version.join("tool"), b"keep-pinned-runtime").unwrap();
+    world(|w| w.pins_unavailable = true);
+    for dry_run in [true, false] {
+        let error = prune(Some(&layout), &[], FAKE, dry_run).unwrap_err();
+        assert!(error.to_string().contains("pin store unavailable"));
+        assert_eq!(std::fs::read(version.join("tool")).unwrap(), b"keep-pinned-runtime");
+    }
 }
 
 /// Sign `release`'s manifest (with a `fake-tool` component of `version`)
@@ -368,6 +388,118 @@ fn upgrades_select_new_versions_defer_restarts_and_roll_back() {
     assert!(!version_dir(&layout, FAKE, "0.1.1").exists());
     assert!(version_dir(&layout, FAKE, "0.1.0").exists(), "selected stays");
     cleanup([layout.base.clone(), source, run]);
+}
+
+/// An incomplete version dir no longer blocks the install: the state a user step recorded into a
+/// dir that was never unpacked left (only `prepared/needs-user.json`; fetch refused it with "exists
+/// but was not unpacked … move it away"), and an unpacked dir that lost files (receipt present,
+/// a required file gone; prepare refused it). Install moves it aside to a dated
+/// `<version>.incomplete-<ts>` and unpacks the version again; a complete dir from another archive is
+/// still refused.
+#[test]
+fn an_incomplete_version_dir_is_moved_aside_and_installed_again() {
+    register();
+    let key = TestKey::new(7);
+    let keys = [key.public()];
+    let layout = installed_layout("0.1.1", 50);
+    let source = temp("component-source");
+    use_source(&layout, &source);
+    ship(&layout, &source, &key, "0.1.1", Some("0.1.0"), b"tool-v1");
+    let exec = FakeExec::default();
+    let handler = handler(FAKE).unwrap();
+    let dir = version_dir(&layout, FAKE, "0.1.0");
+    let parent = dir.parent().unwrap().to_path_buf();
+    let aside = || -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&parent)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&format!("0.1.0{INCOMPLETE_MARK}")))
+            .collect();
+        found.sort();
+        found
+    };
+
+    // 1. Only a needs-user marker in a dir that was never unpacked.
+    std::fs::create_dir_all(dir.join("prepared")).unwrap();
+    std::fs::write(dir.join("prepared/needs-user.json"), br#"{"code":"python_missing"}"#).unwrap();
+    assert!(incomplete_reason(handler.as_ref(), &dir).unwrap().contains("receipt.json"));
+    // A dry run says what it would move and moves nothing.
+    let dry = install(Some(&layout), &keys, FAKE, &InstallRequest { dry_run: true, ..Default::default() }, &exec, Lock::Acquire).unwrap();
+    assert_eq!(dry["result"]["repaired"]["dryRun"], true, "{dry}");
+    assert!(dir.join("prepared/needs-user.json").is_file() && aside().is_empty());
+    let out = install(Some(&layout), &keys, FAKE, &InstallRequest::default(), &exec, Lock::Acquire).unwrap();
+    assert_eq!(out["component"]["state"], states::READY, "{out}");
+    assert!(out["result"]["repaired"]["reason"].as_str().unwrap().contains("receipt.json"), "{out}");
+    assert_eq!(std::fs::read(dir.join("tool")).unwrap(), b"tool-v1");
+    assert!(read_receipt(&dir).is_some());
+    let moved = aside();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert!(moved[0].join("prepared/needs-user.json").is_file(), "kept for inspection, not deleted");
+    assert_eq!(PathBuf::from(out["result"]["repaired"]["movedAside"].as_str().unwrap()), moved[0]);
+
+    // 2. Unpacked, then a required file was lost: fetch would reuse it and prepare refuse it.
+    std::fs::remove_file(dir.join("tool")).unwrap();
+    assert!(incomplete_reason(handler.as_ref(), &dir).unwrap().contains("lacks tool"));
+    let out = install(Some(&layout), &keys, FAKE, &InstallRequest::default(), &exec, Lock::Acquire).unwrap();
+    assert!(out["result"]["repaired"].is_object(), "{out}");
+    assert_eq!(std::fs::read(dir.join("tool")).unwrap(), b"tool-v1");
+    assert_eq!(aside().len(), 2, "a second dated dir, the first one untouched");
+    // Moved-aside dirs are not versions (status, prune).
+    let versions: Vec<Value> = status(&layout, &keys)["versions"].as_array().unwrap().clone();
+    assert_eq!(versions.iter().map(|v| v["version"].clone()).collect::<Vec<_>>(), vec![json!("0.1.0")]);
+
+    // 3. Complete, nothing to repair: reused as before.
+    assert!(incomplete_reason(handler.as_ref(), &dir).is_none());
+    let out = install(Some(&layout), &keys, FAKE, &InstallRequest::default(), &exec, Lock::Acquire).unwrap();
+    assert!(out["result"].get("repaired").is_none(), "{out}");
+    assert_eq!(aside().len(), 2);
+
+    // 4. Complete but from another archive: still refused, never moved.
+    ship(&layout, &source, &key, "0.1.1", Some("0.1.0"), b"tool-other");
+    let error = install(Some(&layout), &keys, FAKE, &InstallRequest::default(), &exec, Lock::Acquire).unwrap_err();
+    assert!(format!("{error:#}").contains("was not unpacked from the manifest's archive"), "{error:#}");
+    assert_eq!(std::fs::read(dir.join("tool")).unwrap(), b"tool-v1");
+    assert_eq!(aside().len(), 2);
+    cleanup([layout.base.clone(), source]);
+}
+
+/// component.json may list a platform the release builds do not package (claude-runtime:
+/// darwin-arm64, source installs only). A release that ships the component for other platforms
+/// only answers `component_no_platform_package` naming this platform, the packaged ones and the
+/// source install, not "update cutex".
+#[test]
+fn a_release_without_this_platforms_package_says_so() {
+    register();
+    let key = TestKey::new(7);
+    let keys = [key.public()];
+    let layout = installed_layout("0.1.1", 50);
+    let source = temp("component-source");
+    use_source(&layout, &source);
+    ship(&layout, &source, &key, "0.1.1", Some("0.1.0"), b"tool-v1");
+    // Re-sign the manifest with the archive listed for another platform only.
+    let dir = layout.release_dir("0.1.1");
+    let mut m = ReleaseManifest::parse(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    let part = m.components.get_mut(FAKE).unwrap();
+    let artifact = part.artifacts.remove(&platform_key()).unwrap();
+    let other = if platform_key() == "linux-x64" { "windows-x64" } else { "linux-x64" };
+    part.artifacts.insert(other.into(), artifact);
+    let bytes = serde_json::to_vec_pretty(&m).unwrap();
+    std::fs::write(dir.join("manifest.json"), &bytes).unwrap();
+    std::fs::write(dir.join("manifest.json.minisig"), key.sign(&bytes, true, "file:manifest.json")).unwrap();
+
+    let error = install(Some(&layout), &keys, FAKE, &InstallRequest::default(), &FakeExec::default(), Lock::Acquire).unwrap_err();
+    assert_eq!(code(&error), "component_no_platform_package", "{error:#}");
+    let text = format!("{error:#}");
+    assert!(text.contains(&format!("no {FAKE} 0.1.0 package for {}", platform_key())), "{text}");
+    assert!(text.contains(other) && text.contains("--from-source"), "{text}");
+    let details = &error.downcast_ref::<UpgradeError>().unwrap().details;
+    assert_eq!(details["platform"], platform_key());
+    assert_eq!(details["packaged"], json!([other]));
+    assert!(!version_dir(&layout, FAKE, "0.1.0").exists());
+    assert_eq!(status(&layout, &keys)["state"], states::NOT_IN_MANIFEST);
+    assert!(world(|w| w.calls.is_empty()));
+    cleanup([layout.base.clone(), source]);
 }
 
 #[test]

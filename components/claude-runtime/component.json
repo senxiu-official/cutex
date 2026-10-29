@@ -1,6 +1,6 @@
 {
   "schema": "cutex/component/v1",
   "name": "claude-runtime",
-  "version": "claude-r21",
+  "version": "claude-r32",
   "platforms": ["linux-x64", "windows-x64", "darwin-arm64"]
 }

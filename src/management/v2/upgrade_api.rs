@@ -474,11 +474,22 @@ fn scheduled(layout: &Layout) {
     }
 }
 
+/// None means the first managed-layout tick is due immediately. Never manufacture
+/// an Instant before process/OS startup: Windows monotonic clocks can be younger
+/// than the former one-hour subtraction.
+fn take_schedule_tick(last: &mut Option<Instant>, now: Instant) -> bool {
+    if last.is_some_and(|previous| now.saturating_duration_since(previous) < Duration::from_secs(300)) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
 /// Management serve: state watcher (events) + scheduler.
 pub fn start_watcher() -> anyhow::Result<()> {
     std::thread::Builder::new().name("cutex-upgrade-watch".into()).spawn(|| {
         let mut stamp: Option<SystemTime> = None;
-        let mut last_schedule = Instant::now() - Duration::from_secs(3600);
+        let mut last_schedule = None;
         let mut last_settle = Instant::now();
         // A run this daemon restarted for: announce its state once.
         let mut first = true;
@@ -501,8 +512,7 @@ pub fn start_watcher() -> anyhow::Result<()> {
                 super::components_api::announce_startup(&layout);
             }
             first = false;
-            if last_schedule.elapsed() >= Duration::from_secs(300) {
-                last_schedule = Instant::now();
+            if take_schedule_tick(&mut last_schedule, Instant::now()) {
                 scheduled(&layout);
             }
             // Deferred component restarts (Job Service): once no job runs.

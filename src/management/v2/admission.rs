@@ -77,6 +77,10 @@ pub struct AdmissionNextStep {
     pub timing: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_step_at: Option<String>,
+    /// Why an idle ridealong waits. A result deadline is computed by the
+    /// scheduler; an accepted native input must await a durable receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<String>,
     /// Why this ride-along may not start a turn now: `ownerStop` (an owner
     /// stop holds every ride-along until resume or the owner's next message)
     /// or `ownerPause` (an explicit delegation pause holds ask results).
@@ -97,12 +101,19 @@ pub struct AdmissionNextStep {
     /// `name@host`); omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_host: Option<String>,
+    /// The sender's cutex session id when it is an agent on this host (a
+    /// local delegate, a same-host tell), for its avatar; never another
+    /// host's session; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_cutex_session_id: Option<String>,
     /// The first non-empty line of the message (an alarm: its text; an
     /// answer: its first line; a question: the first question), whitespace
     /// collapsed, at most [`RIDEALONG_PREVIEW_CHARS`] characters. Never more
     /// than that line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<super::agent_bus_settlement_model::SettlementView>,
     #[serde(skip)]
     pub eligible: bool,
 }
@@ -323,18 +334,19 @@ impl StoredAdmission {
 }
 
 pub(crate) fn ask_items(state: &AskState, session: &str) -> Vec<AdmissionItem> {
-    let paused = state.pauses.contains_key(session);
+    let paused = state.pauses.contains_key(session)
+        || crate::asks::agent_pause::is_paused(state, session);
     let mut items = Vec::new();
-    let mut ordered: Vec<_> = state.asks.values().collect();
-    ordered.sort_by_key(|ask| ask.seq);
-    for ask in ordered.into_iter().filter(|ask| {
+    let mut ordered: Vec<_> = state.asks.values().filter(|ask| {
         ask.remote.is_none()
             && ask.target_cutex_session_id == session
             && (matches!(
                 ask.execution,
                 ExecutionState::Queued
             ) || ask.resume_pending())
-    }) {
+    }).collect();
+    ordered.sort_by_key(|ask| ask.seq);
+    for ask in ordered {
         let hold = ask
             .hold
             .as_ref()
@@ -370,6 +382,9 @@ pub(crate) fn ask_items(state: &AskState, session: &str) -> Vec<AdmissionItem> {
 /// The `held` reason of a ride-along of `session`: an owner stop holds all
 /// of them; an explicit delegation pause holds ask results only.
 pub(crate) fn ridealong_held(state: &AskState, session: &str, ask_result: bool) -> Option<String> {
+    if crate::asks::agent_pause::is_paused(state, session) {
+        return Some("agentPause".into());
+    }
     let pause = state.pauses.get(session)?;
     if pause.stop_hold {
         Some(crate::asks::control::HELD_OWNER_STOP.into())
@@ -386,6 +401,8 @@ pub(crate) fn ask_next_step(state: &AskState, session: &str) -> Vec<AdmissionNex
     // the next-step event goes beside that lease). Results already sent at
     // the next step show `nextStep` since they were sent.
     let oldest = crate::asks::returns::oldest_pending(state, session).map(|at| at.to_rfc3339());
+    // A pending review refusal takes them all at the next step at once (023 Q3).
+    let refused = crate::asks::returns::pending_review_refusal(state, session);
     state.deliveries.values().filter(|delivery| {
         delivery.requester_cutex_session_id == session && !delivery.passive
             && (crate::asks::delivery::actionable(state, delivery)
@@ -400,6 +417,7 @@ pub(crate) fn ask_next_step(state: &AskState, session: &str) -> Vec<AdmissionNex
             .filter(|event| crate::asks::returns::is_next_step_event(&event.native_message_id));
         let (timing, next_step_at) = match sent_next_step {
             Some(event) => ("nextStep".to_string(), Some(event.created_at.clone())),
+            None if delivery.state == DeliveryState::Pending && refused => ("nextStep".to_string(), Some(delivery.created_at.clone())),
             None if delivery.state == DeliveryState::Pending => timing(oldest.as_deref().unwrap_or(&delivery.created_at), false),
             None => timing(&delivery.created_at, false),
         };
@@ -417,6 +435,9 @@ pub(crate) fn ask_next_step(state: &AskState, session: &str) -> Vec<AdmissionNex
                 crate::peers::wire::sanitize_name(&remote.label))),
             None => ask.target_name.as_deref().map(str::trim).filter(|name| !name.is_empty()).map(str::to_string),
         });
+        // A local delegation's delegate (a remote one is another host's).
+        let from_cutex_session_id = ask.filter(|ask| ask.remote.is_none())
+            .map(|ask| ask.target_cutex_session_id.trim()).filter(|id| !id.is_empty()).map(str::to_string);
         let preview = match delivery.kind {
             DeliveryKind::Answer => state.answers.get(&delivery.ref_id)
                 .and_then(|answer| answer.preview.as_deref()).and_then(ridealong_preview),
@@ -427,8 +448,12 @@ pub(crate) fn ask_next_step(state: &AskState, session: &str) -> Vec<AdmissionNex
         AdmissionNextStep {
             id: delivery.delivery_id.clone(), delivery_kind: kind.into(), label: Some(label.into()),
             enqueued_at: delivery.created_at.clone(), timing, next_step_at, held: held.clone(),
-            ask_id: Some(delivery.ask_id.clone()), from, from_host: None, preview,
-            eligible: !state.pauses.contains_key(session) && crate::asks::delivery::actionable(state, delivery),
+            wait_reason: (delivery.state == DeliveryState::QueuedAsEvent).then(|| "nativeReceipt".into()),
+            ask_id: Some(delivery.ask_id.clone()), from, from_host: None, from_cutex_session_id, preview,
+            settlement: None,
+            eligible: !state.pauses.contains_key(session)
+                && !crate::asks::agent_pause::is_paused(state, session)
+                && crate::asks::delivery::actionable(state, delivery),
         }
     }).collect()
 }
@@ -439,12 +464,32 @@ pub(crate) fn ask_next_step(state: &AskState, session: &str) -> Vec<AdmissionNex
 /// 30 s owner liveness bound (`admission_wait`) releases it.
 pub fn delivery_may_start(session: &str, id: &str) -> anyhow::Result<bool> {
     let queue = super::user_input::user_input_repository()?;
-    queue.ask_store().inspect(|state| delivery_may_start_with(&queue, session, id, state))?
+    crate::asks::pause_admission::with_state_or(&queue.ask_store(), Ok(false), |state, _|
+        delivery_may_start_with(&queue, session, id, state))?
+}
+
+pub(crate) fn project_result_window(
+    rows: &mut [AdmissionNextStep], state: &AskState, session: &str,
+    context: crate::asks::result_coalescing::Context,
+    settings: crate::config::result_coalescing::ResultCoalescing,
+    now: chrono::DateTime<chrono::Utc>, numbered_waiting: bool,
+) {
+    if numbered_waiting || state.presence.get(session).is_some_and(|p| p.busy) {
+        return;
+    }
+    let due = crate::asks::result_coalescing::release_at(state, session, context, settings, now);
+    for row in rows.iter_mut().filter(|row| row.delivery_kind == "answer"
+        && row.eligible && row.held.is_none() && row.wait_reason.is_none()) {
+        // Busy insertion timing is not an idle result batching deadline.
+        row.next_step_at = due.map(|at| at.to_rfc3339());
+        row.wait_reason = due.map(|_| "resultCoalescing".into());
+    }
 }
 
 pub(crate) fn delivery_may_start_with(queue: &super::user_input::UserInputRepository, session: &str, id: &str, state: &AskState) -> anyhow::Result<bool> {
     {
-        if state.leases.contains_key(session) || crate::asks::control::stop_held(state, session) { return Ok(false); }
+        if crate::asks::agent_pause::is_paused(state, session)
+            || state.leases.contains_key(session) || crate::asks::control::stop_held(state, session) { return Ok(false); }
         let admission = queue.admission_with_state(session, state)?;
         if owner_priority(session) {
             if admission.items.iter().any(|item| item.kind == "owner" && item.state == "waiting") {
@@ -615,6 +660,48 @@ pub(crate) fn current_turn(session: &str, asks: &AskState) -> Option<AdmissionCu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn caller_perf_filter_before_sort_preserves_fifo_and_holds() {
+        use crate::asks::model::{AttemptRecord, AttemptState, Hold, PausedBy};
+        use crate::asks::store::tests::{new_ask, TARGET};
+        let now = chrono::Utc::now();
+        let mut state = AskState::default();
+        let (template, _) = state.create_ask(new_ask("admission-perf", "fixture"), now).unwrap();
+        state.asks.clear();
+        for n in 0..2048 {
+            let mut ask = template.clone();
+            ask.ask_id = format!("ask-{n:04}");
+            ask.seq = 2048 - n;
+            if n % 128 != 0 { ask.target_cutex_session_id = "other-session".into(); }
+            if n == 128 { ask.hold = Some(Hold::Paused { by: PausedBy::Owner }); }
+            if n == 256 {
+                ask.execution = ExecutionState::Running;
+                let mut record = AttemptRecord::submitting(1, "m".into(), 1, now.to_rfc3339());
+                record.state = AttemptState::Running;
+                ask.attempts.push(record);
+            }
+            state.asks.insert(ask.ask_id.clone(), ask);
+        }
+        // Reference selection uses the previous all-row sort, independently
+        // checking order and eligibility; unrelated sessions must never leak.
+        let start = std::time::Instant::now();
+        let mut previous: Vec<_> = state.asks.values().collect();
+        previous.sort_by_key(|ask| ask.seq);
+        let expected: Vec<_> = previous.into_iter().filter(|ask|
+            ask.remote.is_none() && ask.target_cutex_session_id == TARGET
+                && (ask.execution == ExecutionState::Queued || ask.resume_pending()))
+            .map(|ask| ask.ask_id.clone()).collect();
+        let old = start.elapsed();
+        let start = std::time::Instant::now();
+        let items = ask_items(&state, TARGET);
+        let new = start.elapsed();
+        assert_eq!(items.iter().map(|item| item.id.clone()).collect::<Vec<_>>(), expected);
+        assert_eq!(items.len(), 15);
+        assert_eq!(items.iter().find(|item| item.id == "ask-0128").unwrap().state, "paused");
+        assert!(ask_items(&state, "unrelated-session").is_empty());
+        eprintln!("ADMISSION_PERF rows=2048 previous_sorted=2048 projected_sorted=15 previous_selection_us={} new_complete_items_us={}", old.as_micros(), new.as_micros());
+    }
+
     fn item(kind: &str, id: &str, second: u32) -> AdmissionItem {
         AdmissionItem { kind: kind.into(), id: id.into(), position: 0,
             enqueued_at: format!("2026-10-12T00:00:{second:02}Z"), state: "waiting".into(),

@@ -10,7 +10,6 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use anyhow::Context;
 use serde::Serialize;
@@ -26,10 +25,6 @@ pub const MAX_MEMORY_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_MEMORY_INDEX_BYTES: usize = 256 * 1024;
 pub const MAX_MEMORY_NAME_CHARS: usize = 64;
 pub const MAX_MEMORY_DESCRIPTION_CHARS: usize = 300;
-
-/// Serialises Management API mutations within this process. Agents write the
-/// same files directly; revisions catch those races instead.
-static MEMORY_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// `~/.cutex/projects` (honours the debug private-home boundary).
 pub fn projects_root() -> anyhow::Result<PathBuf> {
@@ -440,6 +435,22 @@ impl MemoryStore {
         self.dir.join(file.as_str())
     }
 
+    /// Serialises cooperating API writers across daemon/CLI processes, including the revision
+    /// check and the index RMW. Direct agent file writes do not participate in this advisory lock.
+    fn write_lock(&self) -> anyhow::Result<fs::File> {
+        self.ensure_dir()?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(self.dir.join(".memory.lock"))?;
+        fs2::FileExt::lock_exclusive(&lock).context("lock memory mutations")?;
+        Ok(lock)
+    }
+
     fn read_raw(
         &self,
         file: &MemoryFileName,
@@ -575,9 +586,7 @@ impl MemoryStore {
             }
             MemoryFileName::Entry(_) => Some(validate_memory_content(content)?),
         };
-        let _guard = MEMORY_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.write_lock()?;
         let current = self
             .read_raw(file)?
             .map(|(bytes, _)| content_revision(&bytes));
@@ -624,9 +633,7 @@ impl MemoryStore {
                 "MEMORY.md cannot be deleted; write an empty index instead".to_string(),
             ));
         }
-        let _guard = MEMORY_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.write_lock()?;
         let current = self
             .read_raw(file)?
             .map(|(bytes, _)| content_revision(&bytes))
@@ -669,6 +676,79 @@ mod tests {
     }
 
     const FEEDBACK: &str = "---\nname: test-style\ndescription: Prefer real DB in integration tests\nmetadata:\n  type: feedback\n---\n\nDo not mock the database.\n**Why:** a mock hid a migration bug.\n**How to apply:** integration tests.\n";
+
+    #[test]
+    fn memory_store_process_mutation() {
+        let Some(dir) = std::env::var_os("CUTEX_MEMORY_LOCK_TEST_DIR") else { return };
+        let store = MemoryStore::new(PathBuf::from(dir));
+        let mode = std::env::var("CUTEX_MEMORY_LOCK_TEST_MODE").unwrap();
+        fs::write(store.dir.join(format!("ready-{mode}")), b"").unwrap();
+        if mode == "write" || mode == "delete" {
+            let file = MemoryFileName::parse("shared.md").unwrap();
+            let expected = ExpectedRevision::Exact(content_revision(FEEDBACK.as_bytes()));
+            let conflict = if mode == "write" {
+                store.write(&file, &format!("{FEEDBACK}child\n"), &expected, true).map(|_| ()).unwrap_err()
+            } else {
+                store.delete(&file, &expected).map(|_| ()).unwrap_err()
+            };
+            assert!(matches!(conflict, MemoryError::RevisionConflict { .. }));
+        } else {
+            for i in 0..8 {
+                let file = MemoryFileName::parse(&format!("{mode}-{i}.md")).unwrap();
+                store.write(&file, FEEDBACK, &ExpectedRevision::Absent, true).unwrap();
+            }
+        }
+    }
+
+    fn mutation_child(store: &MemoryStore, mode: &str) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "memory::store::tests::memory_store_process_mutation", "--nocapture"])
+            .env("CUTEX_MEMORY_LOCK_TEST_DIR", &store.dir)
+            .env("CUTEX_MEMORY_LOCK_TEST_MODE", mode)
+            .spawn().unwrap()
+    }
+
+    fn wait_ready(store: &MemoryStore, modes: &[&str]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !modes.iter().all(|mode| store.dir.join(format!("ready-{mode}")).exists()) {
+            assert!(std::time::Instant::now() < deadline, "memory children did not reach the mutation lock");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn cross_process_writes_and_deletes_check_revision_under_the_directory_lock() {
+        let store = temp_store();
+        let file = MemoryFileName::parse("shared.md").unwrap();
+        store.write(&file, FEEDBACK, &ExpectedRevision::Absent, true).unwrap();
+        let lock = store.write_lock().unwrap();
+        let mut children = [mutation_child(&store, "write"), mutation_child(&store, "delete")];
+        wait_ready(&store, &["write", "delete"]);
+        // Simulate another cooperating writer finishing its critical section while both subprocess
+        // mutations wait on the same OS lock. They must compare revisions only after it releases.
+        let updated = format!("{FEEDBACK}parent\n");
+        crate::config::atomic::write_private_bytes_atomic(&store.path(&file), updated.as_bytes()).unwrap();
+        drop(lock);
+        for child in &mut children { assert!(child.wait().unwrap().success()); }
+        assert_eq!(store.read(&file).unwrap().content, updated);
+        fs::remove_dir_all(store.dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn cross_process_entry_writes_preserve_every_index_line() {
+        let store = temp_store();
+        let lock = store.write_lock().unwrap();
+        let mut children = [mutation_child(&store, "a"), mutation_child(&store, "b")];
+        wait_ready(&store, &["a", "b"]);
+        drop(lock);
+        for child in &mut children { assert!(child.wait().unwrap().success()); }
+        assert_eq!(store.list().unwrap().len(), 16);
+        let index = store.read_index().unwrap().unwrap().content;
+        for mode in ["a", "b"] { for i in 0..8 {
+            assert!(index.contains(&format!("]({mode}-{i}.md)")), "{index}");
+        } }
+        fs::remove_dir_all(store.dir.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn project_key_is_safe_deterministic_and_case_distinct() {

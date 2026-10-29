@@ -28,7 +28,7 @@ pub fn reconcile_cutex_session_store_from_im_registration(
         if store
             .sessions
             .get(&key)
-            .is_some_and(|record| record.is_retired())
+            .is_some_and(|record| crate::agent_management::agent_execution_blocked(&record))
         {
             return Ok(false);
         }
@@ -113,7 +113,7 @@ pub fn im_registry_from_cutex_session_store(
     let retired_session_ids = store
         .sessions
         .values()
-        .filter(|record| record.is_retired())
+        .filter(|record| crate::agent_management::agent_execution_blocked(&record))
         .filter_map(|record| record.codex_session_id.clone())
         .collect::<std::collections::HashSet<_>>();
     for record in store.sessions.values() {
@@ -135,7 +135,7 @@ pub fn im_registry_from_cutex_session_store(
 pub fn coding_registration_from_cutex_session_record(
     record: &CutexSessionRecord,
 ) -> Option<CodingSessionRegistration> {
-    if record.is_retired() {
+    if crate::agent_management::agent_execution_blocked(&record) {
         return None;
     }
     let session_id = record.codex_session_id.clone()?;

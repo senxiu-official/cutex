@@ -571,6 +571,10 @@ mod tests {
             decided_by: None,
             consumed_at: None,
             wait: None,
+            risk: None,
+            matched_rule_id: None,
+            auto_decision: false,
+            rule_revision: None,
         }
     }
 

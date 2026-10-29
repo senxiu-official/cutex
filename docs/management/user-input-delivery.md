@@ -133,11 +133,15 @@ retries owner flush and lets remaining ridealongs join according to their delive
 The timeout does not override a native turn or an admission lease. Held bus records are skipped. Busy wakes wait `agentBus.wakeBusyWaitSecs`: `afterTurn`
 with `nextStepAt` while waiting, `nextStep` after the deadline. Zero is immediate;
 negative/null waits after the turn indefinitely. Alarms always use `afterTurn` without
-a deadline. A frozen native envelope reports its actual frozen timing.
+a deadline, except approval decision notices (023: alarm message id `alarm-approval-…`, owner
+`cutex.approvals`): they wait zero (`nextStep`; older Claude adapters without `soon`: after the
+turn). A frozen native envelope reports its actual frozen timing.
 
 Delegation results (answer / question / delegation status) of a busy requester follow the same
 busy wait, counted from its **oldest** pending result: all pending results go together, so every
-row shows that one `nextStepAt`. This holds also while the requester's running turn holds its
+row shows that one `nextStepAt`. A delegation the owner refused in review (state item
+`rejected@<revision>`) skips the wait: it and everything pending with it are read at the next step
+at once (023 Q3). This holds also while the requester's running turn holds its
 admission lease, i.e. the turn was started by an earlier results event or is a delegation it
 handles (owner observation 2026-10-12, an owner requester agent: results that arrived 4 s into a results turn
 waited for the whole turn). The next-step event does not take that lease: it is recorded beside it
@@ -202,7 +206,8 @@ turn's first input boundary (after the turn's own input). Claude reads them when
 the turn (`Store.claim`); before claude-r21 an owner-started turn skipped them, so they waited for
 its first tool call (PostToolUse) or the next turn, and a turn without tool calls never saw them
 (hachimi 2026-10-19). The owner's wake (`cutex/agentBus/wake`, the desktop's 唤醒 on pending notes)
-is an owner input, `strategy: auto` (`queue` while busy), so the turn it starts reads every pending
+is an owner input, `strategy: auto` (also while busy since 023: read at the next step like typed
+input; owner-notify replies likewise), so the turn it starts reads every pending
 note that has reached the inbox at its start; `pendingNotes` in its result is cutex's count. Each
 note is read into context once: Claude's turn-start items are its delivery receipt
 (`messageDelivered`), and a later PostToolUse finds nothing left.

@@ -233,8 +233,15 @@ fn eligibility(key: &str, record: &CutexSessionRecord) -> Result<(), AgentManage
             | CutexSessionRuntimeBackend::HostForeground
             | CutexSessionRuntimeBackend::CuteAlden
             | CutexSessionRuntimeBackend::ClaudeSubscription
+            | CutexSessionRuntimeBackend::Dsh
+            | CutexSessionRuntimeBackend::Kimi
     ) {
         return Err(conflict("unsupported_durable_backend"));
+    }
+    if record.runtime_backend.is_acp()
+        && (record.dsh_session.is_none() || record.codex_session_id.is_some() || record.claude_session.is_some())
+    {
+        return Err(conflict("malformed_durable_configuration"));
     }
     if record.app_server_launch_claim_id.is_some() {
         return Err(conflict("unresolved_durable_launch_claim"));
@@ -242,6 +249,13 @@ fn eligibility(key: &str, record: &CutexSessionRecord) -> Result<(), AgentManage
     let native = record
         .app_server_thread_id()
         .ok_or(conflict("durable_native_session_missing"))?;
+    // The shared identifier normalizer only rejects empty/path-like strings.
+    // Product DSH facade IDs are canonical UUIDs, separate from ACP native IDs.
+    if record.runtime_backend.is_acp()
+        && uuid::Uuid::parse_str(native).ok().is_none_or(|id| id.to_string() != native)
+    {
+        return Err(conflict("malformed_durable_native_session"));
+    }
     if crate::session::identity::normalize_codex_session_id(native)
         .ok()
         .as_deref()
@@ -785,3 +799,40 @@ fn import_error(error: anyhow::Error) -> AgentManagementError {
 #[cfg(test)]
 #[path = "durable_import_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod dsh_tests {
+    use super::*;
+    #[test]
+    fn dsh_unstarted_facade_identity_is_importable() {
+        let facade = uuid::Uuid::new_v4().to_string();
+        let mut record = CutexSessionRecord::new(
+            "cutex.dsh-import".into(), None,
+            crate::platform::host::current_host_name(),
+            std::env::temp_dir().to_string_lossy().into_owned(), Some("DSH".into()),
+        ).unwrap();
+        record.runtime_backend = CutexSessionRuntimeBackend::Dsh;
+        record.agent_enabled = true;
+        record.registration_class = AgentRegistrationClass::Persistent;
+        record.agent_groups = vec!["default".into()];
+        record.dsh_session = Some(serde_json::from_value(serde_json::json!({
+            "thread_id":facade, "state_dir":"/unused/state", "node":"/unused/node",
+            "adapter":"/unused/adapter", "dsh_cli":"/unused/dsh", "patch":"/unused/patch",
+            "install_root":"/unused/install", "native_session_id":null, "spike":false,
+            "model":"deepseek-v4-flash", "api_key_env":"DEEPSEEK_API_KEY", "deployment_version":"0.2.1-rc.3"
+        })).unwrap());
+        assert!(record.codex_session_id.is_none());
+        assert!(record.app_server_runtime.is_none());
+        eligibility(&record.cutex_session_id, &record).unwrap();
+        let imported = imported_record(&record, "DSH agent").unwrap();
+        assert_eq!(imported.spec.runtime_backend, "dsh");
+        assert_eq!(imported.native_session_id, facade);
+        assert!(record.dsh_session.as_ref().unwrap().native_session_id.is_none());
+        record.codex_session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(eligibility(&record.cutex_session_id, &record).is_err());
+        record.codex_session_id = None;
+
+        record.dsh_session.as_mut().unwrap().thread_id = "not-a-conversation-uuid".into();
+        assert!(eligibility(&record.cutex_session_id, &record).is_err());
+    }
+}

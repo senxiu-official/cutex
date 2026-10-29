@@ -11,14 +11,18 @@
 #   component-claude-runtime-<version>-<platform>.tar.gz   adapter source (component.json, README.md,
 #                     LICENSE, pyproject.toml, src/, scripts/connect_tui.py) + wheels/ (that platform's
 #                     vendored dependencies) + requirements.lock (runtime only, --hash per wheel)
-#                     + THIRD_PARTY_NOTICES.md (the wheels' licenses and license texts)
+#                     + pinned standalone CPython + both sets of licence notices
 #   SHA256SUMS-component-claude-runtime-<platform>
 #   BUILD-INFO-component-claude-runtime-<platform>.json     name, version, commit, platform
-# No venv and no test dependencies; ustar, regular files only, owner 0, a fixed mtime,
-# `gzip -n`. The source comes from an LF `git archive` export of HEAD. The wheels come from PyPI,
-# except claude-agent-sdk, which is built CLI-free from its pinned sdist (scripts/vendor_wheels.py),
-# so a rebuild of the same commit reproduces the archive's sha256.
-# Needs: git, GNU tar, gzip, sha256sum, Python 3.11+ with pip (PYTHON, default python3) and PyPI.
+# No prepared venv and no test dependencies; ustar, regular files only, owner 0, a fixed mtime,
+# `gzip -n`. The source comes from an LF `git archive` export of HEAD. The wheels come from PyPI;
+# the release's reviewed bundle setting replaces the CLI-free SDK build with its platform wheel and CLI. Every
+# downloaded payload has a pinned sha256, so a rebuild of the same commit reproduces the archive.
+# The Claude Code binary's redistribution terms are separate from the SDK's MIT license. The
+# claude-r30 / r263 keeps the reviewed r259 policy, so release archives include it by
+# default. CUTEX_CLAUDE_BUNDLE_CLI=0 keeps the reviewed escape hatch for a CLI-free build.
+# Needs: git, GNU tar, gzip, sha256sum, bootstrap Python 3.11+ (PYTHON, default python3),
+# PyPI and GitHub. CUTEX_PBS_CACHE may name the standalone-Python asset or its directory.
 set -euo pipefail
 
 platform="${1:?platform: linux-x64 | windows-x64 | darwin-arm64}"
@@ -71,11 +75,25 @@ cp "$src/component.json" "$src/README.md" "$src/LICENSE" "$src/pyproject.toml" "
 cp -R "$src/src" "$stage/src"
 cp "$src/scripts/connect_tui.py" "$stage/scripts/"
 find "$stage" \( -name __pycache__ -o -name '*.pyc' -o -name '*.egg-info' \) -prune -exec rm -rf {} +
-"$python" "$src/scripts/vendor_wheels.py" --platform "$platform" --requirements "$src/requirements-runtime.txt" --out "$stage"
+"$python" "$src/scripts/vendor_python.py" --platform "$platform" --manifest "$src/python-build-standalone-assets.json" --out "$stage"
+# The release archive is cross-built. Use the build host's bootstrap interpreter for tooling;
+# target Python is first executed on the target host by cutex's offline prepare step.
+vendor_args=(--platform "$platform" --requirements "$src/requirements-runtime.txt" --out "$stage")
+bundle_cli=false
+case "${CUTEX_CLAUDE_BUNDLE_CLI:-1}" in
+  1) vendor_args+=(--bundle-claude-cli); bundle_cli=true ;;
+  0) ;;
+  *) echo "CUTEX_CLAUDE_BUNDLE_CLI must be 0 or 1" >&2; exit 2 ;;
+esac
+"$python" "$src/scripts/vendor_wheels.py" "${vendor_args[@]}"
 "$python" "$src/scripts/wheel_notices.py" --wheels "$stage/wheels" --out "$stage/THIRD_PARTY_NOTICES.md"
-for f in src/cute_claude/__main__.py src/cute_claude/features.json scripts/connect_tui.py requirements.lock LICENSE THIRD_PARTY_NOTICES.md; do
+for f in src/cute_claude/__main__.py src/cute_claude/features.json scripts/connect_tui.py requirements.lock LICENSE THIRD_PARTY_NOTICES.md python-runtime.json python-runtime.tar.gz PYTHON-LICENSE.txt PYTHON-THIRD-PARTY-NOTICES.md; do
   [ -f "$stage/$f" ] || { echo "archive would lack $f" >&2; exit 1; }
 done
+if [ "$bundle_cli" = true ] && [ ! -f "$stage/claude-cli-runtime.json" ]; then
+  echo "CLI-enabled archive lacks claude-cli-runtime.json" >&2
+  exit 1
+fi
 if find "$stage" -type l | grep -q .; then echo "links in the archive tree" >&2; exit 1; fi
 if grep -qiE '^(pytest|pytest-asyncio|iniconfig|pygments)==' "$stage/requirements.lock"; then
   echo "test dependencies in requirements.lock" >&2; exit 1
@@ -104,7 +122,8 @@ cat > "$out/BUILD-INFO-component-claude-runtime-$platform.json" <<JSON
   "name": "claude-runtime",
   "version": "$version",
   "commit": "$commit",
-  "platform": "$platform"
+  "platform": "$platform",
+  "bundledClaudeCli": $bundle_cli
 }
 JSON
 (cd "$out" && sha256sum "$name" > "SHA256SUMS-component-claude-runtime-$platform")

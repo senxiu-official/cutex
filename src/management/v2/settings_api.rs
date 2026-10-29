@@ -31,7 +31,7 @@ const RESTART_REQUIRED: &[&str] = &["agentBusEnabled", "agentBusPort", "manageme
 /// not open or close network listeners or widen CORS).
 const LOOPBACK_ONLY: &[&str] = &["managementListen", "managementCorsOrigins", "peers"];
 /// Fields applied when a runtime is next launched (running agents keep theirs).
-const NEW_RUNTIMES_ONLY: &[&str] = &["proxy", "claudeUsageRefreshMinutes", "agentHarness"];
+const NEW_RUNTIMES_ONLY: &[&str] = &["proxy", "claudeCli", "claudeUsageRefreshMinutes", "agentHarness", "promptCacheKey"];
 
 const PATCH_FIELDS: &[&str] = &[
     "defaultProfile",
@@ -43,10 +43,12 @@ const PATCH_FIELDS: &[&str] = &[
     "agentBusEnabled",
     "agentBusPort",
     "proxy",
+    "claudeCli",
     "claudeUsageRefreshMinutes",
     "profileQuotaRefreshMinutes",
     "archiveDeleteEmpty",
     "queue",
+    "imageInput",
     "autoThreadTitles",
     "threadTitleModel",
     "codexConfigFollowShared",
@@ -62,11 +64,13 @@ const PATCH_FIELDS: &[&str] = &[
     "notificationLevels",
     "usage",
     "agentHarness",
+    "promptCacheKey",
     "agentBus",
     "artifacts",
     "peers",
     "browser",
     "workflows",
+    "services",
 ];
 
 /// Host proxy (`proxy-modes`): the default every Profile inherits and the proxy of cutex's own
@@ -131,6 +135,71 @@ pub fn quick_chat_profile(config: &CodezConfig, requested: Option<&str>) -> Opti
         .map(str::to_string)
         .or_else(|| config.quick_chat_default_profile.clone())
         .or_else(|| config.default_profile.clone())
+}
+
+/// Read-only retention rule of every store this release prunes or keeps by
+/// design (`/v2/settings` `retention`, capability `retention-rules`; owner
+/// decision 2026-10-23: user data is not deleted on a timer by default).
+/// Values come from the code constants and the current settings. Rows use
+/// the store ids and `rule` vocabulary of cutex-desktop design 043:
+/// `forever`, `age` (`days`), `archive` (moved into the record archive after
+/// `days`), `internal` (bookkeeping, pruned automatically). `setting` names
+/// the `/v2/settings` key that changes it (null: fixed in this release).
+pub fn retention_view(config: &CodezConfig) -> Value {
+    let documents = config.documents.effective();
+    let row = |id: &str, rule: &str, days: Option<i64>, keep_referenced: bool, setting: Option<&str>, detail: &str| {
+        json!({
+            "id": id,
+            "rule": rule,
+            "days": days,
+            "keepReferenced": keep_referenced,
+            "configurable": setting.is_some(),
+            "setting": setting.map(|key| json!({"store": "config", "key": key})),
+            "detail": detail,
+        })
+    };
+    let days_or_forever = |days: Option<i64>| if days.is_some() { "age" } else { "forever" };
+    let closed = Some(i64::from(documents.closed_retention_days));
+    let archive_days = (documents.archive_retention_days > 0).then(|| i64::from(documents.archive_retention_days));
+    let workflow_days = crate::workflows::engine::FINISHED_RUN_RETENTION_DAYS;
+    let revert_days = crate::files_revert::journal::APPLIED_JOURNAL_RETENTION_DAYS;
+    json!([
+        row("attachments", "forever", None, true, None,
+            "Kept while their session exists (a transcript may show them); removed with the session. attachments.retentionDays is stored but not applied since r252."),
+        row("asks", "archive", closed, false, Some("documents.closedRetentionDays"),
+            "Closed delegations move into the record archive after this many days."),
+        row("bus-messages", "archive", closed, false, Some("documents.closedRetentionDays"),
+            "Finished agent messages move into the record archive after this many days."),
+        row("owner-notify", "archive", closed, false, Some("documents.closedRetentionDays"),
+            &format!(
+                "Notifications the owner replied to move into the record archive (kind ownerNotification) after this many days; other finished notifications are deleted after {} days, at most {} records.",
+                crate::owner_notify::store::RETENTION_DAYS,
+                crate::owner_notify::store::MAX_RECORDS,
+            )),
+        row("archive", days_or_forever(archive_days), archive_days, false, Some("documents.archiveRetentionDays"),
+            "Record archive months (0 = kept for good, the default since r252)."),
+        row("documents", "internal", None, false, Some("documents.uploadGraceHours"),
+            "Overflow documents go with their source (archived with it); one whose source never existed after uploadGraceHours."),
+        row("workflow-runs", days_or_forever(workflow_days), workflow_days, false, None,
+            "Finished workflow runs and their step sessions (kept for good since r252; was 30 days)."),
+        row("history-reverts", days_or_forever(revert_days), revert_days, false, None,
+            &format!(
+                "Before-images of applied reverts (kept for good since r252; was 7 days). A rolled-back journal, already restored to disk, is removed after {} days.",
+                crate::files_revert::journal::ROLLED_BACK_JOURNAL_RETENTION_DAYS,
+            )),
+        row("session-store", "internal", Some(i64::from(config.session_store.effective().receipt_retention_days)), false, Some("sessionStore.receiptRetentionDays"),
+            "Completed explicit-launch receipts nothing needs."),
+        row("user-input", "internal", Some(super::user_input::IDENTITY_RETENTION_DAYS), false, None,
+            "Expired input identities only; queued inputs and unresolved native deliveries stay."),
+        row("integration-dedupe", "internal", None, false, None,
+            "Durable event identities prevent recovery from replaying committed owner events; pending events stay."),
+        row("session-activity", "internal", None, false, None,
+            "Derived activity projection removed when its session is deleted."),
+        row("session-usage", "internal", None, false, None,
+            "Derived usage projection removed when its session is deleted; usage ledger is kept forever."),
+        row("alarms", "internal", Some(crate::agent_bus::alarms::CANCELLED_RETENTION_DAYS), false, None,
+            "Cancelled alarms, this many days after their time. Sent alarms are kept."),
+    ])
 }
 
 pub fn settings_view(config: &CodezConfig) -> Value {
@@ -213,10 +282,16 @@ pub fn settings_view(config: &CodezConfig) -> Value {
         "restartRequiredFields": RESTART_REQUIRED,
         "newRuntimesOnlyFields": NEW_RUNTIMES_ONLY,
     });
+    view["imageInput"] = json!(config.image_input);
+    view["imageInputDefault"] = json!(super::user_input::image_steering::ImageInputSettings::default());
+    view["claudeCli"] = json!(config.claude_cli);
+    view["claudeCliDefault"] = json!(crate::config::claude::ClaudeCliChoice::default());
     // Notification levels (capability notification-levels): stored presets /
     // changed cells + the effective presets. Registry and full tables:
     // GET /v2/notification-levels.
     view["notificationLevels"] = notification_levels_view(config);
+    // Read-only retention rules (capability retention-rules; not patchable).
+    view["retention"] = retention_view(config);
     // Usage cost estimates (capabilities usage-price-catalog, usage-currency);
     // outside json! (macro recursion limit).
     for key in ["usage", "usageDefault", "usageOptions"] {
@@ -227,6 +302,15 @@ pub fn settings_view(config: &CodezConfig) -> Value {
     view["agentHarness"] = serde_json::to_value(config.agent_harness).unwrap_or_default();
     view["agentHarnessDefault"] =
         serde_json::to_value(crate::config::agent_harness::AgentHarnessSettings::default()).unwrap_or_default();
+    // Opt-in stable prompt cache key for native agent launches (design 034);
+    // applies to each runtime's next launch, per workspace.
+    view["promptCacheKey"] = serde_json::to_value(config.prompt_cache_key).unwrap_or_default();
+    view["promptCacheKeyDefault"] =
+        serde_json::to_value(crate::config::prompt_cache_key::PromptCacheKeySettings::default()).unwrap_or_default();
+    // off | pending (no launch since) | active | unsupported (this native has
+    // no prompt cache key) | probe_failed (launches went without the key).
+    view["promptCacheKeyStatus"] =
+        serde_json::json!(crate::launch::prompt_cache_key::settings_status(config.prompt_cache_key.enabled));
     // Wake / delegation result timing for a busy recipient (capability
     // wake-busy-wait): agentBus {wakeBusyWaitSecs: seconds | null = never
     // early}; read per delivery (applies at once).
@@ -641,6 +725,8 @@ pub(super) struct SettingsRequest {
     pub(super) usage: Option<Value>,
     /// Partial `agentHarness` update (validated again against the stored value).
     pub(super) agent_harness: Option<Value>,
+    /// Partial `promptCacheKey` update (validated again against the stored value).
+    pub(super) prompt_cache_key: Option<Value>,
     /// Partial `agentBus` update (validated again against the stored value).
     pub(super) agent_bus: Option<Value>,
     /// Partial `artifacts` update (validated again against the stored value).
@@ -649,6 +735,9 @@ pub(super) struct SettingsRequest {
     pub(super) browser: Option<Value>,
     /// Partial `workflows` update (validated again against the stored value).
     pub(super) workflows: Option<Value>,
+    /// Service registry lifecycle settings. Kept in the services store, not
+    /// duplicated into CodezConfig.
+    pub(super) services: Option<crate::services::store::SettingsPatch>,
 }
 
 fn parse_attachments(value: &Value) -> Result<(Option<u64>, Option<u32>), String> {
@@ -691,6 +780,9 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<SettingsRequest, String> {
     if let Some(unknown) = body.keys().find(|key| !PATCH_FIELDS.contains(&key.as_str())) {
         return Err(format!("unsupported field: {unknown}"));
     }
+    if body.contains_key("services") && body.len() != 1 {
+        return Err("services must be patched on its own".into());
+    }
     let mut patch = GlobalConfigPatch {
         default_profile: tri_state(body, "defaultProfile", visible_string(200))?,
         default_profile_direct_launch: required_bool(body, "defaultProfileDirectLaunch")?,
@@ -708,8 +800,20 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<SettingsRequest, String> {
             crate::agent_bus::service::validate_agent_bus_port(port).map_err(|e| e.to_string())?;
             Ok(port)
         })?,
+        claude_cli: body
+            .get("claudeCli")
+            .map(|value| serde_json::from_value(value.clone()).map_err(|_| "claudeCli: must be bundled or system"))
+            .transpose()?,
         ..GlobalConfigPatch::default()
     };
+    if let Some(value) = body.get("imageInput") {
+        let object = value.as_object().ok_or("imageInput: must be an object")?;
+        // An empty patch never resets a previously selected steer policy.
+        if !object.is_empty() {
+            patch.image_input = Some(serde_json::from_value(value.clone())
+                .map_err(|_| "imageInput: requires busyBehavior queue or steer, with no unknown fields")?);
+        }
+    }
     if let Some(value) = body.get("queue") {
         let queue = value.as_object().ok_or("queue: must be an object")?;
         if let Some(unknown) = queue.keys().find(|key| key.as_str() != "ownerMayPassAsks") {
@@ -853,6 +957,13 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<SettingsRequest, String> {
             Some(value.clone())
         }
     };
+    let prompt_cache_key = match body.get("promptCacheKey") {
+        None => None,
+        Some(value) => {
+            crate::config::prompt_cache_key::PromptCacheKeySettings::default().patched(value)?;
+            Some(value.clone())
+        }
+    };
     let agent_bus = match body.get("agentBus") {
         None => None,
         Some(value) => {
@@ -868,11 +979,19 @@ pub(super) fn parse_patch(body: &[u8]) -> Result<SettingsRequest, String> {
         }
     };
     Ok(SettingsRequest {
+        services: body
+            .get("services")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("services: invalid settings patch: {error}"))
+            })
+            .transpose()?,
         workflows: body.get("workflows").map(|value| crate::workflows::WorkflowSettings::default().patched(value).map(|_| value.clone())).transpose()?,
         browser: body.get("browser").map(|value| crate::config::browser::BrowserSettings::default().patched(value).map(|_| value.clone())).transpose()?,
         peers: body.get("peers").map(|value| crate::peers::policy::Settings::default().patched(value).map(|_|value.clone()).map_err(|e|e.to_string())).transpose()?,
         artifacts,
         agent_harness,
+        prompt_cache_key,
         agent_bus,
         notification_levels,
         listen,
@@ -980,6 +1099,11 @@ fn apply(request: SettingsRequest) -> anyhow::Result<(CodezConfig, bool)> {
         changed |= config.agent_harness != next;
         config.agent_harness = next;
     }
+    if let Some(value) = &request.prompt_cache_key {
+        let next = config.prompt_cache_key.patched(value).map_err(|message| anyhow::anyhow!(message))?;
+        changed |= config.prompt_cache_key != next;
+        config.prompt_cache_key = next;
+    }
     if let Some(value) = &request.agent_bus {
         let next = config.agent_bus.patched(value).map_err(|message| anyhow::anyhow!(message))?;
         changed |= config.agent_bus != next;
@@ -1047,6 +1171,10 @@ fn apply(request: SettingsRequest) -> anyhow::Result<(CodezConfig, bool)> {
 fn effective_settings_view(config: &CodezConfig) -> Value {
     let mut view = settings_view(config);
     view["browser"] = crate::config::browser::current().view();
+    view["services"] = crate::services::store::ServiceStore::open_default()
+        .and_then(|store| store.load().map_err(anyhow::Error::msg))
+        .map(|registry| json!(registry.settings))
+        .unwrap_or(Value::Null);
     view
 }
 
@@ -1065,12 +1193,35 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
             ),
         },
         "PATCH" => {
-            let parsed = match parse_patch(&request.body) {
+            let mut parsed = match parse_patch(&request.body) {
                 Ok(parsed) => parsed,
                 Err(message) => return bad_request(stream, &message),
             };
             if parsed.proxy.is_some() && !proxy_editable() {
                 return proxy_owner_required(stream);
+            }
+            if let Some(services) = parsed.services.take() {
+                let store = crate::services::store::ServiceStore::open_default()?;
+                return match store.update_settings(services) {
+                    Ok(_) => match load_codez_config_checked() {
+                        Ok(config) => {
+                            let mut view = effective_settings_view(&config);
+                            view["changed"] = json!(true);
+                            view["restartRequired"] = json!([]);
+                            write_json_response(stream, 200, "OK", &view)
+                        }
+                        Err(error) => super::server::write_v2_error(
+                            stream,
+                            503,
+                            "Service Unavailable",
+                            "settings_unavailable",
+                            "the cutex config could not be read",
+                            true,
+                            json!({ "diagnostic": format!("{error:#}") }),
+                        ),
+                    },
+                    Err(error) => bad_request(stream, &error.to_string()),
+                };
             }
             // owner-local-only: turning cross-host peers on is a root-identity
             // action (turning them off stays open to owner principals).
@@ -1105,10 +1256,34 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
                     );
                 }
             }
+            if let Some(choice) = parsed.patch.claude_cli {
+                if let Err(error) = crate::components::claude_runtime::validate_cli_choice(
+                    super::upgrade_api::layout().as_ref(),
+                    choice,
+                ) {
+                    return bad_request(stream, &format!("claudeCli: {error:#}"));
+                }
+            }
             let before = load_codez_config_checked().ok().map(|c| effective_settings_view(&c));
             let touched = parsed.touched.clone();
             match apply(parsed) {
                 Ok((config, changed)) => {
+                    if touched.iter().any(|field| field == "claudeCli") {
+                        if let Err(error) = crate::components::claude_runtime::apply_cli_choice(
+                            super::upgrade_api::layout().as_ref(),
+                            config.claude_cli,
+                        ) {
+                            return super::server::write_v2_error(
+                                stream,
+                                503,
+                                "Service Unavailable",
+                                "claude_cli_select_failed",
+                                &format!("the setting was saved, but the selected Claude runtime could not be updated: {error:#}"),
+                                true,
+                                json!({}),
+                            );
+                        }
+                    }
                     let mut view = effective_settings_view(&config);
                     let restart_required: Vec<&str> = RESTART_REQUIRED
                         .iter()
@@ -1141,6 +1316,31 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
 mod tests {
     use super::*;
     use crate::profiles::model::ManagementApiToken;
+
+    #[test]
+    fn claude_cli_choice_is_strict_and_defaults_to_bundled() {
+        let defaults = settings_view(&CodezConfig::default());
+        assert_eq!(defaults["claudeCli"], "bundled");
+        assert_eq!(defaults["claudeCliDefault"], "bundled");
+        let parsed = parse_patch(br#"{"claudeCli":"system"}"#).unwrap();
+        assert_eq!(parsed.patch.claude_cli, Some(crate::config::claude::ClaudeCliChoice::System));
+        assert!(parse_patch(br#"{"claudeCli":"path"}"#).unwrap_err().contains("bundled or system"));
+    }
+
+    #[test]
+    fn service_lifecycle_settings_are_additive_and_standalone() {
+        let parsed = parse_patch(br#"{"services":{"ephemeralIdleMinutes":120}}"#).unwrap();
+        assert_eq!(
+            parsed.services.unwrap().ephemeral_idle_minutes,
+            Some(120)
+        );
+        assert!(parse_patch(
+            br#"{"services":{"ephemeralIdleMinutes":120},"autoThreadTitles":true}"#
+        )
+        .unwrap_err()
+        .contains("on its own"));
+        assert!(parse_patch(br#"{"services":{"unknown":1}}"#).is_err());
+    }
 
     #[test]
     fn session_store_view_and_patch_validation() {
@@ -1177,8 +1377,14 @@ mod tests {
     fn agent_bus_wake_busy_wait_view_and_patch() {
         let config = CodezConfig::default();
         let view = settings_view(&config);
-        assert_eq!(view["agentBus"], json!({"wakeBusyWaitSecs": 120}));
-        assert_eq!(view["agentBusDefault"], json!({"wakeBusyWaitSecs": 120}));
+        assert_eq!(view["agentBus"]["wakeBusyWaitSecs"], 120);
+        assert_eq!(view["agentBusDefault"]["wakeBusyWaitSecs"], 120);
+        assert_eq!(view["agentBus"]["resultCoalescing"]["claudeSubscription"]["quietSecs"], 120);
+        let request = parse_patch(br#"{"agentBus":{"resultCoalescing":{"claudeSubscription":{"enabled":false},"codex":{"quietSecs":10}}}}"#).unwrap();
+        let updated = config.agent_bus.patched(request.agent_bus.as_ref().unwrap()).unwrap();
+        assert!(!updated.result_coalescing.claude_subscription.enabled);
+        assert_eq!(updated.result_coalescing.codex.quiet_secs, 10);
+        assert_eq!(updated.result_coalescing.claude_other.quiet_secs, 30);
         assert_eq!(view["agentBusRange"]["wakeBusyWaitSecs"], json!([0, 86400]));
         // Read per delivery: neither a restart nor a new runtime is needed.
         assert!(!RESTART_REQUIRED.contains(&"agentBus") && !NEW_RUNTIMES_ONLY.contains(&"agentBus"));
@@ -1206,6 +1412,24 @@ mod tests {
         }
         // Default omitted from config.json.
         assert!(serde_json::to_value(&config).unwrap().get("agent_bus").is_none());
+    }
+
+    #[test]
+    fn prompt_cache_key_view_and_patch() {
+        let view = settings_view(&CodezConfig::default());
+        assert_eq!(view["promptCacheKey"], json!({"enabled": false}));
+        assert_eq!(view["promptCacheKeyStatus"], "off");
+        // Applied at each runtime's next launch.
+        assert!(PATCH_FIELDS.contains(&"promptCacheKey") && NEW_RUNTIMES_ONLY.contains(&"promptCacheKey"));
+        // Accepted by the field list (it was refused as an unsupported field).
+        let request = parse_patch(br#"{"promptCacheKey":{"enabled":true}}"#).unwrap();
+        let mut config = CodezConfig::default();
+        config.prompt_cache_key = config.prompt_cache_key.patched(request.prompt_cache_key.as_ref().unwrap()).unwrap();
+        assert!(config.prompt_cache_key.enabled);
+        assert_eq!(serde_json::to_value(&config).unwrap()["prompt_cache_key"], json!({"enabled": true}));
+        for bad in [br#"{"promptCacheKey":{"enabled":"yes"}}"#.as_slice(), br#"{"promptCacheKey":{"other":1}}"#, br#"{"promptCacheKey":true}"#] {
+            assert!(parse_patch(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
     }
 
     #[test]
@@ -1622,6 +1846,37 @@ mod tests {
     }
 
     #[test]
+    fn image_input_settings_default_patch_noop_and_persistence() {
+        use super::super::user_input::image_steering::ImageBusyBehavior;
+        let mut config: CodezConfig = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(config.image_input.busy_behavior, ImageBusyBehavior::Queue);
+        assert_eq!(settings_view(&config)["imageInput"], json!({"busyBehavior":"queue"}));
+        let patch = parse_patch(br#"{"imageInput":{"busyBehavior":"steer"}}"#).unwrap();
+        assert!(apply_global_config_patch(&mut config, &patch.patch).unwrap());
+        assert!(!apply_global_config_patch(&mut config, &patch.patch).unwrap());
+        let empty = parse_patch(br#"{"imageInput":{}}"#).unwrap();
+        assert_eq!(empty.patch.image_input, None);
+        assert!(!apply_global_config_patch(&mut config, &empty.patch).unwrap());
+        assert_eq!(settings_view(&config)["imageInput"], json!({"busyBehavior":"steer"}));
+        assert_eq!(settings_view(&config)["imageInputDefault"], json!({"busyBehavior":"queue"}));
+        let root = std::env::temp_dir().join(format!("image-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("config.json");
+        crate::config::atomic::write_private_pretty_json_atomic(&file, &config, "image settings test").unwrap();
+        let reopened: CodezConfig = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(reopened.image_input, config.image_input);
+        assert_eq!(serde_json::to_value(&reopened).unwrap()["image_input"]["busyBehavior"], "steer");
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!RESTART_REQUIRED.contains(&"imageInput") && !NEW_RUNTIMES_ONLY.contains(&"imageInput"));
+        for bad in [r#"{"imageInput":null}"#, r#"{"imageInput":[]}"#,
+            r#"{"imageInput":{"busyBehavior":null}}"#, r#"{"imageInput":{"busyBehavior":true}}"#,
+            r#"{"imageInput":{"busyBehavior":"discard"}}"#, r#"{"imageInput":{"unknown":true}}"#,
+            r#"{"imageInput":{"busy_behavior":"steer"}}"#] {
+            assert!(parse_patch(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn queue_owner_may_pass_asks_defaults_on_and_patches_as_boolean() {
         let mut config: CodezConfig = serde_json::from_value(json!({})).unwrap();
         assert!(config.queue.owner_may_pass_asks);
@@ -1710,7 +1965,7 @@ mod tests {
     fn attachments_view_and_partial_patch() {
         let view = settings_view(&CodezConfig::default());
         assert_eq!(view["attachments"]["maxBytes"], 8 * 1024 * 1024);
-        assert_eq!(view["attachments"]["retentionDays"], 30);
+        assert_eq!(view["attachments"]["retentionDays"], 0, "kept by default since r252");
         let parsed = parse_patch(br#"{"attachments":{"maxBytes":1048576}}"#).unwrap();
         assert_eq!(parsed.attachments, Some((Some(1_048_576), None)));
         let parsed = parse_patch(br#"{"attachments":{"retentionDays":0}}"#).unwrap();
@@ -1737,6 +1992,35 @@ mod tests {
         // Defaults are not written to config.json.
         let json = serde_json::to_value(CodezConfig::default()).unwrap();
         assert!(json.get("attachments").is_none());
+    }
+
+    /// Every retention is visible (owner decision 2026-10-23), read-only.
+    #[test]
+    fn retention_rules_are_listed_and_follow_settings() {
+        let view = settings_view(&CodezConfig::default());
+        let rows = view["retention"].as_array().unwrap();
+        let rule = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap_or_else(|| panic!("{id} missing")).clone();
+        for id in ["attachments", "asks", "bus-messages", "owner-notify", "archive", "documents", "workflow-runs", "history-reverts", "session-store", "alarms"] {
+            let row = rule(id);
+            assert!(row["rule"].is_string() && row["detail"].is_string(), "{row}");
+            assert_eq!(row["configurable"], row["setting"].is_object(), "{row}");
+        }
+        assert_eq!(rule("attachments")["rule"], "forever");
+        assert_eq!(rule("attachments")["keepReferenced"], true);
+        assert_eq!((rule("archive")["rule"].clone(), rule("archive")["days"].clone()), (json!("forever"), Value::Null));
+        assert_eq!(rule("workflow-runs")["rule"], "forever");
+        assert_eq!(rule("history-reverts")["rule"], "forever");
+        assert_eq!((rule("owner-notify")["rule"].clone(), rule("owner-notify")["days"].clone()), (json!("archive"), json!(30)));
+        assert_eq!(rule("archive")["setting"], json!({"store": "config", "key": "documents.archiveRetentionDays"}));
+        let mut config = CodezConfig::default();
+        config.documents.archive_retention_days = 365;
+        config.documents.closed_retention_days = 10;
+        let view = settings_view(&config);
+        let rows = view["retention"].as_array().unwrap();
+        let archive = rows.iter().find(|row| row["id"] == "archive").unwrap();
+        assert_eq!((archive["rule"].clone(), archive["days"].clone()), (json!("age"), json!(365)));
+        assert_eq!(rows.iter().find(|row| row["id"] == "asks").unwrap()["days"], 10);
+        assert_eq!(parse_patch(br#"{"retention":[]}"#).err().as_deref(), Some("unsupported field: retention"));
     }
 
     #[test]

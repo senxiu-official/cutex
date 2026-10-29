@@ -451,6 +451,9 @@ pub fn state_note(state: &str, target: &str, ask_id: &str) -> Option<String> {
         super::awaits::WAITING_STATE => Some(format!(
             "{target} ended its turn to wait for jobs of this delegation (a stage, not the result); it continues by itself when they finish. To make it continue now: delegation_resume(delegation=\"{ask_id}\"); to cancel it and its jobs: delegation_stop(delegation=\"{ask_id}\", stop_jobs=true)."
         )),
+        super::delivery::HANDED_OVER => Some(format!(
+            "Control of {ask_id} (to {target}) passed to you as the project's current Director (handover); the original requester and handler stay as they were. Results and questions of it come to you from now on; what was already given to the earlier controller stays there and is not sent again. Read it with delegation_read(delegation=\"{ask_id}\")."
+        )),
         OWNER_STOPPED_STATE => Some(format!(
             "The owner stopped the turn handling it. Decide: read the partial result with delegation_read(delegation=\"{ask_id}\"), send a follow-up with agent_delegate(follow_up=\"{ask_id}\"), delegate to another agent, or close it with delegation_close(delegation=\"{ask_id}\", outcome=\"abandoned\")."
         )),
@@ -470,6 +473,26 @@ pub const OWNER_STOPPED_STATE: &str = "ownerStopped";
 /// Render levels of one return item: 0 as is (answer ≤ 8 KiB inline),
 /// 1 preview + pointer, 2 a short preview + pointer.
 pub const RETURN_LEVELS: u8 = 3;
+
+fn answer_inline_cap(level: u8, preview_bytes: usize) -> usize {
+    match level {
+        0 => INLINE_ANSWER_MAX_BYTES,
+        1 => preview_bytes,
+        _ => BRIEF_PREVIEW_MIN.min(preview_bytes),
+    }
+}
+
+/// A compact label for a delegation answer that this render level shortens.
+/// Used by the batch header while the full per-piece notice stays in place.
+pub fn return_overlength_label(item: &ReturnItem, level: u8, preview_bytes: usize) -> Option<String> {
+    let ReturnItem::Answer { ask_id, answer_id, revision, inline: Some(text), answer_bytes, .. } = item else {
+        return None;
+    };
+    let cap = answer_inline_cap(level, preview_bytes);
+    (*answer_bytes > cap || text.len() > cap).then(|| {
+        format!("{} ({answer_id} rev {revision})", crate::short_ids::display(ask_id))
+    })
+}
 
 /// One item of a coalesced event at a render level.
 pub fn return_piece(item: &ReturnItem, level: u8, preview_bytes: usize, limit: Option<usize>) -> String {
@@ -497,7 +520,7 @@ pub fn return_piece(item: &ReturnItem, level: u8, preview_bytes: usize, limit: O
                 piece.push_str(note);
                 piece.push('\n');
             }
-            let inline_cap = if level == 0 { INLINE_ANSWER_MAX_BYTES } else { cap };
+            let inline_cap = answer_inline_cap(level, preview_bytes);
             match inline.as_deref() {
                 None => piece.push_str("(the turn ended without a final message)"),
                 Some(text) if *answer_bytes <= inline_cap && text.len() <= inline_cap => piece.push_str(text),
@@ -555,9 +578,15 @@ pub fn return_piece(item: &ReturnItem, level: u8, preview_bytes: usize, limit: O
 
 /// The coalesced event text of rendered pieces; `later` results wait for
 /// the next event (they did not fit into this one).
-pub fn assemble_return(has_answer: bool, pieces: &[String], later: usize) -> (&'static str, String) {
+pub fn assemble_return(has_answer: bool, pieces: &[String], overlength: &[String], later: usize) -> (&'static str, String) {
     let event_type = if has_answer { ANSWER_EVENT } else { QUESTION_EVENT };
     let mut out = String::from("[delegation results]\n");
+    if !overlength.is_empty() {
+        out.push_str(&format!(
+            "[overlength in this batch: {} of {} — {}; read each with delegation_read before acting]\n",
+            overlength.len(), pieces.len(), overlength.join(", ")
+        ));
+    }
     for piece in pieces {
         out.push_str(piece);
         out.push_str("\n\n");
@@ -578,18 +607,23 @@ pub fn return_text(items: &[ReturnItem]) -> (&'static str, String) {
     let has_answer = items.iter().any(|item| matches!(item, ReturnItem::Answer { .. }));
     let budget = EVENT_MAX_BYTES - 600;
     let mut pieces = Vec::new();
-    let mut used = 0;
+    let mut overlength = Vec::new();
     let mut omitted = 0;
     for item in items {
         let piece = return_piece(item, 0, INLINE_ANSWER_MAX_BYTES, None);
-        if used + piece.len() + 2 > budget {
+        let label = return_overlength_label(item, 0, INLINE_ANSWER_MAX_BYTES);
+        let mut trial_pieces = pieces.clone();
+        trial_pieces.push(piece.clone());
+        let mut trial_overlength = overlength.clone();
+        trial_overlength.extend(label);
+        if assemble_return(has_answer, &trial_pieces, &trial_overlength, omitted).1.len() > budget {
             omitted += 1;
             continue;
         }
-        used += piece.len() + 2;
         pieces.push(piece);
+        overlength = trial_overlength;
     }
-    assemble_return(has_answer, &pieces, omitted)
+    assemble_return(has_answer, &pieces, &overlength, omitted)
 }
 
 #[cfg(test)]
@@ -806,10 +840,25 @@ mod tests {
         // Level 2: short preview.
         let l2 = return_piece(&item(4, &long), 2, 800, Some(9_000));
         assert!(l2.contains("preview (first ") && l2.len() < piece.len(), "{l2}");
-        // In a batch, each piece keeps its own notice.
-        let (kind, text) = assemble_return(true, &[piece.clone(), l2.clone()], 0);
+        // The header calls out every shortened result before a mixed batch;
+        // each piece also keeps its own notice.
+        let batch = [
+            piece.clone(),
+            return_piece(&item(2, "ok 2"), 0, 800, None),
+            return_piece(&item(3, "ok 3"), 0, 800, None),
+            l2.clone(),
+            return_piece(&item(5, "ok 5"), 0, 800, None),
+            return_piece(&item(6, "ok 6"), 0, 800, None),
+        ];
+        let labels = vec![
+            return_overlength_label(&item(1, &long), 1, 800).unwrap(),
+            return_overlength_label(&item(4, &long), 2, 800).unwrap(),
+        ];
+        let (kind, text) = assemble_return(true, &batch, &labels, 0);
         assert_eq!(kind, ANSWER_EVENT);
-        assert!(text.starts_with("[delegation results]\n## Answer from Kimi to delegation-1"));
+        assert!(text.starts_with(
+            "[delegation results]\n[overlength in this batch: 2 of 6 — delegation-1 (ans-1 rev 2), delegation-4 (ans-4 rev 2); read each with delegation_read before acting]\n## Answer from Kimi to delegation-1"
+        ), "{text}");
         assert_eq!(text.matches("[overlength delegation result]").count(), 2);
         assert!(!text.contains("read_overlength_content"));
     }

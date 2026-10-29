@@ -11,6 +11,29 @@ use std::time::Duration;
 use anyhow::Context;
 use serde_json::Value;
 
+/// Probe between complete SSE frames without consuming request bytes. Only the
+/// response thread may use the socket while this briefly changes its mode.
+/// FIN alone can be a legal HTTP send-half-close: try one SSE blank-line byte,
+/// not a disconnect verdict. A fully closed peer eventually resets/refuses that
+/// write. One byte avoids partial comment/frame corruption on WouldBlock.
+pub fn stream_disconnected(stream: &TcpStream) -> std::io::Result<bool> {
+    stream.set_nonblocking(true)?;
+    let result = match stream.peek(&mut [0_u8; 1]) {
+        Ok(0) => (&*stream).write(b"\n"),
+        other => other,
+    };
+    // Both peek and the half-close probe are nonblocking. Restore normal I/O
+    // even on error and preserve the caller's existing read/write timeouts.
+    stream.set_nonblocking(false)?;
+    match result {
+        Ok(0) => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => Ok(false),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::NotConnected | std::io::ErrorKind::BrokenPipe) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Debug)]
 pub struct SimpleHttpRequest {
     pub method: String,
@@ -459,4 +482,57 @@ mod tests {
             .unwrap()
             .is_none());
     }
+    #[test]
+    fn stream_disconnect_probe_is_nonblocking_and_preserves_bytes_and_timeouts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        server.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        assert!(!stream_disconnected(&server).unwrap());
+        client.write_all(b"x").unwrap();
+        assert!(!stream_disconnected(&server).unwrap());
+        let mut byte = [0];
+        server.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"x");
+        assert_eq!(server.read_timeout().unwrap(), Some(Duration::from_secs(2)));
+        assert_eq!(server.write_timeout().unwrap(), Some(Duration::from_secs(3)));
+        // A subsequent blocking read still waits for a writer; the probe must
+        // not accidentally leave the connection in nonblocking mode.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(b"y").unwrap();
+            client.shutdown(Shutdown::Both).unwrap();
+        });
+        server.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"y");
+        writer.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !stream_disconnected(&server).unwrap() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn stream_probe_preserves_http_send_half_close() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        // Drain the FIN before probing, without closing the server's write side.
+        assert_eq!(server.read(&mut [0]).unwrap(), 0);
+        for _ in 0..2 {
+            assert!(!stream_disconnected(&server).unwrap());
+            let mut byte = [0];
+            client.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, *b"\n");
+        }
+        server.write_all(b"event: test\ndata: {}\n\n").unwrap();
+        let mut event = [0; 22];
+        client.read_exact(&mut event).unwrap();
+        assert_eq!(&event, b"event: test\ndata: {}\n\n");
+    }
+
 }

@@ -136,6 +136,7 @@ pub(super) fn dispatch_marking_bypass(
         .as_object_mut()
         .expect("validated submit params object");
     let follow_up = params.get("strategy").and_then(Value::as_str) == Some("queue");
+    let agent_paused = session.get("agentPause").is_some_and(Value::is_object);
     // Offline there is no active turn to steer, interrupt or match.
     params.insert("strategy".to_string(), json!("queue"));
     params.remove("expectedTurnId");
@@ -147,6 +148,9 @@ pub(super) fn dispatch_marking_bypass(
         &request,
     )?;
     if result.get("queue").is_some_and(Value::is_object) {
+        if agent_paused {
+            return Ok(result);
+        }
         if !follow_up {
             if let Some(queue_id) = result.pointer("/queue/queueId").and_then(Value::as_str) {
                 mark_bypass(queue_id);
@@ -353,6 +357,7 @@ mod tests {
         ));
         if command.params.strategy == UserInputStrategy::Queue {
             return Ok(UserInputSubmitExecution {
+                join_refusal: None,
                 disposition: UserInputDisposition::Queued,
                 app_server_accepted: false,
                 native_request_id: None,
@@ -375,6 +380,7 @@ mod tests {
             });
         }
         Ok(UserInputSubmitExecution {
+            join_refusal: None,
             disposition: UserInputDisposition::Started,
             app_server_accepted: true,
             native_request_id: Some(json!("native-1")),

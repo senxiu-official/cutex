@@ -142,7 +142,54 @@ pub trait StockRuntimeExecutor {
     fn retain_owner(&mut self);
 }
 
+/// A fresh automatic-start hold. Owner runtime operations do not use this gate.
+#[derive(Debug)]
+pub struct AutomaticRuntimeStartPaused;
+impl std::fmt::Display for AutomaticRuntimeStartPaused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("agent_paused: automatic runtime start deferred")
+    }
+}
+impl std::error::Error for AutomaticRuntimeStartPaused {}
+
 impl AgentManagementProvider {
+    /// Trusted daemon automatic-wake entry only, never an HTTP parameter or
+    /// an owner/maintenance restriction. Keep the provider authority guard
+    /// through the actual start callback so a pause cannot land between a
+    /// preflight and lifecycle launch. A held lifecycle lock defers without
+    /// running the callback. Caller first owns the session lane and management
+    /// lifecycle barrier, in the same order as owner online. Do not wrap the
+    /// outer online function (which takes that barrier), or another provider
+    /// entry recursively.
+    pub fn with_automatic_runtime_start<T>(
+        &self,
+        id: &CutexSessionId,
+        start: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let _execution=super::provider::provider_execution_lock().try_lock()
+            .map_err(|error|match error {
+                std::sync::TryLockError::WouldBlock=>anyhow::Error::new(crate::asks::pause_admission::Deferred),
+                std::sync::TryLockError::Poisoned(_)=>anyhow::anyhow!("stock execution lock unavailable"),
+            })?;
+        let Some(_mutation)=self.store().try_lock_delivery_mutations()? else {
+            return Err(crate::asks::pause_admission::Deferred.into());
+        };
+        self.require_automatic_runtime_start_unpaused(id)?;
+        start()
+    }
+
+    /// Caller already owns this provider's mutation fence. This is a fresh
+    /// read against that exact protected roster; never recursively call gate()
+    /// (which would attempt to acquire the same fence again).
+    fn require_automatic_runtime_start_unpaused(&self,id:&CutexSessionId)->anyhow::Result<()> {
+        let roster=self.store().snapshot()?;
+        let asks=crate::asks::store::AskStore::open_default()?;
+        let paused=asks.inspect(|state|state.pauses.contains_key(id.as_str())
+            ||crate::asks::pause_admission::is_paused_in(state,&roster,id.as_str()))?;
+        if paused { return Err(AutomaticRuntimeStartPaused.into()); }
+        Ok(())
+    }
+
     pub fn review_stock_runtime(
         &self,
         path: &Path,
@@ -258,10 +305,19 @@ impl AgentManagementProvider {
         action_id: &AgentActionId,
         runtime: &mut dyn StockRuntimeExecutor,
     ) -> anyhow::Result<(StockRuntimeReceipt, AgentActionId)> {
+        // This entry is automatic provenance (unlike explicit owner Run and
+        // maintenance). Reuse the exact provider guard across the fresh pause
+        // check and every claim/spawn; never recursively take a pause fence.
         let _execution = super::provider::provider_execution_lock()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("stock execution lock unavailable"))?;
-        let _mutation = self.store().lock_mutations()?;
+            .try_lock()
+            .map_err(|error|match error {
+                std::sync::TryLockError::WouldBlock=>anyhow::Error::new(crate::asks::pause_admission::Deferred),
+                std::sync::TryLockError::Poisoned(_)=>anyhow::anyhow!("stock execution lock unavailable"),
+            })?;
+        let Some(_mutation)=self.store().try_lock_delivery_mutations()? else {
+            return Err(crate::asks::pause_admission::Deferred.into());
+        };
+        self.require_automatic_runtime_start_unpaused(id)?;
         let sessions = load_cutex_session_store_from_path(path)?;
         let record = sessions
             .sessions
@@ -487,7 +543,9 @@ impl AgentManagementProvider {
                     && current_configuration(&before_execution)? == review.configuration,
                     "stock confirmation stale before execution; owner unchanged");
                 if review.restart {
-                    runtime.stop(&before_execution)?;
+                    crate::session::runtime_stop::RequestedStop::run(
+                        &before_execution.cutex_session_id, before_execution.runtime_generation,
+                        || runtime.stop(&before_execution), |_| true)?;
                 }
                 receipt.publication = Some(runtime.publication(&receipt)?);
                 with_locked_session_rows(path, |rows| {
@@ -576,6 +634,7 @@ impl AgentManagementProvider {
                             && current_configuration(current)? == review.configuration,
                         "stock claim/configuration changed during spawn"
                     );
+                    current.provider_family = Some(review.configuration.conversation_family());
                     current.runtime_pid = Some(binding.pid);
                     current.app_server_runtime = Some(binding.clone());
                     rows.insert_receipt::<crate::session::store::ExplicitLaunchReceipts>(
@@ -820,7 +879,7 @@ pub(crate) fn reviewed_relaunch_receipt_with<'a>(
     configuration: impl Fn(&CutexSessionRecord) -> anyhow::Result<StockConfiguration>,
 ) -> Option<&'a StockRuntimeReceipt> {
     let contract = record.explicit_launch.as_ref()?;
-    if record.is_retired() || record.app_server_launch_claim_id.is_some() {
+    if crate::agent_management::agent_execution_blocked(&record) || record.app_server_launch_claim_id.is_some() {
         return None;
     }
     let latest = latest_runtime_receipt(store, &record.cutex_session_id)?;
@@ -876,7 +935,7 @@ pub(super) fn sanitize_shared_projection_marker(
 fn active(record: &CutexSessionRecord, id: &CutexSessionId) -> anyhow::Result<()> {
     anyhow::ensure!(
         record.cutex_session_id == id.as_str()
-            && !record.is_retired()
+            && !crate::agent_management::agent_execution_blocked(&record)
             && (record.is_owned_session() || (record.agent_enabled
             && record.registration_class == crate::agent_bus::model::AgentRegistrationClass::Persistent)),
         "active Cutex agent or owned session runtime required"
@@ -1310,10 +1369,121 @@ mod review_digest_tests {
             panic!("unexpected runtime")
         }
     }
+
+    /// These entry tests use default AskStore paths, so hold the same HOME
+    /// lock as other environment fixtures and keep a marked profile-local home.
+    struct AutomaticStartHome {
+        root: std::path::PathBuf,
+        previous: [Option<std::ffi::OsString>; 2],
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+    impl AutomaticStartHome {
+        fn new() -> Self {
+            let guard = crate::config::paths::test_home_env_lock();
+            let root = crate::config::paths::real_user_home().unwrap()
+                .join(format!(".cutex-test-auto-start-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(crate::config::paths::PRIVATE_HOME_MARKER), b"test").unwrap();
+            let previous = [std::env::var_os("HOME"), std::env::var_os("CUTEX_TEST_PRIVATE_HOME")];
+            unsafe {
+                std::env::set_var("HOME", &root);
+                std::env::set_var("CUTEX_TEST_PRIVATE_HOME", &root);
+            }
+            Self { root, previous, _guard: guard }
+        }
+    }
+    impl Drop for AutomaticStartHome {
+        fn drop(&mut self) {
+            for (name, previous) in ["HOME", "CUTEX_TEST_PRIVATE_HOME"].into_iter().zip(self.previous.iter()) {
+                unsafe { match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }}
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn automatic_start_rechecks_pause_after_preflight_before_callback_or_relaunch() {
+        let _home = AutomaticStartHome::new();
+        let provider = AgentManagementProvider::open_default().unwrap();
+        let asks = crate::asks::store::AskStore::open_default().unwrap();
+        let id = CutexSessionId::new(format!("cutex.{}", uuid::Uuid::new_v4())).unwrap();
+        // The scheduling/asks-runtime preflight passed. A real pause commits
+        // before the provider is entered; it must be read again at that entry.
+        let snapshot = provider.store().snapshot().unwrap();
+        assert!(!asks.inspect(|state| crate::asks::pause_admission::is_paused_in(state, &snapshot, id.as_str())).unwrap());
+        {
+            let _fence = provider.store().lock_mutations().unwrap();
+            asks.with_state(|state| crate::asks::agent_pause::pause(state, id.as_str(), "owner", None, chrono::Utc::now())).unwrap();
+            let error = provider.require_automatic_runtime_start_unpaused(&id).unwrap_err();
+            assert!(error.is::<AutomaticRuntimeStartPaused>(), "{error:#}");
+        }
+        let before = asks.snapshot().unwrap();
+        let error = provider.with_automatic_runtime_start(&id, || -> anyhow::Result<()> { panic!("paused automatic launch callback") }).unwrap_err();
+        assert!(error.is::<AutomaticRuntimeStartPaused>() || error.is::<crate::asks::pause_admission::Deferred>(), "{error:#}");
+        // A missing session file proves this gate precedes even receipt lookup,
+        // as well as all NeverRuntime calls and any lifecycle side effects.
+        let missing = _home.root.join("never-created.json");
+        let error = provider.execute_reviewed_relaunch(&missing, &id, "cutex.director",
+            &AgentActionId::new("asks-wake:cutex.director:paused").unwrap(), &mut NeverRuntime).unwrap_err();
+        assert!(error.is::<AutomaticRuntimeStartPaused>() || error.is::<crate::asks::pause_admission::Deferred>(), "{error:#}");
+        assert!(!missing.exists());
+        assert_eq!(asks.snapshot().unwrap(), before, "a hold creates no admission/claim");
+        {
+            let _fence = provider.store().lock_mutations().unwrap();
+            // A project join after the cached pause membership is also a hold.
+            // This checks the provider's protected current roster, without a
+            // preceding reconciliation write to AskStore.
+            provider.store().with_state(true, |mut roster| {
+                roster.current_project_memberships.insert(id.clone(), serde_json::from_value(json!({
+                    "cutex_session_id":id,"project_id":"automatic-project","revision":1,
+                    "updated_at":"2026-10-27T00:00:00Z"
+                })).unwrap());
+                Ok((roster, (), true))
+            }).unwrap();
+            asks.with_state(|state| {
+                crate::asks::agent_pause::resume(state, id.as_str());
+                let ctx = crate::asks::routing_policy::RoutingContext { project_id:"automatic-project".into(),
+                    authority_epoch:0,current_director:None,actor:crate::asks::routing_policy::RoutingActor::Owner,operator_may_route:false };
+                crate::asks::project_control::pause(state,&ctx,&crate::asks::project_control::PauseRequest{
+                    action_id:"provider-project-pause".into(),expected_epoch:0,mode:crate::asks::project_control::Mode::AfterTurn,
+                    scope:crate::asks::project_control::Scope::Members},&crate::asks::project_control::Membership{
+                        revision:0,members:Default::default(),excluded:Default::default()},"private-host",chrono::Utc::now()).unwrap();
+                assert!(!crate::asks::agent_pause::is_paused(state, id.as_str()));
+            }).unwrap();
+            let before = asks.snapshot().unwrap();
+            let error = provider.require_automatic_runtime_start_unpaused(&id).unwrap_err();
+            assert!(error.is::<AutomaticRuntimeStartPaused>(), "{error:#}");
+            assert_eq!(asks.snapshot().unwrap(), before, "fresh membership gate is read-only");
+        }
+    }
+
+    #[test]
+    fn automatic_start_defers_without_callback_when_provider_fences_are_busy() {
+        let _home = AutomaticStartHome::new();
+        let provider = AgentManagementProvider::open_default().unwrap();
+        let id = CutexSessionId::new("cutex.auto-contention").unwrap();
+        let asks = crate::asks::store::AskStore::open_default().unwrap();
+        let before = asks.snapshot().unwrap();
+        {
+            let _execution = super::super::provider::provider_execution_lock().lock().unwrap();
+            let error = provider.with_automatic_runtime_start(&id, || -> anyhow::Result<()> { panic!("busy provider callback") }).unwrap_err();
+            assert!(error.is::<crate::asks::pause_admission::Deferred>(), "{error:#}");
+        }
+        {
+            let _mutation = provider.store().lock_mutations().unwrap();
+            let error = provider.with_automatic_runtime_start(&id, || -> anyhow::Result<()> { panic!("busy authority callback") }).unwrap_err();
+            assert!(error.is::<crate::asks::pause_admission::Deferred>(), "{error:#}");
+        }
+        assert_eq!(asks.snapshot().unwrap(), before);
+    }
     /// Without matching reviewed-launch evidence the relaunch refuses before
     /// any runtime step and writes nothing.
     #[test]
     fn reviewed_relaunch_without_evidence_refuses_without_side_effects() {
+        let _home = AutomaticStartHome::new();
         let root = std::env::temp_dir().join(format!("reviewed-relaunch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let provider = AgentManagementProvider::open(root.join("management")).unwrap();
@@ -1345,9 +1515,17 @@ mod review_digest_tests {
         crate::session::store::save_cutex_session_store_to_path(&path, &store).unwrap();
         let before = crate::session::store::session_store_json_bytes(&path).unwrap();
         let action = AgentActionId::new("asks-wake:cutex.director:test").unwrap();
-        let error = provider
-            .execute_reviewed_relaunch(&path, &id, "cutex.director", &action, &mut NeverRuntime)
-            .unwrap_err();
+        // Other provider tests may hold the global lifecycle barrier. Only
+        // Deferred proves no callback/claim happened and permits this retry;
+        // keep the original action and never retry another error/outcome.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let error = loop {
+            match provider.execute_reviewed_relaunch(&path, &id, "cutex.director", &action, &mut NeverRuntime) {
+                Err(error) if error.is::<crate::asks::pause_admission::Deferred>()
+                    && std::time::Instant::now() < deadline => std::thread::yield_now(),
+                result => break result.unwrap_err(),
+            }
+        };
         assert!(format!("{error:#}").contains("owner_start_required"), "{error:#}");
         assert_eq!(crate::session::store::session_store_json_bytes(&path).unwrap(), before);
         std::fs::remove_dir_all(root).unwrap();
@@ -1355,6 +1533,7 @@ mod review_digest_tests {
 
     #[test]
     fn runtime_review_completed_legacy_replay_keeps_bytes_by_action_id() {
+        let _home = AutomaticStartHome::new();
         let root = std::env::temp_dir().join(format!("runtime-review-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let provider = AgentManagementProvider::open(root.join("management")).unwrap();
@@ -1381,6 +1560,13 @@ mod review_digest_tests {
         let path = root.join("sessions.json");
         crate::session::store::save_cutex_session_store_to_path(&path, &store).unwrap();
         let original = crate::session::store::session_store_json_bytes(&path).unwrap();
+        // Owner maintenance/replay is deliberately not subject to the new
+        // automatic-provenance gate, even when an agent is paused.
+        crate::asks::store::AskStore::open_default().unwrap().with_state(|state|
+            crate::asks::agent_pause::pause(state, review.subject.cutex_session_id.as_str(), "owner", None, chrono::Utc::now())).unwrap();
+        let owner_replay = provider.execute_stock_runtime(
+            &HumanManagementPrincipal::authenticated(), &path, &action, &review, &mut NeverRuntime).unwrap();
+        assert_eq!(serde_json::to_vec(&owner_replay).unwrap(), serde_json::to_vec(&receipt).unwrap());
         {
             let _execution = super::super::provider::provider_execution_lock()
                 .lock()

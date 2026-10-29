@@ -32,6 +32,10 @@ pub fn cli_program(kind: &CliKind) -> String {
     match kind {
         CliKind::Codex => codex_program(),
         CliKind::Claude => claude_program(),
+        // The standalone CLI name only; managed launches use runtime::dsh.
+        CliKind::Dsh => "dsh".to_string(),
+        // The standalone CLI name only; managed launches use the kimi-runtime component.
+        CliKind::Kimi => "kimi".to_string(),
     }
 }
 
@@ -40,4 +44,12 @@ pub fn program_name(program: &str) -> &str {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or(program)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dsh_cli_name_never_uses_codex_or_claude_selection() {
+        assert_eq!(super::cli_program(&crate::profiles::model::CliKind::Dsh), "dsh");
+    }
 }

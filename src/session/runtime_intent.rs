@@ -156,7 +156,7 @@ fn candidate_ids(state: &IntentState, sessions: &CutexSessionStore, online: &dyn
     state
         .intents
         .keys()
-        .filter(|id| sessions.sessions.get(*id).is_some_and(|record| !record.is_retired() && !online(record)))
+        .filter(|id| sessions.sessions.get(*id).is_some_and(|record| !crate::agent_management::agent_execution_blocked(&record) && !online(record)))
         .cloned()
         .collect()
 }
@@ -179,7 +179,7 @@ pub fn detect_unclean_stop_at(
         }
         // Agents archived or deleted since are no longer intended.
         let before = state.intents.len();
-        state.intents.retain(|id, _| sessions.sessions.get(id).is_some_and(|record| !record.is_retired()));
+        state.intents.retain(|id, _| sessions.sessions.get(id).is_some_and(|record| !crate::agent_management::agent_execution_blocked(&record)));
         changed |= state.intents.len() != before;
         let fresh = candidate_ids(state, sessions, online);
         if fresh.is_empty() {
@@ -247,7 +247,7 @@ pub fn candidates_resource_at(
         .filter_map(|id| {
             let intent = state.intents.get(id)?;
             let record = sessions.sessions.get(id)?;
-            (!record.is_retired() && !online(record)).then(|| {
+            (!crate::agent_management::agent_execution_blocked(&record) && !online(record)).then(|| {
                 json!({
                     "cutexSessionId": id,
                     "displayName": crate::session::metadata::cutex_session_display_name(record),
@@ -278,7 +278,7 @@ pub fn dismiss_at(
         };
         let mut dismissed = 0;
         for id in &unclean.candidates {
-            let offline = sessions.sessions.get(id).is_none_or(|record| record.is_retired() || !online(record));
+            let offline = sessions.sessions.get(id).is_none_or(|record| crate::agent_management::agent_execution_blocked(&record) || !online(record));
             if offline && state.intents.remove(id).is_some() {
                 dismissed += 1;
             }

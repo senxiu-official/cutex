@@ -1,7 +1,10 @@
 //! Remote close of a desktop client (capability `client-remote-close`;
 //! cutex-desktop docs/research/remote-close-desktop-20261019.md). Presence
 //! lives only in memory in the Management daemon: an instance that sent no
-//! heartbeat for 3 × `heartbeatSeconds` disappears; a restart forgets all.
+//! heartbeat for 3 × `heartbeatSeconds` disappears (closing: one heartbeat);
+//! a restart forgets all. A new instance of the same install and credential
+//! replaces its predecessor. Removed ids are fenced for at most 180 seconds
+//! (bounded to 1024 receipts); after that, retries may return 404.
 //!
 //! - `POST /v2/clients/presence` `{installId, instanceId, appName,
 //!   appVersion, deviceName, platform, allowRemoteClose}` → `{instanceId,
@@ -28,7 +31,9 @@
 //!   Host event `cutex/client/closeRequested {instanceId, requestedBy
 //!   {deviceName, userId, local}, graceSeconds, at}`.
 //! - `POST /v2/clients/{instanceId}/closing` `{outcome: "closing" |
-//!   "cancelled"}` → `{instanceId, state}`; only the credential that
+//!   "cancelled" | "exited"}` → `{instanceId, state}`; exited removes the
+//!   instance immediately, with idempotent retries while its receipt remains.
+//!   Only the credential that
 //!   registered the instance (else 403 `client_close_forbidden` `{reason:
 //!   notRegistrant}`). Host event `cutex/client/stateChanged {instanceId,
 //!   state}`.
@@ -55,6 +60,8 @@ pub const STATE_CHANGED: &str = "cutex/client/stateChanged";
 pub const HEARTBEAT_SECONDS: i64 = 60;
 /// An instance without a heartbeat for this long is gone.
 pub const EXPIRE_SECONDS: i64 = 3 * HEARTBEAT_SECONDS;
+/// Removal receipts are bounded, in-memory evidence for retries and event routing.
+const MAX_REMOVED: usize = 2 * MAX_INSTANCES;
 pub const DEFAULT_GRACE_SECONDS: u64 = 15;
 pub const MAX_GRACE_SECONDS: u64 = 300;
 /// Instances one credential may hold (a restarting desktop leaves its old
@@ -225,12 +232,49 @@ pub struct CloseOutcome {
 #[derive(Debug, Default)]
 pub struct Registry {
     instances: HashMap<String, Instance>,
+    removed: HashMap<String, RemovedInstance>,
+    state_events: Vec<Value>,
+}
+
+#[derive(Debug)]
+struct RemovedInstance {
+    token_id: Option<String>,
+    user_id: Option<String>,
+    at: DateTime<Utc>,
 }
 
 impl Registry {
     pub fn prune(&mut self, now: DateTime<Utc>) {
-        let limit = Duration::seconds(EXPIRE_SECONDS);
-        self.instances.retain(|_, instance| now - instance.last_seen <= limit);
+        self.removed.retain(|_, receipt| now - receipt.at <= Duration::seconds(EXPIRE_SECONDS));
+        let expired: Vec<String> = self.instances.iter().filter(|(_, instance)| {
+            let seconds = if instance.state == ClientState::Closing { HEARTBEAT_SECONDS } else { EXPIRE_SECONDS };
+            now - instance.last_seen > Duration::seconds(seconds)
+        }).map(|(id, _)| id.clone()).collect();
+        for id in expired {
+            if self.instances.get(&id).is_some_and(|instance| instance.state == ClientState::Closing) {
+                self.remove_instance(&id, now);
+            } else {
+                // Ordinary missed-heartbeat expiry keeps the existing reconnect semantics.
+                self.instances.remove(&id);
+            }
+        }
+    }
+
+    fn remove_instance(&mut self, id: &str, now: DateTime<Utc>) {
+        let Some(instance) = self.instances.remove(id) else { return; };
+        if self.removed.len() >= MAX_REMOVED {
+            if let Some(oldest) = self.removed.iter().min_by_key(|(id, receipt)| (receipt.at, *id)).map(|(id, _)| id.clone()) {
+                self.removed.remove(&oldest);
+            }
+        }
+        self.removed.insert(id.into(), RemovedInstance {
+            token_id: instance.token_id, user_id: instance.user_id, at: now,
+        });
+        self.state_events.push(json!({"instanceId": id, "state": "exited"}));
+    }
+
+    fn take_state_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.state_events)
     }
 
     pub fn get(&self, instance_id: &str) -> Option<&Instance> {
@@ -249,6 +293,11 @@ impl Registry {
     pub fn heartbeat(&mut self, presence: Presence, caller: &Caller, now: DateTime<Utc>) -> Result<&Instance, ClientError> {
         self.prune(now);
         let id = presence.instance_id.clone();
+        if let Some(removed) = self.removed.get(&id) {
+            return Err(ClientError::new(409,
+                if removed.token_id == caller.token_id { "client_instance_exited" } else { "client_instance_conflict" },
+                "this instance id was removed; register a new instance id"));
+        }
         if let Some(existing) = self.instances.get(&id) {
             if existing.token_id != caller.token_id {
                 return Err(ClientError {
@@ -256,7 +305,16 @@ impl Registry {
                     ..ClientError::new(409, "client_instance_conflict", "this instance id is registered by another credential")
                 });
             }
+            if existing.presence.install_id != presence.install_id {
+                return Err(ClientError::new(409, "client_instance_conflict", "an instance cannot change its installation"));
+            }
         } else {
+            // Validate the requested id before touching any previous instance.
+            // A delayed heartbeat from a replaced instance is fenced by removed.
+            let previous: Vec<String> = self.instances.values()
+                .filter(|instance| instance.token_id == caller.token_id && instance.presence.install_id == presence.install_id)
+                .map(|instance| instance.presence.instance_id.clone()).collect();
+            for old in previous { self.remove_instance(&old, now); }
             let mine: Vec<(String, DateTime<Utc>)> = self
                 .instances
                 .values()
@@ -265,7 +323,7 @@ impl Registry {
                 .collect();
             if mine.len() >= MAX_PER_CREDENTIAL {
                 if let Some((oldest, _)) = mine.iter().min_by_key(|(_, seen)| *seen) {
-                    self.instances.remove(oldest);
+                    self.remove_instance(oldest, now);
                 }
             }
             if self.instances.len() >= MAX_INSTANCES {
@@ -368,15 +426,35 @@ impl Registry {
         now: DateTime<Utc>,
     ) -> Result<(), ClientError> {
         self.prune(now);
+        if !matches!(state, ClientState::Closing | ClientState::Cancelled) {
+            return Err(ClientError::invalid("only closing or cancelled may be reported"));
+        }
         let instance = self.instances.get_mut(instance_id).ok_or_else(|| ClientError::not_found(instance_id))?;
         if instance.token_id != caller.token_id {
             return Err(ClientError::forbidden("notRegistrant", "only the desktop client itself may report its state"));
         }
+        let changed = instance.state != state;
         instance.state = state;
         instance.last_seen = now;
         if state != ClientState::CloseRequested {
             instance.close_request = None;
         }
+        if changed {
+            self.state_events.push(json!({"instanceId": instance_id, "state": state.as_str()}));
+        }
+        Ok(())
+    }
+
+    /// Final report is registrant-only, including retries after removal.
+    pub fn report_exited(&mut self, instance_id: &str, caller: &Caller, now: DateTime<Utc>) -> Result<(), ClientError> {
+        self.prune(now);
+        let token_id = self.instances.get(instance_id).map(|instance| &instance.token_id)
+            .or_else(|| self.removed.get(instance_id).map(|receipt| &receipt.token_id))
+            .ok_or_else(|| ClientError::not_found(instance_id))?;
+        if token_id != &caller.token_id {
+            return Err(ClientError::forbidden("notRegistrant", "only the desktop client itself may report its state"));
+        }
+        self.remove_instance(instance_id, now);
         Ok(())
     }
 
@@ -393,15 +471,21 @@ impl Registry {
     /// The user an instance belongs to (`None`: unknown / pending).
     pub fn user_of_instance(&self, instance_id: &str) -> Option<String> {
         self.instances.get(instance_id).and_then(|instance| instance.user_id.clone())
+            .or_else(|| self.removed.get(instance_id).and_then(|receipt| receipt.user_id.clone()))
     }
 
     #[cfg(test)]
     pub fn clear(&mut self) {
         self.instances.clear();
+        self.removed.clear();
+        self.state_events.clear();
     }
 }
 
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
+// Keep state transitions and their event publication ordered across HTTP workers.
+// Publication must stay outside REGISTRY because event filtering reads it.
+static ROUTE_EVENTS: Mutex<()> = Mutex::new(());
 
 pub fn with_registry<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
     let mut guard = REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -556,6 +640,15 @@ fn audit(action: &str, details: Value) {
 }
 
 fn route(request: &SimpleHttpRequest, caller: &Caller) -> Result<(u16, Value), ClientError> {
+    let _publication = ROUTE_EVENTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = route_inner(request, caller);
+    // Publish outside the registry mutex: event filtering consults the registry.
+    let events = with_registry(Registry::take_state_events);
+    for event in events { super::documents::publish_host_event(STATE_CHANGED, event); }
+    result
+}
+
+fn route_inner(request: &SimpleHttpRequest, caller: &Caller) -> Result<(u16, Value), ClientError> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
     let route = parse_path(path).ok_or_else(|| ClientError::new(404, "route_not_found", "no such clients route"))?;
     let method_ok = match route {
@@ -623,17 +716,22 @@ fn route(request: &SimpleHttpRequest, caller: &Caller) -> Result<(u16, Value), C
         }
         Route::Closing(id) => {
             let object = body(request)?;
+            if object.get("outcome").and_then(Value::as_str) == Some("exited") {
+                with_registry(|registry| registry.report_exited(&id, caller, now))?;
+                audit("clientCloseOutcome", json!({ "instanceId": id, "outcome": "exited",
+                    "actor": caller.token_id.clone().unwrap_or_else(|| "root".into()) }));
+                return Ok((200, json!({"instanceId": id, "state": "exited"})));
+            }
             let state = match object.get("outcome").and_then(Value::as_str) {
                 Some("closing") => ClientState::Closing,
                 Some("cancelled") => ClientState::Cancelled,
-                _ => return Err(ClientError::invalid("outcome must be \"closing\" or \"cancelled\"")),
+                _ => return Err(ClientError::invalid("outcome must be \"closing\", \"cancelled\" or \"exited\"")),
             };
             with_registry(|registry| registry.report_closing(&id, caller, state, now))?;
             audit(
                 "clientCloseOutcome",
                 json!({ "instanceId": id, "outcome": state.as_str(), "actor": caller.token_id.clone().unwrap_or_else(|| "root".into()) }),
             );
-            super::documents::publish_host_event(STATE_CHANGED, json!({ "instanceId": id, "state": state.as_str() }));
             Ok((200, json!({ "instanceId": id, "state": state.as_str() })))
         }
     }

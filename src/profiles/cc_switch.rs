@@ -7,9 +7,10 @@
 //! store `app_paths.json` (key `app_config_dir_override`) in the app-data
 //! directory of `com.ccswitch.desktop` names the moved directory.
 //!
-//! - v3.8+ (up to v4.0.15 at least): SQLite `cc-switch.db`, `PRAGMA
-//!   user_version` 1..=[`MAX_SCHEMA_VERSION`]; table `providers` keyed by
-//!   `(id, app_type)`. Opened read-only (no WAL / journal files created).
+//! - v3.8+: SQLite `cc-switch.db`, audited through `PRAGMA user_version`
+//!   [`KNOWN_SCHEMA_VERSION`]; newer versions are read by known column names
+//!   while required provider fields remain available. Table `providers` is
+//!   keyed by `(id, app_type)`. Opened read-only (no WAL / journal files created).
 //! - before 3.8: `config.json` `{"version": 2, "claude": {"providers": {id:
 //!   Provider}, "current": id}, "codex": {...}}`.
 //!
@@ -27,8 +28,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-/// Newest `PRAGMA user_version` this reader knows (CC Switch v4.0.15).
-pub const MAX_SCHEMA_VERSION: i64 = 20;
+/// Newest audited `PRAGMA user_version`, not a ceiling for additive changes.
+/// Upstream de0a235ad6389ce4afa333b472cdee615a3f3987 schema 21..23 only
+/// adds MCP/Skills enable flags; the provider fields read here are unchanged.
+pub const KNOWN_SCHEMA_VERSION: i64 = 23;
 pub const DIR_NAME: &str = ".cc-switch";
 pub const DB_FILE: &str = "cc-switch.db";
 pub const JSON_FILE: &str = "config.json";
@@ -303,21 +306,21 @@ fn scan_sqlite(dir: &Path, db: &Path) -> Scan {
         Err(_) => return unreadable(source, "database"),
     };
     source.schema_version = Some(version);
-    if version > MAX_SCHEMA_VERSION {
-        return Scan {
+    let rows = match read_rows(&connection) {
+        Ok(Some(rows)) => rows,
+        Ok(None) => return Scan {
             found: true,
             source: Some(source),
             error: Some(ScanError {
-                code: "unsupported_version",
-                message: format!(
-                    "newer CC Switch format (schema {version}; this cutex reads up to {MAX_SCHEMA_VERSION}): update cutex"
-                ),
+                code: if version > KNOWN_SCHEMA_VERSION { "unsupported_version" } else { "unsupported_format" },
+                message: if version > KNOWN_SCHEMA_VERSION {
+                    format!("CC Switch's provider format has changed (schema {version}; audited through {KNOWN_SCHEMA_VERSION}); update cutex before importing")
+                } else {
+                    "CC Switch's providers table is missing required fields (id, app_type, settings_config)".into()
+                },
             }),
             providers: Vec::new(),
-        };
-    }
-    let rows = match read_rows(&connection) {
-        Ok(rows) => rows,
+        },
         Err(_) => return unreadable(source, "providers table"),
     };
     let settings_current = current_from_settings(dir);
@@ -344,7 +347,9 @@ struct Row {
     is_current: bool,
 }
 
-fn read_rows(connection: &rusqlite::Connection) -> rusqlite::Result<Vec<Row>> {
+/// None means the provider layout is incompatible; SQL/IO errors remain
+/// distinguishable so a busy/corrupt store is not reported as a newer format.
+fn read_rows(connection: &rusqlite::Connection) -> rusqlite::Result<Option<Vec<Row>>> {
     // Columns differ across schema versions: select what exists.
     let mut columns = Vec::new();
     {
@@ -354,9 +359,9 @@ fn read_rows(connection: &rusqlite::Connection) -> rusqlite::Result<Vec<Row>> {
             columns.push(name?);
         }
     }
-    let has = |name: &str| columns.iter().any(|column| column == name);
+    let has = |name: &str| columns.iter().any(|column| column.eq_ignore_ascii_case(name));
     if !(has("id") && has("app_type") && has("settings_config")) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Ok(None);
     }
     let column = |name: &str| if has(name) { name.to_string() } else { format!("NULL AS {name}") };
     let mut order = vec!["app_type".to_string()];
@@ -409,7 +414,7 @@ fn read_rows(connection: &rusqlite::Connection) -> rusqlite::Result<Vec<Row>> {
             is_current,
         });
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 fn scan_json(dir: &Path, path: &Path) -> Scan {
@@ -644,9 +649,23 @@ pub(crate) mod tests {
                    settings_config TEXT NOT NULL, website_url TEXT, category TEXT, created_at INTEGER,
                    sort_index INTEGER, notes TEXT, icon TEXT, icon_color TEXT, meta TEXT NOT NULL DEFAULT '{}',
                    is_current BOOLEAN NOT NULL DEFAULT 0, in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
-                   PRIMARY KEY (id, app_type));",
+                   PRIMARY KEY (id, app_type));
+                 CREATE TABLE mcp_servers (id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                   server_config TEXT NOT NULL, enabled_pi BOOLEAN NOT NULL DEFAULT 0);
+                 CREATE TABLE skills (id TEXT PRIMARY KEY, name TEXT NOT NULL, directory TEXT NOT NULL);",
             )
             .unwrap();
+        // The relevant upstream 20 -> 23 migrations. These unrelated tables
+        // deliberately evolve while provider records keep their known layout.
+        for (version, table, flag) in [
+            (21, "mcp_servers", "enabled_agy"), (21, "skills", "enabled_agy"),
+            (22, "mcp_servers", "enabled_kimi"), (22, "skills", "enabled_kimi"),
+            (23, "mcp_servers", "enabled_omp"),
+        ] {
+            if user_version >= version {
+                connection.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {flag} BOOLEAN NOT NULL DEFAULT 0")).unwrap();
+            }
+        }
         connection.pragma_update(None, "user_version", user_version).unwrap();
         let insert = |id: &str, app: &str, name: &str, settings: Value, category: Option<&str>, meta: Value, current: bool, sort: i64| {
             connection
@@ -756,16 +775,95 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn newer_schema_is_refused_without_listing() {
+    fn schema_21_to_23_and_future_additions_are_read_without_changes() {
+        for version in [20, 21, 22, 23, 24, 999] {
+            let root = temp_dir();
+            write_fixture_db(&root, version);
+            if version > KNOWN_SCHEMA_VERSION {
+                let connection = rusqlite::Connection::open(root.join(DB_FILE)).unwrap();
+                connection.execute_batch("ALTER TABLE providers ADD COLUMN future_option TEXT;
+                    CREATE TABLE future_state (id TEXT PRIMARY KEY, payload TEXT);").unwrap();
+            }
+            let before = std::fs::read(root.join(DB_FILE)).unwrap();
+            let mut files = std::fs::read_dir(&root).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>();
+            files.sort();
+            let scan = scan_dir(&root);
+            assert!(scan.found && scan.error.is_none(), "schema {version}: {scan:?}");
+            assert_eq!(scan.source.as_ref().unwrap().schema_version, Some(version));
+            assert_eq!(scan.providers.len(), 6);
+            let claude = scan.find("kimi", App::Claude).unwrap();
+            let codex = scan.find("relay", App::Codex).unwrap();
+            assert_eq!(claude.key.as_ref().unwrap().expose(), CLAUDE_KEY);
+            assert_eq!(codex.key.as_ref().unwrap().expose(), CODEX_KEY);
+            assert_eq!(codex.model.as_deref(), Some("gpt-5.1-codex"));
+            assert!(claude.current && codex.current);
+            assert!(claude.unsupported.is_none() && codex.unsupported.is_none());
+            let debug = format!("{scan:?}");
+            assert!(!debug.contains(CLAUDE_KEY) && !debug.contains(CODEX_KEY));
+            assert_eq!(before, std::fs::read(root.join(DB_FILE)).unwrap());
+            let mut after = std::fs::read_dir(&root).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>();
+            after.sort();
+            assert_eq!(files, after, "schema {version}: read must not create sidecars");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_optional_provider_columns_do_not_block_future_schemas() {
         let root = temp_dir();
-        write_fixture_db(&root, 21);
+        let connection = rusqlite::Connection::open(root.join(DB_FILE)).unwrap();
+        connection.execute_batch("CREATE TABLE providers (ID TEXT, APP_TYPE TEXT, SETTINGS_CONFIG TEXT);
+            PRAGMA user_version=999;").unwrap();
+        let settings = json!({"auth":{"OPENAI_API_KEY":CODEX_KEY},
+            "config":"base_url = \"https://relay.example.com/v1\"\nmodel = \"fixture-model\"\n"});
+        connection.execute("INSERT INTO providers VALUES (?1, ?2, ?3)",
+            rusqlite::params!["minimal", "codex", settings.to_string()]).unwrap();
+        drop(connection);
+        let scan = scan_dir(&root);
+        assert!(scan.error.is_none(), "{scan:?}");
+        let provider = scan.find("minimal", App::Codex).unwrap();
+        assert_eq!(provider.name, "minimal");
+        assert_eq!(provider.key.as_ref().unwrap().expose(), CODEX_KEY);
+        assert_eq!(provider.model.as_deref(), Some("fixture-model"));
+        assert!(!provider.current && provider.unsupported.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incompatible_provider_layouts_have_stable_secret_free_codes() {
+        for version in [23, 24, 999] {
+            for missing in ["id", "app_type", "settings_config", "providers"] {
+                let root = temp_dir();
+                write_fixture_db(&root, version);
+                let connection = rusqlite::Connection::open(root.join(DB_FILE)).unwrap();
+                connection.execute_batch("ALTER TABLE providers RENAME TO future_providers").unwrap();
+                if missing != "providers" {
+                    let fields = ["id TEXT", "app_type TEXT", "settings_config TEXT"].into_iter()
+                        .filter(|field| !field.starts_with(missing)).collect::<Vec<_>>().join(", ");
+                    connection.execute_batch(&format!("CREATE TABLE providers ({fields})")).unwrap();
+                }
+                drop(connection);
+                let before = std::fs::read(root.join(DB_FILE)).unwrap();
+                let scan = scan_dir(&root);
+                assert!(scan.found && scan.providers.is_empty());
+                let error = scan.error.unwrap();
+                assert_eq!(error.code, if version > KNOWN_SCHEMA_VERSION { "unsupported_version" } else { "unsupported_format" });
+                assert!(!error.message.contains(CLAUDE_KEY) && !error.message.contains(CODEX_KEY));
+                assert_eq!(scan.source.unwrap().schema_version, Some(version));
+                assert_eq!(before, std::fs::read(root.join(DB_FILE)).unwrap());
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_sqlite_is_unreadable_rather_than_incompatible() {
+        let root = temp_dir();
+        std::fs::write(root.join(DB_FILE), b"synthetic invalid sqlite").unwrap();
         let scan = scan_dir(&root);
         assert!(scan.found && scan.providers.is_empty());
-        let error = scan.error.unwrap();
-        assert_eq!(error.code, "unsupported_version");
-        assert!(error.message.contains("newer CC Switch format"), "{}", error.message);
-        assert_eq!(scan.source.unwrap().schema_version, Some(21));
-        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(scan.error.unwrap().code, "unreadable");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

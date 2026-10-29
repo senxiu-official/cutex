@@ -2261,6 +2261,7 @@ mod tests {
             thread_id: parent.clone(),
             runtime_generation: 7,
             runtime_backend: "host".to_owned(),
+            full_text_item_terminal: false,
             launched_profile: None,
             launched_profile_id: None,
             usage: Default::default(),

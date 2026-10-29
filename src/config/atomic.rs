@@ -93,11 +93,15 @@ fn write_bytes_atomic_with_privacy(
         let created = options.open(&tmp_path).map_err(anyhow::Error::from);
         let mut file = created
             .with_context(|| format!("Failed to create temp file: {}", tmp_path.display()))?;
+        #[cfg(test)]
+        test_hook::stage(test_hook::Stage::Created, &tmp_path);
         file.write_all(data)
             .with_context(|| format!("Failed to write temp file: {}", tmp_path.display()))?;
         file.sync_all()
             .with_context(|| format!("Failed to sync temp file: {}", tmp_path.display()))?;
         drop(file);
+        #[cfg(test)]
+        test_hook::stage(test_hook::Stage::Written, &tmp_path);
         replace_file_atomic(&tmp_path, path)
             .with_context(|| format!("Failed to replace {}", path.display()))?;
         #[cfg(unix)]
@@ -209,4 +213,48 @@ fn sync_parent_dir_after_atomic_replace(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn sync_parent_dir_after_atomic_replace(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+/// Test-only observer of the temp file between its creation and the rename,
+/// so tests can check that permissions are in place before any secret byte.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        /// Created, nothing written yet.
+        Created,
+        /// Written and synced, not yet renamed over the target.
+        Written,
+    }
+
+    type Hook = Box<dyn FnMut(Stage, &Path)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    /// Observe this thread's atomic writes until the guard drops.
+    pub(crate) fn observe(hook: impl FnMut(Stage, &Path) + 'static) -> Guard {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn stage(stage: Stage, tmp_path: &Path) {
+        HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(stage, tmp_path);
+            }
+        });
+    }
 }

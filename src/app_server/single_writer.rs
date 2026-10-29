@@ -38,6 +38,10 @@
 //! longer applies: launchers write again until Management adopts anew.
 //! Management releases its lease when its connection ends.
 //!
+//! Capability-enabled presentation text still advances emission-time/lease
+//! classification but is never retained/replayed. Its complete durable item
+//! repairs missed fragments. Without that capability, legacy replay is intact.
+//!
 //! Crash safety: each side keeps (bounded) the events the other side is
 //! responsible for. When a launcher sees the owner's cut move up (owner gone
 //! or released, or a later cut of a new owner), it journals the events of
@@ -92,7 +96,7 @@ pub enum Role {
     Launcher,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -251,6 +255,7 @@ impl Ledger {
             role,
             cut: None,
             last_emitted: None,
+            full_text_item_terminal: false,
             registered: false,
             leased: false,
             applied: None,
@@ -306,9 +311,17 @@ impl Ledger {
         let result = (|| {
             let mut file = self.read();
             file.version = FILE_VERSION;
-            file.leases.retain(|_, lease| (self.is_live)(&lease.owner));
+            // One liveness check per process, not per entry: after a restart
+            // every lease of the old Management names the same gone process.
+            let mut known = std::collections::HashMap::<ProcessIdentity, bool>::new();
+            let mut live = |process: &ProcessIdentity| {
+                *known
+                    .entry(process.clone())
+                    .or_insert_with(|| (self.is_live)(process))
+            };
+            file.leases.retain(|_, lease| live(&lease.owner));
             for writers in file.writers.values_mut() {
-                writers.retain(|writer| (self.is_live)(&writer.process));
+                writers.retain(|writer| live(&writer.process));
             }
             file.writers.retain(|_, writers| !writers.is_empty());
             let value = change(&mut file)?;
@@ -418,7 +431,7 @@ fn message_identity(message: &Value) -> Option<String> {
         return Some(format!("request\u{0}{method}\u{0}{id}"));
     }
     let emitted = emitted_at_ms(message)?;
-    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let params = message.get("params").unwrap_or(&Value::Null);
     let subject = params
         .get("itemId")
         .or_else(|| params.pointer("/item/id"))
@@ -498,6 +511,7 @@ pub struct ConnectionOwnership {
     /// Owner only: set by [`Self::activate`].
     cut: Option<i64>,
     last_emitted: Option<i64>,
+    full_text_item_terminal: bool,
     registered: bool,
     leased: bool,
     /// Launcher: the owner cut in effect when last looked (`None` inside: no
@@ -595,6 +609,15 @@ impl ConnectionOwnership {
         self.handles_at(event, now_ms())
     }
 
+    pub fn set_full_text_item_terminal(&mut self, enabled: bool) {
+        self.full_text_item_terminal = enabled;
+        if enabled {
+            self.retained.retain(|entry| !crate::management::v2::native_events::is_live_text_delta(&entry.event));
+            self.retained_bytes = self.retained.iter().map(|entry| entry.bytes).sum();
+            self.replay.retain(|event| !crate::management::v2::native_events::is_live_text_delta(event));
+        }
+    }
+
     pub fn handles_at(&mut self, event: &AppServerEvent, now: i64) -> bool {
         let local = matches!(
             event,
@@ -673,11 +696,18 @@ impl ConnectionOwnership {
     }
 
     fn retain(&mut self, key: i64, event: &AppServerEvent) {
+        // `handles_at` has already advanced emission-time/lease bookkeeping.
+        // Missing presentation fragments are repaired by authoritative finals;
+        // retaining them would reintroduce the durable delta path on takeover.
+        if self.full_text_item_terminal && crate::management::v2::native_events::is_live_text_delta(event) { return; }
         let bytes = match event {
-            AppServerEvent::Notification(notification) => notification.raw.to_string().len(),
-            AppServerEvent::ServerRequest(request) => request.raw.to_string().len(),
+            AppServerEvent::Notification(notification) => crate::management::v2::event_blobs::encoded_len(&notification.raw),
+            AppServerEvent::ServerRequest(request) => crate::management::v2::event_blobs::encoded_len(&request.raw),
             _ => 0,
         };
+        // This event would be evicted immediately below. Do not first clone
+        // an arbitrarily large payload just to drop the clone again.
+        if bytes > MAX_RETAINED_BYTES { return; }
         self.retained.push_back(Retained { key, event: event.clone(), bytes });
         self.retained_bytes += bytes;
         while self.retained.len() > MAX_RETAINED_EVENTS || self.retained_bytes > MAX_RETAINED_BYTES {

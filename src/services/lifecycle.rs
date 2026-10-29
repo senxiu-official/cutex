@@ -159,11 +159,16 @@ impl Lifecycle {
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
         let (leases, released) = self.facts(&record.slug, now);
-        if record.lifetime == ServiceLifetime::Persistent || leases > 0 || active > 0 {
+        if record.lifetime == ServiceLifetime::Persistent
+            || keep_until_archive(record, settings)
+            || leases > 0
+            || active > 0
+        {
             return None;
         }
         let last = [
             parse_time(&record.created_at),
+            record.retention_started_at.as_deref().and_then(parse_time),
             last_traffic.and_then(parse_time),
             Some(self.started_at),
             released,
@@ -171,7 +176,7 @@ impl Lifecycle {
         .into_iter()
         .flatten()
         .max()?;
-        Some(last + idle_duration(settings))
+        Some(last + idle_duration(record, settings))
     }
     pub fn reason(
         &self,
@@ -179,14 +184,25 @@ impl Lifecycle {
         settings: &ServicesSettings,
         last_traffic: Option<&str>,
         active: usize,
-        owner_archived: bool,
+        scope_archived: bool,
         now: DateTime<Utc>,
     ) -> Option<&'static str> {
         if record.lifetime != ServiceLifetime::Ephemeral {
             return None;
         }
-        if settings.reclaim_on_owner_archive && owner_archived {
-            return Some("owner_archived");
+        // Owner archive is reversible organisation, not deletion/reclaim.
+        if record.archived {
+            return None;
+        }
+        // The supervisor resolves the scope's lifecycle: the registering
+        // session for session services, the project for project services.
+        // This also applies to pinned ephemeral services (before TTL/idle).
+        if settings.reclaim_on_owner_archive && scope_archived {
+            return Some(if record.owner_scope.is_session() {
+                "owner_archived"
+            } else {
+                "project_archived"
+            });
         }
         if expires_at(record, settings).is_some_and(|at| now >= at) {
             return Some("ttl");
@@ -211,6 +227,16 @@ impl Lifecycle {
         view["leases"] = json!(self.facts(&record.slug, now).0);
         view["expiresAt"] = json!(expires_at(record, settings));
         view["idleReclaimAt"] = json!(self.idle_at(record, settings, last_traffic, active, now));
+        view["effectiveIdleTtlMinutes"] = if record.lifetime == ServiceLifetime::Ephemeral
+            && !keep_until_archive(record, settings)
+        {
+            json!(record
+                .idle_ttl_minutes
+                .unwrap_or(settings.ephemeral_idle_minutes))
+        } else {
+            Value::Null
+        };
+        view["maxIdleTtlMinutes"] = json!(settings.ephemeral_ttl_hours.saturating_mul(60));
         view["restartsLeft"] =
             if record.lifetime == ServiceLifetime::Ephemeral && record.runtime.supervised() {
                 json!(settings
@@ -221,7 +247,7 @@ impl Lifecycle {
             };
     }
 }
-fn idle_duration(settings: &ServicesSettings) -> Duration {
+fn idle_duration(record: &ServiceRecord, settings: &ServicesSettings) -> Duration {
     // Private debug smoke only; the API range and release behavior stay intact.
     #[cfg(debug_assertions)]
     if let Some(boundary) = std::env::var_os("CUTEX_TEST_PRIVATE_HOME")
@@ -249,7 +275,16 @@ fn idle_duration(settings: &ServicesSettings) -> Duration {
             }
         }
     }
-    Duration::minutes(settings.ephemeral_idle_minutes.into())
+    Duration::minutes(
+        record
+            .idle_ttl_minutes
+            .unwrap_or(settings.ephemeral_idle_minutes)
+            .into(),
+    )
+}
+
+fn keep_until_archive(record: &ServiceRecord, settings: &ServicesSettings) -> bool {
+    record.pinned || (record.idle_ttl_minutes.is_none() && settings.ephemeral_idle_minutes == 0)
 }
 fn expire(memory: &mut Memory, slug: &str, now: DateTime<Utc>) {
     if let Some(leases) = memory.leases.get_mut(slug) {
@@ -272,9 +307,13 @@ pub fn parse_time(s: &str) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 pub fn expires_at(record: &ServiceRecord, settings: &ServicesSettings) -> Option<DateTime<Utc>> {
-    (record.lifetime == ServiceLifetime::Ephemeral)
+    (record.lifetime == ServiceLifetime::Ephemeral && !keep_until_archive(record, settings))
         .then(|| {
-            parse_time(&record.created_at)
+            record
+                .retention_started_at
+                .as_deref()
+                .and_then(parse_time)
+                .or_else(|| parse_time(&record.created_at))
                 .map(|at| at + Duration::hours(settings.ephemeral_ttl_hours.into()))
         })
         .flatten()
@@ -360,6 +399,97 @@ mod tests {
                 now + Duration::days(100)
             ),
             None
+        );
+    }
+    /// services-project-scope: an archived registrant does not reclaim a
+    /// project service; idle / TTL still apply.
+    #[test]
+    fn project_services_outlive_their_archived_registrant() {
+        let now = Utc::now();
+        let life = Lifecycle::new(now);
+        let settings = ServicesSettings::default();
+        let mut record = record(now - Duration::hours(1));
+        record.owner_scope = crate::services::store::ServiceOwnerScope::Project;
+        record.project_id = Some("proj".into());
+        assert_eq!(life.reason(&record, &settings, None, 0, false, now), None);
+        assert_eq!(
+            life.reason(&record, &settings, None, 0, false, now + Duration::hours(24)),
+            Some("ttl")
+        );
+        record.owner_scope = crate::services::store::ServiceOwnerScope::Session;
+        assert_eq!(life.reason(&record, &settings, None, 0, true, now), Some("owner_archived"));
+    }
+    #[test]
+    fn project_archive_reclaims_pins_but_respects_settings_and_service_archive() {
+        let now = Utc::now();
+        let life = Lifecycle::new(now);
+        let mut settings = ServicesSettings::default();
+        let mut service = record(now);
+        service.owner_scope = crate::services::store::ServiceOwnerScope::Project;
+        service.project_id = Some("proj".into());
+        for pinned in [false, true] {
+            service.pinned = pinned;
+            assert_eq!(life.reason(&service, &settings, None, 0, true, now), Some("project_archived"));
+        }
+        settings.ephemeral_idle_minutes = 0;
+        service.pinned = false;
+        assert_eq!(life.reason(&service, &settings, None, 0, true, now), Some("project_archived"));
+        settings.reclaim_on_owner_archive = false;
+        assert_eq!(life.reason(&service, &settings, None, 0, true, now), None);
+        settings.reclaim_on_owner_archive = true;
+        service.archived = true;
+        assert_eq!(life.reason(&service, &settings, None, 0, true, now), None);
+        service.archived = false;
+        service.lifetime = ServiceLifetime::Persistent;
+        assert_eq!(life.reason(&service, &settings, None, 0, true, now), None);
+    }
+    #[test]
+    fn service_override_and_pin_control_ephemeral_reclaim() {
+        let now = Utc::now();
+        let life = Lifecycle::new(now);
+        let mut settings = ServicesSettings::default();
+        let mut service = record(now);
+
+        service.idle_ttl_minutes = Some(120);
+        assert_eq!(
+            life.idle_at(&service, &settings, None, 0, now),
+            Some(now + Duration::minutes(120))
+        );
+
+        service.pinned = true;
+        assert_eq!(life.idle_at(&service, &settings, None, 0, now), None);
+        assert_eq!(expires_at(&service, &settings), None);
+        assert_eq!(
+            life.reason(&service, &settings, None, 0, true, now),
+            Some("owner_archived")
+        );
+
+        service.pinned = false;
+        service.idle_ttl_minutes = None;
+        settings.ephemeral_idle_minutes = 0;
+        assert_eq!(life.idle_at(&service, &settings, None, 0, now), None);
+        assert_eq!(expires_at(&service, &settings), None);
+
+        service.idle_ttl_minutes = Some(30);
+        assert_eq!(
+            life.idle_at(&service, &settings, None, 0, now),
+            Some(now + Duration::minutes(30))
+        );
+        assert!(expires_at(&service, &settings).is_some());
+
+        service.archived = true;
+        assert_eq!(
+            life.reason(&service, &settings, None, 0, true, now + Duration::days(30)),
+            None
+        );
+
+        let mut restored = record(now - Duration::days(30));
+        restored.retention_started_at = Some(now.to_rfc3339());
+        assert_eq!(expires_at(&restored, &settings), None);
+        settings.ephemeral_idle_minutes = 30;
+        assert_eq!(
+            expires_at(&restored, &settings),
+            Some(now + Duration::hours(settings.ephemeral_ttl_hours.into()))
         );
     }
     #[test]

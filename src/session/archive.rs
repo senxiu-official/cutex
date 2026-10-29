@@ -214,6 +214,8 @@ pub fn validate_restore_preconditions(
     record: &CutexSessionRecord,
     expected_revision: u64,
 ) -> Result<(), CutexSessionArchiveError> {
+    crate::agent_management::ensure_agent_not_permanently_retired(record)
+        .map_err(|error| CutexSessionArchiveError::PersistenceUnavailable { detail: error.to_string() })?;
     let actual_revision = record.durable_revision();
     if actual_revision != expected_revision {
         return Err(CutexSessionArchiveError::StaleRevision {

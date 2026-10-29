@@ -7,6 +7,9 @@ use crate::short_ids::{Entry, Index, Kind};
 use serde_json::{json, Value};
 
 pub const PATH: &str = "/api/asks/v1/resolve-ids";
+// Absorb ordinary writer contention without asking agents to retry business
+// calls. Persistent contention still refuses before receipt/business admission.
+const PREFLIGHT_LOOKUP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 fn failure(e: anyhow::Error) -> AskError {
     AskError::new(
         "persistence_unavailable",
@@ -15,7 +18,7 @@ fn failure(e: anyhow::Error) -> AskError {
 }
 fn participant(state: &AskState, ask: &str, caller: &str) -> bool {
     state.asks.get(ask).is_some_and(|ask| {
-        ask.requester.session() == Some(caller) || (ask.remote.is_none() && ask.target_cutex_session_id == caller)
+        ask.readable_by(caller) || (ask.remote.is_none() && ask.target_cutex_session_id == caller)
     })
 }
 pub fn universe(ctx: &ToolContext<'_>) -> Result<Index, AskError> {
@@ -37,6 +40,7 @@ pub fn universe(ctx: &ToolContext<'_>) -> Result<Index, AskError> {
                 .map(|id| Entry::id(id.clone())),
         )
         .collect();
+    entries.extend(ctx.store.archived_identities().map_err(failure)?.into_iter().map(|(_,id)|Entry::id(id)));
     if let Some(store) = ctx.world.document_store() {
         entries.extend(store.all_ids().map_err(failure)?.into_iter().map(Entry::id));
     }
@@ -56,7 +60,7 @@ fn resolve(
                 .asks
                 .range(String::new()..)
                 .filter(|(_, ask)| {
-                    ask.requester.session() == Some(ctx.caller)
+                    ask.readable_by(ctx.caller)
                         || (ask.remote.is_none() && ask.target_cutex_session_id == ctx.caller)
                 })
                 .map(|(id, _)| Entry::id(id.clone())),
@@ -67,7 +71,8 @@ fn resolve(
             state
                 .questions
                 .range(String::new()..)
-                .filter(|(_, q)| participant(state, &q.ask_id, ctx.caller))
+                .filter(|(_, q)| participant(state, &q.ask_id, ctx.caller)
+                    || state.asks.get(&q.ask_id).is_some_and(|ask|super::questions::may_answer(ask,ctx.caller).unwrap_or(false)))
                 .map(|(id, _)| Entry::id(id.clone())),
         );
     }
@@ -123,30 +128,63 @@ fn resolve(
     )
 }
 
-pub fn normalize(ctx: &ToolContext<'_>, tool: &str, mut args: Value) -> Result<Value, AskError> {
+pub fn normalize(ctx: &ToolContext<'_>, tool: &str, args: Value) -> Result<Value, AskError> {
+    normalize_inner(ctx, tool, args, false)
+}
+
+fn normalize_inner(ctx: &ToolContext<'_>, tool: &str, mut args: Value, preflight: bool) -> Result<Value, AskError> {
     let (tool, canonical) = if super::tools::is_tool(tool) {
         super::tools::canonical(tool, args)
     } else {
         (tool, args)
     };
     args = canonical;
+    super::tools::check_director_peer_alias(&args)?;
+    // A role address is resolved once by the authority-fenced tools handler, not by names.
     // A cross-host tell carries only `to` (name@host) and inline text: refuse
     // other options precisely, before any local ID resolution.
     if tool == "agent_tell" && args["to"].as_str().is_some_and(|to| to.contains('@')) {
         crate::peers::tells::check_options(&args)?;
         return Ok(args);
     }
-    let state = ctx.store.snapshot().map_err(failure)?;
+    let mut resources=Vec::new();
+    for field in ["delegation","follow_up","question","artifact"] {
+        if let Some(input)=args[field].as_str() {resources.push(input);}
+    }
+    for field in ["delegations","attachments"] {
+        if let Some(inputs)=args[field].as_array() {resources.extend(inputs.iter().filter_map(Value::as_str));}
+    }
+    // Keep canonical IDs before the receipt/business digests. Moving this to
+    // a worker would change alias replay semantics. Only these slow tools opt
+    // into bounded lock waiting before no-write refusal; their business handler
+    // is unchanged. This never retries or replays a business operation.
+    let state = if preflight && matches!(tool, "agent_create" | "agent_delegate") {
+        ctx.store.lookup_snapshot_with_timeout(&resources, PREFLIGHT_LOOKUP_LOCK_TIMEOUT).map_err(failure)?
+            .ok_or_else(|| {
+                let mut extra = json!({"retryable":true});
+                if let Some(id) = args["action_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 128
+                    && id.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:-/@".contains(&c))) {
+                    extra["action_id"] = json!(id);
+                }
+                AskError::new("id_resolution_busy",
+                    "This invocation stopped before business admission because the asks ID lookup lock is busy. Earlier calls with this action_id may already have effects. Retry only with the same action_id; do not create a replacement action.")
+                    .with(extra)
+            })?
+    } else {
+        ctx.store.lookup_snapshot(&resources).map_err(failure)?
+    };
     let directory = ctx.world.directory()?;
     // Complete-only reply exception stays in Directory::resolve_tell.
     for field in match tool {
-        "agent_delegate" => vec!["target"],
+        "agent_delegate" | "agent_pause" | "agent_resume" => vec!["target"],
         "agent_tell" | "alarm_set" => vec!["to"],
-        "agent_archive" | "member_runtime" => vec!["cutex_session_id"],
+        "agent_archive" | "agent_restore" | "member_runtime" => vec!["cutex_session_id"],
         "member_replace" => vec!["predecessor_cutex_session_id"],
         _ => vec![],
     } {
         if let Some(input) = args[field].as_str() {
+            if matches!(tool, "agent_delegate" | "agent_tell" | "alarm_set") && ctx.facade >= super::tools::FACADE_DIRECTOR_ADDRESS && input.trim().eq_ignore_ascii_case("director") { continue; }
+            if !matches!(tool, "agent_delegate" | "agent_tell" | "alarm_set") && input.trim().eq_ignore_ascii_case("director") { return Err(AskError::new("director_alias_unsupported", "Role addresses are not identity/resource selectors")); }
             if matches!(tool, "agent_delegate" | "agent_tell") && input.contains('@') { continue; }
             if tool == "alarm_set" && input.contains('@') { return Err(AskError::new("remote_unsupported", "alarms are local to a host: set it for an agent on this host")); }
             if input.contains('@') { return Err(AskError::new("remote_unsupported", "only agent_delegate and agent_tell support other hosts")); }
@@ -155,7 +193,7 @@ pub fn normalize(ctx: &ToolContext<'_>, tool: &str, mut args: Value) -> Result<V
             // state and idempotent replay; resolving it here would turn an
             // exact retry against an already archived/replaced target into
             // `recipient_archived` before its receipt can be returned.
-            if matches!(tool, "agent_archive" | "member_runtime" | "member_replace")
+            if matches!(tool, "agent_archive" | "agent_restore" | "member_runtime" | "member_replace")
                 && is_complete_session_id(input)
             {
                 args[field] = json!(input.trim());
@@ -241,7 +279,7 @@ pub fn handle(ctx: &ToolContext<'_>, body: &[u8]) -> Value {
             return AskError::new("invalid_arguments", "expected tool and arguments").to_json()
         }
     };
-    match normalize(ctx, &request.tool, request.arguments) {
+    match normalize_inner(ctx, &request.tool, request.arguments, true) {
         Ok(arguments) => json!({"ok":true,"arguments":arguments}),
         Err(error) => error.to_json(),
     }
@@ -256,6 +294,21 @@ pub(crate) mod tests {
         tools,
     };
     use chrono::Utc;
+
+    #[test]
+    fn designated_director_can_resolve_its_question_without_whole_delegation_access(){
+        context("question-role-visibility",|ctx|{
+            let mut new=new_ask("question-only","private delegation brief");
+            let original="cutex.00000000-0000-0000-0000-0000000000c1";
+            new.requester=super::super::model::Requester::Agent{cutex_session_id:original.into(),name:None};
+            let (ask,_)=ctx.store.with_state(|state|state.create_ask(new,ctx.now)).unwrap().unwrap();
+            super::super::model::route::pin(&ask.ask_id,super::super::model::route::Pin{controller:Err("handover_pending_review"),history:vec![original.into()],questions:Some(ctx.caller.into())});
+            let question="q-abcdef12345600000000000000000000";
+            ctx.store.with_state(|state|{let record=serde_json::from_value(json!({"questionId":question,"askId":ask.ask_id,"attempt":1,"runtimeGeneration":1,"native":{"threadId":"fixture","turnId":"fixture","itemId":"fixture","requestId":1},"questions":[],"route":"requester","state":"open","createdAt":ctx.now.to_rfc3339()})).unwrap();state.questions.insert(question.into(),record);}).unwrap();
+            assert_eq!(normalize(ctx,"question_answer",json!({"question":"q-abcdef"})).unwrap()["question"],question);
+            assert_eq!(normalize(ctx,"delegation_read",json!({"delegation":ask.ask_id})).unwrap_err().code,"id_not_found");
+        });
+    }
 
     pub(crate) fn context<T>(label: &str, f: impl FnOnce(&ToolContext<'_>) -> T) -> T {
         let (world, _world_dir) = world(label);
@@ -505,3 +558,7 @@ pub(crate) mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "short_ids_preflight_tests.rs"]
+mod preflight_tests;

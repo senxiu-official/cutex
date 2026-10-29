@@ -491,13 +491,17 @@ pub fn process_is_running(pid: u32) -> bool {
     }
 }
 
+/// The PIDs of `pids` that are running. On Windows each PID is asked directly
+/// (`OpenProcess`); only the ones that cannot be answered that way (access
+/// denied: a protected or other-session process) share one process snapshot,
+/// so a batch costs at most one fallback however many PIDs it checks.
 pub fn running_process_ids(pids: &[u32]) -> HashSet<u32> {
     #[cfg(windows)]
     {
         running_process_ids_with_fallback(
             pids,
             windows_process_is_running_without_tasklist,
-            windows_tasklist_running_process_ids,
+            windows_fallback_running_process_ids,
         )
     }
     #[cfg(not(windows))]
@@ -568,13 +572,62 @@ fn windows_process_is_running_with_access(pid: u32, access: u32) -> Option<bool>
     unsafe {
         let handle = OpenProcess(access, 0, pid);
         if handle.is_null() {
-            return None;
+            return open_process_failure_liveness(
+                windows_sys::Win32::Foundation::GetLastError(),
+            );
         }
         let mut exit_code = 0u32;
         let ok = GetExitCodeProcess(handle, &mut exit_code) != 0;
         CloseHandle(handle);
         ok.then_some(exit_code == STILL_ACTIVE as u32)
     }
+}
+
+/// What a failed `OpenProcess` says about the PID. `ERROR_INVALID_PARAMETER`
+/// is Windows' answer for a PID that names no process: definitely not running
+/// (before, this went to the `tasklist` fallback, about 2.4 s per dead PID).
+/// Anything else (`ERROR_ACCESS_DENIED` for a protected or elevated process)
+/// says nothing about liveness: unknown, resolved by the fallback.
+#[cfg(any(windows, test))]
+fn open_process_failure_liveness(error: u32) -> Option<bool> {
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    (error == ERROR_INVALID_PARAMETER).then_some(false)
+}
+
+/// The running PIDs for the ones `OpenProcess` could not answer: a ToolHelp
+/// snapshot (milliseconds), else `tasklist` (seconds) if the snapshot fails.
+#[cfg(windows)]
+fn windows_fallback_running_process_ids() -> Option<HashSet<u32>> {
+    windows_snapshot_running_process_ids().or_else(windows_tasklist_running_process_ids)
+}
+
+#[cfg(windows)]
+fn windows_snapshot_running_process_ids() -> Option<HashSet<u32>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..PROCESSENTRY32W::default()
+    };
+    let mut running = HashSet::new();
+    let mut available = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while available {
+        running.insert(entry.th32ProcessID);
+        available = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    // An empty walk is a failed snapshot, not "nothing runs" (this process does).
+    (!running.is_empty()).then_some(running)
 }
 
 #[cfg(windows)]
@@ -622,6 +675,86 @@ fn tasklist_csv_pid_field(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_process_failures_mean_gone_or_unknown() {
+        // No such process: not running, no fallback.
+        assert_eq!(open_process_failure_liveness(87), Some(false));
+        // Access denied (protected / elevated / other session): unknown.
+        assert_eq!(open_process_failure_liveness(5), None);
+        assert_eq!(open_process_failure_liveness(0), None);
+    }
+
+    #[test]
+    fn a_batch_takes_at_most_one_fallback() {
+        let mut fallbacks = 0;
+        let running = running_process_ids_with_fallback(
+            &[10, 11, 12, 13, 13, 0],
+            |pid| match pid {
+                10 => Some(true),
+                11 => Some(false),
+                _ => None,
+            },
+            || {
+                fallbacks += 1;
+                Some(HashSet::from([12]))
+            },
+        );
+        assert_eq!(fallbacks, 1);
+        assert_eq!(running, HashSet::from([10, 12]));
+
+        // Every PID answered directly (alive or gone): no fallback at all.
+        let mut fallbacks = 0;
+        let running = running_process_ids_with_fallback(
+            &[10, 11],
+            |pid| Some(pid == 10),
+            || {
+                fallbacks += 1;
+                None
+            },
+        );
+        assert_eq!(fallbacks, 0);
+        assert_eq!(running, HashSet::from([10]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_dead_pid_is_answered_directly_and_fast() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+        let pid = child.id();
+        child.wait().expect("wait cmd");
+        // Dropping the Child closes its process handle: the PID then names no process.
+        drop(child);
+        let started = Instant::now();
+        assert_eq!(windows_process_is_running_without_tasklist(pid), Some(false));
+        assert!(!process_is_running(pid));
+        assert!(running_process_ids(&[pid]).is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "dead PID check took {:?} (tasklist fallback?)",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_and_live_pids_are_running() {
+        let me = std::process::id();
+        assert_eq!(windows_process_is_running_without_tasklist(me), Some(true));
+        let snapshot = windows_snapshot_running_process_ids().expect("process snapshot");
+        assert!(snapshot.contains(&me));
+        // PID 4 is the System process: always there, and without elevation
+        // OpenProcess may be refused; either way it is running.
+        assert!(snapshot.contains(&4));
+        assert!(process_is_running(4));
+        assert_eq!(running_process_ids(&[me, 4]), HashSet::from([me, 4]));
+    }
 
     #[test]
     fn process_zero_is_not_running() {

@@ -170,6 +170,7 @@ pub(super) fn create_configured_with(
     let native = create_native(&cwd, &configuration, |_| {})?;
     cutex::notify::session::session(&native, cutex::notify::session::Change::Set(notification))?;
     adopt(&cutex::agent_management::HumanAdoptRequest {
+        owner_created_native: true,
             session_only: false,
             creation_defaults: Some(cutex::agent_management::HumanCreationDefaults {
                 profile: configuration.profile_name.clone(),
@@ -552,6 +553,7 @@ pub(super) fn adopt_saved(
         .context("saved thread cwd missing")?;
     let result = super::management_control_plane::ManagementControlClient::connect()?
         .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+            owner_created_native: false,
             session_only: false,
             creation_defaults: None,
             action_id: cutex::agent_management::AgentActionId::new(format!(
@@ -594,6 +596,7 @@ pub(super) fn create_owned_session_with(
     timing.phase("create_native");
     let permissions = launch_permissions(&configuration);
     let result = adopt(&cutex::agent_management::HumanAdoptRequest {
+        owner_created_native: true,
         session_only: true,
         action_id: cutex::agent_management::AgentActionId::new(format!("session-owner-{native}"))?,
         native_id: native.clone(),
@@ -708,7 +711,9 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: "00000000-0000-4000-8000-0000000000a1".into(),
             name: "orchid".into(),
             email: None,
@@ -726,6 +731,7 @@ mod tests {
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         };
         cutex::profiles::store::save_store(&AccountsStore {
             version: cutex::profiles::model::STORE_VERSION,

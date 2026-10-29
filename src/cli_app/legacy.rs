@@ -166,7 +166,9 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: format!("{name}-id"),
             name: name.to_string(),
             email: None,
@@ -184,6 +186,7 @@ mod tests {
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         }
     }
 
@@ -1162,7 +1165,9 @@ base_url = "https://new.example"
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: "demo-id".to_string(),
             name: "demo".to_string(),
             email: None,
@@ -1180,6 +1185,7 @@ base_url = "https://new.example"
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         };
 
         let normalized = normalize_profile_config_for_account(&account, None)
@@ -1214,7 +1220,9 @@ base_url = "https://new.example"
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: "demo-id".to_string(),
             name: "demo".to_string(),
             email: None,
@@ -1232,6 +1240,7 @@ base_url = "https://new.example"
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         };
         let existing = r#"
 [tui]

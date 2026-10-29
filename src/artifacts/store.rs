@@ -16,6 +16,7 @@ use super::{ArtifactSummary, ArtifactVersion, GitInfo, Producer, Scope, Which};
 pub const OPEN_WINDOW_CAP_MS: i64 = 24 * 60 * 60 * 1000;
 /// Idempotency records are kept this long.
 const ACTION_RETENTION_DAYS: i64 = 30;
+const CAPTURE_REQUESTED_PREFIX: &str = "captureRequestedAt:";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -885,6 +886,32 @@ impl ArtifactStore {
             params![session_id, ended_at_ms],
         )?;
         Ok(project.flatten())
+    }
+
+    /// A completion without a matching start still requests a scan, but must
+    /// not invent an attribution window. Keep one durable marker per project.
+    pub(crate) fn note_capture_requested(&self, project: &str, at_ms: i64) -> anyhow::Result<()> {
+        self.set_meta(&format!("{CAPTURE_REQUESTED_PREFIX}{project}"), Some(&at_ms.to_string()))
+    }
+
+    /// Bounded recovery of scan requests after the in-memory scan queue fills.
+    /// The turn recorder persists the boundary before submitting a request, so
+    /// completed windows plus orphan-completion request markers are the source
+    /// of truth; no current-session attribution or growing overflow list is
+    /// needed. Keyset paging keeps memory bounded.
+    pub(crate) fn capture_projects_since(&self, since_ms: i64, after: Option<&str>, limit: usize) -> anyhow::Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT project_id FROM (
+                 SELECT project_id FROM turn_windows WHERE project_id IS NOT NULL AND ended_at_ms >= ?1
+                 UNION
+                 SELECT SUBSTR(key, ?4) AS project_id FROM meta
+                 WHERE key GLOB ?5 AND CAST(value AS INTEGER) >= ?1
+             ) WHERE (?2 IS NULL OR project_id > ?2)
+             ORDER BY project_id LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![since_ms, after, limit.clamp(1, 128) as i64, (CAPTURE_REQUESTED_PREFIX.len() + 1) as i64, format!("{CAPTURE_REQUESTED_PREFIX}*")], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
     }
 
     /// Windows of a project that end at or after `since_ms` (open ones

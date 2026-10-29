@@ -30,6 +30,22 @@ impl Service {
     }
 }
 
+/// A managed install's bus unit written before r248 has no `KillMode`, so
+/// stopping it kills the agent runtimes in its cgroup: patch it first
+/// (`upgrade::service::keep_bus_children`) and reload, as the upgrade runner does.
+#[cfg(target_os = "linux")]
+fn keep_bus_children_before_stop(unit: &str) -> anyhow::Result<()> {
+    let Some(record) = supervisor::managed_layout().and_then(|layout| layout.read_install().ok()) else { return Ok(()) };
+    let Some(dir) = record.unit_dir.map(std::path::PathBuf::from).or_else(cutex::upgrade::service::default_unit_dir) else {
+        return Ok(());
+    };
+    if cutex::upgrade::service::keep_bus_children(&dir, unit)? {
+        let status = Command::new("systemctl").args(["--user", "daemon-reload"]).status().context("Cannot run systemctl --user")?;
+        ensure!(status.success(), "systemctl --user daemon-reload failed after patching {unit}");
+    }
+    Ok(())
+}
+
 pub(super) fn run(service: Service, action: Action) -> anyhow::Result<String> {
     // These controls operate the default instance's machine-wide services.
     cutex::config::instance::refuse_in_instance("Service controls")?;
@@ -46,6 +62,9 @@ fn run_inner(service: Service, action: Action) -> anyhow::Result<String> {
     #[cfg(target_os = "linux")]
     {
         let verb = match action { Action::Status => "show", Action::Start => "start", Action::Stop => "stop", Action::Restart => "restart" };
+        if matches!(service, Service::Bus) && matches!(action, Action::Stop | Action::Restart) {
+            keep_bus_children_before_stop(&service.managed_unit())?;
+        }
         let mut command = Command::new("systemctl");
         command.args(["--user", verb, &service.managed_unit()]);
         if action == Action::Status {

@@ -48,6 +48,45 @@ fn is_claude_spec(spec: &ManagedAgentSpec) -> anyhow::Result<bool> {
     Ok(account.cli_kind == cutex::profiles::model::CliKind::Claude)
 }
 
+/// r265: an agent_create / member_replace spec resolved to a DSH variant
+/// (a DSH profile, or `dsh` on a DeepSeek API-key profile).
+fn is_dsh_spec(spec: &ManagedAgentSpec) -> bool {
+    spec.runtime_backend == "dsh"
+}
+
+/// r266: a spec resolved to a Kimi Code variant (a Kimi-kind profile, or
+/// `kimi` on a Kimi / Moonshot API-key profile).
+fn is_kimi_spec(spec: &ManagedAgentSpec) -> bool {
+    spec.runtime_backend == "kimi"
+}
+
+/// ACP-adapter agents (DSH, Kimi Code): one saved record and binding shape.
+fn is_acp_spec(spec: &ManagedAgentSpec) -> bool {
+    is_dsh_spec(spec) || is_kimi_spec(spec)
+}
+
+/// Agents whose runtime record is created before any process starts (Claude
+/// adapter, DSH): bootstrap reconciliation reads the saved record.
+fn is_saved_record_spec(spec: &ManagedAgentSpec) -> anyhow::Result<bool> {
+    Ok(is_acp_spec(spec) || is_claude_spec(spec)?)
+}
+
+/// The profile's DSH variant (r265 has at most one variant per runtime).
+fn dsh_variant_id(spec: &ManagedAgentSpec) -> anyhow::Result<String> {
+    runtime_variant_id(spec, cutex::profiles::model::CliKind::Dsh)
+}
+
+fn runtime_variant_id(spec: &ManagedAgentSpec, runtime: cutex::profiles::model::CliKind) -> anyhow::Result<String> {
+    let store = super::account_store::load_store_read_only()?;
+    let name = spec.profile.as_deref().context("Profile required")?;
+    let account = cutex::profiles::lookup::find_account(&store, name)?.context("Profile not found")?;
+    cutex::profiles::runtime_variants::variants(account)
+        .into_iter()
+        .find(|variant| variant.runtime == runtime)
+        .map(|variant| variant.id)
+        .with_context(|| format!("the profile has no {} variant", cutex::profiles::runtime_variants::runtime_name(&runtime)))
+}
+
 /// Claude Management creation launches with full access / approval never.
 /// Accept every alias cutex accepts for that level (`full-access`,
 /// `danger-full-access`, `:danger-full-access`, `danger`), not just one
@@ -106,9 +145,10 @@ fn reconcile_claude_bootstrap(spec: &ManagedAgentSpec, started: &Rfc3339, failed
         let timestamp = chrono::DateTime::parse_from_rfc3339(&record.created_at).map_err(unknown("claude_bootstrap_timestamp_invalid"))?;
         let start = chrono::DateTime::parse_from_rfc3339(started.as_str()).map_err(unknown("claude_bootstrap_timestamp_invalid"))?;
         let end = chrono::DateTime::parse_from_rfc3339(failed.as_str()).map_err(unknown("claude_bootstrap_timestamp_invalid"))?;
-        if record.claude_session.is_some() && same_session_cwd(&record.cwd, &spec.cwd) && record.profile == spec.profile
+        let saved_kind = if is_acp_spec(spec) { record.dsh_session.is_some() } else { record.claude_session.is_some() };
+        if saved_kind && same_session_cwd(&record.cwd, &spec.cwd) && record.profile == spec.profile
             && record.formal_agent_name.as_deref() == Some(spec.name.as_str()) && timestamp >= start && timestamp <= end {
-            return Ok(NativeBootstrapIdentityReconciliation::Exact { native_session_id: record.app_server_thread_id().unwrap().into(), reason: "Exact saved Claude adapter identity and creation interval".into() });
+            return Ok(NativeBootstrapIdentityReconciliation::Exact { native_session_id: record.app_server_thread_id().unwrap().into(), reason: "Exact saved Claude adapter / DSH identity and creation interval".into() });
         }
     }
     Ok(NativeBootstrapIdentityReconciliation::Ambiguous { reason: "Reserved name/cwd has conflicting durable identity".into() })
@@ -128,6 +168,7 @@ fn execute_agent_management(
     request: AgentManagementRequest,
 ) -> serde_json::Value {
     let started = std::time::Instant::now();
+    super::agent_start_message::clear_effort_fallback();
     let action_id = request.action_id.clone();
     let caller_cutex_session = invocation.caller_cutex_session.clone();
     let response = match AgentManagementProvider::open_default() {
@@ -172,6 +213,7 @@ fn execute_agent_management(
     }
     let mut value = serde_json::to_value(response).expect("Agent Management response is serializable");
     super::agent_start_message::add_first_message(&mut value, started);
+    super::agent_start_message::add_effort_fallback(&mut value);
     value
 }
 
@@ -298,6 +340,48 @@ pub(crate) fn import_legacy_director_ownership(
         outcome,
     })
     .expect("legacy Director ownership import response is serializable")
+}
+
+/// The binary's create-abandon effects: delete the durable session through
+/// the Management delete path (recovery copy under runtime/session-deletes),
+/// or move a session-less native thread aside.
+struct CreateAbandonEffects;
+
+impl cutex::agent_management::CreateAbandonCleanup for CreateAbandonEffects {
+    fn durable_session_exists(&self, cutex_session_id: &str) -> bool {
+        load_cutex_session_store().is_ok_and(|store| {
+            store.sessions.values().any(|record| record.cutex_session_id == cutex_session_id && !cutex::agent_management::agent_execution_blocked(&record))
+        })
+    }
+
+    fn cleanup(&self, plan: &cutex::agent_management::CreateAbandonPlan) -> Result<Vec<String>, String> {
+        if let Some(id) = &plan.durable_session {
+            let request = cutex::management::v2::session_delete::SessionDeleteRequest { expected_revision: None, only_if_empty: false };
+            super::session_delete::delete_for_management(id, &request)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            return Ok(vec![format!("durable session {id}: deleted with its native thread (recovery copy under runtime/session-deletes)")]);
+        }
+        match &plan.native_thread {
+            Some(thread) => super::session_delete::move_abandoned_native_thread(&plan.action_id, thread).map_err(|error| format!("{error:#}")),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+/// `POST /v2/agent-management/create-abandon` (owner): see
+/// `cutex::agent_management::create_abandon`.
+pub(crate) fn abandon_agent_create(request: cutex::agent_management::CreateAbandonRequest) -> serde_json::Value {
+    let provider = match AgentManagementProvider::open_default() {
+        Ok(provider) => provider,
+        Err(error) => return serde_json::json!({"ok": false, "code": "persistence_unavailable", "detail": format!("{error:#}")}),
+    };
+    match provider.abandon_create(&request.action_id, request.dry_run, &CreateAbandonEffects) {
+        Ok(receipt) => serde_json::json!({"ok": true, "receipt": receipt}),
+        Err(error) => {
+            let (code, detail) = error.wire();
+            serde_json::json!({"ok": false, "code": code, "detail": detail})
+        }
+    }
 }
 
 pub(crate) fn reconcile_agent_reservation(
@@ -527,7 +611,7 @@ fn legacy_director_ownership_evidence_from_record(
             "durable_session_identity_mismatch",
         ));
     }
-    if !record.is_active() || record.retired_at.is_some() {
+    if !!cutex::agent_management::agent_execution_blocked(&record) || record.retired_at.is_some() {
         return Err(AgentManagementError::Conflict(
             "durable_director_session_retired",
         ));
@@ -875,6 +959,51 @@ impl AgentLifecycle for CutexAgentLifecycle {
 
     fn effective_create_spec(&self, spec: &ManagedAgentSpec) -> Result<ManagedAgentSpec, LifecycleFailure> {
         let mut effective = spec.clone();
+        if is_kimi_spec(spec) {
+            use cutex::agent_management::envelope::{ApprovalStrictness, SandboxLevel};
+            let sandbox = SandboxLevel::parse(&effective.sandbox_mode).ok_or_else(|| {
+                LifecycleFailure::definite("invalid_sandbox_mode", format!("unknown sandbox {:?}", effective.sandbox_mode))
+            })?;
+            let approval = ApprovalStrictness::parse(&effective.approval_policy).ok_or_else(|| {
+                LifecycleFailure::definite("invalid_approval_policy", format!("unknown approval policy {:?}", effective.approval_policy))
+            })?;
+            effective.permissions = sandbox.as_str().into();
+            effective.sandbox_mode = sandbox.as_str().into();
+            effective.approval_policy = approval.as_str().into();
+            cutex::profiles::kimi::validate_model(&effective.model).map_err(definite("invalid_model"))?;
+            if cutex::profiles::reasoning::is_default(&effective.reasoning) {
+                effective.reasoning.clear();
+            }
+            if !effective.reasoning.is_empty() {
+                cutex::profiles::kimi::validate_effort(&effective.reasoning).map_err(definite("invalid_reasoning"))?;
+            }
+            runtime_variant_id(&effective, cutex::profiles::model::CliKind::Kimi).map_err(definite("profile_preflight_failed"))?;
+            return Ok(effective);
+        }
+        if is_dsh_spec(spec) {
+            use cutex::agent_management::envelope::{ApprovalStrictness, SandboxLevel};
+            let sandbox = SandboxLevel::parse(&effective.sandbox_mode).ok_or_else(|| {
+                LifecycleFailure::definite("invalid_sandbox_mode", format!("unknown sandbox {:?}", effective.sandbox_mode))
+            })?;
+            let approval = ApprovalStrictness::parse(&effective.approval_policy).ok_or_else(|| {
+                LifecycleFailure::definite("invalid_approval_policy", format!("unknown approval policy {:?}", effective.approval_policy))
+            })?;
+            effective.permissions = sandbox.as_str().into();
+            effective.sandbox_mode = sandbox.as_str().into();
+            effective.approval_policy = approval.as_str().into();
+            cutex::profiles::dsh::validate_catalog_model(&effective.model).map_err(definite("invalid_model"))?;
+            if cutex::profiles::reasoning::is_default(&effective.reasoning) {
+                effective.reasoning.clear();
+            }
+            if !effective.reasoning.is_empty() && !cutex::profiles::dsh::EFFORTS.contains(&effective.reasoning.as_str()) {
+                return Err(LifecycleFailure::definite(
+                    "invalid_reasoning",
+                    format!("DSH reasoning must be one of {}", cutex::profiles::dsh::EFFORTS.join(", ")),
+                ));
+            }
+            dsh_variant_id(&effective).map_err(definite("profile_preflight_failed"))?;
+            return Ok(effective);
+        }
         if is_claude_spec(spec).map_err(definite("profile_preflight_failed"))? {
             effective.runtime_backend = "claude_subscription".into();
             if effective.reasoning.trim().is_empty() { effective.reasoning = "default".into(); }
@@ -926,13 +1055,55 @@ impl AgentLifecycle for CutexAgentLifecycle {
     }
 
     fn bootstrap_native(&self, spec: &ManagedAgentSpec) -> Result<String, LifecycleFailure> {
+        self.bootstrap_native_with_creator(spec, None)
+    }
+
+    fn bootstrap_native_with_creator(
+        &self,
+        spec: &ManagedAgentSpec,
+        creator: Option<&cutex::session::model::SessionCreatedBy>,
+    ) -> Result<String, LifecycleFailure> {
+        if is_kimi_spec(spec) {
+            // Saved before any process starts, like a DSH record.
+            let variant = runtime_variant_id(spec, cutex::profiles::model::CliKind::Kimi).map_err(definite("profile_preflight_failed"))?;
+            let profile = spec.profile.as_deref().context("Profile required").map_err(definite("profile_preflight_failed"))?;
+            let record = cutex::runtime::kimi::create_profile_variant(
+                &spec.name, Path::new(&spec.cwd), profile, Some(&variant), true, creator.cloned(),
+                cutex::runtime::dsh::DshCreateOverrides {
+                    model: Some(spec.model.clone()),
+                    reasoning_effort: Some(spec.reasoning.clone()),
+                    permissions: Some(spec.permissions.clone()),
+                    sandbox_mode: Some(spec.sandbox_mode.clone()),
+                    approval_policy: Some(spec.approval_policy.clone()),
+                },
+            )
+            .map_err(unknown("kimi_bootstrap_failed"))?;
+            return Ok(record.app_server_thread_id().context("Kimi record has no thread").map_err(unknown("kimi_bootstrap_failed"))?.to_string());
+        }
+        if is_dsh_spec(spec) {
+            // The DSH record (state directory, binding, pinned deployment) is
+            // saved before any process starts, like a Claude adapter record.
+            let variant = dsh_variant_id(spec).map_err(definite("profile_preflight_failed"))?;
+            let record = cutex::runtime::dsh::create_profile_variant_with(
+                &spec.name, Path::new(&spec.cwd), spec.profile.clone(), Some(&variant), true, creator.cloned(),
+                cutex::runtime::dsh::DshCreateOverrides {
+                    model: Some(spec.model.clone()),
+                    reasoning_effort: Some(spec.reasoning.clone()),
+                    permissions: Some(spec.permissions.clone()),
+                    sandbox_mode: Some(spec.sandbox_mode.clone()),
+                    approval_policy: Some(spec.approval_policy.clone()),
+                },
+            )
+            .map_err(unknown("dsh_bootstrap_failed"))?;
+            return Ok(record.app_server_thread_id().context("DSH record has no thread").map_err(unknown("dsh_bootstrap_failed"))?.to_string());
+        }
         if is_claude_spec(spec).map_err(definite("profile_preflight_failed"))? {
             let effort = cutex::profiles::appearance::ClaudeEffort::parse(&spec.reasoning)
                 .map_err(definite("invalid_claude_effort"))?;
             // Write / exec follow the profile's rules (default on), as for
             // owner-created Claude agents and quick chats.
-            let record = cutex::runtime::claude::create_profile(&spec.name, Path::new(&spec.cwd),
-                &spec.model, None, None, spec.profile.clone(), true, effort)
+            let record = cutex::runtime::claude::create_profile_with_creator(&spec.name, Path::new(&spec.cwd),
+                &spec.model, None, None, spec.profile.clone(), true, effort, creator.cloned())
                 .map_err(unknown("claude_bootstrap_failed"))?;
             return Ok(record.app_server_thread_id().unwrap().to_string());
         }
@@ -976,7 +1147,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
         started_at: &Rfc3339,
         failed_at: &Rfc3339,
     ) -> Result<NativeBootstrapReconciliation, LifecycleFailure> {
-        if is_claude_spec(spec).map_err(unknown("profile_preflight_failed"))? {
+        if is_saved_record_spec(spec).map_err(unknown("profile_preflight_failed"))? {
             return Ok(match reconcile_claude_bootstrap(spec, started_at, failed_at)? {
                 NativeBootstrapIdentityReconciliation::Exact { reason, .. } => NativeBootstrapReconciliation::Present { reason },
                 NativeBootstrapIdentityReconciliation::Absent { reason } => NativeBootstrapReconciliation::ProvenAbsent { reason },
@@ -1115,7 +1286,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
     fn reconcile_interrupted_native_bootstrap(
         &self, spec: &ManagedAgentSpec, started_at: &Rfc3339, failed_at: &Rfc3339,
     ) -> Result<NativeBootstrapIdentityReconciliation, LifecycleFailure> {
-        if is_claude_spec(spec).map_err(unknown("profile_preflight_failed"))? {
+        if is_saved_record_spec(spec).map_err(unknown("profile_preflight_failed"))? {
             return reconcile_claude_bootstrap(spec, started_at, failed_at);
         }
 
@@ -1149,7 +1320,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
         started_at: &Rfc3339,
         failed_at: &Rfc3339,
     ) -> Result<NativeBootstrapIdentityReconciliation, LifecycleFailure> {
-        if is_claude_spec(spec).map_err(unknown("profile_preflight_failed"))? {
+        if is_saved_record_spec(spec).map_err(unknown("profile_preflight_failed"))? {
             return reconcile_claude_bootstrap(spec, started_at, failed_at);
         }
 
@@ -1356,6 +1527,24 @@ impl AgentLifecycle for CutexAgentLifecycle {
         native_session_id: &str,
         spec: &ManagedAgentSpec,
     ) -> Result<CutexSessionId, LifecycleFailure> {
+        self.adopt_native_with_creator(native_session_id, spec, None)
+    }
+
+    fn adopt_native_with_creator(
+        &self,
+        native_session_id: &str,
+        spec: &ManagedAgentSpec,
+        creator: Option<&cutex::session::model::SessionCreatedBy>,
+    ) -> Result<CutexSessionId, LifecycleFailure> {
+        if is_acp_spec(spec) {
+            let store = load_cutex_session_store().map_err(definite("session_store_unavailable"))?;
+            let matches: Vec<_> = store.sessions.values().filter(|r| r.dsh_session.is_some()
+                && r.app_server_thread_id() == Some(native_session_id)).collect();
+            if let [record] = matches.as_slice() {
+                return CutexSessionId::new(record.cutex_session_id.clone()).map_err(|_| LifecycleFailure::definite("invalid_durable_session", "DSH ID"));
+            }
+            return Err(LifecycleFailure::definite("dsh_adoption_identity_mismatch", "Expected exactly one saved DSH agent record"));
+        }
         if is_claude_spec(spec).map_err(definite("profile_preflight_failed"))? {
             let store = load_cutex_session_store().map_err(definite("session_store_unavailable"))?;
             let matches: Vec<_> = store.sessions.values().filter(|r| r.claude_session.is_some()
@@ -1382,9 +1571,15 @@ impl AgentLifecycle for CutexAgentLifecycle {
                 groups: spec.groups.clone(),
                 expose_to_im: spec.expose_to_im,
                 pin: spec.pin,
+                model_defaults: Some(spec.model.clone()),
+                reasoning_defaults: Some(spec.reasoning.clone()),
             },
         )
         .map_err(definite("session_adopt_failed"))?;
+        store.sessions.get_mut(&outcome.key)
+            .ok_or_else(|| LifecycleFailure::definite("session_not_found", "newly adopted session disappeared"))?
+            .stamp_created_by_at_creation(creator)
+            .map_err(definite("session_creator_conflict"))?;
         cutex::session::store::save_cutex_session_record(&before, &store, &outcome.key)
             .and_then(|_| cutex::session::im_bridge::persist_cutex_session_im_record(&store, &outcome.key))
             .map_err(unknown("session_adopt_persistence_unknown"))?;
@@ -1409,7 +1604,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
         let record = store.sessions.get_mut(&key).ok_or_else(|| {
             LifecycleFailure::definite("session_not_found", "adopted Agent disappeared")
         })?;
-        if record.is_retired() || record.app_server_thread_id() != Some(native_session_id) {
+        if cutex::agent_management::agent_execution_blocked(&record) || record.app_server_thread_id() != Some(native_session_id) {
             return Err(LifecycleFailure::definite(
                 "session_identity_conflict",
                 "adopted Agent does not bind the captured native session",
@@ -1542,6 +1737,22 @@ impl AgentLifecycle for CutexAgentLifecycle {
             cutex::runtime::claude::start(cutex_session_id.as_str()).map_err(unknown("claude_online_failed"))?;
             return super::claude_runtime::observe(cutex_session_id.as_str()).map_err(unknown("claude_registration_failed"));
         }
+        if record.dsh_session.is_some() {
+            online_dsh(&record).map_err(unknown("dsh_online_failed"))?;
+            // Readiness needs the runtime agent on this Bus (the bridge
+            // registers it asynchronously), as Claude's observe and the
+            // cute-codex start wait for it.
+            for _ in 0..100 {
+                let current = load_record(cutex_session_id)?;
+                let state = self.state.lock().map_err(|_| LifecycleFailure::outcome_unknown("bus_lock_failed", "Agent Bus unavailable"))?;
+                if !dsh_bus_endpoints(&state, &current).is_empty() {
+                    return Ok(());
+                }
+                drop(state);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            return Err(LifecycleFailure::outcome_unknown("dsh_registration_failed", "the DSH runtime did not register on the Agent Bus"));
+        }
         let entry = coding_registration_from_cutex_session_record(&record).ok_or_else(|| {
             LifecycleFailure::definite(
                 "native_session_missing",
@@ -1566,9 +1777,17 @@ impl AgentLifecycle for CutexAgentLifecycle {
 
     fn offline(&self, cutex_session_id: &CutexSessionId) -> Result<(), LifecycleFailure> {
         let record = load_record(cutex_session_id)?;
+        if record.dsh_session.is_some() {
+            cutex::runtime::dsh::close(cutex_session_id.as_str(), record.runtime_generation).map_err(unknown("dsh_close_failed"))?;
+            return super::app_server_runtime::disconnect_runtime(cutex_session_id.as_str()).map(drop).map_err(unknown("dsh_disconnect_failed"));
+        }
         if record.claude_session.is_some() {
-            super::claude_runtime::disconnect(cutex_session_id.as_str()).map_err(unknown("claude_disconnect_failed"))?;
-            return cutex::runtime::claude::close(cutex_session_id.as_str()).map(|_| ()).map_err(unknown("claude_close_failed"));
+            return offline_claude_with(
+                cutex_session_id.as_str(),
+                record.runtime_generation,
+                cutex::runtime::claude::close_expected,
+                super::claude_runtime::disconnect,
+            );
         }
         let Some(entry) = coding_registration_from_cutex_session_record(&record) else {
             if record.app_server_runtime.is_none()
@@ -1654,6 +1873,15 @@ impl AgentLifecycle for CutexAgentLifecycle {
         expected: &RuntimeOccurrenceFence,
     ) -> Result<(AgentRuntimeObservation, AgentRuntimeObservation), LifecycleFailure> {
         let record = load_record(cutex_session_id)?;
+        if record.dsh_session.is_some() {
+            let before = self.observe(cutex_session_id)?;
+            match self.historical_runtime_occurrence_for_record(&record)? {
+                HistoricalRuntimeOccurrenceReconciliation::ProvenAbsent { fence, .. } if &fence == expected => {}
+                _ => return Err(LifecycleFailure::definite("runtime_occurrence_changed", "fenced restart owner changed")),
+            }
+            self.online(cutex_session_id)?;
+            return Ok((before, self.observe(cutex_session_id)?));
+        }
         let entry = coding_registration_from_cutex_session_record(&record).ok_or_else(|| {
             LifecycleFailure::definite(
                 "native_session_missing",
@@ -1689,7 +1917,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
 
     fn retire(&self, cutex_session_id: &CutexSessionId) -> Result<(), LifecycleFailure> {
         let record = load_record(cutex_session_id)?;
-        if record.is_retired() {
+        if cutex::agent_management::agent_execution_blocked(&record) {
             return Ok(());
         }
         management_archive::mutate_management_v2_archive(
@@ -1725,7 +1953,10 @@ impl AgentLifecycle for CutexAgentLifecycle {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let bus_ids = if record.claude_session.is_some() {
+        let bus_ids = if record.dsh_session.is_some() {
+            let state = self.state.lock().map_err(|_| LifecycleFailure::outcome_unknown("bus_lock_failed", "Agent Bus unavailable"))?;
+            dsh_bus_endpoints(&state, &record)
+        } else if record.claude_session.is_some() {
             let state = self.state.lock().map_err(|_| LifecycleFailure::outcome_unknown("bus_lock_failed", "Agent Bus unavailable"))?;
             state.agents.values().filter(|a| a.cutex_session_id.as_deref() == Some(cutex_session_id.as_str())
                 && record.current_runtime_agent_id.as_deref() == Some(a.id.as_str())).map(|a| a.id.clone()).collect()
@@ -1748,7 +1979,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
         Ok(AgentRuntimeObservation {
             cutex_session_id: cutex_session_id.clone(),
             native_session_id,
-            active: record.is_active(),
+            active: !cutex::agent_management::agent_execution_blocked(&record),
             cwd: cutex_session_launch_cwd(&record).to_string(),
             profile: record.profile.unwrap_or_default(),
             runtime_backend: serde_json::to_value(record.runtime_backend)
@@ -1897,7 +2128,7 @@ pub(super) fn validate_managed_recovery_record(
     };
     // The durable record's profile may be inherited, cleared, or changed after
     // creation. It is launch configuration, not recovery identity.
-    let mismatch = if !record.is_active() {
+    let mismatch = if !!cutex::agent_management::agent_execution_blocked(&record) {
         Some("active")
     } else if record.cutex_session_id != cutex_session_id.as_str() {
         Some("cutex_session_id")
@@ -2211,6 +2442,55 @@ fn required_top_level_flag_was_rejected(output: &Output) -> bool {
         .any(|marker| stderr.contains(marker))
 }
 
+/// The Bus endpoints of a DSH agent's current runtime occurrence. Only
+/// Claude's registration stamps `cutex_session_id` on the roster entry; a DSH
+/// runtime registers like cute-codex, so it is matched by its exact runtime
+/// agent id and native thread.
+fn dsh_bus_endpoints(state: &cutex::agent_bus::store::AgentBusState, record: &CutexSessionRecord) -> Vec<String> {
+    let (Some(runtime), Some(thread)) = (record.current_runtime_agent_id.as_deref(), record.app_server_thread_id()) else {
+        return Vec::new();
+    };
+    state.agents.values()
+        .filter(|agent| agent.id == runtime && agent.session_id.as_deref() == Some(thread)
+            && agent.cutex_session_id.as_deref().is_none_or(|id| id == record.cutex_session_id))
+        .map(|agent| agent.id.clone())
+        .collect()
+}
+
+// Keep the observed generation through close's input/controller locks. The
+// observer must remain attached until close has persisted its stop receipt;
+// shutting its client down first can publish an unclassified transport error.
+/// Start a DSH agent's runtime and connect it to the Bus (the lifecycle path
+/// of `cutex/runtime/online`): a revert swap a crash left is finished first.
+fn online_dsh(record: &CutexSessionRecord) -> anyhow::Result<()> {
+    let id = record.cutex_session_id.as_str();
+    if super::app_server_runtime::runtime_manager().status(id).ok().flatten().is_some_and(|status| status.connected) {
+        return Ok(());
+    }
+    let config = cutex::config::store::load_codez_config_checked()?;
+    if record.app_server_runtime.as_ref().is_some_and(|binding| cutex::platform::process::process_is_running(binding.pid)) {
+        return super::app_server_runtime::recover_persisted_runtime_for_lifecycle(&config, record).map(drop);
+    }
+    if let Some(session) = &record.dsh_session {
+        super::dsh_structure::finish_pending_revert(session)?;
+    }
+    let current = cutex::runtime::dsh::start(id)?;
+    let binding = current.app_server_runtime.as_ref().context("DSH runtime binding missing after start")?;
+    let agent = current.current_runtime_agent_id.as_deref().context("DSH runtime agent missing after start")?;
+    super::app_server_runtime::connect_runtime(&config, &current, binding, agent)?;
+    Ok(())
+}
+
+fn offline_claude_with(
+    id: &str,
+    generation: u64,
+    close: impl FnOnce(&str, Option<u64>) -> anyhow::Result<serde_json::Value>,
+    disconnect: impl FnOnce(&str) -> anyhow::Result<()>,
+) -> Result<(), LifecycleFailure> {
+    close(id, Some(generation)).map_err(unknown("claude_close_failed"))?;
+    disconnect(id).map_err(unknown("claude_disconnect_failed"))
+}
+
 fn definite<E: std::fmt::Display>(code: &'static str) -> impl FnOnce(E) -> LifecycleFailure {
     move |error| LifecycleFailure::definite(code, error.to_string())
 }
@@ -2224,16 +2504,150 @@ fn unknown<E: std::fmt::Display>(code: &'static str) -> impl FnOnce(E) -> Lifecy
 /// as `execute` runs them, without the reservation / adoption steps.
 #[cfg(test)]
 pub(super) fn bootstrap_for_test(spec: &ManagedAgentSpec) -> Result<String, LifecycleFailure> {
+    bootstrap_with_creator_for_test(spec, None)
+}
+
+#[cfg(test)]
+pub(super) fn bootstrap_with_creator_for_test(spec: &ManagedAgentSpec, creator: Option<&cutex::session::model::SessionCreatedBy>) -> Result<String, LifecycleFailure> {
     let lifecycle = CutexAgentLifecycle {
         state: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
     };
     let effective = lifecycle.effective_create_spec(spec)?;
-    lifecycle.bootstrap_native(&effective)
+    lifecycle.bootstrap_native_with_creator(&effective, creator)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exercise the real client actor's Shutdown -> Disconnected receive edge.
+    // Only Claude close's process/RPC effect is substituted; receipt IO,
+    // event conversion and the repository append are production code.
+    fn claude_stop_receive_boundary(disconnect_first: bool) -> serde_json::Value {
+        use cutex::app_server::client::{AppServerClient, AppServerClientOptions, AppServerEndpoint, AppServerEvent};
+        use cutex::management::v2::{model::{AppServerSchema, AppServerSchemaChannel}, native_events::{self, NativeEventContext, NativeEventDisposition}};
+        use cutex::session::runtime_stop::RequestedStop;
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::Duration;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut websocket = tungstenite::accept(socket).unwrap();
+            let request: serde_json::Value = serde_json::from_str(
+                websocket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "initialize");
+            websocket.send(tungstenite::Message::Text(serde_json::json!({
+                "id":request["id"], "result":{}
+            }).to_string().into())).unwrap();
+            // Keep the transport open: only the explicit client shutdown can
+            // trigger the disconnect; server EOF is not the test stimulus.
+            release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        });
+        let client = AppServerClient::connect(AppServerClientOptions::new(
+            AppServerEndpoint::LoopbackWebSocket {
+                url: format!("ws://{address}"), bearer_token: None,
+            })).unwrap();
+        let handle = client.handle();
+        let id = format!("cutex.claude-stop-boundary-{}", uuid::Uuid::new_v4());
+        let context = NativeEventContext {
+            cutex_session_id: id.clone(), thread_id: "claude-thread".into(),
+            host_id: cutex::platform::host::current_host_name(),
+            runtime_generation: 17, runtime_backend: "claude_subscription".into(),
+            schema: AppServerSchema {
+                protocol: "codex-app-server".into(), major_version: 2,
+                version: "test".into(), sha256: "a".repeat(64),
+                channel: AppServerSchemaChannel::Experimental,
+                capabilities: serde_json::json!({}), extensions: vec![],
+            },
+        };
+        let boundary = Arc::new(Barrier::new(2));
+        let receiver_boundary = boundary.clone();
+        let receiver = std::thread::spawn(move || {
+            // This is the manager's post-stop-check receive boundary. Once
+            // released it consumes the event without rechecking a stop flag.
+            receiver_boundary.wait();
+            let event = client.recv_event_timeout(Duration::from_secs(10)).unwrap().unwrap();
+            assert!(matches!(&event, AppServerEvent::Disconnected { reason } if reason == "client shutdown"));
+            let NativeEventDisposition::Publish(pending) =
+                native_events::pending_event_from_app_server(&context, &event).unwrap()
+                else { panic!("disconnect must publish") };
+            native_events::append_observed_event(pending).unwrap().unwrap().cutex.unwrap()
+        });
+        boundary.wait();
+        let close = |actual_id: &str, expected: Option<u64>| {
+            assert_eq!(actual_id, id);
+            assert_eq!(expected, Some(17));
+            RequestedStop::run(actual_id, expected.unwrap(),
+                || Ok(serde_json::json!({"state":"offline"})), |_| true)
+        };
+        let disconnect = |actual_id: &str| -> anyhow::Result<_> {
+            assert_eq!(actual_id, id);
+            handle.shutdown()?;
+            Ok(())
+        };
+        let message = if disconnect_first {
+            // Negative control forces the problematic append to finish before
+            // close can create a receipt, rather than relying on a lucky race.
+            disconnect(&id).unwrap();
+            let message = receiver.join().unwrap();
+            close(&id, Some(17)).unwrap();
+            message
+        } else {
+            offline_claude_with(&id, 17, close, disconnect).unwrap();
+            receiver.join().unwrap()
+        };
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        serde_json::json!({"method":message.method,"params":message.params})
+    }
+
+    #[test]
+    fn claude_stop_receive_boundary_old_order_persists_error() {
+        let event = claude_stop_receive_boundary(true);
+        assert_eq!(event["method"], "cutex/runtime/disconnected");
+        assert_eq!(event["params"]["error"]["code"], "app_server_disconnected");
+    }
+
+    #[test]
+    fn claude_stop_receive_boundary_close_first_persists_offline() {
+        let event = claude_stop_receive_boundary(false);
+        assert_eq!(event["method"], "cutex/runtime/offline");
+        assert_eq!(event["params"]["runtimeGeneration"], 17);
+        assert!(event["params"].get("error").is_none());
+    }
+
+    #[test]
+    fn claude_stop_close_failure_preserves_observer_and_original_generation() {
+        for reason in ["runtime generation changed", "close RPC failed"] {
+            let result = offline_claude_with("cutex.test", 17,
+                |id, generation| {
+                    assert_eq!(id, "cutex.test");
+                    assert_eq!(generation, Some(17));
+                    anyhow::bail!(reason)
+                },
+                |_| panic!("failed close must not disconnect the observer"));
+            let failure = result.unwrap_err();
+            assert_eq!(failure.code, "claude_close_failed");
+            assert!(failure.outcome_unknown);
+            assert!(failure.detail.contains(reason));
+        }
+    }
+
+    #[test]
+    fn claude_stop_disconnect_failure_remains_unknown() {
+        let result = offline_claude_with("cutex.test", 17,
+            |_, _| Ok(serde_json::json!({"state":"offline"})),
+            |_| anyhow::bail!("observer join failed"));
+        let failure = result.unwrap_err();
+        assert_eq!(failure.code, "claude_disconnect_failed");
+        assert!(failure.outcome_unknown);
+        assert!(failure.detail.contains("observer join failed"));
+    }
 
     /// Agents share cwds: records saved before a bootstrap attempt are other
     /// Agents; unparsable times stay evidence.
@@ -2280,7 +2694,9 @@ mod tests {
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
+            auto_pick: false,
             claude_code: Default::default(),
+            variants: Default::default(),
             id: "account-id".to_string(),
             name: "profile".to_string(),
             email: None,
@@ -2298,6 +2714,7 @@ mod tests {
             provider_category: None,
             claude_account: None,
             model_display_names: Default::default(),
+            interface_base_urls: Default::default(),
         };
         let files = cutex::profiles::materialize::materialized_account_files(&account).unwrap();
         super::super::launch::ResolvedLaunchProfile {
@@ -2327,6 +2744,34 @@ mod tests {
             expose_to_im: true,
             pin: false,
         }
+    }
+
+    #[test]
+    fn dsh_bus_endpoint_matches_the_current_occurrence_without_a_projected_session_id() {
+        let mut record = CutexSessionRecord::new_at("cutex.dsh-b".into(), None, "host".into(), "/w".into(), None, "2026-10-27T00:00:00Z".into()).unwrap();
+        record.runtime_backend = cutex::session::model::CutexSessionRuntimeBackend::Dsh;
+        record.dsh_session = Some(cutex::runtime::dsh::DshSession {
+            flavor: Default::default(), kimi: None,
+            thread_id: "dsh-thread".into(), state_dir: "/s".into(), node: "/n".into(), adapter: "/a".into(), dsh_cli: "/d".into(),
+            patch: "/p".into(), install_root: "/i".into(), native_session_id: None, deployment_version: String::new(), model: String::new(),
+            reasoning_effort: None, api_key_env: String::new(), spike: false,
+        });
+        let agent = |id: &str, thread: &str, durable: Option<&str>| cutex::agent_bus::model::AgentBusAgent {
+            id: id.into(), name: "b".into(), base_name: None, thread_name: None, path_key: None, session_id: Some(thread.into()),
+            cutex_session_id: durable.map(str::to_string), profile: "p".into(), cwd: "/w".into(), pid: 1, host_id: None, groups: Vec::new(),
+            registration_class: AgentRegistrationClass::LocalOnly, last_seen_epoch_secs: 0,
+        };
+        let mut state = cutex::agent_bus::store::AgentBusState::default();
+        for entry in [agent("dsh.old", "dsh-thread", None), agent("dsh.cur", "dsh-thread", None), agent("dsh.other", "other", None)] {
+            state.agents.insert(entry.id.clone(), entry);
+        }
+        assert!(dsh_bus_endpoints(&state, &record).is_empty(), "no runtime yet");
+        record.current_runtime_agent_id = Some("dsh.cur".into());
+        assert_eq!(dsh_bus_endpoints(&state, &record), ["dsh.cur"]);
+        state.agents.insert("dsh.cur".into(), agent("dsh.cur", "dsh-thread", Some("cutex.someone-else")));
+        assert!(dsh_bus_endpoints(&state, &record).is_empty(), "another durable session's endpoint");
+        state.agents.insert("dsh.cur".into(), agent("dsh.cur", "other", None));
+        assert!(dsh_bus_endpoints(&state, &record).is_empty(), "another native thread");
     }
 
     fn managed_recovery_record(spec: &ManagedAgentSpec) -> CutexSessionRecord {

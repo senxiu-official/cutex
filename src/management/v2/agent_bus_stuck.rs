@@ -4,7 +4,7 @@
 //!
 //! - `GET /v2/agent-bus/stuck-messages?minAgeSecs=&agentId=&limit=` →
 //!   `{messages, liveQueue: {available, error?}, minAgeSecs, generatedAt}`.
-//!   Durable records still `pending` / `stale_held` at least `minAgeSecs`
+//!   Durable records still `pending` / `inbox_accepted` / `stale_held` at least `minAgeSecs`
 //!   (default 3600) old, plus messages that sit in the bus's in-memory
 //!   runtime queues that long without being ACKed (`durable: false` when
 //!   the repository has no record of them). Oldest first; each with its
@@ -32,12 +32,13 @@ use crate::http::server::{write_json_response, SimpleHttpRequest};
 
 pub const LIST_PATH: &str = "/v2/agent-bus/stuck-messages";
 pub const DISCARD_PATH: &str = "/v2/agent-bus/stuck-messages/discard";
+pub use super::agent_bus_settlement_model::CLOSE_PATH;
 pub const DEFAULT_MIN_AGE_SECS: u64 = 3600;
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 1000;
 
 pub fn is_path(path: &str) -> bool {
-    matches!(path.split('?').next(), Some(LIST_PATH) | Some(DISCARD_PATH))
+    matches!(path.split('?').next(), Some(LIST_PATH) | Some(DISCARD_PATH) | Some(CLOSE_PATH))
 }
 
 /// The live bus as this module needs it (tests use a fake).
@@ -76,6 +77,17 @@ pub fn list_view(
     now_epoch_secs: u64,
     names: NameOf<'_>,
 ) -> anyhow::Result<Value> {
+    list_view_with_receipt_loader(repository, live, min_age_secs, agent_id, limit, now_epoch_secs, names,
+        &|ids|crate::asks::receipt_uncertainty::read_context::load_messages(ids,
+            |ids|repository.receipt_read_inputs(ids)))
+}
+
+pub(super) fn list_view_with_receipt_loader(
+    repository: &AgentBusMessageRepository, live: &dyn LiveBus, min_age_secs: u64,
+    agent_id: Option<&str>, limit: usize, now_epoch_secs: u64, names: NameOf<'_>,
+    read_receipts: &dyn Fn(&[String]) -> crate::asks::receipt_uncertainty::read_views::ReceiptReadContext,
+) -> anyhow::Result<Value> {
+    super::agent_bus_settlement::repair_outbox(repository);
     let durable = repository.stuck_messages(min_age_secs, now_epoch_secs)?;
     let (queued, live_status) = match live.queued() {
         Ok(queued) => (queued, json!({"available": true})),
@@ -108,6 +120,11 @@ pub fn list_view(
             continue;
         }
         let record = repository.stuck_view_by_id(message_id, now_epoch_secs)?;
+        if record.as_ref().and_then(|record| record.settlement.as_ref())
+            .is_some_and(|settlement| settlement.state == "closed")
+        {
+            continue;
+        }
         rows.push((
             Some(first.created_at_epoch_secs),
             message_id.to_string(),
@@ -122,11 +139,22 @@ pub fn list_view(
     }
     rows.sort_by(|a, b| (a.0.unwrap_or(0), &a.1).cmp(&(b.0.unwrap_or(0), &b.1)));
     let total = rows.len();
-    let messages = rows
+    let mut messages = rows
         .into_iter()
         .take(limit)
         .map(|(_, _, row)| row)
         .collect::<Vec<_>>();
+    // Repository rows above are owned and all bus guards have closed. The
+    // receipt loader reads a coherent row/evidence pair, then independently
+    // reads session identity outside both bus and asks guards. No new actions.
+    let ids: Vec<String> = messages.iter().filter_map(|row|row["messageId"].as_str().map(str::to_string)).collect();
+    let receipts = read_receipts(&ids);
+    for message in &mut messages {
+        let projection = message["messageId"].as_str().and_then(|id|receipts.get(id))
+            .map(|input|crate::asks::receipt_uncertainty::read_views::project_bus_read(input,crate::asks::model::RevisionLevel::Sent))
+            .unwrap_or_else(crate::asks::receipt_uncertainty::read_views::unknown_bus_read);
+        message["receiptProjection"] = projection;
+    }
     Ok(json!({
         "messages": messages,
         "total": total,
@@ -396,6 +424,9 @@ fn session_names() -> impl Fn(&str) -> Option<String> {
 /// HTTP entry (root already checked by the caller).
 pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
+    if path == CLOSE_PATH {
+        return super::agent_bus_settlement::handle(stream, request);
+    }
     let error = |stream: &mut TcpStream, status: u16, code: &str, message: &str| {
         let reason = match status {
             400 => "Bad Request",

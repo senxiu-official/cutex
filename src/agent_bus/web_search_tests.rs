@@ -329,6 +329,7 @@ fn search_usage_is_a_valid_ledger_row() {
         token_source: crate::management::v2::usage::UsageTokenSource::NativeLast,
         model_context_window: None,
         compaction_count: None,
+        model_requests: None,
         cumulative_total: tokens.clone(),
         tokens,
     };

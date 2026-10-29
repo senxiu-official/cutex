@@ -128,6 +128,8 @@ fn local(record: &CutexSessionRecord) -> bool {
         CutexSessionRuntimeBackend::Host
             | CutexSessionRuntimeBackend::HostForeground
             | CutexSessionRuntimeBackend::ClaudeSubscription
+            | CutexSessionRuntimeBackend::Dsh
+            | CutexSessionRuntimeBackend::Kimi
     )
 }
 fn provably_dead(record: &CutexSessionRecord, running: &dyn Fn(u32) -> bool) -> bool {
@@ -311,9 +313,25 @@ fn load_accounts() -> anyhow::Result<Vec<crate::profiles::model::StoredAccount>>
     }
 }
 
+fn integration_dedupe_findings(root: &Path) -> Vec<Finding> {
+    match super::integration_events::integration_dedupe_health(root) {
+        Ok(()) => Vec::new(),
+        Err(error) => vec![finding(
+            "integration_dedupe_unavailable",
+            None,
+            json!({
+                "reason": error.to_string().chars().take(512).collect::<String>(),
+                "nextAction":"Stop writers, preserve the dedupe files and inspect migration/integrity/pending state; do not delete or recreate the ledger"
+            }),
+            None,
+        )],
+    }
+}
+
 pub fn scan() -> anyhow::Result<Value> {
     let store = crate::session::store::load_cutex_session_store_shared()?;
     let mut findings = session_findings(&store, &process_may_be_running);
+    findings.extend(integration_dedupe_findings(&crate::config::paths::runtime_dir()?.join("management-v2")));
     // Report-only and best-effort: a profile store problem must not hide the
     // other findings.
     if let Ok(accounts) = load_accounts() {
@@ -340,7 +358,7 @@ pub fn scan() -> anyhow::Result<Value> {
         Ok(repository.message_state(id)?.is_some())
     })?);
     Ok(
-        json!({"contractVersion":super::model::CONTRACT_VERSION,"scannedAt":chrono::Utc::now().to_rfc3339(),"findings":findings}),
+        json!({"contractVersion":super::model::CONTRACT_VERSION,"scannedAt":chrono::Utc::now().to_rfc3339(),"findings":findings,"claudeObservers":super::claude_observer::diagnostics()}),
     )
 }
 
@@ -1072,4 +1090,30 @@ mod tests {
                 .scan_on_start
         );
     }
+    #[test]
+    fn dedupe_corruption_is_owner_visible_without_an_automatic_destructive_fix() {
+        let root =
+            std::env::temp_dir().join(format!("cutex-dedupe-health-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(integration_dedupe_findings(&root).is_empty());
+        std::fs::write(
+            root.join("integration-event-dedupe-v1.json"),
+            b"broken synthetic ledger",
+        )
+        .unwrap();
+        let findings = integration_dedupe_findings(&root);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "integration_dedupe_unavailable");
+        assert_eq!(findings[0].severity, "warn");
+        assert!(findings[0].fix.is_none());
+        assert_eq!(
+            std::fs::read(root.join("integration-event-dedupe-v1.json")).unwrap(),
+            b"broken synthetic ledger"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
+
+#[cfg(test)]
+#[path = "downgrade_drill.rs"]
+mod downgrade_drill;

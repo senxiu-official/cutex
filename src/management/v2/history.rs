@@ -22,7 +22,8 @@
 //! where `turns` are the newest `limit` turns older than `cursor`, oldest
 //! first; pass `nextCursor` back as `cursor` to load older turns.
 //! `cutexState.latestPlan` is the bootstrap's value (`launch::native_plan`,
-//! derived from the stored rollout for live and offline sources alike);
+//! derived from the stored rollout for live and offline sources alike;
+//! Claude sessions: `claude_plan`);
 //! `cutexState.latestTokenUsage` likewise (`launch::native_token_usage`;
 //! Claude sessions: `claude_token_usage`).
 //!
@@ -45,6 +46,7 @@ use serde_json::Value;
 use super::codex_config::CodexConfigHost;
 use super::codex_config::CodexEndpointFactory;
 use super::codex_config::SpawnedEndpoint;
+use super::history_turns::TurnShaper;
 use super::turn_index::{self, Key};
 use crate::catalog::CatalogError;
 use crate::http::server::SimpleHttpRequest;
@@ -100,7 +102,7 @@ pub fn parse_query(request: &SimpleHttpRequest) -> Result<HistoryQuery, String> 
     let params = super::workspace::query_params(request);
     if let Some(key) = params
         .keys()
-        .find(|key| !matches!(key.as_str(), "limit" | "cursor" | "compact"))
+        .find(|key| !matches!(key.as_str(), "limit" | "cursor" | "compact" | "media"))
     {
         return Err(format!("unknown history query parameter: {key}"));
     }
@@ -163,14 +165,20 @@ pub fn rpc_call<'a>(
             "params": params,
         }))
         .map_err(HistoryCallError::Unavailable)?;
-        if let Some(error) = response.get("error") {
-            return Err(HistoryCallError::Rpc(error.clone()));
-        }
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| HistoryCallError::Unavailable("native response has no result".into()))
+        take_result(response)
     }
+}
+
+/// A JSON-RPC response's `result`, moved out (a history page can be
+/// hundreds of MB), or its `error`.
+fn take_result(mut response: Value) -> Result<Value, HistoryCallError> {
+    if let Some(error) = response.get_mut("error") {
+        return Err(HistoryCallError::Rpc(error.take()));
+    }
+    response
+        .get_mut("result")
+        .map(Value::take)
+        .ok_or_else(|| HistoryCallError::Unavailable("native response has no result".into()))
 }
 
 /// Read one history page with `call(method, params) -> native result`.
@@ -179,14 +187,26 @@ pub fn read_history_page(
     query: &HistoryQuery,
     call: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>,
 ) -> Result<HistoryPage, HistoryCallError> {
-    let metadata = call(
+    read_history_page_shaped(thread_id, query, None, call)
+}
+
+/// `read_history_page` whose turns come back shaped by `shaper` (`compact` /
+/// `media=ref`, `history_turns`): finished turns it already holds are not
+/// read in full again. Without a shaper, exactly `read_history_page`.
+pub fn read_history_page_shaped(
+    thread_id: &str,
+    query: &HistoryQuery,
+    mut shaper: Option<&mut TurnShaper>,
+    call: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>,
+) -> Result<HistoryPage, HistoryCallError> {
+    let mut metadata = call(
         "thread/read",
         json!({ "threadId": thread_id, "includeTurns": false }),
     )?;
     let mut thread = metadata
-        .get("thread")
+        .get_mut("thread")
         .filter(|thread| thread.is_object())
-        .cloned()
+        .map(Value::take)
         .ok_or_else(|| HistoryCallError::Unavailable("thread/read returned no thread".into()))?;
     if thread.get("id").and_then(Value::as_str) != Some(thread_id) {
         return Err(HistoryCallError::Unavailable(
@@ -209,64 +229,43 @@ pub fn read_history_page(
         .as_deref()
         .filter(|cursor| !cursor.starts_with(OFFSET_CURSOR_PREFIX));
     let listed = if query.cursor.is_none() || native_cursor.is_some() {
-        match call(
-            "thread/turns/list",
-            json!({
-                "threadId": thread_id,
-                "cursor": native_cursor,
-                "limit": query.limit,
-                "sortDirection": "desc",
-                "itemsView": "full",
-            }),
-        ) {
-            Ok(page) => Some(page),
-            // A native cursor only comes from thread/turns/list itself, so a
-            // failure there is real; without one, assume an older runtime.
-            Err(error) if native_cursor.is_none() && turn_index::unsupported(&error) => None,
-            Err(error) => return Err(error),
-        }
+        list_turns(thread_id, native_cursor, query.limit, shaper.as_deref_mut(), call)?
     } else {
         None
     };
     let mut first_ordinal = None;
     let mut turn_count = None;
     let (turns, next_cursor) = match listed {
-        Some(page) => {
-            let mut turns = page
-                .get("data")
-                .and_then(Value::as_array)
-                .cloned()
-                .ok_or_else(|| {
-                    HistoryCallError::Unavailable("thread/turns/list returned no data".into())
-                })?;
+        Some((mut turns, next)) => {
             turns.reverse();
-            let next = page
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .filter(|cursor| !cursor.is_empty())
-                .map(str::to_string);
             (turns, next)
         }
         None => {
             let offset = offset_cursor.unwrap_or(0);
-            let full = call(
+            let mut full = call(
                 "thread/read",
                 json!({ "threadId": thread_id, "includeTurns": true }),
             )?;
-            let all = full
-                .pointer("/thread/turns")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            let mut all = match full.pointer_mut("/thread/turns").map(Value::take) {
+                Some(Value::Array(all)) => all,
+                _ => Vec::new(),
+            };
             let end = all.len().saturating_sub(offset);
             let start = end.saturating_sub(query.limit as usize);
             first_ordinal = (start < end).then_some(start + 1);
             turn_count = Some(all.len());
             let next =
                 (start > 0).then(|| format!("{OFFSET_CURSOR_PREFIX}{}", offset + (end - start)));
-            (all[start..end].to_vec(), next)
+            let mut turns: Vec<Value> = all.drain(start..end).collect();
+            if let Some(shaper) = shaper.as_deref_mut() {
+                turns = turns.into_iter().map(|turn| shaper.shape(turn, false)).collect();
+            }
+            (turns, next)
         }
     };
+    if let Some(shaper) = shaper {
+        shaper.finished();
+    }
     thread
         .as_object_mut()
         .expect("thread is an object")
@@ -277,6 +276,147 @@ pub fn read_history_page(
         first_ordinal,
         turn_count,
     })
+}
+
+fn turns_list_params(thread_id: &str, cursor: Option<&str>, limit: u32, view: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "cursor": cursor,
+        "limit": limit,
+        "sortDirection": "desc",
+        "itemsView": view,
+    })
+}
+
+/// `thread/turns/list` data (newest first) and next cursor, moved out.
+fn turns_page(mut page: Value) -> Result<(Vec<Value>, Option<String>), HistoryCallError> {
+    let turns = match page.get_mut("data").map(Value::take) {
+        Some(Value::Array(turns)) => turns,
+        _ => {
+            return Err(HistoryCallError::Unavailable(
+                "thread/turns/list returned no data".into(),
+            ))
+        }
+    };
+    let next = page
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .filter(|cursor| !cursor.is_empty())
+        .map(str::to_string);
+    Ok((turns, next))
+}
+
+/// One `thread/turns/list` page, newest first (`None`: the runtime has no
+/// `thread/turns/list`). With a caching shaper the page is listed without
+/// items and only the newest turns down to the oldest one the shaper does
+/// not hold are read in full; anything unexpected falls back to the plain
+/// full read of the page.
+fn list_turns(
+    thread_id: &str,
+    cursor: Option<&str>,
+    limit: u32,
+    mut shaper: Option<&mut TurnShaper>,
+    call: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>,
+) -> Result<Option<(Vec<Value>, Option<String>)>, HistoryCallError> {
+    let first_page = cursor.is_none();
+    if let Some(shaper) = shaper.as_deref_mut().filter(|shaper| shaper.caching()) {
+        match call("thread/turns/list", turns_list_params(thread_id, cursor, limit, "notLoaded")) {
+            Ok(listing) => {
+                let (listed, next) = turns_page(listing)?;
+                let cacheable: Vec<bool> = listed
+                    .iter()
+                    .enumerate()
+                    .map(|(index, turn)| shaper.cacheable(turn, index, first_page))
+                    .collect();
+                let mut hits: Vec<Option<(Value, usize)>> = listed
+                    .iter()
+                    .zip(&cacheable)
+                    .map(|(turn, &cacheable)| shaper.hit(turn, cacheable))
+                    .collect();
+                let missing = hits.iter().rposition(Option::is_none).map_or(0, |last| last + 1);
+                let mut fresh = Vec::new();
+                let mut fresh_next = None;
+                if missing > 0 {
+                    let page = call(
+                        "thread/turns/list",
+                        turns_list_params(thread_id, cursor, missing as u32, "full"),
+                    )?;
+                    (fresh, fresh_next) = turns_page(page)?;
+                }
+                let same = fresh.len() == missing
+                    && fresh.iter().zip(&listed).all(|(full, listed)| same_turn(full, listed));
+                if same {
+                    let next = if missing == limit as usize { fresh_next } else { next };
+                    let mut turns = Vec::with_capacity(listed.len());
+                    let mut fresh = fresh.into_iter();
+                    for (index, hit) in hits.iter_mut().enumerate() {
+                        let full = if index < missing { fresh.next() } else { None };
+                        match (hit.take(), full) {
+                            (Some((turn, refs)), _) => {
+                                shaper.used(refs);
+                                turns.push(turn);
+                            }
+                            (None, Some(full)) => turns.push(shaper.shape(full, cacheable[index])),
+                            (None, None) => {
+                                return Err(turn_index::invalid("history page changed while read"))
+                            }
+                        }
+                    }
+                    return Ok(Some((turns, next)));
+                }
+                if missing == limit as usize {
+                    // That full read was the plain page read itself.
+                    let turns = fresh
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, turn)| {
+                            let cacheable = shaper.cacheable(&turn, index, first_page);
+                            shaper.shape(turn, cacheable)
+                        })
+                        .collect();
+                    return Ok(Some((turns, fresh_next)));
+                }
+            }
+            Err(HistoryCallError::Unavailable(diagnostic)) => {
+                return Err(HistoryCallError::Unavailable(diagnostic))
+            }
+            // A runtime without the notLoaded view (its "unknown variant"
+            // error looks like a missing method) or without
+            // thread/turns/list: the plain read below decides.
+            Err(HistoryCallError::Rpc(_)) => {}
+        }
+    }
+    let page = match call("thread/turns/list", turns_list_params(thread_id, cursor, limit, "full")) {
+        Ok(page) => page,
+        // A native cursor only comes from thread/turns/list itself, so a
+        // failure there is real; without one, assume an older runtime.
+        Err(error) if first_page && turn_index::unsupported(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let (mut turns, next) = turns_page(page)?;
+    if let Some(shaper) = shaper {
+        turns = turns
+            .into_iter()
+            .enumerate()
+            .map(|(index, turn)| {
+                let cacheable = shaper.cacheable(&turn, index, first_page);
+                shaper.shape(turn, cacheable)
+            })
+            .collect();
+    }
+    Ok(Some((turns, next)))
+}
+
+/// The same turn in both listings: everything but its items.
+fn same_turn(full: &Value, listed: &Value) -> bool {
+    fn rest(turn: &Value) -> Option<Vec<(&String, &Value)>> {
+        turn.as_object().map(|map| {
+            map.iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "items" | "itemsView"))
+                .collect()
+        })
+    }
+    rest(full).is_some() && rest(full) == rest(listed)
 }
 
 pub fn index_key(session_id: &str, session: &Value, source: &str) -> Key {
@@ -316,13 +456,24 @@ pub fn annotate_bootstrap(key: &Key, page: &mut HistoryPage) {
 /// an older page reports `firstOrdinal` from the cached index (positions
 /// before a page turn only change by a rebuild) and no `turnCount`, which
 /// only the newest page can confirm. Single-turn reads still build the index.
+#[cfg(test)]
 fn read_indexed_page(
     key: &Key,
     thread_id: &str,
     query: &HistoryQuery,
     call: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>,
 ) -> Result<HistoryPage, HistoryCallError> {
-    let mut page = read_history_page(thread_id, query, call)?;
+    read_indexed_page_shaped(key, thread_id, query, None, call)
+}
+
+fn read_indexed_page_shaped(
+    key: &Key,
+    thread_id: &str,
+    query: &HistoryQuery,
+    shaper: Option<&mut TurnShaper>,
+    call: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>,
+) -> Result<HistoryPage, HistoryCallError> {
+    let mut page = read_history_page_shaped(thread_id, query, shaper, call)?;
     if page.turn_count.is_some() {
         return Ok(page); // Legacy full read already counted.
     }
@@ -340,7 +491,7 @@ fn read_indexed_page(
 pub fn parse_turn_query(request: &SimpleHttpRequest) -> Result<(), String> {
     if let Some(key) = super::workspace::query_params(request)
         .keys()
-        .find(|key| key.as_str() != "compact")
+        .find(|key| !matches!(key.as_str(), "compact" | "media"))
     {
         return Err(format!("unknown history turn query parameter: {key}"));
     }
@@ -732,13 +883,7 @@ fn live_call(
             }
         })
     })?;
-    if let Some(error) = response.get("error") {
-        return Err(HistoryCallError::Rpc(error.clone()));
-    }
-    response
-        .get("result")
-        .cloned()
-        .ok_or_else(|| HistoryCallError::Unavailable("native response has no result".into()))
+    take_result(response)
 }
 
 /// Spawns readers through the bin-side opener for one session.
@@ -749,6 +894,13 @@ struct SessionReaderFactory {
 
 impl CodexEndpointFactory for SessionReaderFactory {
     fn spawn(&self) -> Result<SpawnedEndpoint, CatalogError> {
+        // Runs under the host's state lock, so a fence taken before the
+        // host is shut down is always seen here (see `fence_offline_reader`).
+        if is_fenced(&self.cutex_session_id) {
+            return Err(CatalogError::Launch(
+                "the offline history reader is paused while the session's files change; retry shortly".into(),
+            ));
+        }
         let (endpoint, codex_home) = (self.open)(&self.cutex_session_id)
             .map_err(|error| CatalogError::Launch(format!("{error:#}")))?;
         Ok(SpawnedEndpoint {
@@ -768,15 +920,64 @@ fn readers() -> std::sync::MutexGuard<'static, HashMap<String, Arc<CodexConfigHo
 }
 
 /// Stop a session's warm offline reader, e.g. before its runtime starts.
+/// Returns once the reader process has exited (the endpoint's drop closes
+/// its stdin, waits, kills on timeout and reaps it).
 pub fn evict_offline_reader(cutex_session_id: &str) {
-    if let Some(host) = readers().remove(cutex_session_id) {
+    let host = readers().remove(cutex_session_id);
+    if let Some(host) = host {
         host.shutdown();
     }
+}
+
+static FENCES: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+fn fences() -> std::sync::MutexGuard<'static, HashMap<String, usize>> {
+    FENCES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn is_fenced(cutex_session_id: &str) -> bool {
+    fences().contains_key(cutex_session_id)
+}
+
+/// While alive, no offline history reader runs for the session: taken
+/// before an operation that moves, renames or replaces the session's files
+/// (delete, revert). A reader keeps its state directory as cwd and the
+/// timeline open; Windows refuses to rename either while it runs.
+#[must_use = "the fence lasts only while the guard lives"]
+pub struct OfflineReaderFence {
+    cutex_session_id: String,
+}
+
+impl Drop for OfflineReaderFence {
+    fn drop(&mut self) {
+        let mut fences = fences();
+        if let Some(count) = fences.get_mut(&self.cutex_session_id) {
+            *count -= 1;
+            if *count == 0 {
+                fences.remove(&self.cutex_session_id);
+            }
+        }
+    }
+}
+
+/// Stop the session's warm offline reader, wait for its process to exit and
+/// keep it from (re)starting until the guard is dropped. Only this session's
+/// reader: no other process is touched, nothing is timed. An in-flight read
+/// finishes first (`shutdown` takes the host's lock); a read that arrives
+/// later is refused as unavailable instead of spawning a new reader.
+pub fn fence_offline_reader(cutex_session_id: &str) -> OfflineReaderFence {
+    *fences().entry(cutex_session_id.to_string()).or_insert(0) += 1;
+    evict_offline_reader(cutex_session_id);
+    OfflineReaderFence { cutex_session_id: cutex_session_id.to_string() }
 }
 
 /// Structural edits may also invalidate a warm native reader's own snapshot.
 pub fn invalidate_session(cutex_session_id: &str) {
     turn_index::invalidate(cutex_session_id);
+    super::history_turns::invalidate(cutex_session_id);
     evict_offline_reader(cutex_session_id);
 }
 
@@ -798,10 +999,15 @@ fn offline_call(
             ))
         })
         .clone();
-    let (outcome, started) = host
-        .call(method, params)
-        .map_err(|error| HistoryCallError::Unavailable(error.to_string()))?;
-    if let Some(generation) = started {
+    let called = host.call(method, params);
+    // Evicted (or fenced) while this call ran on its own handle: never leave
+    // a reader warm in a host no one can reach to stop it.
+    let current = readers().get(cutex_session_id).is_some_and(|known| Arc::ptr_eq(known, &host));
+    if !current {
+        host.shutdown();
+    }
+    let (outcome, started) = called.map_err(|error| HistoryCallError::Unavailable(error.to_string()))?;
+    if let (Some(generation), true) = (started, current) {
         super::codex_config::spawn_reaper(host, generation);
     }
     match outcome.result {
@@ -843,10 +1049,25 @@ pub fn respond(
     forward_native: ManagementNativeRequestHandler,
     open_offline: OfflineHistoryEndpointOpener,
 ) -> HistoryResponse {
-    let response = respond_with(
+    respond_shaped(cutex_session_id, session, query, None, forward_native, open_offline)
+}
+
+/// `respond` with the page's turns shaped by `shaper` (`history_turns`);
+/// finish a success body with `TurnShaper::finish_body`.
+pub fn respond_shaped(
+    cutex_session_id: &str,
+    session: &Value,
+    query: &HistoryQuery,
+    shaper: Option<&mut TurnShaper>,
+    forward_native: ManagementNativeRequestHandler,
+    open_offline: OfflineHistoryEndpointOpener,
+) -> HistoryResponse {
+    let response = respond_read_shaped_with(
         cutex_session_id,
         session,
-        query,
+        Some(query),
+        None,
+        shaper,
         &mut |method, params| live_call(forward_native, cutex_session_id, method, params),
         &mut |method, params| offline_call(cutex_session_id, open_offline, method, params),
     );
@@ -857,6 +1078,7 @@ pub fn respond(
     response
 }
 
+#[cfg(test)]
 fn respond_with(
     cutex_session_id: &str,
     session: &Value,
@@ -888,11 +1110,24 @@ pub fn respond_turn(
     response
 }
 
-fn respond_read_with(
+pub(super) fn respond_read_with(
     cutex_session_id: &str,
     session: &Value,
     query: Option<&HistoryQuery>,
     turn_id: Option<&str>,
+    live: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>,
+    offline: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>,
+) -> HistoryResponse {
+    respond_read_shaped_with(cutex_session_id, session, query, turn_id, None, live, offline)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn respond_read_shaped_with(
+    cutex_session_id: &str,
+    session: &Value,
+    query: Option<&HistoryQuery>,
+    turn_id: Option<&str>,
+    mut shaper: Option<&mut TurnShaper>,
     live: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>,
     offline: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>,
 ) -> HistoryResponse {
@@ -917,10 +1152,13 @@ fn respond_read_with(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut result = None;
-    let read = |source: &str,
-                call: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>|
+    let mut read = |source: &str,
+                    call: &mut dyn FnMut(&str, Value) -> Result<Value, HistoryCallError>|
      -> Result<Option<Value>, HistoryCallError> {
         let key = index_key(cutex_session_id, session, source);
+        if let Some(shaper) = shaper.as_deref_mut() {
+            shaper.begin(&key, source == "live");
+        }
         let mut body = json!({"contractVersion": 2, "cutexSessionId": cutex_session_id, "threadId": thread_id, "source": source});
         if let Some(turn_id) = turn_id {
             let Some((turn, complete)) = read_turn(&key, thread_id, turn_id, true, call)? else {
@@ -933,7 +1171,7 @@ fn respond_read_with(
             body["native"] = json!({"method": "thread/read", "result": {"thread": turn.thread}});
         } else {
             let query = query.expect("page query");
-            let page = read_indexed_page(&key, thread_id, query, call)?;
+            let page = read_indexed_page_shaped(&key, thread_id, query, shaper.as_deref_mut(), call)?;
             body["page"] = page_json(query.limit, query.cursor.as_deref(), &page);
             body["native"] = json!({"method": "thread/read", "result": {"thread": page.thread}});
         }
@@ -1002,9 +1240,114 @@ fn native_error(thread_id: &str, native: Value) -> HistoryResponse {
     )
 }
 
+/// A stand-in offline reader that behaves like the real ones on the
+/// session's files: a child process with the state directory as cwd and the
+/// timeline open (`sh` exec'ing `sleep`), reaped when its endpoint drops.
+/// Linux only (`/proc`); the Windows rename refusal it models is not run here.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) mod reader_probe {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    struct ProcessEndpoint(std::process::Child);
+    impl crate::catalog::CatalogEndpoint for ProcessEndpoint {
+        fn request(&mut self, _: &str, _: Value) -> Result<Value, CatalogError> {
+            Ok(json!({}))
+        }
+        fn notify(&mut self, _: &str, _: Option<Value>) -> Result<(), CatalogError> {
+            Ok(())
+        }
+    }
+    impl Drop for ProcessEndpoint {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    static DIRS: Mutex<Vec<(String, PathBuf, usize)>> = Mutex::new(Vec::new());
+
+    fn open(id: &str) -> anyhow::Result<(Box<dyn crate::catalog::CatalogEndpoint>, PathBuf)> {
+        let mut dirs = DIRS.lock().unwrap();
+        let entry = dirs.iter_mut().find(|(known, _, _)| known == id).expect("probe session registered");
+        entry.2 += 1;
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exec 3<timeline.sqlite; exec sleep 600"])
+            .current_dir(&entry.1)
+            .stdin(std::process::Stdio::null())
+            .spawn()?;
+        Ok((Box::new(ProcessEndpoint(child)), entry.1.clone()))
+    }
+
+    /// A state directory with a timeline, registered for `id`.
+    pub fn session(id: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cutex-reader-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("timeline.sqlite"), b"timeline").unwrap();
+        let dir = dir.canonicalize().unwrap();
+        DIRS.lock().unwrap().push((id.to_string(), dir.clone(), 0));
+        dir
+    }
+
+    pub fn dir(id: &str) -> PathBuf {
+        DIRS.lock().unwrap().iter().find(|(known, _, _)| known == id).unwrap().1.clone()
+    }
+
+    /// How many reader processes were started for `id`.
+    pub fn spawns(id: &str) -> usize {
+        DIRS.lock().unwrap().iter().find(|(known, _, _)| known == id).unwrap().2
+    }
+
+    /// One offline history read through the production reader cache.
+    pub fn read(id: &str) -> Result<Value, HistoryCallError> {
+        super::offline_call(id, open, "thread/read", json!({}))
+    }
+
+    /// Processes whose cwd or an open file is inside `dir`.
+    pub fn holders(dir: &Path) -> Vec<u32> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+            let inside = |link: PathBuf| std::fs::read_link(link).is_ok_and(|target| target.starts_with(dir));
+            let fds = std::fs::read_dir(entry.path().join("fd")).into_iter().flatten().flatten();
+            if inside(entry.path().join("cwd")) || fds.into_iter().any(|fd| inside(fd.path())) {
+                found.push(pid);
+            }
+        }
+        found
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fence stops this session's reader and waits for its process; while
+    /// it lives no read restarts one; afterwards reads work again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_reader_fence_waits_for_the_reader_and_blocks_restarts() {
+        let id = format!("cutex.fence-{}", uuid::Uuid::new_v4());
+        let other = format!("cutex.fence-other-{}", uuid::Uuid::new_v4());
+        let (dir, other_dir) = (reader_probe::session(&id), reader_probe::session(&other));
+        reader_probe::read(&id).unwrap();
+        reader_probe::read(&other).unwrap();
+        assert!(!reader_probe::holders(&dir).is_empty(), "a warm reader holds the state");
+        let fence = fence_offline_reader(&id);
+        assert!(reader_probe::holders(&dir).is_empty(), "the reader exited before the fence returned");
+        assert!(matches!(reader_probe::read(&id), Err(HistoryCallError::Unavailable(_))));
+        assert!(reader_probe::holders(&dir).is_empty());
+        assert_eq!(reader_probe::spawns(&id), 1, "no reader started while fenced");
+        assert!(!reader_probe::holders(&other_dir).is_empty(), "other sessions keep their reader");
+        drop(fence);
+        reader_probe::read(&id).unwrap();
+        assert_eq!(reader_probe::spawns(&id), 2);
+        evict_offline_reader(&id);
+        evict_offline_reader(&other);
+        assert!(reader_probe::holders(&dir).is_empty() && reader_probe::holders(&other_dir).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(other_dir);
+    }
 
     #[test]
     fn browser_history_paged_reader_never_dispatches_legacy_whole_thread_reads() {

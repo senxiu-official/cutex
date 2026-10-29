@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:image-input",
+  "title": "ImageInput",
+  "description": "Host imageInput settings and native.schema.capabilities.features.imageInputSteering. The existing native imageInput boolean is unchanged.",
+  "$defs": {
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "busyBehavior": { "enum": ["queue", "steer"], "default": "queue" } }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["busyBehaviorDefault", "steering", "requiresTargetHostPath"],
+      "properties": {
+        "busyBehaviorDefault": { "const": "queue" },
+        "steering": { "enum": ["pathText", "nativeImage", "unsupported"] },
+        "requiresTargetHostPath": { "type": "boolean" }
+      }
+    },
+    "imageDelivery": {
+      "description": "Actual native acceptance mode; absent while queued or outcome is unknown. Does not prove the model inspected the image.",
+      "enum": ["pathText", "nativeImage"]
+    }
+  }
+}

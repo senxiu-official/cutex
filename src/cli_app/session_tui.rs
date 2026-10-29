@@ -7337,6 +7337,7 @@ fn apply_session_management(
 fn adopt_recent_thread(request: &RecentAdoptionRequest) -> anyhow::Result<RecentAdoptionResult> {
     let client = super::management_control_plane::ManagementControlClient::connect()?;
     let result = client.adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+        owner_created_native: false,
             session_only: false,
             creation_defaults: None,
         action_id: cutex::agent_management::AgentActionId::new(request.action_id.clone())?, native_id:request.thread_id.clone(), cwd:request.cwd.clone(), formal_name:request.formal_name.clone(),
@@ -7480,6 +7481,8 @@ fn apply_session_management_to_store(
                     groups: Vec::new(),
                     expose_to_im: false,
                     pin: false,
+                    model_defaults: None,
+                    reasoning_defaults: None,
                 },
             )?;
         }
@@ -7508,6 +7511,17 @@ fn apply_session_settings_to_store(
         }
         CutexSessionValueUpdate::Clear => {}
     }
+    let provider_family = match profile_update {
+        CutexSessionValueUpdate::Unchanged => None,
+        _ => {
+            let record = store.sessions.get(&request.key).context("session disappeared before profile update")?;
+            let requested = match profile_update { CutexSessionValueUpdate::Set(profile) => Some(profile.as_str()), _ => None };
+            cutex::runtime::claude_accounts::check_profile_change(record, requested)
+                .map_err(|error| anyhow::anyhow!("{}: {error}", cutex::runtime::claude_accounts::MISMATCH_CODE))?;
+            Some(super::management_context::check_codex_profile_family(record, requested)
+                .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?)
+        }
+    };
     if request.draft.routing_is_dirty() {
         update_cutex_session_routing_by_key(
             store,
@@ -7527,6 +7541,9 @@ fn apply_session_settings_to_store(
         CutexSessionValueUpdate::Clear => {
             set_cutex_session_profile_by_key(store, &request.key, None)?;
         }
+    }
+    if let Some(family) = provider_family {
+        store.sessions.get_mut(&request.key).expect("profile-updated session").provider_family = family;
     }
     if request.draft.runtime_defaults_are_dirty() {
         update_cutex_session_runtime_defaults_by_key(
@@ -13082,6 +13099,14 @@ mod tests {
 
     #[test]
     fn profile_choice_is_staged_then_applied_to_only_the_selected_session() {
+        let _home = crate::cli_app::test_home::IsolatedTestHome::new("tui-profile-family").unwrap();
+        let profiles = ["alpha", "beta"].into_iter().map(|name| {
+            let mut profile = cutex::profiles::lifecycle::new_claude_account(name);
+            profile.cli_kind = cutex::profiles::model::CliKind::Codex;
+            profile.source = Some("official".into());
+            profile
+        }).collect();
+        cutex::profiles::store::save_store(&cutex::profiles::model::AccountsStore { version: 3, accounts: profiles, active_account_id: None }).unwrap();
         let mut record = editable_record();
         record.profile = Some("alpha".to_string());
         let untouched = CutexSessionRecord::new_at(
@@ -13156,6 +13181,14 @@ mod tests {
                 .map(|option| option.value.as_str()),
             Some("beta")
         );
+        // The same local TUI apply path must fence a cross-family selection
+        // before any durable fields in the draft are written.
+        store.sessions.get_mut(EDITABLE_AGENT_KEY).unwrap().provider_family = Some("deepseek".into());
+        let before = store.sessions[EDITABLE_AGENT_KEY].clone();
+        let error = apply_session_settings_to_store(&mut store, &request, &profile_names).unwrap_err();
+        assert!(error.to_string().contains("provider_family_mismatch"), "{error:#}");
+        assert_eq!(store.sessions[EDITABLE_AGENT_KEY], before);
+
     }
 
     #[test]
@@ -13423,6 +13456,14 @@ mod tests {
 
     #[test]
     fn failed_routing_validation_does_not_apply_a_profile_change() {
+        let _home = crate::cli_app::test_home::IsolatedTestHome::new("tui-routing-profile").unwrap();
+        let profiles = ["alpha", "beta"].into_iter().map(|name| {
+            let mut profile = cutex::profiles::lifecycle::new_claude_account(name);
+            profile.cli_kind = cutex::profiles::model::CliKind::Codex;
+            profile.source = Some("official".into());
+            profile
+        }).collect();
+        cutex::profiles::store::save_store(&cutex::profiles::model::AccountsStore { version: 3, accounts: profiles, active_account_id: None }).unwrap();
         let mut record = editable_record();
         record.profile = Some("alpha".to_string());
         let snapshot = SessionSettingsSnapshot::from_record_with_profiles(

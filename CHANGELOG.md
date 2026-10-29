@@ -1,7 +1,212 @@
 # Changelog
 
+## 0.2.0 "Beautiful World" (2026-10-29)
+
+- Improves persistent agent communication, delegation and project services.
+- Adds account-aware Profiles and runtime variants, native runtime 0.164.0-r58,
+  and Claude runtime claude-r32 with bundled Python and pinned dependencies.
+- Kimi and DSH are experimental and are not included in the 0.2.0 binaries; later public update.
+- Upgrading from 0.1.5 changes durable agent communication to format v2.
+  This is a one-way update: older releases require an offline restoration;
+  automatic rollback across the migration is unavailable.
+
+- 改进持久化智能体通信、委托和项目服务。
+- 支持按账户管理的 Profile 和运行时变体，提供原生运行时 0.164.0-r58，
+  Claude 运行时 claude-r32 自带 Python 和固定依赖。
+- Kimi 和 DSH 为实验功能，不包含在 0.2.0 二进制发行中，随后续公开更新提供。
+- 从 0.1.5 升级会将持久化智能体通信改为格式 v2。
+  这是不可自动回退的更新；使用旧版本前须先离线恢复数据。
+
+- Kimi kimi-r2 known limits: Linux lacks the node-pty binding, so interactive terminal tools are unavailable; offline Glob/Grep require system ripgrep (`rg`).
+
 <!-- Each entry: English text, then a Chinese text. The English part contains no Chinese characters:
      name UI labels by their English strings (Approvals, "Auto"). -->
+
+## r262
+
+- Completed asks can move transactionally into cold history in the existing
+  database, keeping admission and scheduling focused on active records. History
+  remains readable. The persisted cutoff does not advance automatically. This
+  introduces asks format 2: rollback to r259/r260/r261 requires stopping every
+  writer and running the outgoing binary's asks-archive-restore command first.
+  已结束的 asks 可事务性归档到原数据库，输入准入和调度只处理热数据，历史仍可读取；截止时间固定保存，不自动推进。asks 格式升为 2，回退 r259/r260/r261 前须停下全部写入者并用新版执行恢复命令。
+
+- DSH is an optional installed component. Capabilities reflect installation;
+  standard host kits omit its npm payload and Node preparation. Explicit install
+  and installed-only updates preserve existing sessions, versions and history.
+  Native r52.4 and Claude claude-r29 are unchanged.
+  DSH 改为可选安装组件，能力随安装状态显示；标准安装包不再携带 DSH npm 内容或准备 Node。显式安装与已安装组件更新保留原有会话、版本和历史；Native r52.4、Claude claude-r29 不变。
+
+## r261
+
+- Concurrent ask-store readers share one cold-generation refresh instead of rebuilding the
+  retained state independently. Input admission lease checks use a shared snapshot without
+  copying the whole ask store, retaining the existing hot-only recovery behavior.
+  并发读取 asks 时，同一代数据只重建一次，减少大历史带来的 CPU 和写锁等待；输入准入只读共享快照，保留 hot-only 恢复行为。
+
+- Newly created Gemini profiles leave strict tool-schema compatibility off by default; existing
+  profile settings are preserved. Recognized terminal Google/Gemini tool-schema refusals carry
+  the additive `cutexCode: "tool_schema_rejected"` presentation hint in events and history.
+  新建 Gemini Profile 默认不启用严格工具 schema 模式，已有 Profile 保持原设置；已识别的 Google/Gemini 工具 schema 拒绝带上桌面可识别的提示码。
+
+- Approval Rules lists reuse a bounded in-memory projection, refreshed by approval writes and
+  invalidated by file identity or change metadata. The list response and rule expiry behavior
+  are preserved, with no persistent format migration.
+  自动审批规则列表使用有界内存快照，审批写入后刷新，文件变更时失效；返回格式和规则到期行为保持一致，无需迁移存储格式。
+
+## Unreleased
+
+- Claude runtime claude-r29 (adapter 0.8.3) preserves streamed item identity through corrected
+  full-text terminal events. It ships a pinned standalone Python and, for the r260 release build,
+  Anthropic's unmodified SDK-matched Claude Code CLI by default. The reviewed build switch remains:
+  `CUTEX_CLAUDE_BUNDLE_CLI=0` produces a CLI-free archive, while an omitted value or `1` bundles the
+  hash-pinned platform wheel. Generated notices keep the Claude Code binary under Anthropic's
+  Commercial Terms and legal/compliance documentation. `PATCH /v2/settings` with
+  `{"claudeCli":"bundled"}` or `{"claudeCli":"system"}` selects the source for new Claude sessions,
+  and the `claude-runtime` row from
+  `GET /v2/components` reports only the selected source and bounded bundled/system versions through
+  its public `claudeCli` extension; diagnostic executable paths remain under `detail`.
+  Claude 运行时 claude-r29（适配器 0.8.3）修复流式条目在完整终态中的身份与内容；它自带独立 Python，r260 发布包默认也带上与 SDK 匹配、未经修改的 Claude Code CLI，仍可用 `CUTEX_CLAUDE_BUNDLE_CLI=0` 关闭。设置可为新会话选择内置或系统 CLI，组件状态按桌面协议报告来源与版本。
+
+- Claude auto-compaction per profile (capability `claude-compaction`, cutex-desktop docs/design 036): the profile
+  item carries `claudeCompaction: {window, percent} | null` (detail: `editable.claudeCompaction`,
+  `claudeCompactionError` for a file the launch would refuse) and `PATCH /v2/profiles/{p}` takes
+  `claudeCompaction: {window: 100000..1000000, percent: 1..100} | null`. Stored in the existing
+  `profiles/<id>/claude-runtime.json` (same file shape as before, so older binaries keep reading it; null removes the
+  file and Claude Code decides again). Applies at each agent's next runtime start. Per-model values are not offered:
+  a model switch inside a running Claude agent keeps the launch environment.
+  Claude 自动压缩可以在 Profile 设置里改（窗口 / 百分比），下次启动运行时生效。
+
+- Browser round trips (cutex-desktop docs/design 033): `browser_navigate` and `browser_open` take an optional
+  `snapshot: true` and then also return the page's `browser_read` snapshot (fresh refs) in the same result; new
+  `browser_visit {title, guestId, urls[1..10]}` navigates one leased tab to each URL in turn and reads it (snapshots
+  share a 128 KiB budget, cut ones are marked `truncated`; stops at the first failure; only the last page's refs stay
+  valid). Both are composed in the MCP façade from the existing wire commands - each step is an ordinary
+  `/v2/browser/commands` request with its own request id derived from the outer call, so per-tab admission, the
+  network policy (N2), owner approvals and leases apply to every step exactly as before; Management and the desktop
+  never see a new command (the façade option and the composite tool fail Management's wire validation).
+  浏览器：打开 / 跳转可以顺带返回页面快照；新工具 browser_visit 一次按顺序读多个网址，减少模型往返。
+
+- agent_create states an effort fallback (capability `agent-create-effort-fallback`): when the
+  profile default reasoning effort is not offered by the model and another level is used, the reply
+  carries `effort_fallback {model, requested, used, reason, note}` and `POST /v2/human/agents`
+  answers `effortFallback`. Owner abandon of an unfinished agent_create (capability
+  `agent-create-abandon`): `POST /v2/agent-management/create-abandon {action_id, dry_run?}` (root)
+  and `cutex human management agent-create-abandon <action_id> [--dry-run]` release the name, end the
+  action as `create_abandoned` and remove only what it made (its durable session through the session
+  delete path, else its native thread history moved to `runtime/session-deletes/`); completed,
+  running and non-create actions are refused; repeating replays the receipt
+  (`runtime/agent-management/v1/abandons/<action>.json`).
+  新建时默认推理强度被换成模型支持的一档会在结果里写明；主人可用 `cutex human management agent-create-abandon` 放弃一次没完成的新建（释放名字、清理这次新建建出的会话，保留恢复副本）。
+
+- Approvals at the next step (docs design 023, owner decision 2026-10-22). The approval decision notice (owner
+  `cutex.approvals`, a cutex system notice) is now read by a BUSY requester at its next step with no wait, on Codex and
+  on Claude adapters that offer `soon` (older adapters: after the turn, as before); idle requesters get it at once.
+  The agent's own alarms stay after-turn. Marked by the alarm message id prefix `alarm-approval-` (an older release
+  delivers such a notice as an ordinary after-turn alarm: rollback-safe, no format change); the alarm store checks
+  the owner behind the prefix. Due alarms are now sent in the order they fell due (decision order), one notice per
+  approval and outcome as before. Management shows `nextStep` for them (`afterTurnOnly` no longer set).
+  Owner-notify replies and the owner's wake (`cutex/agentBus/wake`) are submitted `auto` also while the agent is busy
+  (read at the next step like typed input; before: queued after the turn). A delegation the owner refused in review
+  (`rejected` state item) reaches a busy requester at its next step at once instead of after the 120 s busy wait.
+  审批结果现在会在忙着的智能体的下一步送到（不再等回合结束；智能体自己设的提醒照旧回合后）；主人通知的回复和主人唤醒也在下一步插入；委托审核被拒不再等 120 秒。
+
+- Linux managed installs: stopping or restarting the Agent Bus no longer kills the agent runtimes it started (Claude
+  adapters with Claude Code and their tools, Codex app-servers live in its cgroup). `cutex service install` writes
+  `KillMode=process` (+ `TimeoutStopSec=30`) into `cutex-agent-bus.service` as it always did for the Management API;
+  an existing bus unit written by `cutex service install` without any `KillMode` is patched in place (only those
+  lines; `systemctl --user daemon-reload`) right before the upgrade runner's stop and before `cutex human service
+  stop|restart` of the bus, so the first upgrade to this release already keeps the runtimes. The owner's own units
+  (no marker) and units that set a `KillMode` are left alone.
+  Linux 托管安装：停止或重启 Agent Bus 不再结束它启动的智能体运行时（以前所有由总线启动的 Claude 智能体在每次升级时都会被结束）；旧的总线单元在下一次停止前自动补上 `KillMode=process`。
+- Claude background subagents: a finished background subagent / command now really wakes its agent with the
+  "Claude Task" message. In r247 the Agent Bus and Management observers of a Claude adapter never asked for the
+  adapter's `claude/*` notifications (`initialize` capability `claudeExtensions`), so the adapter never sent them
+  `claude/task/updated` and no notice was queued (seen on hachimi, agent r23-live-check). The observers now ask for
+  them and opt out of the high-volume ones (`claude/runtime/event`, `claude/runtime/statusChanged`,
+  `claude/model/observed`, `claude/input/contextPersisted`, `claude/input/statusChanged`); every other `claude/*`
+  frame is ignored before any store is touched. No adapter change (claude-r23 stays).
+  Claude 后台子代理结束后，智能体现在会真正收到“Claude Task”消息（r247 中观察连接没有订阅适配器的 `claude/*` 通知，消息从未发出）。
+- Test only: the service-tile fetch test accepts a timeout as well as a refusal for a closed loopback port on
+  Windows (Windows retries the SYN for about 2 s).
+- Usage-limit reset credits (capability `profile-reset-credits`): `GET /v2/profiles/{p}/reset-credits
+  [?refresh=true]` shows how many resets the profile's account holds, when each expires and its rows
+  (read on request only, cached 60 s per account); `POST /v2/profiles/{p}/reset-credits/consume
+  {idempotencyKey, creditId?}` uses one (owner click only; the same key never uses a second one; 409
+  `reset_credit_consume_in_progress` while one runs; on `reset` the quota is re-read). Codex profiles
+  with a ChatGPT login use the app-server's `account/rateLimits/read` / `account/rateLimitResetCredit/
+  consume` on the short-lived per-profile app-server; Claude subscription accounts use Claude Code's
+  limit resets (`/api/oauth/usage?cedar_ember=1`, `POST /api/organizations/{org}/reset_rate_limits`,
+  organization from the account's `.claude.json`). GLM / Z.ai profiles answer `supported: false`,
+  `unsupportedReason: zcodeOnly`: their resets live on the ZCode service and need a ZCode login.
+  额度重置券（能力 `profile-reset-credits`）：可查看配置所用账号的重置券数量和到期时间，并在主人点击确认后使用一张；支持 ChatGPT 登录的 Codex 配置和 Claude 订阅账号；GLM / Z.ai 的重置券只在 ZCode 服务里，需要 ZCode 登录，暂不支持。
+
+- Claude background subagents (Claude adapter claude-r23, 0.8.0; capability `claude-background-tasks`):
+  `Agent` / `Task` with `run_in_background` (or without it) runs on after its turn, so the agent reads
+  the owner's next message at once instead of waiting for the subagent. Its tools are admitted by its
+  agent id; cutex tools, nested subagents, questions and approvals are refused in it (full access: a
+  safety check becomes a safety block on the origin turn). Its transcript stays open until the task
+  ends. A finished, failed, stopped or lost one (and a main-agent background shell command, at most one
+  notice a minute) reaches the agent as ONE Agent Bus message from "Claude Task" (control type
+  `cutex.claude.task.v1`, view `cutex.claude-task.v1`, stable id `ctask-…`, so a repeated notice is
+  queued once): read at a busy agent's next tool step at once, a new visible turn when idle. Its usage
+  is added to the turn that started it. The session native request `claude/tasks/stop {threadId,
+  taskId}` stops a running one; interrupting the turn does not. Claude Code's own invisible
+  notification turn stays without tools (components/claude-runtime/docs/BUSY_DELIVERY.md).
+  Claude 后台子智能体（适配器 claude-r23 / 0.8.0，能力 `claude-background-tasks`）：后台子智能体在父回合结束后继续运行，主智能体可立即读取主人的新消息；跑完、失败、被停止或因重启丢失时，cutex 以「Claude Task」给该智能体发一条消息（按任务去重；忙时下一步读入，空闲时开可见回合）；子智能体内不能用 cutex 工具、嵌套子智能体、提问或审批；`claude/tasks/stop` 可停止正在运行的后台子智能体。
+- `cutex component install` repairs an incomplete component version dir instead of refusing it
+  forever: a `<install base>/components/<name>/<version>/` without `receipt.json` (an unpack that
+  never finished, or only a `prepared/needs-user.json`) or missing a required or receipted file is
+  moved aside to `<version>.incomplete-<UTC timestamp>` and the version is downloaded and unpacked
+  again (result `repaired`; `--dry-run` reports it). The Claude runtime records a user step only in
+  an unpacked version dir, its status names an incomplete version as `degraded` with the repair
+  command, and its install dry run no longer fails for a version not downloaded yet. A release that
+  ships a component for other platforms only now answers `component_no_platform_package` (this
+  platform, the packaged ones, `--from-source`) instead of "update cutex"; darwin-arm64 Claude
+  runtime installs are source installs (releases package linux-x64 and windows-x64).
+  组件安装不再因不完整的版本目录（缺 `receipt.json` 或必需文件）而一直失败：该目录被移到 `<版本>.incomplete-<时间>` 后重新下载解包；发布未提供本平台安装包时报 `component_no_platform_package` 并提示 `--from-source`（darwin-arm64 的 Claude 运行时仅支持源码安装）。
+- A one-time safety grant (Approve once on a Claude safety check) reaches a busy agent at its running
+  turn's next step (`cutex/userInput/submit` `auto`, steered as a busy wake past its wait is), no
+  longer queued as "after this turn": the agent that hit the check usually still waits for it in that
+  turn. Idle agents still get a new turn, offline ones are started.
+  主人「批准一次」安全检查后，「主人已批准一次：…」对忙碌中的智能体在当前回合的下一步插入（与忙碌唤醒相同），不再显示为「本回合结束后送达」；空闲时照旧立即开新回合。
+- Claude adapter claude-r22 (0.7.9): `thread/tokenUsage/updated` after each assistant message with new
+  usage while a turn runs, not only at its end, keeping the thread's last known `modelContextWindow`
+  (never null between steps).
+  Claude 适配器 claude-r22（0.7.9）：回合进行中每条带用量的助手消息后即更新上下文用量，并沿用该会话最近已知的上下文窗口（中途不再变为空）。
+- Bootstrap and history `cutexState.latestPlan` for Claude sessions (capability `session-latest-plan`):
+  the newest `turn/plan/updated` checklist (TodoWrite / Task tools) of the bound thread, kept by the
+  daemon across restarts and dropped when a revert removes its turn. It was always null.
+  Claude 会话的 bootstrap / 历史 `cutexState.latestPlan` 不再总是 null：守护进程保存当前线程最新的任务清单（TodoWrite / Task 工具），重启后仍在，撤回其回合时清除。
+- Home page pins can point at a client page (capability `user-home-page-pins`): `kind: "page"` with
+  `key` `<pageId>:<argument>` (for example `project-view:<projectId>`, the desktop's Project view of
+  a project; page id `[a-z][a-z0-9._-]{0,63}`, argument not empty). Other keys are refused with 400
+  `invalid_home`; the `users` schema export (`homePin`) and docs/remote-clients.md describe it.
+  主页固定项新增 `page` 类型（能力 `user-home-page-pins`）：`key` 为 `<pageId>:<参数>`（如桌面端某项目的 Project 视图 `project-view:<projectId>`），格式不符返回 400 `invalid_home`。
+- `cutex human session delete <id> [--yes] [--json]` permanently deletes a session through the
+  running Management API, like the desktop's "Delete…" (`cutex/session/delete`, as the owner with the
+  local credential; the id is a cutex_session_id, Codex session id or unique name; on a terminal it
+  asks first, otherwise `--yes` is required). It prints what was deleted and the recovery directory
+  under `runtime/session-deletes/`. Old local explicit-launch sessions (e.g. pinned to a pruned r177
+  bundle, or a native without `thread/delete`) are deleted too: their rollout moves into the recovery
+  directory; a fork that still reads the history refuses the delete, copies left behind by earlier
+  forks move along.
+  新增 `cutex human session delete <id> [--yes] [--json]`：通过运行中的管理 API 永久删除会话，与桌面端「删除…」相同；终端上先确认，非交互时须加 `--yes`；输出删除内容和恢复目录。旧的本地显式启动会话（如固定在已清理的 r177 包上）也能删除：其历史文件移入恢复目录。
+- `cutex human session unmanage` writes only its own record (no more "session store revision
+  conflict" while the daemon runs) and refuses where the change would not hold: a session with a
+  running runtime (its Agent Bus registration turned it back into an Agent within seconds), a durable
+  Agent on the Agent Management roster (archive or delete it instead) and an already local session
+  (unmanage never removed a record; use `session delete`).
+  `cutex human session unmanage` 只写本会话的记录（守护进程运行时不再出现 revision conflict），并拒绝不会生效的情况：运行时仍在运行（Agent Bus 注册会在数秒内把它改回智能体）、Agent Management 名册中的持久智能体（请归档或删除）、已是本地会话（unmanage 从不删除记录，请用 `session delete`）。
+- Service tiles for the home page (capability `service-tiles`): `service_register` / `service_update`
+  and `POST|PATCH /v2/services` take an optional static `tile` template and / or `tilePath` (a path
+  inside the service, default `/.well-known/cutex-tile.json`). `GET /v2/services/{slug}/tile` answers
+  `{tile, fetchedAt, error, source}`; the daemon fetches the template from the service (2 s, at most
+  16 KiB, redirects only inside the service), validates it strictly (unknown fields dropped, no URLs
+  or `javascript:` / `data:` paths) and caches it for `refreshSeconds` (at least 60).
+  `GET /v2/services/{slug}/tile/image` serves the tile image (PNG, JPEG or WebP, at most 512 KiB; no
+  SVG). Same access as the services routes (owner; read-scoped devices may read).
+  服务磁贴（主页用，能力 `service-tiles`）：注册 / 更新服务时可给静态 `tile` 模板和 / 或 `tilePath`（服务内路径，默认 `/.well-known/cutex-tile.json`）；`GET /v2/services/{slug}/tile` 返回磁贴，守护进程从服务取回（2 秒、16 KiB 上限、只跟随服务内跳转），严格校验并按 `refreshSeconds`（至少 60 秒）缓存；`GET /v2/services/{slug}/tile/image` 提供磁贴图片（PNG / JPEG / WebP，512 KiB 以内，不支持 SVG）。
 
 ## 0.1.5 "First Take" (2026-10-20)
 

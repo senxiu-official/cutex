@@ -90,6 +90,8 @@ pub struct Scope {
 pub enum ScopedRoute {
     FsDir,
     FsFile,
+    FsTransferMeta,
+    FsTransferChunk,
     FsSearch,
     FsWatch,
     GitStatus,
@@ -195,6 +197,8 @@ pub fn parse_route(path: &str) -> Option<WorkspaceRoute> {
     let route = match tail {
         "fs/dir" => ScopedRoute::FsDir,
         "fs/file" => ScopedRoute::FsFile,
+        "fs/transfer" => ScopedRoute::FsTransferMeta,
+        "fs/transfer/chunk" => ScopedRoute::FsTransferChunk,
         "fs/search" => ScopedRoute::FsSearch,
         "fs/watch" => ScopedRoute::FsWatch,
         "git/status" => ScopedRoute::GitStatus,
@@ -356,6 +360,9 @@ fn dispatch(
                 (_, ScopedRoute::FsFile) => {
                     write_result(stream, super::workspace_fs::file_resource(&root, &params))
                 }
+                (_, ScopedRoute::FsTransferMeta | ScopedRoute::FsTransferChunk) => {
+                    super::file_transfer::handle(stream, request, Some(&root))
+                }
                 (_, ScopedRoute::FsSearch) => {
                     write_result(stream, super::workspace_fs::search_resource(&root, &params))
                 }
@@ -483,6 +490,8 @@ fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        416 => "Range Not Satisfiable",
+        501 => "Not Implemented",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         503 => "Service Unavailable",

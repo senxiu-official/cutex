@@ -193,9 +193,19 @@ fn render_with_browser(facts: &HarnessFacts, browser: bool) -> String {
 
 /// The section when `agent_harness.enabled` (the launch paths).
 pub fn launch_harness(record: &CutexSessionRecord) -> Option<String> {
-    crate::config::agent_harness::current()
+    let harness = crate::config::agent_harness::current()
         .enabled
-        .then(|| render_cutex_harness(record))
+        .then(|| render_cutex_harness(record));
+    let fork = crate::session::fork::boundary_note(&record.cutex_session_id);
+    match (harness, fork) {
+        (Some(mut harness), Some(note)) => {
+            harness.push_str("\n## Fork boundary\n");
+            harness.push_str(&note);
+            Some(harness)
+        }
+        (harness, None) => harness,
+        (None, Some(note)) => Some(format!("# Fork boundary\n\n{note}")),
+    }
 }
 
 /// Most bytes of AGENTS.md text cutex passes to a Claude agent (Codex's

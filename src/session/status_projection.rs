@@ -167,6 +167,8 @@ pub fn runtime_backend_short_label(backend: CutexSessionRuntimeBackend) -> &'sta
         CutexSessionRuntimeBackend::CuteAlden => "alden",
         CutexSessionRuntimeBackend::ClaudeSubscription => "claude",
         CutexSessionRuntimeBackend::Future => "future",
+        CutexSessionRuntimeBackend::Dsh => "dsh",
+        CutexSessionRuntimeBackend::Kimi => "kimi",
     }
 }
 

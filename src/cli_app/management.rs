@@ -83,6 +83,9 @@ pub(crate) fn run_command(command: ManagementCommand) -> anyhow::Result<()> {
             port,
             token,
         } => cmd_management_agent_reservation_reconcile(&request_file, port, token.as_deref()),
+        ManagementCommand::AgentCreateAbandon { action_id, dry_run, port, token } => {
+            cmd_management_agent_create_abandon(&action_id, dry_run, port, token.as_deref())
+        }
     }
 }
 
@@ -352,6 +355,31 @@ fn arm_windows_hosted_launcher_guard() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `cutex [human] management agent-create-abandon <action_id> [--dry-run]`:
+/// POST /v2/agent-management/create-abandon (root), prints the JSON reply.
+fn cmd_management_agent_create_abandon(
+    action_id: &str,
+    dry_run: bool,
+    port: Option<u16>,
+    explicit_root_token: Option<&str>,
+) -> anyhow::Result<()> {
+    let request = cutex::agent_management::CreateAbandonRequest { action_id: action_id.to_string(), dry_run };
+    let body = serde_json::to_vec(&request)?;
+    let config = load_codez_config();
+    let port = port.unwrap_or_else(|| cutex::management::service::management_port(&load_codez_config()));
+    validate_management_port(port)?;
+    let token = management_root_credential(&config, explicit_root_token)?;
+    let response = management_http_json(
+        &management_base_url(port),
+        "POST",
+        "/v2/agent-management/create-abandon",
+        Some(token),
+        Some(&body),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
 fn cmd_management_agent_reservation_reconcile(
     request_file: &str,
     port: Option<u16>,
@@ -545,6 +573,9 @@ pub(crate) fn cmd_management_serve(
     // profile-generic-switches: legacy private ChatGPT profile -> switch,
     // quota_preset auto -> explicit reader (converges every start).
     cutex::profiles::generic_switches::run_on_startup("management serve");
+    // Design 028 (e): known-model catalog rows lose the values their provider
+    // rejects (e.g. glm-5.3 `medium`); owner edits stay. Converges every start.
+    cutex::profiles::catalog_api::correct_known_rows_on_startup("management serve");
     // 2026-10-15: notification presets `legacy` removed; absent / legacy
     // tables are stored as `default` once (record in archive/). Never fatal.
     cutex::config::notification_levels::run_legacy_migration_on_startup("management serve");
@@ -608,6 +639,9 @@ pub(crate) fn cmd_management_serve(
             app_server_runtime::observe_late_runtimes(&current_host_name());
         })?;
     super::claude_runtime::spawn_observer()?;
+    if let Err(error) = cutex::management::v2::journal_watch::start_watcher() {
+        eprintln!("shared journal watcher warning: {error:#}");
+    }
     cutex::management::v2::health::start_scan();
     // Asks (委托): admission scheduler and Management v2 ask events.
     if let Err(error) = super::asks_runtime::spawn_scheduler() {

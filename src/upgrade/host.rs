@@ -80,7 +80,11 @@ impl RealHost {
                 uid: super::launchd::current_uid(),
             })
         } else {
-            Box::new(SystemdControl { exec: &RealExec, names: self.names.clone() })
+            Box::new(SystemdControl {
+                exec: &RealExec,
+                names: self.names.clone(),
+                unit_dir: self.unit_dir.clone().or_else(super::service::default_unit_dir),
+            })
         }
     }
 

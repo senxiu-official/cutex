@@ -221,5 +221,5 @@ async def test_side_is_refused_without_the_sdk_backend(h):
 
 def test_features_declare_side_chat_and_busy_fork():
     features = json.loads((Path(__file__).parents[1] / 'src/cute_claude/features.json').read_text())
-    assert features['release'] == 'claude-r21'
+    assert int(features['release'].removeprefix('claude-r')) >= 21  # sideChat since claude-r21
     assert features['features']['sideChat'] is True and features['features']['forkWhileBusy'] is True
