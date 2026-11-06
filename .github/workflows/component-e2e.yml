@@ -26,6 +26,11 @@ on:
         required: false
         default: ""
         type: string
+      adapter_only:
+        description: "Run only the external-adapter contract checks"
+        required: false
+        default: false
+        type: boolean
       real_claude:
         description: "Also install the real Claude Code CLI from npm and check it is found (login required)"
         required: false
@@ -44,6 +49,7 @@ env:
 
 jobs:
   claude-runtime:
+    if: inputs.adapter_only != true
     name: claude-runtime ${{ matrix.platform }} bundle-cli=${{ matrix.bundle_cli }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -137,6 +143,7 @@ jobs:
           retention-days: 7
 
   job-service:
+    if: inputs.adapter_only != true
     name: job-service linux-x64
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -212,3 +219,61 @@ jobs:
           path: ${{ runner.temp }}/e2e-logs/
           if-no-files-found: ignore
           retention-days: 7
+
+  external-adapters:
+    name: external-adapter contracts ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-22.04
+          - platform: windows-x64
+            runner: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '24.21.0'
+      - name: Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Private test home
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          original = Path.home()
+          private = original / 'cutex-ci-private' / 'external-adapters'
+          private.mkdir(parents=True, exist_ok=True, mode=0o700)
+          (private / '.cutex-test-private-home').write_text('CI external-adapter contracts\n')
+          values = {'HOME': str(private), 'CUTEX_TEST_PRIVATE_HOME': str(private),
+                    'CARGO_HOME': os.environ.get('CARGO_HOME', str(original / '.cargo')),
+                    'RUSTUP_HOME': os.environ.get('RUSTUP_HOME', str(original / '.rustup'))}
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              for key, value in values.items(): env.write(f'{key}={value}\n')
+          PY
+      - name: External adapter lifecycle and view contracts
+        env:
+          CARGO_BUILD_JOBS: '2'
+          CARGO_PROFILE_TEST_DEBUG: '0'
+          CARGO_PROFILE_DEV_DEBUG: '0'
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 test --locked --lib components::external_contract_tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/external-contracts.log"
+          cargo +1.95.0 test --locked --lib components::external_view_tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/external-views.log"
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: always()
+        with:
+          name: external-adapter-contracts-${{ matrix.platform }}
+          path: ${{ runner.temp }}/external-*.log
+          if-no-files-found: ignore
+          retention-days: 14
