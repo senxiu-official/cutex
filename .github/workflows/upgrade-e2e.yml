@@ -37,6 +37,11 @@ on:
         required: false
         default: ""
         type: string
+      sign_ref:
+        description: "Reviewed full commit of the signing workflow for formal-assets"
+        required: false
+        default: ""
+        type: string
       from_repo:
         description: "Repository of the installed release's source"
         required: false
@@ -331,7 +336,8 @@ jobs:
       - name: Candidate helpers and embedded release public key
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.to_ref || github.ref }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Python from the runner's tool cache
         run: bash .github/ci/component-e2e-pythons.sh
@@ -343,6 +349,8 @@ jobs:
           BUILD_RUN: ${{ inputs.build_run }}
           SIGN_RUN: ${{ inputs.sign_run }}
           CI_WORKFLOW_COMMIT: ${{ github.sha }}
+          PRODUCT_REF: ${{ inputs.to_ref }}
+          SIGN_WORKFLOW_COMMIT: ${{ inputs.sign_ref }}
         run: |
           set -euo pipefail
           [[ "$BUILD_RUN" =~ ^[1-9][0-9]*$ && "$SIGN_RUN" =~ ^[1-9][0-9]*$ ]] || { echo 'Successful build_run and sign_run are required' >&2; exit 1; }
@@ -351,17 +359,25 @@ jobs:
           "$E2E_PYTHON" - <<'PY'
           import json, os, subprocess
           from pathlib import Path
-          product_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          product_commit = subprocess.check_output(["git", "rev-parse", "--verify", os.environ["PRODUCT_REF"] + "^{commit}"], text=True).strip()
           ci_commit = os.environ["CI_WORKFLOW_COMMIT"]
-          if len(ci_commit) != 40 or any(c not in "0123456789abcdef" for c in ci_commit):
-              raise SystemExit("Expected CI workflow commit is not a full SHA")
+          sign_commit = os.environ["SIGN_WORKFLOW_COMMIT"]
+          for commit in (product_commit, ci_commit, sign_commit):
+              if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
+                  raise SystemExit("Expected product and workflow commits must be full SHAs")
+              subprocess.run(["git", "merge-base", "--is-ancestor", commit, ci_commit], check=True)
+          for path in (".github/workflows/sign-release.yml", ".github/ci/sign-and-upload.sh", ".github/ci/cutex-release.pub"):
+              subprocess.run(["git", "diff", "--exit-code", sign_commit, ci_commit, "--", path], check=True)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write("FORMAL_PRODUCT_COMMIT=" + product_commit + "\n")
           print("Reviewed CI workflow:", ci_commit, "Product source:", product_commit)
           root = Path(os.environ["RUNNER_TEMP"])
-          for name, path in [("formal-build-run.json", ".github/workflows/build-binaries.yml"),
-                             ("formal-sign-run.json", ".github/workflows/sign-release.yml")]:
+          for name, path, commit in [("formal-build-run.json", ".github/workflows/build-binaries.yml", product_commit),
+                                     ("formal-sign-run.json", ".github/workflows/sign-release.yml", sign_commit)]:
               run = json.loads((root / name).read_text())
               if (run["status"] != "completed" or run["conclusion"] != "success" or
-                      run["head_sha"] != ci_commit or run["path"] != path):
+                      run["head_sha"] != commit or run["path"] != path or
+                      run["repository"]["full_name"] != os.environ["GITHUB_REPOSITORY"]):
                   raise SystemExit("Workflow run does not match successful candidate build/sign provenance")
           PY
       - name: Original build archives (no rebuild)
@@ -385,7 +401,7 @@ jobs:
           "$E2E_PYTHON" - <<'PY'
           import json, os, subprocess
           from pathlib import Path
-          product_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          product_commit = os.environ["FORMAL_PRODUCT_COMMIT"]
           root = Path(os.environ["RUNNER_TEMP"]) / "formal-build"
           records = sorted(root.rglob("BUILD-INFO-*.json"))
           if not records:
@@ -451,7 +467,7 @@ jobs:
           "$E2E_PYTHON" .github/ci/upgrade-e2e.py formal-assets \
             --build-assets "$RUNNER_TEMP/formal-build" --signed-assets "$RUNNER_TEMP/formal-sign" \
             --old-assets "$RUNNER_TEMP/formal-old" --native-assets "$RUNNER_TEMP/formal-native" \
-            --public-key .github/ci/cutex-release.pub --expected-commit "$(git rev-parse HEAD)" \
+            --public-key .github/ci/cutex-release.pub --expected-commit "$FORMAL_PRODUCT_COMMIT" \
             --expected-native-version "$NATIVE_VERSION" --confirm-one-way "$TO_RELEASE" \
             --management-port 24391 --bus-port 24392 --work "$RUNNER_TEMP/formal upgrade"
       - name: Keep scrubbed verification receipt and logs
