@@ -76,7 +76,6 @@ jobs:
           ref: ${{ inputs.source_ref || github.ref }}
           persist-credentials: false
       - name: Reviewed CI helpers (separate from product source)
-        if: matrix.platform == 'linux-x64' && matrix.bundle_cli == '1'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
@@ -123,7 +122,7 @@ jobs:
           args=(claude-runtime --cutex "$exe" --archives "$RUNNER_TEMP/archives" --work "$work")
           if [ -n "${E2E_OLD_PYTHON:-}" ]; then args+=(--old-python "$E2E_OLD_PYTHON"); fi
           if [ -n "${E2E_NPM_PREFIX:-}" ]; then args+=(--npm-claude-prefix "$E2E_NPM_PREFIX"); fi
-          "$E2E_PYTHON" .github/ci/component-e2e.py "${args[@]}"
+          "$E2E_PYTHON" ci/.github/ci/component-e2e.py "${args[@]}"
       - name: Collect logs
         if: failure()
         run: |

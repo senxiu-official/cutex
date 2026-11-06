@@ -154,8 +154,8 @@
     },
     {
       "path": ".github/workflows/component-e2e.yml",
-      "sha256": "369533d29d211bea66911c9ea263d9fd9bf1c1624b4eeceb5b1bb79384b33323",
-      "size": 13105
+      "sha256": "ace650415d51561c7fe63932754be85ad571b191e4f2ffad9bc8a5cb3ad21223",
+      "size": 13037
     },
     {
       "path": ".github/workflows/release.yml",
