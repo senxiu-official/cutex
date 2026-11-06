@@ -139,8 +139,8 @@
     },
     {
       "path": ".github/ci/upgrade-e2e.py",
-      "sha256": "42d9716b98ae98d6f7798426f209f71afec2daaf06b1c5609d68c271a0dd05f0",
-      "size": 114408
+      "sha256": "0357603034bde47e20af2364f715029ef8c1ac698a46532acb9d231f576b5707",
+      "size": 114499
     },
     {
       "path": ".github/ci/upgrade-manifest.py",

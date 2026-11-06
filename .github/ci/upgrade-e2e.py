@@ -1561,7 +1561,8 @@ def capture_formal_baseline(state_dir: Path, fixture: dict, blobs: dict[str, byt
     revision = baseline.get("revision")
     # fail_ask changes the store once, and its queued notice may be drained once.
     allowed_revisions = (fixture["revision"] + 1, fixture["revision"] + 2) if reconciled else (fixture["revision"],)
-    require(type(revision) is int and revision in allowed_revisions, "invalid old baseline store revision")
+    require(type(revision) is int and revision in allowed_revisions,
+            f"invalid old baseline store revision: actual={revision!r}, expected={allowed_revisions!r}, reconciled={reconciled}")
     for collection in ("asks", "answers", "artifacts", "deliveries", "actions"):
         actual_rows = baseline.get(collection)
         require(isinstance(actual_rows, dict) and actual_rows.keys() == fixture[collection].keys(),
