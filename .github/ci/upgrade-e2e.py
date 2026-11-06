@@ -1559,8 +1559,10 @@ def capture_formal_baseline(state_dir: Path, fixture: dict, blobs: dict[str, byt
         expected_pending.update(execution="failed", revision=original["revision"] + 1,
                                 closed="completed", closedAt=closed_at, updatedAt=closed_at)
     revision = baseline.get("revision")
-    # fail_ask changes the store once, and its queued notice may be drained once.
-    allowed_revisions = (fixture["revision"] + 1, fixture["revision"] + 2) if reconciled else (fixture["revision"],)
+    # Original signed 0.2.0 reaches seed+3 during startup reconciliation and
+    # notice publication. The exact five retained collections are checked below;
+    # never infer content preservation from this global store counter alone.
+    allowed_revisions = tuple(fixture["revision"] + n for n in (1, 2, 3)) if reconciled else (fixture["revision"],)
     require(type(revision) is int and revision in allowed_revisions,
             f"invalid old baseline store revision: actual={revision!r}, expected={allowed_revisions!r}, reconciled={reconciled}")
     for collection in ("asks", "answers", "artifacts", "deliveries", "actions"):
