@@ -50,9 +50,12 @@ pub fn home_dir() -> Option<PathBuf> {
 #[cfg(not(test))]
 pub fn home_dir() -> Option<PathBuf> {
     // A test runner must never silently fall through to the real user home.
+    // Release: only the exact marked private home (as the marker-fenced test
+    // hooks require: `HOME` == `CUTEX_TEST_PRIVATE_HOME`, absolute, marker
+    // file, not the real profile), else no home at all.
     #[cfg(not(debug_assertions))]
-    if std::env::var_os("CUTEX_TEST_PRIVATE_HOME").is_some() {
-        return None;
+    if let Some(boundary) = std::env::var_os("CUTEX_TEST_PRIVATE_HOME") {
+        return release_private_test_home(&boundary, std::env::var_os("HOME").as_deref());
     }
     #[cfg(debug_assertions)]
     {
@@ -96,6 +99,16 @@ fn private_test_home_dir() -> Option<PathBuf> {
         .filter(|home| home.is_dir() && !is_real_user_home(home))
         .or(Some(boundary))
         .filter(|home| !is_real_user_home(home))
+}
+
+/// Release builds' `CUTEX_TEST_PRIVATE_HOME` (the release load runs, S25):
+/// the boundary only when `HOME` is byte for byte the same absolute path,
+/// it carries [`PRIVATE_HOME_MARKER`] and it is not the real profile.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn release_private_test_home(boundary: &std::ffi::OsStr, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path = PathBuf::from(boundary);
+    let exact = !boundary.is_empty() && home == Some(boundary) && path.is_absolute();
+    (exact && path.join(PRIVATE_HOME_MARKER).is_file() && !is_real_user_home(&path)).then_some(path)
 }
 
 /// The OS account's real profile directory, independent of `HOME`
@@ -167,6 +180,10 @@ fn forbid_real_home_env() -> bool {
 /// debug processes told so by `CUTEX_TEST_FORBID_REAL_HOME`).
 pub fn real_home_forbidden() -> bool {
     if in_test_harness() {
+        return true;
+    }
+    // Any build: a process given a private test home never uses the real one.
+    if std::env::var_os("CUTEX_TEST_PRIVATE_HOME").is_some_and(|value| !value.is_empty()) {
         return true;
     }
     #[cfg(debug_assertions)]
@@ -501,6 +518,29 @@ mod guard_tests {
             .join("cutex-guard-other")
             .join(".cutex");
         assert!(ensure_not_real_state(&other).is_ok());
+    }
+
+    #[test]
+    fn release_private_home_needs_the_exact_marked_boundary() {
+        let root = std::env::temp_dir().join(format!("cutex-release-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let boundary = root.as_os_str();
+        // No marker yet.
+        assert_eq!(release_private_test_home(boundary, Some(boundary)), None);
+        std::fs::write(root.join(PRIVATE_HOME_MARKER), b"test\n").unwrap();
+        assert_eq!(release_private_test_home(boundary, Some(boundary)), Some(root.clone()));
+        // HOME must be the same path byte for byte.
+        assert_eq!(release_private_test_home(boundary, None), None);
+        let other = root.join("other");
+        assert_eq!(release_private_test_home(boundary, Some(other.as_os_str())), None);
+        // Relative / empty boundaries and the real profile are refused.
+        let relative = std::ffi::OsStr::new("relative-home");
+        assert_eq!(release_private_test_home(relative, Some(relative)), None);
+        let empty = std::ffi::OsStr::new("");
+        assert_eq!(release_private_test_home(empty, Some(empty)), None);
+        let real = real_user_home().expect("real user home");
+        assert_eq!(release_private_test_home(real.as_os_str(), Some(real.as_os_str())), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

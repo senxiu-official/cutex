@@ -1,0 +1,7 @@
+Cutex Kimi adapter
+Copyright 2026 The Cutex Authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+This archive contains the Cutex adapter only. Upstream CLI packages and Node.js
+are installed separately by the user and retain their own licenses and notices.
+Product names are trademarks of their owners; no affiliation is implied.

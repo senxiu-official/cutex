@@ -13,11 +13,12 @@
 //! the JSON to `<name>.pre-sqlite-<YYYYMMDD>` (kept forever, never read
 //! again) and leaves a sentinel JSON at the old path that older cutex cannot
 //! parse, so an older binary fails loudly instead of starting an empty store.
-//! There is no way back: rolling back means restoring a backup.
+//! Pre-SQLite readers cannot read this format. The 058 S3 extension preserves
+//! SQLite v1 and supports the exact previous SQLite build on current data;
+//! see `docs/management-v2-session-deltas.md` for its R0 contract.
 
-use std::collections::BTreeMap;
+use crate::session::shared_rows::SharedOrdRows;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -40,6 +41,9 @@ use sha2::Digest;
 use super::CutexSessionStoreRevisionConflict;
 use crate::session::model::CutexSessionRecord;
 use crate::session::model::CutexSessionStore;
+
+pub(super) mod indexed;
+pub(super) mod name_ledger;
 
 /// `PRAGMA user_version` of the session database.
 pub(crate) const SCHEMA_VERSION: i64 = 1;
@@ -95,8 +99,8 @@ pub fn database_path(json_path: &Path) -> PathBuf {
 pub(crate) trait ReceiptMap {
     const NAME: &'static str;
     type Value: Clone + PartialEq + Serialize + DeserializeOwned;
-    fn map(store: &CutexSessionStore) -> &BTreeMap<String, Self::Value>;
-    fn map_mut(store: &mut CutexSessionStore) -> &mut BTreeMap<String, Self::Value>;
+    fn map(store: &CutexSessionStore) -> &SharedOrdRows<Self::Value>;
+    fn map_mut(store: &mut CutexSessionStore) -> &mut SharedOrdRows<Self::Value>;
 }
 
 macro_rules! receipt_map {
@@ -105,10 +109,10 @@ macro_rules! receipt_map {
         impl ReceiptMap for $marker {
             const NAME: &'static str = $name;
             type Value = $value;
-            fn map(store: &CutexSessionStore) -> &BTreeMap<String, Self::Value> {
+            fn map(store: &CutexSessionStore) -> &SharedOrdRows<Self::Value> {
                 &store.$field
             }
-            fn map_mut(store: &mut CutexSessionStore) -> &mut BTreeMap<String, Self::Value> {
+            fn map_mut(store: &mut CutexSessionStore) -> &mut SharedOrdRows<Self::Value> {
                 &mut store.$field
             }
         }
@@ -184,7 +188,7 @@ fn open_connection(db: &Path, create: bool) -> anyhow::Result<Connection> {
 }
 
 fn open_existing(db: &Path) -> anyhow::Result<Connection> {
-    let connection = open_connection(db, false)?;
+    let mut connection = open_connection(db, false)?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version != SCHEMA_VERSION {
         bail!(
@@ -192,6 +196,8 @@ fn open_existing(db: &Path) -> anyhow::Result<Connection> {
             db.display()
         );
     }
+    indexed::install(&mut connection)?;
+    name_ledger::install(&mut connection)?;
     Ok(connection)
 }
 
@@ -259,7 +265,7 @@ fn with_connection<T>(
 }
 
 /// Closes pooled connections to `db` (before files next to it are renamed).
-fn drop_pooled(db: &Path) {
+pub(super) fn drop_pooled(db: &Path) {
     let mut pool = POOL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -292,6 +298,13 @@ fn parsed_row() {
 }
 
 fn read_revision(connection: &Connection) -> anyhow::Result<u64> {
+    crate::store::metrics::note(
+        "session-store",
+        crate::store::metrics::OpCounts {
+            sql_statements: 1,
+            ..Default::default()
+        },
+    );
     let value: String = connection
         .query_row(
             "SELECT value FROM meta WHERE key = 'store_revision'",
@@ -327,30 +340,38 @@ fn refresh_sessions(
     revs: &mut HashMap<String, u64>,
     store: &mut CutexSessionStore,
 ) -> anyhow::Result<()> {
-    let since = since.map_or(-1, |since| since as i64);
+    if let Some(since) = since {
+        let mut deleted = connection.prepare_cached(
+            "SELECT key FROM session_changes WHERE map='' AND commit_revision>?1 AND deleted=1",
+        )?;
+        for key in deleted.query_map([since as i64], |r| r.get::<_, String>(0))? {
+            let key = key?;
+            store.sessions.remove(&key);
+            revs.remove(&key);
+        }
+    }
     let mut statement = connection
-        .prepare_cached("SELECT key, rev, CASE WHEN rev > ?1 THEN record_json END FROM sessions")?;
-    let mut rows = statement.query(params![since])?;
-    let mut seen = HashSet::with_capacity(revs.len());
+        .prepare_cached("SELECT key, rev, record_json FROM sessions WHERE rev > ?1")?;
+    let mut rows = statement.query([since.map_or(-1, |v| v as i64)])?;
     while let Some(row) = rows.next()? {
         let key: String = row.get(0)?;
         let rev = as_rev(row.get(1)?)?;
-        match row.get::<_, Option<String>>(2)? {
-            Some(json) => {
+        let json: String = row.get(2)?;
                 parsed_row();
                 let record: CutexSessionRecord = serde_json::from_str(&json)
                     .with_context(|| format!("failed to parse cutex session row {key}"))?;
+        crate::store::metrics::note(
+            "session-store",
+            crate::store::metrics::OpCounts {
+                bytes_read: json.len() as u64,
+                bytes_decoded: json.len() as u64,
+                rows_visited: 1,
+                rows_materialized: 1,
+                ..Default::default()
+            },
+        );
                 store.sessions.insert(key.clone(), record);
-                revs.insert(key.clone(), rev);
-            }
-            None if revs.get(&key) == Some(&rev) => {}
-            None => return Err(SnapshotGap.into()),
-        }
-        seen.insert(key);
-    }
-    if seen.len() != revs.len() {
-        revs.retain(|key, _| seen.contains(key));
-        store.sessions.retain(|key, _| seen.contains(key));
+                revs.insert(key, rev);
     }
     Ok(())
 }
@@ -362,32 +383,39 @@ fn refresh_map<M: ReceiptMap>(
     store: &mut CutexSessionStore,
 ) -> anyhow::Result<()> {
     let revs = all_revs.entry(M::NAME).or_default();
-    let since = since.map_or(-1, |since| since as i64);
-    let mut statement = connection.prepare_cached(
-        "SELECT key, rev, CASE WHEN rev > ?2 THEN json END FROM receipts WHERE map = ?1",
-    )?;
-    let mut rows = statement.query(params![M::NAME, since])?;
-    let mut seen = HashSet::with_capacity(revs.len());
     let map = M::map_mut(store);
+    if let Some(since) = since {
+        let mut deleted = connection.prepare_cached(
+            "SELECT key FROM session_changes WHERE map=?1 AND commit_revision>?2 AND deleted=1",
+    )?;
+        for key in deleted.query_map(params![M::NAME, since as i64], |r| r.get::<_, String>(0))? {
+            let key = key?;
+            map.remove(&key);
+            revs.remove(&key);
+        }
+    }
+    let mut statement = connection
+        .prepare_cached("SELECT key, rev, json FROM receipts WHERE map = ?1 AND rev > ?2")?;
+    let mut rows = statement.query(params![M::NAME, since.map_or(-1, |v| v as i64)])?;
     while let Some(row) = rows.next()? {
         let key: String = row.get(0)?;
         let rev = as_rev(row.get(1)?)?;
-        match row.get::<_, Option<String>>(2)? {
-            Some(json) => {
+        let json: String = row.get(2)?;
                 parsed_row();
                 let value: M::Value = serde_json::from_str(&json)
                     .with_context(|| format!("failed to parse cutex {} receipt {key}", M::NAME))?;
+        crate::store::metrics::note(
+            "session-store",
+            crate::store::metrics::OpCounts {
+                bytes_read: json.len() as u64,
+                bytes_decoded: json.len() as u64,
+                rows_visited: 1,
+                rows_materialized: 1,
+                ..Default::default()
+            },
+        );
                 map.insert(key.clone(), value);
-                revs.insert(key.clone(), rev);
-            }
-            None if revs.get(&key) == Some(&rev) => {}
-            None => return Err(SnapshotGap.into()),
-        }
-        seen.insert(key);
-    }
-    if seen.len() != revs.len() {
-        revs.retain(|key, _| seen.contains(key));
-        map.retain(|key, _| seen.contains(key));
+                revs.insert(key, rev);
     }
     Ok(())
 }
@@ -400,7 +428,12 @@ fn refresh(connection: &Connection, snapshot: Option<Snapshot>) -> anyhow::Resul
         if snapshot.revision == revision {
             return Ok(snapshot);
         }
-        if snapshot.revision < revision {
+        let low_revision: i64 = connection.query_row(
+            "SELECT low_revision FROM session_query_head WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if snapshot.revision < revision && snapshot.revision >= as_rev(low_revision)? {
             let Snapshot {
                 revision: since,
                 mut session_revs,
@@ -552,6 +585,7 @@ fn write_sessions(
         }
         let json = serde_json::to_string(record)
             .with_context(|| format!("failed to serialize cutex session {key}"))?;
+        name_ledger::validate_session_change(connection,before.sessions.get(key),record)?;
         upsert.execute(params![
             key,
             record.cutex_session_id,
@@ -562,6 +596,16 @@ fn write_sessions(
             json
         ])?;
         changes.bytes += json.len() as u64;
+        crate::store::metrics::note(
+            "session-store",
+            crate::store::metrics::OpCounts {
+                bytes_encoded: json.len() as u64,
+                bytes_written: json.len() as u64,
+                rows_visited: 1,
+                sql_statements: 1,
+                ..Default::default()
+            },
+        );
         changes.sessions.push(key.clone());
     }
     let mut delete = connection.prepare_cached("DELETE FROM sessions WHERE key = ?1")?;
@@ -595,6 +639,16 @@ fn write_map<M: ReceiptMap>(
             .with_context(|| format!("failed to serialize cutex {} receipt {key}", M::NAME))?;
         upsert.execute(params![M::NAME, key, rev, json])?;
         changes.bytes += json.len() as u64;
+        crate::store::metrics::note(
+            "session-store",
+            crate::store::metrics::OpCounts {
+                bytes_encoded: json.len() as u64,
+                bytes_written: json.len() as u64,
+                rows_visited: 1,
+                sql_statements: 1,
+                ..Default::default()
+            },
+        );
         changes.receipts.push((M::NAME, key.clone()));
     }
     let mut delete =
@@ -618,8 +672,11 @@ fn patch_map<M: ReceiptMap>(
     let revs = revs.entry(M::NAME).or_default();
     for (_, key) in keys.iter().filter(|(map, _)| *map == M::NAME) {
         match M::map(source).get(key) {
-            Some(value) => {
-                M::map_mut(target).insert(key.clone(), value.clone());
+            Some(_) => {
+                M::map_mut(target).insert_shared(
+                    key.clone(),
+                    M::map(source).shared(key).expect("committed receipt row"),
+                );
                 revs.insert(key.clone(), revision);
             }
             None => {
@@ -631,8 +688,8 @@ fn patch_map<M: ReceiptMap>(
     Ok(())
 }
 
-/// Applies a commit to the cached snapshot it was diffed against, copying
-/// the committed values (no re-parse).
+/// Applies a commit to its cached snapshot, sharing committed row Arcs
+/// without re-parsing or copying neighboring business values.
 fn patch_snapshot(
     mut snapshot: Snapshot,
     source: &CutexSessionStore,
@@ -642,8 +699,10 @@ fn patch_snapshot(
     let target = Arc::make_mut(&mut snapshot.store);
     for key in &changes.sessions {
         match source.sessions.get(key) {
-            Some(record) => {
-                target.sessions.insert(key.clone(), record.clone());
+            Some(_) => {
+                target.sessions.insert_shared(key.clone(),
+                    source.sessions.shared(key).expect("committed session row"),
+                );
                 snapshot.session_revs.insert(key.clone(), revision);
             }
             None => {
@@ -773,6 +832,7 @@ fn write_touched_sessions(
             Some(record) => {
                 let json = serde_json::to_string(record)
                     .with_context(|| format!("failed to serialize cutex session {key}"))?;
+                name_ledger::validate_session_change(connection,base.sessions.get(key),record)?;
                 upsert.execute(params![
                     key,
                     record.cutex_session_id,
@@ -783,6 +843,16 @@ fn write_touched_sessions(
                     json
                 ])?;
                 changes.bytes += json.len() as u64;
+                crate::store::metrics::note(
+                    "session-store",
+                    crate::store::metrics::OpCounts {
+                        bytes_encoded: json.len() as u64,
+                        bytes_written: json.len() as u64,
+                        rows_visited: 1,
+                        sql_statements: 1,
+                        ..Default::default()
+                    },
+                );
             }
             None => {
                 delete.execute(params![key])?;
@@ -818,6 +888,16 @@ fn write_touched_map<M: ReceiptMap>(
                 })?;
                 upsert.execute(params![M::NAME, key, rev, json])?;
                 changes.bytes += json.len() as u64;
+                crate::store::metrics::note(
+                    "session-store",
+                    crate::store::metrics::OpCounts {
+                        bytes_encoded: json.len() as u64,
+                        bytes_written: json.len() as u64,
+                        rows_visited: 1,
+                        sql_statements: 1,
+                        ..Default::default()
+                    },
+                );
             }
             None => {
                 delete.execute(params![M::NAME, key])?;
@@ -948,7 +1028,7 @@ pub(super) fn read_session_row(
 
 /// `CUTEX_SESSION_STORE_TRACE=1`: one stderr line per commit (kind and
 /// duration), to see which writers run on an idle service.
-fn trace_commit(kind: &str, site: Site, started: std::time::Instant) {
+pub(super) fn trace_commit(kind: &str, site: Site, started: std::time::Instant) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ENABLED.get_or_init(|| std::env::var_os("CUTEX_SESSION_STORE_TRACE").is_some()) {
         eprintln!(
@@ -1171,7 +1251,7 @@ fn ensure_ready_locked(json_path: &Path, db: &Path, create: bool) -> anyhow::Res
 }
 
 fn read_meta(connection: &Connection) -> anyhow::Result<HashMap<String, String>> {
-    let mut statement = connection.prepare("SELECT key, value FROM meta")?;
+    let mut statement = connection.prepare("SELECT key, value FROM meta WHERE key IN ('imported_at','imported_from','imported_sha256','imported_bytes','imported_revision','imported_sessions','imported_receipts','store_revision')")?;
     let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     let mut meta = HashMap::new();
     for row in rows {

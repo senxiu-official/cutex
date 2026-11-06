@@ -134,6 +134,7 @@ fn write_bundle(layout: &Layout, release: &str, native: NativeFiles, home: &Path
 /// Full mode: select this release's runtime package for new agents.
 /// Returns false when there is nothing to select (no native anywhere).
 pub fn select_runtime(layout: &Layout, release: &str, manifest: &ReleaseManifest) -> anyhow::Result<bool> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     use crate::launch::local_deployment::LocalDeployment;
     let selected = LocalDeployment::selected()?;
     let native = match &manifest.native {

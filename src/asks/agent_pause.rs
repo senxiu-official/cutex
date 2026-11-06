@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use super::now_rfc3339;
-use super::store::{AgentPause, AgentPausePhase, AskError, AskState, AskStore};
+use super::store::{AgentPause, AgentPauseAt, AgentPausePhase, AskError, AskState, AskStore, HeldToolCall};
 
 pub const PAUSE_METHOD: &str = "cutex/agent/pause";
 pub const RESUME_METHOD: &str = "cutex/agent/resume";
@@ -53,6 +53,9 @@ pub fn pause(
         paused_at: (!busy).then_some(at),
         by: by.into(),
         by_cutex_session_id: by_session.map(str::to_string),
+        at: None,
+        tool_gate: None,
+        held: Vec::new(),
     });
     presence.paused = true;
     emit(state, session);
@@ -83,6 +86,53 @@ pub fn settle(state: &mut AskState, session: &str, busy: bool, now: DateTime<Utc
     }
     pause.phase = AgentPausePhase::Paused;
     pause.paused_at = Some(now_rfc3339(now));
+    emit(state, session);
+    true
+}
+
+/// Most held calls listed in the pause state (the runtime bounds its own list too).
+pub const MAX_HELD: usize = 64;
+
+/// The live runtime was told about the pause (r276 tool gate): with a gate the
+/// pause takes effect at its next tool call, otherwise at the end of the turn.
+pub fn note_gate(state: &mut AskState, session: &str, tool_gate: bool) -> bool {
+    let Some(pause) = state.presence.get_mut(session).and_then(|presence| presence.agent_pause.as_mut()) else {
+        return false;
+    };
+    let at = if tool_gate { AgentPauseAt::ToolBoundary } else { AgentPauseAt::TurnEnd };
+    if pause.tool_gate == Some(tool_gate) && pause.at == Some(at) {
+        return false;
+    }
+    pause.tool_gate = Some(tool_gate);
+    pause.at = Some(at);
+    if !tool_gate {
+        pause.held.clear();
+    }
+    emit(state, session);
+    true
+}
+
+/// The runtime reported the calls it holds. The first held call completes the
+/// pause (`paused`) although its turn is still open; resume lets it run.
+/// Without a pause (a late report after resume) nothing changes.
+pub fn note_held(state: &mut AskState, session: &str, mut held: Vec<HeldToolCall>, now: DateTime<Utc>) -> bool {
+    let Some(pause) = state.presence.get_mut(session).and_then(|presence| presence.agent_pause.as_mut()) else {
+        return false;
+    };
+    held.truncate(MAX_HELD);
+    let settles = !held.is_empty() && pause.phase == AgentPausePhase::Pausing;
+    if pause.held == held && !settles {
+        return false;
+    }
+    if !held.is_empty() {
+        pause.tool_gate = Some(true);
+        pause.at = Some(AgentPauseAt::ToolBoundary);
+    }
+    pause.held = held;
+    if settles {
+        pause.phase = AgentPausePhase::Paused;
+        pause.paused_at = Some(now_rfc3339(now));
+    }
     emit(state, session);
     true
 }

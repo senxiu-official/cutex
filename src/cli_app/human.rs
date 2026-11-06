@@ -8,8 +8,8 @@ use cutex::role_revision::CutexSessionId;
 
 pub(super) fn resolve_id(selector: &str) -> anyhow::Result<String> {
     let store = cutex::session::store::load_cutex_session_store()?;
-    if store.sessions.contains_key(selector) {
-        return Ok(selector.into());
+    if let Some(record)=store.sessions.get(selector) {
+        return Ok(record.cutex_session_id.clone());
     }
     let native: Vec<_> = store
         .sessions
@@ -19,21 +19,26 @@ pub(super) fn resolve_id(selector: &str) -> anyhow::Result<String> {
     if native.len() == 1 {
         return Ok(native[0].cutex_session_id.clone());
     }
-    let index = cutex::short_ids::Index::new(store.sessions.values().map(|record| {
-        cutex::short_ids::Entry {
-            id: record.cutex_session_id.clone(),
-            name: record
-                .formal_agent_name
-                .iter()
-                .chain(record.display_name_hint.iter())
-                .find(|name| name.eq_ignore_ascii_case(selector.trim()))
-                .cloned()
-                .or_else(|| record.formal_agent_name.clone()),
-        }
-    }));
-    index
-        .resolve(selector, &index, cutex::short_ids::settings().minimum())
-        .map_err(|error| anyhow::anyhow!("{}", error.to_json()))
+    ensure!(native.is_empty(), "native session ID is bound to multiple durable sessions; use a full Cutex ID");
+    ensure!(!selector.trim().eq_ignore_ascii_case("director"), "director is a role address; select a Project or use its full Director session ID");
+    let directory=cutex::asks::directory::Directory::load()
+        .map_err(|error|anyhow::anyhow!("{}",error.to_json()))?;
+    match directory.resolve_scoped(None,selector,None) {
+        Ok((agent,resolution))=>{
+            for note in resolution.rename_notes {eprintln!("{}",note.text());}
+            return Ok(agent.cutex_session_id.clone());
+        },
+        Err(error) if error.code=="id_not_found"=>{},
+        Err(error)=>return Err(anyhow::anyhow!("{}",error.to_json())),
+    }
+    // Ordinary chat labels remain an owner presentation selector. They never
+    // become formal-agent aliases or override a formal-name history match.
+    let index=cutex::short_ids::Index::new(store.sessions.values()
+        .filter(|record|!record.agent_enabled&&record.formal_agent_name.is_none())
+        .map(|record|cutex::short_ids::Entry {id:record.cutex_session_id.clone(),
+            name:record.display_name_override.clone().or_else(||record.display_name_hint.clone()).or_else(||record.thread_name.clone())}));
+    index.resolve(selector,&index,cutex::short_ids::settings().minimum())
+        .map_err(|error|anyhow::anyhow!("{}",error.to_json()))
 }
 
 pub(super) fn recover(
@@ -87,6 +92,7 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
             use cutex::runtime::claude;
             let result = match command {
                 ClaudeCommand::Install { file } => {
+                    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
                     let deployment: claude::ClaudeDeployment =
                         serde_json::from_slice(&std::fs::read(file)?)?;
                     deployment.install()?;
@@ -240,6 +246,7 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
             job_descriptor,
         } => {
             use cutex::launch::local_deployment::LocalDeployment;
+            let _runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
             let prior = LocalDeployment::selected()?;
             let deployment = LocalDeployment {
                 bundle_manifest: bundle_manifest.canonicalize()?,
@@ -255,7 +262,17 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
                 },
             };
             deployment.install()?;
-            println!("{}", serde_json::to_string_pretty(&deployment)?);
+            println!("{}", serde_json::to_string_pretty(&LocalDeployment::selected()?)?);
+        }
+        HumanCommand::ManageNativeRuntime { check } => {
+            let result = if check {
+                cutex::launch::native_managed::status(
+                    &cutex::launch::local_deployment::LocalDeployment::selected()?.context("No local runtime installed")?,
+                )?
+            } else {
+                cutex::launch::native_managed::manage_selected()?
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         HumanCommand::Config { command } => run_config(command)?,
         HumanCommand::Action { action_id, resume } => {
@@ -649,6 +666,16 @@ mod tests {
     use super::*;
     use clap::Parser;
     use cutex::cli::args::{Cli, CommandKind};
+    #[test]
+    fn human_native_managed_copy_and_readonly_check_parse() {
+        for (args, expected) in [
+            (vec!["cutex", "human", "manage-native-runtime"], false),
+            (vec!["cutex", "human", "manage-native-runtime", "--check"], true),
+        ] {
+            assert!(matches!(Cli::try_parse_from(args).unwrap().command,
+                Some(CommandKind::Human { command: HumanCommand::ManageNativeRuntime { check } }) if check == expected));
+        }
+    }
     #[test]
     fn human_stop_and_restart_parse_without_agent_identity_or_task_flags() {
         assert!(matches!(

@@ -724,6 +724,10 @@ impl AgentManagementProvider {
             let committed_at = now();
             let grant = match request.operation {
                 HumanManagementOperatorKind::Grant => {
+                    // r271: never grant to a deleted session (roster row pending cleanup).
+                    if super::pending_forget::contains(request.operator_cutex_session_id.as_str()) {
+                        return Err(AgentManagementError::Conflict("operator_must_be_active_managed_agent"));
+                    }
                     let agent = state
                         .agents
                         .get(&request.operator_cutex_session_id)
@@ -992,6 +996,7 @@ impl AgentManagementProvider {
                         }
                         None => {}
                     }
+                    self.require_name_scope_available(cutex_session_id,Some(&request.project_id))?;
                     let record = next_membership(
                         &state,
                         cutex_session_id,
@@ -1028,6 +1033,7 @@ impl AgentManagementProvider {
                             "agent_not_current_project_member",
                         ));
                     }
+                    self.require_name_scope_available(cutex_session_id,None)?;
                     // Operator grants only exist under a Director.
                     if let Some(authority) = &authority {
                         revoke_operator_for_detach(
@@ -2452,8 +2458,8 @@ mod tests {
                 Ok((state, (), true))
             })
             .unwrap();
-        serde_json::from_slice::<super::super::AgentManagementSnapshot>(
-            &std::fs::read(root.join("agent-management-v1.json")).unwrap(),
+        super::super::roster_sql::decode_legacy(
+            &serde_json::to_vec_pretty(&super::super::store::committed_for_tests(&root)).unwrap(),
         )
         .expect("snapshot with additive fields remains readable");
         provider
@@ -2558,6 +2564,64 @@ mod tests {
             !root.join("task-service-seat-authority-v1").exists(),
             "Agent Management must not create the removed Director seat store"
         );
+    }
+
+    #[test]
+    fn rename_and_membership_move_serialize_destination_claim_checks() {
+        use crate::agent_names::{NameScope,RenameRequest};
+        use crate::session::{model::CutexSessionRecord,store};
+        let (provider,root,project_id)=provider_with_project();
+        let path=root.join("sessions.json");
+        let worker="cutex.worker-online";
+        let mut current=CutexSessionRecord::new(worker.into(),Some("native-worker".into()),
+            "host".into(),root.to_string_lossy().into_owned(),None).unwrap();
+        current.agent_enabled=true;current.formal_agent_name=Some("Old".into());
+        let mut previous=current.clone();previous.cutex_session_id="cutex.previous".into();
+        previous.codex_session_id=Some("native-previous".into());
+        previous.archive_state=crate::session::model::CutexSessionArchiveState::Retired;
+        store::with_locked_session_rows(&path,|rows| {
+            rows.insert_session(worker,current.clone());rows.insert_session("cutex.previous",previous.clone());
+            rows.commit()?;Ok(())
+        }).unwrap();
+        store::rename_formal_name_at(&path,"cutex.previous",&RenameRequest {
+            request_id:"reserve-destination-old".into(),expected_revision:previous.durable_revision(),name:"Previous New".into(),
+        },&NameScope::Unassigned,None,"human-management").unwrap();
+        let provider=provider.with_current_names_path(path.clone());
+        let detach=HumanManagementProjectMutationRequest {
+            schema:HumanManagementProjectMutationSchema::V1,action_id:AgentActionId::new("move-rename-worker").unwrap(),
+            project_id:project_id.clone(),expected_authority_epoch:Some(7),expected_project_revision:None,
+            operation:HumanManagementProjectMutationKind::DetachMember {cutex_session_id:session(worker)},
+        };
+        assert_eq!(provider.execute_project_mutation_for_management(&HumanManagementPrincipal::authenticated(),&detach).unwrap_err(),
+            AgentManagementError::Conflict("agent_name_reserved_in_target_scope"));
+        let barrier=std::sync::Barrier::new(2);
+        let (renamed,moved)=std::thread::scope(|scope| {
+            let rename=scope.spawn(|| {
+                barrier.wait();
+                provider.rename_formal_name_for_management(&HumanManagementPrincipal::authenticated(),worker,&RenameRequest {
+                    request_id:"rename-moving-worker".into(),expected_revision:current.durable_revision(),name:"Worker New".into(),
+                })
+            });
+            let move_member=scope.spawn(|| {
+                barrier.wait();provider.execute_project_mutation_for_management(&HumanManagementPrincipal::authenticated(),&detach)
+            });
+            (rename.join().unwrap().unwrap(),move_member.join().unwrap())
+        });
+        assert_eq!(renamed.event.scope,NameScope::for_project(Some(project_id.as_str())));
+        let roster=provider.store().snapshot().unwrap();
+        let membership=current_project_id(&roster,&roster.agents[&session(worker)]);
+        if moved.is_ok() {assert_eq!(membership,None)} else {
+            assert_eq!(moved.unwrap_err(),AgentManagementError::Conflict("agent_name_reserved_in_target_scope"));
+            assert_eq!(membership,Some(project_id.clone()));
+        }
+        let record=store::load_session_row(&path,worker).unwrap().unwrap().1;
+        assert_eq!(record.formal_agent_name.as_deref(),Some("Worker New"));
+        let (_,claims)=store::formal_name_claims_at(&path,None,"Old").unwrap();
+        assert_eq!(claims.len(),2);
+        assert!(claims.iter().any(|claim|claim.cutex_session_id==worker&&claim.scope==renamed.event.scope));
+        assert!(claims.iter().any(|claim|claim.cutex_session_id=="cutex.previous"&&claim.scope==NameScope::Unassigned));
+        store::close_session_store(&path);
+        drop(provider);std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3054,10 +3118,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let reloaded: crate::agent_management::AgentManagementSnapshot = serde_json::from_slice(
-            &std::fs::read(root.join("agent-management-v1.json")).unwrap(),
-        )
-        .unwrap();
+        let reloaded = super::super::store::committed_for_tests(&root);
         assert_eq!(
             reloaded.human_management_project_mutations
                 [&AgentActionId::new("repair-1").unwrap()],

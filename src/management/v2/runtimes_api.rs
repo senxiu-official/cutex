@@ -14,11 +14,12 @@
 //! - `native`: one entry per native version in the version registry
 //!   (`runtime_artifacts` / `runtime_paths`), plus one per pinned executable
 //!   the registry does not know (`version` absent). `selected`: the version of
-//!   the selected runtime package's executable (else the registry's latest
-//!   runtime); `latest`: the registry's latest runtime. Agents: non-retired
+//!   the selected runtime package's exact executable SHA; absent deployment
+//!   selects nothing, and an unregistered SHA selects an unknown entry.
+//!   `latest`: the registry's latest runtime. Agents: all durable
 //!   explicit-launch records whose bundle manifest pins that executable.
 //! - `claude`: one entry per Claude runtime directory (`claude-r5`, …) used
-//!   by the selected deployment or by a non-retired Claude session.
+//!   by the selected deployment or any durable Claude session, including retired rows.
 //! - `agents` is capped at [`MAX_AGENTS`] per entry; `agentCount` is exact.
 //! - Paths are reduced to `<release dir>/<file>` (`path`) and directory names;
 //!   no tokens, no auth or home paths.
@@ -50,6 +51,8 @@ pub fn is_runtimes_path(path: &str) -> bool {
 pub struct AgentRef {
     pub cutex_session_id: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_runtime_path: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -74,11 +77,24 @@ pub struct Entry {
     pub missing: bool,
     pub agents: Vec<AgentRef>,
     pub agent_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_managed: Option<bool>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub external_agent_count: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub managed_agent_count: usize,
 }
+
+fn is_zero(value: &usize) -> bool { *value == 0 }
 
 impl Entry {
     fn add_agent(&mut self, agent: AgentRef) {
         self.agent_count += 1;
+        match agent.external_runtime_path {
+            Some(true) => self.external_agent_count += 1,
+            Some(false) => self.managed_agent_count += 1,
+            None => {},
+        }
         if self.agents.len() < MAX_AGENTS {
             self.agents.push(agent);
         }
@@ -102,6 +118,7 @@ pub struct Inputs<'a> {
     pub selected_claude_adapter: Option<String>,
     pub read_manifest: &'a dyn Fn(&Path) -> Option<PinnedExecutable>,
     pub exists: &'a dyn Fn(&str) -> bool,
+    pub managed_native_root: Option<&'a Path>,
 }
 
 /// Last path component (`/` or `\`).
@@ -145,6 +162,7 @@ pub fn claude_runtime_label(adapter_source: &str) -> String {
 
 fn agent_ref(record: &CutexSessionRecord) -> AgentRef {
     AgentRef {
+        external_runtime_path: None,
         cutex_session_id: record.cutex_session_id.clone(),
         name: crate::session::metadata::cutex_session_presented_name(record),
     }
@@ -188,8 +206,8 @@ pub fn build(inputs: &Inputs<'_>) -> Built {
     let selected_version = inputs
         .selected_native
         .as_ref()
-        .and_then(|pinned| sha_to_version.get(&pinned.sha256).cloned())
-        .or_else(|| latest.clone());
+        // Latest is release metadata, never evidence of the selected bytes.
+        .and_then(|pinned| sha_to_version.get(&pinned.sha256).cloned());
     // Executables the registry does not know, keyed by sha.
     let mut unknown: BTreeMap<String, Entry> = BTreeMap::new();
     fn unknown_entry(unknown: &mut BTreeMap<String, Entry>, pinned: &PinnedExecutable, exists: &dyn Fn(&str) -> bool) -> String {
@@ -216,7 +234,7 @@ pub fn build(inputs: &Inputs<'_>) -> Built {
     let mut claude: BTreeMap<String, Entry> = BTreeMap::new();
     let mut unpinned_agent_count = 0;
     let mut records: Vec<&CutexSessionRecord> =
-        inputs.sessions.sessions.values().filter(|record| !record.is_retired()).collect();
+        inputs.sessions.sessions.values().collect();
     records.sort_by(|a, b| {
         crate::session::metadata::cutex_session_presented_name(a)
             .cmp(&crate::session::metadata::cutex_session_presented_name(b))
@@ -259,22 +277,35 @@ pub fn build(inputs: &Inputs<'_>) -> Built {
             entry.add_agent(agent_ref(record));
             continue;
         };
+        let mut agent = agent_ref(record);
+        agent.external_runtime_path = inputs.managed_native_root
+            .map(|root| !crate::launch::native_managed::is_inside(Path::new(&pinned.path), root));
         match sha_to_version.get(&pinned.sha256) {
-            Some(version) => native.entry(version.clone()).or_default().add_agent(agent_ref(record)),
+            Some(version) => native.entry(version.clone()).or_default().add_agent(agent),
             None => {
                 let key = unknown_entry(&mut unknown, &pinned, inputs.exists);
-                unknown.get_mut(&key).expect("inserted").add_agent(agent_ref(record));
+                unknown.get_mut(&key).expect("inserted").add_agent(agent);
             }
         }
     }
     if let Some(version) = &selected_version {
         if let Some(entry) = native.get_mut(version) {
             entry.selected = true;
+            entry.sha256_prefix = inputs.selected_native.as_ref().map(|pinned| sha_prefix(&pinned.sha256));
+            if let Some(pinned) = &inputs.selected_native {
+                entry.path = short_path(&pinned.path);
+                entry.release_dir = parent_name(&pinned.path);
+                entry.missing = !(inputs.exists)(&pinned.path);
+                entry.selected_managed = inputs.managed_native_root
+                    .map(|root| crate::launch::native_managed::is_inside(Path::new(&pinned.path), root));
+            }
         }
     }
     if let Some(key) = selected_unknown {
         if let Some(entry) = unknown.get_mut(&key) {
             entry.selected = true;
+            entry.selected_managed = inputs.selected_native.as_ref().and_then(|pinned| inputs.managed_native_root
+                .map(|root| crate::launch::native_managed::is_inside(Path::new(&pinned.path), root)));
         }
     }
 
@@ -293,7 +324,8 @@ pub fn build(inputs: &Inputs<'_>) -> Built {
     }
 
     // Newest first: registry entries by version (descending), then unknown.
-    let mut native: Vec<Entry> = native.into_values().collect();
+    let mut native: Vec<Entry> = native.into_values().filter(|entry|
+        entry.selected || entry.agent_count > 0 || (entry.path.is_some() && !entry.missing)).collect();
     native.sort_by(|a, b| natural_key(b.version.as_deref()).cmp(&natural_key(a.version.as_deref())));
     native.extend(unknown.into_values());
     let mut claude: Vec<Entry> = claude.into_values().collect();
@@ -359,6 +391,7 @@ fn cutex_view() -> Value {
 }
 
 pub fn resource() -> anyhow::Result<Value> {
+    let managed_root = crate::launch::native_managed::root()?;
     let sessions = crate::session::store::load_cutex_session_store()?;
     let registry = crate::launch::version_registry::load_relaxed();
     let selected_native = crate::launch::local_deployment::LocalDeployment::selected()
@@ -373,6 +406,7 @@ pub fn resource() -> anyhow::Result<Value> {
         selected_claude_adapter: selected_claude_adapter(),
         read_manifest: &read_manifest,
         exists: &exists,
+        managed_native_root: Some(&managed_root),
     });
     Ok(json!({
         "contractVersion": 2,
@@ -399,25 +433,25 @@ pub fn summary_from(built: &Built) -> Value {
             .iter()
             .filter(|entry| entry.selected || entry.agent_count > 0)
             .map(|entry| {
-                json!({
+                let mut value = json!({
                     "release": entry.release,
                     "version": entry.version,
                     "agents": entry.agent_count,
                     "selected": entry.selected,
                     "missing": entry.missing,
-                })
+                });
+                if let Some(managed) = entry.selected_managed { value["selectedManaged"] = json!(managed); }
+                if entry.external_agent_count > 0 { value["externalAgentCount"] = json!(entry.external_agent_count); }
+                if entry.managed_agent_count > 0 { value["managedAgentCount"] = json!(entry.managed_agent_count); }
+                value
             })
             .collect()
     }
-    let selected = |entries: &[Entry]| {
-        entries
-            .iter()
-            .find(|entry| entry.selected)
-            .map(|entry| entry.version.clone().unwrap_or_else(|| entry.release.clone()))
-    };
+    let selected_native = built.native.iter().find(|entry| entry.selected);
     json!({
         "native": {
-            "selected": selected(&built.native),
+            "selected": selected_native.and_then(|entry| entry.version.clone()),
+            "selectedSha256Prefix": selected_native.and_then(|entry| entry.sha256_prefix.clone()),
             "latest": built.native.iter().find(|entry| entry.latest).and_then(|entry| entry.version.clone()),
             "inUse": uses(&built.native),
         },
@@ -431,6 +465,7 @@ pub fn summary_from(built: &Built) -> Value {
 
 /// [`summary_from`] over the live stores.
 pub fn summary() -> anyhow::Result<Value> {
+    let managed_root = crate::launch::native_managed::root()?;
     let sessions = crate::session::store::load_cutex_session_store_shared()?;
     let registry = crate::launch::version_registry::load_relaxed();
     let selected_native = crate::launch::local_deployment::LocalDeployment::selected()
@@ -445,6 +480,7 @@ pub fn summary() -> anyhow::Result<Value> {
         selected_claude_adapter: selected_claude_adapter(),
         read_manifest: &read_manifest,
         exists: &exists,
+        managed_native_root: Some(&managed_root),
     });
     Ok(summary_from(&built))
 }

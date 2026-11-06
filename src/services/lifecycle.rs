@@ -37,13 +37,22 @@ struct Memory {
 pub struct Lifecycle {
     pub started_at: DateTime<Utc>,
     memory: Mutex<Memory>,
+    revision: std::sync::atomic::AtomicU64,
 }
 impl Lifecycle {
     pub fn new(started_at: DateTime<Utc>) -> Self {
         Self {
             started_at,
             memory: Mutex::new(Memory::default()),
+            revision: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+    pub(super) fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn changed(&self) {
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     pub fn lease(
         &self,
@@ -92,6 +101,7 @@ impl Lifecycle {
                 .find(|lease| lease.client_key.as_ref() == Some(key))
             {
                 existing.expires_at = now + Duration::seconds(LEASE_TTL_SECONDS);
+                self.changed();
                 return Ok(existing.clone());
             }
         }
@@ -123,6 +133,7 @@ impl Lifecycle {
             client_key,
         };
         leases.insert(lease.lease_id.clone(), lease.clone());
+        self.changed();
         Ok(lease)
     }
     pub fn release(&self, slug: &str, id: &str, now: DateTime<Utc>) -> bool {
@@ -135,12 +146,25 @@ impl Lifecycle {
         if released && memory.leases.get(slug).is_some_and(BTreeMap::is_empty) {
             memory.released.insert(slug.into(), now);
         }
+        if released {
+            self.changed();
+        }
         released
     }
     pub fn forget(&self, slug: &str) {
         let mut memory = self.memory.lock().expect("service leases");
         memory.leases.remove(slug);
         memory.released.remove(slug);
+        self.changed();
+    }
+    /// Lease expiry can make a service idle even without an explicit release.
+    pub(super) fn next_lease_expiry(&self, slug: &str) -> Option<DateTime<Utc>> {
+        self.memory
+            .lock()
+            .expect("service leases")
+            .leases
+            .get(slug)
+            .and_then(|leases| leases.values().map(|lease| lease.expires_at).min())
     }
     pub fn facts(&self, slug: &str, now: DateTime<Utc>) -> (usize, Option<DateTime<Utc>>) {
         let mut memory = self.memory.lock().expect("service leases");
@@ -177,6 +201,15 @@ impl Lifecycle {
         .flatten()
         .max()?;
         Some(last + idle_duration(record, settings))
+    }
+    /// Persistent managed sleep is independent of ephemeral reclamation/deletion.
+    pub fn idle_stop_at(&self, record: &ServiceRecord, last_traffic: Option<&str>, process_started_at: Option<&str>, active: usize, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !super::idle::eligible(record) || record.stopped || record.archived || record.stopped_idle_at.is_some() || active > 0 { return None; }
+        let seconds = record.idle_stop_preset.seconds()?;
+        let (leases, released) = self.facts(&record.slug, now);
+        if leases > 0 { return None; }
+        let base = [parse_time(&record.created_at), last_traffic.and_then(parse_time), process_started_at.and_then(parse_time), Some(self.started_at), released].into_iter().flatten().max()?;
+        Some(base + Duration::seconds(seconds))
     }
     pub fn reason(
         &self,
@@ -225,6 +258,8 @@ impl Lifecycle {
     ) {
         let now = Utc::now();
         view["leases"] = json!(self.facts(&record.slug, now).0);
+        let idle_traffic = last_traffic.map(str::to_owned).or_else(|| view["lastTrafficAt"].as_str().map(str::to_owned));
+        view["idleStopAt"] = json!(self.idle_stop_at(record, idle_traffic.as_deref(), view["process"]["startedAt"].as_str(), active, now));
         view["expiresAt"] = json!(expires_at(record, settings));
         view["idleReclaimAt"] = json!(self.idle_at(record, settings, last_traffic, active, now));
         view["effectiveIdleTtlMinutes"] = if record.lifetime == ServiceLifetime::Ephemeral

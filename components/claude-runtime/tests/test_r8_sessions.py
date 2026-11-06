@@ -11,6 +11,16 @@ from cute_claude.history import History, thread_wire
 from cute_claude.history_reader import Reader
 from cute_claude.session_ops import NativeSessionApi, SessionOperations
 from cute_claude.store import Store, dump, identifier
+from cute_claude import history_order
+
+
+def remove_history_order_for_r7_fixture(db):
+    # An actual r7 database has neither the reverted column nor this later
+    # read model. Strip coupled triggers before reconstructing that old schema.
+    for suffix in history_order.TRIGGERS:
+        db.execute('DROP TRIGGER history_order_' + suffix)
+    db.execute('DROP TABLE history_item_order')
+    db.execute('DELETE FROM meta WHERE key=?', (history_order.MARKER,))
 
 
 def add_turn(store, tid, prompt, answer='answer'):
@@ -95,6 +105,8 @@ async def test_first_turn_revert_resets_to_unattempted_session(native):
     assert native.api.transcript(result['nativeSessionId']) is None
     assert native.path.exists()
     assert History(native.store).full_read(native.tid) == []
+    assert History(native.store).page(native.tid, {}, items=True)['data'] == []
+    assert native.store.db.execute('SELECT count(*) FROM history_item_order').fetchone()[0] == 0
 
 
 async def test_sdk_fork_exports_private_projection_with_inert_sources(native, tmp_path):
@@ -110,6 +122,13 @@ async def test_sdk_fork_exports_private_projection_with_inert_sources(native, tm
         assert result['threadId'] == new_tid
         assert forked.thread_properties(new_tid)['forkedFromId'] == native.tid
         assert len(History(forked).full_read(new_tid)) == 1
+        copied = History(forked).page(new_tid, {}, items=True)['data']
+        assert copied and all(item['turnId'] != native.turns[0] for item in copied)
+        assert {r[0] for r in forked.db.execute('SELECT thread_id FROM history_item_order')} == {new_tid}
+        forked.db.execute('UPDATE turns SET reverted=1 WHERE thread_id=?', (new_tid,))
+        assert History(forked).page(new_tid, {}, items=True)['data'] == []
+        assert History(native.store).page(native.tid, {}, items=True)['data']
+        forked.db.execute('UPDATE turns SET reverted=0 WHERE thread_id=?', (new_tid,))
         assert forked.claim(new_tid) is None
         assert not forked.pending(new_tid)
         assert forked.db.execute('SELECT state FROM inputs').fetchone()[0] == 'inherited'
@@ -160,10 +179,15 @@ async def test_failed_rewind_does_not_change_conversation(native):
 
 
 async def test_delete_uses_sdk_and_cleans_extension_rows(native):
+    prompt = native.store.directory / 'system-prompts' / f'{native.tid}.md'
+    prompt.parent.mkdir()
+    prompt.write_text('private prompt', encoding='utf-8')
     native.store.db.execute('CREATE TABLE external_inputs(thread_id TEXT, payload TEXT)')
     native.store.db.execute('INSERT INTO external_inputs VALUES(?,?)', (native.tid, '{}'))
     await native.ops.delete(native.tid)
+    assert native.store.db.execute('SELECT count(*) FROM history_item_order WHERE thread_id=?', (native.tid,)).fetchone()[0] == 0
     assert not native.path.exists()
+    assert not prompt.exists()
     assert native.store.db.execute('SELECT count(*) FROM external_inputs').fetchone()[0] == 0
     with pytest.raises(RpcError, match='thread not found'):
         native.store.thread(native.tid)
@@ -290,6 +314,7 @@ def test_r7_database_read_then_additive_migration(tmp_path):
     turn, _ = add_turn(store, tid, 'legacy prompt')
     store.close()
     db = sqlite3.connect(directory / 'state.sqlite3')
+    remove_history_order_for_r7_fixture(db)
     db.execute('ALTER TABLE turns DROP COLUMN reverted')
     for table in ('thread_properties', 'sdk_turn_messages', 'session_operations'):
         db.execute('DROP TABLE ' + table)
@@ -335,6 +360,7 @@ def test_failed_migration_rolls_back_version_and_schema_and_releases_lease(tmp_p
     store.close()
     original_connect = sqlite3.connect
     db = original_connect(directory / 'state.sqlite3')
+    remove_history_order_for_r7_fixture(db)
     db.execute('ALTER TABLE turns DROP COLUMN reverted')
     db.execute('DROP TABLE sdk_turn_messages')
     db.execute("UPDATE meta SET value='1' WHERE key='schema'")

@@ -1,6 +1,6 @@
 //! Native adapter for typed Agent Management; no nested management HTTP calls.
 use super::app_server_runtime::ManagedRuntimeRecoveryOutcome;
-use anyhow::{ensure, Context};
+use anyhow::ensure;
 use cutex::session::model::CutexSessionRecord;
 
 pub(super) fn recover(
@@ -32,8 +32,7 @@ pub(super) fn recover(
         );
         return Ok(ManagedRuntimeRecoveryOutcome::ClearedDeadClaim);
     }
-    let sessions = cutex::session::store::load_cutex_session_store()?;
-    super::stock_lifecycle::reconnect_ready_runtime(record, &sessions)?;
+    super::stock_lifecycle::reconnect_ready_runtime_outside_fence(&record.cutex_session_id)?;
     Ok(ManagedRuntimeRecoveryOutcome::RecoveredExact)
 }
 
@@ -41,9 +40,10 @@ pub(super) fn online(
     permit: &cutex::agent_management::RuntimeExecutionPermit<'_>,
     record: &CutexSessionRecord,
 ) -> anyhow::Result<()> {
-    let sessions = cutex::session::store::load_cutex_session_store()?;
+    // r273.1 (B1): the live-claim proof of a reconnect runs outside the
+    // registered host fence; the claim is compared once the fence is back.
     if record.app_server_runtime.is_some() && record.app_server_launch_claim_id.is_none() {
-        super::stock_lifecycle::reconnect_ready_runtime(record, &sessions)?;
+        super::stock_lifecycle::reconnect_ready_runtime_outside_fence(&record.cutex_session_id)?;
         return Ok(());
     }
     let path = cutex::session::store::cutex_sessions_path()?;
@@ -51,16 +51,11 @@ pub(super) fn online(
     ensure!(
         receipt.stage == cutex::agent_management::StockRuntimeStage::Ready
             && receipt.error.is_none(),
-        "native start incomplete; resume the same managed action (runtime action {})",
+        "native start incomplete{}; resume the same managed action (runtime action {})",
+        // Why it stopped (e.g. an agent bus timeout), so the failure is classified.
+        receipt.error.as_deref().map(|error| format!(" ({error})")).unwrap_or_default(),
         receipt.action_id.as_str()
     );
-    let current = cutex::session::store::load_cutex_session_store()?
-        .sessions
-        .remove(&record.cutex_session_id)
-        .context("managed agent disappeared")?;
-    super::stock_lifecycle::reconnect_ready_runtime(
-        &current,
-        &cutex::session::store::load_cutex_session_store()?,
-    )?;
+    super::stock_lifecycle::reconnect_ready_runtime_outside_fence(&record.cutex_session_id)?;
     Ok(())
 }

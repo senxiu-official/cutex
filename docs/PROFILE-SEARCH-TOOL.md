@@ -59,12 +59,10 @@ on provider hosts, and parsing is provider-neutral.
   provider error text is scrubbed of it. The profile's effective proxy applies.
 - Budget: one request per call, provider timeout 90 s (Bus wait 120 s), response ≤ 4 MiB, answer
   ≤ 32 000 chars, ≤ 50 citations, query ≤ 2000 chars.
-- Rate limit: 20 calls per agent per sliding hour (attempts, failures included; Bus memory, a Bus
-  restart starts a fresh window) → `rate_limited` with `retryAfterSeconds`.
 - Usage: the provider's `usage` becomes a usage-ledger row (`usage:web-search:<uuid>`, profile id +
   name, provider, model, the calling turn when known), so `/v2/usage` and API quotas count it.
 - Failure codes (all `status: no_write`): `invalid_arguments`, `search_tool_disabled`,
-  `profile_unavailable`, `rate_limited`, `provider_error` (+ `providerStatus`, the provider's
+  `profile_unavailable`, `provider_error` (+ `providerStatus`, the provider's
   message), `provider_timeout`, `provider_unreachable`, `no_answer`.
 - Results are untrusted web content; the result's `note` says so.
 - Bus unreachable at `tools/list`: the fallback listing drops `web_search` (fail closed).

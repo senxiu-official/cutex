@@ -201,14 +201,17 @@ fn profiles(home: &Path) -> Result<()> {
 /// may contain frozen provenance before its session exists, so refuse rather
 /// than dropping that evidence to make the previous build start.
 fn creator_actions(home: &Path) -> Result<()> {
-    for relative in ["runtime", "runtime/agent-management"] {
+    for relative in ["runtime", "runtime/agent-management", "runtime/agent-management/v1"] {
         match fs::symlink_metadata(home.join(relative)) {
             Ok(m) => ensure!(!linked(&m) && m.is_dir(), "creation provenance storage boundary is invalid"),
             Err(e) if e.kind()==std::io::ErrorKind::NotFound => return Ok(()),
             Err(_)=>bail!("creation provenance storage boundary is unreadable"),
         }
     }
-    let path=home.join("runtime/agent-management/agent-management-v1.json");
+    // The previous build reads only the JSON roster: a SQLite one (058 S4)
+    // must be exported back first, so its JSON is never stale here.
+    crate::agent_management::ensure_roster_legacy_authoritative(&home.join("runtime/agent-management/v1"))?;
+    let path=home.join("runtime/agent-management/v1/agent-management-v1.json");
     if file(&path)?.is_none() { return Ok(()); }
     let bytes=read(&path,64*1024*1024)?;
     let value:Value=serde_json::from_slice(&bytes).map_err(|_|anyhow!("creation provenance store is invalid"))?;
@@ -628,7 +631,7 @@ mod tests {
             let db=database(&home.0,&current,false);drop(db);
             let before=snapshot(&home.0,false);assert!(preflight(&home.0).is_err());assert_eq!(snapshot(&home.0,false),before);
         }
-        let home=Home::new();let path=home.0.join("runtime/agent-management/agent-management-v1.json");
+        let home=Home::new();let path=home.0.join("runtime/agent-management/v1/agent-management-v1.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut state=serde_json::to_value(crate::agent_management::AgentManagementSnapshot::empty()).unwrap();
         fs::write(&path,serde_json::to_vec(&state).unwrap()).unwrap();preflight(&home.0).unwrap();
@@ -636,6 +639,19 @@ mod tests {
         let bytes=serde_json::to_vec(&state).unwrap();fs::write(&path,&bytes).unwrap();
         assert!(preflight(&home.0).unwrap_err().to_string().contains("captured creation provenance"));
         assert_eq!(fs::read(&path).unwrap(),bytes);assert!(!home.0.join(DATABASE).exists());
+    }
+
+    #[test]
+    fn creation_provenance_check_refuses_an_authoritative_sql_roster() {
+        // The store's own root (`v1/`, where the pre-fix check never looked).
+        let home=Home::new();let root=home.0.join("runtime/agent-management/v1");
+        fs::create_dir_all(&root).unwrap();
+        let state=crate::agent_management::AgentManagementSnapshot::empty();
+        fs::write(root.join("agent-management-v1.json"),serde_json::to_vec(&state).unwrap()).unwrap();
+        preflight(&home.0).unwrap();
+        crate::agent_management::AgentManagementStore::open(&root).unwrap().import_now().unwrap();
+        let error=preflight(&home.0).unwrap_err().to_string();
+        assert!(error.contains("R1 roster export"), "{error}");
     }
 
     #[test]

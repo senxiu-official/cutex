@@ -730,6 +730,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"), "{response}");
         assert!(response.contains("Access-Control-Allow-Origin: http://localhost\r\n"));
         assert!(response.contains("Access-Control-Allow-Headers: Authorization, Content-Type, If-Match, Last-Event-ID"));
+        assert!(response.contains("Accept-Encoding, X-Cutex-Read-Priority\r\n"));
         assert!(response.contains("Access-Control-Allow-Methods: GET, POST"));
         assert!(response.contains("Connection: keep-alive\r\n"));
         assert_eq!(state, KeepAlive::Kept);

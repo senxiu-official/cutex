@@ -148,6 +148,7 @@ pub fn is_self_service_path(path: &str) -> bool {
         || path == ME_DEVICES
         || me_device_id(path).is_some()
         || is_home_path(path)
+        || super::user_layout_api::is_path(path)
 }
 
 /// `/v2/users/me/home` and `/v2/users/me/home/cover` (user-home).
@@ -578,6 +579,9 @@ fn bind_peer(store: &UserStore, peer_id: &str, user: &str, actor: &str) -> Resul
 
 pub fn handle_self_service(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
+    if super::user_layout_api::is_path(path) {
+        return super::user_layout_api::handle(stream, request);
+    }
     let principal = users::current_principal();
     if is_home_path(path) {
         return handle_home(stream, request, principal.as_ref(), path);

@@ -1,7 +1,8 @@
 //! Management's read-only connection to already running Claude adapters.
 //! Recovery reconnects observers; it never spawns an adapter or a model turn.
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use cutex::app_server::manager::{AppServerRuntimeEventContext, AppServerRuntimeManager};
@@ -44,6 +45,8 @@ pub(super) fn lifecycle(id: &str, online: bool) -> anyhow::Result<serde_json::Va
         json!({"expectedRuntimeGeneration":record.runtime_generation,"reason":"cutex_cli"});
     if online {
         params["openVisibleTerminal"] = json!(false);
+    } else if let Some(requester) = super::session_runtime::stop_requested_by() {
+        params["requestedBy"] = requester;
     }
     let encoded: String = url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
     let response: serde_json::Value =
@@ -75,6 +78,11 @@ pub(super) fn manager() -> &'static AppServerRuntimeManager {
 struct ClaudeEventSink;
 
 impl cutex::app_server::manager::AppServerRuntimeEventSink for ClaudeEventSink {
+    fn handle_background_work(&self, context: &AppServerRuntimeEventContext,
+        work: Option<cutex::app_server::background_work::BackgroundWork>) -> anyhow::Result<()> {
+        cutex::management::v2::repository::publish_background_work(context, work);
+        Ok(())
+    }
     fn handle_live_connection_boundary(&self, context: &AppServerRuntimeEventContext) -> anyhow::Result<()> {
         management_v2_repository()?.invalidate_live(&context.cutex_session_id, context.runtime_generation);
         Ok(())
@@ -143,6 +151,14 @@ fn handle_claude_event(
                     eprintln!("Claude task notice for {} not queued: {error:#}", context.cutex_session_id);
                 }
             }
+            // 054 §2.11: owner-insert stages advance the input ledger record
+            // (never forwarded raw to clients).
+            cutex::management::v2::agent_bus_state::claude_input_stage(
+                &context.cutex_session_id, &notification.method, notification.params.as_ref());
+            // r276 agent pause: the tool calls the adapter holds.
+            if notification.method == super::tool_gate::CLAUDE_CHANGED {
+                super::tool_gate::note_changed(&context.cutex_session_id, &context.thread_id, notification.params.as_ref());
+            }
             // Status changes only, as cutex/claudeTask/changed (project log).
             if let ("claude/task/updated", Some(params)) = (notification.method.as_str(), notification.params.as_ref()) {
                 if params.get("threadId").and_then(serde_json::Value::as_str) == Some(context.thread_id.as_str()) {
@@ -166,22 +182,46 @@ fn handle_claude_event(
     if let NativeEventDisposition::OtherThread { thread_id, pending } = disposition {
         // A subagent transcript frame: stream-only, nothing else observes it.
         for frame in subagent_frames(context, &native, event, Some((&thread_id, pending)))? {
-            management_v2_repository()?.append(frame)?;
+            let bytes = cutex::management::v2::runtime_journal::retained_cost(&frame);
+            cutex::management::v2::runtime_journal::submit(frame, bytes, |_| Ok(()))?;
         }
         return Ok(());
     }
     if let NativeEventDisposition::Publish(pending) = disposition {
-        let envelope = cutex::management::v2::native_events::append_observed_event(pending)?;
+        let bytes = cutex::management::v2::runtime_journal::retained_cost(&pending);
+        let captured_context = context.clone();
+        let captured_event = event.clone();
+        cutex::management::v2::runtime_journal::submit(pending, bytes, move |envelope| {
+            complete_claude_event(&captured_context, &captured_event, synchronize_before_publish, envelope)
+        })?;
         // A subAgentActivity `started` names a subagent transcript as a verified descendant.
         for frame in subagent_frames(context, &native, event, None)? {
-            management_v2_repository()?.append(frame)?;
+            let bytes = cutex::management::v2::runtime_journal::retained_cost(&frame);
+            cutex::management::v2::runtime_journal::submit(frame, bytes, |_| Ok(()))?;
         }
+        return Ok(());
+    }
+    // Ignored protocol events still take the original bookkeeping path.
+    complete_claude_event(context, event, synchronize_before_publish, None)
+}
+
+fn complete_claude_event(
+    context: &AppServerRuntimeEventContext,
+    event: &cutex::app_server::client::AppServerEvent,
+    synchronize_before_publish: bool,
+    envelope: Option<cutex::management::v2::model::EventEnvelope>,
+) -> anyhow::Result<()> {
         if let Some(envelope) = envelope {
-        cutex::management::v2::activity::record_activity_event(&envelope)?;
         // Token usage goes into the usage ledger under the session's
         // profile, as for Codex runtimes: GET /v2/usage and the quota
         // of a Claude API account (API usage) read it.
         let profile = context.current_profile();
+        // A failed turn keeps its error under this profile (turn-error-surface).
+        cutex::management::v2::activity::record_activity_event_for_profile(
+            &envelope,
+            profile.id.as_deref(),
+            profile.name.as_deref(),
+        )?;
         if let Err(error) = cutex::management::v2::usage::record_usage_event_for_profile(
             &envelope,
             profile.id.as_deref(),
@@ -200,7 +240,6 @@ fn handle_claude_event(
         if let Err(error) = cutex::management::v2::claude_plan::record_event(&envelope, &context.thread_id) {
             eprintln!("Claude latest plan for {} not kept: {error:#}", context.cutex_session_id);
         }
-    }
     }
     if !synchronize_before_publish {
         super::app_server_state_sync::handle_runtime_event(context, event)?;
@@ -225,6 +264,9 @@ fn handle_claude_event(
             if let Some(turn) = notification.params.as_ref().and_then(|p| p.pointer("/turn/id")).and_then(serde_json::Value::as_str) {
                 cutex::browser_relay::turn_completed(&context.cutex_session_id, &context.thread_id, context.runtime_generation, turn);
             }
+            // 054 S24: what waited for this turn to end goes out now, before
+            // the next turn starts (not at the next 5 s observer pass).
+            wake_delivery(&context.cutex_session_id);
         }
     }
     if let cutex::app_server::client::AppServerEvent::Notification(notification) = event {
@@ -265,12 +307,27 @@ fn claude_task_notice_params<'a>(
 /// becomes one Agent Bus message from "Claude Task" to the same agent. The bus
 /// keeps its stable `ctask-` id once (a repeated notice is deduplicated there).
 fn notify_parent(cutex_session_id: &str, params: &serde_json::Value) -> anyhow::Result<()> {
+    notify_parent_with(cutex_session_id, params, |request| {
+        let config = cutex::config::store::load_codez_config();
+        cutex::agent_bus::client::send_claude_task_notice(&config, request).map(drop)
+    })
+}
+
+/// [`notify_parent`] with the bus send injected. A queued notice wakes the
+/// parent's delivery at once (r274.2): a system sender emits no
+/// `messageQueued`, so an idle parent would otherwise wait for the next
+/// observer pass.
+fn notify_parent_with(
+    cutex_session_id: &str,
+    params: &serde_json::Value,
+    send: impl FnOnce(&cutex::agent_bus::model::AgentBusSendRequest) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let Some(notice) = cutex::agent_bus::claude_task::ClaudeTaskNotice::from_task_updated(params) else {
         return Ok(());
     };
     let request = cutex::agent_bus::claude_task::send_request(cutex_session_id, &notice)?;
-    let config = cutex::config::store::load_codez_config();
-    cutex::agent_bus::client::send_claude_task_notice(&config, &request)?;
+    send(&request)?;
+    wake_delivery(cutex_session_id);
     Ok(())
 }
 
@@ -379,6 +436,12 @@ fn observe_inner(id: &str) -> anyhow::Result<()> {
     if !connected {
         manager().disconnect(id)?;
         manager().connect_adapter(observation)?;
+        // The stream may have missed its last turn/completed before losing
+        // the socket. Recover that terminal fact before trying the owner queue,
+        // even if Agent Bus registration is temporarily unavailable.
+        if let Err(error) = reconcile_observed_completion(id, record.runtime_generation) {
+            eprintln!("Claude completed turn for {id} was not reconciled: {error:#}");
+        }
     }
     cutex::runtime::claude::refresh_mcp_binding(id)?;
     let name = cutex::session::service::cutex_session_display_name(&record);
@@ -423,44 +486,130 @@ fn observe_inner(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn reconcile_observed_completion(id: &str, generation: u64) -> anyhow::Result<()> {
+    let store = cutex::asks::store::AskStore::open_default()?;
+    let Some(lease) = store.inspect(|state| state.leases.get(id).filter(|lease| lease.turn_id.is_some()).cloned())? else {
+        return Ok(());
+    };
+    let Some(status) = manager().status(id)?.filter(|status| status.connected && status.runtime_generation == generation) else {
+        return Ok(());
+    };
+    let thread = if cutex::management::v2::input_ledger::enabled() {
+        // 054 §2.12 b (S17): one turn, once per runtime generation and
+        // lease turn; later checks belong to the lease reconcile.
+        let Some(turn_id) = lease.turn_id.clone() else { return Ok(()) };
+        static READ: OnceLock<Mutex<std::collections::HashSet<(String, u64, String)>>> = OnceLock::new();
+        let first = READ.get_or_init(Default::default).lock()
+            .map_err(|_| anyhow::anyhow!("Claude completion reconcile lock poisoned"))?
+            .insert((id.to_string(), generation, turn_id.clone()));
+        if !first {
+            return Ok(());
+        }
+        let handle = manager().handle(id)?;
+        let key = cutex::management::v2::turn_index::Key::new(id, &status.thread_id, "live", generation);
+        let mut call = |method: &str, params: serde_json::Value| {
+            handle.request(method, params).map_err(|error| match error {
+                cutex::app_server::client::AppServerClientError::Rpc(error) => cutex::management::v2::history::HistoryCallError::Rpc(
+                    serde_json::json!({"code": error.code, "message": error.message, "data": error.data})),
+                other => cutex::management::v2::history::HistoryCallError::Unavailable(other.to_string()),
+            })
+        };
+        match cutex::management::v2::history::read_complete_turn(&key, &status.thread_id, &turn_id, &mut call) {
+            Ok(Some(turn)) => serde_json::json!({"thread": {"id": status.thread_id, "turns": [turn.turn()]}}),
+            Ok(None) => return Ok(()),
+            Err(_) => anyhow::bail!("the lease turn {turn_id} could not be read"),
+        }
+    } else {
+        manager().commands(id)?.thread_read(&cutex::app_server::commands::ThreadReadParams {
+            thread_id: status.thread_id.clone(), include_turns: true,
+        })?
+    };
+    if manager().status(id)?.is_some_and(|status| status.connected && status.runtime_generation == generation) {
+        reconcile_observed_history(&store, &lease, &status.thread_id, &thread)?;
+    }
+    Ok(())
+}
+
+pub(super) fn reconcile_observed_history(
+    store: &cutex::asks::store::AskStore,
+    lease: &cutex::asks::model::AdmissionLease,
+    thread_id: &str,
+    response: &serde_json::Value,
+) -> anyhow::Result<()> {
+    // An absent/unreadable history is not a synthetic completion. The
+    // scheduler independently handles leases from an earlier runtime generation.
+    if response.pointer("/thread/id").and_then(serde_json::Value::as_str) != Some(thread_id) {
+        return Ok(());
+    }
+    let turn = response.pointer("/thread/turns").and_then(serde_json::Value::as_array)
+        .and_then(|turns| turns.iter().find(|turn| turn.get("id").and_then(serde_json::Value::as_str) == lease.turn_id.as_deref()));
+    if let Some(turn) = turn {
+        cutex::asks::observe::observe_bound_completion(store, lease, turn, chrono::Utc::now(),
+            &|| cutex::management::v2::quota_continue::enabled_default(&lease.cutex_session_id))?;
+    }
+    Ok(())
+}
+
 // Rebuildable settlement sidecar failures must not abort ordinary delivery.
 // Close remains independently fail-closed; this never retries or fabricates facts.
 fn persist_settlement_observation(
     id: &str,
     message_id: &str,
     persist: impl FnOnce() -> anyhow::Result<bool>,
-) {
-    if let Err(error) = persist() {
-        eprintln!("Claude settlement persistence for {id}/{message_id}: {error:#}");
+) -> bool {
+    match persist() {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("Claude settlement persistence for {id}/{message_id}: {error:#}");
+            false
+        }
     }
 }
 
 /// Rebuildable evidence only. Called by the bounded post-delivery phase, never
 /// from ordinary delivery/poll or while holding a session input/store guard.
-fn observe_settlement_message(id: &str, message_id: &str, deadline: Instant) -> anyhow::Result<()> {
+fn observe_settlement_message(id: &str, message_id: &str, generation: u64) -> anyhow::Result<()> {
     let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
-    observe_settlement_message_with(repository, id, message_id, deadline, settlement::collect_background)
+    let Some(manager) = MANAGER.get() else { return Ok(()); };
+    if manager.status(id)?.is_none_or(|status| status.runtime_generation != generation) { return Ok(()); }
+    observe_settlement_message_with(repository, id, message_id,
+        Instant::now() + settlement::OBSERVATION_BUDGET, generation,
+        |snapshot, deadline| settlement::collect_background(snapshot, deadline),
+        || Ok(manager.status(id)?.is_some_and(|status| status.runtime_generation == generation)))
 }
 
 fn observe_settlement_message_with(
     repository: &cutex::management::v2::agent_bus_state::AgentBusMessageRepository,
-    id: &str, message_id: &str, deadline: Instant,
+    id: &str, message_id: &str, deadline: Instant, generation: u64,
     collect: impl FnOnce(&cutex::management::v2::agent_bus_state::AgentBusMessageSnapshot, Instant)
         -> anyhow::Result<cutex::management::v2::agent_bus_settlement_model::Observation>,
+    binding_current: impl FnOnce() -> anyhow::Result<bool>,
 ) -> anyhow::Result<()> {
     let Some(snapshot) = repository.snapshot_by_message_id(message_id)? else {return Ok(());};
     anyhow::ensure!(snapshot.to_cutex_session_id == id, "settlement recipient changed");
+    if cutex::management::v2::agent_bus_state::AgentBusMessageRepository::settlement_observation_failed(&snapshot, generation) {
+        return Ok(());
+    }
+    let mut failed = false;
     let evidence = match collect(&snapshot, deadline) {
         Ok(cutex::management::v2::agent_bus_settlement_model::Observation::Terminal(evidence)) => Some(evidence),
         Ok(cutex::management::v2::agent_bus_settlement_model::Observation::Ineligible) => None,
         Err(error) => {
             eprintln!("Claude settlement observation for {id}/{message_id}: {error:#}");
+            failed = true;
             None // Unavailable observations never create close eligibility.
         }
     };
-    persist_settlement_observation(id, message_id, || {
+    let terminal = evidence.is_some();
+    let persisted = persist_settlement_observation(id, message_id, || {
         repository.observe_settlement(message_id, evidence, chrono::Utc::now())
     });
+    if terminal && persisted { repository.clear_settlement_observation_failure(&snapshot)?; }
+    if failed && binding_current()? {
+        // CAS retains receipt/status changes that raced the failed read. No
+        // automatic close, replay, discard or fabricated delivery receipt.
+        repository.record_settlement_observation_failure(&snapshot, generation)?;
+    }
     Ok(())
 }
 
@@ -484,6 +633,17 @@ fn deliver_messages(
     bus: &cutex::agent_bus::client::AgentBusHttpClient,
     attempts: &mut HashMap<String, (u64, Instant)>,
 ) -> anyhow::Result<()> {
+    deliver_messages_with(id,bus,attempts,
+        |generation|super::asks_claude::adapter_capabilities(id,generation),claude_message_params)
+}
+
+fn deliver_messages_with(
+    id:&str,bus:&cutex::agent_bus::client::AgentBusHttpClient,
+    attempts:&mut HashMap<String,(u64,Instant)>,
+    capabilities:impl Fn(u64)->Option<serde_json::Value>,
+    project:impl Fn(&cutex::session::model::CutexSessionStore,&str,&str,&cutex::agent_bus::model::AgentBusMessage,
+        Option<&cutex::management::v2::agent_bus_state::AgentBusMessageMeta>,bool)->anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<()> {
     use anyhow::{ensure, Context};
     use cutex::agent_bus::delivery::AgentDeliveryMode;
     // The shared snapshot at the latest revision (no whole-store copy per
@@ -495,7 +655,7 @@ fn deliver_messages(
     let runtime = record.current_runtime_agent_id.as_deref().context("Claude offline")?;
     let thread = record.app_server_thread_id().context("Claude thread missing")?;
     let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
-    let capabilities = super::asks_claude::adapter_capabilities(id, record.runtime_generation);
+    let capabilities = capabilities(record.runtime_generation);
     let v2 = capabilities.as_ref().is_some_and(super::asks_claude::offers_agent_messages_v2);
     let native = capabilities.as_ref().is_some_and(super::claude_ingress::offers_native);
     if native && reconciliation_due(attempts, id, record.runtime_generation, Instant::now()) {
@@ -507,16 +667,26 @@ fn deliver_messages(
             }
         }
     }
-    for message in bus.poll(runtime)? {
+    // Both the regular pass and event wakes share this serial observer. Its
+    // outer wait handles idling; a 2 s long poll here delays every later seat.
+    let polled = bus.poll_now(runtime)?;
+    // 054 S10: Job Service notices, planned as the Codex bridge plans them
+    // (batched, awaited ones passive). Native ingress only; not a ledger
+    // feature (the ledger mapping of these writes stays behind its switch).
+    let jobs_on = native;
+    let (job_hold, job_batch_passive) = if jobs_on {
+        cutex::app_server::bus_bridge::job_notice_plan_for(&polled, id)
+    } else {
+        Default::default()
+    };
+    for message in polled {
         // Service controls need their own typed target/seat checks and receipts.
         // A cross-host tell is an ordinary passive note with a peer control record.
         // An Agent Management start / notice is validated against its action
         // (the Codex bridge's provenance check) when its input is built.
         let management = cutex::app_server::bus_bridge::is_agent_management_message(&message);
-        if !(message.sender_kind.is_agent() || message.sender_kind.is_alarm_system())
-            || (message.control_type.is_some() && !cutex::agent_bus::peer_tell::is_peer_tell(&message)
-                && !cutex::agent_bus::claude_task::is_claude_task(&message) && !management)
-            || message.kind != cutex::agent_bus::model::AgentBusEnvelopeKind::Message {
+        let job = jobs_on && message.sender_kind.is_job_service_system();
+        if !submits(&message, jobs_on) {
             continue;
         }
         ensure!(message.to_cutex_session_id.as_deref() == Some(id), "Claude message target mismatch");
@@ -529,9 +699,23 @@ fn deliver_messages(
         // Only the native ingress takes it (no legacy local-inbox receipt).
         if management && !native { continue; }
         let meta = repository.message_meta(&message.id)?;
-        let payload = match claude_message_params(&sessions, thread, id, &message, meta.as_ref(), v2) {
+        let unfrozen = repository.snapshot_by_message_id(&message.id)?.is_some_and(|snapshot| snapshot.external_input.is_none());
+        // A job notice a delegation awaits, or batched behind the newest one,
+        // rides along passive; the rest of a still-arriving batch waits.
+        let job_passive = job && (cutex::app_server::bus_bridge::job_notice_awaited(&message, id)
+            || (unfrozen && job_batch_passive.contains(&message.id)));
+        if job && !job_passive && unfrozen && job_hold.contains(&message.id) { continue; }
+        let built = if job {
+            // The legacy payload is never sent (native only); this checks
+            // the Job Service provenance before anything is frozen.
+            cutex::app_server::bus_bridge::job_notice_envelope(&message, id, thread, record.runtime_generation, job_passive, false)
+                .map(|_| serde_json::json!({"threadId": thread, "messageId": message.id}))
+        } else {
+            project(&sessions, thread, id, &message, meta.as_ref(), v2)
+        };
+        let payload = match built {
             Ok(payload) => payload,
-            Err(error) if management => {
+            Err(error) if management || job => {
                 // Bad Management provenance is permanent: quarantined (the
                 // requester gets its notice on the ACK), as on Codex.
                 if !cutex::app_server::bus_bridge::quarantine_terminal_external_input(id, &message, &error)? {
@@ -560,6 +744,19 @@ fn deliver_messages(
             }
             Err(error) => return Err(error),
         };
+        if native&&!job&&unfrozen {
+            // A malformed/unsupported projection is a message failure, not a
+            // broken adapter connection. Validate before any native request or
+            // turn admission so it cannot put the whole seat into backoff.
+            if let Err(error)=super::claude_ingress::envelope(id,thread,record.runtime_generation,&payload) {
+                if !cutex::app_server::bus_bridge::quarantine_invalid_external_projection(id,&message,&format!("{error:#}"))? {
+                    return Err(error);
+                }
+                bus.ack(runtime,&[message.id.clone()])?;
+                eprintln!("warning: Claude message {} projection quarantined: {error:#}",message.id);
+                continue;
+            }
+        }
         let handle = manager().handle_for_generation(id, record.runtime_generation)?;
         let frozen = repository.snapshot_by_message_id(&message.id)?.and_then(|snapshot| snapshot.external_input);
         // Probe accepted r7 ids before selecting the native route. Migration
@@ -570,20 +767,43 @@ fn deliver_messages(
         } else { None };
         let input_lock = cutex::management::v2::user_input::session_input_lock(id)?;
         let _input_guard = input_lock.lock().map_err(|_| anyhow::anyhow!("session input lock poisoned"))?;
+        if repository.owner_delivery_blocked(id, &message.id)? {
+            // A carried identity belongs to its owner's atomic request. The
+            // observer may recover genuine native proof, but must never submit
+            // an Unknown carried item as an independent turn or passive note.
+            if let Some(envelope) = repository.snapshot_by_message_id(&message.id)?.and_then(|snapshot| snapshot.external_input) {
+                reconcile_native_message(id, record.runtime_generation, &envelope)?;
+                if repository.snapshot_by_message_id(&message.id)?.is_some_and(|snapshot| snapshot.state == "delivered") {
+                    bus.ack(runtime, &[message.id.clone()])?;
+                }
+            }
+            continue;
+        }
         let active = manager().status(id)?.filter(|status| status.connected && status.runtime_generation == record.runtime_generation);
         let busy_turn = active.as_ref().and_then(|status| status.active_turn_id.as_deref());
         let wait = claude_task_wait(&message, cutex::agent_bus::delivery::busy_wait_for(&message));
         busy_delivery::note(&message, wait, busy_turn);
         let age = Duration::from_secs((chrono::Utc::now().timestamp().max(0) as u64).saturating_sub(message.created_at_epoch_secs));
         let timing = busy_delivery::timing(age, wait, active.as_ref().map(|status| status.active_turn_id.is_some()),
-            frozen.is_none() && existing.is_none()
+            frozen.is_none() && existing.is_none() && !job_passive
                 && busy_delivery::candidate(&message, capabilities.as_ref().is_some_and(super::claude_ingress::offers_soon)));
         if timing == cutex::agent_bus::delivery::WakeTiming::Hold { continue; }
         let mut already_accepted = existing.is_some();
-        if existing.is_none() && message.delivery_mode.trigger_turn() {
+        // A passive job notice rides along (no turn of its own), as on Codex.
+        let triggers_turn = message.delivery_mode.trigger_turn() && !job_passive;
+        if existing.is_none() && triggers_turn {
             let accepted = match frozen.as_ref() {
-                Some(envelope) => super::claude_ingress::status(&handle, envelope, record.runtime_generation)?
-                    .delivery_state != cutex::app_server::external_input::DeliveryState::Unknown,
+                Some(envelope) => {
+                    let status = super::claude_ingress::status(&handle, envelope, record.runtime_generation)?;
+                    // 054 RC8: keep what the native runtime said (held / retry / conflict).
+                    if cutex::management::v2::agent_bus_state::input_ledger_active() {
+                        repository.observe_external_input(&message.id, envelope, &status)?;
+                        // Still withheld by the runtime: no new sending, no
+                        // local inbox receipt until it takes the input.
+                        if native_withheld(&status) { continue; }
+                    }
+                    status.delivery_state != cutex::app_server::external_input::DeliveryState::Unknown
+                }
                 None => false,
             };
             already_accepted = accepted;
@@ -598,14 +818,18 @@ fn deliver_messages(
         if !already_accepted && cutex::asks::pause_admission::is_held(
             &cutex::asks::store::AskStore::open_default()?, id,
         )? { continue; }
-        let prepared_turn = (busy_turn.is_none() && !already_accepted && message.delivery_mode.trigger_turn())
+        let prepared_turn = (busy_turn.is_none() && !already_accepted && triggers_turn)
             .then(|| cutex::management::v2::admission::prepare_turn(id, "delivery", None));
         let mut receipt = if let Some(existing) = existing {
             existing
         } else if native || frozen.is_some() {
             ensure!(native, "native Claude input was frozen but this runtime lacks its protocol; no legacy fallback");
             let frozen_input = repository.freeze_external_input(id, &message.id, |canonical| {
-                let mut projection = claude_message_params(&sessions, thread, id, canonical, meta.as_ref(), true)?;
+                if job {
+                    return cutex::app_server::bus_bridge::job_notice_envelope(canonical, id, thread, record.runtime_generation,
+                        job_passive, timing == cutex::agent_bus::delivery::WakeTiming::NextStep);
+                }
+                let mut projection = project(&sessions, thread, id, canonical, meta.as_ref(), true)?;
                 if timing == cutex::agent_bus::delivery::WakeTiming::NextStep {
                     // Of the system alarms only approval notices are read early (023).
                     ensure!(!canonical.sender_kind.is_alarm_system()
@@ -618,7 +842,7 @@ fn deliver_messages(
             let envelope = match frozen_input {
                 Ok(envelope) => envelope,
                 // The durable canonical record failed the provenance check.
-                Err(error) if management
+                Err(error) if (management || job)
                     && cutex::app_server::bus_bridge::quarantine_terminal_external_input(id, &message, &error)? => {
                     bus.ack(runtime, &[message.id.clone()])?;
                     eprintln!("warning: Claude Agent Management message {} quarantined: {error:#}", message.id);
@@ -627,8 +851,21 @@ fn deliver_messages(
                 Err(error) => return Err(error),
             };
             ensure!(envelope.owner_id == id && envelope.thread_id == thread, "frozen Claude input binding changed");
-            super::claude_ingress::submit(&handle, &envelope, record.runtime_generation)?
-        } else { match handle.request("claude/input/submit", payload) {
+            // 054 §2.9: frozen, native IO starts now.
+            repository.input_ledger_sending(id, &message.id);
+            let submitted = super::claude_ingress::submit(&handle, &envelope, record.runtime_generation);
+            // 054 RC8 (S12): the local inbox receipt says nothing about a
+            // native hold / retry / conflict. With the ledger on, read the
+            // native status once and keep it; a withheld input gets no
+            // receipt and no ack (the next sweep checks it again).
+            if cutex::management::v2::agent_bus_state::input_ledger_active() {
+                if let Ok(status) = super::claude_ingress::status(&handle, &envelope, record.runtime_generation) {
+                    repository.observe_external_input(&message.id, &envelope, &status)?;
+                    if native_withheld(&status) { continue; }
+                }
+            }
+            submitted?
+        } else { repository.input_ledger_sending(id, &message.id); match handle.request("claude/input/submit", payload) {
             Ok(receipt) => receipt,
             // The id is known with other content (a retry after an upgrade
             // changed the projection): its first acceptance stands.
@@ -647,6 +884,28 @@ fn deliver_messages(
         bus.ack(runtime, &[message.id])?;
     }
     Ok(())
+}
+
+/// Whether the Claude observer submits a polled bus message (the rest stay
+/// on the bus): agent messages and alarms, cross-host tells, Claude task
+/// notices, Agent Management messages and, with `jobs` (native ingress),
+/// Job Service notices.
+fn submits(message: &cutex::agent_bus::model::AgentBusMessage, jobs: bool) -> bool {
+    let management = cutex::app_server::bus_bridge::is_agent_management_message(message);
+    let job = jobs && message.sender_kind.is_job_service_system();
+    (message.sender_kind.is_agent() || message.sender_kind.is_alarm_system() || job)
+        && (message.control_type.is_none() || cutex::agent_bus::peer_tell::is_peer_tell(message)
+            || cutex::agent_bus::claude_task::is_claude_task(message)
+            || cutex::agent_bus::rename_notice::is_notice(message) || management || job)
+        && message.kind == cutex::agent_bus::model::AgentBusEnvelopeKind::Message
+}
+
+/// The native runtime holds the input, asks for a retry, or refuses it
+/// (RC8): not a context receipt, whatever the local inbox says.
+fn native_withheld(status: &cutex::app_server::external_input::Status) -> bool {
+    use cutex::app_server::external_input::{DeliveryState, ProcessingState};
+    matches!(status.delivery_state, DeliveryState::RetryableError | DeliveryState::Conflict)
+        || status.processing.state == ProcessingState::Held
 }
 
 fn claude_message_is_settled(
@@ -684,6 +943,15 @@ fn claude_message_params(
 ) -> anyhow::Result<serde_json::Value> {
     use anyhow::Context;
     use cutex::agent_bus::delivery::AgentDeliveryMode;
+    if cutex::agent_bus::rename_notice::is_notice(message) {
+        anyhow::ensure!(v2,"passive formal-name notices need a Claude runtime with passive input support");
+        anyhow::ensure!(message.to_cutex_session_id.as_deref()==Some(id),"rename notice recipient mismatch");
+        let text=cutex::agent_bus::rename_notice::model_text(message)?;
+        return Ok(serde_json::json!({"threadId":thread,"messageId":message.id,
+            "source":{"kind":"service","id":cutex::agent_bus::rename_notice::SOURCE_ID},
+            "eventType":cutex::agent_bus::rename_notice::EVENT_TYPE,"text":text,
+            "metadata":{"sourceName":cutex::agent_bus::rename_notice::SOURCE_ID,"cutexSessionId":id,"deliveryMode":"passive"}}));
+    }
     if message.sender_kind.is_alarm_system() {
         let projection = cutex::app_server::bus_bridge::alarm_inter_agent_params(thread, id, message)?;
         cutex::agent_bus::alarms::authenticate_queued_message(
@@ -831,18 +1099,208 @@ pub(super) fn disconnect(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Claude sessions to deliver bus messages to now (054 S24): a message was
+/// queued for them, or their turn ended. Not a ledger feature: no ledger
+/// state is read or written here; the regular 5 s pass stays the backstop.
+static DELIVERY_WAKE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+static DELIVERY_WAKE_SIGNAL: Condvar = Condvar::new();
+/// Some Claude session took deliveries at the observer's last pass: only
+/// then does [`follow_queued_messages`] keep its event subscription (none,
+/// and so no shared-journal following, on a host without Claude agents).
+static DELIVERY_WAKE_WANTED: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn wake_delivery(id: &str) {
+    let mut woken = DELIVERY_WAKE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if woken.insert(id.to_string()) {
+        DELIVERY_WAKE_SIGNAL.notify_one();
+    }
+}
+
+/// Sessions woken before `until` (empty: the pass is due).
+fn wait_for_delivery_wake(until: Instant) -> Vec<String> {
+    let mut woken = DELIVERY_WAKE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        if !woken.is_empty() {
+            return std::mem::take(&mut *woken).into_iter().collect();
+        }
+        let now = Instant::now();
+        if now >= until {
+            return Vec::new();
+        }
+        woken = DELIVERY_WAKE_SIGNAL.wait_timeout(woken, until - now)
+            .unwrap_or_else(std::sync::PoisonError::into_inner).0;
+    }
+}
+
+/// Sessions woken so far, without waiting (r275: served inside the pass).
+fn take_delivery_wakes() -> Vec<String> {
+    let mut woken = DELIVERY_WAKE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *woken).into_iter().collect()
+}
+
+/// One step of an observer pass.
+enum PassStep<'a> {
+    /// The regular visit of a candidate (observe, then deliver).
+    Visit(&'a str),
+    /// A delivery for a session woken meanwhile.
+    Woken(String),
+}
+
+/// Wall time of one observer pass and its slowest visit (r275 timing log).
+struct PassTiming {
+    started: Instant,
+    sessions: usize,
+    woken: usize,
+    slowest: Option<(String, Duration)>,
+}
+
+/// A pass at least this long is logged.
+const SLOW_PASS: Duration = Duration::from_secs(2);
+/// At most one slow-pass line per this interval.
+const PASS_LOG_EVERY: Duration = Duration::from_secs(600);
+
+impl PassTiming {
+    fn start() -> Self {
+        Self { started: Instant::now(), sessions: 0, woken: 0, slowest: None }
+    }
+
+    fn visited(&mut self, id: &str, took: Duration) {
+        self.sessions += 1;
+        if self.slowest.as_ref().is_none_or(|(_, slowest)| took > *slowest) {
+            self.slowest = Some((id.to_string(), took));
+        }
+    }
+
+    /// The stderr line of a pass over [`SLOW_PASS`], else `None`.
+    fn slow_line(&self, total: Duration) -> Option<String> {
+        if total <= SLOW_PASS {
+            return None;
+        }
+        let (id, took) = self.slowest.as_ref().map_or(("-", Duration::ZERO), |(id, took)| (id.as_str(), *took));
+        Some(format!("Claude observer pass: {} ms, {} sessions, {} woken served; slowest {id} {} ms",
+            total.as_millis(), self.sessions, self.woken, took.as_millis()))
+    }
+}
+
+/// Visits `ids` in order. Before each visit it serves the sessions woken
+/// meanwhile (`take_wakes`), so a wake raised during a long pass waits for
+/// the current visit only, not for the whole pass. A session already
+/// visited in this pass is delivered again when woken.
+fn visit_serving_wakes(
+    ids: &[String],
+    timing: &mut PassTiming,
+    mut take_wakes: impl FnMut() -> Vec<String>,
+    mut step: impl FnMut(PassStep<'_>),
+) {
+    for id in ids {
+        for woken in take_wakes() {
+            timing.woken += 1;
+            step(PassStep::Woken(woken));
+        }
+        let at = Instant::now();
+        step(PassStep::Visit(id));
+        timing.visited(id, at.elapsed());
+    }
+}
+
+/// A woken delivery: only for a session whose last pass delivered (one in
+/// backoff waits for its regular visit). Same gates as every delivery.
+fn deliver_woken(
+    id: &str,
+    healthy: &mut HashSet<String>,
+    bus: &cutex::agent_bus::client::AgentBusHttpClient,
+    attempts: &mut HashMap<String, (u64, Instant)>,
+) {
+    if !healthy.contains(id) {
+        return;
+    }
+    if let Err(error) = deliver_messages(id, bus, attempts) {
+        eprintln!("Claude delivery on wake for {id}: {error:#}");
+        healthy.remove(id);
+    }
+}
+
+/// A bus message was queued for a session (`cutex/agentBus/messageQueued`):
+/// wake its delivery.
+fn wake_for_event(event: &cutex::management::v2::model::EventEnvelope) {
+    if !event.cutex_session_id.is_empty()
+        && event.cutex.as_ref().is_some_and(|cutex| cutex.method == "cutex/agentBus/messageQueued") {
+        wake_delivery(&event.cutex_session_id);
+    }
+}
+
+/// Follows the Management event stream (other processes' events arrive via
+/// the shared journal watcher) from now on while `wanted()`, waking delivery
+/// for every bus message queued. Never returns. A lagged or lost
+/// subscription only costs the wake (the 5 s pass delivers).
+fn follow_queued_messages(repository: &cutex::management::v2::repository::EventRepository, wanted: impl Fn() -> bool) {
+    let mut subscription: Option<cutex::management::v2::repository::EventSubscription> = None;
+    loop {
+        if !wanted() {
+            subscription = None;
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        let Some(live) = subscription.as_ref() else {
+            let subscribed = repository.checkpoint().ok().and_then(|checkpoint| {
+                repository.page_and_subscribe(cutex::management::v2::repository::ReplayQuery {
+                    stream_id: Some(checkpoint.stream_id.clone()),
+                    after: checkpoint.cursor.clone(),
+                    limit: 1,
+                    cutex_session_id: None,
+                }, 1024).ok()
+            });
+            if subscribed.is_none() {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            subscription = subscribed;
+            continue;
+        };
+        let lost = match live.receiver.recv_timeout(Duration::from_millis(500)) {
+            Ok(event) => {
+                wake_for_event(&event);
+                for event in live.receiver.try_iter().take(1024) {
+                    wake_for_event(&event);
+                }
+                false
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+        };
+        if lost || live.lagged.load(Ordering::SeqCst) {
+            subscription = None;
+        }
+    }
+}
+
 pub(super) fn spawn_observer() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("cutex-claude-delivery-wake".into())
+        .spawn(|| match management_v2_repository() {
+            Ok(repository) => follow_queued_messages(repository, || DELIVERY_WAKE_WANTED.load(Ordering::Relaxed)),
+            Err(error) => eprintln!("Claude delivery wake: {error:#}"),
+        })?;
     cutex::management::v2::agent_bus_settlement_model::register_collector(settlement::collect);
     cutex::management::v2::agent_bus_settlement_model::register_runtime_fence(settlement::runtime_fence);
+    let settlement_worker = settlement::ObservationWorker::spawn(|id, message, generation| {
+        if let Err(error) = observe_settlement_message(id, message, generation) {
+            eprintln!("Claude settlement source for {id}/{message}: {error:#}");
+        }
+    })?;
     std::thread::Builder::new()
         .name("cutex-claude-observer".into())
-        .spawn(|| {
+        .spawn(move || {
             let mut store_failure = None;
+            let mut last_pass_log: Option<Instant> = None;
             let mut reconciliation_attempts = HashMap::<String, (u64, Instant)>::new();
             let mut previous_candidates = HashMap::<String, RuntimeIdentity>::new();
             let mut outbox_attempt = None::<Instant>;
             let mut settlement_observations = settlement::BackgroundObservations::default();
+            // Sessions whose last pass delivered (a woken delivery skips the
+            // ones in backoff; the regular pass handles those).
+            let mut healthy = HashSet::<String>::new();
             loop {
+                let mut timing = PassTiming::start();
                 // Independent of candidate discovery/connection success: a
                 // fresh process and a fully offline host still repair outbox.
                 if outbox_attempt.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
@@ -880,6 +1338,7 @@ pub(super) fn spawn_observer() -> anyhow::Result<()> {
                             &cutex::config::store::load_codez_config(),
                         );
                         for removed in removed {
+                            healthy.remove(&removed);
                             let _ = disconnect(&removed);
                             reconciliation_attempts.remove(&removed);
                             eprintln!("Claude observer inactive for {removed}: no eligible local live runtime");
@@ -887,8 +1346,16 @@ pub(super) fn spawn_observer() -> anyhow::Result<()> {
                         settlement_observations.retain_candidates(&wanted.keys().cloned().collect::<Vec<_>>());
                         settlement_observations.after_deliveries(settlement::background_enabled(), || {
                         let mut delivered = Vec::new();
-                        for id in &wanted.keys().cloned().collect::<Vec<_>>() {
-                            if !with_state(|state| state.due(id, Instant::now())) { continue; }
+                        let ids = wanted.keys().cloned().collect::<Vec<_>>();
+                        visit_serving_wakes(&ids, &mut timing, take_delivery_wakes, |step| {
+                            let id = match step {
+                                PassStep::Woken(id) => {
+                                    deliver_woken(&id, &mut healthy, &bus, &mut reconciliation_attempts);
+                                    return;
+                                }
+                                PassStep::Visit(id) => id,
+                            };
+                            if !with_state(|state| state.due(id, Instant::now())) { return; }
                             with_state(|state| state.attempted(id));
                             let observation = observe_inner(id);
                             let stage = if observation.is_err() { "observe" } else { "delivery" };
@@ -896,16 +1363,18 @@ pub(super) fn spawn_observer() -> anyhow::Result<()> {
                             match result {
                                 Ok(()) => {
                                     record_observation_result(id, wanted.get(id), stage, &Ok(()));
-                                    delivered.push(id.clone());
+                                    healthy.insert(id.to_string());
+                                    delivered.push(id.to_string());
                                 },
                                 Err(error) => {
+                                    healthy.remove(id);
                                     // Includes an offline occurrence discovered
                                     // after the candidate scan, and failed
                                     // connection checks while the PID survives.
                                     invalidate_settlement_observations(id);
                                     let offline = error.downcast_ref::<cutex::runtime::claude::ClaudeObservationOffline>().is_some();
                                     record_observation_result(id, wanted.get(id), stage, &Err(error));
-                                    if offline { reconciliation_attempts.remove(id); continue; }
+                                    if offline { reconciliation_attempts.remove(id); return; }
                                     // A dead adapter (PID gone, endpoint
                                     // refused) is offline: clear its stale
                                     // claim; the next pass stops observing it.
@@ -918,22 +1387,21 @@ pub(super) fn spawn_observer() -> anyhow::Result<()> {
                                             wanted.remove(id);
                                             reconciliation_attempts.remove(id);
                                             with_state(|state| { state.sync_candidates(&wanted, Instant::now()); });
-                                            continue;
                                         }
                                         Ok(false) => {}
                                         Err(_) => {} // Preserve the original failure and its retry state.
                                     }
                                 }
                             }
-                        }
+                        });
                         delivered
                         }, |id| {
                             cutex::management::v2::agent_bus_state::agent_bus_message_repository()?
                                 .pending_native_envelopes(id)
                                 .map(|envelopes| envelopes.into_iter().map(|envelope| envelope.message.id).collect())
-                        }, |id, message, deadline| {
-                            if let Err(error) = observe_settlement_message(id, message, deadline) {
-                                eprintln!("Claude settlement source for {id}/{message}: {error:#}");
+                        }, |id, message, _scheduling_deadline| {
+                            if let Some(identity) = previous_candidates.get(id) {
+                                settlement_worker.schedule(id, message, identity.generation);
                             }
                         });
                     }
@@ -945,7 +1413,31 @@ pub(super) fn spawn_observer() -> anyhow::Result<()> {
                         }
                     }
                 }
-                std::thread::sleep(Duration::from_secs(5));
+                if let Some(line) = timing.slow_line(timing.started.elapsed()) {
+                    // A pass that served a wake always logs; other slow
+                    // passes log once per PASS_LOG_EVERY. Bus probes do not
+                    // wait, but observation or delivery RPCs may still stall.
+                    if timing.woken > 0 || last_pass_log.is_none_or(|at: Instant| at.elapsed() >= PASS_LOG_EVERY) {
+                        eprintln!("{line}");
+                        last_pass_log = Some(Instant::now());
+                    }
+                }
+                DELIVERY_WAKE_WANTED.store(!healthy.is_empty(), Ordering::Relaxed);
+                // The next pass in 5 s; meanwhile deliver at once to a
+                // session a bus message was queued for or whose turn ended.
+                let until = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let woken = wait_for_delivery_wake(until);
+                    if woken.is_empty() {
+                        break;
+                    }
+                    let bus = cutex::agent_bus::client::AgentBusHttpClient::from_config(
+                        &cutex::config::store::load_codez_config(),
+                    );
+                    for id in woken {
+                        deliver_woken(&id, &mut healthy, &bus, &mut reconciliation_attempts);
+                    }
+                }
             }
         })?;
     Ok(())
@@ -973,25 +1465,42 @@ fn record_agent_message_item(
         }
         return Ok(());
     }
-    if notification.method != "item/completed" {
+    if !matches!(notification.method.as_str(), "item/started" | "item/completed") {
         return Ok(());
     }
     let item = &params["item"];
     if item["type"] != "functionCallOutput" || item["name"] != "external_event" {
         return Ok(());
     }
-    if !matches!(item.pointer("/externalInputView/schema").and_then(serde_json::Value::as_str),
-        Some(cutex::agent_bus::projection::AGENT_MESSAGE_VIEW_SCHEMA | cutex::agent_bus::alarms::ALARM_VIEW_SCHEMA))
-    {
-        return Ok(());
-    }
     let (Some(message), Some(turn)) = (item["id"].as_str(), params["turnId"].as_str()) else {
         return Ok(());
     };
     let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
-    if repository.snapshot_by_message_id(message)?.is_some_and(|snapshot| snapshot.external_input.is_some()) {
-        // Native r8 timeline items are an audit projection at claim time. Wait
-        // for the separately validated native context-persisted receipt.
+    let snapshot = repository.snapshot_by_message_id(message)?;
+    if let Some(envelope) = snapshot.as_ref().and_then(|snapshot| snapshot.external_input.as_ref()) {
+        // Native r8 timeline items are an audit projection at claim time:
+        // the bus waits for the separately validated native context-persisted
+        // receipt. r274.2 §9.1: the ledger record moves to the timeline now
+        // (`accepted`, this turn, this item), any view and delivery mode
+        // (notes, alarms, notices, Claude Tasks, peer tells; claude-r35 also
+        // emits busy `soon` items at claim time).
+        if envelope.owner_id == id && params["threadId"].as_str() == Some(envelope.thread_id.as_str()) {
+            repository.input_ledger_native_item(id, message, turn)?;
+        }
+        return Ok(());
+    }
+    if snapshot.is_none() {
+        // Not a bus message: a delegation results event (its native message
+        // id), e.g. a `soon` result the claude-r35 hook claimed.
+        cutex::asks::ledger::results_item_shown(id, message, turn);
+        return Ok(());
+    }
+    if notification.method != "item/completed" {
+        return Ok(());
+    }
+    if !matches!(item.pointer("/externalInputView/schema").and_then(serde_json::Value::as_str),
+        Some(cutex::agent_bus::projection::AGENT_MESSAGE_VIEW_SCHEMA | cutex::agent_bus::alarms::ALARM_VIEW_SCHEMA))
+    {
         return Ok(());
     }
     if repository.record_context_injected(id, message, turn)? {
@@ -1031,6 +1540,43 @@ fn reconcile_native_message(id: &str, generation: u64, envelope: &cutex::app_ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_history_replays_only_exact_terminal_bound_turn() {
+        use cutex::asks::model::{AdmissionLease, LeaseHolder};
+        use serde_json::json;
+        let root = std::env::temp_dir().join(format!("claude-reconnect-{}", uuid::Uuid::new_v4()));
+        let repository = cutex::management::v2::user_input::UserInputRepository::open(&root).unwrap();
+        let store = repository.ask_store();
+        let lease = AdmissionLease {
+            cutex_session_id: "reconnect-owner".into(), holder: LeaseHolder::Owner,
+            native_message_id: "old-message".into(), runtime_generation: 7,
+            turn_id: Some("old-turn".into()), since: chrono::Utc::now().to_rfc3339(),
+        };
+        for response in [
+            json!({"thread":{"id":"other","turns":[{"id":"old-turn","status":"completed"}]}}),
+            json!({"thread":{"id":"thread","turns":[{"id":"old-turn","status":"inProgress"}]}}),
+            json!({"thread":{"id":"thread","turns":[{"id":"other","status":"completed"}]}}),
+            json!({"thread":{"id":"thread","turns":[]}}),
+            json!({"thread":{"id":"thread","turns":[{"id":"old-turn"}]}}),
+        ] {
+            store.with_state(|state| { state.leases.insert(lease.cutex_session_id.clone(), lease.clone()); }).unwrap();
+            reconcile_observed_history(&store, &lease, "thread", &response).unwrap();
+            assert_eq!(store.inspect(|s| s.leases.get(&lease.cutex_session_id).cloned()).unwrap(), Some(lease.clone()));
+        }
+        let completed = json!({"thread":{"id":"thread","turns":[{"id":"old-turn","status":"completed"}]}});
+        store.with_state(|state| state.leases.get_mut(&lease.cutex_session_id).unwrap().native_message_id = "replacement".into()).unwrap();
+        reconcile_observed_history(&store, &lease, "thread", &completed).unwrap();
+        assert_eq!(store.inspect(|s| s.leases[&lease.cutex_session_id].native_message_id.clone()).unwrap(), "replacement");
+        store.with_state(|state| { state.leases.insert(lease.cutex_session_id.clone(), lease.clone()); }).unwrap();
+        reconcile_observed_history(&store, &lease, "thread", &completed).unwrap();
+        assert!(!store.inspect(|s| s.leases.contains_key(&lease.cutex_session_id)).unwrap());
+        // A duplicate history read is harmless.
+        reconcile_observed_history(&store, &lease, "thread", &completed).unwrap();
+        drop(store);
+        drop(repository);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn settlement_persistence_failure_is_best_effort_and_never_retries() {
@@ -1191,7 +1737,8 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
-                if cutex::http::server::read_simple_http_request(&mut stream).is_ok() {
+                if let Ok(request) = cutex::http::server::read_simple_http_request(&mut stream) {
+                    assert!(request.path.contains("ack=1&wait_ms=0"), "observer must not long-poll: {}", request.path);
                     let _ = cutex::http::server::write_json_response(
                         &mut stream, 200, "OK", &serde_json::json!({"messages": []}));
                 }
@@ -1274,6 +1821,73 @@ mod tests {
         // No notice in an ordinary task update.
         assert!(cutex::agent_bus::claude_task::ClaudeTaskNotice::from_task_updated(
             &json!({"threadId":"thread","task":{"taskId":"task-a","status":"running"}})).is_none());
+    }
+
+    #[test]
+    fn invalid_native_projection_is_quarantined_before_later_message_processing() {
+        use serde_json::json;
+        use cutex::management::v2::agent_bus_state::{agent_bus_message_repository,AgentBusQueuedMessage};
+        use cutex::session::{model::CutexSessionRecord,store};
+        let owner=format!("cutex.{}",uuid::Uuid::new_v4());
+        let mut record=CutexSessionRecord::new(owner.clone(),Some("projection-thread".into()),"private".into(),"/private".into(),None).unwrap();
+        record.current_runtime_agent_id=Some("projection-runtime".into());record.runtime_generation=1;
+        let path=store::cutex_sessions_path().unwrap();
+        store::with_locked_session_rows(&path,|rows|{rows.insert_session(&owner,record);rows.commit()?;Ok(())}).unwrap();
+        let messages:Vec<cutex::agent_bus::model::AgentBusMessage>=(0..2).map(|n|serde_json::from_value(json!({
+            "id":format!("projection-{n}-{}",uuid::Uuid::new_v4()),"kind":"message","from":"sender","to":"projection-runtime",
+            "fromCutexSessionId":"cutex.sender","toCutexSessionId":owner,"content":"unchanged canonical content",
+            "deliveryMode":"passive","triggerTurn":false,"createdAtEpochSecs":1,"senderKind":"agent"
+        })).unwrap()).collect();
+        let repository=agent_bus_message_repository().unwrap();
+        for message in &messages {
+            let params=cutex::app_server::bus_bridge::inter_agent_params("projection-thread","receiver",&owner,message).unwrap();
+            repository.record_queued(AgentBusQueuedMessage {owner_cutex_session_id:owner.clone(),message_id:message.id.clone(),
+                from_cutex_session_id:message.from_cutex_session_id.clone(),to_cutex_session_id:owner.clone(),
+                from_runtime_agent_id:None,to_runtime_agent_id:Some("projection-runtime".into()),delivery_mode:"passive".into(),
+                content:message.content.clone(),queued_at:chrono::Utc::now(),canonical_envelope:message.clone(),
+                semantic_sha256:cutex::app_server::bus_bridge::inter_agent_semantic_sha256(&params)}).unwrap();
+        }
+        let listener=std::net::TcpListener::bind(("127.0.0.1",0)).unwrap();
+        let port=listener.local_addr().unwrap().port();listener.set_nonblocking(true).unwrap();
+        let wire=messages.clone();let acknowledgments=Arc::new(Mutex::new(Vec::<String>::new()));let acked=acknowledgments.clone();
+        let server=std::thread::spawn(move|| {
+            let deadline=Instant::now()+Duration::from_secs(5);
+            while Instant::now()<deadline {
+                let Ok((mut stream,_))=listener.accept() else {std::thread::sleep(Duration::from_millis(10));continue};
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let request=cutex::http::server::read_simple_http_request(&mut stream).unwrap();
+                let reply=if request.method=="GET" {json!({"messages":wire})} else {
+                    let body:serde_json::Value=serde_json::from_slice(&request.body).unwrap();
+                    acked.lock().unwrap().extend(body["messageIds"].as_array().unwrap().iter().map(|id|id.as_str().unwrap().to_owned()));
+                    json!({"ok":true,"acked":1})
+                };
+                cutex::http::server::write_json_response(&mut stream,200,"OK",&reply).unwrap();
+                if !acked.lock().unwrap().is_empty() {break}
+            }
+        });
+        let bus=cutex::agent_bus::client::AgentBusHttpClient::new(format!("http://127.0.0.1:{port}"),None);
+        let projected=std::cell::RefCell::new(Vec::new());
+        let error=deliver_messages_with(&owner,&bus,&mut HashMap::new(),|_|Some(json!({
+            "externalInputVersion":1,"externalInputVersions":[1,2],"externalInputDeliveries":["after_turn","passive"],
+            "input":{"views":true,"deliveryModes":["passive"]}
+        })),|sessions,thread,id,message,meta,v2| {
+            projected.borrow_mut().push(message.id.clone());
+            if message.id==messages[0].id {return Ok(json!({"threadId":thread,"messageId":message.id,
+                "source":{"kind":"service","id":"Future Service"},"eventType":"unrecognized_future_projection",
+                "text":"never sent","metadata":{"deliveryMode":"passive"}}))}
+            claude_message_params(sessions,thread,id,message,meta,v2)
+        }).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(*projected.borrow(),messages.iter().map(|message|message.id.clone()).collect::<Vec<_>>());
+        assert!(error.to_string().contains("runtime generation changed: expected 1, actual none"),
+            "the later valid input reached its native generation fence: {error:#}");
+        assert_eq!(*acknowledgments.lock().unwrap(),vec![messages[0].id.clone()]);
+        let invalid=repository.snapshot_by_message_id(&messages[0].id).unwrap().unwrap();
+        assert_eq!(invalid.state,"quarantined");assert_eq!(invalid.error.unwrap()["code"],"external_projection_invalid");
+        assert_eq!(repository.snapshot_by_message_id(&messages[1].id).unwrap().unwrap().state,"pending");
+        for message in &messages {
+            assert_eq!(serde_json::to_value(repository.canonical_message(&message.id).unwrap()).unwrap(),serde_json::to_value(message).unwrap());
+        }
     }
 
     #[test]
@@ -1450,5 +2064,231 @@ mod tests {
         assert!(reconciliation_due(&mut attempts, "two", 1, start));
         assert!(reconciliation_due(&mut attempts, "one", 1, start + Duration::from_secs(60)));
         assert!(reconciliation_due(&mut attempts, "one", 2, start + Duration::from_secs(61)));
+    }
+}
+
+#[cfg(test)]
+mod delivery_wake_tests {
+    use super::*;
+
+    /// The tests in this process that wake or take the shared wake set
+    /// (`isolated_*` ones run in a child process).
+    static WAKE_SET: Mutex<()> = Mutex::new(());
+
+    fn wake_set() -> std::sync::MutexGuard<'static, ()> {
+        WAKE_SET.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 054 S24: the observer waits at most until its next pass, and returns
+    /// at once with the sessions woken meanwhile (from any thread).
+    #[test]
+    fn delivery_wake_returns_woken_sessions_or_the_pass_deadline() {
+        let _wake_set = wake_set();
+        let started = Instant::now();
+        assert!(wait_for_delivery_wake(started + Duration::from_millis(60)).is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        let waker = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(30));
+            let mut woken = DELIVERY_WAKE.lock().unwrap();
+            woken.insert("cutex.wake-b".into());
+            woken.insert("cutex.wake-a".into());
+            DELIVERY_WAKE_SIGNAL.notify_one();
+        });
+        let started = Instant::now();
+        let woken = wait_for_delivery_wake(started + Duration::from_secs(10));
+        waker.join().unwrap();
+        assert_eq!(woken, ["cutex.wake-a", "cutex.wake-b"]);
+        assert!(started.elapsed() < Duration::from_secs(5), "woken, not the pass deadline");
+        assert!(wait_for_delivery_wake(Instant::now()).is_empty(), "taken once");
+    }
+
+    /// r275: a wake raised while the pass visits session 1 of 3 is served
+    /// before session 2 (not after the whole pass), and a session already
+    /// visited in this pass is delivered again when woken. Only this test's
+    /// own ids are taken from the shared wake set.
+    #[test]
+    fn a_wake_during_a_visit_is_served_before_the_next_session() {
+        let _wake_set = wake_set();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let ids = (1..=3).map(|n| format!("cutex.pass-{tag}-{n}")).collect::<Vec<_>>();
+        let mine = ids.clone();
+        let take = || {
+            let mut woken = DELIVERY_WAKE.lock().unwrap();
+            mine.iter().filter(|id| woken.remove(id.as_str())).cloned().collect::<Vec<_>>()
+        };
+        let mut steps = Vec::new();
+        let mut timing = PassTiming::start();
+        visit_serving_wakes(&ids, &mut timing, take, |step| match step {
+            PassStep::Visit(id) => {
+                steps.push(format!("visit {id}"));
+                if id == ids[0] { wake_delivery(&ids[2]); }
+                if id == ids[1] {
+                    std::thread::sleep(Duration::from_millis(40));
+                    wake_delivery(&ids[0]);
+                }
+            }
+            PassStep::Woken(id) => steps.push(format!("woken {id}")),
+        });
+        assert_eq!(steps, [
+            format!("visit {}", ids[0]), format!("woken {}", ids[2]), format!("visit {}", ids[1]),
+            format!("woken {}", ids[0]), format!("visit {}", ids[2]),
+        ]);
+        assert_eq!((timing.sessions, timing.woken), (3, 2));
+        assert_eq!(timing.slowest.as_ref().map(|(id, _)| id.as_str()), Some(ids[1].as_str()));
+        // One line, only for a pass over 2 s.
+        assert_eq!(timing.slow_line(Duration::from_millis(1999)), None);
+        assert_eq!(timing.slow_line(Duration::from_secs(2)), None);
+        let line = timing.slow_line(Duration::from_millis(2500)).unwrap();
+        let slowest = timing.slowest.as_ref().unwrap().1.as_millis();
+        assert_eq!(line, format!("Claude observer pass: 2500 ms, 3 sessions, 2 woken served; slowest {} {slowest} ms", ids[1]));
+        assert!(slowest >= 40);
+    }
+
+    /// r274.2: a queued Claude Task notice wakes the parent's delivery (a
+    /// system sender emits no `messageQueued`); a failed send or a frame
+    /// without a valid notice wakes nothing. Only this test's own id is
+    /// taken from the wake set.
+    #[test]
+    fn a_queued_claude_task_notice_wakes_the_parent() {
+        let _wake_set = wake_set();
+        let parent = format!("cutex.ctask-wake-{}", uuid::Uuid::new_v4());
+        let woken = |id: &str| DELIVERY_WAKE.lock().unwrap().remove(id);
+        let finished = serde_json::json!({"threadId": "t", "task": {"background": true, "status": "completed",
+            "taskId": "afa1b240b52a47bb4", "taskType": "local_agent",
+            "notifyParent": {"description": "bg", "noticeId": "afa1b240b52a47bb4", "originTurnId": "3216c31d",
+                "status": "completed", "summary": "bg-done", "summaryTruncated": false, "taskId": "afa1b240b52a47bb4",
+                "taskType": "local_agent", "toolUseId": "toolu_01Fr", "transcript": "claude:3c57b94d:task:afa1b240b52a47bb4"}}});
+        assert!(notify_parent_with(&parent, &finished, |_| Err(anyhow::anyhow!("bus down"))).is_err());
+        assert!(!woken(&parent), "a notice the bus did not take wakes nothing");
+        assert!(notify_parent_with(&parent, &serde_json::json!({"task": {}}), |_| panic!("no notice, no send")).is_ok());
+        assert!(!woken(&parent));
+        let mut sent = None;
+        notify_parent_with(&parent, &finished, |request| {
+            sent = request.external_message_id.clone();
+            Ok(())
+        }).unwrap();
+        assert_eq!(sent, Some(cutex::agent_bus::claude_task::message_id(&parent, "afa1b240b52a47bb4")));
+        assert!(woken(&parent), "the queued notice wakes the parent's delivery");
+    }
+
+    const JOB_OWNER: &str = "cutex.11111111-1111-4111-8111-111111111111";
+
+    fn job_notice(id: &str) -> cutex::agent_bus::model::AgentBusMessage {
+        use cutex::agent_bus::model::{JobServiceCompletionRequest, JobServiceTerminalStatus, JOB_SERVICE_COMPLETION_SCHEMA};
+        let request = JobServiceCompletionRequest {
+            schema: JOB_SERVICE_COMPLETION_SCHEMA.to_string(), event_id: format!("event-{id}"), job_id: format!("job-{id}"),
+            job_revision: 1, terminal_status: JobServiceTerminalStatus::Exited, result_sha256: "a".repeat(64),
+            target_cutex_session_id: JOB_OWNER.to_string(), summary: Some("untrusted summary".to_string()),
+            output_reference: Some(format!("job-output:job-{id}")),
+        };
+        serde_json::from_value(serde_json::json!({
+            "id":id,"kind":"message","from":"cutex-job-service","to":"runtime","toCutexSessionId":JOB_OWNER,
+            "content":"Message Type: JOB_SERVICE_COMPLETION\nSummary (untrusted data): untrusted summary",
+            "deliveryMode":"after_turn","triggerTurn":true,"createdAtEpochSecs":1,"senderKind":"job_service_system",
+            "displaySource":"Cutex Job Service","controlType":JOB_SERVICE_COMPLETION_SCHEMA,
+            "controlPayload":request,"externalActionId":format!("job-{id}"),"externalMessageId":format!("event-{id}")
+        })).unwrap()
+    }
+
+    /// S10 with the ledger switch off: a Claude runtime with native ingress
+    /// takes Job Service notices (they used to stay on the bus); without
+    /// native ingress they still wait there (no legacy route).
+    #[test]
+    fn job_notices_are_submitted_to_native_claude_runtimes() {
+        let notice = job_notice("jsc_submits");
+        assert!(submits(&notice, true));
+        assert!(!submits(&notice, false));
+        let agent: cutex::agent_bus::model::AgentBusMessage = serde_json::from_value(serde_json::json!({
+            "id":"bus-agent","kind":"message","from":"peer","to":"runtime","toCutexSessionId":JOB_OWNER,
+            "content":"hi","deliveryMode":"after_turn","triggerTurn":true,"createdAtEpochSecs":1,"senderKind":"agent"
+        })).unwrap();
+        assert!(submits(&agent, true) && submits(&agent, false));
+        let mut controlled = agent.clone();
+        controlled.control_type = Some("cutex.unknown.v1".into());
+        assert!(!submits(&controlled, true));
+    }
+
+    /// Ledger switch OFF (isolated home): a bus message queued for a session
+    /// wakes its delivery at once (no 5 s pass, no settle thread), the Job
+    /// Service notice path (plan, envelope, freeze, sending, local inbox
+    /// receipt) works, and the input ledger is never written (its file is
+    /// not even created).
+    #[test]
+    fn isolated_switch_off_wake_and_job_notice_write_no_ledger() {
+        const CHILD: &str = "CUTEX_CLAUDE_UNGATE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!("cutex-claude-ungate-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(".cutex-test-private-home"), b"ungate test").unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli_app::claude_runtime::delivery_wake_tests::isolated_switch_off_wake_and_job_notice_write_no_ledger", "--nocapture"])
+                .env("HOME", &root).env("CUTEX_TEST_PRIVATE_HOME", &root).env(CHILD, "1")
+                .status().unwrap();
+            let ran = root.join("ungate-test-done").is_file();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(result.success() && ran);
+            return;
+        }
+        use cutex::management::v2::agent_bus_state::{agent_bus_message_repository, AgentBusQueuedMessage};
+        use serde_json::json;
+        cutex::management::v2::input_ledger::set_enabled_override(Some(false));
+        assert!(!cutex::management::v2::input_ledger::enabled());
+        let ledger_file = cutex::config::paths::runtime_dir().unwrap().join("management-v2")
+            .join(cutex::management::v2::input_ledger::DATABASE_FILE);
+        let repository = agent_bus_message_repository().unwrap();
+        let events = management_v2_repository().unwrap();
+        std::thread::spawn(move || follow_queued_messages(events, || true));
+        let queue = |message: &cutex::agent_bus::model::AgentBusMessage, from: Option<&str>| {
+            repository.record_queued(AgentBusQueuedMessage {
+                owner_cutex_session_id: JOB_OWNER.into(), message_id: message.id.clone(),
+                from_cutex_session_id: from.map(str::to_string), to_cutex_session_id: JOB_OWNER.into(),
+                from_runtime_agent_id: None, to_runtime_agent_id: Some("runtime".into()),
+                delivery_mode: "after_turn".into(), content: message.content.clone(), queued_at: chrono::Utc::now(),
+                canonical_envelope: message.clone(), semantic_sha256: cutex::app_server::bus_bridge::inter_agent_semantic_sha256(
+                    &cutex::app_server::bus_bridge::inter_agent_params("thread", "ignored", JOB_OWNER, message).unwrap()),
+            }).unwrap()
+        };
+        // S24: queued -> woken, well before a 5 s pass would find it.
+        const SENDER: &str = "cutex.22222222-2222-4222-8222-222222222222";
+        let note: cutex::agent_bus::model::AgentBusMessage = serde_json::from_value(json!({
+            "id":"bus-note-1","kind":"message","from":"peer","to":"runtime","fromCutexSessionId":SENDER,
+            "toCutexSessionId":JOB_OWNER,"content":"a note","deliveryMode":"after_turn","triggerTurn":true,
+            "createdAtEpochSecs":1,"senderKind":"agent"
+        })).unwrap();
+        // The follower subscribes from "now": queue until it sees one.
+        let started = Instant::now();
+        let mut woken = Vec::new();
+        for attempt in 0..20 {
+            let mut message = note.clone();
+            message.id = format!("bus-note-{attempt}");
+            assert!(queue(&message, Some(SENDER)));
+            let queued_at = Instant::now();
+            woken = wait_for_delivery_wake(queued_at + Duration::from_millis(500));
+            if !woken.is_empty() {
+                assert!(queued_at.elapsed() < Duration::from_millis(500));
+                break;
+            }
+        }
+        assert_eq!(woken, [JOB_OWNER], "a queued bus message wakes delivery (waited {:?})", started.elapsed());
+        // S10: the Job Service notice path, switch off.
+        let notice = job_notice("jsc_switch_off");
+        assert!(submits(&notice, true));
+        let (hold, passive) = cutex::app_server::bus_bridge::job_notice_plan_for(std::slice::from_ref(&notice), JOB_OWNER);
+        assert!(hold.is_empty() && passive.is_empty());
+        assert!(!cutex::app_server::bus_bridge::job_notice_awaited(&notice, JOB_OWNER));
+        assert!(queue(&notice, None));
+        let envelope = repository.freeze_external_input(JOB_OWNER, &notice.id, |canonical|
+            cutex::app_server::bus_bridge::job_notice_envelope(canonical, JOB_OWNER, "thread", 7, false, false)).unwrap();
+        assert_eq!((envelope.message.event_type.as_str(), envelope.message.source.id.as_str()), ("job_completion", "cutex-job-service"));
+        repository.input_ledger_sending(JOB_OWNER, &notice.id);
+        let receipt = json!({"threadId":"thread","messageId":notice.id,"durable":true,"receiptScope":"local-inbox","state":"queued"});
+        repository.record_local_inbox(JOB_OWNER, &notice.id, &receipt).unwrap();
+        assert_eq!(repository.message_state(&notice.id).unwrap(), Some(("inbox_accepted".into(), true)));
+        // Turn end wakes too (in process, no ledger).
+        wake_delivery(JOB_OWNER);
+        assert_eq!(wait_for_delivery_wake(Instant::now() + Duration::from_secs(1)), [JOB_OWNER]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!ledger_file.exists(), "switch off: the input ledger is never opened or written");
+        std::fs::write(std::path::Path::new(&std::env::var_os("CUTEX_TEST_PRIVATE_HOME").unwrap()).join("ungate-test-done"), b"ok").unwrap();
     }
 }

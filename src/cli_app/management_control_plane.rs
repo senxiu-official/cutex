@@ -247,10 +247,13 @@ impl ManagementControlClient {
         &self,
         request: &cutex::agent_management::AgentArchiveRequest,
     ) -> anyhow::Result<cutex::agent_management::AgentArchiveReceipt> {
-        self.request(
+        // Archive may stop a real runtime before committing its receipt.
+        // Use the lifecycle transaction budget, not the short read budget.
+        self.request_with_timeout(
             "POST",
             "/v2/agent-management/archive-actions",
             Some(&serde_json::to_vec(request)?),
+            Duration::from_secs(120),
         )
     }
     #[cfg(test)]
@@ -473,7 +476,8 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             let mut request = [0; 1024];
-            socket.read(&mut request).unwrap();
+            let received = socket.read(&mut request).unwrap();
+            assert!(received > 0, "client sent no request bytes");
             std::thread::sleep(Duration::from_millis(5500));
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"stage\":\"ready\"}").unwrap();
         });

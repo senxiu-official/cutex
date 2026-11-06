@@ -194,8 +194,11 @@ pub(super) fn create_native(
     configuration: &cutex::launch::stock::StockConfiguration,
     mut captured: impl FnMut(&str),
 ) -> anyhow::Result<String> {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
     let mut timing = CreateTiming::new("create_native");
-    let deployment = LocalDeployment::selected()?.context("No local runtime installed")?;
+    let deployment = cutex::launch::native_managed::copy(
+        &LocalDeployment::selected()?.context("No local runtime installed")?,
+    )?;
     let bundle: StockBundle = serde_json::from_slice(&std::fs::read(&deployment.bundle_manifest)?)?;
     StockBundle::load_references(
         bundle
@@ -708,6 +711,7 @@ mod tests {
         let account = StoredAccount {
             options: Default::default(),
             browser_tools: false,
+            browser_tool_surface: Default::default(),
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,

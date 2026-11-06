@@ -9,6 +9,10 @@ mod fixes_tests;
 #[cfg(test)]
 mod http_tests;
 pub mod model;
+pub mod names;
+mod name_bindings;
+#[cfg(test)]
+mod names_tests;
 pub mod pair;
 pub mod policy;
 pub mod profiles;
@@ -145,6 +149,24 @@ impl From<serde_json::Error> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub fn instance_id() -> String {
+    // The ignored two-daemon fixture is a client of a real private daemon.
+    // Ordinary unit tests keep management's fixed test ID. This test-only
+    // adapter reads only that marked HOME's public instance ID; authentication
+    // remains the real receiver's unchanged token + instance-header gate.
+    #[cfg(test)]
+    if std::env::var_os("CUTEX_PEER_NAME_FIXTURE").is_some() {
+        if let Some(home)=crate::config::paths::home_dir() {
+            if home.join(crate::config::paths::PRIVATE_HOME_MARKER).is_file() {
+                if let Ok(selected)=crate::config::paths::config_dir() {
+                    if selected==home.join(".cutex") {
+                        if let Ok(id)=std::fs::read_to_string(selected.join("instance-id")) {
+                            if valid_id(id.trim()) {return id.trim().into();}
+                        }
+                    }
+                }
+            }
+        }
+    }
     crate::management::instance::instance_id()
 }
 pub fn now() -> String {

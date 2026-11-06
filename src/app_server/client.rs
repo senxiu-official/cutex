@@ -316,13 +316,45 @@ pub enum AppServerEvent {
 
 #[derive(Clone)]
 pub struct AppServerHandle {
+    request_hook: Arc<std::sync::OnceLock<Arc<dyn RequestHook>>>,
+    initialize_response: Arc<std::sync::OnceLock<Value>>,
     command_tx: SyncSender<ActorCommand>,
     next_id: Arc<AtomicU64>,
     default_timeout: Duration,
     disconnect_reason: Arc<Mutex<Option<String>>>,
 }
 
+/// Optional controller middleware, shared by clones of a bound connection.
+/// Runs on the requesting thread, never on the transport actor. Implementors
+/// must ignore their own auxiliary RPCs to avoid recursive request handling.
+pub trait RequestHook: Send + Sync {
+    fn before(&self, handle: &AppServerHandle, message: &Value);
+    fn after(&self, handle: &AppServerHandle, method: &str, response: &Result<RpcResponse, AppServerClientError>);
+    fn observe(&self, _handle: &AppServerHandle, _event: &AppServerEvent) {}
+}
+
 impl AppServerHandle {
+    pub fn install_request_hook(&self, hook: Arc<dyn RequestHook>) {
+        let _ = self.request_hook.set(hook);
+    }
+    /// Called by the owning event consumer, not by the socket actor.
+    pub fn observe_request_hook(&self, event: &AppServerEvent) {
+        if let Some(hook) = self.request_hook.get() { hook.observe(self, event); }
+    }
+    /// Install a cheap, memory-only lifecycle observer on the transport actor.
+    /// Receives item/started, item/completed, thread/started, claude/task/updated
+    /// and disconnect, in wire order with response observers before the durable
+    /// consumer queue. Text/output fragments do not invoke this observer.
+    /// The callback must never issue requests or wait on the event consumer.
+    pub fn observe_notifications(&self, observer: Box<dyn Fn(&AppServerEvent) + Send>) -> Result<(), AppServerClientError> {
+        self.command_tx.send(ActorCommand::ObserveNotifications(observer))
+            .map_err(|_| AppServerClientError::Shutdown)
+    }
+    /// Capabilities of this exact connection, cached by its original initialize.
+    /// Reading them never initializes again or performs transport IO.
+    pub fn initialize_response(&self) -> Option<&Value> {
+        self.initialize_response.get()
+    }
     /// Transport health is independent of draining the lossless event queue.
     /// A disconnected event may be delayed (or the bounded queue may be full).
     pub fn disconnect_reason(&self) -> Option<String> {
@@ -436,6 +468,20 @@ impl AppServerHandle {
     }
 
     fn request_rpc_message_observed(
+        &self,
+        message: Value,
+        timeout: Duration,
+        response_observer: Option<Box<dyn FnOnce(&RpcResponse) + Send>>,
+    ) -> Result<RpcResponse, AppServerClientError> {
+        let hook = self.request_hook.get();
+        let method = message.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        if let Some(hook) = hook { hook.before(self, &message); }
+        let result = self.request_rpc_message_unhooked(message, timeout, response_observer);
+        if let Some(hook) = hook { hook.after(self, &method, &result); }
+        result
+    }
+
+    fn request_rpc_message_unhooked(
         &self,
         message: Value,
         timeout: Duration,
@@ -626,6 +672,8 @@ impl AppServerClient {
         let actor_disconnect_reason = disconnect_reason.clone();
         let actor = thread::spawn(move || run_actor(socket, command_rx, event_tx, actor_disconnect_reason));
         let handle = AppServerHandle {
+            initialize_response: Default::default(),
+            request_hook: Default::default(),
             command_tx,
             next_id: Arc::new(AtomicU64::new(1)),
             default_timeout: options.request_timeout,
@@ -663,6 +711,7 @@ impl AppServerClient {
                 "capabilities": capabilities,
             }),
         )?;
+        let _ = client.handle.initialize_response.set(client.initialize_response.clone());
         client.handle.notify("initialized", None)?;
         Ok(client)
     }
@@ -757,6 +806,8 @@ pub(crate) fn saturated_event_client_for_test() -> (AppServerClient, Receiver<()
         next_id: Arc::new(AtomicU64::new(1)),
         default_timeout: Duration::from_secs(1),
         disconnect_reason: Arc::new(Mutex::new(None)),
+        initialize_response: Default::default(),
+        request_hook: Default::default(),
     };
     let (event_tx, event_rx) = event_channel(1, Arc::new(EventQueueMetrics::default()));
     event_tx
@@ -790,6 +841,7 @@ pub(crate) fn saturated_event_client_for_test() -> (AppServerClient, Receiver<()
 }
 
 enum ActorCommand {
+    ObserveNotifications(Box<dyn Fn(&AppServerEvent) + Send>),
     Request {
         id: Value,
         method: String,
@@ -1142,6 +1194,7 @@ fn run_actor(
     connection_failure: Arc<Mutex<Option<String>>>,
 ) {
     let mut pending = HashMap::<RpcRequestIdKey, PendingRequest>::new();
+    let mut notification_observer: Option<Box<dyn Fn(&AppServerEvent) + Send>> = None;
     let mut queued_command = None;
     let mut socket_read_timeout = IDLE_SOCKET_PROBE_TIMEOUT;
     let disconnect_reason = 'actor: loop {
@@ -1151,6 +1204,7 @@ fn run_actor(
                 None => command_rx.try_recv(),
             };
             match command {
+                Ok(ActorCommand::ObserveNotifications(observer)) => notification_observer = Some(observer),
                 Ok(ActorCommand::Request {
                     id,
                     method,
@@ -1284,6 +1338,9 @@ fn run_actor(
                         let _ = pending_request.response_tx.try_send(Ok(response));
                     }
                     Ok(InboundMessage::Notification(notification)) => {
+                        if matches!(notification.method.as_str(), "item/started" | "item/completed" | "thread/started" | "claude/task/updated") {
+                            if let Some(observer) = &notification_observer { observer(&AppServerEvent::Notification(notification.clone())); }
+                        }
                         if !emit_event(&event_tx, AppServerEvent::Notification(notification)) {
                             break 'actor "app-server event consumer disconnected".to_string();
                         }
@@ -1354,6 +1411,9 @@ fn run_actor(
     // Publish before waking RPC callers or notifying the event consumer, so
     // recovery never depends on that consumer reaching the tail of its queue.
     *connection_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(disconnect_reason.clone());
+    if let Some(observer) = &notification_observer {
+        observer(&AppServerEvent::Disconnected { reason: disconnect_reason.clone() });
+    }
     for (_, request) in pending.drain() {
         let _ = request
             .response_tx
@@ -1478,6 +1538,7 @@ mod tests {
         let (options, done, peer) = initialize_burst_peer(DEFAULT_EVENT_CAPACITY * 2, true, false);
         let client = AppServerClient::connect_rpc_only(options).unwrap();
         assert_eq!(client.initialize_response(), &json!({"fixture":true}));
+        assert_eq!(client.handle().initialize_response(), Some(client.initialize_response()));
         assert_eq!(client.handle().request("test/after-init", json!({})).unwrap(), json!({"ok":true}));
         drop(client);
         done.recv_timeout(Duration::from_secs(5)).expect("control initialization threads stopped");
@@ -1624,6 +1685,8 @@ mod tests {
                 command_tx, next_id: Arc::new(AtomicU64::new(1)),
                 default_timeout: Duration::from_secs(1),
                 disconnect_reason: Arc::new(Mutex::new(None)),
+                initialize_response: Default::default(),
+                request_hook: Default::default(),
             },
             event_rx: Some(receiver), control_drain: None,
             actor: Some(actor), initialize_response: json!({}),
@@ -1654,6 +1717,8 @@ mod tests {
                 command_tx, next_id: Arc::new(AtomicU64::new(1)),
                 default_timeout: Duration::from_secs(1),
                 disconnect_reason: Arc::new(Mutex::new(None)),
+                initialize_response: Default::default(),
+                request_hook: Default::default(),
             },
             event_rx: Some(receiver), control_drain: None,
             actor: Some(actor), initialize_response: json!({}),
@@ -2006,6 +2071,8 @@ mod tests {
             next_id: Arc::new(AtomicU64::new(u64::MAX)),
             default_timeout: Duration::from_secs(1),
             disconnect_reason: Arc::new(Mutex::new(None)),
+            initialize_response: Default::default(),
+            request_hook: Default::default(),
         };
 
         assert!(matches!(

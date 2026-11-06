@@ -22,7 +22,7 @@ pub fn ask_error(error: Error) -> AskError {
 }
 
 pub fn current_director(ask: &AskRecord) -> Option<String> {
-    let snapshot = crate::asks::directory::Directory::director_snapshot().ok()?;
+    let snapshot = crate::asks::directory::Directory::director_snapshot_shared().ok()?;
     let project = crate::agent_management::ProjectId::new(ask.project_id.clone()?).ok()?;
     snapshot
         .projects
@@ -323,14 +323,42 @@ pub fn guards_for(
 
 /// Run before the existing target queue scan. Ready continuations enter the
 /// existing ResumeRecord lane; they never launch an offline runtime.
+fn tick_projection(
+    state:&AskState,ask:&AskRecord,status:&TargetStatus,archived:bool,permitted:bool,
+    now:DateTime<Utc>,director:Option<&str>,
+)->Option<(ContinuationData,Option<ResumeRecord>,Option<model::Hold>)> {
+    let guards=guards_for(state,ask,status,archived,permitted);
+    let mut data=ask.bounded_continuation.clone();
+    if let Some(record)=data.current.as_ref() {
+        if let Ok(facts)=super::delegation_children::collect(state,&record.declaration.source,record.declaration.wake.as_ref()) {
+            // An unavailable later child read cannot erase authenticated facts.
+            let mut next=data.clone();
+            if super::delegation_children::apply(&mut next,facts).is_ok(){data=next;}
+        }
+    }
+    let eligibility=data.evaluate(guards,now,director);
+    let mut resume=ask.resume.clone();let mut hold=ask.hold.clone();
+    match eligibility {
+        Eligibility::Ready if resume.is_none()=>{
+            let source=&data.current.as_ref().expect("ready record").declaration;
+            if let Some(from_attempt)=ask.attempts.iter().find(|a|format!("{}#{}",ask.ask_id,a.n)==source.source.attempt_id).map(|a|a.n){
+                resume=Some(ResumeRecord{reason:ResumeReason::Resumed,since:crate::asks::now_rfc3339(now),from_attempt,jobs:vec![],by:None,note:Some(source.note.clone())});hold=None;
+            }
+        },
+        Eligibility::Limited|Eligibility::Cancelled=>resume=None,
+        _=>{},
+    }
+    (data!=ask.bounded_continuation||resume!=ask.resume||hold!=ask.hold).then_some((data,resume,hold))
+}
+
 pub fn tick_due(
     world: &dyn SchedulerWorld,
     runtime: &dyn AskRuntime,
     store: &AskStore,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let candidates: Vec<AskRecord> = store.inspect(|state| {
-        state
+    let snapshot=store.shared()?;
+    let candidates: Vec<_> = snapshot
             .asks
             .values()
             .filter(|ask| {
@@ -341,80 +369,36 @@ pub fn tick_due(
                         .as_ref()
                         .is_some_and(|r| r.state != Phase::Cancelled)
             })
-            .cloned()
-            .collect()
-    })?;
+            .collect();
     if candidates.is_empty() {
         return Ok(());
     }
     let directory = world.directory().ok();
-    for snapshot in candidates {
-        let status = runtime.target_status(&snapshot.target_cutex_session_id);
-        let director = world.continuation_director(&snapshot);
+    let mut changed=Vec::new();
+    for ask in candidates {
+        let status = runtime.target_status(&ask.target_cutex_session_id);
+        let director = world.continuation_director(ask);
         let archived = directory.as_ref().is_some_and(|d| {
-            d.get(&snapshot.target_cutex_session_id)
+            d.get(&ask.target_cutex_session_id)
                 .is_none_or(|a| a.archived)
         });
-        let permitted = admission_permission(world, directory.as_ref(), &snapshot);
-        store.with_state(|state| {
-            let Some(ask) = state.asks.get(&snapshot.ask_id) else {
-                return;
-            };
-            if ask.revision != snapshot.revision {
-                return;
-            }
-            let guards = guards_for(state, ask, &status, archived, permitted);
-            let before = ask.bounded_continuation.clone();
-            let facts=ask.bounded_continuation.current.as_ref().map(|record|
-                super::delegation_children::collect(state,&record.declaration.source,record.declaration.wake.as_ref()));
-            let eligibility = state.update_ask(&snapshot.ask_id, now, |ask| {
-                if let Some(Ok(facts))=facts {
-                    // Keep old trustworthy facts on a later unavailable read.
-                    let mut next=ask.bounded_continuation.clone();
-                    if super::delegation_children::apply(&mut next,facts).is_ok(){ask.bounded_continuation=next;}
-                }
-                ask.bounded_continuation
-                    .evaluate(guards, now, director.as_deref())
-            });
-            state.update_ask(&snapshot.ask_id, now, |ask| match eligibility {
-                Some(Eligibility::Ready) if ask.resume.is_none() => {
-                    let source = &ask
-                        .bounded_continuation
-                        .current
-                        .as_ref()
-                        .expect("ready record")
-                        .declaration;
-                    let from_attempt = ask
-                        .attempts
-                        .iter()
-                        .find(|a| format!("{}#{}", ask.ask_id, a.n) == source.source.attempt_id)
-                        .map(|a| a.n);
-                    if let Some(from_attempt) = from_attempt {
-                        ask.resume = Some(ResumeRecord {
-                            reason: ResumeReason::Resumed,
-                            since: crate::asks::now_rfc3339(now),
-                            from_attempt,
-                            jobs: vec![],
-                            by: None,
-                            note: Some(source.note.clone()),
-                        });
-                        ask.hold = None;
-                    }
-                }
-                Some(Eligibility::Limited | Eligibility::Cancelled) => {
-                    ask.resume = None;
-                }
-                _ => {}
-            });
-            if state
-                .asks
-                .get(&snapshot.ask_id)
-                .is_some_and(|ask| ask.bounded_continuation != before)
-            {
-                changed_and_notice(state, &snapshot.ask_id, director.as_deref(), now);
-            }
-        })?;
+        let permitted = admission_permission(world, directory.as_ref(), ask);
+        if tick_projection(&snapshot,ask,&status,archived,permitted,now,director.as_deref()).is_some(){
+            changed.push((ask.ask_id.clone(),ask.revision,status,director,archived,permitted));
+        }
     }
+    if changed.is_empty(){return Ok(());}
+    // One transaction for the dirty batch, never one whole-store draft for
+    // every merely waiting continuation. Recheck all mutable guards/facts.
+    store.with_state(|state| {
+        for (id,revision,status,director,archived,permitted) in changed {
+            let Some(ask)=state.asks.get(&id).filter(|ask|ask.revision==revision) else{continue};
+            let Some((data,resume,hold))=tick_projection(state,ask,&status,archived,permitted,now,director.as_deref()) else{continue};
+            let continuation_changed=data!=ask.bounded_continuation;
+            state.update_ask(&id,now,|ask|{ask.bounded_continuation=data;ask.resume=resume;ask.hold=hold;});
+            if continuation_changed {changed_and_notice(state,&id,director.as_deref(),now);}
+        }
+    })?;
     Ok(())
 }
 

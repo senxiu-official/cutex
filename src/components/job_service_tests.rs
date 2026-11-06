@@ -45,6 +45,7 @@ fn unpack(layout: &Layout, version: &str) -> PathBuf {
         version: version.into(),
         origin: super::super::ORIGIN_SIGNED.into(),
         archive_sha256: Some("0".repeat(64)),
+        selection_source: None,
         files: super::super::file_hashes(&dir).unwrap(),
         unpacked_at: "2026-10-16T00:00:00Z".into(),
     };
@@ -54,7 +55,18 @@ fn unpack(layout: &Layout, version: &str) -> PathBuf {
 
 fn fixture() -> Fixture {
     let guard = crate::config::paths::test_home_env_lock();
-    let root = std::env::temp_dir().join(format!("cutex-jobsvc-{}", uuid::Uuid::new_v4().simple()));
+    // The full UUID plus HOME/.cutex/runtime/job-service/v1/job-service.sock
+    // exceeds the Unix socket limit even under a short marked test home.
+    // Allocate exclusively so a short random suffix can never reuse a fixture.
+    let root = loop {
+        let name = format!("cjs-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let path = std::env::temp_dir().join(name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => break path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create private Job Service test fixture: {error}"),
+        }
+    };
     let home = root.join("home");
     std::fs::create_dir_all(home.join(".cutex/codex-home")).unwrap();
     std::fs::write(home.join(".cutex/codex-home/config.toml"), b"").unwrap();
@@ -139,6 +151,17 @@ fn handler() -> JobService {
     JobService { ready: fake_descriptor, ..Default::default() }
 }
 
+fn assert_selected_managed_launcher(path: &Path) {
+    let deployment = crate::launch::local_deployment::LocalDeployment::selected().unwrap().unwrap();
+    let bundle: crate::launch::stock::StockBundle =
+        serde_json::from_slice(&std::fs::read(deployment.bundle_manifest).unwrap()).unwrap();
+    let cli = bundle.cli.expect("selected runtime includes its CLI");
+    assert_eq!(path, cli.path.as_path(), "launcher = selected runtime's codex");
+    assert!(crate::launch::native_managed::is_inside(path, &crate::launch::native_managed::root().unwrap()));
+    cli.validate().unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"new-cli", "selected native version's bytes are preserved");
+}
+
 fn ctx<'a>(f: &'a Fixture, exec: &'a FakeExec, version: &str, dry_run: bool) -> Context<'a> {
     Context {
         layout: &f.layout,
@@ -190,7 +213,7 @@ fn plan_pins_the_version_binary_and_always_offers_nci() {
     assert!(plan.unit_text.contains("Restart=on-failure") && plan.unit_text.contains("UMask=0077"));
     assert_eq!(plan.argv[1], "serve");
     assert_eq!(plan.argv[2], plan.paths.root.display().to_string());
-    assert!(plan.argv[6].ends_with("natives/0.162.1-r53/codex"), "launcher = selected runtime's codex");
+    assert_selected_managed_launcher(Path::new(&plan.argv[6]));
     let joined = plan.argv.join(" ");
     assert!(joined.contains("--allow-launcher") && joined.contains("natives/0.160.0-r52/codex"), "{joined}");
     assert!(joined.contains(&format!("--completion-v2 {} {}", plan.bus_url, plan.paths.completion_token.display())));
@@ -277,7 +300,7 @@ fn select_restarts_selects_and_defers_while_jobs_run() {
     assert!(unit.contains(&format!("components/job-service/{V1}/cutex-job-service serve")), "{unit}");
     let job = crate::launch::local_deployment::LocalDeployment::selected().unwrap().unwrap().job_mcp.expect("descriptor selected");
     assert!(job.adapter.path.ends_with(format!("{V1}/cutex-job-service")));
-    assert!(job.launcher.path.ends_with("natives/0.162.1-r53/codex"));
+    assert_selected_managed_launcher(&job.launcher.path);
 
     // A daemon answers (not V2's binary, so selecting V2 needs a restart),
     // and a local job runs: the restart is deferred.

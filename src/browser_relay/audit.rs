@@ -31,6 +31,14 @@ pub struct Record {
     pub dropped: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup: Option<Cleanup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busy_cause: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abort_cause: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_ms: Option<u64>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,6 +177,10 @@ mod tests {
             late_result: 0,
             dropped: 0,
             cleanup: None,
+            busy_cause: None,
+            abort_cause: None,
+            dispatch_ms: None,
+            running_ms: None,
         };
         append(&temp, &record).unwrap();
         let value = serde_json::to_value(&record).unwrap();

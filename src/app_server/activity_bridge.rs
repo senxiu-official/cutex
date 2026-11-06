@@ -1,6 +1,7 @@
 //! Durable projection from owner-scoped Management v2 facts to the app-server
 //! `thread/cutexActivity` UI-only lane.
 
+use crate::asks::shared::Shared;
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -553,7 +554,7 @@ struct OwnerProjectionCursor {
     #[serde(default)]
     scan_cursor: Option<String>,
     #[serde(default)]
-    pending: Vec<PendingProjection>,
+    pending: Shared<Vec<PendingProjection>>,
     #[serde(default)]
     live_acknowledged_sequence: u64,
 }
@@ -575,7 +576,7 @@ struct PendingProjection {
     /// older release queued with a removed Task Service item type loads as
     /// `None` too ([`deserialize_pending_activity`]).
     #[serde(default, deserialize_with = "deserialize_pending_activity")]
-    activity: Option<CutexUiActivity>,
+    activity: Option<Shared<CutexUiActivity>>,
 }
 
 /// r219: tolerant decode of [`PendingProjection::activity`]. The state file
@@ -583,7 +584,9 @@ struct PendingProjection {
 /// queued before the Task Service was removed; they become skips instead of
 /// making the whole projector state unreadable. Any other shape is still
 /// strict.
-fn deserialize_pending_activity<'de, D>(deserializer: D) -> Result<Option<CutexUiActivity>, D::Error>
+fn deserialize_pending_activity<'de, D>(
+    deserializer: D,
+) -> Result<Option<Shared<CutexUiActivity>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -597,7 +600,9 @@ where
     {
         return Ok(None);
     }
-    serde_json::from_value(value).map(Some).map_err(serde::de::Error::custom)
+    serde_json::from_value(value)
+        .map(|activity| Some(Shared::new(activity)))
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -616,7 +621,7 @@ struct ProjectionState {
     live_origin_sequence: u64,
     #[serde(default)]
     live_initialized: bool,
-    owners: BTreeMap<String, OwnerProjectionCursor>,
+    owners: Shared<BTreeMap<String, OwnerProjectionCursor>>,
 }
 
 impl Default for ProjectionState {
@@ -629,14 +634,75 @@ impl Default for ProjectionState {
             live_sequence: 0,
             live_origin_sequence: 0,
             live_initialized: false,
-            owners: BTreeMap::new(),
+            owners: Shared::default(),
         }
     }
+}
+
+/// Queue order is small metadata; payload identity never changes when a front
+/// entry is acknowledged. Removing one entry cannot rewrite the remaining
+/// activity payloads.
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedOwner {
+    cursor: OwnerProjectionCursor,
+    order: Vec<String>,
+}
+
+fn pending_key(pending: &PendingProjection) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&(
+        &pending.stream_id,
+        &pending.cursor,
+        pending.sequence,
+    ))?)
+}
+
+fn owner_row(owner: &OwnerProjectionCursor) -> anyhow::Result<PersistedOwner> {
+    let mut cursor = owner.clone();
+    cursor.pending = Shared::default();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut order = Vec::new();
+    for pending in &owner.pending {
+        let identity = pending_key(pending)?;
+        if seen.insert(identity.clone()) {
+            order.push(identity);
+        }
+    }
+    report_duplicate_pending(owner.pending.len() - order.len());
+    Ok(PersistedOwner { cursor, order })
+}
+
+fn report_duplicate_pending(count: usize) {
+    if count != 0 {
+        eprintln!("warning: Cutex activity projector ignored {count} duplicate pending identities (kept first)");
+    }
+}
+
+/// Transport batch coordinates are not part of source identity. Preserve the
+/// first entry, including its already assigned delivery, across overlapping scans.
+fn extend_pending_unique(
+    pending: &mut Vec<PendingProjection>,
+    additions: impl IntoIterator<Item = PendingProjection>,
+) {
+    let mut duplicates = 0;
+    for entry in additions {
+        if pending.iter().any(|existing| {
+            existing.stream_id == entry.stream_id
+                && existing.cursor == entry.cursor
+                && existing.sequence == entry.sequence
+        }) {
+            duplicates += 1;
+        } else {
+            pending.push(entry);
+        }
+    }
+    report_duplicate_pending(duplicates);
 }
 
 struct ProjectionStateStore {
     path: PathBuf,
     state: ProjectionState,
+    persisted: std::cell::RefCell<ProjectionState>,
+    generation: std::cell::Cell<u64>,
     /// Successful saves so far: a pass that saved nothing changed nothing.
     saves: std::cell::Cell<u64>,
     /// When the state was last written (`None`: not by this process).
@@ -665,25 +731,170 @@ fn bound_pending(pending: &mut Vec<PendingProjection>) {
     });
 }
 
-impl ProjectionStateStore {
-    fn open(path: PathBuf) -> anyhow::Result<Self> {
-        let (mut state, recovered) = match fs::read(&path) {
-            Ok(bytes) => (
-                serde_json::from_slice(&bytes).with_context(|| {
-                    format!("invalid activity projector state: {}", path.display())
-                })?,
-                true,
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (ProjectionState::default(), false)
-            }
-            Err(error) => return Err(error).context("failed to read activity projector state"),
+/// How long the storage fence write keeps retrying a Windows sharing or
+/// permission refusal (antivirus, backup, or a reader holding the old JSON).
+const STORAGE_FENCE_RETRY_BUDGET: Duration = Duration::from_secs(5);
+const STORAGE_FENCE_RETRY_INITIAL: Duration = Duration::from_millis(50);
+
+/// True for the Windows errors another process' open handle produces when a
+/// file is replaced: access denied, sharing violation, lock violation.
+fn transient_replace_error(error: &anyhow::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                .is_some_and(|code| matches!(code, 5 | 32 | 33))
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// Replace the legacy JSON with the version-2 fence, retrying a transient
+/// Windows refusal with a doubling delay (50 ms, 100 ms, ...) for about
+/// `budget` in total. The rows are already committed to SQLite, so a retry
+/// only repeats this idempotent write.
+fn write_storage_fence(path: &std::path::Path, budget: Duration) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut delay = STORAGE_FENCE_RETRY_INITIAL;
+    loop {
+        let result = write_private_pretty_json_atomic(
+            path,
+            &serde_json::json!({"version": 2, "storage": "sqlite"}),
+            "activity projector storage fence",
+        );
+        let error = match result {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
         };
-        if state.version != PROJECTION_STATE_VERSION {
-            anyhow::bail!("unsupported activity projector state version");
+        let now = std::time::Instant::now();
+        if !transient_replace_error(&error) || now >= deadline {
+            return Err(error);
         }
-        if recovered {
-            for owner in state.owners.values_mut() {
+        thread::sleep(delay.min(deadline - now));
+        delay = delay.saturating_mul(2);
+    }
+}
+
+impl ProjectionStateStore {
+    fn database(path: &std::path::Path) -> PathBuf {
+        path.with_extension("sqlite3")
+    }
+
+    fn decode_rows(
+        rows: &crate::management::v2::hot_store::Rows,
+    ) -> anyhow::Result<ProjectionState> {
+        let bytes = rows
+            .get(&("state".into(), "global".into()))
+            .context("activity global row missing")?;
+        let mut state: ProjectionState = serde_json::from_slice(bytes)?;
+        anyhow::ensure!(
+            state.version == PROJECTION_STATE_VERSION && state.owners.is_empty(),
+            "invalid activity global row"
+        );
+        let mut referenced = std::collections::BTreeSet::new();
+        for ((collection, key), bytes) in rows {
+            if collection == "owner" {
+                let header: PersistedOwner = serde_json::from_slice(bytes)?;
+                anyhow::ensure!(
+                    header.cursor.pending.is_empty(),
+                    "activity owner row contains pending payloads"
+                );
+                let mut owner = header.cursor;
+                for identity in header.order {
+                    let row_key = ("pending".into(), serde_json::to_string(&(key, &identity))?);
+                    anyhow::ensure!(
+                        referenced.insert(row_key.clone()),
+                        "duplicate activity pending reference"
+                    );
+                    let pending: PendingProjection = serde_json::from_slice(
+                        rows.get(&row_key).context("activity pending row missing")?,
+                    )?;
+                    anyhow::ensure!(
+                        pending_key(&pending)? == identity,
+                        "activity pending identity mismatch"
+                    );
+                    owner.pending.push(pending);
+                }
+                state.owners.insert(key.clone(), owner);
+            }
+        }
+        for ((collection, key), _) in rows {
+            anyhow::ensure!(
+                match collection.as_str() {
+                    "state" => key == "global",
+                    "owner" => true,
+                    "pending" => referenced.contains(&(collection.clone(), key.clone())),
+                    _ => false,
+                },
+                "unknown or unreferenced activity projection row"
+            );
+        }
+        Ok(state)
+    }
+
+    fn rows(state: &ProjectionState) -> anyhow::Result<crate::management::v2::hot_store::Rows> {
+        let mut rows = crate::management::v2::hot_store::Rows::new();
+        let mut global = state.clone();
+        global.owners = Shared::default();
+        rows.insert(
+            ("state".into(), "global".into()),
+            serde_json::to_vec(&global)?,
+        );
+        for (id, owner) in &state.owners {
+            rows.insert(
+                ("owner".into(), id.clone()),
+                serde_json::to_vec(&owner_row(owner)?)?,
+            );
+            for pending in &owner.pending {
+                rows.entry((
+                    "pending".into(),
+                    serde_json::to_string(&(id, pending_key(pending)?))?,
+                ))
+                .or_insert(serde_json::to_vec(pending)?);
+            }
+        }
+        Ok(rows)
+    }
+
+    fn open(path: PathBuf) -> anyhow::Result<Self> {
+        use crate::management::v2::hot_store;
+        let database = Self::database(&path);
+        let loaded = hot_store::load_or_migrate(
+            &database,
+            "activity_projection",
+            &path,
+            |bytes| {
+                let state: ProjectionState = serde_json::from_slice(bytes)?;
+                anyhow::ensure!(
+                    state.version == PROJECTION_STATE_VERSION,
+                    "unsupported activity projector state version"
+                );
+                Self::rows(&state)
+            },
+            |rows| Self::decode_rows(rows).map(|_| ()),
+        )?;
+        let state = if loaded.exists {
+            Self::decode_rows(&loaded.rows)?
+        } else {
+            ProjectionState::default()
+        };
+        let mut store = Self {
+            path,
+            persisted: std::cell::RefCell::new(state.clone()),
+            state,
+            generation: std::cell::Cell::new(loaded.generation),
+            saves: std::cell::Cell::new(0),
+            last_save: std::cell::Cell::new(None),
+            changes: std::cell::Cell::new(0),
+        };
+        if loaded.exists {
+            for owner in store.state.owners.values_mut() {
                 for pending in &mut owner.pending {
                     pending.recovered = true;
                     if let Some(delivery) = pending.delivery.as_mut() {
@@ -691,23 +902,119 @@ impl ProjectionStateStore {
                     }
                 }
             }
-            write_private_pretty_json_atomic(&path, &state, "activity projector state")?;
         }
-        Ok(Self {
-            path,
-            state,
-            saves: std::cell::Cell::new(0),
-            last_save: std::cell::Cell::new(None),
-            changes: std::cell::Cell::new(0),
-        })
+        // Initialize even an empty store before fencing its old JSON. A crash
+        // after the SQLite commit leaves a complete authoritative row store.
+        // If the fence still cannot be written, open fails and the caller
+        // retries it later: the next open finds the verified rows and only
+        // repeats this fence write, so no row is lost or duplicated.
+        store.save()?;
+        write_storage_fence(&store.path, STORAGE_FENCE_RETRY_BUDGET)?;
+        store.saves.set(0);
+        store.changes.set(0);
+        store.last_save.set(None);
+        Ok(store)
     }
 
     fn save(&self) -> anyhow::Result<()> {
-        write_private_pretty_json_atomic(&self.path, &self.state, "activity projector state")?;
+        use crate::management::v2::hot_store::{self, RowChange};
+        let before = self.persisted.borrow();
+        let mut changes = Vec::new();
+        let mut global = self.state.clone();
+        global.owners = Shared::default();
+        let mut old_global = before.clone();
+        old_global.owners = Shared::default();
+        if self.generation.get() == 0 || global != old_global {
+            changes.push(RowChange::Put {
+                collection: "state".into(),
+                key: "global".into(),
+                value: serde_json::to_vec(&global)?,
+            });
+        }
+        if !Shared::ptr_eq(&before.owners, &self.state.owners) || self.generation.get() == 0 {
+            for (id, owner) in &self.state.owners {
+                let old = before.owners.get(id);
+                if old.is_some_and(|old| old == owner) {
+                    continue;
+                }
+                let header = owner_row(owner)?;
+                let old_header = old.map(owner_row).transpose()?;
+                if old_header.as_ref() != Some(&header) {
+                    changes.push(RowChange::Put {
+                        collection: "owner".into(),
+                        key: id.clone(),
+                        value: serde_json::to_vec(&header)?,
+                    });
+                }
+                if old.is_some_and(|old| Shared::ptr_eq(&old.pending, &owner.pending)) {
+                    continue;
+                }
+                let mut previous = BTreeMap::new();
+                for pending in old.into_iter().flat_map(|old| old.pending.iter()) {
+                    previous.entry(pending_key(pending)?).or_insert(pending);
+                }
+                let mut retained = std::collections::BTreeSet::new();
+                for pending in &owner.pending {
+                    let identity = pending_key(pending)?;
+                    if !retained.insert(identity.clone()) {
+                        continue;
+                    }
+                    if previous.get(&identity).is_some_and(|old| *old == pending) {
+                        continue;
+                    }
+                    changes.push(RowChange::Put {
+                        collection: "pending".into(),
+                        key: serde_json::to_string(&(id, &identity))?,
+                        value: serde_json::to_vec(pending)?,
+                    });
+                }
+                for identity in previous.keys().filter(|key| !retained.contains(*key)) {
+                    changes.push(RowChange::Delete {
+                        collection: "pending".into(),
+                        key: serde_json::to_string(&(id, identity))?,
+                    });
+                }
+            }
+            for (id, owner) in &before.owners {
+                if self.state.owners.contains_key(id) {
+                    continue;
+                }
+                changes.push(RowChange::Delete {
+                    collection: "owner".into(),
+                    key: id.clone(),
+                });
+                for pending in &owner.pending {
+                    changes.push(RowChange::Delete {
+                        collection: "pending".into(),
+                        key: serde_json::to_string(&(id, pending_key(pending)?))?,
+                    });
+                }
+            }
+        }
+        let generation = hot_store::commit(
+            &Self::database(&self.path),
+            "activity_projection",
+            self.generation.get(),
+            changes,
+        )?;
+        drop(before);
+        *self.persisted.borrow_mut() = self.state.clone();
+        self.generation.set(generation);
         self.saves.set(self.saves.get() + 1);
         self.changes.set(self.changes.get() + 1);
         self.last_save.set(Some(std::time::Instant::now()));
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn read_persisted(path: &std::path::Path) -> ProjectionState {
+        let rows = crate::management::v2::hot_store::verified_rows(
+            &Self::database(path),
+            "activity_projection",
+        )
+        .unwrap()
+        .unwrap();
+        Self::decode_rows(&rows.rows).unwrap()
     }
 
     /// Save a cursor-only change unless the state was written within
@@ -988,7 +1295,7 @@ where
                     delivery_class: CutexUiActivityDeliveryClass::Live,
                     delivery: None,
                     recovered: false,
-                    activity,
+                    activity: activity.map(Shared::new),
                 },
             ));
         }
@@ -1022,7 +1329,7 @@ where
                         stream_id: Some(stream_id.to_string()),
                         ..Default::default()
                     });
-            owner_cursor.pending.push(pending);
+            extend_pending_unique(&mut owner_cursor.pending, [pending]);
             bound_pending(&mut owner_cursor.pending);
         }
         if let Some(scanned_through) = scanned_through {
@@ -1200,7 +1507,7 @@ where
                     delivery_class: CutexUiActivityDeliveryClass::CatchUp,
                     delivery: None,
                     recovered: true,
-                    activity,
+                    activity: activity.map(Shared::new),
                 });
             }
             scanned_through = Some(event_cursor);
@@ -1222,7 +1529,7 @@ where
                 .context("activity projector owner cursor disappeared")?;
             let pending_before = added.then(|| owner_cursor.pending.clone());
             let scan_cursor_before = owner_cursor.scan_cursor.clone();
-            owner_cursor.pending.extend(additions);
+            extend_pending_unique(&mut owner_cursor.pending, additions);
             bound_pending(&mut owner_cursor.pending);
             if let Some(scanned_through) = scanned_through {
                 owner_cursor.scan_cursor = Some(scanned_through);
@@ -1302,7 +1609,9 @@ where
                     .delivery
                     .clone()
                     .context("projected activity is missing durable delivery metadata")?;
-                let disposition = self.submitter.submit(owner, delivery, activity)?;
+                let disposition = self
+                    .submitter
+                    .submit(owner, delivery, activity.into_inner())?;
                 if !matches!(
                     disposition,
                     CutexUiActivityIngestionDisposition::Accepted
@@ -1425,6 +1734,27 @@ fn default_projection_state_path() -> anyhow::Result<PathBuf> {
     Ok(runtime_dir()?.join("management-v2/activity-projector-state.json"))
 }
 
+/// Target-version decoder gate for a marked, consistent business-only copy.
+#[cfg(test)]
+#[test]
+#[ignore = "requires an explicitly marked, consistent release data copy"]
+fn release_data_copy_projector_migrate_validate_and_reopen() {
+    let root = PathBuf::from(std::env::var_os("CUTEX_RELEASE_DATA_COPY").expect("explicit copy root"));
+    assert!(root.is_absolute() && root.join(".cutex-release-data-copy").is_file());
+    let root = root.canonicalize().unwrap();
+    let home = crate::config::paths::config_dir().unwrap().canonicalize().unwrap();
+    assert_eq!(home, root, "decoder must bind only the marked business copy");
+    let path = root.join("runtime/management-v2/activity-projector-state.json");
+    assert!(path.is_file() || ProjectionStateStore::database(&path).is_file());
+    for pass in 0..2 {
+        let store = ProjectionStateStore::open(path.clone()).unwrap();
+        let rows = ProjectionStateStore::rows(&store.state).unwrap();
+        ProjectionStateStore::decode_rows(&rows).unwrap();
+        eprintln!("RELEASE DATA COPY projector pass={pass} owners={}", store.state.owners.len());
+        drop(store);
+    }
+}
+
 struct ActivityProjectorLeaderLock {
     file: File,
 }
@@ -1500,6 +1830,25 @@ impl PassFailure {
     }
 }
 
+/// Call `open` until it succeeds, sleeping with the pass failure backoff
+/// (250 ms .. 30 s) between attempts; each distinct failure is reported once.
+fn open_with_retry<T>(
+    mut open: impl FnMut() -> anyhow::Result<T>,
+    mut sleep: impl FnMut(Duration),
+    mut report: impl FnMut(&str),
+) -> T {
+    let mut failure = PassFailure::default();
+    loop {
+        match open() {
+            Ok(value) => return value,
+            Err(error) => {
+                let delay = failure.next_delay(Err(format!("{error:#}")), &mut report);
+                sleep(delay);
+            }
+        }
+    }
+}
+
 /// Starts a projector contender. The durable file lock elects exactly one
 /// cross-process leader; only presentation cursors are mutable here, while the
 /// Management v2 repository remains authoritative.
@@ -1526,21 +1875,28 @@ pub fn spawn_activity_projector(
                     }
                 }
             };
-            let mut projector = match ActivityProjector::new(
-                state_path,
-                manager,
-                RegistryParticipantMetadataResolver,
-            ) {
-                Ok(projector) => projector,
-                Err(error) => {
+            // A failed open (for example the storage fence refused while
+            // another process holds the old JSON) is retried with the pass
+            // backoff instead of leaving the projector down until restart.
+            // It serves nothing until the fence is written, so a predecessor
+            // can never replay JSON older than rows delivered from SQLite.
+            let mut projector = open_with_retry(
+                || {
+                    ActivityProjector::new(
+                        state_path.clone(),
+                        manager.clone(),
+                        RegistryParticipantMetadataResolver,
+                    )
+                },
+                thread::sleep,
+                |detail| {
                     if emit_background_diagnostics {
                         eprintln!(
-                            "\x1b[33mwarning:\x1b[0m failed to initialize Cutex activity projector: {error:#}"
+                            "\x1b[33mwarning:\x1b[0m failed to initialize Cutex activity projector: {detail}"
                         );
                     }
-                    return;
-                }
-            };
+                },
+            );
             // A failing pass is retried after an exponential delay (250 ms ..
             // 30 s), and the same failure is logged once, not every 250 ms.
             let mut failure = PassFailure::default();
@@ -1590,6 +1946,381 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn duplicate_pending_keeps_first_delivery_in_rows_migration_and_save() {
+        let temp = TestDir::new();
+        let repo = repository(&temp);
+        let mapper = ActivityMapper::new(FakeParticipants);
+        let mut first = Vec::new();
+        for (index, sequence) in [7581989, 7581997].into_iter().enumerate() {
+            let mut event = append(
+                &repo,
+                "cutex.director",
+                MESSAGE_SENT,
+                message_params("pending"),
+            );
+            event.sequence = sequence;
+            let MappingDisposition::Project(activity) = mapper.map(&event).unwrap() else {
+                panic!("message must project");
+            };
+            let mut delivery = test_delivery(CutexUiActivityDeliveryClass::CatchUp);
+            delivery.batch_id = "catch_up:old-stream:7581989:8001131".into();
+            delivery.batch_index = index as u32;
+            delivery.batch_size = 32;
+            delivery.source_checkpoint = CutexUiActivityCheckpoint {
+                stream_id: "old-stream".into(),
+                cursor: event.cursor.clone(),
+                sequence,
+            };
+            first.push(PendingProjection {
+                stream_id: "old-stream".into(),
+                cursor: event.cursor,
+                sequence,
+                delivery_class: CutexUiActivityDeliveryClass::CatchUp,
+                delivery: Some(delivery),
+                recovered: true,
+                activity: Some(Shared::new(*activity)),
+            });
+        }
+        let mut duplicates = first.clone();
+        for entry in &mut duplicates {
+            entry.delivery.as_mut().unwrap().batch_index += 2;
+        }
+        let mut pending = first.clone();
+        extend_pending_unique(&mut pending, duplicates.clone());
+        assert_eq!(pending, first);
+        // Duplicate identities inside one incoming page are fenced as well.
+        let mut empty = Vec::new();
+        extend_pending_unique(&mut empty, first.iter().chain(&duplicates).cloned());
+        assert_eq!(empty, first);
+
+        let mut legacy = ProjectionState::default();
+        legacy.stream_id = Some("new-stream".into());
+        let mut owner = OwnerProjectionCursor::default();
+        owner.pending.extend(first.clone());
+        owner.pending.extend(duplicates.clone());
+        legacy.owners.insert("cutex.director".into(), owner);
+        let rows = ProjectionStateStore::rows(&legacy).unwrap();
+        assert_eq!(
+            ProjectionStateStore::decode_rows(&rows).unwrap().owners["cutex.director"]
+                .pending
+                .as_slice(),
+            first.as_slice()
+        );
+
+        let path = temp.path().join("projector.json");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut store = ProjectionStateStore::open(path.clone()).unwrap();
+        assert_eq!(
+            store.state.owners["cutex.director"].pending.as_slice(),
+            first.as_slice()
+        );
+        store
+            .state
+            .owners
+            .get_mut("cutex.director")
+            .unwrap()
+            .pending
+            .extend(duplicates);
+        store.save().unwrap();
+        let reopened = ProjectionStateStore::open(path).unwrap();
+        assert_eq!(
+            reopened.state.owners["cutex.director"].pending.as_slice(),
+            first.as_slice()
+        );
+    }
+
+    #[test]
+    fn live_rescan_does_not_append_an_already_pending_identity() {
+        let temp = TestDir::new();
+        let repo = repository(&temp);
+        let event = append(
+            &repo,
+            "cutex.director",
+            MESSAGE_SENT,
+            message_params("one event"),
+        );
+        let mut projector = projector(&temp, Arc::new(FakeAppServer::default()));
+        projector.fill_live_queues(&repo, &event.stream_id).unwrap();
+        let first = projector.state.state.owners["cutex.director"]
+            .pending
+            .clone();
+        // A recovered scan boundary can overlap an entry retained from an
+        // earlier pass; source identity, not its delivery class, fences it.
+        projector.state.state.live_cursor = None;
+        projector.state.state.live_sequence = 0;
+        projector.fill_live_queues(&repo, &event.stream_id).unwrap();
+        assert_eq!(
+            projector.state.state.owners["cutex.director"].pending,
+            first
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only evidence input; migrates only a private copy"]
+    fn migrate_activity_snapshot_copy() {
+        let source = std::env::var_os("CUTEX_ACTIVITY_SNAPSHOT").expect("snapshot path");
+        let temp = TestDir::new();
+        let path = temp.path().join("projector.json");
+        fs::copy(source, &path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let legacy: ProjectionState = serde_json::from_slice(&bytes).unwrap();
+        let expected =
+            ProjectionStateStore::decode_rows(&ProjectionStateStore::rows(&legacy).unwrap())
+                .unwrap();
+        let store = ProjectionStateStore::open(path.clone()).unwrap();
+        let original_count: usize = legacy.owners.values().map(|owner| owner.pending.len()).sum();
+        let migrated_count: usize = store.state.owners.values().map(|owner| owner.pending.len()).sum();
+        eprintln!("activity snapshot copy: {original_count} pending -> {migrated_count} retained");
+        for (id, owner) in &expected.owners {
+            let actual = &store.state.owners[id].pending;
+            assert_eq!(actual.len(), owner.pending.len());
+            for (actual, expected) in actual.iter().zip(owner.pending.iter()) {
+                let mut expected = expected.clone();
+                expected.recovered = true;
+                if let Some(delivery) = expected.delivery.as_mut() {
+                    delivery.recovered = true;
+                }
+                assert_eq!(actual, &expected);
+            }
+        }
+        drop(store);
+        ProjectionStateStore::open(path).unwrap();
+    }
+
+    #[test]
+    fn projection_rows_migrate_preserve_order_and_write_only_changed_payloads() {
+        let temp = TestDir::new();
+        let path = temp.path().join("projector.json");
+        let mut legacy = ProjectionState::default();
+        let mut owner = OwnerProjectionCursor::default();
+        for sequence in [9, 3, 7] {
+            owner.pending.push(PendingProjection {
+                stream_id: format!("stream-{sequence}"),
+                cursor: format!("cursor-{sequence}"),
+                sequence,
+                delivery_class: CutexUiActivityDeliveryClass::CatchUp,
+                delivery: None,
+                recovered: false,
+                activity: None,
+            });
+        }
+        legacy.owners.insert("owner".into(), owner);
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut store = ProjectionStateStore::open(path.clone()).unwrap();
+        assert_eq!(
+            store.state.owners["owner"]
+                .pending
+                .iter()
+                .map(|p| p.sequence)
+                .collect::<Vec<_>>(),
+            [9, 3, 7]
+        );
+        assert!(store.state.owners["owner"]
+            .pending
+            .iter()
+            .all(|p| p.recovered));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()
+                ["version"],
+            2
+        );
+        let db = rusqlite::Connection::open(ProjectionStateStore::database(&path)).unwrap();
+        db.execute_batch("CREATE TABLE writes(kind TEXT); CREATE TRIGGER record_put AFTER UPDATE ON hot_store_rows
+            WHEN NEW.collection='pending' BEGIN INSERT INTO writes VALUES ('put'); END;
+            CREATE TRIGGER record_delete AFTER DELETE ON hot_store_rows
+            WHEN OLD.collection='pending' BEGIN INSERT INTO writes VALUES ('delete'); END;").unwrap();
+        let snapshot = store.state.clone();
+        assert!(Shared::ptr_eq(
+            &snapshot.owners["owner"].pending,
+            &store.state.owners["owner"].pending
+        ));
+        store.state.owners.get_mut("owner").unwrap().pending[1].recovered = false;
+        store.save().unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM writes WHERE kind='put'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        db.execute("DELETE FROM writes", []).unwrap();
+        store
+            .state
+            .owners
+            .get_mut("owner")
+            .unwrap()
+            .pending
+            .remove(0);
+        store.save().unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM writes WHERE kind='put'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM writes WHERE kind='delete'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(snapshot.owners["owner"].pending.len(), 3);
+        let reopened = ProjectionStateStore::open(path.clone()).unwrap();
+        assert_eq!(
+            reopened.state.owners["owner"]
+                .pending
+                .iter()
+                .map(|p| p.sequence)
+                .collect::<Vec<_>>(),
+            [3, 7]
+        );
+        // A stale writer cannot partially move the global or owner cursors.
+        store.state.live_sequence = 123;
+        assert!(store.save().is_err());
+        assert_ne!(
+            ProjectionStateStore::read_persisted(&path).live_sequence,
+            123
+        );
+        fs::remove_file(&path).unwrap();
+        ProjectionStateStore::open(path.clone()).unwrap();
+        assert!(path.is_file()); // repair the fence after a crash between commit and fence
+    }
+
+    #[cfg(windows)]
+    fn legacy_with_pending(path: &std::path::Path) {
+        let mut legacy = ProjectionState::default();
+        let mut owner = OwnerProjectionCursor::default();
+        for sequence in [9, 3, 7] {
+            owner.pending.push(PendingProjection {
+                stream_id: format!("stream-{sequence}"),
+                cursor: format!("cursor-{sequence}"),
+                sequence,
+                delivery_class: CutexUiActivityDeliveryClass::CatchUp,
+                delivery: None,
+                recovered: false,
+                activity: None,
+            });
+        }
+        legacy.owners.insert("owner".into(), owner);
+        fs::write(path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    }
+
+    /// Open the file the way antivirus or a backup reader does: shared for
+    /// read and write but not delete, so replacing it fails with os error 5.
+    #[cfg(windows)]
+    fn hold_without_delete_share(path: &std::path::Path) -> File {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn assert_fenced_with_rows(path: &std::path::Path) {
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap(),
+            serde_json::json!({"version": 2, "storage": "sqlite"})
+        );
+        let state = ProjectionStateStore::read_persisted(path);
+        assert_eq!(
+            state.owners["owner"]
+                .pending
+                .iter()
+                .map(|p| p.sequence)
+                .collect::<Vec<_>>(),
+            [9, 3, 7]
+        );
+        let db = rusqlite::Connection::open(ProjectionStateStore::database(path)).unwrap();
+        let pending_rows: i64 = db
+            .query_row(
+                "SELECT count(*) FROM hot_store_rows WHERE store='activity_projection' AND collection='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_rows, 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_fence_waits_for_a_reader_holding_the_legacy_json() {
+        let temp = TestDir::new();
+        let path = temp.path().join("projector.json");
+        legacy_with_pending(&path);
+        let held = hold_without_delete_share(&path);
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        ProjectionStateStore::open(path.clone()).unwrap();
+        release.join().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(350));
+        assert_fenced_with_rows(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_fence_held_past_the_budget_fails_then_reopen_completes_once() {
+        let temp = TestDir::new();
+        let path = temp.path().join("projector.json");
+        legacy_with_pending(&path);
+        let held = hold_without_delete_share(&path);
+        let error = ProjectionStateStore::open(path.clone())
+            .err()
+            .expect("fence held for the whole budget");
+        assert!(transient_replace_error(&error), "{error:#}");
+        // The rows are committed, the legacy JSON is untouched.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()
+                ["version"],
+            1
+        );
+        drop(held);
+        let reopened = ProjectionStateStore::open(path.clone()).unwrap();
+        assert_eq!(reopened.state.owners["owner"].pending.len(), 3);
+        assert_fenced_with_rows(&path);
+        ProjectionStateStore::open(path.clone()).unwrap();
+        assert_fenced_with_rows(&path);
+    }
+
+    #[test]
+    fn projector_open_is_retried_with_backoff_and_reports_each_failure_once() {
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let mut reports = Vec::new();
+        let opened = open_with_retry(
+            || {
+                attempts += 1;
+                if attempts < 4 {
+                    anyhow::bail!("fence refused")
+                }
+                Ok(attempts)
+            },
+            |delay| sleeps.push(delay),
+            |detail| reports.push(detail.to_string()),
+        );
+        assert_eq!(opened, 4);
+        assert_eq!(
+            sleeps,
+            [
+                PROJECTOR_POLL_INTERVAL * 2,
+                PROJECTOR_POLL_INTERVAL * 4,
+                PROJECTOR_POLL_INTERVAL * 8
+            ]
+        );
+        assert_eq!(reports, ["fence refused"]);
     }
 
     #[test]
@@ -2367,7 +3098,7 @@ mod tests {
         first.run_once(&repository).unwrap();
         assert_eq!(submitter.submissions.lock().unwrap().len(), 32);
         let durable_after_uncertain: ProjectionState =
-            serde_json::from_slice(&fs::read(temp.path().join("projector.json")).unwrap()).unwrap();
+            ProjectionStateStore::read_persisted(&temp.path().join("projector.json"));
         let owner = &durable_after_uncertain.owners["cutex.director"];
         assert_eq!(owner.sequence, PROJECTOR_DELIVERY_BATCH_LIMIT as u64);
         assert_eq!(
@@ -2555,7 +3286,9 @@ mod tests {
         assert_eq!(loaded[1].activity, None);
         assert_eq!(
             loaded[2].activity,
-            Some(serde_json::from_value::<CutexUiActivity>(outbound).unwrap())
+            Some(Shared::new(
+                serde_json::from_value::<CutexUiActivity>(outbound).unwrap()
+            ))
         );
         assert_eq!(loaded[3].activity, None);
         // Reopening the rewritten state (open() saves the recovered flags)
@@ -2567,8 +3300,9 @@ mod tests {
         let mut unknown = state.clone();
         unknown["owners"]["cutex.director"]["pending"][0]["activity"]["type"] =
             serde_json::json!("somethingElse");
-        fs::write(&path, serde_json::to_vec(&unknown).unwrap()).unwrap();
-        assert!(ProjectionStateStore::open(path).is_err());
+        let unknown_path = temp.path().join("unknown-projector.json");
+        fs::write(&unknown_path, serde_json::to_vec(&unknown).unwrap()).unwrap();
+        assert!(ProjectionStateStore::open(unknown_path).is_err());
 
         let repository = repository(&temp);
         let task_fact = append(
@@ -2716,7 +3450,7 @@ mod tests {
         projector.run_once(&repository).unwrap();
 
         let persisted: ProjectionState =
-            serde_json::from_slice(&fs::read(temp.path().join("projector.json")).unwrap()).unwrap();
+            ProjectionStateStore::read_persisted(&temp.path().join("projector.json"));
         let owner = &persisted.owners["cutex.director"];
         assert!(owner.cursor.is_none());
         assert_eq!(owner.pending.len(), 1);
@@ -2869,8 +3603,7 @@ mod tests {
                 .run_once(&repository)
                 .unwrap();
             let state: ProjectionState =
-                serde_json::from_slice(&fs::read(temp.path().join("projector.json")).unwrap())
-                    .unwrap();
+                ProjectionStateStore::read_persisted(&temp.path().join("projector.json"));
             assert_eq!(
                 state.owners["cutex.director"].cursor.as_deref(),
                 Some(event.cursor.as_str())

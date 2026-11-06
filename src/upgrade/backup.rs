@@ -264,6 +264,7 @@ pub fn move_aside(home: &Path, relative: &str, displaced: &Path) -> anyhow::Resu
 /// Put the selection files of a backup back (current ones moved aside);
 /// an item the backup lacks (none was selected then) is only moved aside.
 pub fn restore_selection(backup: &Path, home: &Path, displaced: &Path) -> anyhow::Result<Vec<String>> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     let mut restored = Vec::new();
     for item in SELECTION_ITEMS {
         let saved = backup.join("home").join(item);

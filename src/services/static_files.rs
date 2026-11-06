@@ -74,7 +74,7 @@ fn agent_roots(cutex_session_id: &str, home: Option<&Path>) -> ServicesResult<(V
     if let Some(record) = sessions.sessions.get(cutex_session_id) {
         candidates.push(PathBuf::from(&record.cwd));
     }
-    if let Ok(snapshot) = crate::memory::load_agent_management_snapshot() {
+    if let Ok(snapshot) = crate::memory::load_agent_management_directory() {
         if let Some(project) = crate::memory::project_for_session(&snapshot, cutex_session_id) {
             if let Some(root) = snapshot
                 .project_states

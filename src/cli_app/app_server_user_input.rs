@@ -20,6 +20,7 @@ use cutex::management::v2::repository::management_v2_repository;
 use cutex::management::v2::control_timing::{Path as TimingPath, Stage as TimingStage, Trace as ControlTrace};
 use cutex::management::v2::user_input::user_input_repository;
 use cutex::management::v2::user_input::image_steering::{self, ImageInputSettings, ImageBusyBehavior};
+use cutex::management::v2::user_input::ledger;
 use cutex::management::v2::user_input::ClientIdentityDecision;
 use cutex::management::v2::user_input::InputDelivery;
 use cutex::management::v2::user_input::QueueEnqueueDecision;
@@ -31,6 +32,10 @@ use cutex::management::v2::user_input::UserInputSubmitExecution;
 use cutex::platform::host::current_host_name;
 
 use super::app_server_runtime;
+
+#[path = "app_server_interrupt_send.rs"]
+mod interrupt_send;
+pub(crate) use interrupt_send::interrupt_send_v2;
 
 const INTERRUPT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -84,6 +89,10 @@ pub(crate) fn submit_v2_with_image_settings(
         execution_error("route", "event_persistence_unavailable", error, true, false)
     })?;
     trace.stage(TimingStage::Dispatch);
+    if let Some(held) = held_entry(&command) {
+        return held;
+    }
+    let held_command = command.clone();
     let result = submit_v2_with_repository_and_image_settings(
         command,
         repository,
@@ -95,17 +104,22 @@ pub(crate) fn submit_v2_with_image_settings(
         send_user_input_native_request,
         |cutex_session_id: &str, stop_before: Option<&str>| {
             // The session input lock is already held (see above).
-            flush_queued_locked(
+            flush_queued_locked_with(
                 cutex_session_id,
                 false,
                 repository,
                 stop_before,
                 read_thread,
+                read_active_turn_bounded,
                 send_user_input_native_request,
                 append_input_event,
             )
         },
     );
+    let result = match result {
+        Err(error) if error.code == HELD_SIGNAL => super::owner_admission::hold(&held_command),
+        result => result,
+    };
     trace.status(if result.is_ok() { 200 } else { 500 });
     result
 }
@@ -319,7 +333,8 @@ fn route_owner_join(
         Err(error) if matches!(error.code.as_str(), "steer_unavailable" | "turn_conflict" | "session_offline") => {
             let reason = error.details.get("reason").and_then(Value::as_str)
                 .unwrap_or(if error.code == "turn_conflict" { "turnConflict" } else { "sessionOffline" });
-            let mut result = enqueue_submit(repository, command, active_turn_id)?;
+            let mut result = queued_because(enqueue_submit(repository, command, active_turn_id)?,
+                if reason == "admissionBusy" { "hostBusy" } else { "joinRefused" });
             result.join_refusal = Some(reason.into());
             Ok(result)
         }
@@ -335,7 +350,11 @@ fn supports_owner_steer_for(runtime: OwnerSteerRuntime, generation: u64, live: i
         OwnerSteerRuntime::Native => true,
         OwnerSteerRuntime::Unsupported => false,
         OwnerSteerRuntime::Claude => live(generation)
-            .is_some_and(|caps| caps.pointer("/input/sameTurnSteering").and_then(Value::as_bool) == Some(true)),
+            // This is an explicit owner steer. A failed lookup (or an older
+            // response without the flag) is unknown, not an unsupported
+            // runtime. Try turn/steer once and let its authoritative refusal
+            // pass through steer_failure; never retry an uncertain send.
+            .is_none_or(|caps| caps.pointer("/input/sameTurnSteering").and_then(Value::as_bool) != Some(false)),
     }
 }
 
@@ -380,6 +399,14 @@ fn steer_failure(method: &str, mut error: UserInputExecutionError) -> UserInputE
                 || native.pointer("/data/unsupported").and_then(Value::as_bool) == Some(true);
             let turn_changed = message.starts_with("no active turn to steer")
                 || message.starts_with("expected active turn id");
+            // claude-r34: `turn/steer` while the turn finishes is refused
+            // before enqueue (-32009, data.reason turnFinishing).
+            if native.pointer("/data/reason").and_then(Value::as_str) == Some("turnFinishing") {
+                let mut refused = cutex::management::v2::queue_order::steer_unavailable("turnFinishing");
+                refused.message = message.to_owned();
+                refused.details["nativeError"] = native;
+                return refused;
+            }
             if unsupported {
                 let mut refused = cutex::management::v2::queue_order::steer_unavailable("runtimeNoSteer");
                 refused.message = message.to_owned();
@@ -560,7 +587,7 @@ fn submit_v2_with_repository_and_image_settings(
     };
     if let Some(turn_id) = deduplicated_turn {
         return Ok(UserInputSubmitExecution {
-            join_refusal: None,
+            join_refusal: None, queued_reason: None,
             disposition: UserInputDisposition::Deduplicated,
             app_server_accepted: true,
             native_request_id: None,
@@ -643,11 +670,18 @@ fn route_submit_with_image_settings(
         }
     }
 
-    // A whole-agent pause never steers or interrupts the current turn.
-    let agent_paused = cutex::asks::pause_admission::is_held(&repository.ask_store(), &command.cutex_session_id)
-        .map_err(queue_persistence_error)?;
-    if agent_paused {
-        return enqueue_submit(repository, command, active_turn_id);
+    // A whole-agent pause never steers or interrupts the current turn. A busy
+    // host authority fence decides nothing: it is reported as `hostBusy`,
+    // never as a pause (the input still waits in the queue until the
+    // dedicated owner admission worker exists).
+    match cutex::asks::pause_admission::gate(&repository.ask_store(), &command.cutex_session_id)
+        .map_err(queue_persistence_error)?
+    {
+        cutex::asks::pause_admission::Gate::Open => {}
+        cutex::asks::pause_admission::Gate::Paused =>
+            return Ok(queued_because(enqueue_submit(repository, command, active_turn_id)?, "paused")),
+        cutex::asks::pause_admission::Gate::Deferred =>
+            return host_busy(repository, command, active_turn_id, turn_state_known),
     }
 
     // A Claude runtime without same-turn steering: an `auto` submit while a
@@ -680,7 +714,17 @@ fn route_submit_with_image_settings(
         }
         // Nothing queued, nothing held: start it below like `auto`.
     } else if command.params.strategy == UserInputStrategy::Queue || image_queue || claude_queue || ask_queue {
-        return enqueue_submit(repository, command, active_turn_id);
+        let reason = if command.params.strategy == UserInputStrategy::Queue { "explicitQueue" }
+            else if ask_queue { "delegationLease" }
+            else if image_queue { "imageBusy" }
+            else { "turnRunning" };
+        // 054 §2.4 / §2.6: an Ask lease whose turn runs is a running turn for
+        // the owner (`delegationLease` is a lease without a turn, S14). The
+        // wire keeps `queuedReason: delegationLease`; ledger only.
+        if reason == "delegationLease" && active_turn_id.is_some() {
+            ledger::note_wait_reason(&command.cutex_session_id, &command.params.client_user_message_id, "turnRunning");
+        }
+        return Ok(queued_because(enqueue_submit(repository, command, active_turn_id)?, reason));
     }
 
     if let Some(active_turn_id) = active_turn_id {
@@ -698,12 +742,24 @@ fn route_submit_with_image_settings(
                     UserInputDisposition::Steered,
                 );
                 return match result {
-                    Err(error) if matches!(error.details["reason"].as_str(),Some("agentPaused"|"admissionBusy")) =>
-                        enqueue_submit(repository, command, Some(active_turn_id)),
+                    Err(error) if error.details["reason"].as_str() == Some("admissionBusy") =>
+                        host_busy(repository, command, Some(active_turn_id), true),
+                    Err(error) if error.details["reason"].as_str() == Some("agentPaused") =>
+                        Ok(queued_because(enqueue_submit(repository, command, Some(active_turn_id))?, "paused")),
+                    // claude-r34: the turn is finishing; the input becomes the
+                    // next turn (never reported as steered). With the input
+                    // ledger on, also the adapter's raw refusal (-32009,
+                    // data.reason turnFinishing; 054 S5).
+                    Err(error) if error.details["reason"].as_str() == Some("turnFinishing")
+                        || (cutex::management::v2::input_ledger::enabled()
+                            && error.details.pointer("/nativeError/data/reason").and_then(Value::as_str) == Some("turnFinishing")) =>
+                        Ok(queued_because(enqueue_submit(repository, command, None)?, "turnFinishing")),
                     result => result,
                 };
             }
             UserInputStrategy::Interrupt => {
+                // The record exists while the route waits for the interrupt.
+                ledger::materialize(&command.cutex_session_id, &command.params.client_user_message_id);
                 timed_input(TimingPath::InputNative, TimingStage::Dispatch, || session_manager(&command.cutex_session_id)
                     .commands(&command.cutex_session_id)
                     .and_then(|commands| {
@@ -740,9 +796,76 @@ fn route_submit_with_image_settings(
         // The Claude adapter is about to run input it queued itself (an Agent
         // Bus message): keep this one in the Management queue instead of
         // failing it; it is flushed when that turn completes.
-        Err(error) if is_native_thread_busy(&error) || matches!(error.details["reason"].as_str(),Some("agentPaused"|"admissionBusy")) => enqueue_submit(repository, command, None),
+        Err(error) if error.details["reason"].as_str() == Some("admissionBusy") => host_busy(repository, command, None, turn_state_known),
+        Err(error) if is_native_thread_busy(&error) || error.details["reason"].as_str() == Some("agentPaused") => {
+            let reason = if is_native_thread_busy(&error) { "adapterQueued" } else { "paused" };
+            Ok(queued_because(enqueue_submit(repository, command, None)?, reason))
+        }
         result => result,
     }
+}
+
+/// r271 owner admission (design 050 §5), under the session lane: a held
+/// identity answers held again; once a session holds owner input, every later
+/// owner input of it waits behind (FIFO) instead of taking the fast path.
+fn held_entry(command: &UserInputSubmitCommand) -> Option<Result<UserInputSubmitExecution, UserInputExecutionError>> {
+    if super::owner_admission::on_worker_thread() {
+        return None;
+    }
+    let session = &command.cutex_session_id;
+    match cutex::management::v2::owner_held::find(session, &command.params.client_user_message_id) {
+        Ok(Some(_)) => {
+            ledger::note_host_busy(session, &command.params.client_user_message_id,
+                runtime_active_turn(session, &command.thread_id) == Some(None));
+            return Some(Ok(super::owner_admission::held_execution()));
+        },
+        Ok(None) => {}
+        Err(error) => return Some(Err(queue_persistence_error(error))),
+    }
+    if !cutex::management::v2::owner_held::allow_held() {
+        return None;
+    }
+    match cutex::management::v2::owner_held::has_session(session) {
+        Ok(true) => {
+            ledger::note_host_busy(session, &command.params.client_user_message_id,
+                runtime_active_turn(session, &command.thread_id) == Some(None));
+            Some(super::owner_admission::hold(command))
+        },
+        Ok(false) => None,
+        Err(error) => Some(Err(queue_persistence_error(error))),
+    }
+}
+
+/// Internal marker: the route met a busy host authority fence for a client
+/// that accepts held input. `submit_v2_with_image_settings` turns it into a
+/// durable held record; it never reaches a client.
+const HELD_SIGNAL: &str = "owner_input_held";
+
+/// A busy host authority fence decided nothing. A client that opted in
+/// (`allowHeld`) gets the input held for the owner admission worker; any
+/// other keeps today's queue item, with `queuedReason: hostBusy`.
+fn host_busy(
+    repository: &cutex::management::v2::user_input::UserInputRepository,
+    command: &UserInputSubmitCommand,
+    active_turn_id: Option<String>,
+    turn_state_known: bool,
+) -> Result<UserInputSubmitExecution, UserInputExecutionError> {
+    ledger::note_host_busy(&command.cutex_session_id, &command.params.client_user_message_id, turn_state_known && active_turn_id.is_none());
+    if cutex::management::v2::owner_held::allow_held() {
+        return Err(execution_error_message("route", HELD_SIGNAL, "held for the owner admission worker", true, false));
+    }
+    Ok(queued_because(enqueue_submit(repository, command, active_turn_id)?, "hostBusy"))
+}
+
+/// Record why a `queued` disposition waits. A paused queue always wins (the
+/// item leaves only after resume or an explicit flush); other dispositions
+/// (a repeated identity already sent) carry no reason.
+fn queued_because(mut execution: UserInputSubmitExecution, reason: &'static str) -> UserInputSubmitExecution {
+    debug_assert!(cutex::management::v2::queue_order::QUEUED_REASONS.contains(&reason));
+    if execution.disposition == UserInputDisposition::Queued {
+        execution.queued_reason = Some(if execution.queue_paused { "paused" } else { reason });
+    }
+    execution
 }
 
 /// `queue` while the agent is idle. A queued follow-up waits for the running
@@ -774,6 +897,8 @@ fn queue_on_idle(
     // along as authenticated native context instead of starting their own turn.
     if !paused && waiting.is_empty() && is_claude_session(session)
         && repository.admission(session).map_err(queue_persistence_error)?.items.is_empty()
+        && !session_manager(session).status(session).ok().flatten()
+            .is_some_and(|status| super::owner_carries::OwnerCarries::supported(session, status.runtime_generation))
     {
         if let Err(error) = super::asks_claude::stage_owner_results_locked(session, &repository.ask_store()) {
             // An indeterminate passive acceptance keeps its frozen identity;
@@ -782,15 +907,31 @@ fn queue_on_idle(
         }
     }
     let owner_head = (!paused).then(|| waiting.first()).flatten().map(|item| item.queue_id.as_str());
-    let asks_first = ask_lease_held(session)
-        || !repository.owner_may_start(session, owner_head).map_err(queue_persistence_error)?;
-    if (paused && command.params.strategy == UserInputStrategy::Queue) || asks_first {
-        return enqueue_submit(repository, command, None).map(Some);
+    use cutex::management::v2::user_input::OwnerStart;
+    // The wire says `delegationLease` for every "a delegation goes first";
+    // the input ledger tells a lease, an Event lease and a ride-along apart.
+    let (asks_first, ledger_reason) = if ask_lease_held(session) {
+        (Some("delegationLease"), ledger::lease_reason(session))
+    } else {
+        match repository.owner_start_with_reason(session, owner_head).map_err(queue_persistence_error)? {
+            (OwnerStart::Ready, _) => (None, None),
+            (OwnerStart::Blocked, reason) => (Some("delegationLease"), Some(reason)),
+            (OwnerStart::Deferred, _) => return host_busy(repository, command, None, true).map(Some),
+        }
+    };
+    if paused && command.params.strategy == UserInputStrategy::Queue {
+        return Ok(Some(queued_because(enqueue_submit(repository, command, None)?, "paused")));
+    }
+    if let Some(reason) = asks_first {
+        if let Some(ledger_reason) = ledger_reason {
+            ledger::note_wait_reason(session, &command.params.client_user_message_id, ledger_reason);
+        }
+        return Ok(Some(queued_because(enqueue_submit(repository, command, None)?, reason)));
     }
     if paused || waiting.is_empty() {
         return Ok(None);
     }
-    let execution = enqueue_submit(repository, command, None)?;
+    let execution = queued_because(enqueue_submit(repository, command, None)?, "ownerQueueAhead");
     // A newly queued item is announced (`cutex/userInput/queued`) only after
     // this returns, so the flush stops before it; a repeated submit of an
     // item already waiting may go out now.
@@ -805,6 +946,9 @@ fn queue_on_idle(
 }
 
 fn queue_persistence_error(error: anyhow::Error) -> UserInputExecutionError {
+    if cutex::asks::pause_admission::is_deferred(&error) {
+        return cutex::management::v2::server::admission_busy_user_input_error("queue", error);
+    }
     execution_error("queue", "event_persistence_unavailable", error, true, false)
 }
 
@@ -830,7 +974,7 @@ fn enqueue_submit(
     };
     match decision {
         QueueEnqueueDecision::Queued(queue) => Ok(UserInputSubmitExecution {
-            join_refusal: None,
+            join_refusal: None, queued_reason: None,
             disposition: UserInputDisposition::Queued,
             app_server_accepted: false,
             native_request_id: None,
@@ -840,7 +984,7 @@ fn enqueue_submit(
             queue_paused: queue_paused()?,
         }),
         QueueEnqueueDecision::Deduplicated(queue) => Ok(UserInputSubmitExecution {
-            join_refusal: None,
+            join_refusal: None, queued_reason: None,
             disposition: UserInputDisposition::Deduplicated,
             app_server_accepted: false,
             native_request_id: None,
@@ -913,7 +1057,8 @@ fn resolve_prior_delivery(
     // that the earlier native request will never execute.
     if matches!(delivery, InputDelivery::Sending { .. } | InputDelivery::Unknown { .. })
         && (retain_unresolved || repository.list(cutex_session_id)?.1.iter()
-            .any(|item| item.client_user_message_id == client_user_message_id))
+            .any(|item| item.client_user_message_id == client_user_message_id)
+            || super::owner_carries::OwnerCarries::has_reservation(cutex_session_id, client_user_message_id)?)
     {
         return Ok(PriorDelivery::InProgress(delivery));
     }
@@ -1052,10 +1197,22 @@ fn send_recorded(
         let current = repository.delivery(session, client_id).ok().flatten();
         return Err(delivery_in_progress_error(client_id, current.as_ref()));
     }
+    // 054 §2.9 / r274 decision 3: `sending` before the request leaves (own
+    // store first: the C-010 reservation above). Never under the fence: the
+    // owner admission worker's fence covered the re-check and reservation
+    // only and is dropped here (it would be dropped before native IO anyway).
+    if cutex::management::v2::input_ledger::enabled() {
+        cutex::asks::pause_admission::release_worker_fence();
+    }
+    ledger::native_sending(session, &command.params, method == "turn/steer");
     match prepare_native_input(method == "turn/steer"
         && image_steering::contains_images(&command.params.input) && is_claude_session(session), method, params)
         .and_then(|params| send_native(command, method, params, disposition)) {
         Ok(execution) => {
+            // 054 §2.9: sending → inContext{turnStartInput} / accepted{turnId}.
+            ledger::native_accepted(session, &command.params, execution.disposition, execution.turn_id.as_deref(),
+                execution.disposition == UserInputDisposition::Steered
+                    && cutex::management::v2::input_ledger::enabled() && is_claude_session(session));
             let accepted = InputDelivery::Accepted {
                 thread_id: command.thread_id.clone(),
                 turn_id: execution.turn_id.clone(),
@@ -1083,6 +1240,10 @@ fn send_recorded(
             }
         }
         Err(error) => {
+            if error.outcome_unknown {
+                // Native IO ran, its outcome is unknown: sending → uncertain.
+                ledger::native_unknown(session, &command.params);
+            }
             let next = error.outcome_unknown.then(|| InputDelivery::Unknown {
                 thread_id: command.thread_id.clone(),
                 since: Utc::now().to_rfc3339(),
@@ -1104,8 +1265,41 @@ fn send_recorded(
 fn send_user_input_native_request(
     command: &UserInputSubmitCommand,
     method: &str,
+    mut params: Value,
+    disposition: UserInputDisposition,
+) -> Result<UserInputSubmitExecution, UserInputExecutionError> {
+    let session = &command.cutex_session_id;
+    let status = session_manager(session).status(session)
+        .map_err(|error| execution_error("native_request", "app_server_unavailable", error, true, false))?;
+    let generation = status.as_ref().filter(|status| status.connected && status.thread_id == command.thread_id)
+        .map(|status| status.runtime_generation);
+    let carries = if matches!(method, "turn/start" | "turn/steer") && owner_reopens_gate(command)
+        && generation.is_some_and(|generation| super::owner_carries::OwnerCarries::supported(session, generation)) {
+        Some(super::owner_carries::OwnerCarries::prepare(session, &command.params.client_user_message_id,
+            &command.thread_id, generation.expect("checked above"))
+            .map_err(|error| {
+                let unknown = error.is::<super::owner_carries::ExistingReservation>();
+                execution_error("native_request", if unknown { "request_outcome_unknown" } else { "owner_carry_reservation_failed" }, error, !unknown, unknown)
+            })?)
+    } else { None };
+    if let Some(carries) = &carries { carries.attach(&mut params); }
+    let result = send_user_input_native_request_inner(command, method, params, disposition, generation);
+    if let Some(carries) = &carries {
+        match &result {
+            Ok(execution) => carries.accepted(execution.turn_id.as_deref()),
+            Err(error) if error.outcome_unknown => carries.unknown(),
+            Err(_) => carries.release_unsent(),
+        }
+    }
+    result
+}
+
+fn send_user_input_native_request_inner(
+    command: &UserInputSubmitCommand,
+    method: &str,
     params: Value,
     disposition: UserInputDisposition,
+    expected_generation: Option<u64>,
 ) -> Result<UserInputSubmitExecution, UserInputExecutionError> {
     use cutex::app_server::client::AppServerClientError;
 
@@ -1116,12 +1310,21 @@ fn send_user_input_native_request(
     let handle = if let Some(join) = &command.params.join_delegation {
         manager.handle_for_generation(&command.cutex_session_id, join.runtime_generation)
             .map_err(|_| cutex::management::v2::queue_order::steer_unavailable("joinChanged"))?
+    } else if let Some(generation) = expected_generation {
+        manager.handle_for_generation(&command.cutex_session_id, generation)
+            .map_err(|error| execution_error("native_request", "app_server_unavailable", error, true, false))?
     } else {
         manager.handle(&command.cutex_session_id).map_err(|error|
             execution_error("native_request", "app_server_unavailable", error, true, false))?
     };
-    let send = |native_request_id: &str| {
-        ensure_native_input_open(repository_for_retry()?, &command.cutex_session_id)?;
+    // `reserved`: the first send follows the C-010 `sending` reservation the
+    // caller (`send_recorded`, every owner native request) just made under
+    // the host fence, which re-checked the pause (r274 decision 1).
+    let send = |native_request_id: &str, reserved: bool| {
+        ensure_native_input_open_after(repository_for_retry()?, &command.cutex_session_id, reserved)?;
+        // r271: the owner admission worker held the host fence only for the
+        // re-check and the durable `sending` reservation. Never native IO.
+        cutex::asks::pause_admission::release_worker_fence();
         timed_input(TimingPath::InputNative, TimingStage::Dispatch, || handle
         .request_raw_message(json!({
             "id": native_request_id,
@@ -1149,7 +1352,7 @@ fn send_user_input_native_request(
         })
     };
     let mut native_request_id = native_request_id;
-    let mut response = send(&native_request_id)?;
+    let mut response = send(&native_request_id, true)?;
     // The owner's own message to a Claude agent whose adapter closed its
     // input gate (the last turn was interrupted or failed, tool effects may
     // be uncertain) is the owner's acknowledgement: reopen the gate, as
@@ -1160,7 +1363,7 @@ fn send_user_input_native_request(
         && owner_reopens_gate(command)
         && is_claude_session(&command.cutex_session_id)
     {
-        ensure_native_input_open(repository_for_retry()?, &command.cutex_session_id)?;
+        ensure_native_input_open_after(repository_for_retry()?, &command.cutex_session_id, false)?;
         match super::asks_claude::resume(&command.cutex_session_id) {
             Ok(()) => {
                 eprintln!(
@@ -1168,7 +1371,7 @@ fn send_user_input_native_request(
                     command.cutex_session_id
                 );
                 native_request_id = format!("cutex-user-input-{}", Uuid::new_v4());
-                response = send(&native_request_id)?;
+                response = send(&native_request_id, false)?;
             }
             Err(error) => eprintln!(
                 "user input: could not reopen the Claude input gate of {}: {error:#}",
@@ -1199,7 +1402,7 @@ fn send_user_input_native_request(
         .note_active_turn(&command.cutex_session_id, turn_id.clone())
         .map_err(|error| execution_error("post_submit", "internal_error", error, false, true))?;
     Ok(UserInputSubmitExecution {
-        join_refusal: None,
+        join_refusal: None, queued_reason: None,
         disposition,
         app_server_accepted: true,
         native_request_id: Some(Value::String(native_request_id)),
@@ -1217,10 +1420,23 @@ fn repository_for_retry()->Result<&'static cutex::management::v2::user_input::Us
         .map_err(queue_persistence_error)
 }
 
+#[cfg(test)]
 fn ensure_native_input_open(repository:&cutex::management::v2::user_input::UserInputRepository,session:&str)->Result<(),UserInputExecutionError> {
+    ensure_native_input_open_after(repository, session, false)
+}
+
+/// The last pause check before native IO. `reserved`: the caller's C-010
+/// `sending` reservation was made under the host fence moments ago and
+/// re-checked the pause there (`send_recorded`), so a busy fence now decides
+/// nothing new: the send goes ahead (r274 decision 1; it used to be refused
+/// as `admissionBusy` whenever another thread took the fence in between). A
+/// pause that is visible is still honored, and the reopen-and-retry send
+/// (`reserved: false`) keeps the strict check.
+fn ensure_native_input_open_after(repository:&cutex::management::v2::user_input::UserInputRepository,session:&str,reserved:bool)->Result<(),UserInputExecutionError> {
     match cutex::asks::pause_admission::gate(&repository.ask_store(),session).map_err(queue_persistence_error)? {
         cutex::asks::pause_admission::Gate::Open=>Ok(()),
         cutex::asks::pause_admission::Gate::Paused=>Err(cutex::management::v2::queue_order::steer_unavailable("agentPaused")),
+        cutex::asks::pause_admission::Gate::Deferred if reserved=>Ok(()),
         cutex::asks::pause_admission::Gate::Deferred=>Err(cutex::management::v2::queue_order::steer_unavailable("admissionBusy")),
     }
 }
@@ -1393,12 +1609,13 @@ pub(crate) fn flush_queued(cutex_session_id: &str, ignore_pause: bool) -> anyhow
 fn flush_queued_in_reservation(cutex_session_id: &str, ignore_pause: bool) -> anyhow::Result<bool> {
     super::management_archive::api::ensure_input_allowed(cutex_session_id)?;
     let repository = user_input_repository()?;
-    flush_queued_locked(
+    flush_queued_locked_with(
         cutex_session_id,
         ignore_pause,
         repository,
         None,
         read_thread,
+        read_active_turn_bounded,
         send_user_input_native_request,
         append_input_event,
     )
@@ -1406,7 +1623,9 @@ fn flush_queued_in_reservation(cutex_session_id: &str, ignore_pause: bool) -> an
 
 /// `flush_queued` with the session input lock already held. `stop_before`:
 /// a clientUserMessageId this flush must not send (a submit that just
-/// queued it and has not announced it yet).
+/// queued it and has not announced it yet). The active turn comes from the
+/// thread read (tests); production uses [`flush_queued_locked_with`].
+#[cfg(test)]
 fn flush_queued_locked(
     cutex_session_id: &str,
     ignore_pause: bool,
@@ -1421,7 +1640,40 @@ fn flush_queued_locked(
     ) -> Result<UserInputSubmitExecution, UserInputExecutionError>,
     append_event: impl Fn(&str, EventCorrelation, &str, Value) -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
+    flush_queued_locked_with(cutex_session_id, ignore_pause, repository, stop_before, &read_native_thread,
+        |session, thread| Ok(active_turn_id_from_thread(&read_native_thread(session, thread)?)),
+        send_native, append_event)
+}
+
+/// Newest turn only (`thread/turns/list`, summary items), not the history.
+fn read_active_turn_bounded(cutex_session_id: &str, thread_id: &str) -> anyhow::Result<Option<String>> {
+    timed_input(TimingPath::InputHistory, TimingStage::ContextRead,
+        || super::active_turn::active_turn_id(cutex_session_id, thread_id))
+}
+
+/// 051 / S17: the whole history (`read_native_thread`, `thread/read
+/// includeTurns:true`) is read only for an item with a recorded delivery
+/// (C-010: native can hold an input only after its `sending` reservation),
+/// and at most once per pass; a never-sent item needs only the active turn
+/// (`read_active_turn`, the newest turn).
+fn flush_queued_locked_with(
+    cutex_session_id: &str,
+    ignore_pause: bool,
+    repository: &cutex::management::v2::user_input::UserInputRepository,
+    stop_before: Option<&str>,
+    read_native_thread: impl Fn(&str, &str) -> anyhow::Result<Value>,
+    read_active_turn: impl Fn(&str, &str) -> anyhow::Result<Option<String>>,
+    send_native: impl Fn(
+        &UserInputSubmitCommand,
+        &str,
+        Value,
+        UserInputDisposition,
+    ) -> Result<UserInputSubmitExecution, UserInputExecutionError>,
+    append_event: impl Fn(&str, EventCorrelation, &str, Value) -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
     let mut changed = false;
+    // (thread id, `thread/read`): one whole-history read per pass at most.
+    let mut history: Option<(String, Value)> = None;
     loop {
         let Some((management_request_id, thread_id, queue_item)) =
             repository.next_flushable(cutex_session_id, ignore_pause)?
@@ -1431,29 +1683,42 @@ fn flush_queued_locked(
         if stop_before == Some(queue_item.client_user_message_id.as_str()) {
             return Ok(changed);
         }
-        let thread = read_native_thread(cutex_session_id, &thread_id)?;
+        // r273 stab: while the lifecycle fence is busy this pass can only
+        // end deferred (below). Check that first: reading the native thread
+        // (`thread/read includeTurns:true`, the whole history of a long
+        // Director thread) on every backoff retry burned CPU/memory on host-a.
+        if cutex::asks::pause_admission::gate(&repository.ask_store(), cutex_session_id)?
+            == cutex::asks::pause_admission::Gate::Deferred
+        {
+            cutex::management::v2::admission::retry_later(cutex_session_id);
+            return Ok(changed);
+        }
+        let delivery = repository.delivery(cutex_session_id, &queue_item.client_user_message_id)?;
+        if delivery.is_some() && history.as_ref().is_none_or(|(read, _)| *read != thread_id) {
+            history = Some((thread_id.clone(), read_native_thread(cutex_session_id, &thread_id)?));
+        }
+        let thread = delivery.as_ref().and(history.as_ref()).map(|(_, thread)| thread);
         // Visible in native history: native took it (a flush or steer whose
         // response was lost, or a crash after the native write): only the
         // queue item is left to remove, as before 02. No adapter in this
         // release projects an input before its write (Claude has no
         // same-turn steering here); one that does must add a durable receipt
         // check before this.
-        let visible = client_message_turn_id(&thread, &queue_item.client_user_message_id).is_some();
+        let visible = thread.is_some_and(|thread| client_message_turn_id(thread, &queue_item.client_user_message_id).is_some());
         if !visible
-            && matches!(repository.delivery(cutex_session_id, &queue_item.client_user_message_id)?,
-                Some(InputDelivery::Sending { .. } | InputDelivery::Unknown { .. }))
+            && matches!(delivery, Some(InputDelivery::Sending { .. } | InputDelivery::Unknown { .. }))
         {
             // Unresolved and not in history: never resent automatically. The
             // queue list shows `delivery` so the owner can decide (remove).
             return Ok(changed);
         }
         let already_submitted = visible
-            || match resolve_prior_delivery(
+            || delivery.is_some() && match resolve_prior_delivery(
                 repository,
                 cutex_session_id,
                 &queue_item.client_user_message_id,
                 &thread_id,
-                Some(&thread),
+                thread,
                 Utc::now(),
                 UNRESOLVED_DELIVERY_GRACE,
                 true,
@@ -1477,17 +1742,29 @@ fn flush_queued_locked(
                 "submitted",
                 repository.list(cutex_session_id)?.0,
             )?;
+            ledger::already_in_context(cutex_session_id, &queue_item.client_user_message_id);
             changed = true;
             continue;
         }
-        if active_turn_id_from_thread(&thread).is_some() {
+        let active_turn = match thread {
+            Some(thread) => active_turn_id_from_thread(thread),
+            None => read_active_turn(cutex_session_id, &thread_id)?,
+        };
+        if active_turn.is_some() {
             return Ok(changed);
         }
         // Asks (委托) share this session's admission: no flush while an ask
         // holds the lease, and an ask queued earlier goes first (FIFO). An
         // explicit flush is the owner's decision.
-        let agent_paused = cutex::asks::pause_admission::is_held(&repository.ask_store(), cutex_session_id)?;
-        if agent_paused || (!ignore_pause && !repository.owner_may_start(cutex_session_id, Some(&queue_item.queue_id))?) {
+        match cutex::asks::pause_admission::gate(&repository.ask_store(), cutex_session_id)? {
+            cutex::asks::pause_admission::Gate::Open => {},
+            cutex::asks::pause_admission::Gate::Paused => return Ok(changed),
+            cutex::asks::pause_admission::Gate::Deferred => {
+                cutex::management::v2::admission::retry_later(cutex_session_id);
+                return Ok(changed);
+            }
+        }
+        if !ignore_pause && !repository.owner_may_start(cutex_session_id, Some(&queue_item.queue_id))? {
             return Ok(changed);
         }
         let command = UserInputSubmitCommand {
@@ -1517,9 +1794,19 @@ fn flush_queued_locked(
         ) {
             Ok(execution) => execution,
             // Not idle after all (see `is_native_thread_busy`): the next
-            // turn/completed flushes again.
-            Err(error) if is_native_thread_busy(&error) || matches!(error.details["reason"].as_str(),Some("agentPaused"|"admissionBusy")) => return Ok(changed),
+            // turn/completed flushes again. The item stays queued: a refused
+            // `sending` waits again (decision 3).
+            Err(error) if retry_deferred_queue_send(cutex_session_id, &error) => {
+                ledger::native_refused(cutex_session_id, &queue_item.client_user_message_id, Some("hostBusy"));
+                return Ok(changed);
+            }
+            Err(error) if is_native_thread_busy(&error) || error.details["reason"].as_str() == Some("agentPaused") => {
+                let reason = if is_native_thread_busy(&error) { "adapterQueued" } else { "paused" };
+                ledger::native_refused(cutex_session_id, &queue_item.client_user_message_id, Some(reason));
+                return Ok(changed);
+            }
             Err(error) => {
+                ledger::native_failed(cutex_session_id, &queue_item.client_user_message_id, &error);
                 append_event(
                     cutex_session_id,
                     EventCorrelation {
@@ -1587,6 +1874,13 @@ fn flush_queued_locked(
         )?;
         return Ok(true);
     }
+}
+
+fn retry_deferred_queue_send(session: &str, error: &UserInputExecutionError) -> bool {
+    if error.code != "steer_unavailable" || error.outcome_unknown
+        || error.details["reason"].as_str() != Some("admissionBusy") { return false; }
+    cutex::management::v2::admission::retry_later(session);
+    true
 }
 
 /// `cutex/turn/stop` backend: interrupt the session's active native turn and
@@ -1859,6 +2153,7 @@ mod control_read_queue_tests {
 mod tests {
     include!("app_server_user_input/image_tests.rs");
     include!("app_server_user_input/owner_sink_tests.rs");
+    include!("app_server_user_input/owner_carry_retry_tests.rs");
     use super::*;
     use cutex::management::v2::user_input::UserInputOrigin;
     use cutex::management::v2::user_input::UserInputOriginKind;
@@ -1963,6 +2258,7 @@ mod tests {
         assert_eq!(revision, 1);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].client_user_message_id, "client-offline-queue-1");
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -2018,6 +2314,7 @@ mod tests {
         .expect_err("other native errors are not queued");
         assert_eq!(failed.code, "native_request_failed");
         assert_eq!(repository.list("cutex.busy-claude").unwrap().1.len(), 0);
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -2045,7 +2342,7 @@ mod tests {
             },
         };
         let ok = |method: &str, disposition| UserInputSubmitExecution {
-            join_refusal: None,
+            join_refusal: None, queued_reason: None,
             disposition,
             app_server_accepted: true,
             native_request_id: None,
@@ -2129,6 +2426,7 @@ mod tests {
         .expect("dedupe");
         assert_eq!(deduplicated.disposition, UserInputDisposition::Deduplicated);
         assert_eq!(deduplicated.turn_id.as_deref(), Some("turn-1"));
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -2150,6 +2448,7 @@ mod tests {
             ).unwrap();
             assert!(result.app_server_accepted);
             assert_eq!(reads.get(), 1);
+            drop(repository);
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -2196,6 +2495,7 @@ mod tests {
                 assert_eq!(result.unwrap().disposition, UserInputDisposition::Started);
                 assert_eq!((reads.get(), sends.get()), (1, 2));
             }
+            drop(repository);
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -2221,6 +2521,7 @@ mod tests {
             } else {
                 assert_eq!(result.unwrap_err().code, "turn_conflict");
             }
+            drop(repository);
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -2326,7 +2627,7 @@ mod tests {
             sent.borrow_mut()
                 .push(format!("{method} {}", command.params.client_user_message_id));
             Ok(UserInputSubmitExecution {
-                join_refusal: None,
+                join_refusal: None, queued_reason: None,
                 disposition,
                 app_server_accepted: true,
                 native_request_id: None,
@@ -2387,6 +2688,7 @@ mod tests {
         assert_eq!(read.disposition, UserInputDisposition::Started);
         assert_eq!(*sent.borrow(), ["turn/start idle-1", "turn/start idle-2"]);
         assert!(clients(&repository, session).is_empty());
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -2443,6 +2745,7 @@ mod tests {
                 Some(InputDelivery::Accepted { .. })
             ));
         }
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2462,6 +2765,7 @@ mod tests {
         assert_eq!(error.details["reason"],"agentPaused");
         assert!(repository.delivery(&command.cutex_session_id,&command.params.client_user_message_id).unwrap().is_none());
         assert_eq!(repository.list(&command.cutex_session_id).unwrap().1[0].client_user_message_id,"original-client");
+        drop(repository);
         let _=std::fs::remove_dir_all(root);
     }
 
@@ -2487,6 +2791,7 @@ mod tests {
         assert!(repository.delivery(&command.cutex_session_id,&command.params.client_user_message_id).unwrap().is_none());
         let items=repository.list(&command.cutex_session_id).unwrap().1;
         assert_eq!(items.len(),1);assert_eq!(items[0].client_user_message_id,command.params.client_user_message_id);
+        drop(repository);
         let _=std::fs::remove_dir_all(root);
     }
 
@@ -2505,7 +2810,221 @@ mod tests {
         assert!(matches!(outcome,cutex::asks::pause_admission::Admission::Ready(())));
         assert!(!repository.ask_store().snapshot().unwrap().presence.get(&command.cutex_session_id).is_some_and(|p|p.paused));
         assert_eq!(repository.list(&command.cutex_session_id).unwrap().1.len(),1);
+        drop(repository);
         let _=std::fs::remove_dir_all(root);
+    }
+
+    /// Another holder of the host authority fence (a lifecycle action) until
+    /// the returned sender fires.
+    fn hold_host_fence() -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            cutex::asks::pause_admission::acquire_worker_fence().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            cutex::asks::pause_admission::release_worker_fence();
+        });
+        held_rx.recv().unwrap();
+        (release_tx, holder)
+    }
+
+    fn started(command: &UserInputSubmitCommand) -> UserInputSubmitExecution {
+        UserInputSubmitExecution {
+            disposition: UserInputDisposition::Started,
+            app_server_accepted: true,
+            native_request_id: Some(json!(format!("native-{}", command.params.client_user_message_id))),
+            native_method: Some("turn/start".into()),
+            turn_id: Some(format!("turn-{}", command.params.client_user_message_id)),
+            queue: None,
+            queue_paused: false,
+            join_refusal: None,
+            queued_reason: None,
+        }
+    }
+
+    fn auto_command(session: &str, client: &str) -> UserInputSubmitCommand {
+        let mut command = queue_command(session, client);
+        command.params.strategy = UserInputStrategy::Auto;
+        command
+    }
+
+    /// r274 decision 1: the last pause check before native IO right after the
+    /// C-010 `sending` reservation (made under the fence, which re-checked the
+    /// pause) is not refused by another thread's fence hold in between; the
+    /// Claude reopen-and-retry send keeps the strict check.
+    #[test]
+    fn a_reserved_send_is_not_refused_by_a_busy_fence_but_a_retry_send_is() {
+        if test_runs_in_private_home("a_reserved_send_is_not_refused_by_a_busy_fence_but_a_retry_send_is") { return; }
+        let (root, repository) = queue_repository("reserved-send");
+        let session = "cutex.reserved-send";
+        let (release, holder) = hold_host_fence();
+        assert!(ensure_native_input_open_after(&repository, session, true).is_ok());
+        let refused = ensure_native_input_open_after(&repository, session, false).unwrap_err();
+        assert_eq!((refused.code.as_str(), refused.details["reason"].as_str()), ("steer_unavailable", Some("admissionBusy")));
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(ensure_native_input_open(&repository, session).is_ok());
+        drop(repository);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// r274 decision 1 (051): the admission projection (`list_admission`, the
+    /// `cutex-admission` thread's recompute) is computed without the host
+    /// fence, so it neither waits for nor blocks an owner route's fence try.
+    #[test]
+    fn admission_projection_runs_while_the_host_fence_is_held() {
+        if test_runs_in_private_home("admission_projection_runs_while_the_host_fence_is_held") { return; }
+        let (root, repository) = queue_repository("projection-unfenced");
+        let session = "cutex.projection-unfenced";
+        repository.enqueue(session, "thread-q", "request", &queue_command(session, "q1").params).unwrap();
+        let (release, holder) = hold_host_fence();
+        let (_, items, _, _) = repository.list_admission(session).unwrap();
+        assert_eq!(items.len(), 1);
+        let (_, _, _, _, fresh) = repository.list_admission_or_committed(session).unwrap();
+        assert!(fresh);
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        drop(repository);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// r271 lock-held send: an idle owner send meeting a busy host authority
+    /// fence is never a pause; an opted-in client gets it held, others a
+    /// queue item with `queuedReason: hostBusy`; queue/list stays readable.
+    #[test]
+    fn busy_host_fence_holds_idle_owner_send_without_pause() {
+        if test_runs_in_private_home("busy_host_fence_holds_idle_owner_send_without_pause") { return; }
+        let (root, repository) = queue_repository("busy-host-fence");
+        let session = "cutex.busy-host-fence";
+        let (release, holder) = hold_host_fence();
+        let queued = submit_v2_with_repository(auto_command(session, "legacy-client"), &repository, |_, _| Some(None), idle_thread,
+            |_, _, _, _| panic!("nothing is sent while the fence is busy"), no_flush).unwrap();
+        assert_eq!((queued.disposition, queued.queued_reason), (UserInputDisposition::Queued, Some("hostBusy")));
+        let (_, items, pause, _, fresh) = repository.list_admission_or_committed(session).unwrap();
+        // r274 decision 1 (051): the projection no longer needs the fence.
+        assert!(fresh, "a busy fence no longer defers the admission projection");
+        assert_eq!(items.len(), 1);
+        assert!(pause.is_none());
+        assert!(!repository.ask_store().snapshot().unwrap().presence.get(session).is_some_and(|presence| presence.paused));
+        let held = cutex::management::v2::owner_held::with_allow_held(true, false, || {
+            submit_v2_with_repository(auto_command(session, "held-client"), &repository, |_, _| Some(None), idle_thread,
+                |_, _, _, _| panic!("nothing is sent while the fence is busy"), no_flush)
+        }).unwrap_err();
+        assert_eq!(held.code, HELD_SIGNAL, "the route signals held; the HTTP entry records it");
+        assert_eq!(repository.list(session).unwrap().1.len(), 1, "a held input is not a queue item");
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let (_, _, _, _, fresh) = repository.list_admission_or_committed(session).unwrap();
+        assert!(fresh);
+        drop(repository);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Alice GO (2): A held, B sent 100 ms later -> A then B, B never takes
+    /// the fast path past A; a repeated identity answers held again.
+    #[test]
+    fn held_owner_inputs_of_a_session_are_admitted_in_order() {
+        if test_runs_in_private_home("held_owner_inputs_of_a_session_are_admitted_in_order") { return; }
+        use cutex::management::v2::owner_held;
+        let session = "cutex.held-order";
+        let (release, holder) = hold_host_fence();
+        owner_held::with_allow_held(true, false, || super::super::owner_admission::hold(&auto_command(session, "A"))).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let b = owner_held::with_allow_held(true, false, || held_entry(&auto_command(session, "B"))).expect("B waits behind A").unwrap();
+        assert_eq!(b.disposition, UserInputDisposition::Held);
+        let again = held_entry(&auto_command(session, "A")).expect("held identity").unwrap();
+        assert_eq!(again.disposition, UserInputDisposition::Held);
+        assert!(held_entry(&auto_command(session, "other")).is_none(), "a client without allowHeld keeps today's route");
+        let held: Vec<String> = owner_held::held_for(session).unwrap().into_iter().map(|held| held.client_user_message_id).collect();
+        assert_eq!(held, ["A", "B"]);
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let order = std::sync::Mutex::new(Vec::new());
+        let submit = |command: UserInputSubmitCommand| {
+            order.lock().unwrap().push(command.params.client_user_message_id.clone());
+            Ok(started(&command))
+        };
+        std::thread::scope(|scope| scope.spawn(|| {
+            cutex::management::v2::session_coordination::set_thread_lane_try_only(true);
+            while super::super::owner_admission::admit_one(&submit).unwrap() {}
+        }).join().unwrap());
+        assert_eq!(*order.lock().unwrap(), ["A", "B"]);
+        assert!(!owner_held::has_session(session).unwrap());
+    }
+
+    /// Plan §7.2: lifecycle holds the fence and then waits for the session
+    /// lane (native stop) while the owner sends on that lane. Nobody waits
+    /// for the fence under a lane, so all three finish.
+    #[test]
+    fn lifecycle_fence_then_lane_never_deadlocks_with_owner_send() {
+        if test_runs_in_private_home("lifecycle_fence_then_lane_never_deadlocks_with_owner_send") { return; }
+        use cutex::management::v2::owner_held;
+        let session = "cutex.lifecycle-deadlock";
+        let (root, repository) = queue_repository("lifecycle-deadlock");
+        let repository = std::sync::Arc::new(repository);
+        let lane = cutex::management::v2::session_coordination::session_lane(session).unwrap();
+        let (http_lane_tx, http_lane_rx) = std::sync::mpsc::channel();
+        let (fence_tx, fence_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let http = {
+            let (lane, repository, done) = (lane.clone(), repository.clone(), done_tx.clone());
+            std::thread::spawn(move || {
+                let reservation = lane.reserve().unwrap();
+                http_lane_tx.send(()).unwrap();
+                fence_rx.recv().unwrap();
+                let command = auto_command(session, "owner-send");
+                let routed = owner_held::with_allow_held(true, false, || {
+                    submit_v2_with_repository(command.clone(), &repository, |_, _| Some(None), idle_thread,
+                        |_, _, _, _| panic!("the fence is busy"), no_flush)
+                });
+                assert_eq!(routed.unwrap_err().code, HELD_SIGNAL);
+                super::super::owner_admission::hold(&command).unwrap();
+                drop(reservation);
+                done.send("http").unwrap();
+            })
+        };
+        let lifecycle = {
+            let (lane, done) = (lane.clone(), done_tx.clone());
+            std::thread::spawn(move || {
+                http_lane_rx.recv().unwrap();
+                cutex::asks::pause_admission::acquire_worker_fence().unwrap();
+                fence_tx.send(()).unwrap();
+                let reservation = lane.reserve().unwrap(); // fence -> lane, as native_stop
+                std::thread::sleep(Duration::from_millis(100));
+                drop(reservation);
+                cutex::asks::pause_admission::release_worker_fence();
+                done.send("lifecycle").unwrap();
+            })
+        };
+        let worker = {
+            let done = done_tx.clone();
+            std::thread::spawn(move || {
+                cutex::management::v2::session_coordination::set_thread_lane_try_only(true);
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                let submit = |command: UserInputSubmitCommand| Ok(started(&command));
+                let mut admitted = 0;
+                while admitted == 0 {
+                    assert!(std::time::Instant::now() < deadline, "owner admission did not finish");
+                    if owner_held::any_waiting().unwrap() && super::super::owner_admission::admit_one(&submit).unwrap() {
+                        admitted += 1;
+                    } else {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                done.send("worker").unwrap();
+            })
+        };
+        let mut finished = Vec::new();
+        for _ in 0..3 {
+            finished.push(done_rx.recv_timeout(Duration::from_secs(30)).expect("deadlock: a thread never finished"));
+        }
+        for thread in [http, lifecycle, worker] { thread.join().unwrap(); }
+        finished.sort();
+        assert_eq!(finished, ["http", "lifecycle", "worker"]);
+        assert!(!owner_held::has_session(session).unwrap());
+        drop(repository);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2558,6 +3077,7 @@ mod tests {
             .delivery(&command.cutex_session_id, "queued")
             .unwrap()
             .is_none());
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2602,6 +3122,7 @@ mod tests {
             .delivery(&command.cutex_session_id, "queued")
             .unwrap()
             .is_none());
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2702,6 +3223,7 @@ mod tests {
                 }
             }
         }
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2716,6 +3238,10 @@ mod tests {
             let error = mapped("turn/steer", native(-32600, message, Value::Null));
             assert_eq!((error.code.as_str(), error.retryable), ("turn_conflict", true), "{message}");
         }
+        // claude-r34: the turn is finishing; never reported as steered.
+        let error = mapped("turn/steer", native(-32009, "turn is finishing", json!({"reason": "turnFinishing"})));
+        assert_eq!((error.code.as_str(), error.details["reason"].as_str()), ("steer_unavailable", Some("turnFinishing")));
+        assert_eq!(error.details["nativeError"]["code"], -32009);
         // A runtime without steer.
         let error = mapped("turn/steer", native(-32601, "Claude cannot add input", json!({"unsupported": true})));
         assert_eq!((error.code.as_str(), error.details["reason"].as_str()), ("steer_unavailable", Some("runtimeNoSteer")));
@@ -2874,6 +3400,7 @@ mod tests {
         assert_eq!(removed.borrow().len(), 1);
         assert_eq!(removed.borrow()[0].0, "cutex/userInput/queueRemoved");
         assert_eq!(removed.borrow()[0].1["reason"], "submitted");
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2928,6 +3455,7 @@ mod tests {
         .unwrap());
         assert_eq!(*sent.borrow(), ["turn/start c"]);
         assert_eq!(clients(&repository, session), ["a", "b"]);
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2969,14 +3497,15 @@ mod tests {
             command.params.input.push(if kind == "image" {
                 json!({"type":"image","url":"data:image/png;base64,fixture"})
             } else { json!({"type":"localImage","path":private.join("screenshot.png")}) });
-            assert!(!supports_owner_steer_for_input(&session, 1, &command.params.input),
-                "a runtime without live text steer capability cannot accept images");
+            assert!(supports_owner_steer_for_input(&session, 1, &command.params.input),
+                "an unknown capability may be tried by an explicit owner steer");
             let execution = route_submit(&command, &repository, Some("running".into()), true, &never_sent, &no_flush).unwrap();
             assert_eq!(execution.disposition, UserInputDisposition::Queued);
             let before = repository.list(&session).unwrap();
             assert_eq!(before.1[0].input, command.params.input);
             let error = steer_queued_with_repository(&command, false, &repository, Some("running".into()), false,
-                || supports_owner_steer_for_input(&session, 1, &command.params.input), never_sent).unwrap_err();
+                || supports_owner_steer_for(OwnerSteerRuntime::Claude, 1,
+                    |_| Some(json!({"input":{"sameTurnSteering":false}}))), never_sent).unwrap_err();
             assert_eq!(error.code, "steer_unavailable");
             assert_eq!(error.details["reason"], "runtimeNoSteer");
             assert_eq!(repository.list(&session).unwrap(), before);
@@ -2985,6 +3514,7 @@ mod tests {
             let retained = repository.list(&session).unwrap().1;
             assert_eq!(retained.len(), 1);
             assert_eq!(retained[0].input, command.params.input, "stop preserves image and text");
+            drop(repository);
             std::fs::remove_dir_all(root).unwrap();
         }
         assert!(claude_steering_accepts(&[json!({"type":"text","text":"ordinary steer"})]));
@@ -3025,8 +3555,55 @@ mod tests {
             assert_eq!(*sent.borrow(), ["turn/start owner-message"]);
             assert!(clients(&repository, &session).is_empty());
             assert!(repository.ask_store().snapshot().unwrap().next_step_leases.contains_key(&session));
+            drop(repository);
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    /// 051 / S17: a flush pass reads the whole history only for an item with
+    /// a recorded delivery, at most once; never-sent items need only the
+    /// newest turn.
+    #[test]
+    fn flush_reads_history_only_for_recorded_deliveries_and_once_per_pass() {
+        let (root, repository) = queue_repository("flush-history-reads");
+        let session = format!("cutex.flush-reads-{}", uuid::Uuid::new_v4());
+        let mut ids = Vec::new();
+        for client in ["q0", "q1", "q2", "q3"] {
+            let command = queue_command(&session, client);
+            repository.enqueue(&session, &command.thread_id, &command.management_request_id, &command.params).unwrap();
+            ids.push(command);
+        }
+        // q0 and q1 were accepted earlier (their flush reply was lost).
+        for command in &ids[..2] {
+            assert!(repository.set_delivery(&session, &command.params.client_user_message_id, None,
+                Some(InputDelivery::Accepted { thread_id: command.thread_id.clone(), turn_id: None,
+                    accepted_at: Utc::now().to_rfc3339() })).unwrap());
+        }
+        let full = std::cell::Cell::new(0);
+        let newest = std::cell::Cell::new(0);
+        let sent = std::cell::RefCell::new(Vec::new());
+        let events = std::cell::RefCell::new(Vec::new());
+        let pass = || flush_queued_locked_with(&session, false, &repository, None,
+            |s, t| { full.set(full.get() + 1); idle_thread(s, t) },
+            |_, _| { newest.set(newest.get() + 1); Ok(None) },
+            recording_sender(&sent), recording_events(&events)).unwrap();
+        assert!(pass());
+        assert_eq!(full.get(), 1, "one whole-history read for the two recorded deliveries");
+        assert_eq!(newest.get(), 1, "the never-sent q2 needs only the newest turn");
+        assert_eq!(*sent.borrow(), ["turn/start q2"]);
+        // The next pass (turn completed): q3 never sent, no history at all.
+        assert!(pass());
+        assert_eq!((full.get(), newest.get()), (1, 2));
+        assert_eq!(*sent.borrow(), ["turn/start q2", "turn/start q3"]);
+        // A running newest turn keeps a never-sent item queued.
+        let command = queue_command(&session, "q4");
+        repository.enqueue(&session, &command.thread_id, &command.management_request_id, &command.params).unwrap();
+        assert!(!flush_queued_locked_with(&session, false, &repository, None,
+            |_, _| panic!("no history for a never-sent item"), |_, _| Ok(Some("running".into())),
+            recording_sender(&sent), recording_events(&events)).unwrap());
+        assert_eq!(sent.borrow().len(), 2);
+        drop(repository);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3053,6 +3630,44 @@ mod tests {
             recording_sender(&sent), recording_events(&events)).unwrap());
         assert_eq!(*sent.borrow(), ["turn/start waiting-owner"]);
         assert!(clients(&repository, &session).is_empty());
+        drop(repository);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idle_owner_admission_retries_image_after_final_unsent_reservation_refusal() {
+        let (root, repository) = queue_repository("idle-image-admission-retry");
+        let session = format!("cutex.idle-image-{}", uuid::Uuid::new_v4());
+        let mut command = queue_command(&session, "image-only");
+        command.params.input = vec![json!({"type":"localImage","path":"/fixture/owner.png"})];
+        repository.enqueue(&session, &command.thread_id, &command.management_request_id, &command.params).unwrap();
+        cutex::management::v2::admission::take_change(&session);
+        let sent = std::cell::RefCell::new(Vec::new());
+        let events = std::cell::RefCell::new(Vec::new());
+        let sender = |command: &UserInputSubmitCommand, method: &str, params: Value, disposition| {
+            assert_eq!(params["input"][0]["type"], "localImage");
+            recording_sender(&sent)(command, method, params, disposition)
+        };
+        // Contend at send_recorded's final reservation, before it writes Sending or calls native.
+        cutex::agent_management::AgentManagementStore::open_default().unwrap();
+        let fence = std::fs::OpenOptions::new().read(true).write(true).create(true)
+            .open(cutex::config::paths::runtime_dir().unwrap().join("agent-management/v1/agent-management-mutation-v1.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&fence).unwrap();
+        let error = send_recorded(&repository, &sender, &command, "turn/start",
+            json!({"threadId":command.thread_id,"input":command.params.input}), UserInputDisposition::Started).unwrap_err();
+        assert!(retry_deferred_queue_send(&session, &error));
+        assert!(sent.borrow().is_empty(), "busy final reservation must never reach native");
+        assert_eq!(repository.list(&session).unwrap().1.len(), 1);
+        assert!(!cutex::management::v2::admission::take_change(&session));
+        drop(fence);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(cutex::management::v2::admission::take_change(&session), "no new source event should be required");
+        assert!(flush_queued_locked(&session, false, &repository, None, idle_thread, &sender, recording_events(&events)).unwrap());
+        assert!(repository.list(&session).unwrap().1.is_empty());
+        assert_eq!(*sent.borrow(), ["turn/start image-only"]);
+        assert!(!flush_queued_locked(&session, false, &repository, None, idle_thread, &sender, recording_events(&events)).unwrap());
+        assert_eq!(sent.borrow().len(), 1, "coalesced retry must not submit twice");
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3077,6 +3692,7 @@ mod tests {
             recording_sender(&sent), recording_events(&events)).unwrap());
         assert_eq!(*sent.borrow(), ["turn/start moved-owner"]);
         assert!(clients(&repository, &session).is_empty());
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3107,6 +3723,7 @@ mod tests {
         assert!(queued.queue_paused);
         assert_eq!(clients(&repository, session), ["held-1", "held-2"]);
         assert!(repository.pause_state(session).unwrap().is_some());
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -3135,6 +3752,7 @@ mod tests {
         assert_eq!(queued.disposition, UserInputDisposition::Queued);
         assert!(repository.admission(&session).unwrap().items.iter().any(|item| item.id == ask));
         assert_eq!(clients(&repository, &session), ["held", "after-ask"]);
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3175,7 +3793,84 @@ mod tests {
             ["cutex/userInput/submitted", "cutex/userInput/queueRemoved"]
         );
         assert!(clients(&repository, session).is_empty());
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
+    }
+
+    /// r273 stab (host-a 2026-11-01): while the lifecycle fence is busy a
+    /// flush can only end deferred, so it must not read the whole native
+    /// history first; the deferral keeps a retry wake and the input.
+    #[test]
+    fn deferred_flush_reads_no_native_history_and_keeps_its_retry() {
+        let (root, repository) = queue_repository("deferred-no-history");
+        let session = "cutex.deferred-no-history";
+        let command = queue_command(session, "waiting-owner");
+        repository.enqueue(session, &command.thread_id, &command.management_request_id, &command.params).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            cutex::asks::pause_admission::acquire_worker_fence().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            cutex::asks::pause_admission::release_worker_fence();
+        });
+        held_rx.recv().unwrap();
+        let _ = cutex::management::v2::admission::take_change(session);
+        let events = std::cell::RefCell::new(Vec::new());
+        assert!(!flush_queued_locked(session, false, &repository, None, no_history, never_sent,
+            recording_events(&events)).unwrap());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(cutex::management::v2::admission::take_change(session), "the deferral keeps its retry wake");
+        assert_eq!(repository.list(session).unwrap().1.len(), 1, "queued input is kept");
+        let sent = std::cell::RefCell::new(Vec::new());
+        assert!(flush_queued_locked(session, false, &repository, None, idle_thread,
+            recording_sender(&sent), recording_events(&events)).unwrap());
+        assert_eq!(*sent.borrow(), ["turn/start waiting-owner"]);
+        cutex::management::v2::admission::admission_settled(session);
+        drop(repository);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missed_event_completion_unblocks_queued_owner_exactly_once() {
+        use cutex::asks::model::{AdmissionLease, EventOutboxRecord, LeaseHolder};
+        let (root, repository) = queue_repository("missed-event-owner");
+        let session = "cutex.missed-event-owner";
+        let command = queue_command(session, "waiting-owner");
+        repository.enqueue(session, &command.thread_id, &command.management_request_id, &command.params).unwrap();
+        let store = repository.ask_store();
+        let now = Utc::now();
+        let lease = AdmissionLease {
+            cutex_session_id: session.into(), holder: LeaseHolder::Event { event_id: "old-event".into() },
+            native_message_id: "accepted-event".into(), runtime_generation: 7,
+            turn_id: Some("old-turn".into()), since: now.to_rfc3339(),
+        };
+        store.with_state(|state| {
+            state.leases.insert(session.into(), lease.clone());
+            state.events.insert("old-event".into(), EventOutboxRecord {
+                event_id: "old-event".into(), cutex_session_id: session.into(), delivery_ids: vec![],
+                native_message_id: "accepted-event".into(), event_artifact: None,
+                turn_id: Some("old-turn".into()), acknowledged: true, created_at: now.to_rfc3339(),
+                view: None, compacted_at: None, compaction_reminder_pending: false,
+            });
+        }).unwrap();
+        let sent = std::cell::RefCell::new(Vec::new());
+        let events = std::cell::RefCell::new(Vec::new());
+        assert!(!flush_queued_locked(session, false, &repository, None, idle_thread,
+            recording_sender(&sent), recording_events(&events)).unwrap());
+        super::super::claude_runtime::reconcile_observed_history(&store, &lease, "thread-q",
+            &json!({"thread":{"id":"thread-q","turns":[{"id":"old-turn","status":"completed"}]}})).unwrap();
+        assert!(flush_queued_locked(session, false, &repository, None, idle_thread,
+            recording_sender(&sent), recording_events(&events)).unwrap());
+        assert!(!flush_queued_locked(session, false, &repository, None, idle_thread,
+            recording_sender(&sent), recording_events(&events)).unwrap());
+        assert_eq!(*sent.borrow(), ["turn/start waiting-owner"]);
+        assert!(clients(&repository, session).is_empty());
+        assert!(store.inspect(|state| state.events["old-event"].acknowledged).unwrap());
+        drop(repository);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The race: the turn ends and its idle flush runs on an empty queue; the
@@ -3211,6 +3906,7 @@ mod tests {
         assert_eq!(execution.turn_id.as_deref(), Some("turn-new"));
         assert_eq!(*sent.borrow(), ["turn/start late-1"]);
         assert!(clients(&repository, session).is_empty());
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -3260,6 +3956,7 @@ mod tests {
         )
         .expect("stop before the new item");
         assert!(!none);
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -3299,7 +3996,7 @@ mod tests {
                 turns.push(next);
             }
             Ok(UserInputSubmitExecution {
-                join_refusal: None,
+                join_refusal: None, queued_reason: None,
                 disposition,
                 app_server_accepted: true,
                 native_request_id: None,
@@ -3381,6 +4078,7 @@ mod tests {
                 UserInputDisposition::Started
             ]
         );
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -3393,7 +4091,7 @@ mod tests {
            + '_ {
         move |_, method, _, disposition| {
             Ok(UserInputSubmitExecution {
-                join_refusal: None,
+                join_refusal: None, queued_reason: None,
                 disposition,
                 app_server_accepted: true,
                 native_request_id: None,
@@ -3450,6 +4148,7 @@ mod tests {
             assert_eq!(retry.disposition, UserInputDisposition::Deduplicated);
             assert_eq!(retry.turn_id.as_deref(), Some("turn-a"));
         }
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -3485,6 +4184,7 @@ mod tests {
             .expect_err("conflict");
             assert_eq!(error.code, "idempotency_conflict");
         }
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -3531,6 +4231,7 @@ mod tests {
             .expect("resubmit");
             assert_eq!(sends.get(), 1, "{case}: sent again");
             assert_eq!(result.disposition, UserInputDisposition::Started);
+            drop(repository);
             std::fs::remove_dir_all(root).expect("remove user-input repository");
         }
     }
@@ -3618,6 +4319,7 @@ mod tests {
             repository.delivery(session, client).unwrap(),
             Some(InputDelivery::Accepted { turn_id: Some(turn), .. }) if turn == "turn-y"
         ));
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -3684,6 +4386,7 @@ mod tests {
         .expect_err("refused");
         assert_eq!(refused.code, "native_request_failed");
         assert_eq!(repository.delivery(session, client).unwrap(), None);
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -3709,6 +4412,7 @@ mod tests {
         assert!(error.outcome_unknown);
         assert!(!error.retryable);
         assert_eq!(error.stage, "post_submit");
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
 
@@ -3764,6 +4468,7 @@ mod tests {
         .unwrap());
         assert!(clients(&repository, session).is_empty());
         assert_eq!(*events.borrow(), ["cutex/userInput/queueRemoved"]);
+        drop(repository);
         std::fs::remove_dir_all(root).expect("remove user-input repository");
     }
     fn owner_join_fixture(label: &str) -> (std::path::PathBuf, cutex::management::v2::user_input::UserInputRepository, UserInputSubmitCommand) {
@@ -3785,7 +4490,7 @@ mod tests {
             attempt.turn_id = Some("delegation-turn".into());
             ask.attempts.push(attempt);
             ask.execution = ExecutionState::Running;
-            state.asks.insert(ask.ask_id.clone(), ask.clone());
+            state.asks.insert(ask.ask_id.clone(), ask.clone().into());
             state.leases.insert(label.into(), AdmissionLease { cutex_session_id: label.into(),
                 holder: LeaseHolder::Ask { ask_id: ask.ask_id.clone(), attempt: 1 },
                 native_message_id: "native-ask".into(), runtime_generation: 7,
@@ -3835,6 +4540,7 @@ mod tests {
                 let returned = cutex::asks::returns::return_item(&repository.ask_store(), &state, state.deliveries.values().next().unwrap()).unwrap();
                 let returned = cutex::asks::returns::item_json(&returned);
                 assert!(returned["flags"].as_array().unwrap().contains(&json!("ownerSteered")));
+                drop(repository);
                 std::fs::remove_dir_all(root).unwrap();
             }
         }
@@ -3877,6 +4583,7 @@ mod tests {
             let direct = route_owner_join(&command, &repository, active, generation, || true, &never_sent).unwrap();
             assert!(direct.queue.is_some());
             assert_eq!(direct.join_refusal.as_deref(), Some("joinChanged"));
+            drop(repository);
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -3905,20 +4612,94 @@ mod tests {
                 assert!(serde_json::to_value(result.queue).unwrap().get("joinDelegation").is_none());
             }
             assert_eq!(calls.get(), usize::from(reason != "runtimeNoSteer"));
+            drop(repository);
             std::fs::remove_dir_all(root).unwrap();
         }
     }
 
     #[test]
-    fn owner_join_claude_requires_current_generation_live_capability() {
-        for caps in [None, Some(json!({})), Some(json!({"input":{"sameTurnSteering":false}}))] {
-            assert!(!supports_owner_steer_for(OwnerSteerRuntime::Claude, 7, |generation| { assert_eq!(generation,7); caps }));
+    fn owner_join_claude_only_refuses_explicit_current_generation_unsupported() {
+        for caps in [None, Some(json!({})), Some(json!({"input":{"sameTurnSteering":true}}))] {
+            assert!(supports_owner_steer_for(OwnerSteerRuntime::Claude, 7, |generation| { assert_eq!(generation,7); caps }));
         }
+        assert!(!supports_owner_steer_for(OwnerSteerRuntime::Claude, 7, |_| Some(json!({"input":{"sameTurnSteering":false}}))));
         assert!(supports_owner_steer_for(OwnerSteerRuntime::Native, 7, |_| panic!("native does not use Claude capability files")));
         assert!(!supports_owner_steer_for(OwnerSteerRuntime::Unsupported, 7, |_| panic!("unsupported runtime cannot steer")));
-        assert!(!supports_owner_steer_for(OwnerSteerRuntime::Claude, 8, |generation| {
-            if generation == 7 { Some(json!({"input":{"sameTurnSteering":true}})) } else { None }
+        assert!(supports_owner_steer_for(OwnerSteerRuntime::Claude, 8, |generation| {
+            assert_eq!(generation, 8);
+            // An old explicit refusal must not veto a restarted adapter.
+            if generation == 7 { Some(json!({"input":{"sameTurnSteering":false}})) } else { None }
         }));
+    }
+
+    #[test]
+    fn queue_claude_capability_unknown_or_supported_sends_once_but_false_keeps_input() {
+        for (label, caps, allowed) in [
+            ("transient-rpc", None, true),
+            ("missing-flag", Some(json!({})), true),
+            ("supported", Some(json!({"input":{"sameTurnSteering":true}})), true),
+            ("unsupported", Some(json!({"input":{"sameTurnSteering":false}})), false),
+        ] {
+            let (root, repository) = queue_repository(label);
+            let command = queue_command(label, "original-client");
+            repository.enqueue(&command.cutex_session_id, &command.thread_id,
+                &command.management_request_id, &command.params).unwrap();
+            let calls = std::cell::Cell::new(0);
+            let result = steer_queued_at_generation(7, &command, false, &repository,
+                Some("running-turn".into()), false,
+                || supports_owner_steer_for(OwnerSteerRuntime::Claude, 7, |generation| {
+                    assert_eq!(generation, 7);
+                    caps
+                }),
+                |sent, method, params, disposition| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(method, "turn/steer");
+                    assert_eq!(params["expectedTurnId"], "running-turn");
+                    assert_eq!(params["clientUserMessageId"], "original-client");
+                    assert_eq!(params["input"], json!(command.params.input));
+                    accepted("running-turn")(sent, method, params, disposition)
+                });
+            assert_eq!(calls.get(), usize::from(allowed));
+            if allowed {
+                assert!(result.unwrap().app_server_accepted);
+                assert!(matches!(repository.delivery(label, "original-client").unwrap(), Some(InputDelivery::Accepted { .. })));
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.details["reason"], "runtimeNoSteer");
+                assert!(error.details.get("nativeError").is_none());
+                assert_eq!(clients(&repository, label), ["original-client"]);
+            }
+            drop(repository);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn queue_claude_unknown_capability_native_unsupported_is_definite_and_not_resent() {
+        let (root, repository) = queue_repository("unknown-native-unsupported");
+        let command = queue_command("unknown-native-unsupported", "original-client");
+        repository.enqueue(&command.cutex_session_id, &command.thread_id,
+            &command.management_request_id, &command.params).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let error = steer_queued_at_generation(7, &command, false, &repository,
+            Some("running-turn".into()), false,
+            || supports_owner_steer_for(OwnerSteerRuntime::Claude, 7, |_| None),
+            |_, _, _, _| {
+                calls.set(calls.get() + 1);
+                Err(UserInputExecutionError {
+                    stage: "native_request".into(),
+                    code: "native_request_failed".into(), message: "unsupported".into(),
+                    retryable: false, outcome_unknown: false,
+                    details: json!({"nativeError":{"code":-32601,"message":"unsupported"}}),
+                })
+            }).unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(error.details["reason"], "runtimeNoSteer");
+        assert_eq!(error.details["nativeError"]["code"], -32601);
+        assert!(!error.outcome_unknown);
+        assert_eq!(clients(&repository, &command.cutex_session_id), ["original-client"]);
+        drop(repository);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
 }

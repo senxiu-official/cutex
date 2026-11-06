@@ -74,6 +74,7 @@ pub enum Scoped {
     /// `GET|PUT /v2/users/me/home`, `GET|PUT|DELETE /v2/users/me/home/cover`:
     /// the caller's own home page (user-home).
     UserHome,
+    UserLayout,
     /// `GET {scope}/fs/dir|file|search|watch` and `{scope}/git/status|diff`
     /// with scope `/v2/projects/{id}` (a granted project) or
     /// `/v2/sessions/{id}` (a visible agent's cwd): read-only, read grant
@@ -173,6 +174,9 @@ macro_rules! owner_prefixes {
 /// Ordered: the first matching rule wins. Scoped rules use the exact path
 /// parsers of the handlers they guard; `OwnerOnly` prefix rules follow.
 const SCOPED_RULES: &[Rule] = &[
+    Rule { methods: GET_PUT_DELETE, matcher: Matcher::Shape(super::user_layout_api::is_path), class: Class::Scoped(Scoped::UserLayout) },
+    Rule { methods: GET, matcher: Matcher::Exact("/v2/sessions/page"), class: Class::OwnerOnly },
+    Rule { methods: GET, matcher: Matcher::Exact("/v2/sessions/changes"), class: Class::OwnerOnly },
     Rule { methods: ANY, matcher: Matcher::Shape(|path| super::delegations::parse_path(path).is_some()), class: Class::OwnerOnly },
     Rule { methods: POST, matcher: Matcher::Exact(super::pairing::PAIR_PATH), class: Class::Public },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/capabilities"), class: Class::HostRead },
@@ -224,7 +228,7 @@ const SCOPED_RULES: &[Rule] = &[
 /// Every other route family: owner only (explicitly listed so the
 /// enumeration test proves each one was considered).
 const OWNER_RULES: &[Rule] = owner_prefixes![
-    "/v2/agent-bus", "/v2/agent-management", "/v2/alarms", "/v2/approval-rules", "/v2/approvals",
+    "/v2/admission", "/v2/agent-bus", "/v2/agent-management", "/v2/alarms", "/v2/approval-rules", "/v2/approvals",
     "/v2/artifact-store", "/v2/artifacts", "/v2/asks", "/v2/browser", "/v2/capabilities",
     "/v2/claude", "/v2/client-tokens", "/v2/clients", "/v2/codex", "/v2/components", "/v2/director-rotations",
     "/v2/diagnostics", "/v2/documents", "/v2/events", "/v2/experimental", "/v2/fs", "/v2/health", "/v2/host", "/v2/human", "/v2/identity",
@@ -233,7 +237,7 @@ const OWNER_RULES: &[Rule] = owner_prefixes![
     "/v2/peers", "/v2/profile-auto-pick", "/v2/profile-imports", "/v2/profile-link", "/v2/profile-presets", "/v2/profiles", "/v2/projects",
     "/v2/model-overload-retry", "/v2/quota-auto-continue", "/v2/record-archive", "/v2/release", "/v2/runtime-packages", "/v2/safety-checks",
     "/v2/runtimes", "/v2/services", "/v2/sessions", "/v2/settings", "/v2/side-chats",
-    "/v2/storage", "/v2/summary", "/v2/task-service", "/v2/tasks", "/v2/terminals", "/v2/upgrade", "/v2/usage",
+    "/v2/storage", "/v2/summary", "/v2/task-service", "/v2/tasks", "/v2/terminals", "/v2/test", "/v2/upgrade", "/v2/usage",
     "/v2/user-instructions", "/v2/users", "/v2/workflows",
 ];
 
@@ -280,6 +284,8 @@ pub const CUTEX_READ: &[&str] = &[
     "cutex/session/groups/get",
     "cutex/focus/get",
     "cutex/userInput/queue/list",
+    "cutex/input/get",
+    "cutex/input/list",
 ];
 pub const CUTEX_SEND: &[&str] = &[
     "cutex/userInput/submit",
@@ -287,6 +293,7 @@ pub const CUTEX_SEND: &[&str] = &[
     "cutex/userInput/queue/steer",
     "cutex/userInput/queue/yield",
     "cutex/userInput/queue/update",
+    "cutex/userInput/queue/merge",
     "cutex/userInput/queue/remove",
     "cutex/userInput/queue/flush",
     "cutex/turn/stop",
@@ -436,7 +443,7 @@ pub fn gate(
         Principal::Pending => {
             return deny(
                 stream,
-                "access_pending",
+                if super::user_layout_api::is_path(path) { "user_pending" } else { "access_pending" },
                 "this device is waiting for the host owner to assign it to a user",
                 json!({}),
             )
@@ -721,6 +728,12 @@ fn scoped_gate(
             if scope.sees_project(&id) { Gate::Continue } else { not_found(stream, "project_not_found") }
         }
         Scoped::AskList => {
+            // Cleanup keyset cursors describe the host-wide owner collection.
+            // Scoped visibility filtering after an owner page would skip rows.
+            if query("updatedBefore").is_some() || query("cursor").is_some() {
+                return Ok(Gate::Handled(srv::write_v2_error(stream, 403, "Forbidden",
+                    "forbidden", "cleanup pagination requires the owner credential", false, json!({}))));
+            }
             let store = crate::asks::store::AskStore::open_default()?;
             // Filter the newest asks the owner could list, then apply the limit.
             let limit = query("limit").and_then(|v| v.parse::<usize>().ok()).filter(|l| (1..=super::asks::MAX_LIMIT).contains(l)).unwrap_or(super::asks::DEFAULT_LIMIT);
@@ -743,7 +756,7 @@ fn scoped_gate(
             }
         }
         // The handler answers for "me" only and checks who may see whom.
-        Scoped::SelfProfile | Scoped::UserAvatar | Scoped::UserHome => Gate::Continue,
+        Scoped::SelfProfile | Scoped::UserAvatar | Scoped::UserHome | Scoped::UserLayout => Gate::Continue,
         Scoped::AskRead | Scoped::AskAnswer => {
             let id = match super::asks::parse_path(path) {
                 Some(super::asks::Route::Ask(id) | super::asks::Route::Answer(id)) => id,
@@ -806,7 +819,7 @@ pub fn scope_need(
         return ScopeNeed::Read;
     }
     // user-home: the own home page is a personal setting, not the host's.
-    if super::users_api::is_home_path(path) {
+    if super::users_api::is_home_path(path) || super::user_layout_api::is_path(path) {
         return ScopeNeed::Chat;
     }
     if method == "DELETE" {
@@ -1043,6 +1056,9 @@ fn current_user_id() -> Option<String> {
 fn event_visible(event: &super::model::EventEnvelope, scope: &Scope, asks: &AskVisibility, user: Option<&str>) -> bool {
     if event.cutex_session_id == HOST_EVENTS {
         return match (&event.cutex, user) {
+            (Some(message), Some(user)) if message.method == crate::management::user_layout::CHANGED => {
+                message.params["docKey"].as_str() == Some(user)
+            }
             (Some(message), Some(user)) if message.method.starts_with("cutex/client/") => {
                 super::clients_api::event_for_user(&message.params, user)
             }

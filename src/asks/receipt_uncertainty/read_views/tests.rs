@@ -39,6 +39,7 @@ pub(crate) fn input() -> ReceiptReadInput {
         },
     };
     let evidence = Evidence {
+        stale_ack: None,
         schema_version: 1,
         runtime: "claude".into(),
         recipient_id: fixtures::TARGET.into(),
@@ -121,6 +122,82 @@ fn output_observed_and_all_exact_terminal_outcomes_remain_uncertain_not_delivere
         assert_eq!(view["confirmedLevel"], "sent");
         assert!(input.snapshot.external_input_receipt.is_none());
     }
+}
+
+#[test]
+fn later_turn_close_qualification_is_not_exact_input_read_evidence() {
+    use crate::management::v2::agent_bus_settlement_model::StaleAckEvidence;
+    for processing in ["held", "output_observed"] {
+        for outcome in ["completed", "failed", "interrupted"] {
+            let mut input = input();
+            let evidence = input.terminal.as_mut().unwrap();
+            evidence.processing_state = processing.into();
+            evidence.terminal_status = outcome.into();
+            evidence.stale_ack = Some(StaleAckEvidence {
+                queued_at: evidence.observed_at - chrono::Duration::hours(1),
+                accepted_at: evidence.observed_at - chrono::Duration::minutes(30),
+                min_wait_secs: 300,
+                native_attempt_id: Some(evidence.attempt_id.clone()),
+                later_completed_turn_id: Some("later-completed".into()),
+            });
+            evidence.validate_shape().unwrap();
+            let status = input
+                .snapshot
+                .external_input_last_observed
+                .as_mut()
+                .unwrap();
+            status.processing.state = if processing == "held" {
+                ProcessingState::Held
+            } else {
+                ProcessingState::OutputObserved
+            };
+            status.processing.reason = if processing == "held" {
+                Some(HoldReason::RequestUncertain)
+            } else {
+                None
+            };
+            assert!(
+                terminal_bound(&input).is_none(),
+                "{processing}/{outcome}: follow-up proof must not become ExactTurnRead"
+            );
+            assert_eq!(
+                project_bus_read(&input, RevisionLevel::Sent)["confirmedLevel"],
+                "sent"
+            );
+            input
+                .terminal
+                .as_mut()
+                .unwrap()
+                .stale_ack
+                .as_mut()
+                .unwrap()
+                .later_completed_turn_id = None;
+            assert!(
+                terminal_bound(&input).is_some(),
+                "the exact original-terminal path remains valid"
+            );
+        }
+    }
+}
+
+#[test]
+fn original_context_receipt_still_wins_over_followup_only_qualification() {
+    use crate::management::v2::agent_bus_settlement_model::StaleAckEvidence;
+    let mut input = input();
+    let evidence = input.terminal.as_mut().unwrap();
+    evidence.stale_ack = Some(StaleAckEvidence {
+        queued_at: evidence.observed_at - chrono::Duration::hours(1),
+        accepted_at: evidence.observed_at - chrono::Duration::minutes(30),
+        min_wait_secs: 300,
+        native_attempt_id: Some(evidence.attempt_id.clone()),
+        later_completed_turn_id: Some("later-completed".into()),
+    });
+    assert!(terminal_bound(&input).is_none());
+    input.snapshot.external_input_receipt = Some(a4(&input));
+    assert_eq!(
+        project_bus_read(&input, RevisionLevel::Sent)["state"],
+        "inContext"
+    );
 }
 
 fn a4(input: &ReceiptReadInput) -> Receipt {
@@ -318,7 +395,7 @@ fn production_view_entry_points_keep_full_original_revision_fields() {
         .unwrap();
     let mut ask = ask;
     ask.revisions.push(revision(RevisionLevel::Delivered));
-    state.asks.insert(ask.ask_id.clone(), ask.clone());
+    state.asks.insert(ask.ask_id.clone(), ask.clone().into());
     let context = context(input());
     let before = serde_json::to_vec(&state).unwrap();
     let summary = crate::asks::view::summary_with_receipts(&state, &ask, &context);

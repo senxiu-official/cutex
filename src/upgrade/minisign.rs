@@ -61,7 +61,10 @@ impl PublicKey {
             .context("empty minisign public key")?;
         let bytes = b64(line)?;
         ensure!(bytes.len() == 42, "minisign public key must be 42 bytes");
-        ensure!(bytes[..2] == ALG_LEGACY, "unsupported minisign public key algorithm");
+        ensure!(
+            bytes[..2] == ALG_LEGACY,
+            "unsupported minisign public key algorithm"
+        );
         Ok(Self {
             key_id: bytes[2..10].try_into().expect("8 bytes"),
             key: bytes[10..42].try_into().expect("32 bytes"),
@@ -84,10 +87,16 @@ impl PublicKey {
 
 impl Signature {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        ensure!(text.len() <= MAX_SIGNATURE_FILE, "minisign signature file too large");
+        ensure!(
+            text.len() <= MAX_SIGNATURE_FILE,
+            "minisign signature file too large"
+        );
         let mut lines = text.lines().map(|line| line.trim_end_matches('\r'));
         let first = lines.next().context("empty minisign signature")?;
-        ensure!(first.starts_with("untrusted comment:"), "minisign signature must start with an untrusted comment");
+        ensure!(
+            first.starts_with("untrusted comment:"),
+            "minisign signature must start with an untrusted comment"
+        );
         let sig = b64(lines.next().context("minisign signature line missing")?)?;
         ensure!(sig.len() == 74, "minisign signature must be 74 bytes");
         let prehashed = match [sig[0], sig[1]] {
@@ -101,7 +110,10 @@ impl Signature {
             .context("minisign trusted comment line malformed")?
             .to_string();
         let global = b64(lines.next().context("minisign global signature missing")?)?;
-        ensure!(global.len() == 64, "minisign global signature must be 64 bytes");
+        ensure!(
+            global.len() == 64,
+            "minisign global signature must be 64 bytes"
+        );
         Ok(Self {
             prehashed,
             key_id: sig[2..10].try_into().expect("8 bytes"),
@@ -120,15 +132,23 @@ fn ed25519_verify(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool 
 
 /// Verify `data` against a minisign signature made by one of `keys`.
 pub fn verify(keys: &[PublicKey], data: &[u8], signature: &Signature) -> anyhow::Result<Verified> {
+    if signature.prehashed {
+        verify_message(keys, &super::blake2b::Blake2b512::digest(data), signature)
+    } else {
+        verify_message(keys, data, signature)
+    }
+}
+
+fn verify_message(
+    keys: &[PublicKey],
+    message: &[u8],
+    signature: &Signature,
+) -> anyhow::Result<Verified> {
     let key = keys
         .iter()
         .find(|key| key.key_id == signature.key_id)
         .with_context(|| format!("signed by untrusted key {}", key_id_hex(&signature.key_id)))?;
-    let ok = if signature.prehashed {
-        ed25519_verify(&key.key, &super::blake2b::Blake2b512::digest(data), &signature.signature)
-    } else {
-        ed25519_verify(&key.key, data, &signature.signature)
-    };
+    let ok = ed25519_verify(&key.key, message, &signature.signature);
     ensure!(ok, "signature verification failed");
     let mut global = Vec::with_capacity(64 + signature.trusted_comment.len());
     global.extend_from_slice(&signature.signature);
@@ -137,12 +157,44 @@ pub fn verify(keys: &[PublicKey], data: &[u8], signature: &Signature) -> anyhow:
         ed25519_verify(&key.key, &global, &signature.global_signature),
         "trusted comment signature verification failed"
     );
-    Ok(Verified { key_id: key.key_id_hex(), trusted_comment: signature.trusted_comment.clone() })
+    Ok(Verified {
+        key_id: key.key_id_hex(),
+        trusted_comment: signature.trusted_comment.clone(),
+    })
 }
 
 /// Parse and verify in one step.
-pub fn verify_text(keys: &[PublicKey], data: &[u8], signature_text: &str) -> anyhow::Result<Verified> {
+pub fn verify_text(
+    keys: &[PublicKey],
+    data: &[u8],
+    signature_text: &str,
+) -> anyhow::Result<Verified> {
     verify(keys, data, &Signature::parse(signature_text)?)
+}
+
+/// Stream the standard minisign prehashed format, so large component archives
+/// do not require an archive-sized allocation. Legacy Ed signatures remain readable.
+pub fn verify_file(
+    keys: &[PublicKey],
+    path: &std::path::Path,
+    signature_text: &str,
+) -> anyhow::Result<Verified> {
+    use std::io::Read;
+    let signature = Signature::parse(signature_text)?;
+    if !signature.prehashed {
+        return verify(keys, &std::fs::read(path)?, &signature);
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = super::blake2b::Blake2b512::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    verify_message(keys, &hash.finalize(), &signature)
 }
 
 /// Test signer producing real minisign files (used by the upgrade tests;
@@ -159,12 +211,19 @@ pub(crate) mod test_key {
 
     impl TestKey {
         pub fn new(seed: u8) -> Self {
-            let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).expect("test key");
-            Self { pair, key_id: [seed, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77] }
+            let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[seed; 32])
+                .expect("test key");
+            Self {
+                pair,
+                key_id: [seed, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77],
+            }
         }
 
         pub fn public(&self) -> PublicKey {
-            PublicKey { key_id: self.key_id, key: self.pair.public_key().as_ref().try_into().expect("32") }
+            PublicKey {
+                key_id: self.key_id,
+                key: self.pair.public_key().as_ref().try_into().expect("32"),
+            }
         }
 
         pub fn public_text(&self) -> String {
@@ -183,7 +242,11 @@ pub(crate) mod test_key {
             };
             let sig = self.pair.sign(&message);
             let mut first = Vec::new();
-            first.extend_from_slice(if prehashed { &ALG_PREHASHED } else { &ALG_LEGACY });
+            first.extend_from_slice(if prehashed {
+                &ALG_PREHASHED
+            } else {
+                &ALG_LEGACY
+            });
             first.extend_from_slice(&self.key_id);
             first.extend_from_slice(sig.as_ref());
             let mut global = sig.as_ref().to_vec();
@@ -212,7 +275,10 @@ mod tests {
         for prehashed in [true, false] {
             let text = key.sign(data, prehashed, "timestamp:1760000000\tfile:manifest.json");
             let verified = verify_text(&[key.public()], data, &text).unwrap();
-            assert_eq!(verified.trusted_comment, "timestamp:1760000000\tfile:manifest.json");
+            assert_eq!(
+                verified.trusted_comment,
+                "timestamp:1760000000\tfile:manifest.json"
+            );
             assert_eq!(verified.key_id, key.public().key_id_hex());
             assert!(Signature::parse(&text).unwrap().prehashed == prehashed);
         }
@@ -225,7 +291,9 @@ mod tests {
         let data = b"payload";
         let text = key.sign(data, true, "c");
         assert!(verify_text(&[key.public()], b"payloaD", &text).is_err());
-        let error = verify_text(&[other.public()], data, &text).unwrap_err().to_string();
+        let error = verify_text(&[other.public()], data, &text)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("untrusted key"), "{error}");
         // Same key id, different key (forged id) fails the signature.
         let mut forged = other.public();
@@ -233,7 +301,9 @@ mod tests {
         assert!(verify_text(&[forged], data, &text).is_err());
         // Altered trusted comment.
         let altered = text.replace("trusted comment: c", "trusted comment: d");
-        let error = verify_text(&[key.public()], data, &altered).unwrap_err().to_string();
+        let error = verify_text(&[key.public()], data, &altered)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("trusted comment"), "{error}");
         assert!(Signature::parse("").is_err());
         assert!(Signature::parse("untrusted comment: x\nnot-base64!\n").is_err());
@@ -251,7 +321,10 @@ mod tests {
             trusted comment: timestamp:1760486400\tfile:manifest.json\thashed\n\
             9TbGc9L9zKpYyxULnQEF/2tSM6mhGM4iV+5Fa6vQt8u6JyqeSrhFzBvJjLqT5KjnwXxCz2zCu5lj2biVgifEDg==\n";
         let verified = verify_text(&[key.clone()], data.as_bytes(), signature).unwrap();
-        assert_eq!(verified.trusted_comment, "timestamp:1760486400\tfile:manifest.json\thashed");
+        assert_eq!(
+            verified.trusted_comment,
+            "timestamp:1760486400\tfile:manifest.json\thashed"
+        );
         assert!(verify_text(&[key], b"other", signature).is_err());
     }
 
@@ -260,7 +333,10 @@ mod tests {
         let key = TestKey::new(3);
         let parsed = PublicKey::parse(&key.public_text()).unwrap();
         assert_eq!(parsed, key.public());
-        assert_eq!(PublicKey::parse(&key.public().to_base64()).unwrap(), key.public());
+        assert_eq!(
+            PublicKey::parse(&key.public().to_base64()).unwrap(),
+            key.public()
+        );
         assert_eq!(parsed.key_id_hex(), "7766554433221103");
         assert!(PublicKey::parse("untrusted comment: x\n").is_err());
         assert!(PublicKey::parse("AAAA").is_err());

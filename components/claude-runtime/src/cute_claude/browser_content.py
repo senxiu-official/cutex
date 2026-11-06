@@ -1,9 +1,12 @@
 """Browser-only transport/journal policy; no authority or provider operations."""
 from copy import deepcopy
 
+# Every cutex browser tool name: the legacy tools, browser_visit and the
+# one-tool surface `browser` (cutex design 059). Results may carry an image.
 BROWSER_TOOLS = frozenset({
     'browser_list', 'browser_open', 'browser_claim', 'browser_read', 'browser_act',
     'browser_screenshot', 'browser_navigate', 'browser_release', 'browser_find',
+    'browser_visit', 'browser', 'browser_script', 'browser_script_reset',
 })
 
 

@@ -50,6 +50,9 @@ pub fn membership(snapshot:&crate::agent_management::AgentManagementSnapshot,pro
         if m.project_id.as_ref().is_some_and(|p|p.as_str()==project)
             && !snapshot.agents.get(id).is_some_and(|a|a.retired_at.is_some()) {members.insert(id.as_str().into());}
     }
+    // r271: a deleted session (roster row pending cleanup) is not a member.
+    let deleted=crate::agent_management::pending_forget::pending();
+    members.retain(|id|!deleted.contains(id));
     let mut excluded=std::collections::BTreeSet::new();
     if let Some(authority)=snapshot.projects.values().find(|a|a.project_id.as_str()==project){
         members.insert(authority.authorized_director_session.as_str().into());

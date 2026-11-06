@@ -42,6 +42,8 @@ use super::store::ServiceStore;
 use super::store::ServicesError;
 use super::store::ServicesResult;
 use super::store::ServicesSettings;
+#[path = "idle_supervisor.rs"]
+mod idle_supervisor;
 
 pub const LOG_RING_BYTES: usize = 256 * 1024;
 const LOG_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -233,11 +235,14 @@ struct Entry {
     last_seen_persisted: Option<Instant>,
     max_restarts: Option<u32>,
     crash_looped: bool,
+    idle_waking: bool,
+    idle_wake_failed: bool,
 }
 
 impl Entry {
     fn new(record: &ServiceRecord, persisted: Option<RuntimeSnapshot>) -> Self {
         let mut snapshot = persisted.unwrap_or(RuntimeSnapshot {
+            idle_stop_at: None,
             last_traffic_at: None,
             health: ServiceHealth::Unreachable,
             last_seen_at: None,
@@ -275,6 +280,8 @@ impl Entry {
             last_seen_persisted: None,
             max_restarts: None,
             crash_looped,
+            idle_waking: false,
+            idle_wake_failed: false,
         }
     }
 
@@ -295,7 +302,7 @@ impl Entry {
 fn wants_running(record: &ServiceRecord) -> bool {
     match record.runtime {
         ServiceRuntime::External | ServiceRuntime::Static => false,
-        ServiceRuntime::Managed => !record.stopped && !record.archived,
+        ServiceRuntime::Managed => !record.stopped && !record.archived && record.stopped_idle_at.is_none(),
     }
 }
 
@@ -312,9 +319,27 @@ struct Inner {
     /// Slugs whose `restartRequestedAt` changed since the last reload
     /// (`service_restart`, possibly written by the Agent Bus process).
     pending_restarts: Vec<String>,
+    registry_stamp: Option<crate::platform::file_stamp::FileStamp>,
+    reclaim_inputs: Option<ReclaimInputs>,
+    next_reclaim: Option<chrono::DateTime<chrono::Utc>>,
+    watch_session_archive: bool,
+    watch_project_archive: bool,
+    watch_ephemeral_activity: bool,
+}
+
+#[derive(Clone,PartialEq,Eq)]
+struct ReclaimInputs {
+    /// SQL roster commit stamp (project archive watch).
+    roster: Option<crate::agent_management::RosterStamp>,
+    registry: Option<crate::platform::file_stamp::FileStamp>,
+    scopes: Vec<Option<crate::platform::file_stamp::FileStamp>>,
+    session_revision: Option<u64>,
+    leases: u64,
+    traffic: u64,
 }
 
 pub struct Supervisor {
+    idle_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     store: ServiceStore,
     inner: Mutex<Inner>,
     wake: Condvar,
@@ -328,6 +353,7 @@ impl Supervisor {
         let default_cwd = crate::config::paths::home_dir().unwrap_or_else(std::env::temp_dir);
         let lifecycle = super::lifecycle::for_store(&store);
         Arc::new(Self {
+            idle_gates: Mutex::new(HashMap::new()),
             lifecycle,
             store,
             inner: Mutex::new(Inner::default()),
@@ -406,6 +432,7 @@ impl Supervisor {
 
     /// One supervision pass (also called directly by tests).
     pub fn tick(self: &Arc<Self>) {
+        self.stop_idle_services();
         self.reclaim();
         let mut events = Vec::new();
         let due = {
@@ -449,6 +476,13 @@ impl Supervisor {
                     if let Ok(logs) = self.ring(&slug) {
                         logs.note("restart requested by the owning agent");
                     }
+                    if record.stopped_idle_at.is_some() {
+                        let supervisor = self.clone();
+                        let _ = std::thread::Builder::new().name(format!("service-wake-{slug}")).spawn(move || {
+                            if let Err(error) = supervisor.restart_service(&slug) { eprintln!("services: idle restart of {slug} failed: {error}"); }
+                        });
+                        continue;
+                    }
                     if let Err(error) = self.restart_service(&slug) {
                         eprintln!("services: agent restart of {slug} failed: {error}");
                     }
@@ -464,6 +498,10 @@ impl Supervisor {
     }
 
     fn reload_locked(&self, inner: &mut Inner, events: &mut Vec<ServiceEvent>, initial: bool) {
+        let stamp = crate::platform::file_stamp::FileStamp::of(&self.store.registry_path());
+        if !initial && inner.revision.is_some() && inner.registry_stamp == stamp {
+            return;
+        }
         let registry: Registry = match self.store.load() {
             Ok(registry) => registry,
             Err(error) => {
@@ -471,6 +509,7 @@ impl Supervisor {
                 return;
             }
         };
+        inner.registry_stamp = stamp;
         if inner.revision == Some(registry.revision) {
             return;
         }
@@ -495,6 +534,7 @@ impl Supervisor {
             .cloned()
             .collect();
         for slug in removed {
+            self.idle_gates.lock().expect("service idle gates").remove(&slug);
             inner.records.remove(&slug);
             if let Some(mut entry) = inner.entries.remove(&slug) {
                 if let Some(running) = entry.running.take() {
@@ -525,7 +565,9 @@ impl Supervisor {
                 // one carries over (process, restarts, health, traffic).
                 if let Some(mut entry) = inner.entries.remove(&slug) {
                     if let Some(running) = entry.running.take() {
-                        entry.logs.note("service registered again; stopping the previous one");
+                        entry
+                            .logs
+                            .note("service registered again; stopping the previous one");
                         running.tree.kill();
                     }
                 }
@@ -588,7 +630,7 @@ impl Supervisor {
             let generation = inner.generation + 1;
             let entry = inner.entries.get_mut(&slug).expect("entry per record");
             let fingerprint = record.launch_fingerprint();
-            let want = wants_running(&record) && !entry.crash_looped;
+            let want = (wants_running(&record) || (entry.idle_waking && !record.stopped && !record.archived)) && !entry.crash_looped;
             if let Some(running) = &entry.running {
                 let stale = fingerprint != entry.fingerprint;
                 if !want || stale {
@@ -632,6 +674,7 @@ impl Supervisor {
                 }
             }
             if want
+                && record.stopped_idle_at.is_none()
                 && entry.running.is_none()
                 && entry.next_restart.is_none_or(|at| Instant::now() >= at)
             {
@@ -716,7 +759,7 @@ impl Supervisor {
     }
 
     fn schedule_restart(&self, record: &ServiceRecord, entry: &mut Entry) {
-        if record.runtime != ServiceRuntime::Managed || record.stopped {
+        if record.runtime != ServiceRuntime::Managed || record.stopped || record.stopped_idle_at.is_some() {
             entry.next_restart = None;
             entry.snapshot.next_restart_at = None;
             return;
@@ -901,10 +944,22 @@ impl Supervisor {
     }
 
     fn persist_locked(&self, inner: &mut Inner) {
+        let now = chrono::Utc::now();
         for (slug, entry) in &mut inner.entries {
             if let Some(at) = super::traffic::take_persisted_timestamp(slug) {
                 if entry.snapshot.last_traffic_at.as_ref() != Some(&at) {
                     entry.snapshot.last_traffic_at = Some(at);
+                    inner.state_dirty = true;
+                }
+            }
+            if let Some(record) = inner.records.get(slug) {
+                let traffic = super::traffic::snapshot_for(record);
+                // Match the persisted lastTrafficAt cadence, rather than writing
+                // state on every packet. Live connections and leases still clear
+                // the estimate immediately; Management views use live facts.
+                let at = self.lifecycle.idle_stop_at(record, entry.snapshot.last_traffic_at.as_deref(), entry.snapshot.started_at.as_deref(), traffic.active_connections, now).map(|at| at.to_rfc3339());
+                if entry.snapshot.idle_stop_at != at {
+                    entry.snapshot.idle_stop_at = at;
                     inner.state_dirty = true;
                 }
             }
@@ -970,7 +1025,31 @@ impl Supervisor {
         // The registry lock makes the predicate and delete atomic against lifetime upgrades.
         // Lock order is supervisor -> registry, like reconciliation; leases never take either lock.
         let mut inner = self.inner.lock().expect("services supervisor");
+        let inputs = self.reclaim_inputs(&inner);
+        if inner.reclaim_inputs.as_ref() == Some(&inputs)
+            && inner.next_reclaim.is_none_or(|deadline| now < deadline)
+        {
+            return;
+        }
         let result = self.store.mutate(|registry| {
+            inner.watch_ephemeral_activity = registry.services.values().any(|record| {
+                record.lifetime == super::store::ServiceLifetime::Ephemeral && !record.archived
+            });
+            inner.watch_session_archive = registry.settings.reclaim_on_owner_archive
+                && registry.services.values().any(|record| {
+                    record.lifetime == super::store::ServiceLifetime::Ephemeral
+                        && record.owner_scope.is_session()
+                        && record.owner_cutex_session_id.is_some()
+                });
+            inner.watch_project_archive = registry.settings.reclaim_on_owner_archive
+                && registry.services.values().any(|record| {
+                    record.lifetime == super::store::ServiceLifetime::Ephemeral
+                        && !record.owner_scope.is_session()
+                        && record.project_id.is_some()
+                });
+            // Sample before reading the predicates. Changes during or after
+            // this transaction remain visible as dirty on the next tick.
+            let inputs = self.reclaim_inputs(&inner);
             // Only the owners' archived state is needed. Read it from the shared
             // session-store snapshot (no whole-store copy), and only when some
             // service has an owner: an empty or ownerless registry does no
@@ -984,10 +1063,14 @@ impl Supervisor {
                 .filter_map(|record| {
                     let traffic = super::traffic::snapshot_for(record);
                     let archived = if record.owner_scope.is_session() {
-                        record.owner_cutex_session_id.as_ref()
+                        record
+                            .owner_cutex_session_id
+                            .as_ref()
                             .is_some_and(|owner| archived_owners.contains(owner.as_str()))
                     } else {
-                        record.project_id.as_ref()
+                        record
+                            .project_id
+                            .as_ref()
                             .is_some_and(|project| archived_projects.contains(project.as_str()))
                     };
                     self.lifecycle
@@ -1018,11 +1101,14 @@ impl Supervisor {
             registry.tombstones.retain(|_, tomb| {
                 super::lifecycle::parse_time(&tomb.reclaimed_at).is_some_and(|at| at > cutoff)
             });
-            Ok(victims)
+            let next = self.next_reclaim_at(registry, now);
+            Ok((victims, next, inputs))
         });
         let mut events = Vec::new();
         match result {
-            Ok(victims) => {
+            Ok((victims, next, inputs)) => {
+                inner.next_reclaim = next;
+                inner.reclaim_inputs = Some(inputs);
                 for (record, _) in victims {
                     self.lifecycle.forget(&record.slug);
                     inner.records.remove(&record.slug);
@@ -1040,6 +1126,68 @@ impl Supervisor {
         }
         drop(inner);
         self.emit(events);
+    }
+
+    fn reclaim_inputs(&self, inner: &Inner) -> ReclaimInputs {
+        use crate::platform::file_stamp::FileStamp;
+        let scopes = Vec::new();
+        // SQLite commits cannot be inferred from WAL file timestamps (notably
+        // on Windows with open handles). Use its shared incremental revision.
+        let session_revision = inner
+            .watch_session_archive
+            .then(|| {
+                crate::session::store::with_cutex_session_store(|store| store.store_revision.get())
+                    .ok()
+            })
+            .flatten();
+        let roster = inner
+            .watch_project_archive
+            .then(|| crate::config::paths::runtime_dir().ok())
+            .flatten()
+            .and_then(|root| crate::agent_management::roster_stamp(&root.join("agent-management/v1")));
+        ReclaimInputs {
+            roster,
+            registry: FileStamp::of(&self.store.registry_path()),
+            scopes,
+            session_revision,
+            leases: if inner.watch_ephemeral_activity {
+                self.lifecycle.revision()
+            } else {
+                0
+            },
+            traffic: if inner.watch_ephemeral_activity {
+                super::traffic::revision()
+            } else {
+                0
+            },
+        }
+    }
+
+    fn next_reclaim_at(
+        &self,
+        registry: &Registry,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let mut deadlines = Vec::new();
+        for record in registry.services.values().filter(|record| {
+            record.lifetime == super::store::ServiceLifetime::Ephemeral && !record.archived
+        }) {
+            deadlines.extend(super::lifecycle::expires_at(record, &registry.settings));
+            let traffic = super::traffic::snapshot_for(record);
+            deadlines.extend(self.lifecycle.idle_at(
+                record,
+                &registry.settings,
+                traffic.last_traffic_at.as_deref(),
+                traffic.active_connections,
+                now,
+            ));
+            deadlines.extend(self.lifecycle.next_lease_expiry(&record.slug));
+        }
+        deadlines.extend(registry.tombstones.values().filter_map(|tomb| {
+            super::lifecycle::parse_time(&tomb.reclaimed_at)
+                .map(|at| at + chrono::Duration::days(registry.settings.tombstone_days.into()))
+        }));
+        deadlines.into_iter().min()
     }
 
     fn require_supervised(&self, slug: &str) -> ServicesResult<ServiceRecord> {
@@ -1066,13 +1214,26 @@ impl Supervisor {
 
     /// `POST /v2/services/{slug}/start`.
     pub fn start_service(self: &Arc<Self>, slug: &str) -> ServicesResult<Value> {
-        self.require_supervised(slug)?;
+        let record = self.require_supervised(slug)?;
+        if record.stopped_idle_at.is_some() && !record.stopped {
+            self.store.mutate(|registry| {
+                let current = registry.services.get_mut(slug).ok_or_else(|| ServicesError::not_found(slug))?;
+                if current.stopped || current.archived { return Err(ServicesError::new(409, "service_changed", "Service was stopped while waking.")); }
+                current.idle_wake_failed_at = None;
+                Ok(())
+            })?;
+            if let Some(entry) = self.inner.lock().expect("services supervisor").entries.get_mut(slug) { entry.idle_wake_failed = false; }
+            self.ready_for_proxy(slug)?;
+            return self.view(slug);
+        }
         self.store.set_stopped(slug, false)?;
         {
             let mut inner = self.inner.lock().expect("services supervisor");
             let mut events = Vec::new();
             self.reload_locked(&mut inner, &mut events, false);
             if let Some(entry) = inner.entries.get_mut(slug) {
+                entry.idle_waking = false;
+                entry.idle_wake_failed = false;
                 entry.next_restart = None;
                 entry.backoff = BACKOFF_MIN;
                 entry.crash_looped = false;
@@ -1109,6 +1270,7 @@ impl Supervisor {
     /// `POST /v2/services/{slug}/restart`: kill (if running) and start again.
     pub fn restart_service(self: &Arc<Self>, slug: &str) -> ServicesResult<Value> {
         let record = self.require_supervised(slug)?;
+        if record.stopped_idle_at.is_some() && !record.stopped { return self.start_service(slug); }
         let killed = {
             let mut inner = self.inner.lock().expect("services supervisor");
             inner.entries.get_mut(slug).is_some_and(|entry| {
@@ -1152,6 +1314,9 @@ impl Supervisor {
 
     pub fn open_service(self: &Arc<Self>, slug: &str) -> ServicesResult<Value> {
         let record = self.store.get(slug)?;
+        if super::idle::eligible(&record) && record.stopped {
+            return Err(ServicesError::new(503, "service_manually_stopped", "Stopped by the owner; use Start in the service menu."));
+        }
         if record.archived {
             return Err(ServicesError::new(
                 409,
@@ -1167,29 +1332,33 @@ impl Supervisor {
                     .get(slug)
                     .is_some_and(|entry| entry.running.is_some())
             };
-            if record.stopped || !running {
-                self.start_service(slug)?;
-            }
-            let deadline = Instant::now() + OPEN_READY_TIMEOUT;
-            loop {
-                let ready = probe(record.port, record.path.as_deref());
-                if ready || Instant::now() >= deadline {
-                    if ready {
-                        self.probe_all();
+            if record.stopped_idle_at.is_some() && !record.stopped {
+                self.ready_for_proxy(slug)?;
+            } else {
+                if record.stopped || !running {
+                    self.start_service(slug)?;
+                }
+                let deadline = Instant::now() + OPEN_READY_TIMEOUT;
+                loop {
+                    let ready = probe(record.port, record.path.as_deref());
+                    if ready || Instant::now() >= deadline {
+                        if ready {
+                            self.probe_all();
+                        }
+                        break;
                     }
-                    break;
+                    let alive = {
+                        let inner = self.inner.lock().expect("services supervisor");
+                        inner
+                            .entries
+                            .get(slug)
+                            .is_some_and(|entry| entry.running.is_some())
+                    };
+                    if !alive {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
                 }
-                let alive = {
-                    let inner = self.inner.lock().expect("services supervisor");
-                    inner
-                        .entries
-                        .get(slug)
-                        .is_some_and(|entry| entry.running.is_some())
-                };
-                if !alive {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(250));
             }
         }
         let view = self.view(slug)?;
@@ -1393,7 +1562,7 @@ fn projects_archived<'a>(
     if projects.is_empty() {
         return Default::default();
     }
-    crate::memory::load_agent_management_snapshot()
+    crate::memory::load_agent_management_directory()
         .map(|snapshot| {
             snapshot.project_states.values()
                 .filter(|state| projects.contains(state.project_id.as_str()))
@@ -1468,6 +1637,51 @@ mod tests {
     use crate::services::store::RegisterRequest;
     use crate::services::store::ServiceCommand;
     use std::net::TcpListener;
+
+    #[test]
+    #[ignore = "EVA-scale services fixture; scripts/perf/waste-runtime.ps1"]
+    fn waste_scale_b8_idle_services() {
+        use crate::test_support::waste_runtime_scale as scale;
+        let root = scale::Root::new("b8");
+        let store =
+            ServiceStore::new(root.path().to_path_buf(), "scale-host").with_port_probe(|_| false);
+        for i in 0..40 {
+            store
+                .register(
+                    RegisterRequest {
+                        slug: format!("scale-{i}"),
+                        port: Some(40000 + i),
+                        lifetime: Some("ephemeral".into()),
+                        ..Default::default()
+                    },
+                    &Caller::Owner,
+                )
+                .unwrap();
+        }
+        let (supervisor, _) = recording_supervisor(store.clone());
+        supervisor.inner.lock().unwrap().last_health = Some(Instant::now());
+        supervisor.tick();
+        super::super::store::REGISTRY_READS.with(|n| n.set(0));
+        let mut samples = Vec::new();
+        for _ in 0..100 {
+            let start = Instant::now();
+            supervisor.tick();
+            samples.push(start.elapsed());
+        }
+        let reads = super::super::store::REGISTRY_READS.with(|n| n.get());
+        scale::emit(
+            "B8",
+            serde_json::json!({"services":40,"registry_bytes":std::fs::metadata(store.registry_path()).unwrap().len()}),
+            &samples,
+            serde_json::json!({"registry_full_reads":reads}),
+        );
+        if !scale::before() {
+            assert_eq!(
+                reads, 0,
+                "no full registry read between lifecycle deadlines or source changes"
+            );
+        }
+    }
 
     fn temp_store() -> ServiceStore {
         let dir = std::env::temp_dir().join(format!(
@@ -1603,6 +1817,15 @@ mod tests {
                 "{slug}"
             );
         }
+        // Settle our own registry changes, then retire the remaining owner
+        // without touching the service registry. SQLite revision invalidates
+        // the previously cached future deadline.
+        supervisor.reclaim();
+        let mut latest=crate::session::store::load_cutex_session_store_shared().unwrap().as_ref().clone();
+        latest.sessions.get_mut("cutex.live").unwrap().archive_state=CutexSessionArchiveState::Retired;
+        crate::session::store::save_cutex_session_store(&latest).unwrap();
+        supervisor.reclaim();
+        assert_eq!(store.get_tombstone("live-owner").unwrap().unwrap().reason,"owner_archived");
     }
 
     #[test]
@@ -1610,43 +1833,165 @@ mod tests {
         use crate::agent_management::{AgentManagementStore, ProjectId, ProjectStateRecord};
         let _home = crate::profiles::lifecycle::tests::TestHome::new();
         let projects = AgentManagementStore::open_default().unwrap();
-        projects.with_state(true, |mut snapshot| {
-            for (project, lifecycle) in [("active", "active"), ("archived", "archived"), ("removed", "removed")] {
-                let state: ProjectStateRecord = serde_json::from_value(json!({
-                    "project_id": project, "lifecycle": lifecycle, "revision": 1,
-                    "created_at": "2026-10-28T00:00:00Z", "updated_at": "2026-10-28T00:00:00Z"
-                })).unwrap();
-                snapshot.project_states.insert(ProjectId::new(project).unwrap(), state);
-            }
-            Ok((snapshot, (), true))
-        }).unwrap();
+        projects
+            .with_state(true, |mut snapshot| {
+                for (project, lifecycle) in [
+                    ("active", "active"),
+                    ("archived", "archived"),
+                    ("removed", "removed"),
+                ] {
+                    let state: ProjectStateRecord = serde_json::from_value(json!({
+                        "project_id": project, "lifecycle": lifecycle, "revision": 1,
+                        "created_at": "2026-10-28T00:00:00Z", "updated_at": "2026-10-28T00:00:00Z"
+                    }))
+                    .unwrap();
+                    snapshot
+                        .project_states
+                        .insert(ProjectId::new(project).unwrap(), state);
+                }
+                Ok((snapshot, (), true))
+            })
+            .unwrap();
         let store = temp_store();
-        store.mutate(|registry| {
-            for project in ["active", "archived", "removed", "legacy"] {
-                let record: ServiceRecord = serde_json::from_value(json!({
-                    "slug": project, "displayName": project, "host": "testhost", "port": 1,
-                    "runtime": "external", "lifetime": "ephemeral", "pinned": true,
-                    "ownerScope": "project", "projectId": project,
-                    "ownerCutexSessionId": "cutex.missing",
-                    "createdAt": chrono::Utc::now().to_rfc3339(),
-                    "updatedAt": chrono::Utc::now().to_rfc3339()
-                })).unwrap();
-                registry.services.insert(project.into(), record);
-            }
-            Ok(())
-        }).unwrap();
+        store
+            .mutate(|registry| {
+                for project in ["active", "archived", "removed", "legacy"] {
+                    let record: ServiceRecord = serde_json::from_value(json!({
+                        "slug": project, "displayName": project, "host": "testhost", "port": 1,
+                        "runtime": "external", "lifetime": "ephemeral", "pinned": true,
+                        "ownerScope": "project", "projectId": project,
+                        "ownerCutexSessionId": "cutex.missing",
+                        "createdAt": chrono::Utc::now().to_rfc3339(),
+                        "updatedAt": chrono::Utc::now().to_rfc3339()
+                    }))
+                    .unwrap();
+                    registry.services.insert(project.into(), record);
+                }
+                Ok(())
+            })
+            .unwrap();
         let (supervisor, _) = recording_supervisor_unlocked(store.clone());
         supervisor.reclaim();
         for project in ["active", "legacy"] {
-            assert!(store.get(project).is_ok(), "missing registrant is not the project's archive");
+            assert!(
+                store.get(project).is_ok(),
+                "missing registrant is not the project's archive"
+            );
         }
         for project in ["archived", "removed"] {
             let tombstone = store.get_tombstone(project).unwrap().unwrap();
             assert_eq!(tombstone.reason, "project_archived");
             crate::management::v2::schema_export::assert_valid(
-                "services", "tombstone", &serde_json::to_value(&tombstone).unwrap(),
+                "services",
+                "tombstone",
+                &serde_json::to_value(&tombstone).unwrap(),
             );
         }
+        // A project archived after the cached pass must invalidate the
+        // schedule even though services/registry.json itself did not change.
+        projects
+            .with_state(true, |mut snapshot| {
+                snapshot
+                    .project_states
+                    .get_mut(&ProjectId::new("active").unwrap())
+                    .unwrap()
+                    .lifecycle = crate::agent_management::ProjectLifecycle::Archived;
+                Ok((snapshot, (), true))
+            })
+            .unwrap();
+        supervisor.reclaim();
+        assert_eq!(
+            store.get_tombstone("active").unwrap().unwrap().reason,
+            "project_archived"
+        );
+    }
+
+    #[test]
+    fn waste_guard_b8_idle_registry_budget_and_deadline_recheck() {
+        use crate::test_support::waste_runtime_scale as scale;
+        let root = scale::Root::new("b8-guard");
+        let store =
+            ServiceStore::new(root.path().to_path_buf(), "scale-host").with_port_probe(|_| false);
+        store
+            .register(
+                RegisterRequest {
+                    slug: "kept".into(),
+                    port: Some(40123),
+                    lifetime: Some("persistent".into()),
+                    ..Default::default()
+                },
+                &Caller::Owner,
+            )
+            .unwrap();
+        let (supervisor, _) = recording_supervisor(store.clone());
+        supervisor.reclaim();
+        super::super::store::REGISTRY_READS.with(|n| n.set(0));
+        for _ in 0..20 {
+            supervisor.reclaim();
+        }
+        assert_eq!(super::super::store::REGISTRY_READS.with(|n| n.get()), 0);
+        // Force a due deadline, but upgrade retention before the delete CAS:
+        // the locked predicate must re-read the real registry, never delete
+        // according to a cached expiry decision.
+        store
+            .mutate(|registry| {
+                let record = registry.services.get_mut("kept").unwrap();
+                record.lifetime = super::super::store::ServiceLifetime::Ephemeral;
+                record.created_at = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+                Ok(())
+            })
+            .unwrap();
+        store
+            .mutate(|registry| {
+                registry.services.get_mut("kept").unwrap().lifetime =
+                    super::super::store::ServiceLifetime::Persistent;
+                Ok(())
+            })
+            .unwrap();
+        super::super::store::REGISTRY_READS.with(|n| n.set(0));
+        supervisor.inner.lock().unwrap().next_reclaim =
+            Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        supervisor.reclaim();
+        assert!(store.get("kept").is_ok());
+        assert_eq!(super::super::store::REGISTRY_READS.with(|n| n.get()), 2); // due scan + this get
+    }
+
+    #[test]
+    fn scheduled_reclaim_follows_lease_release_and_traffic_changes() {
+        let store = temp_store().with_port_probe(|_| false);
+        store
+            .register(
+                RegisterRequest {
+                    slug: "ephemeral".into(),
+                    port: Some(40124),
+                    lifetime: Some("ephemeral".into()),
+                    ..Default::default()
+                },
+                &Caller::Owner,
+            )
+            .unwrap();
+        let (supervisor, _) = recording_supervisor(store.clone());
+        let now = chrono::Utc::now();
+        let lease = supervisor
+            .lifecycle
+            .lease("ephemeral", None, None, now)
+            .unwrap();
+        supervisor.reclaim();
+        let with_lease = supervisor.inner.lock().unwrap().reclaim_inputs.clone();
+        assert!(supervisor.inner.lock().unwrap().next_reclaim.is_some());
+        assert!(supervisor
+            .lifecycle
+            .release("ephemeral", &lease.lease_id, now));
+        supervisor.reclaim();
+        let after_release = supervisor.inner.lock().unwrap().reclaim_inputs.clone();
+        assert!(with_lease != after_release);
+        let connection = super::super::traffic::begin("ephemeral");
+        supervisor.reclaim();
+        let active = supervisor.inner.lock().unwrap().reclaim_inputs.clone();
+        drop(connection);
+        supervisor.reclaim();
+        assert!(active != supervisor.inner.lock().unwrap().reclaim_inputs);
+        assert!(store.get("ephemeral").is_ok());
     }
 
     #[test]
@@ -1877,7 +2222,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_lifecycle_and_open_starts_stopped() {
+    fn managed_lifecycle_and_explicit_start_after_manual_stop() {
         if !node_available() {
             eprintln!("node not found; skipping");
             return;
@@ -1959,8 +2304,10 @@ mod tests {
             !crate::services::health::probe(managed.port, None)
         }));
 
-        // Open on a stopped managed service starts it and clears `stopped`.
+        // Persistent manual stop requires an explicit start, including view-ticket opens.
         assert_eq!(supervisor.view("managed").unwrap()["health"], "stopped");
+        assert_eq!(supervisor.open_service("managed").unwrap_err().code, "service_manually_stopped");
+        supervisor.start_service("managed").unwrap();
         let opened = supervisor.open_service("managed").unwrap();
         assert_eq!(opened["health"], "reachable");
         assert_eq!(
@@ -1968,6 +2315,10 @@ mod tests {
             format!("http://127.0.0.1:{}/", managed.port)
         );
         assert!(!store.get("managed").unwrap().stopped);
+        // The previous ephemeral open behavior remains unchanged.
+        store.update("managed", super::super::store::UpdateRequest { lifetime: Some("ephemeral".into()), ..Default::default() }, &Caller::Owner).unwrap();
+        supervisor.stop_service("managed").unwrap();
+        assert_eq!(supervisor.open_service("managed").unwrap()["health"], "reachable");
         // Unregistering a running service stops it.
         store.remove("managed", &Caller::Owner).unwrap();
         supervisor.sync();

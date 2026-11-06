@@ -252,6 +252,7 @@ impl AgentManagementProvider {
             } else {
                 AgentOperation::Online {
                     cutex_session_id: request.cutex_session_id.clone(),
+                    allow_unlisted: false,
                 }
             },
         };

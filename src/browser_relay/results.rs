@@ -11,6 +11,8 @@ struct Node {
     name: String,
     value: Option<String>,
     truncated: Option<bool>,
+    /// browser-page-links-v1: a link's target or an image's source.
+    url: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -30,6 +32,11 @@ struct Page {
     /// browser-scroll-outcome: a wheel scroll's observed effect on the
     /// container that moved (CSS px) and whether it is at the requested edge.
     scroll: Option<ScrollOutcome>,
+    /// browser-page-links-v1: `true` when this click opened a new tab (main
+    /// admitted it as the agent's own popup; its lease arrives under
+    /// browser-popup-grant), or `{"blocked": <reason>}` when main blocked the
+    /// page's attempt to open one.
+    new_tab: Option<Value>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -59,6 +66,10 @@ pub struct Tab {
 struct Open {
     kind: String,
     tab: Tab,
+    /// Design 059 staged open (`browser-open-stages-v1`): "loading" = the
+    /// tab exists and is leased; its first load is still running.
+    #[serde(default, rename = "loadState")]
+    load_state: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +112,8 @@ pub struct Projection {
     pub refs: Vec<String>,
     pub opened: Option<Tab>,
     pub validated_image: Option<super::images::ValidImage>,
+    /// The tab's current page, for the lease view (browser_list).
+    pub url: Option<String>,
 }
 fn seq(value: u64) -> Result<()> {
     if value > 0 && value <= MAX_SEQUENCE {
@@ -126,6 +139,7 @@ pub fn project(value: Value, kind: &str) -> Result<Projection> {
         refs: Vec::new(),
         opened: None,
         validated_image: None,
+        url: None,
     };
     match kind {
         "tab.snapshot" | "tab.find" => {
@@ -167,12 +181,21 @@ pub fn project(value: Value, kind: &str) -> Result<Projection> {
                 if node.truncated == Some(true) {
                     item["truncated"] = json!(true);
                 }
+                if let Some(url) = node.url.as_deref() {
+                    if url.len() > 8192 {
+                        return Err(bad());
+                    }
+                    let url = link_url(url);
+                    if !url.is_empty() {
+                        item["url"] = json!(url);
+                    }
+                }
                 let item_text = serde_json::to_string(&item).map_err(|_| bad())?;
                 let added = serde_json::to_vec(&item_text).map_err(|_| bad())?.len() - 2
                     + usize::from(!projection.refs.is_empty());
                 if escaped_bytes + added > 63 * 1024 {
                     out["truncated"] = json!(true);
-                    out["hint"] = json!("Use browser_find for a smaller set of matches.");
+                    out["hint"] = json!("This read stops here; the page has more. Use browser_find for specific matches, or scroll down and read again (pages that load as you scroll add rows only then).");
                     break;
                 }
                 escaped_bytes += added;
@@ -180,6 +203,7 @@ pub fn project(value: Value, kind: &str) -> Result<Projection> {
                 projection.refs.push(node.r#ref);
             }
             projection.page_generation = Some(snapshot.page_generation);
+            projection.url = Some(safe_url(&snapshot.url));
             projection.content = text_result(out);
         }
         "tab.act" => {
@@ -194,6 +218,15 @@ pub fn project(value: Value, kind: &str) -> Result<Projection> {
                 }
                 out["scroll"] = json!({"dx":scroll.dx,"dy":scroll.dy,"atEdge":scroll.at_edge});
             }
+            match page.new_tab {
+                None => {}
+                Some(Value::Bool(true)) => out["newTab"] = json!(true),
+                Some(blocked) => {
+                    let reason = blocked.as_object().filter(|o| o.len() == 1).and_then(|o| o.get("blocked")).and_then(Value::as_str);
+                    let note = reason.and_then(blocked_popup_note).ok_or_else(bad)?;
+                    out["newTab"] = json!({"blocked": reason, "note": note});
+                }
+            }
             projection.content = text_result(out);
         }
         "tab.navigate" => {
@@ -203,6 +236,7 @@ pub fn project(value: Value, kind: &str) -> Result<Projection> {
                 return Err(bad());
             }
             projection.page_generation = Some(page.page_generation);
+            projection.url = Some(safe_url(&page.url));
             projection.content = text_result(
                 json!({"kind":page.kind,"pageGeneration":page.page_generation,"url":safe_url(&page.url)}),
             );
@@ -254,13 +288,19 @@ pub fn project(value: Value, kind: &str) -> Result<Projection> {
                 || !display_text(&open.tab.title, 200)
                 || safe_url(&open.tab.url).is_empty()
                 || open.tab.tab_ref.as_ref().is_some_and(|v| !identifier(v))
+                || open.load_state.as_deref().is_some_and(|state| !matches!(state, "loading" | "loaded"))
             {
                 return Err(bad());
             }
             projection.page_generation = Some(open.tab.page_generation);
-            projection.content = text_result(
-                json!({"kind":kind,"tab":{"guestId":open.tab.guest_id,"url":safe_url(&open.tab.url),"title":open.tab.title,"pageGeneration":open.tab.page_generation}}),
-            );
+            let mut body = json!({"kind":kind,"tab":{"guestId":open.tab.guest_id,"url":safe_url(&open.tab.url),"title":open.tab.title,"pageGeneration":open.tab.page_generation}});
+            if let Some(state) = &open.load_state {
+                body["loadState"] = json!(state);
+                if state == "loading" {
+                    body["note"] = json!("The page is still loading. Read it, or wait for load with act, before acting on it.");
+                }
+            }
+            projection.content = text_result(body);
             projection.opened = Some(open.tab);
         }
         _ => return Err(RelayError::new("unsupported_operation")),
@@ -275,9 +315,51 @@ pub fn project(value: Value, kind: &str) -> Result<Projection> {
     Ok(projection)
 }
 
+/// The desktop's fixed reasons for a page popup it blocked after the agent's
+/// click, each with what the agent can do next. Unknown reasons are invalid.
+fn blocked_popup_note(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "late_page_popup" => "The page tried to open a tab after your click's input window (from script, typically after asking its server); the desktop blocks those like a popup blocker and shows the owner a popup-blocked notice. Nothing opened. Read this tab: if the target is a link, open it with browser_navigate; otherwise ask the owner to click it.",
+        "rate_limited" => "The page tried to open more than one tab per second; the desktop blocked this one. Nothing opened.",
+        "address_not_allowed" => "The page tried to open a tab at an address the desktop does not allow pages to open. Nothing opened.",
+        "form_post" => "The page tried to send a form into a new tab; the desktop blocks that. Nothing opened; ask the owner to do this step.",
+        "invalid_url" => "The page tried to open a tab with an invalid address. Nothing opened.",
+        "unavailable" => "The page tried to open a tab, but the desktop could not open one right now. Nothing opened.",
+        _ => return None,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// browser-page-links-v1: links / images carry a redacted url; a click that
+    /// opened a tab says so; reads and navigations report the page for the lease view.
+    #[test]
+    fn browser_page_links_new_tab_and_current_url() {
+        let nodes = json!([{"ref":"a","role":"link","name":"订单详情","url":"https://trade.example.com/detail?id=5&token=secret"},
+            {"ref":"b","role":"image","name":"","url":"https://img.example.com/sku-red.jpg"},
+            {"ref":"c","role":"image","name":"","url":"javascript:alert(1)"}]);
+        let out = project(json!({"kind":"tab.snapshot","pageGeneration":3,"snapshotId":1,"url":"https://trade.example.com/list","nodes":nodes,"truncated":false}), "tab.snapshot").unwrap();
+        let text: Value = serde_json::from_str(out.content["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text["nodes"][0]["url"], "https://trade.example.com/detail?id=5");
+        assert!(!text.to_string().contains("secret"));
+        assert_eq!(text["nodes"][1]["url"], "https://img.example.com/sku-red.jpg");
+        assert!(text["nodes"][2].get("url").is_none());
+        assert_eq!(out.url.as_deref(), Some("https://trade.example.com/list"));
+        let long = json!([{"ref":"a","role":"link","name":"x","url":format!("https://e.com/{}", "a".repeat(8200))}]);
+        assert!(project(json!({"kind":"tab.snapshot","pageGeneration":3,"snapshotId":1,"url":"https://e.com/","nodes":long,"truncated":false}), "tab.snapshot").is_err());
+        let act = project(json!({"kind":"tab.act","pageGeneration":3,"newTab":true}), "tab.act").unwrap();
+        assert!(act.content.to_string().contains("newTab"));
+        assert!(project(json!({"kind":"tab.act","pageGeneration":3,"newTab":false}), "tab.act").is_err());
+        // A popup main blocked: the fixed reason and what to do next, never page data.
+        let blocked = project(json!({"kind":"tab.act","pageGeneration":3,"newTab":{"blocked":"late_page_popup"}}), "tab.act").unwrap();
+        let text = blocked.content.to_string();
+        assert!(text.contains("late_page_popup") && text.contains("browser_navigate"), "{text}");
+        for bad in [json!({"blocked":"<b>"}), json!({"blocked":"late_page_popup","url":"https://x/"}), json!({}), json!("late_page_popup")] {
+            assert!(project(json!({"kind":"tab.act","pageGeneration":3,"newTab":bad}), "tab.act").is_err(), "{bad}");
+        }
+        let nav = project(json!({"kind":"tab.navigate","pageGeneration":4,"url":"https://trade.example.com/x"}), "tab.navigate").unwrap();
+        assert_eq!(nav.url.as_deref(), Some("https://trade.example.com/x"));
+    }
     #[test]
     fn browser_snapshot_budget_accounts_for_mcp_escaping_and_only_returns_actual_refs() {
         let nodes: Vec<_> = (0..100)
@@ -290,6 +372,23 @@ mod tests {
         assert_eq!(snapshot["truncated"], true);
         assert_eq!(snapshot["nodes"].as_array().unwrap().len(), out.refs.len());
         assert_eq!(snapshot["url"], "http://localhost/");
+    }
+    #[test]
+    fn browser_open_load_state_is_optional_strict_and_reaches_the_model() {
+        let tab = json!({"guestId":"g1","url":"https://example.com/?token=secret","title":"Example","pageGeneration":1});
+        let old = project(json!({"kind":"tabs.open","tab":tab}), "tabs.open").unwrap();
+        let text: Value = serde_json::from_str(old.content["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(text.get("loadState").is_none(), "a desktop without stages: unchanged");
+        let staged = project(json!({"kind":"tabs.open","tab":tab,"loadState":"loading"}), "tabs.open").unwrap();
+        let text: Value = serde_json::from_str(staged.content["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text["loadState"], "loading");
+        assert!(text["note"].as_str().unwrap().contains("still loading"));
+        assert_eq!(text["tab"]["url"], "https://example.com/");
+        assert!(staged.opened.is_some());
+        assert!(project(json!({"kind":"tabs.open","tab":tab,"loadState":"loaded"}), "tabs.open").is_ok());
+        for bad in [json!("complete"), json!(1)] {
+            assert!(project(json!({"kind":"tabs.open","tab":tab,"loadState":bad}), "tabs.open").is_err(), "{bad}");
+        }
     }
     #[test]
     fn browser_results_reject_extra_authority_or_wrong_kind() {

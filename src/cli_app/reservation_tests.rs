@@ -77,7 +77,7 @@ fn blocked_submit(
                 "native release barrier timed out"
             );
             Ok(UserInputSubmitExecution {
-                join_refusal: None,
+                join_refusal: None, queued_reason: None,
                 disposition,
                 app_server_accepted: true,
                 native_request_id: Some(json!("barrier-native")),
@@ -367,14 +367,15 @@ fn recover_input_from_disk(
     source: &std::path::Path,
     fresh: &std::path::Path,
 ) -> UserInputRepository {
-    // A fresh path defeats the process-local file-stamp cache, so this checks
-    // the durable delivery record rather than its surviving in-memory Arc.
+    // A consistent SQLite snapshot includes committed WAL rows. A fresh path
+    // checks durable reservations without sharing the process's StoreDb handle.
     std::fs::create_dir_all(fresh).unwrap();
-    std::fs::copy(
-        source.join("user-input-state.json"),
-        fresh.join("user-input-state.json"),
-    )
-    .unwrap();
+    let db = rusqlite::Connection::open_with_flags(
+        source.join("owner-input.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).unwrap();
+    db.execute("VACUUM INTO ?1", [fresh.join("owner-input.sqlite3").display().to_string()]).unwrap();
+    drop(db);
     UserInputRepository::open(fresh).unwrap()
 }
 

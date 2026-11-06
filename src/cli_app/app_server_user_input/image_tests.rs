@@ -60,6 +60,7 @@ fn image_auto_steer_unknown_visible_in_history_deduplicates_without_send() {
         never_sent, no_flush).unwrap();
     assert_eq!(result.disposition, UserInputDisposition::Deduplicated);
     assert_eq!(result.turn_id.as_deref(), Some("accepted-turn"));
+    drop(repository);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -84,6 +85,7 @@ fn image_persisted_host_settings_reload_without_runtime_restart() {
             UserInputDisposition::Steered
         } else { UserInputDisposition::Queued });
     }
+    drop(repository);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -135,6 +137,7 @@ fn image_default_queue_preserves_original_and_flushes_original_for_both_runtimes
         assert_eq!(calls.get(), 1);
         assert!(repository.list(&session).unwrap().1.is_empty());
         assert!(events.borrow().iter().any(|event| event == "cutex/userInput/queueRemoved"));
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -176,6 +179,7 @@ fn image_explicit_steer_converts_only_claude_and_waits_for_acceptance() {
         // A repeat insertion cannot send the same identity again.
         assert!(steer_queued_with_repository(&command, false, &repository, Some("running".into()), false,
             || true, never_sent).is_err());
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -224,6 +228,7 @@ fn image_missing_file_failure_retry_unknown_and_owner_stop_preserve_queue() {
     let reopened = UserInputRepository::open(&root).unwrap();
     assert_eq!(reopened.list(&session).unwrap().1[0].input, command.params.input);
     assert!(matches!(reopened.delivery(&session, "image-failure").unwrap(), Some(InputDelivery::Unknown { .. })));
+    drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -244,5 +249,6 @@ fn image_steer_policy_is_opt_in_and_explicit_queue_and_idle_still_keep_original(
     let params = json!({"input":command.params.input});
     assert_eq!(prepare_native_input(true, "turn/start", params.clone()).unwrap(), params);
     assert_eq!(prepare_native_input(false, "turn/steer", params.clone()).unwrap(), params);
+    drop(repository);
     std::fs::remove_dir_all(root).unwrap();
 }

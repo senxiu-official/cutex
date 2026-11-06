@@ -27,7 +27,12 @@ with ``run_in_background`` (``background = 1``) stays open after its turn ends;
 it closes on the SDK task's terminal status (``background_ended``). Its stream
 messages keep arriving while no adapter turn runs and land here as well. The
 model usage of its messages (by API message id) is summed per run for the
-origin turn (``take_usage``). A run left open by an earlier adapter process is
+origin turn (``take_usage``). The stream copy of a message carries the usage of
+its first content blocks only (``output_tokens`` as of ``message_start``, a few
+tokens), so when the task ends the run's own Claude Code transcript
+(``projects/<project>/<session>/subagents/agent-<task>.jsonl`` in the account
+home), whose lines carry the final counts, is read too; each count is the larger
+of the two totals (claude-r35). A run left open by an earlier adapter process is
 reported lost to the parent on the next ``thread/resume`` (``lost_notices``).
 
 Bounds: ``MAX_ITEMS`` items per subagent (later ones are dropped, the run is
@@ -39,7 +44,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+from pathlib import Path
+import re
 import time
+import uuid
 from types import SimpleNamespace
 from typing import Any
 
@@ -52,6 +60,9 @@ TEXT_BYTES = 65536
 REF_PREFIX = 'claude:'
 TERMINAL = {'completed', 'failed', 'interrupted'}
 USAGE_KEYS = {'input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'}
+TASK_ID = re.compile(r'[A-Za-z0-9_-]{1,128}')
+# A background run's transcript larger than this is not read for usage.
+TRANSCRIPT_BYTES = 256 * 1024 * 1024
 
 
 def field(obj: Any, key: str, default: Any = None) -> Any:
@@ -76,6 +87,24 @@ def parse_reference(value: Any) -> tuple[str, str] | None:
         return None
     sid, sep, key = value[len(REF_PREFIX):].partition(':task:')
     return (sid, key) if sep and sid and key else None
+
+
+def note(seen: dict[str, dict], key: Any, usage: Any) -> None:
+    """Keep the largest count per usage key of one API message."""
+    if not isinstance(key, str) or not isinstance(usage, dict):
+        return
+    counts = {k: v for k, v in usage.items() if k in USAGE_KEYS and type(v) is int and v >= 0}
+    if counts and (key in seen or len(seen) < 4096):
+        old = seen.get(key, {})
+        seen[key] = {**old, **{k: max(v, old.get(k, 0)) for k, v in counts.items()}}
+
+
+def summed(seen: dict[str, dict]) -> dict[str, int]:
+    total: dict[str, int] = {}
+    for counts in seen.values():
+        for key, value in counts.items():
+            total[key] = total.get(key, 0) + value
+    return total
 
 
 class SubagentTranscripts:
@@ -276,13 +305,41 @@ class SubagentTranscripts:
         row = self.store.db.execute('SELECT call_id FROM subagent_runs WHERE session_id=? AND task_id=?',
                                     (sid, task_id)).fetchone()
         seen = self.usage.pop(row[0], None) if row else None
-        if not seen:
-            return None
-        total: dict[str, int] = {}
-        for counts in seen.values():
-            for key, value in counts.items():
-                total[key] = total.get(key, 0) + value
-        return total
+        streamed, written = summed(seen or {}), summed(self.transcript_usage(sid, task_id))
+        total = {key: max(streamed.get(key, 0), written.get(key, 0)) for key in streamed.keys() | written.keys()}
+        return total or None
+
+    def transcript_usage(self, sid: str, task_id: str) -> dict[str, dict]:
+        """Final usage per API message id from the run's Claude Code transcript."""
+        config_dir = getattr(getattr(self.engine, 'driver', None), 'config_dir', None)
+        if config_dir is None or not isinstance(task_id, str) or not TASK_ID.fullmatch(task_id):
+            return {}
+        try:
+            uuid.UUID(sid)
+        except (TypeError, ValueError, AttributeError):
+            return {}
+        root = Path(config_dir) / 'projects'
+        seen: dict[str, dict] = {}
+        if not root.is_dir():
+            return seen
+        for path in root.glob(f'*/{sid}/subagents/agent-{task_id}.jsonl'):
+            try:
+                if (path.is_symlink() or not path.resolve().is_relative_to(root.resolve())
+                        or path.stat().st_size > TRANSCRIPT_BYTES):
+                    continue
+                with path.open('rb') as lines:
+                    for line in lines:
+                        try:
+                            entry = json.loads(line)
+                        except ValueError:
+                            continue  # a line still being written
+                        message = entry.get('message') if isinstance(entry, dict) else None
+                        if entry.get('type') != 'assistant' or not isinstance(message, dict):
+                            continue
+                        note(seen, message.get('id'), message.get('usage'))
+            except OSError:
+                continue
+        return seen
 
     async def turn_ended(self, tid: str, turn_id: str) -> None:
         # A linked background run outlives its turn; one never launched does not.
@@ -374,13 +431,8 @@ class SubagentTranscripts:
         if usage is None and isinstance(field(message, 'message'), dict):
             usage = message['message'].get('usage')
         key = field(message, 'message_id') or field(message, 'uuid')
-        if not isinstance(usage, dict) or not isinstance(key, str):
-            return
-        counts = {k: v for k, v in usage.items() if k in USAGE_KEYS and type(v) is int and v >= 0}
-        seen = self.usage.setdefault(call_id, {})
-        if counts and (key in seen or len(seen) < 4096):
-            old = seen.get(key, {})
-            seen[key] = {k: max(v, old.get(k, 0)) for k, v in counts.items()}
+        if isinstance(usage, dict) and isinstance(key, str):
+            note(self.usage.setdefault(call_id, {}), key, usage)
 
     def _tool_item(self, name: str, arguments: dict, tool_id: str) -> dict:
         # The parent timeline's projection (presentation only; nothing runs here).

@@ -214,7 +214,7 @@ pub fn retry(state: &mut AskState, ask_id: &str, requester: Option<&str>, now: D
         // A deliberate retry gets a fresh submit-retry budget.
         ask.submit_retry = None;
     });
-    Ok(state.asks[ask_id].clone())
+    Ok((*state.asks[ask_id]).clone())
 }
 
 #[cfg(test)]

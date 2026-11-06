@@ -38,6 +38,96 @@ fn now() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-10-14T12:00:00Z").unwrap().with_timezone(&Utc)
 }
 
+#[test]
+fn native_thread_membership_follows_append_replacement_and_shared_file_removal() {
+    let temp=TempDir::new();let root=temp.path().join("mv2");
+    let first=root.join(store::USAGE_LEDGER_DIR).join("2026-10.jsonl");
+    append(&first,&[json!({"threadId":"shared"})]);
+    let index=store::native_thread_index(&root).unwrap();
+    assert!(index.native_thread_exists("shared").unwrap());
+    append(&first,&[json!({"threadId":"new"})]);
+    let index=store::native_thread_index(&root).unwrap();
+    assert!(index.native_thread_exists("new").unwrap());
+    let second=root.join(store::USAGE_LEDGER_DIR).join("2026-11.jsonl");
+    append(&second,&[json!({"threadId":"shared"})]);
+    store::native_thread_index(&root).unwrap();
+    fs::write(&first,b"{\"threadId\":\"replacement\"}\n").unwrap();
+    let index=store::native_thread_index(&root).unwrap();
+    assert!(index.native_thread_exists("shared").unwrap());
+    assert!(index.native_thread_exists("replacement").unwrap());
+    assert!(!index.native_thread_exists("new").unwrap());
+    fs::remove_file(second).unwrap();
+    let index=store::native_thread_index(&root).unwrap();
+    assert!(!index.native_thread_exists("shared").unwrap());
+    assert!(index.native_thread_exists("replacement").unwrap());
+}
+
+#[test]
+fn watched_collector_ticks_keep_fresh_tails_and_follow_rename_delete() {
+    let temp=TempDir::new();let root=temp.path().join("mv2");let home=temp.path().join("codex");
+    let path=home.join("sessions/rollout-a.jsonl");
+    append(&path,&[codex_meta("outside","codex_cli_rs"),record("fresh","2026-10-14T11:59:30Z","outside")]);
+    let source=spec("watched",SourceKind::Codex,&home);
+    assert_eq!(scan_source_mode(&root,&source,"h",now(),false).unwrap().rows,0);
+    // No new file event: the pending offset alone must schedule this file.
+    assert_eq!(scan_source_mode(&root,&source,"h",now()+chrono::Duration::seconds(90),false).unwrap().rows,1);
+    let renamed=home.join("sessions/rollout-b.jsonl");fs::rename(&path,&renamed).unwrap();
+    discovery::wait_for_hint(&root,&source,&renamed);
+    assert_eq!(scan_source_mode(&root,&source,"h",now()+chrono::Duration::seconds(90),false).unwrap().files,1);
+    fs::remove_file(&renamed).unwrap();discovery::wait_for_hint(&root,&source,&renamed);
+    assert_eq!(scan_source_mode(&root,&source,"h",now()+chrono::Duration::seconds(90),false).unwrap().files,0);
+    assert_eq!(status_json(&root,"watched")["files"],0);
+    assert_eq!(samples(&load(&root)).len(),1,"checkpoint replay must not double bill or erase canonical history");
+    discovery::forget(&root,&source.id);
+}
+
+#[path="external_scale_tests.rs"]
+mod scale;
+
+#[test]
+fn unrelated_source_directory_events_do_not_rewalk_transcript_history() {
+    let temp=TempDir::new();let root=temp.path().join("mv2");let home=temp.path().join("codex");
+    for n in 0..100 {append(&home.join(format!("sessions/rollout-cold-{n:04}.jsonl")),&[codex_meta(&format!("cold-{n}"),"codex_cli_rs")]);}
+    let hot=home.join("sessions/rollout-hot.jsonl");append(&hot,&[codex_meta("hot","codex_cli_rs")]);
+    let source=spec("unrelated",SourceKind::Codex,&home);
+    scan_source_mode(&root,&source,"h",now(),false).unwrap();
+    scan_source_mode(&root,&source,"h",now(),false).unwrap();
+    fs::create_dir_all(home.join("unrelated-cache/new-directory")).unwrap();
+    fs::remove_dir(home.join("unrelated-cache/new-directory")).unwrap();
+    fs::write(home.join("auth.json"),b"not transcript data").unwrap();
+    append(&hot,&[record("new-record","2026-10-14T09:00:03Z","hot")]);
+    discovery::wait_for_hint(&root,&source,&hot);
+    let (summary,counts)=crate::store::metrics::measure(||scan_source_mode(&root,&source,"h",now(),false).unwrap());
+    assert_eq!(summary.rows,1);assert!(counts.rows_visited<20,"{counts:?}");
+    discovery::forget(&root,&source.id);
+}
+
+#[test]
+fn checkpoint_rebuild_and_purge_are_scoped_to_one_source() {
+    let temp=TempDir::new();let root=temp.path().join("mv2");
+    let a=spec("source-a",SourceKind::Codex,&temp.path().join("a"));
+    let b=spec("source-b",SourceKind::Codex,&temp.path().join("b"));
+    for source in [&a,&b] {
+        append(&source.path.join("sessions/rollout-one.jsonl"),&[codex_meta(&source.id,"codex_cli_rs"),record(&source.id,"2026-10-14T09:00:03Z",&source.id)]);
+        assert_eq!(scan_source_mode(&root,source,"h",now(),false).unwrap().rows,1);
+    }
+    // A missing derived source header must force discovery even with a warm watcher.
+    checkpoints::forget(&root,&a.id).unwrap();
+    assert_eq!(scan_source_mode(&root,&a,"h",now(),false).unwrap().files,1);
+    assert_eq!(samples(&load(&root)).len(),2,"cache rebuild cannot double bill");
+    // Old releases remove this marker along with the source ledger directory.
+    fs::remove_file(source_dir(&root,&a.id).join("collector-checkpoint-epoch")).unwrap();
+    assert_eq!(scan_source_mode(&root,&a,"h",now(),false).unwrap().files,1);
+    assert_eq!(samples(&load(&root)).len(),2);
+    assert!(store::purge_external_source(&root,&a.id).unwrap());
+    assert!(checkpoints::status(&root,&a.id).unwrap().is_none());
+    assert!(checkpoints::status(&root,&b.id).unwrap().is_some());
+    assert_eq!(samples(&load(&root)).len(),1,"other source rows remain");
+    assert_eq!(scan_source_mode(&root,&a,"h",now(),false).unwrap().rows,1);
+    assert_eq!(samples(&load(&root)).len(),2);
+    discovery::forget(&root,&a.id);discovery::forget(&root,&b.id);
+}
+
 fn spec(id: &str, kind: SourceKind, path: &Path) -> SourceSpec {
     SourceSpec {
         id: id.into(),
@@ -401,7 +491,7 @@ fn overlap_guard_and_validation() {
     let file = temp.path().join("file.txt");
     fs::write(&file, "x").unwrap();
     assert!(normalize_source_path(&file.to_string_lossy()).is_err());
-    assert_eq!(normalize_source_path(&claude.to_string_lossy()).unwrap(), claude.canonicalize().unwrap());
+    assert_eq!(normalize_source_path(&claude.to_string_lossy()).unwrap().canonicalize().unwrap(), claude.canonicalize().unwrap());
 }
 
 #[test]

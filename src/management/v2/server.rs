@@ -62,6 +62,9 @@ pub fn handle_v2_request(
     context: ManagementRequestContext,
 ) -> anyhow::Result<()> {
     let _diagnostic_scope = super::error_log::scope(request);
+    // 054 C5: the settlement / SessionDelivery thread of this process (idle
+    // while management.inputLedger.enabled is off).
+    super::input_ledger_settle::ensure_started(context.load_runtime_status, context.forward_native_request);
     let path = request
         .path
         .split('?')
@@ -136,6 +139,25 @@ pub fn handle_v2_request(
             return write_v2_error(stream, 401, "Unauthorized", "unauthorized", "human owner credential required", false, json!({}));
         }
         return super::delegations::handle(stream, request, route);
+    }
+    #[cfg(debug_assertions)]
+    if path == super::input_ledger_owner::TEST_HOLD_FENCE_PATH {
+        // 054 S7 test hook: debug builds with CUTEX_TEST_PRIVATE_HOME only.
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized", "the Management root credential is required", false, json!({}));
+        }
+        return super::input_ledger_owner::handle_test_hold_fence(stream, request);
+    }
+    if let Some(route) = super::input_ledger::parse_path(path) {
+        // Input ledger reads (054 §2.7, CLI / phone): the owner's, like the
+        // other per-session HTTP reads; disabled unless the internal switch is on.
+        if !authenticated_root_request(request, agent_management_admin_token)
+            || crate::management::users::current_principal().is_some_and(|p| !p.is_owner())
+        {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management owner credential is required for inputs", false, json!({}));
+        }
+        return super::input_ledger::handle(stream, request, route);
     }
     if super::fork_preview::is_path(path) {
         if !authenticated_root_request(request, agent_management_admin_token)
@@ -251,6 +273,13 @@ pub fn handle_v2_request(
                 "the Management root credential is required for runtime restore", false, json!({}));
         }
         return super::runtime_restore_api::handle(stream, request);
+    }
+    if path == super::runtime_prune::PATH {
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management owner credential is required for runtime cleanup", false, json!({}));
+        }
+        return super::runtime_prune::handle(stream, request);
     }
     if super::runtimes_api::is_runtimes_path(path) {
         // Read-only runtime overview (desktop 运行时 page): root, incl.
@@ -466,6 +495,13 @@ pub fn handle_v2_request(
         }
         return super::owner_notify::handle(stream, request);
     }
+    if path == super::admission_cleanup::PATH {
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for host admission receipts", false, json!({}));
+        }
+        return super::admission_cleanup::handle(stream, request);
+    }
     if super::health::is_path(path) {
         if !authenticated_root_request(request, agent_management_admin_token) {
             return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
@@ -474,8 +510,10 @@ pub fn handle_v2_request(
         return super::health::handle(stream, request, context);
     }
     if super::agent_bus_stuck::is_path(path) {
-        if path == super::agent_bus_stuck::CLOSE_PATH
-            && (!authenticated_root_request(request, agent_management_admin_token)
+        if matches!(
+            path,
+            super::agent_bus_stuck::CLOSE_PATH | super::agent_bus_stuck::EVIDENCE_PATH
+        ) && (!authenticated_root_request(request, agent_management_admin_token)
                 || crate::management::users::current_principal().is_some_and(|p| !p.is_owner())
                 || crate::management::listeners::current_client_token().is_some_and(|token|
                     token.scope != crate::management::client_tokens::DeviceScope::Full))
@@ -646,7 +684,9 @@ fn agent_management_admin_path(path: &str) -> bool {
             | "/v2/host/sessions"
             | "/v2/human/agents"
             | "/v2/human/sessions"
-    ) || management_project_id_from_path(path).is_some()
+    ) || super::host_sessions::exact_id(path).is_some()
+        || super::agent_names::path_target(path).is_some()
+        || management_project_id_from_path(path).is_some()
         || super::profile_quota::parse_path(path).is_some()
         || path == super::profile_auto_pick::PATH
         || path == super::profile_link::SECRET_PATH
@@ -959,10 +999,14 @@ fn handle_v2_request_with_repository(
         ("POST", "/v2/human/agents") => {
             super::human_agents::handle_create(stream, request, context, repository)
         }
+        (_, path) if super::agent_names::path_target(path).is_some() => {
+            super::agent_names::handle(stream,request,context,repository)
+        }
         ("POST", super::human_sessions::PATH) => {
             super::human_sessions::handle_create(stream, request, context, repository)
         }
         ("POST", "/v2/host/sessions") => super::host_sessions::handle(stream,request,context),
+        ("GET", path) if super::host_sessions::exact_id(path).is_some() => super::host_sessions::handle_exact(stream,request,context),
         ("POST", "/v2/job-service/management-query") => super::human_jobs::handle(stream, request),
         ("GET", "/v2/job-service/capabilities") => super::human_jobs::handle_capabilities(stream),
         ("POST", "/v2/job-service/cancel") => super::human_jobs::handle_cancel(stream, request),
@@ -970,6 +1014,7 @@ fn handle_v2_request_with_repository(
         ("GET", "/v2/nci-verification") | ("PUT", "/v2/nci-verification/config") | ("DELETE", "/v2/nci-verification/config") | ("POST", "/v2/nci-verification/key") | ("GET", "/v2/nci-verification/helper") => super::nci_verification::handle(stream, request),
         ("GET", "/v2/inbound-mail") | ("PUT", "/v2/inbound-mail/config") | ("DELETE", "/v2/inbound-mail/config") | ("POST", "/v2/inbound-mail/test") => super::inbound_mail::handle(stream, request),
         ("POST", "/v2/job-service/output") => super::human_jobs::handle_output(stream, request),
+        ("GET", "/v2/sessions/page" | "/v2/sessions/changes") => super::session_deltas::handle(stream, request),
         ("GET", "/v2/sessions") => {
             super::archive::handle_session_collection_get(stream, request, context, repository, root)
         }
@@ -1084,12 +1129,16 @@ fn handle_v2_request_with_repository(
         ("GET" | "POST", "/v2/notifications/states" | "/v2/notifications/ack" | "/v2/notifications/outbound" | "/v2/notifications/deliveries" | "/v2/notifications/test" | "/v2/notifications/retry") => crate::notify::outbound::handle_request(stream, request),
         ("GET" | "POST", "/v2/notifications/session") => crate::notify::session::handle_request(stream, request),
         ("GET", "/v2/events") => {
+            let layout_doc_key = super::user_layout_api::event_doc_key()?;
             let query = match replay_query(request, false) {
                 Ok(query) => query,
                 Err(error) => return write_replay_error(stream, error),
             };
             match repository.page(query) {
-                Ok(page) => write_json_response(stream, 200, "OK", &serde_json::to_value(page)?),
+                Ok(mut page) => {
+                    page.events.retain(|event| super::user_layout_api::event_visible(event, &layout_doc_key));
+                    write_json_response(stream, 200, "OK", &serde_json::to_value(page)?)
+                }
                 Err(error) => write_replay_error(stream, error),
             }
         }
@@ -1107,6 +1156,7 @@ fn handle_v2_request_with_repository(
             }
         }
         ("GET", "/v2/events/stream") => {
+            let layout_doc_key = super::user_layout_api::event_doc_key()?;
             let query = match replay_query(request, true) {
                 Ok(query) => query,
                 Err(error) => return write_replay_error(stream, error),
@@ -1121,11 +1171,13 @@ fn handle_v2_request_with_repository(
             }
             write_sse_headers(stream)?;
             let watch = crate::management::listeners::RevocationWatch::for_stream(stream)?;
-            stream_events(
+            stream_events_filtered(
                 stream,
                 subscription,
                 &query,
                 watch,
+                &mut |event| super::user_layout_api::event_visible(event, &layout_doc_key),
+                &mut |_| true,
             )
         }
         _ => write_v2_error(
@@ -1380,10 +1432,11 @@ pub(crate) fn write_agent_management_control_error(
         | AgentManagementError::ProjectNotAuthorized => (403, "Forbidden", false),
         AgentManagementError::NotFound(_) => (404, "Not Found", false),
         AgentManagementError::Removed(_) => (410, "Gone", false),
-        AgentManagementError::Conflict(_) | AgentManagementError::ConflictDetail(_) => {
+        AgentManagementError::Conflict(_) | AgentManagementError::ConflictDetail(_) | AgentManagementError::NameConflict(_) => {
             (409, "Conflict", false)
         }
         AgentManagementError::PersistenceUnavailable => (503, "Service Unavailable", true),
+        AgentManagementError::HostBusy(_) => (503, "Service Unavailable", true),
         AgentManagementError::OwnerActionRequired(_)
         | AgentManagementError::InvalidStore
         | AgentManagementError::External(_)
@@ -1393,6 +1446,15 @@ pub(crate) fn write_agent_management_control_error(
             (500, "Internal Server Error", false)
         }
     };
+    // r271: a busy host fence is the 050 `admission_busy` / `hostBusy` family.
+    let details = if matches!(error, AgentManagementError::HostBusy(_)) {
+        use crate::asks::pause_admission::{ADMISSION_BUSY_RETRY_AFTER_MS, HOST_BUSY_REASON};
+        json!({ "reason": HOST_BUSY_REASON, "retryAfterMs": ADMISSION_BUSY_RETRY_AFTER_MS })
+    } else if let AgentManagementError::NameConflict(ref error) = error {
+        error.details.clone()
+    } else {
+        json!({})
+    };
     write_v2_error(
         stream,
         status,
@@ -1400,7 +1462,7 @@ pub(crate) fn write_agent_management_control_error(
         error.code(),
         &error.to_string(),
         retryable,
-        json!({}),
+        details,
     )
 }
 
@@ -1496,6 +1558,8 @@ fn handle_bootstrap(
                     "latestTokenUsage".to_string(),
                     (context.load_latest_token_usage)(cutex_session_id),
                 );
+                // input-ledger-v1 (054 §2.7), switch on only.
+                super::input_ledger_settle::add_bootstrap_fields(state, cutex_session_id);
             }
             Ok(state)
         },
@@ -2103,6 +2167,16 @@ fn handle_native_server_response(
             native_request_id,
             expected_runtime_generation,
         ),
+        ServerResponseClaimDecision::InvalidAnswer(message) => write_v2_server_response_error(
+            stream,
+            400,
+            "Bad Request",
+            Some(&response.response_id),
+            "invalid_question_answer",
+            &message,
+            false,
+            json!({ "nativeRequestId": native_request_id }),
+        ),
         ServerResponseClaimDecision::NotFound => write_v2_server_response_error(
             stream,
             404,
@@ -2674,12 +2748,18 @@ fn handle_control_diagnostics(stream: &mut TcpStream, request: &SimpleHttpReques
     if request.method != "GET" {
         return write_v2_error(stream, 405, "Method Not Allowed", "method_not_allowed", "use GET", false, json!({}));
     }
-    write_json_response(stream, 200, "OK", &json!({"contractVersion":2,
+    let mut body = json!({"contractVersion":2,
         "scope":"management_process", "timing":super::control_timing::snapshot(),
         "asksStoreLocks":crate::asks::store::diagnostics::snapshot(),
         "capacity":super::control_capacity::snapshot(),
         "queues":{"repository":super::repository::queue_diagnostics(),
-            "nativeEvents":crate::app_server::client::event_queue_diagnostics()}}))
+            "nativeEvents":crate::app_server::client::event_queue_diagnostics()}});
+    // r274 (054 S25): only while the input-ledger switch is on; off, the
+    // response is the r273.1 one.
+    if let Some(ledger) = super::input_ledger_timing::diagnostics() {
+        body["inputLedger"] = ledger;
+    }
+    write_json_response(stream, 200, "OK", &body)
 }
 
 impl<'lock> SlowSubmitTrace<'lock> {
@@ -2827,7 +2907,7 @@ fn handle_cutex_request(
     // Keep UI projections and their shared activity/pending/cache reads out
     // of this session's serialized submit path. A changing/offline binding
     // falls back to the existing full resource used by offline start plans.
-    let online_submit = if matches!(cutex_request.method.as_str(),"cutex/userInput/queue/list"|"cutex/focus/get") {
+    let online_submit = if matches!(cutex_request.method.as_str(),"cutex/userInput/queue/list"|"cutex/focus/get"|"cutex/input/get"|"cutex/input/list") {
         super::session::read_route_resource(cutex_session_id,&registry,
             !request_may_resolve_hidden_session(&cutex_request.method,owner.is_some()))?
     } else if cutex_request.method == "cutex/userInput/submit" {
@@ -3024,11 +3104,37 @@ fn handle_cutex_request(
             &session,
             &cutex_request,
         )
+    } else if cutex_request.method == super::input_ledger::RETRY_METHOD {
+        // §2.14: the ledger half, then the same id again through the submit route.
+        super::input_ledger_settle::retry(owner.is_some(), cutex_session_id, &cutex_request.params, &mut |payload| {
+            dispatch_user_input_submit(
+                event_repository,
+                context.handle_user_input,
+                cutex_session_id,
+                &session,
+                &ValidatedCutexRequest {
+                    request_id: format!("input-retry-{}", uuid::Uuid::new_v4()),
+                    method: "cutex/userInput/submit".to_string(),
+                    params: payload.clone(),
+                },
+            )
+        })
+    } else if cutex_request.method == super::input_ledger::INTERRUPT_SEND_METHOD {
+        // r274 interrupt-send contract: owner only, switch on only.
+        super::input_interrupt_send::dispatch(owner.is_some(), cutex_session_id, &session, &cutex_request.params, || {
+            // Owner decision 8: the agent starts; the input waits queued first.
+            super::offline_submit::start_for_interrupt_send(context, owner.copied(), cutex_session_id, &session, &cutex_request.request_id);
+        })
+    } else if super::input_ledger::is_method(&cutex_request.method) {
+        super::input_ledger::dispatch(cutex_session_id, &cutex_request.method, &cutex_request.params, owner.is_some())
     } else if super::queue_order::is_method(&cutex_request.method) {
         user_input_repository().map_err(persistence_user_input_error).and_then(|queue| {
             super::queue_order::dispatch(event_repository, queue, context.steer_user_input_queue,
                 cutex_session_id, &session, &cutex_request)
-        }).inspect(|result| {
+        }).map_err(|error| if cutex_request.method == super::queue_order::STEER_METHOD {
+            // Owner decision 8 / r274 decision 2 (switch on): start the agent.
+            super::offline_submit::start_for_offline_steer(context, owner.copied(), cutex_session_id, &session, &cutex_request, error)
+        } else { error }).inspect(|result| {
             // A steered / started queue item is the owner's next message.
             if let Some(disposition) = result.get("disposition").and_then(Value::as_str).filter(|_| owner_message_landed(result)) {
                 crate::asks::control::owner_message_default(cutex_session_id, disposition);
@@ -3076,7 +3182,7 @@ fn handle_cutex_request(
             &cutex_request,
         )
     } else if cutex_request.method == "cutex/userInput/submit" {
-        let result = super::offline_submit::dispatch(
+        let result = super::offline_submit::dispatch_owner_submit(
             event_repository,
             context,
             owner.copied(),
@@ -3149,7 +3255,7 @@ fn handle_cutex_request(
 
 /// A `cutex/userInput/submit` result that put an owner message into the
 /// session: started, steered or queued (not a deduplicated replay).
-pub(super) fn owner_message_landed(result: &Value) -> bool {
+pub fn owner_message_landed(result: &Value) -> bool {
     matches!(
         result.get("disposition").and_then(Value::as_str),
         Some("started" | "steered" | "queued")
@@ -3543,14 +3649,22 @@ fn dispatch_cutex_request(
         ),
         "cutex/userInput/queue/list" => {
             require_empty_params(&request.params)?;
-            let (revision, items, pause, admission) = user_input_repository()
-                .and_then(|repository| repository.list_admission(cutex_session_id))
+            // A busy authority fence returns the committed projection with
+            // `admissionFresh: false` instead of failing the read.
+            let (revision, items, pause, admission, fresh) = user_input_repository()
+                .and_then(|repository| repository.list_admission_or_committed(cutex_session_id))
                 .map_err(persistence_user_input_error)?;
+            let owner_admission = owner_admission_state(cutex_session_id, &admission, pause.is_some());
             let (paused, pause) = super::queue_pause::pause_fields(pause.as_ref());
-            Ok(json!({ "revision": revision, "items": items, "admission": admission, "paused": paused, "pause": pause, "asksPaused": crate::asks::control::pause_state_default(cutex_session_id) }))
+            let mut result = json!({ "revision": revision, "items": items, "admission": admission, "admissionFresh": fresh, "ownerAdmission": owner_admission, "paused": paused, "pause": pause, "asksPaused": crate::asks::control::pause_state_default(cutex_session_id) });
+            super::input_ledger_owner::add_queue_list_fields(&mut result, cutex_session_id, fresh);
+            Ok(result)
         }
         "cutex/userInput/queue/update" => {
             dispatch_queue_update(event_repository, cutex_session_id, request)
+        }
+        "cutex/userInput/queue/merge" => {
+            dispatch_queue_merge(event_repository, cutex_session_id, request)
         }
         "cutex/userInput/queue/remove" => {
             dispatch_queue_remove(event_repository, cutex_session_id, request)
@@ -3620,14 +3734,14 @@ pub(super) fn dispatch_runtime_mutation(
         .as_object()
         .ok_or_else(|| invalid_user_input_error("params must be an object"))?;
     let online = request.method == "cutex/runtime/online";
-    let max_fields = 4;
+    let max_fields = if online { 4 } else { 5 };
     if object.len() > max_fields
         || object.keys().any(|key| {
             !matches!(key.as_str(), "expectedRuntimeGeneration" | "reason")
                 && !if online {
                     matches!(key.as_str(), "openVisibleTerminal" | "launchProfile")
                 } else {
-                    matches!(key.as_str(), "force" | "requireDefaultLaunch")
+                    matches!(key.as_str(), "force" | "requireDefaultLaunch" | "requestedBy")
                 }
         })
     {
@@ -3697,6 +3811,15 @@ pub(super) fn dispatch_runtime_mutation(
         }
         None => None,
     };
+    let requested_by = match object.get("requestedBy") {
+        None => None,
+        Some(value) => Some(resolve_stop_requester(
+            stop_requester_id(value).ok_or_else(|| {
+                invalid_user_input_error("requestedBy must be {kind: \"agent\", runtimeAgentId}")
+            })?,
+            crate::session::store::load_cutex_session_store_shared().ok().as_deref(),
+        )),
+    };
     let target_generation = current_generation;
     let backend = session
         .pointer("/runtime/backend")
@@ -3730,17 +3853,24 @@ pub(super) fn dispatch_runtime_mutation(
         cutex_session_id,
         correlation.clone(),
         requested_method,
-        runtime_event_params(
-            target_generation,
-            backend,
-            requested_status,
-            runtime_agent_id.clone(),
-            reason.clone(),
+        with_requested_by(
+            runtime_event_params(
+                target_generation,
+                backend,
+                requested_status,
+                runtime_agent_id.clone(),
+                reason.clone(),
+            ),
+            &requested_by,
         ),
     )
     .map_err(persistence_user_input_error)?;
 
     let mut mutation_params = request.params.clone();
+    // Who asked is for the event log only: the stop itself is unchanged.
+    if let Some(params) = mutation_params.as_object_mut() {
+        params.remove("requestedBy");
+    }
     if let Some(profile) = launch_profile.as_deref() {
         mutation_params
             .as_object_mut()
@@ -3822,12 +3952,15 @@ pub(super) fn dispatch_runtime_mutation(
         cutex_session_id,
         correlation.clone(),
         terminal_method,
-        runtime_event_params(
-            result_generation,
-            backend,
-            result_status,
-            result_runtime_agent_id,
-            reason,
+        with_requested_by(
+            runtime_event_params(
+                result_generation,
+                backend,
+                result_status,
+                result_runtime_agent_id,
+                reason,
+            ),
+            &requested_by,
         ),
     )
     .map_err(post_operation_persistence_error)?;
@@ -3923,6 +4056,47 @@ fn validate_launch_profile_receipt(
         ));
     }
     Ok(Some(receipt.clone()))
+}
+
+/// r276: the runtime agent id a stop request names as its requester
+/// (`requestedBy: {kind: "agent", runtimeAgentId}`, sent by the `cutex` CLI
+/// run inside an agent's process).
+fn stop_requester_id(value: &Value) -> Option<&str> {
+    let object = value.as_object().filter(|object| object.len() == 2)?;
+    if object.get("kind").and_then(Value::as_str) != Some("agent") {
+        return None;
+    }
+    object
+        .get("runtimeAgentId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= 200 && !id.chars().any(char::is_control))
+}
+
+/// The requester as the stop events carry it: the agent's session and name
+/// when its runtime is the current one of a known session.
+fn resolve_stop_requester(
+    runtime_agent_id: &str,
+    sessions: Option<&crate::session::model::CutexSessionStore>,
+) -> Value {
+    let mut requester = json!({"kind": "agent", "runtimeAgentId": runtime_agent_id});
+    let record = sessions.and_then(|sessions| {
+        sessions
+            .sessions
+            .values()
+            .find(|record| record.current_runtime_agent_id.as_deref() == Some(runtime_agent_id))
+    });
+    if let Some(record) = record {
+        requester["cutexSessionId"] = json!(record.cutex_session_id);
+        requester["name"] = json!(crate::session::metadata::cutex_session_display_name(record));
+    }
+    requester
+}
+
+fn with_requested_by(mut params: Value, requested_by: &Option<Value>) -> Value {
+    if let (Some(requester), Some(object)) = (requested_by, params.as_object_mut()) {
+        object.insert("requestedBy".to_string(), requester.clone());
+    }
+    params
 }
 
 fn runtime_event_params(
@@ -4457,7 +4631,13 @@ pub(super) fn dispatch_user_input_submit(
     session: &Value,
     request: &ValidatedCutexRequest,
 ) -> Result<Value, super::user_input::UserInputExecutionError> {
-    let params = parse_user_input_submit_params(&request.params).map_err(|message| {
+    // `owner-admission-held-v1`: a client that understands `disposition:
+    // "held"` opts in with `allowHeld: true`; it is not part of the input.
+    let mut submit_params = request.params.clone();
+    let allow_held = submit_params.as_object_mut()
+        .and_then(|object| object.remove("allowHeld"))
+        .is_some_and(|value| value == Value::Bool(true));
+    let params = parse_user_input_submit_params(&submit_params).map_err(|message| {
         super::user_input::UserInputExecutionError {
             stage: "route".to_string(),
             code: "invalid_request".to_string(),
@@ -4467,6 +4647,8 @@ pub(super) fn dispatch_user_input_submit(
             outcome_unknown: false,
         }
     })?;
+    // 054 §2.14: what `cutex/input/retry` sends again (switch on only).
+    super::input_ledger_settle::remember_owner_submit(cutex_session_id, &params.client_user_message_id, &request.params);
     let thread_id = session
         .pointer("/native/threadId")
         .and_then(Value::as_str)
@@ -4509,17 +4691,132 @@ pub(super) fn dispatch_user_input_submit(
         },
     )
     .map_err(persistence_user_input_error)?;
-    let execution = handle_user_input(UserInputSubmitCommand {
+    super::input_ledger_owner::route_accepted(cutex_session_id, &params);
+    let claude_backend = session.pointer("/runtime/backend").and_then(Value::as_str) == Some("claude_subscription");
+    let execution = super::owner_held::with_allow_held(allow_held, claude_backend, || handle_user_input(UserInputSubmitCommand {
         management_request_id: request.request_id.clone(),
         cutex_session_id: cutex_session_id.to_string(),
         thread_id: thread_id.clone(),
         params: params.clone(),
-    });
+    }));
+    publish_submit_outcome(event_repository, cutex_session_id, &thread_id, &request.request_id, &params, claude_backend, execution)
+}
+
+/// `owner-admission-state-v1`: why a new owner message would not start or
+/// steer right now. One source for the desktop's send decision, working row
+/// and 接下来 (design 050 §5): `idle | turn | finishing | held`, with
+/// `reason` for `held`. Read without the host authority fence.
+/// `finishing` is reserved for runtimes that report a turn's finishing phase.
+pub fn owner_admission_state(
+    cutex_session_id: &str,
+    admission: &super::admission::AdmissionSnapshot,
+    queue_paused: bool,
+) -> Value {
+    let held = super::owner_held::held_for(cutex_session_id).unwrap_or_default();
+    if !held.is_empty() {
+        return json!({ "state": "held", "reason": "hostBusy", "heldCount": held.len(),
+            "heldUntil": held.first().map(|first| first.deadline.clone()) });
+    }
+    if queue_paused {
+        return json!({ "state": "held", "reason": "stopHold" });
+    }
+    // Same predicate as the admission gate, over committed state (no fence).
+    let roster = crate::agent_management::AgentManagementStore::open_default().ok()
+        .and_then(|store| store.snapshot().ok());
+    let (agent_paused, lease) = crate::asks::store::AskStore::open_default().ok()
+        .and_then(|store| store.peek_shared().ok().flatten())
+        .map(|state| (
+            match &roster {
+                Some(roster) => crate::asks::pause_admission::is_paused_in(&state, roster, cutex_session_id),
+                None => state.presence.get(cutex_session_id).is_some_and(|presence| presence.agent_pause.is_some()),
+            },
+            state.leases.contains_key(cutex_session_id),
+        ))
+        .unwrap_or((false, false));
+    if agent_paused {
+        return json!({ "state": "held", "reason": "paused" });
+    }
+    if let Some(turn) = &admission.current_turn {
+        return json!({ "state": "turn", "turnKind": turn.kind });
+    }
+    if lease {
+        return json!({ "state": "held", "reason": "delegationLease" });
+    }
+    json!({ "state": "idle" })
+}
+
+/// Durable events and the result of one owner submit outcome. Shared by the
+/// HTTP submit and the owner admission worker (a held input's later outcome).
+/// With the input ledger on, the outcome is written to the record (054 §2.9)
+/// and the result carries it as `input` (§2.7).
+pub fn publish_submit_outcome(
+    event_repository: &EventRepository,
+    cutex_session_id: &str,
+    thread_id: &str,
+    request_id: &str,
+    params: &super::user_input::UserInputSubmitParams,
+    claude_backend: bool,
+    execution: Result<super::user_input::UserInputSubmitExecution, super::user_input::UserInputExecutionError>,
+) -> Result<Value, super::user_input::UserInputExecutionError> {
+    super::input_ledger_owner::submit_outcome(cutex_session_id, params, &execution);
+    let mut result = publish_submit_outcome_events(event_repository, cutex_session_id, thread_id, request_id, params, claude_backend, execution)?;
+    super::input_ledger_owner::add_result_input(&mut result, cutex_session_id, &params.client_user_message_id);
+    Ok(result)
+}
+
+fn publish_submit_outcome_events(
+    event_repository: &EventRepository,
+    cutex_session_id: &str,
+    thread_id: &str,
+    request_id: &str,
+    params: &super::user_input::UserInputSubmitParams,
+    claude_backend: bool,
+    execution: Result<super::user_input::UserInputSubmitExecution, super::user_input::UserInputExecutionError>,
+) -> Result<Value, super::user_input::UserInputExecutionError> {
+    let thread_id = thread_id.to_string();
     match execution {
+        Ok(execution) if execution.disposition == UserInputDisposition::Held => {
+            let held = super::owner_held::find(cutex_session_id, &params.client_user_message_id)
+                .map_err(post_operation_persistence_error)?
+                .ok_or_else(|| post_operation_persistence_error(anyhow::anyhow!("held owner input record is missing")))?;
+            append_cutex_event(
+                event_repository,
+                cutex_session_id,
+                super::model::EventCorrelation {
+                    thread_id: Some(thread_id),
+                    client_user_message_id: Some(params.client_user_message_id.clone()),
+                    management_request_id: Some(request_id.to_string()),
+                    ..Default::default()
+                },
+                "cutex/userInput/held",
+                json!({
+                    "managementRequestId": request_id,
+                    "clientUserMessageId": params.client_user_message_id,
+                    "origin": params.origin,
+                    "input": params.input,
+                    "strategy": params.strategy,
+                    "heldBy": held.held_by,
+                    "heldSince": held.held_since,
+                    "heldUntil": held.deadline,
+                }),
+            )
+            .map_err(post_operation_persistence_error)?;
+            Ok(json!({
+                "clientUserMessageId": params.client_user_message_id,
+                "disposition": execution.disposition,
+                "appServerAccepted": false,
+                "nativeRequestId": null,
+                "turnId": null,
+                "queue": null,
+                "heldBy": held.held_by,
+                "heldSince": held.held_since,
+                "heldUntil": held.deadline,
+            }))
+        }
         Ok(execution) => {
             let image_delivery = super::user_input::image_steering::accepted_delivery(
                 &params.input,
-                session.pointer("/runtime/backend").and_then(Value::as_str) == Some("claude_subscription"),
+                claude_backend,
                 &execution,
             );
             if execution.disposition == UserInputDisposition::Queued {
@@ -4534,13 +4831,14 @@ pub(super) fn dispatch_user_input_submit(
                         queued_event["queueRevision"] = json!(revision);
                     }
                 }
+                if let Some(reason) = execution.queued_reason { queued_event["queuedReason"] = json!(reason); }
                 append_cutex_event(
                     event_repository,
                     cutex_session_id,
                     super::model::EventCorrelation {
                         thread_id: Some(thread_id),
                         client_user_message_id: Some(params.client_user_message_id.clone()),
-                        management_request_id: Some(request.request_id.clone()),
+                        management_request_id: Some(request_id.to_string()),
                         queue_id: Some(queue.queue_id.clone()),
                         ..Default::default()
                     },
@@ -4559,14 +4857,14 @@ pub(super) fn dispatch_user_input_submit(
                         thread_id: Some(thread_id),
                         turn_id: execution.turn_id.clone(),
                         client_user_message_id: Some(params.client_user_message_id.clone()),
-                        management_request_id: Some(request.request_id.clone()),
+                        management_request_id: Some(request_id.to_string()),
                         native_request_id: execution.native_request_id.clone(),
                         ..Default::default()
                     },
                     "cutex/userInput/submitted",
                     {
                         let mut submitted = json!({
-                        "managementRequestId": request.request_id,
+                        "managementRequestId": request_id,
                         "clientUserMessageId": params.client_user_message_id,
                         "origin": params.origin,
                         "input": params.input,
@@ -4597,6 +4895,9 @@ pub(super) fn dispatch_user_input_submit(
             if execution.queue.is_some() {
                 result["paused"] = json!(execution.queue_paused);
                 if let Some(reason) = &execution.join_refusal { result["joinRefusal"] = json!(reason); }
+                // `owner-admission-busy-v1`: why it waits; `hostBusy` is a
+                // busy authority fence, never a pause.
+                if let Some(reason) = execution.queued_reason { result["queuedReason"] = json!(reason); }
             }
             Ok(result)
         }
@@ -4614,12 +4915,12 @@ pub(super) fn dispatch_user_input_submit(
                 super::model::EventCorrelation {
                     thread_id: Some(thread_id),
                     client_user_message_id: Some(params.client_user_message_id.clone()),
-                    management_request_id: Some(request.request_id.clone()),
+                    management_request_id: Some(request_id.to_string()),
                     ..Default::default()
                 },
                 "cutex/userInput/failed",
                 json!({
-                    "managementRequestId": request.request_id,
+                    "managementRequestId": request_id,
                     "clientUserMessageId": params.client_user_message_id,
                     "origin": params.origin,
                     "input": params.input,
@@ -4679,6 +4980,83 @@ fn dispatch_queue_update(
     Ok(serde_json::to_value(item).expect("queue item serialization"))
 }
 
+/// `cutex/userInput/queue/merge` (input-ledger-v1, internal switch only):
+/// merge N queued owner inputs into the first one in one store write; the
+/// others become `superseded{mergedInsert, supersededBy: first}` in the
+/// ledger. Returns every affected InputRecord.
+fn dispatch_queue_merge(
+    event_repository: &EventRepository,
+    cutex_session_id: &str,
+    request: &ValidatedCutexRequest,
+) -> Result<Value, super::user_input::UserInputExecutionError> {
+    if !super::input_ledger::enabled() {
+        return Err(super::user_input::UserInputExecutionError {
+            stage: "route".into(), code: "cutex_method_denied".into(),
+            message: "queue merge needs the input ledger (management.inputLedger.enabled)".into(),
+            retryable: false, details: json!({}), outcome_unknown: false,
+        });
+    }
+    let lock = super::user_input::session_input_lock(cutex_session_id).map_err(persistence_user_input_error)?;
+    let _guard = lock.lock().map_err(|_| persistence_user_input_error(anyhow::anyhow!("session input lock poisoned")))?;
+    let object = allowed_params(&request.params, &["items"], &["input"])?;
+    let items: Vec<(String, u64)> = object.get("items").and_then(Value::as_array)
+        .filter(|items| (2..=20).contains(&items.len()))
+        .ok_or_else(|| invalid_user_input_error("items must hold 2..=20 {queueId, expectedRevision}"))?
+        .iter()
+        .map(|item| {
+            let item = item.as_object().filter(|item| item.len() == 2)
+                .ok_or_else(|| invalid_user_input_error("each item is exactly {queueId, expectedRevision}"))?;
+            Ok((required_string_param(item, "queueId")?.to_string(), required_safe_integer_param(item, "expectedRevision")?))
+        })
+        .collect::<Result<_, super::user_input::UserInputExecutionError>>()?;
+    let unique: std::collections::BTreeSet<&str> = items.iter().map(|(id, _)| id.as_str()).collect();
+    if unique.len() != items.len() {
+        return Err(invalid_user_input_error("queueIds must be distinct"));
+    }
+    let input = match object.get("input") {
+        None => None,
+        Some(value) => {
+            let input = value.as_array().filter(|input| !input.is_empty()).cloned()
+                .ok_or_else(|| invalid_user_input_error("input must be a non-empty array"))?;
+            for item in &input {
+                validate_user_input(item).map_err(|message| invalid_user_input_error(&message))?;
+            }
+            Some(input)
+        }
+    };
+    let (merged, removed) = user_input_repository()
+        .and_then(|repository| repository.merge(cutex_session_id, &items, input))
+        .map_err(queue_repository_error)?
+        .ok_or_else(|| queue_not_found_error(&items.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(",")))?;
+    let (queue_revision, _) = user_input_repository().and_then(|repository| repository.list(cutex_session_id))
+        .map_err(post_operation_persistence_error)?;
+    for item in &removed {
+        append_cutex_event(event_repository, cutex_session_id, super::model::EventCorrelation {
+            client_user_message_id: Some(item.client_user_message_id.clone()),
+            management_request_id: Some(request.request_id.clone()),
+            queue_id: Some(item.queue_id.clone()),
+            ..Default::default()
+        }, "cutex/userInput/queueRemoved", json!({
+            "queueId": item.queue_id, "clientUserMessageId": item.client_user_message_id,
+            "revision": item.revision, "queueRevision": queue_revision, "reason": "cancelled",
+            "removedAt": chrono::Utc::now().to_rfc3339(),
+        })).map_err(persistence_user_input_error)?;
+    }
+    let mut event = serde_json::to_value(&merged).expect("queue item serialization");
+    event["queueRevision"] = json!(queue_revision);
+    append_cutex_event(event_repository, cutex_session_id, super::model::EventCorrelation {
+        client_user_message_id: Some(merged.client_user_message_id.clone()),
+        management_request_id: Some(request.request_id.clone()),
+        queue_id: Some(merged.queue_id.clone()),
+        ..Default::default()
+    }, "cutex/userInput/queueUpdated", event).map_err(persistence_user_input_error)?;
+    let removed_ids: Vec<String> = removed.iter().map(|item| item.client_user_message_id.clone()).collect();
+    let inputs = super::input_ledger_owner::queue_merged(cutex_session_id, &merged.client_user_message_id, &removed_ids);
+    let mut affected = vec![merged.queue_id.clone()];
+    affected.extend(removed.iter().map(|item| item.queue_id.clone()));
+    Ok(json!({ "revision": queue_revision, "affectedQueueIds": affected, "item": merged, "inputs": inputs }))
+}
+
 fn dispatch_queue_remove(
     event_repository: &EventRepository,
     cutex_session_id: &str,
@@ -4716,10 +5094,13 @@ fn dispatch_queue_remove(
         }),
     )
     .map_err(persistence_user_input_error)?;
-    Ok(json!({
+    let mut result = json!({
         "revision": queue_revision,
         "affectedQueueIds": [queue_id],
-    }))
+    });
+    super::input_ledger_owner::queue_removed(cutex_session_id, &removed.client_user_message_id);
+    super::input_ledger_owner::add_result_input(&mut result, cutex_session_id, &removed.client_user_message_id);
+    Ok(result)
 }
 
 fn dispatch_queue_flush(
@@ -4786,14 +5167,19 @@ fn dispatch_queue_flush(
         .iter()
         .map(|item| item.queue_id.as_str())
         .collect::<std::collections::HashSet<_>>();
-    let affected_queue_ids = before_items
+    let affected = before_items
         .into_iter()
-        .filter_map(|item| (!remaining.contains(item.queue_id.as_str())).then_some(item.queue_id))
+        .filter(|item| !remaining.contains(item.queue_id.as_str()))
         .collect::<Vec<_>>();
-    Ok(json!({
+    let mut result = json!({
         "revision": revision,
-        "affectedQueueIds": affected_queue_ids,
-    }))
+        "affectedQueueIds": affected.iter().map(|item| item.queue_id.clone()).collect::<Vec<_>>(),
+    });
+    // §2.7: the first item this flush sent.
+    if let Some(first) = affected.first() {
+        super::input_ledger_owner::add_result_input(&mut result, cutex_session_id, &first.client_user_message_id);
+    }
+    Ok(result)
 }
 
 pub(super) fn append_cutex_event(
@@ -4914,12 +5300,32 @@ pub(super) fn invalid_user_input_error(
 pub(super) fn persistence_user_input_error(
     error: anyhow::Error,
 ) -> super::user_input::UserInputExecutionError {
+    if crate::asks::pause_admission::is_deferred(&error) {
+        return admission_busy_user_input_error("route", error);
+    }
     super::user_input::UserInputExecutionError {
         stage: "route".to_string(),
         code: "event_persistence_unavailable".to_string(),
         message: format!("{error:#}"),
         retryable: true,
         details: json!({}),
+        outcome_unknown: false,
+    }
+}
+
+/// The host authority fence was busy: nothing was decided or sent, and the
+/// same request may be retried (`owner-admission-busy-v1`).
+pub fn admission_busy_user_input_error(
+    stage: &str,
+    error: anyhow::Error,
+) -> super::user_input::UserInputExecutionError {
+    use crate::asks::pause_admission::{ADMISSION_BUSY_CODE, ADMISSION_BUSY_RETRY_AFTER_MS, HOST_BUSY_REASON};
+    super::user_input::UserInputExecutionError {
+        stage: stage.to_string(),
+        code: ADMISSION_BUSY_CODE.to_string(),
+        message: format!("{error:#}"),
+        retryable: true,
+        details: json!({ "reason": HOST_BUSY_REASON, "retryAfterMs": ADMISSION_BUSY_RETRY_AFTER_MS }),
         outcome_unknown: false,
     }
 }
@@ -5026,6 +5432,8 @@ pub(super) fn cutex_operation_error_status(code: &str, outcome_unknown: bool) ->
         | "already_retired"
         | "already_active"
         | "agent_name_taken"
+        | "agent_name_reserved"
+        | "agent_name_conflict"
         | "turn_conflict"
         | "session_offline"
         | "turn_active"
@@ -5061,6 +5469,13 @@ pub(super) fn cutex_operation_error_status(code: &str, outcome_unknown: bool) ->
         | "notification_closed"
         | "notification_not_replyable" => 409,
         "ask_not_found" | "question_not_found" | "recipient_not_found" | "revision_not_found" => 404,
+        // cutex/input/retry (input-ledger-v1).
+        "input_not_found" => 404,
+        "input_not_retryable" => 409,
+        "input_not_holdable" => 409,
+        // cutex/input/interruptSend (input-ledger-v1).
+        "input_not_interruptible" => 409,
+        "owner_required" => 403,
         "notification_not_found" | "safety_block_not_found" => 404,
         // Safety grants.
         "safety_block_closed" | "safety_grants_unsupported" | "runtime_refused" => 409,
@@ -5072,7 +5487,8 @@ pub(super) fn cutex_operation_error_status(code: &str, outcome_unknown: bool) ->
         "history_revert_failed" | "session_delete_failed" | "session_fork_failed" => 502,
         "app_server_unavailable" | "native_request_failed" | "interrupt_timeout" => 502,
         "runtime_stop_failed" => 502,
-        "event_persistence_unavailable" | "persistence_uncertain" => 503,
+        "event_persistence_unavailable" | "persistence_uncertain" | "owner_carry_reservation_failed" => 503,
+        "admission_busy" => 503,
         _ => 500,
     }
 }
@@ -5461,8 +5877,10 @@ pub(super) fn enable_live_deltas(
     query: &ReplayQuery,
     subscription: &mut super::repository::EventSubscription,
 ) -> Result<(),super::live_deltas::LiveCapacityError> {
-    if query_parameter(&request.path, "liveDeltas").ok().flatten().as_deref() == Some("true") {
-        repository.enable_live(subscription,query.cutex_session_id.clone())?;
+    let text = query_parameter(&request.path, "liveDeltas").ok().flatten().as_deref() == Some("true");
+    let status = query_parameter(&request.path, "sessionStatus").ok().flatten().as_deref() == Some("true");
+    if text || status {
+        repository.enable_live(subscription,query.cutex_session_id.clone(),text,status)?;
     }
     Ok(())
 }
@@ -5483,8 +5901,37 @@ fn write_sse_event(stream: &mut impl Write, event: &EventEnvelope) -> anyhow::Re
     Ok(())
 }
 
+/// The host stream serves the one durable `cutex/input/stateChanged` in its
+/// host projection (no `preview` / `actions`, 054 §2.13); session streams
+/// and every other event are written as stored.
+fn write_sse_event_for(stream: &mut impl Write, event: &EventEnvelope, host_stream: bool) -> anyhow::Result<()> {
+    match &event.cutex {
+        Some(message) if host_stream && message.method == super::input_ledger::STATE_CHANGED_EVENT => {
+            let mut projected = event.clone();
+            if let Some(message) = projected.cutex.as_mut() {
+                super::input_ledger::host_projection(&message.method.clone(), &mut message.params);
+            }
+            write_sse_event(stream, &projected)
+        }
+        _ => write_sse_event(stream, event),
+    }
+}
+
 fn write_live_delta(stream: &mut impl Write, json: &str) -> anyhow::Result<()> {
     write!(stream, "event: live_delta\ndata: {json}\n\n")?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn write_session_status(stream: &mut impl Write, frame: &super::live_deltas::LiveFrame,
+    stream_id: &str, sequence: u64) -> anyhow::Result<()> {
+    // Cursor fields are observation-only. This separate SSE name deliberately
+    // never enters durable feed advance()/Last-Event-ID, and has no SSE id.
+    let envelope = json!({"contractVersion":2,"eventId":format!("live-{}",uuid::Uuid::new_v4()),
+        "cursor":"","streamId":stream_id,"sequence":sequence,"receivedAt":chrono::Utc::now().to_rfc3339(),
+        "cutexSessionId":frame.cutex_session_id,"hostId":frame.host_id,"source":"cutex","sensitivity":"owner",
+        "correlation":{},"cutex":{"method":frame.method,"params":frame.params}});
+    writeln!(stream,"event: session_status\ndata: {envelope}\n")?;
     stream.flush()?;
     Ok(())
 }
@@ -5518,7 +5965,7 @@ pub(super) fn stream_events_filtered(
     let mut delivered_sequence = 0;
     for event in subscription.page.events {
         if visible(&event) {
-            write_sse_event(stream, &event)?;
+            write_sse_event_for(stream, &event, query.cutex_session_id.is_none())?;
         }
         last_cursor = Some(event.cursor.clone());
         delivered_sequence = delivered_sequence.max(event.sequence);
@@ -5555,7 +6002,7 @@ pub(super) fn stream_events_filtered(
                     .is_none_or(|session_id| event.cutex_session_id == session_id)
                     && visible(&event)
                 {
-                    write_sse_event(stream, &event)?;
+                    write_sse_event_for(stream, &event, query.cutex_session_id.is_none())?;
                     last_write = std::time::Instant::now();
                 }
                 last_cursor = Some(event.cursor.clone());
@@ -5586,6 +6033,19 @@ pub(super) fn stream_events_filtered(
                 let Some(delivery) = live.pop_ready(&subscribed_stream_id,delivered_sequence) else { break; };
                 progressed=true;
                 let frame = delivery.frame();
+                if frame.kind == "gap" && frame.gap_scope == Some("subscription") && live.wants_status() {
+                    // Status is replaceable, not replayable. Force the existing
+                    // stream-resync path so a slow sidebar re-reads its snapshot.
+                    write_sse_lagged(stream, last_cursor.as_deref())?;
+                    return Ok(());
+                }
+                if frame.kind == "sessionStatus" {
+                    if live_visible(&frame.cutex_session_id) {
+                        write_session_status(stream, frame, &subscribed_stream_id, delivered_sequence)?;
+                        last_write = std::time::Instant::now();
+                    }
+                    continue;
+                }
                 let anchored = if frame.kind=="gap" {
                     frame.anchor.as_ref().is_none_or(|a|a.stream_id==subscribed_stream_id)
                 } else {frame.anchor.as_ref().is_some_and(|a|
@@ -5729,6 +6189,32 @@ mod tests {
 
 
     #[test]
+    fn cleanup_http_owner_auth_and_read_only_method_gate() {
+        for path in [super::super::agent_bus_stuck::CONTENT_PATH, super::super::admission_cleanup::PATH] {
+            let send = |bearer: Option<&str>, method: &str| {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let (mut server, _) = listener.accept().unwrap();
+                let mut headers = HashMap::new();
+                if let Some(token) = bearer { headers.insert("authorization".into(), format!("Bearer {token}")); }
+                let request = SimpleHttpRequest { method: method.into(),
+                    path: format!("{path}?minAgeSecs=invalid"), headers, body: vec![] };
+                handle_v2_request(&mut server, &request, Some("agent-secret"), Some("owner-secret"), safety_http_context()).unwrap();
+                drop(server);
+                let mut response = String::new();
+                client.read_to_string(&mut response).unwrap();
+                response
+            };
+            for token in [None, Some("wrong"), Some("agent-secret")] {
+                assert!(!send(token, "GET").starts_with("HTTP/1.1 200"));
+            }
+            assert!(send(Some("owner-secret"), "POST").starts_with("HTTP/1.1 405"));
+            assert!(send(Some("owner-secret"), "GET").starts_with("HTTP/1.1 400"));
+        }
+    }
+
+    #[test]
     fn settlement_http_owner_auth_and_method_gate() {
         use crate::management::client_tokens::{DeviceScope, VerifiedClientToken};
         use crate::management::users::{self, Principal};
@@ -5740,7 +6226,7 @@ mod tests {
             }
         }
         let _reset = Reset;
-        let send = |bearer: Option<&str>, method: &str, body: &[u8]| {
+        let send_to = |path: &str, bearer: Option<&str>, method: &str, body: &[u8]| {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -5750,7 +6236,7 @@ mod tests {
                 headers.insert("authorization".into(), format!("Bearer {bearer}"));
             }
             let request = SimpleHttpRequest { method: method.into(),
-                path: format!("{}?test=1", super::super::agent_bus_stuck::CLOSE_PATH),
+                path: format!("{path}?test=1"),
                 headers, body: body.to_vec() };
             handle_v2_request(&mut server, &request, Some("agent-secret"), Some("owner-secret"), safety_http_context()).unwrap();
             drop(server);
@@ -5758,6 +6244,13 @@ mod tests {
             client.read_to_string(&mut response).unwrap();
             response
         };
+        for path in [
+            super::super::agent_bus_stuck::CLOSE_PATH,
+            super::super::agent_bus_stuck::EVIDENCE_PATH,
+        ] {
+            users::set_current_principal(None);
+            crate::management::listeners::set_current_client_token(None);
+            let send = |bearer, method, body: &[u8]| send_to(path, bearer, method, body);
         for bearer in [None, Some("wrong"), Some("agent-secret")] {
             assert!(send(bearer, "POST", b"{}").starts_with("HTTP/1.1 403"));
         }
@@ -5780,6 +6273,7 @@ mod tests {
             assert!(send(Some("owner-secret"), "POST", b"{}").starts_with("HTTP/1.1 400"));
             assert!(send(Some("owner-secret"), "POST", br#"{"messageId":"m","expectedEvidenceToken":"t","requestId":"r","reason":"reviewed","actor":"forged-owner"}"#)
                 .starts_with("HTTP/1.1 400"));
+            }
         }
     }
 
@@ -5913,6 +6407,33 @@ mod tests {
         request.method = "POST".into();
         let rejected = capture_http_response(|stream| handle_control_diagnostics(stream, &request, Some("test-root")));
         assert!(rejected.starts_with("HTTP/1.1 405"));
+    }
+
+    /// r274 (054 S25): `inputLedger` only while the switch is on; off, the
+    /// top-level keys are exactly r273.1's.
+    #[test]
+    fn control_diagnostics_input_ledger_field_follows_the_switch() {
+        use super::super::input_ledger::pin_enabled;
+        let mut request = request("/v2/diagnostics/control");
+        request.headers.insert("authorization".into(), "Bearer test-root".into());
+        let read = |request: &SimpleHttpRequest| {
+            response_json(&capture_http_response(|stream| handle_control_diagnostics(stream, request, Some("test-root"))))
+        };
+        let pin = pin_enabled(Some(false));
+        let off = read(&request);
+        let mut keys: Vec<&str> = off.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["asksStoreLocks", "capacity", "contractVersion", "queues", "scope", "timing"]);
+        pin.set(Some(true));
+        let on = read(&request);
+        drop(pin);
+        let ledger = &on["inputLedger"];
+        for key in ["transition", "lockWait", "commit", "publish"] {
+            assert!(ledger[key]["count"].is_u64(), "{key}: {ledger}");
+            for field in ["p50Ms", "p99Ms", "maxMs", "meanMs"] {
+                assert!(ledger[key][field].is_f64(), "{key}.{field}: {ledger}");
+            }
+        }
     }
 
     #[test]
@@ -6110,6 +6631,13 @@ mod tests {
         for code in ["variant_base_url_missing", "relay_runtime_unavailable"] {
             assert_eq!(human_agent_error_status(code), 409, "{code}");
             assert_eq!(cutex_operation_error_status(code, false), 409, "{code}");
+        }
+    }
+
+    #[test]
+    fn restore_name_refusals_are_conflicts_not_500() {
+        for code in ["agent_name_taken", "agent_name_reserved", "agent_name_conflict"] {
+            assert_eq!(cutex_operation_error_status(code, false),409,"{code}");
         }
     }
 
@@ -6373,7 +6901,7 @@ mod tests {
         assert_eq!(command.management_request_id, "management-input-1");
         assert_eq!(command.params.origin.client_id, "device-1");
         Ok(super::super::user_input::UserInputSubmitExecution {
-            join_refusal: None,
+            join_refusal: None, queued_reason: None,
             disposition: UserInputDisposition::Started,
             app_server_accepted: true,
             native_request_id: Some(json!("native-input-1")),
@@ -7492,6 +8020,75 @@ mod tests {
             2
         );
         std::fs::remove_dir_all(root).expect("remove event repository");
+    }
+
+    /// r276: a stop an agent's own process asked for (its `cutex` CLI
+    /// sends requestedBy) is named in closing / closed; the stop the runtime
+    /// gets is exactly the one without it.
+    #[test]
+    fn runtime_stop_names_the_agent_that_asked_without_changing_the_stop() {
+        let root = std::env::temp_dir().join(format!("cutex-v2-stop-requested-by-{}", uuid::Uuid::new_v4()));
+        let repository = EventRepository::open(&root, crate::platform::host::current_host_name()).unwrap();
+        let session = json!({
+            "native": { "threadId": "thread-1" },
+            "runtime": { "backend": "claude_subscription", "status": "online", "runtimeGeneration": 3, "runtimeAgentId": "claude.self" }
+        });
+        let seen = std::cell::RefCell::new(Vec::new());
+        let callback = |_: &str, method: &str, params: Value| {
+            seen.borrow_mut().push(params);
+            assert_eq!(method, "cutex/runtime/close");
+            Ok(json!({"runtimeGeneration": 3, "status": "closed", "runtimeAgentId": null}))
+        };
+        let close = |id: &str, params: Value| ValidatedCutexRequest { request_id: id.into(), method: "cutex/runtime/close".into(), params };
+        let base = json!({"expectedRuntimeGeneration": 3, "reason": "cutex_cli", "force": true});
+        let mut asked = base.clone();
+        asked["requestedBy"] = json!({"kind": "agent", "runtimeAgentId": "claude.self"});
+        dispatch_runtime_mutation(&repository, callback, "cutex.self", &session, &close("stop-1", asked)).unwrap();
+        dispatch_runtime_mutation(&repository, callback, "cutex.self", &session, &close("stop-2", base.clone())).unwrap();
+        assert_eq!(seen.borrow()[0], base, "the runtime gets the same stop");
+        assert_eq!(seen.borrow()[1], base);
+        let events = repository.page(ReplayQuery::default()).unwrap().events;
+        let params = |i: usize| events[i].cutex.as_ref().unwrap().params.clone();
+        let methods: Vec<_> = events.iter().map(|event| event.cutex.as_ref().unwrap().method.clone()).collect();
+        assert_eq!(methods, ["cutex/runtime/closing", "cutex/runtime/closed", "cutex/runtime/closing", "cutex/runtime/closed"]);
+        for i in [0, 1] {
+            assert_eq!(params(i)["requestedBy"]["kind"], "agent");
+            assert_eq!(params(i)["requestedBy"]["runtimeAgentId"], "claude.self");
+            assert_eq!(params(i)["reason"], "cutex_cli");
+        }
+        assert!(params(2).get("requestedBy").is_none() && params(3).get("requestedBy").is_none());
+        // Malformed requesters are refused before anything happens.
+        for bad in [json!("claude.self"), json!({"kind": "owner", "runtimeAgentId": "x"}), json!({"kind": "agent", "runtimeAgentId": ""}),
+            json!({"kind": "agent", "runtimeAgentId": "x", "name": "forged"})] {
+            let mut params = base.clone();
+            params["requestedBy"] = bad;
+            let error = dispatch_runtime_mutation(&repository, |_, _, _| panic!("refused"), "cutex.self", &session, &close("bad", params)).unwrap_err();
+            assert_eq!(error.code, "invalid_request", "{}", error.message);
+        }
+        // Not on online.
+        let online = ValidatedCutexRequest { request_id: "on".into(), method: "cutex/runtime/online".into(),
+            params: json!({"requestedBy": {"kind": "agent", "runtimeAgentId": "x"}}) };
+        assert!(dispatch_runtime_mutation(&repository, |_, _, _| panic!("refused"), "cutex.self", &json!({"runtime": {"runtimeGeneration": 3}}), &online).is_err());
+        assert_eq!(repository.page(ReplayQuery::default()).unwrap().events.len(), 4);
+        // The events validate against the published runtime event schema.
+        let schema: Value = serde_json::from_str(include_str!("schema/cutex-methods-v2.json")).unwrap();
+        let defs = schema["$defs"]["runtimeEvent"]["properties"]["requestedBy"].clone();
+        assert_eq!(defs["required"], json!(["kind", "runtimeAgentId"]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stop_requester_resolves_to_the_agents_session_and_name() {
+        let mut record = crate::session::model::CutexSessionRecord::new_at("cutex.alpha".into(), Some("thread".into()), "host".into(), "cwd".into(), None, "2026-10-26T00:00:00Z".into()).unwrap();
+        record.current_runtime_agent_id = Some("claude.alpha".into());
+        record.formal_agent_name = Some("chief-maple".into());
+        let mut store = crate::session::model::CutexSessionStore::default();
+        store.sessions.insert("cutex.alpha".into(), record);
+        let resolved = resolve_stop_requester("claude.alpha", Some(&store));
+        assert_eq!(resolved["cutexSessionId"], "cutex.alpha");
+        assert_eq!(resolved["name"].as_str(), Some(crate::session::metadata::cutex_session_display_name(&store.sessions["cutex.alpha"]).as_str()));
+        assert_eq!(resolve_stop_requester("claude.gone", Some(&store)), json!({"kind": "agent", "runtimeAgentId": "claude.gone"}));
+        assert_eq!(resolve_stop_requester("claude.alpha", None), json!({"kind": "agent", "runtimeAgentId": "claude.alpha"}));
     }
 
     #[test]

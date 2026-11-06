@@ -161,6 +161,19 @@ pub fn queued_agent_messages(
     Ok(queued)
 }
 
+/// Read one message without polling, acknowledging or changing queue order.
+pub fn queued_message_content(
+    state: &Arc<Mutex<AgentBusState>>, message_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let state = state.lock().map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+    let mut content: Option<&str> = None;
+    for message in state.messages.values().flatten().filter(|m| m.id == message_id) {
+        anyhow::ensure!(content.is_none_or(|text| text == message.content), "conflicting queued message content");
+        content = Some(&message.content);
+    }
+    Ok(content.map(str::to_owned))
+}
+
 /// Remove these message ids from every runtime's in-memory queue (owner
 /// discard: the record is already terminal, so no redrive brings them
 /// back). Returns `(agent_id, message_id)` pairs removed.

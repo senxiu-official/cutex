@@ -20,7 +20,7 @@
 //! (`runtime/claude/deployment.json`) adds `claudeRuntimeChanged: true`.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -143,13 +143,21 @@ struct Watch {
     /// The snapshot last compared; an unchanged store hands out the same one.
     store: Option<Arc<CutexSessionStore>>,
     sessions: BTreeMap<String, Fingerprint>,
-    projects: Stamp,
+    projects: Option<crate::agent_management::RosterStamp>,
     claude: ClaudeStamps,
+    cursor: Option<crate::store::ChangeCursor>,
+    /// Only active Claude rows are needed for pending-repin file observations.
+    claude_rows: CutexSessionStore,
 }
 
 /// One watcher step on the current session store snapshot, project store
 /// stamp and Claude runtime stamps. The first step only primes.
-fn step(watch: &mut Watch, store: Arc<CutexSessionStore>, projects: Stamp, claude: ClaudeStamps) -> Changes {
+fn step(
+    watch: &mut Watch,
+    store: Arc<CutexSessionStore>,
+    projects: Option<crate::agent_management::RosterStamp>,
+    claude: ClaudeStamps,
+) -> Changes {
     let projects_changed = watch.primed && projects != watch.projects;
     watch.projects = projects;
     let claude_runtime_changed = watch.primed && claude.selected != watch.claude.selected;
@@ -159,7 +167,8 @@ fn step(watch: &mut Watch, store: Arc<CutexSessionStore>, projects: Stamp, claud
         claude
             .pending
             .iter()
-            .filter(|(id, now)| watch.claude.pending.get(*id).is_some_and(|before| before != *now))
+            .filter(|(id, now)| { watch.claude.pending.get(*id).is_some_and(|before| before != *now)
+            })
             .map(|(id, _)| id.clone())
             .collect()
     } else {
@@ -203,22 +212,21 @@ pub(crate) fn event_params(changes: &Changes, host_id: &str) -> Value {
     params
 }
 
-fn projects_store_path() -> anyhow::Result<PathBuf> {
-    Ok(crate::config::paths::runtime_dir()?
-        .join("agent-management")
-        .join("v1")
-        .join("agent-management-v1.json"))
+/// The roster (projects) commit stamp; SQL commits are not visible as file
+/// timestamps.
+fn projects_stamp() -> anyhow::Result<Option<crate::agent_management::RosterStamp>> {
+    Ok(crate::agent_management::roster_stamp(
+        &crate::config::paths::runtime_dir()?.join("agent-management").join("v1"),
+    ))
 }
 
 static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
 
 fn poll() -> anyhow::Result<()> {
-    let store = crate::session::store::load_cutex_session_store_shared()?;
-    let projects = stamp(&projects_store_path()?);
-    let claude = claude_stamps(&store);
+    let projects = projects_stamp()?;
     let changes = {
         let mut guard = WATCH.lock().unwrap_or_else(|e| e.into_inner());
-        step(guard.get_or_insert_with(Watch::default), store, projects, claude)
+        keyed_step(guard.get_or_insert_with(Watch::default), projects)?
     };
     if changes.is_empty() {
         return Ok(());
@@ -230,6 +238,130 @@ fn poll() -> anyhow::Result<()> {
         super::model::EventCorrelation::default(),
         SESSIONS_CHANGED_EVENT,
         event_params(&changes, &crate::platform::host::current_host_name()),
+    )
+}
+
+fn watch_row(watch: &mut Watch, record: &Arc<CutexSessionRecord>) {
+    if record.is_active() && record.claude_session.is_some() {
+        watch
+            .claude_rows
+            .sessions
+            .insert_shared(record.cutex_session_id.clone(), Arc::clone(record));
+    } else {
+        watch.claude_rows.sessions.remove(&record.cutex_session_id);
+    }
+}
+
+/// One budgeted feed page per tick. A gap rebuilds fingerprints once from
+/// bounded catalog pages, capturing the feed head before those pages.
+fn keyed_step(watch: &mut Watch, projects: Option<crate::agent_management::RosterStamp>) -> anyhow::Result<Changes> {
+    use crate::session::store::{
+        session_changes_at, session_page_at, shared_session_row_at, SessionChanges,
+    };
+    use crate::store::PageBudget;
+    let path = crate::session::store::cutex_sessions_path()?;
+    let mut changes = Changes::default();
+    let delta = watch
+        .cursor
+        .as_ref()
+        .map(|cursor| session_changes_at(&path, cursor, PageBudget::DELTA_DEFAULT))
+        .transpose()?;
+    match delta.flatten() {
+        Some(SessionChanges::Page {
+            changes: rows,
+            cursor,
+            ..
+        }) => {
+            for change in rows {
+                let record = if change.deleted {
+                    None
+                } else {
+                    shared_session_row_at(&path, &change.key)?
+                };
+                if let Some(record) = record {
+                    let now = Fingerprint::of(&record);
+                    match watch
+                        .sessions
+                        .insert(record.cutex_session_id.clone(), now.clone())
+                    {
+                        None => changes.added.push(record.cutex_session_id.clone()),
+                        Some(old) if old != now => {
+                            changes.changed.push(record.cutex_session_id.clone())
+                        }
+                        Some(_) => {}
+                    }
+                    watch_row(watch, &record);
+                } else {
+                    if watch.sessions.remove(&change.key).is_some() {
+                        changes.removed.push(change.key.clone());
+                    }
+                    watch.claude_rows.sessions.remove(&change.key);
+                }
+            }
+            watch.cursor = Some(cursor);
+        }
+        _ => {
+            let mut sessions = BTreeMap::new();
+            let mut head = None;
+            watch.claude_rows = CutexSessionStore::default();
+            for retired in [false, true] {
+                let mut cursor = None;
+                loop {
+                    let Some(page) = session_page_at(
+                        &path,
+                        retired,
+                        cursor.as_deref(),
+                        PageBudget::LIST_DEFAULT,
+                    )?
+                    else {
+                        break;
+                    };
+                    if head.is_none() {
+                        head = Some(page.change_cursor);
+                    }
+                    for record in page.rows {
+                        watch_row(watch, &record);
+                        sessions.insert(record.cutex_session_id.clone(), Fingerprint::of(&record));
+                    }
+                    cursor = page.next;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+            }
+            if watch.primed {
+                changes = diff(&watch.sessions, &sessions);
+            }
+            watch.sessions = sessions;
+            watch.cursor = head;
+        }
+    }
+    let claude = claude_stamps(&watch.claude_rows);
+    if watch.primed {
+        changes.projects_changed = projects != watch.projects;
+        changes.claude_runtime_changed = claude.selected != watch.claude.selected;
+        for (id, now) in &claude.pending {
+            if watch
+                .claude
+                .pending
+                .get(id)
+                .is_some_and(|before| before != now)
+                && !changes.added.contains(id)
+            {
+                changes.changed.push(id.clone());
+            }
+        }
+    }
+    watch.projects = projects;
+    watch.claude = claude;
+    watch.primed = true;
+    changes.added.sort();
+    changes.added.dedup();
+    changes.changed.sort();
+    changes.changed.dedup();
+    changes.removed.sort();
+    changes.removed.dedup();
+    Ok(changes
     )
 }
 
@@ -290,11 +422,11 @@ mod tests {
 
         // agent_create in another process: the new session appears.
         let mut worker = record("cutex.w", "worker");
-        let created = step(&mut watch, store(&[director.clone(), worker.clone()]), None, ClaudeStamps::default());
+        let created = step(&mut watch, store(&[director.clone(), worker.clone()]), None, ClaudeStamps::default(),);
         assert_eq!(created.added, vec!["cutex.w".to_string()]);
         assert!(created.removed.is_empty() && created.changed.is_empty() && !created.projects_changed);
         worker.stamp_created_by_at_creation(Some(&crate::session::model::SessionCreatedBy::Owner)).unwrap();
-        let provenance = step(&mut watch, store(&[director.clone(), worker.clone()]), None, ClaudeStamps::default());
+        let provenance = step(&mut watch, store(&[director.clone(), worker.clone()]), None, ClaudeStamps::default(),);
         assert_eq!(provenance.changed, vec!["cutex.w".to_string()], "creation-time stamp invalidates early observer materialization");
 
         // Runtime-only updates (timestamps, generation) are not reported.
@@ -305,10 +437,10 @@ mod tests {
 
         let mut grouped = busy.clone();
         grouped.agent_groups.push("project:p".into());
-        let regrouped = step(&mut watch, store(&[director.clone(), grouped]), None, ClaudeStamps::default());
+        let regrouped = step(&mut watch, store(&[director.clone(), grouped]), None, ClaudeStamps::default(),);
         assert_eq!(regrouped.changed, vec!["cutex.w".to_string()]);
 
-        let removed = step(&mut watch, store(&[director]), None, ClaudeStamps::default());
+        let removed = step(&mut watch, store(&[director]), None, ClaudeStamps::default(),);
         assert_eq!(removed.removed, vec!["cutex.w".to_string()]);
     }
 
@@ -316,7 +448,7 @@ mod tests {
     fn project_store_writes_are_reported() {
         let mut watch = Watch::default();
         let snapshot = store(&[record("cutex.d", "director")]);
-        let at = |secs| Some((SystemTime::UNIX_EPOCH + Duration::from_secs(secs), 10));
+        let at = |seq| Some(("epoch".to_string(), seq));
         assert!(step(&mut watch, snapshot.clone(), at(1), ClaudeStamps::default()).is_empty());
         assert!(step(&mut watch, snapshot.clone(), at(1), ClaudeStamps::default()).is_empty());
         let changes = step(&mut watch, snapshot, at(2), ClaudeStamps::default());
@@ -376,8 +508,8 @@ mod tests {
     /// the resulting store write into a live host event.
     #[test]
     fn a_session_created_by_another_process_reaches_live_subscribers() {
-        use super::super::repository::{management_v2_repository, EventRepository, ReplayQuery};
         use super::super::model::{CutexMessage, EventCorrelation, EventSource, PendingEvent};
+        use super::super::repository::{management_v2_repository, EventRepository, ReplayQuery};
 
         let _home = crate::profiles::lifecycle::tests::TestHome::new();
         *WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -390,7 +522,7 @@ mod tests {
         let repository = management_v2_repository().expect("repository");
         poll().expect("prime");
         let subscription = repository
-            .page_and_subscribe(ReplayQuery { limit: 1000, ..ReplayQuery::default() }, 64)
+            .page_and_subscribe(ReplayQuery { limit: 1000, ..ReplayQuery::default() }, 64,)
             .expect("subscribe");
 
         // `cutex agent serve`: its own repository instance on the same journal.
@@ -433,8 +565,10 @@ mod tests {
         }
 
         poll().expect("watch");
-        let event = drain(Duration::from_secs(1)).into_iter().find(|event|event.cutex.as_ref()
-            .is_some_and(|m|m.method == SESSIONS_CHANGED_EVENT && m.params["added"] == json!([worker.cutex_session_id])))
+        let event = drain(Duration::from_secs(1)).into_iter().find(|event| {event.cutex.as_ref()
+            .is_some_and(|m| {m.method == SESSIONS_CHANGED_EVENT && m.params["added"] == json!([worker.cutex_session_id])
+                })
+            })
             .expect("live host event for the newly adopted worker");
         assert_eq!(event.cutex_session_id, HOST_EVENT_SESSION_ID);
         let message = event.cutex.expect("cutex message");

@@ -587,10 +587,10 @@ impl AgentManagementProvider {
         action: &AgentActionId,
         runtime: &mut dyn StockRuntimeExecutor,
     ) -> anyhow::Result<MaintenanceReceipt> {
-        let _execution = super::provider::provider_execution_lock()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("maintenance execution lock"))?;
-        let _mutation = self.store().lock_mutations()?;
+        // r271 (051 §2): fence-first when the owner route opted in.
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+        let lane = super::fence_first::fence_first_session_lane(None)?;
+        let _locks = self.entry_locks(lane.as_deref(), true, "maintenance start")?;
         let mut receipt = self
             .maintenance_receipt(human, path, action)?
             .context("maintenance action not applied")?;
@@ -637,10 +637,10 @@ impl AgentManagementProvider {
         request: &MaintenanceRecoveryStartRequest,
         runtime: &mut dyn StockRuntimeExecutor,
     ) -> anyhow::Result<MaintenanceReceipt> {
-        let _execution = super::provider::provider_execution_lock()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("maintenance execution lock"))?;
-        let _mutation = self.store().lock_mutations()?;
+        // r271 (051 §2): fence-first when the owner route opted in.
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+        let lane = super::fence_first::fence_first_session_lane(None)?;
+        let _locks = self.entry_locks(lane.as_deref(), true, "maintenance recovery start")?;
         ensure!(
             request.expires_at_unix > chrono::Utc::now().timestamp()
                 && request.expires_at_unix <= chrono::Utc::now().timestamp() + 600,
@@ -731,7 +731,8 @@ impl AgentManagementProvider {
         path: &Path,
         action: &AgentActionId,
     ) -> anyhow::Result<MaintenanceRecoveryStartRequest> {
-        let _mutation = self.store().lock_mutations()?;
+        // r271.1: only tries the fence when the caller holds a lane.
+        let _locks = self.fence_locks("maintenance recovery review")?;
         let receipt = self
             .maintenance_receipt(human, path, action)?
             .context("maintenance action not applied")?;
@@ -841,10 +842,10 @@ impl AgentManagementProvider {
         path: &Path,
         review: &MaintenanceReview,
     ) -> anyhow::Result<MaintenanceReceipt> {
-        let _execution = super::provider::provider_execution_lock()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("maintenance execution lock"))?;
-        let _mutation = self.store().lock_mutations()?;
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+        // r271 (051 §2): fence-first when the owner route opted in.
+        let lane = super::fence_first::fence_first_session_lane(Some(review.subject.cutex_session_id.as_str()))?;
+        let _locks = self.entry_locks(lane.as_deref(), true, "maintenance apply")?;
         let mut receipt=if let Some(prior)=self.maintenance_receipt(human,path,&review.action_id)? {
             ensure!(&prior.review==review,"maintenance action changed semantics");
             if matches!(prior.phase,MaintenancePhase::Applied|MaintenancePhase::Activated){return Ok(prior)}
@@ -895,7 +896,9 @@ impl AgentManagementProvider {
         path: &Path,
         request: &MaintenanceReviewRequest,
     ) -> anyhow::Result<MaintenanceReview> {
-        let _mutation = self.store().lock_mutations()?;
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+        // r271.1: only tries the fence when the caller holds a lane.
+        let _locks = self.fence_locks("maintenance review")?;
         let expected=selected(&request.cutex_session_id)?;
         let state=self.store().snapshot()?;
         let (project,authority)=authority_digest(&state,&request.cutex_session_id)?;
@@ -1364,7 +1367,8 @@ mod tests {
         let mut uncommitted: crate::session::model::CutexSessionStore =
             serde_json::from_value(serde_json::to_value(&sessions).unwrap()).unwrap();
         if let Some(ExplicitLaunchActionReceipt::Maintenance(receipt)) =
-            uncommitted.explicit_launch_receipts.values_mut().next()
+            uncommitted.explicit_launch_receipts.keys().next().cloned()
+            .and_then(|key| uncommitted.explicit_launch_receipts.get_mut(&key))
         {
             receipt.phase = MaintenancePhase::Prepared;
         }

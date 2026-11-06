@@ -34,9 +34,14 @@ use super::model::EventPage;
 use super::model::EventPageScope;
 use super::model::EventStreamBoundary;
 use super::model::EventStreamMetadata;
+use super::model::EventSource;
 use super::model::PendingEvent;
 use super::model::CONTRACT_VERSION;
 use super::model::MAX_SAFE_SEQUENCE;
+
+#[path = "integration_lookup_snapshot.rs"]
+mod integration_lookup_snapshot;
+pub(super) use integration_lookup_snapshot::{LookupCheckpoint,ReadSnapshot};
 
 const STATE_FILE_NAME: &str = "stream-state.json";
 const EVENTS_FILE_NAME: &str = "events.jsonl";
@@ -55,6 +60,14 @@ pub fn management_v2_repository() -> anyhow::Result<&'static EventRepository> {
     )?;
     *DIAGNOSTIC_REPOSITORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(repository);
     Ok(repository)
+}
+
+/// Status ingress never opens a store. If no Management subscriber initialized
+/// the repository yet, the next session snapshot supplies the current value.
+pub fn publish_background_work(context: &crate::app_server::manager::AppServerRuntimeEventContext,
+    work: Option<crate::app_server::background_work::BackgroundWork>) {
+    let repository = *DIAGNOSTIC_REPOSITORY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(repository) = repository { repository.publish_background_work(context, work); }
 }
 
 /// Never opens storage or waits for a repository operation to finish.
@@ -307,6 +320,19 @@ struct CommitQueue {
     done: HashMap<u64, anyhow::Result<EventEnvelope>>,
 }
 
+// Preserve the IO cause (notably Windows AV error 225) across every ticket of
+// a failed group commit; formatting into a String would lose classification.
+#[derive(Debug)]
+struct SharedAppendError(std::sync::Arc<anyhow::Error>);
+impl std::fmt::Display for SharedAppendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+impl std::error::Error for SharedAppendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref().as_ref()) }
+}
+
 /// The newest stream position this process made durable, and when the
 /// stream state file last recorded it. `stream-state.json` is a checkpoint:
 /// its `nextSequence` may lag the journal tail (written at most every
@@ -447,12 +473,18 @@ impl EventRepository {
         self.live_deltas.publish(pending)
     }
 
+    pub fn publish_background_work(&self, context: &crate::app_server::manager::AppServerRuntimeEventContext,
+        work: Option<crate::app_server::background_work::BackgroundWork>) {
+        self.live_deltas.publish_background_work(&context.cutex_session_id, &self.host_id,
+            context.runtime_generation, &context.thread_id, work);
+    }
+
     pub fn subscribe_live(&self, session: Option<String>) -> Result<super::live_deltas::LiveSubscription,super::live_deltas::LiveCapacityError> {
         self.live_deltas.subscribe(session)
     }
 
-    pub(crate) fn enable_live(&self, subscription:&mut EventSubscription, session:Option<String>)->Result<(),super::live_deltas::LiveCapacityError> {
-        subscription.live_deltas=Some(self.live_deltas.subscribe_woken(session,Some(subscription.wake.clone()))?);
+    pub(crate) fn enable_live(&self, subscription:&mut EventSubscription, session:Option<String>, text: bool, status: bool)->Result<(),super::live_deltas::LiveCapacityError> {
+        subscription.live_deltas=Some(self.live_deltas.subscribe_selected(session,Some(subscription.wake.clone()),text,status)?);
         Ok(())
     }
 
@@ -661,10 +693,10 @@ impl EventRepository {
                 if let Ok(mut index) = self.replay_index.lock() {
                     *index = ReplayIndex::default();
                 }
-                let message = format!("{error:#}");
+                let error = std::sync::Arc::new(error);
                 tickets
                     .into_iter()
-                    .map(|ticket| (ticket, Err(anyhow::anyhow!("{message}"))))
+                    .map(|ticket| (ticket, Err(anyhow::Error::new(SharedAppendError(error.clone())))))
                     .collect()
             }
         }
@@ -730,6 +762,46 @@ impl EventRepository {
 
     pub fn page(&self, query: ReplayQuery) -> Result<EventPage, ReplayError> {
         self.with_replay_lock(|repository| repository.page_locked(query))
+    }
+
+    /// Keep stable handles/byte boundaries only. Cold lookup parsing must not
+    /// occupy this repository lock and indirectly block a dedupe-lock holder.
+    pub(super) fn integration_read_snapshot(&self) -> anyhow::Result<ReadSnapshot> {
+        self.with_repository_lock(|repository| {
+            let (snapshot, reset) = repository.load_snapshot_locked()?;
+            repository.record_recovery_reset(reset)?;
+            let metadata = EventStreamMetadata {
+                stream_id: snapshot.state.stream_id,
+                earliest: snapshot.earliest,
+                latest: snapshot.latest,
+            };
+            let mut files = Vec::new();
+            for path in repository.read_paths() {
+                let file = match File::open(&path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let length = file.metadata()?.len();
+                files.push(integration_lookup_snapshot::SnapshotFile { path, file, length });
+            }
+            Ok(ReadSnapshot { metadata, files })
+        })
+    }
+
+    /// Read one exact retained envelope for a durable integration cursor.
+    /// The lookup cache is advisory: stream, sequence, cursor and the original
+    /// journal bytes are verified under the same lock used by retention.
+    pub(super) fn event_at_cursor(
+        &self,
+        stream: &str,
+        cursor: &str,
+        sequence: u64,
+    ) -> Result<Option<EventEnvelope>, ReplayError> {
+        self.integration_read_snapshot()
+            .map_err(ReplayError::from)?
+            .event_at(stream, cursor, sequence)
+            .map_err(ReplayError::from)
     }
 
     pub fn has_live_subscribers(&self) -> bool {
@@ -1029,7 +1101,12 @@ impl EventRepository {
         }
         let envelope = EventEnvelope {
             contract_version: CONTRACT_VERSION,
-            event_id: Uuid::new_v4().to_string(),
+            // An owner-notify outbox retry is the same logical event. Keeping
+            // its identity lets existing webhook/client consumers deduplicate
+            // after a crash between this append and the outbox acknowledgement.
+            event_id: if pending.source == EventSource::Cutex && pending.cutex.as_ref().is_some_and(|event|matches!(event.method.as_str(),crate::owner_notify::CREATED_EVENT|crate::owner_notify::UPDATED_EVENT|crate::owner_notify::DELETED_EVENT)) {
+                pending.correlation.management_request_id.as_deref().and_then(|id|id.strip_prefix("owner-notify-outbox:")).and_then(|id|Uuid::parse_str(id).ok()).map(|id|id.to_string()).unwrap_or_else(||Uuid::new_v4().to_string())
+            } else {Uuid::new_v4().to_string()},
             cursor: format!("c2:{}", Uuid::new_v4()),
             stream_id: state.stream_id.clone(),
             sequence: state.next_sequence,
@@ -1466,6 +1543,9 @@ impl EventRepository {
         });
         let scan = match self.scan_records_locked(false, validate_cold) {
             Ok(scan) => scan,
+            // AV quarantine/access denial is not evidence of corrupt bytes.
+            // Do not rename/reset the journal while it is merely unreadable.
+            Err(error) if super::runtime_journal::blocked_io(&error).is_some() => return Err(error),
             Err(error) => {
                 return self.reset_uncertain_stream_locked(
                     loaded_state.as_ref(),
@@ -2073,7 +2153,7 @@ impl EventRepository {
         cursor: &str,
         location: ReplayLocation,
         stream_id: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<EventEnvelope> {
         let paths = self.read_paths();
         let path = paths.get(location.file_index).with_context(|| {
             format!(
@@ -2101,7 +2181,7 @@ impl EventRepository {
                 event.sequence
             );
         }
-        Ok(())
+        Ok(event)
     }
 
     /// A cursor older than the hot index: searched in the cold files, newest
@@ -2812,6 +2892,21 @@ mod tests {
     }
 
     #[test]
+    fn owner_notify_outbox_retries_keep_event_identity_for_existing_consumers() {
+        let root=test_root("owner-notify-outbox-id");
+        let repo=EventRepository::open(&root,"devbox").unwrap();
+        let key=Uuid::new_v4().to_string();
+        let mut event=pending("s",1);
+        event.cutex.as_mut().unwrap().method=crate::owner_notify::CREATED_EVENT.into();
+        event.correlation.management_request_id=Some(format!("owner-notify-outbox:{key}"));
+        let first=repo.append(event.clone()).unwrap();let retry=repo.append(event.clone()).unwrap();
+        assert_eq!(first.event_id,key);assert_eq!(retry.event_id,key);assert_ne!(first.cursor,retry.cursor);
+        event.cutex.as_mut().unwrap().method="cutex/test/event".into();
+        assert_ne!(repo.append(event).unwrap().event_id,key,"ordinary request IDs never override event identity");
+        drop(repo);std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn subscription_diagnostics_follow_receive_lag_and_drop() {
         let root = test_root("subscription-diagnostics");
         let repo = EventRepository::open(&root, "devbox").unwrap();
@@ -2899,6 +2994,47 @@ mod tests {
     }
 
     #[test]
+    fn background_status_sse_uses_cutex_envelope_without_text_opt_in_or_durable_writes() {
+        use crate::app_server::background_work::BackgroundWork;
+        use crate::app_server::manager::AppServerRuntimeEventContext;
+        struct StopAfterStatus(Vec<u8>);
+        impl std::io::Write for StopAfterStatus {
+            fn write(&mut self,b:&[u8])->std::io::Result<usize>{self.0.extend_from_slice(b);Ok(b.len())}
+            fn flush(&mut self)->std::io::Result<()> {
+                if String::from_utf8_lossy(&self.0).contains("event: session_status\n") { Err(std::io::ErrorKind::BrokenPipe.into()) } else { Ok(()) }
+            }
+        }
+        let root=test_root("background-status-sse");
+        let repo=EventRepository::open(&root,"devbox").unwrap();
+        repo.append(pending("cutex.a",1)).unwrap();
+        let before=fs::read(root.join("events.jsonl")).unwrap();
+        let checkpoint=repo.checkpoint().unwrap();
+        let mut sub=repo.page_and_subscribe(ReplayQuery::default(),16).unwrap();
+        let request=crate::http::server::SimpleHttpRequest {
+            method:"GET".into(),path:"/v2/events/stream?sessionStatus=true".into(),headers:Default::default(),body:Vec::new(),
+        };
+        super::super::server::enable_live_deltas(&repo,&request,&ReplayQuery::default(),&mut sub).unwrap();
+        let context=AppServerRuntimeEventContext {cutex_session_id:"cutex.a".into(),thread_id:"root".into(),runtime_generation:7,
+            runtime_backend:"host".into(),full_text_item_terminal:false,launched_profile:None,launched_profile_id:None,
+            usage:Default::default(),schema:Default::default()};
+        repo.publish_background_work(&context,Some(BackgroundWork {running:true,terminals:1,..Default::default()}));
+        let mut output=StopAfterStatus(Vec::new());
+        assert!(super::super::server::stream_events(&mut output,sub,&ReplayQuery::default(),crate::management::listeners::RevocationWatch::new(None)).is_err());
+        let text=String::from_utf8(output.0).unwrap();
+        assert!(!text.contains("event: live_delta"));
+        let frame=text.split("event: session_status\ndata: ").nth(1).unwrap();
+        assert!(!frame.contains("\nid:"));
+        let envelope:serde_json::Value=serde_json::from_str(frame.trim()).unwrap();
+        assert_eq!(envelope["source"],"cutex");
+        assert_eq!(envelope["cutex"]["method"],crate::app_server::background_work::METHOD);
+        assert_eq!(envelope["cutex"]["params"]["runtimeGeneration"],7);
+        assert_eq!(envelope["cutex"]["params"]["backgroundWork"]["running"],true);
+        assert_eq!(repo.checkpoint().unwrap(),checkpoint);
+        assert_eq!(fs::read(root.join("events.jsonl")).unwrap(),before);
+        drop(repo);fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn live_text_is_not_durable_and_sse_frame_has_no_cursor() {
         use super::super::model::{AppServerSchema,AppServerSchemaChannel,NativeMessage,NativeMessageKind};
         struct StopAfterLive(Vec<u8>);
@@ -2915,7 +3051,7 @@ mod tests {
         let first=repo.append(pending("cutex.a",1)).unwrap();
         let before=fs::read(root.join("events.jsonl")).unwrap();
         let mut sub=repo.page_and_subscribe(ReplayQuery::default(),16).unwrap();
-        repo.enable_live(&mut sub,Some("cutex.a".into())).unwrap();
+        repo.enable_live(&mut sub,Some("cutex.a".into()),true,false).unwrap();
         let delta=PendingEvent{cutex_session_id:"cutex.a".into(),host_id:"devbox".into(),source:EventSource::AppServer,
             schema:Some(AppServerSchema{protocol:"codex-app-server".into(),major_version:2,version:"test".into(),sha256:"0".repeat(64),
                 channel:AppServerSchemaChannel::Experimental,capabilities:json!({"features":{"fullTextItemTerminal":true}}),extensions:vec![]}),

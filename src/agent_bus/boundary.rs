@@ -101,7 +101,7 @@ impl AgentBoundary {
         if security.cross_project == CrossProjectAccess::Host {
             return Ok(Self::new(security, HashMap::new(), HashMap::new()));
         }
-        let snapshot = crate::memory::load_agent_management_snapshot()?;
+        let snapshot = crate::memory::load_agent_management_directory()?;
         Ok(Self::from_snapshot(security, &snapshot))
     }
 
@@ -140,6 +140,12 @@ impl AgentBoundary {
             (right.clone(), left.clone())
         };
         self.links.contains(&pair)
+    }
+
+    /// A direct configured link, independent of host-wide access or grants.
+    /// Read-only presentation code must not infer a link from may_see.
+    pub fn explicitly_linked(&self, left: &DomainKey, right: &DomainKey) -> bool {
+        self.linked(left, right)
     }
 
     /// Mutual cooperation: same agent, same domain or linked domains (or

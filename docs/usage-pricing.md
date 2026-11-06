@@ -41,11 +41,11 @@ OpenAI API-key profile is Codex, and some profiles have no explicit base URL.)
   value: codex → `chatgpt`, glm / zai → `glm`, kimi / other → `other`, deepseek, claude.
 - The exact v2 value goes into a new account-level field `provider_category`.
 
-r216 reads `options` with a strict enum inside a `deny_unknown_fields` struct; a value such
-as `"codex"` or `"kimi"` there would make the whole profile store unreadable for r216, so
+The legacy reader reads `options` with a strict enum inside a `deny_unknown_fields` struct; a value such
+as `"codex"` or `"kimi"` there would make the whole profile store unreadable for that reader, so
 v2 values are never written there. `StoredAccount` itself has no `deny_unknown_fields`:
-r216 ignores `provider_category` and **drops it on its next profile-store save**. After a
-rollback r216 therefore shows the legacy value (zai as GLM, kimi as Other, codex as ChatGPT).
+the legacy reader ignores `provider_category` and **drops it on its next profile-store save**. After a
+rollback the legacy reader therefore shows the legacy value (zai as GLM, kimi as Other, codex as ChatGPT).
 After rolling forward again, a dropped v2 value reads as the legacy one (zai → glm, kimi → other).
 
 `provider_category` counts only while its legacy projection equals `options.provider`. If an
@@ -154,10 +154,10 @@ Response: `{contractVersion: 2, currency, models, currencies: ["USD","AUD","CNY"
 
 - `<cutex home>/usage-prices-v2.json` — authoritative `{version: 2, currency, models,
   legacySha256}`.
-- `<cutex home>/usage-prices.json` — rewritten on every save in the **r216 format**
+- `<cutex home>/usage-prices.json` — rewritten on every save in the **legacy format**
   (`{currency, models: {k: {input, cachedInput?, output}}}`): entries converted to the table
   currency at the rates in effect, aliases expanded to extra keys (≤ 256, case-unique),
-  `cacheWriteInput` dropped. r216 reads it unchanged (its `deny_unknown_fields` structs would
+  `cacheWriteInput` dropped. The legacy reader reads it unchanged (its `deny_unknown_fields` structs would
   reject the v2 entry fields, hence the separate file).
 - If `usage-prices.json` no longer matches `legacySha256` (an older cutex or a hand edit
   changed it), it is imported and wins until the next save; reports / GET carry a warning.
@@ -168,7 +168,7 @@ Response: `{contractVersion: 2, currency, models, currencies: ["USD","AUD","CNY"
 `GET|PUT /v2/usage/prices`. The target's price comes from wherever Y has one (manual entry,
 the selected library, the built-in cards), so the owner never retypes a library price for a
 relay's renamed model (e.g. `gemini-3.8-flash-tiere` → `gemini-3.8-flash`) or for the bare
-Claude Code aliases some old claude-r5 rows recorded (`sonnet` → `claude-sonnet-4-5`).
+Older Claude adapters recorded some Claude Code aliases (`sonnet` → `claude-sonnet-4-5`).
 Generic owner-maintained data; nothing is provider-specific.
 
 - Matching: the sample's pricing model (`requestModel`, else `model`), then its `model`, each
@@ -193,18 +193,18 @@ Generic owner-maintained data; nothing is provider-specific.
 The map is stored in `usage-prices-v2.json` (`modelMap`, omitted while empty), not in
 `config.json` `usage`:
 - it belongs to the price table and is saved by the same `PUT` (one atomic table write);
-- r216 and older never write `usage-prices-v2.json`, while they drop the unknown parts of
+- legacy builds never write `usage-prices-v2.json`, while they drop the unknown parts of
   `config.json` on *any* config save;
-- the r216 projection `usage-prices.json` also gets every `from` whose target has a manual
-  price as an extra key (like aliases, within the 256 cap), so r216 keeps pricing those
-  mapped names. Library / built-in targets have no r216 equivalent (r216 shows them unpriced).
-- r217 – this branch's predecessors read the v2 file (no `deny_unknown_fields` there) and
+- the legacy projection `usage-prices.json` also gets every `from` whose target has a manual
+  price as an extra key (like aliases, within the 256 cap), so the legacy reader keeps pricing those
+  mapped names. Library / built-in targets have no legacy equivalent (the legacy reader shows them unpriced).
+- Earlier readers of the version-2 format read the v2 file (no `deny_unknown_fields` there) and
   ignore `modelMap`; their next price-table save drops it. Roll-forward then shows no map
   (re-enter it). If an older binary changed only `usage-prices.json` (`legacy-changed`), the
   imported table keeps the v2 file's map, minus names the imported table prices directly
   (these are the projected manual-target names: same price).
 
-No conversion either way.
+These are format compatibility notes. Supported rollback still depends on the signed release migration metadata.
 
 ## 3. Currency (`usage-currency`)
 
@@ -218,16 +218,16 @@ No conversion either way.
   (`exchangeRatesSource: "auto"`); before the first success or when off, the configured rates.
 - Reports return `currency` and `pricing.exchangeRates` / `exchangeRatesSource`.
 
-## 4. Rollback summary (this branch → r216)
+## 4. Compatibility with the legacy pricing format
 
-| Data | r216 behaviour |
+| Data | legacy behaviour |
 |---|---|
 | `accounts.json` `options.provider` | readable (legacy values only) |
-| `accounts.json` `provider_category` | ignored, dropped on r216's next profile-store save |
-| `config.json` `usage` block | ignored, dropped on r216's next config save (like `owner_notify` for r210) |
-| `usage-prices.json` | r216 format; prices converted, aliases as keys |
-| `usage-prices-v2.json` | ignored; kept. After roll-forward it is used again unless r216 changed `usage-prices.json` |
-| `usage-prices-v2.json` `modelMap` | ignored by r216 (names mapped to manual entries are priced through the projection); dropped by r217+ binaries without `usage-model-map` on their next price save (§2a) |
+| `accounts.json` `provider_category` | ignored, dropped on the legacy reader's next profile-store save |
+| `config.json` `usage` block | ignored, dropped on the legacy reader's next config save (as with the older `owner_notify` field) |
+| `usage-prices.json` | legacy format; prices converted, aliases as keys |
+| `usage-prices-v2.json` | ignored; kept. After roll-forward it is used again unless the legacy reader changed `usage-prices.json` |
+| `usage-prices-v2.json` `modelMap` | ignored by the legacy reader (names mapped to manual entries are priced through the projection); dropped by later legacy binaries without `usage-model-map` on their next price save (§2a) |
 | `runtime/usage-pricing/` | ignored; can be deleted any time (re-fetched) |
 
 No conversion step is needed either way.

@@ -110,7 +110,6 @@ fn route_json_with_receipt_loader(
     let query = |key: &str| crate::http::query::query_value(full_path, key);
     match route {
         Route::Collection => {
-            let state = store.history_snapshot().map_err(unavailable)?;
             let filter = AskFilter {
                 project: query("project"),
                 requester: query("requester"),
@@ -127,7 +126,41 @@ fn route_json_with_receipt_loader(
                     .ok_or_else(|| bad_request(format!("limit must be 1..={MAX_LIMIT}")))?,
             };
             let peer = query("peer");
-            let mut asks: Vec<_> = state.asks.values().filter(|ask| filter.matches(ask) && peer.as_ref().is_none_or(|id|ask.remote.as_ref().is_some_and(|r|&r.peer_id==id)||matches!(&ask.requester,crate::asks::model::Requester::Peer{peer_id,..}if peer_id==id))).collect();
+            let cleanup_query = |key: &str| -> Result<Option<String>, RouteError> {
+                let values = full_path.split_once('?').into_iter()
+                    .flat_map(|(_, query)| query.split('&'))
+                    .filter(|part| part.split('=').next() == Some(key))
+                    .collect::<Vec<_>>();
+                if values.len() > 1 { return Err(bad_request(format!("duplicate {key}"))); }
+                values.first().map(|part| {
+                    let (_, value) = part.split_once('=').ok_or_else(|| bad_request(format!("missing {key} value")))?;
+                    super::attachments::percent_decode(value).ok_or_else(|| bad_request(format!("invalid {key} encoding")))
+                }).transpose()
+            };
+            let updated_before = cleanup_query("updatedBefore")?;
+            let cursor = cleanup_query("cursor")?;
+            if cursor.is_some() && updated_before.is_none() {
+                return Err(bad_request("cursor requires updatedBefore"));
+            }
+            let state = store.readonly_history_snapshot().map_err(unavailable)?;
+            if updated_before.is_some() {
+                let page = crate::asks::view::cleanup_page(
+                    &state, &filter, peer.as_deref(), updated_before.as_deref(), cursor.as_deref(), limit,
+                ).map_err(|error| RouteError {
+                    status: if error.code == "invalid_request" { 400 } else { 503 },
+                    code: error.code, message: error.detail, details: json!({}),
+                })?;
+                let receipts = read_receipts(&page.asks);
+                return Ok(json!({
+                    "hostId": crate::platform::host::current_host_name(),
+                    "asks": page.asks.into_iter()
+                        .map(|ask| crate::asks::view::summary_with_receipts(&state, ask, &receipts))
+                        .collect::<Vec<_>>(),
+                    "hasMore": page.has_more,
+                    "nextCursor": page.next_cursor,
+                }));
+            }
+            let mut asks: Vec<_> = state.asks.values().map(|ask| &**ask).filter(|ask| filter.matches(ask) && peer.as_ref().is_none_or(|id|ask.remote.as_ref().is_some_and(|r|&r.peer_id==id)||matches!(&ask.requester,crate::asks::model::Requester::Peer{peer_id,..}if peer_id==id))).collect();
             asks.sort_by_key(|ask| std::cmp::Reverse(ask.seq));
             let has_more = asks.len() > limit;
             asks.truncate(limit);
@@ -577,6 +610,78 @@ mod tests {
     use super::*;
     use crate::asks::model::*;
     use crate::asks::store::tests::{new_ask, temp_store, REQUESTER};
+
+    fn cleanup_list(store: &AskStore, path: &str) -> Result<Value, RouteError> {
+        route_json_with_receipt_loader(store, path, &Route::Collection, &|_| Default::default())
+    }
+
+    #[test]
+    fn cleanup_route_filters_before_limit_and_preserves_legacy_order_and_files() {
+        let (store, dir) = temp_store("cleanup-route");
+        let mut state = crate::asks::store::AskState::default();
+        let old = crate::asks::parse_time("2026-10-29T00:00:00Z").unwrap();
+        let (template, _) = state.create_ask(new_ask("route-cleanup", "old"), old).unwrap();
+        state.asks.clear();
+        for n in 0..1005 {
+            let mut ask = template.clone();
+            ask.ask_id = format!("ask-{n:04}");
+            ask.seq = n;
+            ask.updated_at = if n < 3 { "2026-10-29T00:00:00Z" } else { "2026-10-31T00:00:00Z" }.into();
+            if n == 0 { ask.project_id = Some("excluded".into()); }
+            state.asks.insert(ask.ask_id.clone(), ask.into());
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("asks-v1.json");
+        let bytes = serde_json::to_vec(&state).unwrap();
+        std::fs::write(&file, &bytes).unwrap();
+        let path = format!("/v2/asks?updatedBefore=2026-10-29T00%3A00%3A00Z&project=alpha&involving={REQUESTER}&state=open&limit=1");
+        let first = cleanup_list(&store, &path).ok().unwrap();
+        assert_eq!(first["asks"][0]["askId"], "ask-0001");
+        assert_eq!(first["hasMore"], true);
+        let second = cleanup_list(&store, &format!("{path}&cursor={}", first["nextCursor"].as_str().unwrap())).ok().unwrap();
+        assert_eq!(second["asks"][0]["askId"], "ask-0002");
+        assert_eq!(second["hasMore"], false);
+        assert!(second["nextCursor"].is_null());
+        let legacy = cleanup_list(&store, "/v2/asks?limit=1").ok().unwrap();
+        assert_eq!(legacy["asks"][0]["askId"], "ask-1004");
+        assert!(legacy.get("nextCursor").is_none());
+        let none = cleanup_list(&store, "/v2/asks?updatedBefore=2026-11-01T00:00:00Z&involving=unrelated").ok().unwrap();
+        assert!(none["asks"].as_array().unwrap().is_empty());
+        assert_eq!(std::fs::read(file).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_route_rejects_invalid_and_scope_mismatched_queries() {
+        let (store, dir) = temp_store("cleanup-route-invalid");
+        for path in [
+            "/v2/asks?cursor=abc",
+            "/v2/asks?updatedBefore=",
+            "/v2/asks?updatedBefore",
+            "/v2/asks?updatedBefore=2026-10-30",
+            "/v2/asks?updatedBefore=2026-10-30T00:00:00",
+            "/v2/asks?updatedBefore=2026-10-30%2000:00:00Z",
+            "/v2/asks?updatedBefore=%GG",
+            "/v2/asks?updatedBefore=2026-10-30T00:00:00Z&updatedBefore=2026-10-31T00:00:00Z",
+            "/v2/asks?updatedBefore=2026-10-30T00:00:00Z&cursor=bad",
+            "/v2/asks?updatedBefore=2026-10-30T00:00:00Z&cursor=abc&cursor=def",
+        ] {
+            assert_eq!(cleanup_list(&store, path).err().unwrap().status, 400, "{path}");
+        }
+        assert!(!dir.exists());
+        store.with_state(|state| {
+            let now = crate::asks::parse_time("2026-10-29T00:00:00Z").unwrap();
+            state.create_ask(new_ask("scope-a", "first"), now).unwrap();
+            state.create_ask(new_ask("scope-b", "second"), now).unwrap();
+        }).unwrap();
+        let path = format!("/v2/asks?updatedBefore=2026-10-30T00:00:00Z&involving={REQUESTER}&limit=1");
+        let first = cleanup_list(&store, &path).ok().unwrap();
+        let cursor = first["nextCursor"].as_str().unwrap();
+        let changed = format!("/v2/asks?updatedBefore=2026-10-30T00:00:00Z&involving=other&limit=1&cursor={cursor}");
+        assert_eq!(cleanup_list(&store, &changed).err().unwrap().status, 400);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn paths_parse_strictly() {

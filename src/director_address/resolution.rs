@@ -39,7 +39,7 @@ impl Store {
         raw_digest: &str,
         resolution: RoleResolution,
     ) -> Result<RoleResolution, AskError> {
-        self.update(|state| {
+        self.update_if(|state| {
             let key = key(caller, action_id, tool);
             if let Some(receipt) = state.role_resolutions.get(&key) {
                 if receipt.raw_digest != raw_digest {
@@ -48,7 +48,7 @@ impl Store {
                         "Role-address action ID already has another request",
                     ));
                 }
-                return Ok(receipt.resolution.clone());
+                return Ok((receipt.resolution.clone(),false));
             }
             state.role_resolutions.insert(
                 key,
@@ -58,7 +58,7 @@ impl Store {
                     business: None,
                 },
             );
-            Ok(resolution)
+            Ok((resolution,true))
         })
     }
 }
@@ -70,11 +70,11 @@ pub fn with_role_action<T>(
 ) -> Result<T, AskError> {
     let roster = crate::agent_management::AgentManagementStore::open_default().map_err(store::unavailable)?;
     let _fence = roster.lock_mutations().map_err(store::unavailable)?;
-    let snapshot = roster.snapshot().map_err(store::unavailable)?;
+    let snapshot = roster.directory_snapshot_shared().map_err(store::unavailable)?;
     let store = Store::open_default()?;
-    // Maintenance is optional: unavailable terminal proof must retain rows, not
-    // block or change the business action. No clock or expiry is involved.
-    let _ = store.prune_redundant_role_bookkeeping();
+    // The periodic worker performs optional maintenance. A role action never
+    // does receipt IO or a whole-AskState transaction just to prune copies.
+    super::pruning::request_maintenance();
     run(&snapshot, &store)
 }
 
@@ -105,16 +105,16 @@ impl Store {
     /// only by a caller holding with_role_action and validating fresh authority.
     pub fn refresh_role_target(&self, caller: &str, action_id: &str, tool: &str, raw_digest: &str,
         resolution: RoleResolution) -> Result<RoleResolution, AskError> {
-        self.update(|state| {
+        self.update_if(|state| {
             let key = key(caller, action_id, tool);
             if let Some(old) = state.role_resolutions.get_mut(&key) {
                 if old.raw_digest != raw_digest { return Err(AskError::new("action_conflict", "Role-address action ID already has another request")); }
-                if old.business.is_some() { return Ok(old.resolution.clone()); }
+                if old.business.is_some() || old.resolution==resolution { return Ok((old.resolution.clone(),false)); }
                 old.resolution = resolution.clone();
             } else {
                 state.role_resolutions.insert(key, RoleResolutionReceipt { raw_digest: raw_digest.into(), resolution: resolution.clone(), business: None });
             }
-            Ok(resolution)
+            Ok((resolution,true))
         })
     }
 
@@ -127,12 +127,13 @@ impl Store {
     /// after this write is uncertain, so it must not be retargeted on retry.
     pub fn set_role_business(&self, caller: &str, action_id: &str, tool: &str, raw_digest: &str,
         business: Option<serde_json::Value>) -> Result<(), AskError> {
-        self.update(|state| {
+        self.update_if(|state| {
             let record = state.role_resolutions.get_mut(&key(caller, action_id, tool))
                 .ok_or_else(|| AskError::new("action_conflict", "No role-address intent exists"))?;
             if record.raw_digest != raw_digest { return Err(AskError::new("action_conflict", "Role-address action ID already has another request")); }
+            if record.business==business {return Ok(((),false));}
             record.business = business;
-            Ok(())
+            Ok(((),true))
         })
     }
 

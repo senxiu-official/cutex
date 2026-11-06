@@ -102,11 +102,20 @@ fn local_resolution(spec: &ManagedAgentSpec) -> anyhow::Result<LocalResolution> 
     Ok(LocalResolution { catalog, reasoning: configuration.reasoning, fallback: configuration.effort_fallback })
 }
 
+/// A launch review that failed before anything was created; a model the
+/// profile's model list does not show is `invalid_model`.
+pub(super) fn preflight_failure(error: anyhow::Error) -> LifecycleFailure {
+    match error.downcast_ref::<cutex::profiles::model_check::UnlistedModel>() {
+        Some(refusal) => LifecycleFailure::definite("invalid_model", refusal.to_string()),
+        None => LifecycleFailure::definite("native_bootstrap_preflight_failed", error.to_string()),
+    }
+}
+
 fn resolve_local_reasoning_with(
     spec: &mut ManagedAgentSpec,
     review: impl Fn(&ManagedAgentSpec) -> anyhow::Result<LocalResolution>,
 ) -> Result<(), LifecycleFailure> {
-    let preflight = |error: anyhow::Error| LifecycleFailure::definite("native_bootstrap_preflight_failed", error.to_string());
+    let preflight = preflight_failure;
     if reasoning::is_default(&spec.reasoning) {
         // Resolve the profile default; the review validates it for the model.
         let configuration = review(spec).map_err(preflight)?;
@@ -292,6 +301,17 @@ mod tests {
         assert_eq!(default.reasoning, "high");
         let error = resolve_local_reasoning_with(&mut spec("max-only", ""), review).unwrap_err();
         assert_eq!(error.code, "native_bootstrap_preflight_failed");
+    }
+
+    /// r274.1: the launch review's unlisted-model refusal is `invalid_model`
+    /// with its text; other review failures keep their code.
+    #[test]
+    fn an_unlisted_model_preflight_is_invalid_model() {
+        let refusal = "Model 'gpt-sol-6.1' is not on the model list of profile 'Ada' (x). Allowed models: gpt-6.1-sol.";
+        let failure = preflight_failure(cutex::profiles::model_check::UnlistedModel(refusal.into()).into());
+        assert_eq!((failure.code.as_str(), failure.detail.as_str()), ("invalid_model", refusal));
+        let failure = preflight_failure(anyhow::anyhow!("selected profile changed during review"));
+        assert_eq!(failure.code, "native_bootstrap_preflight_failed");
     }
 
     /// Design 028 (b): a `default` effort the review replaced (Zooey: profile

@@ -43,6 +43,30 @@ pub struct HostSession {
     #[serde(default)]
     pub runtime_version_recorded_at: Option<String>,
 }
+
+pub(super) fn exact_id(path: &str) -> Option<String> {
+    let encoded=path.split('?').next()?.strip_prefix("/v2/host/sessions/")?;
+    if encoded.is_empty() || encoded.len()>480 || encoded.contains('/') { return None; }
+    super::server::decode_path_segment(encoded).filter(|id|id.len()<=160 && !id.chars().any(char::is_control))
+}
+
+pub(super) fn handle_exact(stream:&mut TcpStream,request:&SimpleHttpRequest,context:ManagementRequestContext)->anyhow::Result<()> {
+    let id=exact_id(&request.path).expect("exact host route dispatch validated its ID");
+    let value=exact_value_at(&crate::session::store::cutex_sessions_path()?,
+        &crate::platform::host::current_host_name(),&id,context.load_runtime_status)?;
+    write_json_response(stream,200,"OK",&value)
+}
+
+fn exact_value_at(path:&std::path::Path,host:&str,id:&str,load:crate::management::server::ManagementRuntimeStatusLoader)->anyhow::Result<serde_json::Value> {
+    let mut store=crate::session::model::CutexSessionStore::default();
+    if let Some(record)=crate::session::store::host_session_row_at(path,host,id)? {
+        store.sessions.insert_shared(record.cutex_session_id.clone(),record);
+    }
+    let native_versions=crate::launch::version_registry::load_relaxed();
+    let mut value=project(&store,host,&Query::default(),load,native_versions.as_ref());
+    annotate_projects(&mut value);
+    Ok(value)
+}
 pub(super) fn handle(
     stream: &mut TcpStream,
     request: &SimpleHttpRequest,
@@ -73,21 +97,39 @@ pub(super) fn handle(
             json!({}),
         );
     }
-    let store = crate::session::store::load_cutex_session_store()?;
     let host = crate::platform::host::current_host_name();
+    let (records, next) = crate::session:: store::host_session_page_at(
+        & crate::session::store::cutex_sessions_path()?,
+        & host,
+        query.cursor.as_deref(),
+        &query.query,
+        query.limit.unwrap_or(50),
+    )?;
+    let mut store = crate::session::model::CutexSessionStore::default();
+    for record in records {
+        store
+            .sessions
+            .insert_shared(record.cutex_session_id.clone(), record);
+    }
     let native_versions = crate::launch::version_registry::load_relaxed();
     let mut value=project(&store,&host,&query,context.load_runtime_status,native_versions.as_ref());
-    if let Ok(snapshot)=crate::agent_management::AgentManagementStore::open_default().and_then(|s|s.snapshot().map_err(anyhow::Error::new)) {
+    value["nextCursor"] = json!(next);
+    annotate_projects(&mut value);
+    write_json_response(stream,200,"OK",&value)
+}
+
+fn annotate_projects(value:&mut serde_json::Value) {
+    if value["data"].as_array().is_none_or(|rows|rows.is_empty()) { return; }
+    if let Ok(snapshot)=crate::agent_management::AgentManagementStore::open_default().and_then(|s|s.directory_snapshot_shared().map_err(anyhow::Error::new)) {
         if let Some(rows)=value["data"].as_array_mut(){for row in rows {
-            if let Some((_,agent))=snapshot.agents.iter().find(|(id,_)|Some(id.as_str())==row["id"].as_str()) {
+            if let Some(agent)=row["id"].as_str().and_then(|id|snapshot.agent_by_session(id)) {
                 if let Some(id)=crate::agent_management::current_project_id(&snapshot,agent) {
-                    let presentation=crate::agent_management::effective_presentation(&id,snapshot.project_presentations.get(&id));
+                    let presentation=crate::agent_management::effective_presentation(&id,snapshot.project_presentations.get(&id),);
                     row["projectId"]=json!(id.as_str());row["projectName"]=json!(presentation.display_name);
                 }
             }
         }}
     }
-    write_json_response(stream,200,"OK",&value)
 }
 fn project(
     store:&crate::session::model::CutexSessionStore,
@@ -161,7 +203,8 @@ fn project(
                     .or_else(|| {
                         r.explicit_launch
                             .as_ref()
-                            .and_then(|contract| registry.runtime_version_for_launch_contract(contract))
+                            .and_then(|contract| { registry.runtime_version_for_launch_contract(contract)
+                        })
                     })
             });
             HostSession {
@@ -202,27 +245,56 @@ fn project(
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[test]
+ fn exact_id_route_is_owner_heavy_bounded_and_not_a_substring_or_map_alias() {
+  let _home_lock=crate::config::paths::test_home_env_lock();
+  use crate::session::{model::{CutexSessionRecord,CutexSessionStore,CutexSessionArchiveState},store::*};
+  let root=std::env::temp_dir().join(format!("c2-exact-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(&root).unwrap();
+  let path=root.join("cutex-sessions.json");let host="local-test";
+  let mut store=CutexSessionStore::default();
+  for id in ["cutex.target","cutex.target-more","cutex.hidden","cutex.foreign","cutex.retired"] {
+   let mut row=CutexSessionRecord::new_at(id.into(),None,host.into(),"/synthetic".into(),None,"2026-11-04T00:00:00Z".into()).unwrap();row.agent_enabled=id!="cutex.hidden";
+   if id=="cutex.foreign" {row.host_id="foreign-host".into();}
+   if id=="cutex.retired" {row.archive_state=CutexSessionArchiveState::Retired;}
+   let key=if id=="cutex.target" {"imported-map-key"} else if id=="cutex.target-more" {"cutex.target"} else {id};
+   store.sessions.insert(key.into(),row);
+  }
+  save_cutex_session_store_to_path(&path,&store).unwrap();
+  let schema:serde_json::Value=serde_json::from_str(include_str!("schema/export/host-session.json")).unwrap();let validator=jsonschema::validator_for(&schema).unwrap();
+  let row=exact_value_at(&path,host,"cutex.target", |_|Ok(None)).unwrap();
+  assert!(validator.is_valid(&row));assert_eq!(row["data"].as_array().unwrap().len(),1);assert_eq!(row["data"][0]["id"],"cutex.target");assert!(row["nextCursor"].is_null());
+  for id in ["cutex.targe","cutex.TARGET","cutex.missing","cutex.hidden","cutex.foreign","cutex.retired","imported-map-key"] {
+   let value=exact_value_at(&path,host,id, |_|panic!("ineligible/missing ID must not load runtime")).unwrap();assert!(validator.is_valid(&value));assert!(value["data"].as_array().unwrap().is_empty(),"{id}");
+  }
+  assert_eq!(exact_id("/v2/host/sessions/cutex%2Etarget").as_deref(),Some("cutex.target"));
+  for path in ["/v2/host/sessions/","/v2/host/sessions/a/b","/v2/host/sessions/a%2Fb","/v2/host/sessions/a%00","/v2/host/sessions/%ZZ"] {assert!(exact_id(path).is_none(),"{path}");}
+  let route="/v2/host/sessions/cutex.target";
+  assert_eq!(super::super::access::classify("GET",route),Some(super::super::access::Class::OwnerOnly));
+  let request=crate::http::server::SimpleHttpRequest {method:"GET".into(),path:route.into(),headers:Default::default(),body:Vec::new()};
+  assert_eq!(super::super::control_capacity::classify(&request),super::super::control_capacity::WorkClass::HeavyRead);
+  std::fs::remove_dir_all(root).unwrap();
+ }
  #[test] fn catalog_pages_exclude_foreign_records_and_runtime_secrets(){
   let mut store=crate::session::model::CutexSessionStore::default();
   for i in 0..206 {
    let id=format!("cutex.{}",uuid::Uuid::new_v4());
-   let mut r=crate::session::model::CutexSessionRecord::new(id.clone(),None,if i==205{"foreign"}else{"local-test"}.into(),"/work".into(),Some("preset".into())).unwrap();
+   let mut r=crate::session::model::CutexSessionRecord::new(id.clone(),None,if i==205{"foreign"}else{"local-test"}.into(),"/work".into(),Some("preset".into()),).unwrap();
    r.agent_enabled=true;r.formal_agent_name=Some(format!("Worker-{i}"));r.thread_name=Some("SECRET_HISTORY_SENTINEL".into());store.sessions.insert(id,r);
   }
   let default_page=project(&store,"local-test",&Query::default(), |_|Ok(None),None);
   assert_eq!(default_page["data"].as_array().unwrap().len(),50);
-  let desktop_page=project(&store,"local-test",&Query{limit:Some(200),..Default::default()}, |_|Ok(None),None);
+  let desktop_page=project(&store,"local-test",&Query{limit:Some(200),..Default::default()}, |_|Ok(None),None,);
   assert_eq!(desktop_page["data"].as_array().unwrap().len(),200);
-  let first=project(&store,"local-test",&Query{limit:Some(5000),..Default::default()}, |_|Ok(None),None);
+  let first=project(&store,"local-test",&Query{limit:Some(5000),..Default::default()}, |_|Ok(None),None,);
   assert_eq!(first["data"].as_array().unwrap().len(),200);assert!(!first.to_string().contains("SECRET_HISTORY_SENTINEL"));
-  let second=project(&store,"local-test",&Query{cursor:first["nextCursor"].as_str().map(str::to_owned),..Default::default()}, |_|Ok(None),None);assert_eq!(second["data"].as_array().unwrap().len(),5);assert!(second["nextCursor"].is_null());
-  let one=project(&store,"local-test",&Query{query:"WORKER-54".into(),..Default::default()}, |_|Ok(None),None);assert_eq!(one["data"].as_array().unwrap().len(),1);assert_eq!(one["data"][0]["name"],"Worker-54");
+  let second=project(&store,"local-test",&Query{cursor:first["nextCursor"].as_str().map(str::to_owned),..Default::default()}, |_|Ok(None),None,);assert_eq!(second["data"].as_array().unwrap().len(),5);assert!(second["nextCursor"].is_null());
+  let one=project(&store,"local-test",&Query{query:"WORKER-54".into(),..Default::default()}, |_|Ok(None),None,);assert_eq!(one["data"].as_array().unwrap().len(),1);assert_eq!(one["data"][0]["name"],"Worker-54");
  }
 
  #[test] fn host_sessions_report_additive_runtime_versions_and_accept_older_peers(){
   let mut store=crate::session::model::CutexSessionStore::default();
   let id="cutex.runtime-version";
-  let mut record=crate::session::model::CutexSessionRecord::new(id.to_string(),None,"local-test".into(),"/work".into(),Some("preset".into())).unwrap();
+  let mut record=crate::session::model::CutexSessionRecord::new(id.to_string(),None,"local-test".into(),"/work".into(),Some("preset".into()),).unwrap();
   record.agent_enabled=true;
   record.runtime_pid=Some(std::process::id());
   store.sessions.insert(id.to_string(),record);
@@ -245,7 +317,7 @@ mod tests {
     version("0.157.1-r44"),
    )]),
   };
-  let value=project(&store,"local-test",&Query::default(),|_|Ok(None),Some(&registry));
+  let value=project(&store,"local-test",&Query::default(),|_|Ok(None),Some(&registry),);
   assert_eq!(value["data"][0]["runtimeVersion"],"0.157.1-r44");
   assert_eq!(value["data"][0]["runtimeVersionLatest"],"0.157.1-r45");
   let old_peer=r#"{

@@ -227,5 +227,5 @@ A `PATCH` that sets or clears `model` on a Claude profile also drops that
 profile's `newSessionDefaults` model when it differs (its `reasoning` stays;
 an entry left empty goes), so the value written is what new sessions get.
 Existing sessions keep their own model (a Claude session copies it at
-creation); pinned older adapters (claude-r5 …) pass the string to the SDK
+creation); older pinned adapters without validation pass the string to the SDK
 unchanged, ids and aliases alike.

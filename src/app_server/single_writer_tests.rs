@@ -19,6 +19,106 @@ fn temp_root() -> PathBuf {
     root
 }
 
+#[test]
+#[ignore = "EVA-scale runtime fixture; scripts/perf/waste-runtime.ps1"]
+fn waste_scale_b10_launcher_lease_liveness() {
+    use crate::test_support::waste_runtime_scale as scale;
+    use std::sync::atomic::AtomicUsize;
+    let root = scale::Root::new("b10");
+    // 64 leases is the observed order of magnitude (~13KB owner file).
+    let mut file = OwnersFile::default();
+    file.version = FILE_VERSION;
+    for index in 0..64 {
+        file.leases.insert(
+            format!("cutex.{index:036}"),
+            Lease {
+                owner: identity(2),
+                runtime_generation: 1,
+                cut_at_ms: 2000,
+                token: format!("token-{index:032}"),
+                since: "2026-10-31T00:00:00Z".into(),
+            },
+        );
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let ledger = Ledger::new(root.path(), identity(1), Role::Launcher, move |_| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        true
+    });
+    crate::config::atomic::write_private_pretty_json_atomic(&ledger.path(), &file, "scale leases")
+        .unwrap();
+    let mut samples = Vec::new();
+    for _ in 0..100 {
+        ledger.invalidate();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            ledger.owner_cut("cutex.000000000000000000000000000000000000", 1),
+            Some(2000)
+        );
+        samples.push(start.elapsed());
+    }
+    let count = calls.load(Ordering::Relaxed);
+    scale::emit(
+        "B10",
+        json!({"leases":64,"bytes":fs::metadata(ledger.path()).unwrap().len()}),
+        &samples,
+        json!({"process_checks":count}),
+    );
+    if !scale::before() {
+        assert_eq!(
+            count, 100,
+            "one liveness probe per distinct ProcessIdentity per refresh"
+        );
+    }
+}
+
+#[test]
+fn waste_guard_b10_launcher_refresh_probes_pid_start_identity_once_and_rechecks_death() {
+    let root = temp_root();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = calls.clone();
+    let alive = Arc::new(AtomicBool::new(true));
+    let check_alive = alive.clone();
+    let ledger = Ledger::new(&root, identity(1), Role::Launcher, move |process| {
+        seen.lock().unwrap().push(process.clone());
+        check_alive.load(Ordering::Relaxed)
+    });
+    let mut file = OwnersFile::default();
+    file.version = FILE_VERSION;
+    for index in 0..64 {
+        // Reused PID with a different start time is a distinct process.
+        let mut owner = identity(2);
+        if index % 2 == 1 {
+            owner.started_at = Some("another-start".into());
+        }
+        file.leases.insert(
+            format!("s-{index}"),
+            Lease {
+                owner,
+                runtime_generation: 7,
+                cut_at_ms: 2000,
+                token: format!("t-{index}"),
+                since: "now".into(),
+            },
+        );
+    }
+    crate::config::atomic::write_private_pretty_json_atomic(&ledger.path(), &file, "leases")
+        .unwrap();
+    assert_eq!(ledger.owner_cut("s-0", 7), Some(2000));
+    assert_eq!(ledger.owner_cut("s-1", 7), Some(2000));
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    alive.store(false, Ordering::Relaxed);
+    ledger.invalidate();
+    assert_eq!(ledger.owner_cut("s-0", 7), None);
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        4,
+        "negative result is also per-process cached"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Two simulated processes on one home: the Agent Bus service (launcher)
 /// and Management (owner). `owner_alive` stands for Management's process.
 struct Home {

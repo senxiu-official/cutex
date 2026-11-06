@@ -380,6 +380,9 @@ fn receipts(value: Option<&Value>, reader: Reader) -> anyhow::Result<()> {
     Ok(())
 }
 fn archive_json(home: &Path, reader: Reader) -> anyhow::Result<()> {
+    crate::agent_management::ensure_roster_legacy_authoritative(
+        &home.join("runtime/agent-management/v1"),
+    )?;
     if let Some(state) = optional_json(&home.join(AUTHORITY))? {
         marker(&state, reader)?;
         ensure!(

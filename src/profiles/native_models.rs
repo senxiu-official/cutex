@@ -236,6 +236,7 @@ impl std::fmt::Display for NativeCliExit {
 impl std::error::Error for NativeCliExit {}
 
 pub(crate) fn run_cli(cli: &VerifiedFile, args: &[&str], native_home: &Path, timeout: std::time::Duration) -> anyhow::Result<Vec<u8>> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     let mut command = std::process::Command::new(&cli.path);
     #[cfg(windows)]
     {

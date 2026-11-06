@@ -393,7 +393,7 @@ fn reason(status: u16) -> &'static str {
 }
 
 fn load_default_source() -> anyhow::Result<DefaultScopeSource> {
-    let snapshot = crate::memory::load_agent_management_snapshot()?;
+    let snapshot = crate::memory::load_agent_management_directory()?;
     let session_ids = crate::session::store::load_cutex_session_store()?
         .sessions
         .values()

@@ -172,6 +172,15 @@ impl Store {
         &self,
         update: impl FnOnce(&mut OwnershipState) -> Result<T, AskError>,
     ) -> Result<T, AskError> {
+        self.update_if(|state| update(state).map(|result| (result, true)))
+    }
+
+    /// Explicit dirty result avoids cloning/comparing the whole ownership
+    /// document just to discover that a replay did not change one record.
+    pub(super) fn update_if<T>(
+        &self,
+        update: impl FnOnce(&mut OwnershipState) -> Result<(T, bool), AskError>,
+    ) -> Result<T, AskError> {
         fs::create_dir_all(&self.root).map_err(unavailable)?;
         let lock = fs::OpenOptions::new()
             .read(true)
@@ -193,7 +202,10 @@ impl Store {
                 "Ownership store is newer than this daemon; refusing to rewrite it",
             ));
         }
-        let result = update(&mut state)?;
+        let (result, changed) = update(&mut state)?;
+        if !changed {
+            return Ok(result);
+        }
         state.version = ownership_version();
         state.revision += 1;
         crate::config::atomic::write_private_pretty_json_atomic(
@@ -208,5 +220,139 @@ impl Store {
             .map_err(unavailable)?
             .remove(&self.path());
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod waste_tests {
+    use super::*;
+    #[test]
+    #[ignore = "EVA-sized ownership no-op scale probe"]
+    fn waste_scale_a11_ownership_noop() {
+        let root = std::env::temp_dir().join(format!("scale-ownership-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(&root);
+        store
+            .update(|s| {
+                for n in 0..1024 {
+                    s.extra.insert(
+                        format!("retained-{n}"),
+                        serde_json::json!("synthetic-history ".repeat(50)),
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        let bytes = std::fs::metadata(store.path()).unwrap().len();
+        let resolution = super::super::RoleResolution {
+            project_id: "synthetic".into(),
+            target: "director".into(),
+            epoch: 1,
+        };
+        store
+            .pin_role_target(
+                "synthetic",
+                "same-action",
+                "agent_tell",
+                "digest",
+                resolution.clone(),
+            )
+            .unwrap();
+        let revision = store.snapshot().unwrap().revision;
+        let mut samples = Vec::new();
+        for _ in 0..12 {
+            let t = std::time::Instant::now();
+            store
+                .pin_role_target(
+                    "synthetic",
+                    "same-action",
+                    "agent_tell",
+                    "digest",
+                    resolution.clone(),
+                )
+                .unwrap();
+            samples.push(t.elapsed());
+        }
+        crate::test_support::waste_scale::emit(
+            "a11_ownership_noop",
+            &samples,
+            store.snapshot().unwrap().revision - revision,
+            serde_json::json!({"serialized_bytes":bytes,"eva_target_bytes":crate::test_support::waste_scale::OWNERSHIP_BYTES}),
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn waste_guard_ownership_replay_and_identical_business_never_write() {
+        let root = std::env::temp_dir().join(format!("guard-ownership-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(&root);
+        let resolution = super::super::RoleResolution {
+            project_id: "synthetic".into(),
+            target: "director".into(),
+            epoch: 1,
+        };
+        store
+            .pin_role_target(
+                "caller",
+                "action",
+                "agent_tell",
+                "digest",
+                resolution.clone(),
+            )
+            .unwrap();
+        store
+            .set_role_business(
+                "caller",
+                "action",
+                "agent_tell",
+                "digest",
+                Some(serde_json::json!({"state":"committed"})),
+            )
+            .unwrap();
+        let stamp = Stamp::of(&store.path());
+        let revision = store.snapshot().unwrap().revision;
+        let bytes = std::fs::read(store.path()).unwrap();
+        for _ in 0..8 {
+            store
+                .pin_role_target(
+                    "caller",
+                    "action",
+                    "agent_tell",
+                    "digest",
+                    resolution.clone(),
+                )
+                .unwrap();
+            store
+                .refresh_role_target(
+                    "caller",
+                    "action",
+                    "agent_tell",
+                    "digest",
+                    resolution.clone(),
+                )
+                .unwrap();
+            store
+                .set_role_business(
+                    "caller",
+                    "action",
+                    "agent_tell",
+                    "digest",
+                    Some(serde_json::json!({"state":"committed"})),
+                )
+                .unwrap();
+        }
+        assert_eq!(store.snapshot().unwrap().revision, revision);
+        assert_eq!(Stamp::of(&store.path()), stamp);
+        assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
+        assert!(store
+            .pin_role_target(
+                "caller",
+                "action",
+                "agent_tell",
+                "changed-digest",
+                resolution
+            )
+            .is_err());
+        assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -12,6 +12,7 @@ pub mod env;
 pub mod job_mcp;
 pub mod local_deployment;
 pub mod native_features;
+pub mod native_managed;
 pub mod profile;
 pub mod program;
 pub mod runtime;

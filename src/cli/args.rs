@@ -1640,6 +1640,12 @@ pub enum HumanCommand {
         #[arg(long)]
         job_descriptor: Option<std::path::PathBuf>,
     },
+    /// Copy the selected native artifacts into managed storage for future agents
+    ManageNativeRuntime {
+        /// Verify and show current paths without copying or selecting anything
+        #[arg(long)]
+        check: bool,
+    },
     /// Inspect, change, or undo desired configuration
     Config {
         #[command(subcommand)]
@@ -2085,6 +2091,30 @@ pub enum InstanceCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum ComponentCommand {
+    /// Re-check the selected/candidate adapter's external dependencies (no install)
+    Check { name: String },
+    /// Configure external dependency paths and re-check (no selection change)
+    Configure {
+        name: String,
+        #[arg(long, conflicts_with = "clear_external_root")]
+        external_root: Option<std::path::PathBuf>,
+        #[arg(long)]
+        clear_external_root: bool,
+        #[arg(long, conflicts_with = "clear_node")]
+        node: Option<std::path::PathBuf>,
+        #[arg(long)]
+        clear_node: bool,
+        #[arg(long, conflicts_with = "clear_rg")]
+        rg: Option<std::path::PathBuf>,
+        #[arg(long)]
+        clear_rg: bool,
+    },
+
+    /// Signed component index policy, verification and offline kits
+    Index {
+        #[command(subcommand)]
+        command: ComponentIndexCommand,
+    },
     /// Every component: state, selected / available version
     List {
         #[arg(long)]
@@ -2098,6 +2128,9 @@ pub enum ComponentCommand {
         /// Build / take the files from a checkout instead (origin: source)
         #[arg(long = "from-source", value_name = "DIR")]
         from_source: Option<std::path::PathBuf>,
+        /// Select an explicit version from the configured component offer source
+        #[arg(long, conflicts_with = "from_source")]
+        version: Option<String>,
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
@@ -2116,6 +2149,36 @@ pub enum ComponentCommand {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ComponentIndexCommand {
+    /// Show the configured offer policy (no download or probe)
+    Status,
+    /// Verify and cache channel-components/index.json and its minisig
+    Check,
+    /// Change offer policy only; never change defaults or existing session pins
+    Config {
+        #[arg(long, value_parser = ["releaseManifest", "componentIndex", "privateKit"])]
+        policy: String,
+        #[arg(long, default_value = "public-stable")]
+        channel: String,
+        /// HTTPS release source or absolute local mirror; required for privateKit
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Copy canonical archive/signature bytes and the signed snapshot into a new offline kit
+    FreezeKit {
+        destination: std::path::PathBuf,
+        /// NAME@VERSION:PLATFORM; repeat for every exact asset to freeze
+        #[arg(long = "asset", required = true)]
+        assets: Vec<String>,
+    },
+    /// Verify an offline kit without changing host policy or selected components
+    VerifyKit { root: std::path::PathBuf },
+    /// Verify/import an offline kit and freeze this host's offer source (no selection)
+    ImportKit { root: std::path::PathBuf },
+
 }
 
 #[derive(Subcommand, Debug)]
@@ -2208,6 +2271,34 @@ pub enum UpgradeCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum StorageCommand {
+    /// S7 offline import of one session row store (r276; stopped writers only).
+    SessionRowsImport {
+        #[arg(long, value_parser=["session-activity", "session-projection"])]
+        store: String,
+        #[arg(long)]
+        daemon_stopped: bool,
+    },
+    /// Build or catch up the usage ledger index (design 058 S1); with
+    /// --verify, compare it with the full ledger reader. Safe while cutex
+    /// runs (it takes the usage store lock); the kit runs it in the pause.
+    UsageIndex {
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Import owner notifications/safety and receipts into keyed SQL; offline R1 export with --rollback
+    NotificationStore {
+        #[arg(long)]
+        rollback: bool,
+        #[arg(long = "daemon-stopped")]
+        daemon_stopped: bool,
+    },
+    /// Import approvals, rules and confirmation nonces into keyed SQL; offline R1 export with --rollback
+    ApprovalStore {
+        #[arg(long)]
+        rollback: bool,
+        #[arg(long = "daemon-stopped")]
+        daemon_stopped: bool,
+    },
     /// Configure and run the permanent asks hot/archive split offline
     AsksArchive {
         /// Fixed RFC3339 cutoff; default is activation-day local midnight
@@ -2221,6 +2312,29 @@ pub enum StorageCommand {
         /// Exact preceding kit release: r259, r260, or r261
         #[arg(long)]
         target: String,
+        #[arg(long = "daemon-stopped")]
+        daemon_stopped: bool,
+    },
+    /// Read-only: where the agent roster lives (SQLite or legacy JSON), its
+    /// revision and row counts (058 S4 kit check-only)
+    RosterStatus,
+    /// Import the legacy roster JSON into SQLite now (058 S4); the JSON is
+    /// only read. Normally the first locked access does this.
+    RosterImport {
+        /// Confirm that management, agent-bus and runtime services are stopped
+        #[arg(long = "daemon-stopped")]
+        daemon_stopped: bool,
+    },
+    /// Import the complete owner-input JSON into SQLite before new writers
+    /// start (058 S5); retain the JSON and report the ready marker and counts.
+    OwnerInputImport {
+        #[arg(long = "daemon-stopped")]
+        daemon_stopped: bool,
+    },
+    /// R1: write the SQLite roster back as the exact previous build's
+    /// agent-management-v1.json and hand authority back to it
+    RosterExport {
+        /// Confirm that management, agent-bus and runtime services are stopped
         #[arg(long = "daemon-stopped")]
         daemon_stopped: bool,
     },
@@ -2266,4 +2380,28 @@ pub enum ServiceCommand {
     /// Windows: the supervisor the logon task starts (also usable on Linux for tests)
     #[command(hide = true)]
     Run,
+}
+
+#[cfg(test)]
+mod component_index_args_tests {
+    use super::*;
+    #[test]
+    fn explicit_version_and_index_kit_commands_parse_without_touching_state() {
+        for args in [
+            vec!["cutex","component","install","dsh-runtime","--version","dsh-r3"],
+            vec!["cutex","component","index","check"],
+            vec!["cutex","component","check","dsh-runtime"],
+            vec!["cutex","component","configure","dsh-runtime","--external-root","/private/prefix","--clear-node","--clear-rg"],
+            vec!["cutex","component","index","config","--policy","componentIndex"],
+            vec!["cutex","component","index","freeze-kit","/tmp/new-kit","--asset","dsh-runtime@dsh-r3:linux-x64"],
+            vec!["cutex","component","index","verify-kit","/tmp/kit"],
+            vec!["cutex","component","index","import-kit","/tmp/kit"],
+        ] { assert!(Cli::try_parse_from(args.clone()).is_ok(),"{args:?}"); }
+        assert!(Cli::try_parse_from(["cutex","component","install","dsh-runtime","--version","dsh-r3","--from-source","checkout"]).is_err());
+        assert!(Cli::try_parse_from(["cutex","component","index","config","--policy","unknown"]).is_err());
+        assert!(Cli::try_parse_from(["cutex","component","index","freeze-kit","/tmp/new-kit"]).is_err());
+        for (set,clear) in [("--external-root","--clear-external-root"),("--node","--clear-node"),("--rg","--clear-rg")] {
+            assert!(Cli::try_parse_from(["cutex","component","configure","dsh-runtime",set,"/private/path",clear]).is_err());
+        }
+    }
 }

@@ -400,6 +400,19 @@ pub fn read_page(store: &DocumentStore, document_id: &str, reader: &str, cursor:
 /// event `system.<kind>` in the notification level tables. Tests never
 /// reach the real store: callers run in the management process only.
 pub fn notify_owner(kind: &str, agent_id: &str, agent_name: Option<String>, text: String, delegation: Option<String>) {
+    notify_owner_for_turn(kind, agent_id, agent_name, text, delegation, None);
+}
+
+/// As [`notify_owner`], about the agent's turn `turn_id` (the record's
+/// `turnId`, so a client can open that turn).
+pub fn notify_owner_for_turn(
+    kind: &str,
+    agent_id: &str,
+    agent_name: Option<String>,
+    text: String,
+    delegation: Option<String>,
+    turn_id: Option<String>,
+) {
     use crate::owner_notify::store::{Level, NewNotification, OwnerNotifyStore};
     if cfg!(test) {
         return;
@@ -416,12 +429,11 @@ pub fn notify_owner(kind: &str, agent_id: &str, agent_name: Option<String>, text
         needs_reply: false,
         delegation,
         job: None,
-        turn_id: None,
+        turn_id,
     };
     // Written by cutex, not by the agent: no reply, labelled as a cutex notice.
-    let origin = crate::owner_notify::store::Origin::System;
     let created =
-        store.with_state(|state| state.create_decided(new, origin, Some(kind), &settings, &evaluator, None, Utc::now()));
+        store.create_system(new,Some(kind),&settings,&evaluator,Utc::now());
     if let Err(error) = created {
         eprintln!("documents: could not notify the owner: {error:#}");
         return;

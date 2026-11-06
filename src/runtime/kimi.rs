@@ -41,6 +41,9 @@ pub const KIMI_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KimiOptions {
+    /// Session-pinned external ripgrep, independent of later deployment changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rg: Option<PathBuf>,
     pub credential: KimiCredentialSource,
     /// Model aliases cutex declares for an API-key launch (empty: Kimi's catalog
     /// below for the selected model; account launches use the account's catalog).
@@ -153,6 +156,8 @@ pub fn api_key_models(
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KimiDeployment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rg: Option<PathBuf>,
     pub node: PathBuf,
     pub adapter: PathBuf,
     /// `<install_root>/node_modules/@moonshot-ai/kimi-code/dist/main.mjs`.
@@ -182,6 +187,11 @@ pub fn node_version_ready(text: &str) -> bool {
 
 impl KimiDeployment {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if crate::components::dsh_runtime::validate_external_deployment(
+            "kimi-runtime", &self.node, &self.adapter, &self.kimi_cli, &self.install_root, &self.version, self.rg.as_deref(),
+        )? {
+            return Ok(());
+        }
         ensure!(self.version == PINNED_KIMI_VERSION, "Kimi Code deployment must pin {PINNED_KIMI_VERSION}");
         for path in [&self.node, &self.adapter, &self.kimi_cli] {
             ensure!(path.is_absolute() && path.is_file(), "Kimi deployment runtime file missing: {}", path.display());
@@ -195,6 +205,7 @@ impl KimiDeployment {
         Ok(())
     }
     pub fn install(&self) -> anyhow::Result<()> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         self.validate()?;
         crate::config::atomic::write_private_pretty_json_atomic(&deployment_path()?, self, "Kimi deployment")
     }
@@ -229,7 +240,7 @@ pub fn require_control(record: &CutexSessionRecord) -> anyhow::Result<()> {
 pub fn require_session(record: &CutexSessionRecord) -> anyhow::Result<()> {
     require_control(record)?;
     let session = session(record)?;
-    KimiDeployment { node: session.node.clone(), adapter: session.adapter.clone(), kimi_cli: session.dsh_cli.clone(),
+    KimiDeployment { rg: options(session)?.rg.clone(), node: session.node.clone(), adapter: session.adapter.clone(), kimi_cli: session.dsh_cli.clone(),
         install_root: session.install_root.clone(), version: session.deployment_version.clone() }.validate()?;
     ensure!(session.state_dir.is_absolute() && session.patch == kimi_home(session).join("config.toml"), "Kimi config must be session-owned");
     options(session)?;
@@ -275,7 +286,8 @@ pub const EFFORTS: &[&str] = &["off", "on", "low", "medium", "high", "max"];
 /// Preallocates the app-server thread id (not Kimi's session id, which Kimi
 /// mints at the first start), so an unstarted agent can join a Project.
 pub fn create_agent(request: KimiCreate) -> anyhow::Result<CutexSessionRecord> {
-    let KimiCreate { name, cwd, profile, model, reasoning_effort, options, managed, created_by, permissions, sandbox_mode, approval_policy, profile_binding } = request;
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+    let KimiCreate { name, cwd, profile, model, reasoning_effort, mut options, managed, created_by, permissions, sandbox_mode, approval_policy, mut profile_binding } = request;
     ensure!(!name.trim().is_empty() && name.trim() == name && name.chars().count() <= 128 && !name.chars().any(char::is_control), "valid Kimi agent name required");
     ensure!(cwd.is_absolute() && cwd.is_dir(), "absolute Kimi working directory required");
     ensure!(valid_model(&model), "valid Kimi model required");
@@ -284,6 +296,10 @@ pub fn create_agent(request: KimiCreate) -> anyhow::Result<CutexSessionRecord> {
     }
     validate_options(&options)?;
     let deployment = KimiDeployment::selected()?;
+    options.rg = deployment.rg.clone();
+    if let Some(binding) = profile_binding.as_mut() {
+        binding.runtime_package_version = Some(deployment.version.clone());
+    }
     let cwd = crate::agent_management::strip_verbatim_prefix(cwd.canonicalize()?.to_str().context("Kimi cwd must be Unicode")?).to_string();
     let id = format!("cutex.{}", uuid::Uuid::new_v4());
     let state_dir = crate::config::paths::runtime_dir()?.join(AcpFlavor::Kimi.state_root()).join(&id);
@@ -368,14 +384,14 @@ pub fn create_profile_variant(
     if let Some(effort) = &effort {
         crate::profiles::kimi::validate_effort(effort)?;
     }
-    let binding = plan.binding(Some(model.clone()), effort.clone(), Some(PINNED_KIMI_VERSION.into()));
+    let binding = plan.binding(Some(model.clone()), effort.clone(), None);
     create_agent(KimiCreate {
         name: name.into(),
         cwd: cwd.into(),
         profile: Some(account.name.clone()),
         model,
         reasoning_effort: effort,
-        options: KimiOptions { credential: KimiCredentialSource::Profile, models: Vec::new() },
+        options: KimiOptions { rg: None, credential: KimiCredentialSource::Profile, models: Vec::new() },
         managed,
         created_by,
         permissions: overrides.permissions,
@@ -563,12 +579,18 @@ fn pin_scratch_project_root_in(config: &Path, cwd: &Path) -> anyhow::Result<()> 
 /// private, so it never sees the user's), `# File references` and, for
 /// project members, `# Memory`. Project files are Kimi's own (not repeated).
 pub fn instructions(record: &CutexSessionRecord) -> (Option<String>, Vec<PathBuf>) {
+    let (text, sources, _) = instructions_with_snapshot(record);
+    (text, sources)
+}
+
+fn instructions_with_snapshot(record: &CutexSessionRecord) -> (Option<String>, Vec<PathBuf>, Option<crate::memory::idle_note::Snapshot>) {
     let cwd = Path::new(&record.cwd);
     let memory = crate::memory::launch_memory_context_or_warn(&record.cutex_session_id);
     let root = memory.as_ref().map(|memory| memory.file_reference_root(cwd)).unwrap_or(cwd);
     let user = crate::memory::harness::user_agents_md();
     let mut sources = user.as_ref().map(|user| user.files.clone()).unwrap_or_default();
     sources.extend(project_instruction_files(cwd));
+    let snapshot = memory.as_ref().and_then(|memory| memory.index_snapshot.clone());
     let sections = crate::memory::harness::compose_claude_sections(
         crate::memory::harness::launch_harness(record),
         user,
@@ -578,7 +600,7 @@ pub fn instructions(record: &CutexSessionRecord) -> (Option<String>, Vec<PathBuf
         KIMI_INSTRUCTIONS_MAX_BYTES,
     );
     let text = crate::memory::harness::join_sections(&sections);
-    ((!text.trim().is_empty()).then_some(text), sources)
+    ((!text.trim().is_empty()).then_some(text), sources, snapshot)
 }
 
 // ---------------------------------------------------------------- launch
@@ -631,7 +653,7 @@ pub fn write_home(record: &CutexSessionRecord) -> anyhow::Result<KimiLaunchParts
     let image_models = image_models(&config);
     let text = format!("# Written by cutex at every start of this agent; edits are replaced.\n{}", toml::to_string(&config)?);
     crate::config::atomic::write_private_bytes_atomic(&session.patch, text.as_bytes())?;
-    let (instructions, instruction_sources) = instructions(record);
+    let (instructions, instruction_sources, snapshot) = instructions_with_snapshot(record);
     let agents = home.join("AGENTS.md");
     match instructions {
         Some(text) => crate::config::atomic::write_private_bytes_atomic(&agents, text.as_bytes())?,
@@ -639,6 +661,7 @@ pub fn write_home(record: &CutexSessionRecord) -> anyhow::Result<KimiLaunchParts
             let _ = std::fs::remove_file(&agents);
         }
     }
+    crate::memory::idle_note::launched(&record.cutex_session_id, snapshot, false);
     // A Kimi account: cutex refreshes the shared token ahead of Kimi (no Kimi
     // process of the account races a refresh) and records its values'
     // fingerprints for redaction.

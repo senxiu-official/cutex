@@ -145,7 +145,14 @@ pub(super) fn dispatch(
             };
             // No queue mutation precedes native acceptance. Sending/unknown is
             // durably recorded by the backend; failed calls leave this item intact.
-            let execution = steer(&command, start_if_idle, session)?;
+            let execution = steer(&command, start_if_idle, session).inspect_err(|error| {
+                // The item stays queued: a refused `sending` waits again
+                // (r274 decision 3; an unknown outcome is `uncertain` already).
+                if !error.outcome_unknown {
+                    super::input_ledger_owner::native_refused(session_id, &item.client_user_message_id,
+                        super::input_ledger_owner::refusal_reason(error));
+                }
+            })?;
             if !execution.app_server_accepted
                 || !matches!((execution.disposition, execution.native_method.as_deref()),
                     (UserInputDisposition::Steered, Some("turn/steer")) |
@@ -208,12 +215,14 @@ pub(super) fn dispatch(
                 "reason": if execution.disposition == UserInputDisposition::Steered { "steered" } else { "submitted" },
                 "removedAt": chrono::Utc::now().to_rfc3339(),
             }), image_delivery)).map_err(post_operation_persistence_error)?;
-            Ok(with_image_delivery(json!({
+            let mut result = with_image_delivery(json!({
                 "disposition": execution.disposition,
                 "turnId": execution.turn_id,
                 "clientUserMessageId": item.client_user_message_id,
                 "queueRevision": revision,
-            }), image_delivery))
+            }), image_delivery);
+            super::input_ledger_owner::add_result_input(&mut result, session_id, &item.client_user_message_id);
+            Ok(result)
         }
         _ => unreachable!("not a queue order method"),
     }
@@ -258,13 +267,128 @@ pub fn session_offline() -> UserInputExecutionError {
 }
 
 pub fn steer_unavailable(reason: &str) -> UserInputExecutionError {
+    debug_assert!(STEER_UNAVAILABLE_REASONS.contains(&reason), "unlisted steer_unavailable reason {reason}");
+    let mut details = json!({"reason": reason});
+    if reason == "admissionBusy" {
+        // Deferred admission (host authority fence busy): nothing was sent.
+        details["retryAfterMs"] = json!(crate::asks::pause_admission::ADMISSION_BUSY_RETRY_AFTER_MS);
+    }
     UserInputExecutionError {
         stage: "queue".into(),
         code: "steer_unavailable".into(),
         message: "the queued input cannot be sent immediately; it was kept".into(),
         retryable: true,
-        details: json!({"reason": reason}),
+        details,
         outcome_unknown: false,
+    }
+}
+
+/// Every `steer_unavailable` `details.reason`. Clients must map each one
+/// explicitly (exported as `schema/export/owner-input-reasons.json`; the
+/// desktop contract test reads that file). Append-only.
+pub const STEER_UNAVAILABLE_REASONS: &[&str] = &[
+    "joinChanged", "agentPaused", "admissionBusy", "delegationTurn",
+    "runtimeNoSteer", "runtimeRefused", "noActiveTurn", "imagePathRequired", "imageUnavailable",
+    "turnFinishing",
+];
+
+/// `queuedReason` of a `queued` owner submit (`owner-admission-busy-v1`).
+/// Why the input waits; `hostBusy` is never a pause. Append-only.
+pub const QUEUED_REASONS: &[&str] = &[
+    "explicitQueue", "paused", "hostBusy", "delegationLease", "turnRunning",
+    "imageBusy", "adapterQueued", "ownerQueueAhead", "joinRefused", "turnFinishing",
+];
+
+/// Owner-input error codes a client can receive from submit / queue routes.
+/// Append-only; `admission_busy` is retryable and means nothing was sent.
+pub const OWNER_INPUT_ERROR_CODES: &[&str] = &[
+    "admission_busy", "steer_unavailable", "turn_conflict", "session_offline",
+    "outcome_unknown", "request_outcome_unknown", "revision_conflict", "queue_item_not_found",
+    "queue_input_already_submitted", "user_input_in_progress", "event_persistence_unavailable",
+    "invalid_input", "app_server_unavailable", "interrupt_timeout", "owner_required",
+    "admission_timeout",
+];
+
+/// queue/list `ownerAdmission.state` / `.reason` (`owner-admission-state-v1`).
+pub const OWNER_ADMISSION_STATES: &[&str] = &["idle", "turn", "finishing", "held"];
+pub const OWNER_ADMISSION_HELD_REASONS: &[&str] = &["hostBusy", "stopHold", "paused", "delegationLease"];
+
+pub const REASONS_EXPORTED_SCHEMA: super::schema_export::ExportedSchema = super::schema_export::ExportedSchema {
+    name: "owner-input-reasons",
+    title: "Owner input reasons and error codes",
+    routes: &["POST cutex/userInput/submit", "POST cutex/userInput/queue/list"],
+    text: include_str!("schema/export/owner-input-reasons.json"),
+};
+
+#[cfg(test)]
+mod owner_input_reason_tests {
+    use super::*;
+
+    fn exported(name: &str) -> Vec<String> {
+        let schema: serde_json::Value = serde_json::from_str(REASONS_EXPORTED_SCHEMA.text).unwrap();
+        serde_json::from_value(schema["$defs"][name]["enum"].clone()).unwrap()
+    }
+
+    /// `source` up to its first test module.
+    fn production(source: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        source.split("\n#[cfg(test)]\nmod ").next().unwrap_or(&source).to_string()
+    }
+
+    /// String literals passed first to `call` in the non-test part of `source`.
+    fn literals(source: &str, call: &str) -> Vec<String> {
+        source.split(call).skip(1).filter_map(|rest| {
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix('"')?;
+            Some(rest[..rest.find('"')?].to_string())
+        }).collect()
+    }
+
+    /// The desktop contract test enumerates these; every value cutex can emit
+    /// is listed, exported and in the methods schema.
+    #[test]
+    fn owner_input_reasons_are_enumerated_everywhere() {
+        assert_eq!(exported("queuedReason"), QUEUED_REASONS);
+        assert_eq!(exported("steerUnavailableReason"), STEER_UNAVAILABLE_REASONS);
+        assert_eq!(exported("ownerInputErrorCode"), OWNER_INPUT_ERROR_CODES);
+        assert_eq!(exported("ownerAdmissionState"), OWNER_ADMISSION_STATES);
+        assert_eq!(exported("ownerAdmissionHeldReason"), OWNER_ADMISSION_HELD_REASONS);
+        let methods: serde_json::Value = serde_json::from_str(include_str!("schema/cutex-methods-v2.json")).unwrap();
+        let defs = &methods["$defs"];
+        let methods_enum = |pointer: &str| -> Vec<String> { serde_json::from_value(defs.pointer(pointer).unwrap().clone()).unwrap() };
+        assert_eq!(methods_enum("/queuedReason/enum"), QUEUED_REASONS);
+        assert_eq!(methods_enum("/ownerAdmission/properties/state/enum"), OWNER_ADMISSION_STATES);
+        assert_eq!(methods_enum("/ownerAdmission/properties/reason/enum"), OWNER_ADMISSION_HELD_REASONS);
+        let refusals = methods_enum("/userInputSubmitResult/properties/joinRefusal/enum");
+        for reason in STEER_UNAVAILABLE_REASONS {
+            assert!(refusals.iter().any(|refusal| refusal == reason), "joinRefusal lacks {reason}");
+        }
+        // Literals in the routes (production code only).
+        let route = production(include_str!("../../cli_app/app_server_user_input.rs"));
+        let server = production(include_str!("server.rs"));
+        let queued: Vec<String> = route.split("queued_because(").skip(1).filter_map(|rest| {
+            let call = &rest[..rest.find(';').unwrap_or(rest.len())];
+            let quote = call.rfind('"')?;
+            let start = call[..quote].rfind('"')? + 1;
+            Some(call[start..quote].to_string())
+        }).collect();
+        assert!(queued.len() >= 5,"queued_because literals not found: {queued:?}");
+        for reason in &queued {
+            assert!(QUEUED_REASONS.contains(&reason.as_str()), "unlisted queuedReason {reason}");
+        }
+        let mut steer = Vec::new();
+        for source in [&route, &server, &production(include_str!("user_input.rs")), &production(include_str!("queue_order.rs"))] {
+            steer.extend(literals(source, "steer_unavailable("));
+        }
+        assert!(steer.len() >= 8, "steer_unavailable literals not found: {steer:?}");
+        for reason in &steer {
+            assert!(STEER_UNAVAILABLE_REASONS.contains(&reason.as_str()), "unlisted steer reason {reason}");
+        }
+        let held = literals(&server, "json!({ \"state\": \"held\", \"reason\": ");
+        assert_eq!(held.len(), OWNER_ADMISSION_HELD_REASONS.len(), "{held:?}");
+        for reason in &held {
+            assert!(OWNER_ADMISSION_HELD_REASONS.contains(&reason.as_str()), "unlisted held reason {reason}");
+        }
     }
 }
 
@@ -342,7 +466,7 @@ mod tests {
                     assert_eq!(command.params.client_user_message_id, "b");
                     assert_eq!(command.params.origin.client_id, "desktop");
                     Ok(UserInputSubmitExecution {
-                        join_refusal: None,
+                        join_refusal: None, queued_reason: None,
                         disposition: UserInputDisposition::Steered,
                         app_server_accepted: true,
                         native_request_id: Some(json!("native-1")),
@@ -394,7 +518,7 @@ mod tests {
             let result = dispatch(&f.events, &f.queue, |command, _, _| {
                 assert_eq!(f.list().1.len(), 1, "queue remains until runtime success");
                 assert_eq!(command.params.input, params.input);
-                Ok(UserInputSubmitExecution { join_refusal:None, disposition,
+                Ok(UserInputSubmitExecution { join_refusal:None, queued_reason:None, disposition,
                     app_server_accepted:true, native_request_id:Some(json!("native-image")),
                     native_method:Some(method.into()), turn_id:Some("turn".into()), queue:None, queue_paused:false })
             }, "session", &json!({"native":{"threadId":"thread"},"runtime":{"backend":backend}}), &request).unwrap();
@@ -432,7 +556,7 @@ mod tests {
                     return Err(UserInputExecutionError { stage:"native_request".into(),code:failure.into(),
                         message:"fixture failure".into(),retryable:false,details:json!({}),outcome_unknown:failure=="unknown" });
                 }
-                Ok(UserInputSubmitExecution { join_refusal:None,
+                Ok(UserInputSubmitExecution { join_refusal:None, queued_reason:None,
                     disposition:if failure=="queued" { UserInputDisposition::Queued } else { UserInputDisposition::Steered },
                     app_server_accepted:failure!="unaccepted", native_request_id:None,
                     native_method:Some(if failure=="wrong-method" { "turn/start" } else { "turn/steer" }.into()),
@@ -453,7 +577,7 @@ mod tests {
         let result = dispatch(&h.events, &h.queue, |command, start, _| {
             assert!(!start);
             assert_eq!(serde_json::to_value(command.params.join_delegation.as_ref().unwrap()).unwrap(), join);
-            Ok(UserInputSubmitExecution { join_refusal: None, disposition: UserInputDisposition::Steered,
+            Ok(UserInputSubmitExecution { join_refusal: None, queued_reason: None, disposition: UserInputDisposition::Steered,
                 app_server_accepted:true, native_request_id:Some(json!("native-joined")), native_method:Some("turn/steer".into()),
                 turn_id:Some("turn".into()),queue:None,queue_paused:false })
         }, "session", &json!({"native":{"threadId":"thread"}}), &request).unwrap();

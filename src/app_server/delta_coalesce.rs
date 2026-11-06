@@ -123,6 +123,25 @@ mod tests {
     use serde_json::json;
     use std::collections::VecDeque;
 
+    #[test]
+    fn background_lifecycle_boundaries_survive_delta_backlogs_in_order() {
+        let mut queue = VecDeque::from([
+            delta("item/agentMessage/delta", "a", "1", 1),
+            other("item/started"),
+            delta("item/commandExecution/outputDelta", "b", "2", 2),
+            other("item/completed"),
+            other("claude/task/updated"),
+        ]);
+        let mut carried = None;
+        let mut methods = Vec::new();
+        loop {
+            let Some(mut event) = carried.take().or_else(|| queue.pop_front()) else { break };
+            carried = coalesce_ready_until(&mut event, None, || queue.pop_front());
+            methods.push(notification(&event).method.clone());
+        }
+        assert_eq!(methods, ["item/agentMessage/delta", "item/started", "item/commandExecution/outputDelta", "item/completed", "claude/task/updated"]);
+    }
+
     fn delta(method: &str, item: &str, text: &str, emitted: u64) -> AppServerEvent {
         let params = json!({ "threadId": "t", "turnId": "u", "itemId": item, "delta": text });
         AppServerEvent::Notification(RpcNotification {

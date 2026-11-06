@@ -77,7 +77,7 @@ fn execute(request: &SimpleHttpRequest) -> Result<Value, AskError> {
     let route = route(&request.path)
         .ok_or_else(|| AskError::new("not_found", "Unknown Director resource"))?;
     let project = &route.project;
-    let roster = crate::memory::load_agent_management_snapshot().map_err(da_error)?;
+    let roster = crate::memory::load_agent_management_directory().map_err(da_error)?;
     let (director, epoch) = da::project_director_state(&roster, project)?;
     let ownership = da::Store::open_default()?.snapshot()?;
     let extension = da::management::ManagementStore::open_default()

@@ -8,6 +8,7 @@
 //! instruction section at launch, and serves the files over Management v2.
 
 pub mod harness;
+pub mod idle_note;
 pub mod instructions;
 pub mod scope;
 pub mod store;

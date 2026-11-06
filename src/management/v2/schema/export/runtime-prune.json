@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:runtime-prune",
+  "title": "Owner runtime cleanup",
+  "description": "runtime-prune-v1: owner GET previews; POST explicitly deletes selected unused versions after authoritative checks.",
+  "anyOf": [{"$ref":"#/$defs/plan"},{"$ref":"#/$defs/request"},{"$ref":"#/$defs/result"}],
+  "$defs": {
+    "id":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+    "version":{"type":"object","required":["id","kind","release","bytes","canPrune","blockedReasons"],"properties":{"id":{"$ref":"#/$defs/id"},"kind":{"enum":["native","claude","dsh","kimi"]},"release":{"type":"string"},"version":{"type":"string"},"bytes":{"type":"integer","minimum":0},"canPrune":{"type":"boolean"},"blockedReasons":{"type":"array","items":{"type":"string"}}},"additionalProperties":false},
+    "plan":{"type":"object","required":["versions"],"properties":{"versions":{"type":"array","items":{"$ref":"#/$defs/version"}}},"additionalProperties":false},
+    "request":{"type":"object","required":["ids"],"properties":{"ids":{"type":"array","minItems":1,"maxItems":100,"uniqueItems":true,"items":{"$ref":"#/$defs/id"}}},"additionalProperties":false},
+    "item":{"type":"object","required":["id","status","freedBytes"],"properties":{"id":{"$ref":"#/$defs/id"},"status":{"enum":["deleted","refused","failed"]},"freedBytes":{"type":"integer","minimum":0},"reason":{"type":["string","null"]}},"additionalProperties":false},
+    "result":{"type":"object","required":["freedBytes","results"],"properties":{"freedBytes":{"type":"integer","minimum":0},"results":{"type":"array","items":{"$ref":"#/$defs/item"}}},"additionalProperties":false}
+  }
+}

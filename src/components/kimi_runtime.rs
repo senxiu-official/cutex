@@ -20,6 +20,16 @@ pub const NODE_MINIMUM: &str = "22.19.0";
 pub const NODE_ENV: &str = "CUTEX_KIMI_NODE";
 pub const KIMI_MAIN: &str = "runtime/node_modules/@moonshot-ai/kimi-code/dist/main.mjs";
 
+pub const ADAPTER_FILES: &[&str] = &[
+    "component.json", "external-runtime.json", "package.json", "LICENSE", "NOTICE",
+    "src/server.mjs", "src/runtime.mjs", "src/rpc.mjs", "src/store.mjs", "src/projection.mjs",
+    "src/toolItems.mjs", "src/wire.mjs", "src/delivery.mjs", "src/history-reader.mjs",
+    "src/session-ops.mjs", "src/redaction.mjs",
+];
+pub fn payload_files(dir: &Path) -> &'static [&'static str] {
+    if dir.join("external-runtime.json").exists() { ADAPTER_FILES } else { REQUIRED_FILES }
+}
+
 pub const REQUIRED_FILES: &[&str] = &[
     "component.json",
     "package.json",
@@ -66,6 +76,8 @@ pub fn advertised_with(layout: Option<&Layout>) -> bool {
     }
     // A hand-selected deployment (unmanaged hosts, private tests).
     selected_raw().and_then(|value| serde_json::from_value::<KimiDeployment>(value).ok()).is_some_and(|deployment| {
+        if let Some(present) = super::dsh_runtime::external_presence(NAME, &deployment.node,
+            &deployment.adapter, &deployment.kimi_cli, &deployment.install_root, &deployment.version) { return present; }
         deployment.version == PINNED_KIMI_VERSION && deployment.adapter.is_file() && deployment.kimi_cli.is_file() && deployment.install_root.is_dir()
     })
 }
@@ -82,6 +94,17 @@ fn component_probe() -> (crate::profiles::runtime_variants::Status, Option<&'sta
     if !advertised() {
         return (Status::ComponentNotInstalled, Some("componentNotInstalled"));
     }
+    if let Some(adapter) = selected_raw().and_then(|v| v["adapter"].as_str().map(PathBuf::from)) {
+        if let Some(dir) = adapter.parent().and_then(Path::parent) {
+            if dir.join("external-runtime.json").exists() {
+                return if super::dsh_runtime::cached_external_probe(dir, NAME, true)["state"] == states::READY {
+                    (Status::Supported, None)
+                } else {
+                    (Status::ComponentNotInstalled, Some("componentNeedsRepair"))
+                };
+            }
+        }
+    }
     match KimiDeployment::selected() {
         Ok(_) => (Status::Supported, None),
         Err(_) => (Status::ComponentNotInstalled, Some("componentNeedsRepair")),
@@ -90,10 +113,18 @@ fn component_probe() -> (crate::profiles::runtime_variants::Status, Option<&'sta
 
 fn cli_locator() -> anyhow::Result<crate::profiles::kimi::KimiCli> {
     let deployment = KimiDeployment::selected()?;
+    let mut env: Vec<(String, String)> = crate::runtime::kimi::KIMI_SWITCHES.iter()
+        .map(|(key, value)| (key.to_string(), value.to_string())).collect();
+    if let Some(rg) = &deployment.rg {
+        let parent = rg.parent().context("ripgrep path lacks parent")?;
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(std::iter::once(parent.to_path_buf()).chain(std::env::split_paths(&current)))?;
+        env.push(("PATH".into(), path.to_string_lossy().into_owned()));
+    }
     Ok(crate::profiles::kimi::KimiCli {
         program: deployment.node,
         args: vec![deployment.kimi_cli.to_string_lossy().into_owned()],
-        env: crate::runtime::kimi::KIMI_SWITCHES.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect(),
+        env,
     })
 }
 
@@ -134,11 +165,15 @@ fn package(dir: &Path, relative: &str, name: &str, version: &str) -> anyhow::Res
 
 pub fn check_layout(dir: &Path) -> anyhow::Result<()> {
     ensure!(dir.is_absolute(), "Kimi component directory must be absolute");
-    for file in REQUIRED_FILES {
+    for file in payload_files(dir) {
         ensure!(dir.join(file).is_file(), "Kimi component lacks {file}");
     }
     let meta: Metadata = serde_json::from_slice(&std::fs::read(dir.join("component.json"))?)?;
     ensure!(meta.name == NAME && meta.schema == super::COMPONENT_SCHEMA, "invalid Kimi component identity");
+    if dir.join("external-runtime.json").exists() {
+        super::external_runtime::load_contract(dir, NAME, &meta.version)?;
+        return Ok(());
+    }
     package(dir, "runtime/node_modules/@moonshot-ai/kimi-code/package.json", crate::runtime::kimi::KIMI_PACKAGE, PINNED_KIMI_VERSION)?;
     package(dir, "runtime/node_modules/ws/package.json", "ws", "8.22.0")?;
     package(dir, "node_modules/ws/package.json", "ws", "8.22.0")?;
@@ -176,6 +211,10 @@ fn user_step() -> Value {
 fn selected_path() -> anyhow::Result<PathBuf> {
     crate::runtime::kimi::deployment_path()
 }
+/// The Node this host's selected deployment runs (browser script kernels reuse it).
+pub fn selected_node() -> Option<PathBuf> {
+    selected_raw().and_then(|value| value["node"].as_str().map(PathBuf::from))
+}
 fn selected_raw() -> Option<Value> {
     serde_json::from_slice(&std::fs::read(selected_path().ok()?).ok()?).ok()
 }
@@ -183,13 +222,17 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a.canonicalize().unwrap_or_else(|_| a.to_path_buf()) == b.canonicalize().unwrap_or_else(|_| b.to_path_buf())
 }
 fn selected_is(dir: &Path) -> bool {
+    if selected_raw().and_then(|v| v["adapter"].as_str().map(PathBuf::from))
+        .is_some_and(|adapter| same_path(&adapter, &dir.join("src/server.mjs"))) {
+        return true;
+    }
     selected_raw().and_then(|v| v["install_root"].as_str().map(PathBuf::from)).is_some_and(|root| same_path(&root, &dir.join("runtime")))
 }
 
-fn verify_payload(dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn verify_payload(dir: &Path) -> anyhow::Result<()> {
     check_layout(dir)?;
     let receipt = super::read_receipt(dir).context("Kimi component has no receipt")?;
-    for file in REQUIRED_FILES {
+    for file in payload_files(dir) {
         ensure!(receipt.files.contains_key(*file), "Kimi receipt lacks {file}");
     }
     for (file, expected) in &receipt.files {
@@ -206,6 +249,7 @@ fn deployment_for(dir: &Path, node: PathBuf) -> KimiDeployment {
         kimi_cli: dir.join(KIMI_MAIN),
         install_root: dir.join("runtime"),
         version: PINNED_KIMI_VERSION.to_string(),
+        rg: None,
     }
 }
 
@@ -216,6 +260,9 @@ impl Handler for KimiRuntime {
     fn required_files(&self) -> &'static [&'static str] {
         REQUIRED_FILES
     }
+    fn required_files_for(&self, dir: &Path) -> &'static [&'static str] {
+        payload_files(dir)
+    }
     /// Explicit input only: `<source>/components/kimi-runtime` (or the
     /// component directory itself) with an explicitly staged `runtime/`
     /// (`npm install @moonshot-ai/kimi-code@2.3.3 ws@8.22.0` run elsewhere,
@@ -223,6 +270,9 @@ impl Handler for KimiRuntime {
     fn from_source(&self, source: &Path, dest: &Path) -> anyhow::Result<()> {
         ensure!(source.is_absolute(), "source tree must be absolute");
         let adapter = if source.join("components").join(NAME).join("component.json").is_file() { source.join("components").join(NAME) } else { source.to_path_buf() };
+        if adapter.join("external-runtime.json").exists() {
+            return super::dsh_runtime::copy_adapter_source(&adapter, dest, NAME, ADAPTER_FILES);
+        }
         super::dsh_runtime::same_component_version(&adapter, &self.metadata)?;
         let runtime = if adapter.join("runtime").is_dir() { adapter.join("runtime") } else { source.join(".kimi-install") };
         ensure!(runtime.join("node_modules").is_dir(), "explicit source needs runtime/node_modules or checkout .kimi-install/node_modules; no packages are downloaded");
@@ -249,13 +299,16 @@ impl Handler for KimiRuntime {
         false
     }
     fn configured_by_hand(&self) -> bool {
-        KimiDeployment::selected().is_ok()
+        advertised_with(None)
     }
     fn prepare(&self, ctx: &Context) -> anyhow::Result<Value> {
         if ctx.dry_run {
             return Ok(json!({"dryRun": true, "unpacked": check_layout(&ctx.dir).is_ok()}));
         }
         verify_payload(&ctx.dir)?;
+        if ctx.dir.join("external-runtime.json").exists() {
+            return super::dsh_runtime::prepare_external(ctx, NAME);
+        }
         let path = node_path(&ctx.dir, &self.options());
         let node = node_detail(path.as_deref(), ctx.exec);
         if node["ready"] != true {
@@ -264,10 +317,14 @@ impl Handler for KimiRuntime {
         Ok(json!({"prepared": true, "kimi": {"version": PINNED_KIMI_VERSION, "node": node}}))
     }
     fn select(&self, ctx: &Context) -> anyhow::Result<Value> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         if ctx.dry_run {
             return Ok(json!({"selected": false, "dryRun": true}));
         }
         verify_payload(&ctx.dir)?;
+        if ctx.dir.join("external-runtime.json").exists() {
+            return super::dsh_runtime::select_external_kimi(ctx);
+        }
         let path = node_path(&ctx.dir, &self.options());
         let node = node_detail(path.as_deref(), ctx.exec);
         if node["ready"] != true {
@@ -307,6 +364,9 @@ impl Handler for KimiRuntime {
 }
 
 pub fn probe_dir(dir: &Path, options: &Options, exec: &dyn Exec) -> Value {
+    if dir.join("external-runtime.json").exists() {
+        return super::dsh_runtime::cached_external_probe(dir, NAME, selected_is(dir));
+    }
     if let Err(error) = check_layout(dir) {
         return json!({"dir": dir, "kimi": requirements(), "state": states::DEGRADED, "problem": format!("{error:#}; install the component again")});
     }

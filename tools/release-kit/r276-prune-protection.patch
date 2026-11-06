@@ -1,0 +1,85 @@
+--- a/deploy.py
++++ b/deploy.py
+@@ -10,6 +10,8 @@
+ ROOT = pathlib.Path(__file__).resolve().parent
+ sys.dont_write_bytecode = True
+ sys.path.insert(0,str(ROOT))
++
++import runtime_prune_kit
+
+ def require(ok, why):
+     if not ok: raise RuntimeError(why)
+@@ -343,6 +345,7 @@
+         finally:db.close()
+         return {'files':files,'entries':entries,'bytes':len(database)}
+     def rollback_steps(self,op,act,pins):
++        self.j.run('prune.protection.invalidate',lambda:runtime_prune_kit.invalidate(self))
+         # Each step is idempotent: a resumed rollback repeats only what is not done yet.
+         self.j.run('r276.stores.handback',lambda:module('kit_store_handback',self.root/'store_handback.py').rollback(self,op))
+         status=self.store_command(['storage','roster-status'],timeout=300)
+@@ -393,7 +396,9 @@
+             self.record(op,'rollback-stopping',pins=pins)
+             self.j.run('offline',lambda:self.offline(op,rows))
+             self.j.run('services.stop',lambda:self.service('stop'))
+-            self.j.run('stopped.fence',self.fence);self.j.run('stopped.storage',self.storage)
++            self.j.run('stopped.fence',self.fence)
++            self.j.run('prune.protection.invalidate',lambda:runtime_prune_kit.invalidate(self))
++            self.j.run('stopped.storage',self.storage)
+             require(self.persisted()==pins,'CHECK 6: durable pins changed while stopping')
+             self.j.run('backup.verify',lambda:self.backup(op));self.j.run('stopped.fence.again',self.fence)
+             self.record(op,'rollback-exporting')
+@@ -780,6 +785,7 @@
+         for parent in load(op/'operation.json').get('retryOf',[]):
+             path=self.root/'operations'/parent/'operation.json';r=load(path)
+             write(path,{**r,'supersededBy':op.name})
++        self.j.run('prune.protection.export',lambda:runtime_prune_kit.publish(self,op))
+     def restore_component_policy(self,op):
+         if self.plan.get('componentKit'):
+             module('kit_policy_recover',self.root/'component_bridge.py').restore_policy(self)
+@@ -890,6 +896,7 @@
+         require(load(path).get('management',{}).get('inputLedger',{}).get('enabled') is True,'input ledger switch not persisted')
+         return {'inputLedger':'enabled'}
+     def reconcile(self,op):
++        self.j.run('prune.protection.invalidate',lambda:runtime_prune_kit.invalidate(self))
+         self.restore_component_policy(op)
+         r=load(op/'operation.json');pins=r['pins'];state=self.swap_state(op)
+         if state['changed'] or (r['phase']=='selected' and state['complete'] and state['entries']):
+@@ -901,7 +908,9 @@
+         require(r['phase']!='selected','selected operation no longer matches actual images')
+         self.j.run('recover.unchanged.start',lambda:self.service('start'))
+         self.j.run('recover.unchanged.health',lambda:self.previous_health(pins,r['previous']['commit']))
+-        self.record(op,'recovered-previous');return 'unchanged-previous'
++        self.record(op,'recovered-previous')
++        self.j.run('prune.protection.export',lambda:runtime_prune_kit.publish(self,op))
++        return 'unchanged-previous'
+     def summary(self):
+         op=None
+         try:h=self.api('/v2/host');selected=h['cutexBuild'];health='API reachable'
+@@ -959,7 +968,9 @@
+             write(op/'managed-roots.json',self.managed_roots)
+             self.j.run('offline',lambda:self.offline(op,rows));self.record(op,'stopping')
+             self.j.run('services.stop',lambda:self.service('stop'))
+-            self.j.run('stopped.fence',self.fence);self.j.run('stopped.storage',self.storage)
++            self.j.run('stopped.fence',self.fence)
++            self.j.run('prune.protection.invalidate',lambda:runtime_prune_kit.invalidate(self))
++            self.j.run('stopped.storage',self.storage)
+             require(self.persisted()==pins,'CHECK 6: durable pins changed while stopping')
+             self.j.run('backup.verify',lambda:self.backup(op));self.j.run('stopped.fence.again',self.fence)
+             self.j.run('stopped.fence.before-swap',self.fence)
+@@ -983,6 +994,8 @@
+         if os.name!='nt':os.umask(0o077)
+         private_dir(op,self.root/'operations');r=load(op/'operation.json')
+         self.j=Journal(op,self.token)
++        if r['phase']!='preparing':
++            self.j.run('prune.protection.invalidate',lambda:runtime_prune_kit.invalidate(self))
+         self.restore_component_policy(op)
+         if (op/'managed-roots.json').exists():
+             roots=load(op/'managed-roots.json')
+@@ -1003,6 +1016,7 @@
+             # or default changes. Only check current selected service health.
+             self.j.run('recover.services.start',lambda:self.service('start'))
+             self.j.run('recover.current.readiness',lambda:self.ready_retry(self.current_readiness))
++            self.j.run('prune.protection.export',lambda:runtime_prune_kit.publish(self,op))
+         elif r['phase']=='preparing':
+             self.j.run('recover.preparing.readiness',lambda:self.ready_retry(self.current_readiness))
+         else:

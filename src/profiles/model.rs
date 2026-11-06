@@ -98,11 +98,16 @@ impl Default for AccountsStore {
 pub struct StoredAccount {
     #[serde(default)]
     pub options: super::appearance::ProfileOptions,
-    /// Browser tools are explicit opt-in for both runtimes. Keep this outside
-    /// `options` (deny_unknown_fields) so pre-browser binaries can read the
-    /// store, ignoring this additive field. Older saves may drop the opt-in.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Browser tools default on for profiles with no stored preference. Always
+    /// persist both values so an explicit off survives saves and transfers.
+    /// Keep this top-level so pre-browser binaries can still read the store.
+    #[serde(default = "browser_tools_default")]
     pub browser_tools: bool,
+    /// Design 059: which browser tools the model sees when `browser_tools`
+    /// is on. Absent = `auto`. Top level for the same reason as
+    /// `browser_tools`; an older binary ignores it and keeps the legacy tools.
+    #[serde(default, skip_serializing_if = "BrowserToolSurface::is_auto")]
+    pub browser_tool_surface: BrowserToolSurface,
     /// `web_search` cutex tool (profile-search-tool): one separate,
     /// search-only Responses request to this profile's provider / model, for
     /// providers that refuse the built-in web search mixed with function
@@ -193,11 +198,40 @@ pub struct StoredAccount {
     pub variants: super::runtime_variants::VariantState,
 }
 
+/// The owner's browser tool surface choice (profile `browserToolSurface`).
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserToolSurface {
+    /// The one `browser` tool where the runtime carries it, else legacy.
+    #[default]
+    Auto,
+    /// Same as auto today; kept explicit so a later auto may differ.
+    Command,
+    /// The ten `browser_*` tools.
+    Legacy,
+    /// `browser_script` where allowed (full access, Node on this host), else as command.
+    Script,
+}
+impl BrowserToolSurface {
+    pub fn is_auto(&self) -> bool { *self == Self::Auto }
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Auto => "auto", Self::Command => "command", Self::Legacy => "legacy", Self::Script => "script" }
+    }
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw { "auto" => Some(Self::Auto), "command" => Some(Self::Command), "legacy" => Some(Self::Legacy), "script" => Some(Self::Script), _ => None }
+    }
+}
+
+pub const fn browser_tools_default() -> bool {
+    true
+}
+
 impl StoredAccount {
     pub fn from_import(name: String, snapshot: &ImportedSnapshot, runtime: RuntimeConfig) -> Self {
         Self {
             options: Default::default(),
-            browser_tools: false,
+            browser_tools: browser_tools_default(),
+            browser_tool_surface: Default::default(),
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
@@ -558,6 +592,10 @@ pub struct CodezConfig {
     /// cutex ignores and drops it.
     #[serde(default, skip_serializing_if = "crate::workflows::WorkflowSettings::is_default")]
     pub workflows: crate::workflows::WorkflowSettings,
+    /// Internal management switches (`management.inputLedger.enabled`,
+    /// cutex-desktop docs/design/054). Development only; default off.
+    #[serde(default, skip_serializing_if = "crate::management::v2::input_ledger::ManagementInternalSettings::is_default")]
+    pub management: crate::management::v2::input_ledger::ManagementInternalSettings,
 }
 
 impl Default for CodezConfig {
@@ -632,6 +670,7 @@ impl Default for CodezConfig {
             artifacts: Default::default(),
             workflows: Default::default(),
             browser: Default::default(),
+            management: Default::default(),
         }
     }
 }
@@ -865,8 +904,8 @@ mod tests {
             let mut account: StoredAccount = serde_json::from_value(serde_json::json!({
                 "id": "fixture-profile", "name": "compat", "cli_kind": kind
             })).unwrap();
-            assert!(!account.browser_tools, "old accounts default off");
-            assert!(serde_json::to_value(&account).unwrap().get("browser_tools").is_none());
+            assert!(account.browser_tools, "missing preference defaults on");
+            assert_eq!(serde_json::to_value(&account).unwrap()["browser_tools"], true);
             account.browser_tools = true;
             let store = AccountsStore {
                 version: STORE_VERSION,
@@ -893,6 +932,21 @@ mod tests {
             assert!(tolerant.accounts[0].browser_tools, "the top-level opt-in still decides");
             let resaved = serde_json::to_value(&tolerant).unwrap();
             assert_eq!(resaved["accounts"][0]["options"]["browser_tools"], true, "kept for the writer that knows it");
+        }
+    }
+
+    #[test]
+    fn browser_tools_explicit_values_survive_save_and_reload() {
+        for kind in ["codex", "claude", "dsh", "kimi"] {
+            for enabled in [false, true] {
+                let account: StoredAccount = serde_json::from_value(serde_json::json!({
+                    "id": "fixture", "name": "fixture", "cli_kind": kind, "browser_tools": enabled
+                })).unwrap();
+                let saved = serde_json::to_value(account).unwrap();
+                assert_eq!(saved["browser_tools"], enabled);
+                let restored: StoredAccount = serde_json::from_value(saved).unwrap();
+                assert_eq!(restored.browser_tools, enabled);
+            }
         }
     }
 
@@ -933,6 +987,7 @@ mod tests {
         let account = StoredAccount {
             options: Default::default(),
             browser_tools: false,
+            browser_tool_surface: Default::default(),
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,

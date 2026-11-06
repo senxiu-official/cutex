@@ -53,6 +53,11 @@ pub(crate) fn envelope(
         && legacy["source"]["kind"] == "service"
         && legacy["source"]["id"] == cutex::agent_management::AGENT_MANAGEMENT_SYSTEM_SENDER
         && legacy.get("view").is_none();
+    let rename_notice=legacy["eventType"]==cutex::agent_bus::rename_notice::EVENT_TYPE
+        &&legacy["source"]["kind"]=="service"
+        &&legacy["source"]["id"]==cutex::agent_bus::rename_notice::SOURCE_ID
+        &&legacy["metadata"]["deliveryMode"]=="passive"&&legacy.get("view").is_none();
+    let service_without_view=management||rename_notice;
     ensure!(
         legacy["threadId"] == thread
             && (legacy["eventType"] == "agent_message"
@@ -83,11 +88,11 @@ pub(crate) fn envelope(
                         legacy["metadata"]["deliveryMode"].as_str(),
                         Some("after-turn" | "soon")
                     ))
-                || management),
-        "not a Claude agent-message, peer-message, Claude task, alarm or Agent Management projection"
+                || service_without_view),
+        "not a Claude agent-message, peer-message, Claude task, alarm, Agent Management or formal-name notice projection"
     );
     let mut value = Envelope {
-        version: if management { 1 } else { 2 },
+        version: if service_without_view { 1 } else { 2 },
         owner_id: owner.into(),
         thread_id: thread.into(),
         runtime_generation: generation,
@@ -115,7 +120,7 @@ pub(crate) fn envelope(
                 .context("message text missing")?
                 .into(),
         },
-        view: if management {
+        view: if service_without_view {
             None
         } else {
             Some(serde_json::from_value(
@@ -334,6 +339,26 @@ mod tests {
         agent["source"]["kind"] = json!("agent");
         assert!(envelope("owner", "thread", 7, &agent).is_err());
         assert!(envelope("owner", "thread", 7, &payload("management_other", "after-turn")).is_err());
+    }
+
+    #[test]
+    fn formal_name_notice_is_passive_service_v1_and_never_a_wake() {
+        let payload=json!({"threadId":"thread","messageId":"rename-event",
+            "source":{"kind":"service","id":cutex::agent_bus::rename_notice::SOURCE_ID},
+            "eventType":cutex::agent_bus::rename_notice::EVENT_TYPE,"text":"The owner renamed A to B.",
+            "metadata":{"cutexSessionId":"owner","deliveryMode":"passive"}});
+        let value=envelope("owner","thread",7,&payload).unwrap();
+        assert_eq!(value.version,1);assert!(value.view.is_none());
+        assert_eq!(value.message.delivery,Delivery::Passive);
+        assert_eq!(value.message.source.kind,cutex::app_server::external_input::SourceKind::Service);
+        for mode in ["after-turn","soon"] {
+            let mut forged=payload.clone();forged["metadata"]["deliveryMode"]=json!(mode);
+            assert!(envelope("owner","thread",7,&forged).is_err());
+        }
+        let mut forged=payload.clone();forged["source"]["kind"]=json!("agent");
+        assert!(envelope("owner","thread",7,&forged).is_err());
+        let mut forged=payload;forged["source"]["id"]=json!("someone else");
+        assert!(envelope("owner","thread",7,&forged).is_err());
     }
 
     #[test]

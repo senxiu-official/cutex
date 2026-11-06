@@ -246,6 +246,7 @@ fn receive_delivers_once_dedupes_and_applies_inbound_policy() {
 /// and records the request lines and bodies.
 fn scripted(
     responses: Vec<(u16, Value)>,
+    wake: bool,
 ) -> (
     String,
     Arc<Mutex<Vec<(String, Value)>>>,
@@ -258,7 +259,8 @@ fn scripted(
     let log = seen.clone();
     let task = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(20);
-        for (status, body) in responses {
+        let mut responses=responses.into_iter().peekable();
+        while responses.peek().is_some() {
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -292,10 +294,18 @@ fn scripted(
                 .unwrap_or(0);
             let mut data = vec![0u8; length];
             stream.read_exact(&mut data).unwrap();
-            log.lock().unwrap().push((
-                head.lines().next().unwrap().to_string(),
-                serde_json::from_slice(&data).unwrap_or(Value::Null),
-            ));
+            let (status,body)=if head.starts_with("GET /peer/v1/hello ") {
+                let mut features:Vec<_>=super::pair::FEATURES.iter().map(|s|s.to_string()).collect();
+                features.push(tells::FEATURE.into());
+                if wake {features.push(tells::FEATURE_V2.into());}
+                (200,json!({"instanceId":"ci-000000000000000000000000000000bd","protocol":1,"features":features}))
+            } else {
+                log.lock().unwrap().push((
+                    head.lines().next().unwrap().to_string(),
+                    serde_json::from_slice(&data).unwrap_or(Value::Null),
+                ));
+                responses.next().unwrap()
+            };
             let body = body.to_string();
             stream
                 .write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes())
@@ -308,6 +318,7 @@ fn scripted(
 fn remote_peer(url: &str) -> super::store::Peer {
     let store = Store::open().unwrap();
     let mut p = peer();
+    p.peer_id="ci-000000000000000000000000000000bd".into();
     p.urls = vec![url.into()];
     p.inbound_token_sha256 = token::hash(&token::generate());
     p.policy.outbound.visibility = policy::Visibility::All;
@@ -368,12 +379,12 @@ fn agent_tell_to_name_at_host_sends_once_and_maps_refusals() {
         (200, ok),
         (403, json!({"code":"recipient_outside_boundary"})),
         (404, json!({"code":"not_found"})),
-    ]);
+    ], false);
     let p = remote_peer(&url);
 
     let sent = call(
         "agent_tell",
-        json!({"to":"worker@beta","text":"fyi: see /tmp/a"}),
+        json!({"to":"cutex.00000000-0000-0000-0000-0000000000d1@beta","text":"fyi: see /tmp/a"}),
         "t1",
         &asks,
         &w,
@@ -385,6 +396,7 @@ fn agent_tell_to_name_at_host_sends_once_and_maps_refusals() {
     assert_eq!(sent["peerId"], p.peer_id);
     assert_eq!(sent["deliveryKind"], "note");
     assert_eq!(sent["recipientState"], "busy");
+    assert!(sent.get("messageId").is_none(), "the receiver's bus ID is not a local messageSent ID: {sent}");
     assert!(sent["detail"]
         .as_str()
         .unwrap()
@@ -404,13 +416,14 @@ fn agent_tell_to_name_at_host_sends_once_and_maps_refusals() {
     // The same action replays locally without another request.
     let replay = call(
         "agent_tell",
-        json!({"to":"worker@beta","text":"fyi: see /tmp/a"}),
+        json!({"to":"cutex.00000000-0000-0000-0000-0000000000d1@beta","text":"fyi: see /tmp/a"}),
         "t1",
         &asks,
         &w,
         &local,
     );
     assert_eq!(replay["tellId"], sent["tellId"]);
+    assert!(replay.get("messageId").is_none());
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert_eq!(*local.borrow(), 0, "never the local bus");
 
@@ -418,15 +431,15 @@ fn agent_tell_to_name_at_host_sends_once_and_maps_refusals() {
     // wake to a peer that did not negotiate tells.v2 too).
     for (args, needle) in [
         (
-            json!({"to":"worker@beta","text":"x","wake":true}),
+            json!({"to":"cutex.00000000-0000-0000-0000-0000000000d1@beta","text":"x","wake":true}),
             "does not support cross-host wake",
         ),
         (
-            json!({"to":"worker@beta","text":"x","attachments":["a.png"]}),
+            json!({"to":"cutex.00000000-0000-0000-0000-0000000000d1@beta","text":"x","attachments":["a.png"]}),
             "attachments",
         ),
         (
-            json!({"to":"worker@beta","text":"x","supersedes":"v2"}),
+            json!({"to":"cutex.00000000-0000-0000-0000-0000000000d1@beta","text":"x","supersedes":"v2"}),
             "revisions",
         ),
     ] {
@@ -443,7 +456,7 @@ fn agent_tell_to_name_at_host_sends_once_and_maps_refusals() {
     // A remote policy refusal passes through; nothing is kept locally.
     let refused = call(
         "agent_tell",
-        json!({"to":"worker@beta","text":"x"}),
+        json!({"to":"cutex.00000000-0000-0000-0000-0000000000d1@beta","text":"x"}),
         "t3",
         &asks,
         &w,
@@ -453,7 +466,7 @@ fn agent_tell_to_name_at_host_sends_once_and_maps_refusals() {
     // An older peer without the route.
     let old = call(
         "agent_tell",
-        json!({"to":"worker@beta","text":"x"}),
+        json!({"to":"cutex.00000000-0000-0000-0000-0000000000d1@beta","text":"x"}),
         "t4",
         &asks,
         &w,
@@ -482,7 +495,7 @@ fn agent_tell_to_name_at_host_sends_once_and_maps_refusals() {
         .unwrap();
     let off = call(
         "agent_tell",
-        json!({"to":"worker@beta","text":"x"}),
+        json!({"to":"cutex.00000000-0000-0000-0000-0000000000d1@beta","text":"x"}),
         "t6",
         &asks,
         &w,
@@ -713,7 +726,7 @@ fn agent_tell_wake_to_name_at_host() {
         (403, json!({"code":"wake_not_allowed","details":{"reason":"review"}})),
         (400, json!({"code":"peer_protocol_error"})),
         (200, json!({"schemaVersion":1,"tellId":"x","messageId":"bus-3","deliveryKind":"note","recipientState":"idle","target":target})),
-    ]);
+    ], true);
     let p = remote_peer(&url);
     Store::open()
         .unwrap()
@@ -723,7 +736,7 @@ fn agent_tell_wake_to_name_at_host() {
         })
         .unwrap();
     let tell = |action: &str, wake: bool| {
-        call("agent_tell", json!({"to":"worker@beta","text":"look","wake":wake}), action, &asks, &w, &local)
+        call("agent_tell", json!({"to":"cutex.00000000-0000-0000-0000-0000000000d1@beta","text":"look","wake":wake}), action, &asks, &w, &local)
     };
 
     let woke = tell("w1", true);

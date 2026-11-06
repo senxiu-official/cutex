@@ -264,6 +264,7 @@ fn default_profile_browser_tools_survive_owner_creation_without_project() {
     fixture.set_default_profile(CLAUDE);
     let mut profiles=super::account_store::load_store().unwrap();
     profiles.accounts.iter_mut().find(|a|a.name==CLAUDE).unwrap().browser_tools=true;
+    profiles.accounts.iter_mut().find(|a|a.name==CLAUDE_UNSET).unwrap().browser_tools=false;
     cutex::profiles::store::save_store(&profiles).unwrap();
     for (route,body) in [
         ("/v2/human/sessions",json!({"requestId":"default-browser-chat","cwd":fixture.work()})),

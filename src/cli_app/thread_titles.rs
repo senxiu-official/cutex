@@ -137,12 +137,8 @@ pub(super) fn on_runtime_event(context: &AppServerRuntimeEventContext, event: &A
 }
 
 fn session_record(cutex_session_id: &str) -> anyhow::Result<Option<cutex::session::model::CutexSessionRecord>> {
-    let store = cutex::session::store::load_cutex_session_store()?;
-    Ok(store
-        .sessions
-        .values()
-        .find(|record| record.cutex_session_id == cutex_session_id)
-        .cloned())
+    cutex::session::store::shared_session_row(cutex_session_id)
+        .map(|record| record.map(|record| (*record).clone()))
 }
 
 fn needs_title(record: &cutex::session::model::CutexSessionRecord) -> bool {

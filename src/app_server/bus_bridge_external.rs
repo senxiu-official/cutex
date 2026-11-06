@@ -587,6 +587,10 @@ pub(super) fn quarantine_terminal(
     Ok(quarantined)
 }
 
+pub(super) fn quarantine_projection(owner:&str,message:&AgentBusMessage,detail:&str)->anyhow::Result<bool> {
+    quarantine_terminal(owner,message,&terminal_external_input_error("external_projection_invalid",detail))
+}
+
 /// Start message of an Agent Management create / replace that no reviewed
 /// bootstrap intent covers (every Director / operator `agent_create` and
 /// `member_replace`). Only the in-process Management principal can queue an
@@ -718,6 +722,12 @@ pub(super) fn envelope(
                 "alarm service sender mismatch",
             ));
         }
+        AgentMessageKind::Agent if crate::agent_bus::rename_notice::is_notice(message) => {
+            let text=crate::agent_bus::rename_notice::model_text(message).map_err(|error|
+                terminal_external_input_error("rename_notice_provenance_invalid",format!("{error:#}")))?;
+            (Source {kind:SourceKind::Service,id:crate::agent_bus::rename_notice::SOURCE_ID.into()},
+                crate::agent_bus::rename_notice::EVENT_TYPE,text)
+        }
         AgentMessageKind::Agent if crate::agent_bus::peer_tell::is_peer_tell(message) => {
             // Cross-host tell: the remote agent is never a local Agent
             // source; the reserved peer control record names it.
@@ -831,6 +841,47 @@ pub(super) fn envelope(
 // Agent messaging v2: the model text gets a `Sender:` header and the view
 // carries display facts; both are frozen with the envelope. Routing keeps the
 // authenticated durable sender. A missing local name never blocks delivery.
+/// Owner transport uses precisely the ordinary bus identity, provenance, view
+/// and receiver-size policy. Read metadata before reserving: the builder runs
+/// under the non-reentrant bus source lock and must not query that repository.
+pub fn owner_carry_envelope(
+    message: &AgentBusMessage,
+    binding: &crate::launch::stock::ExternalInputBinding,
+    meta: Option<&crate::management::v2::agent_bus_state::AgentBusMessageMeta>,
+    fallback_name: Option<&str>,
+) -> anyhow::Result<Envelope> {
+    if super::is_agent_management_message(message) {
+        validate_management_delivery(message, &binding.owner_id)?;
+    }
+    let mut e = if crate::agent_bus::claude_task::is_claude_task(message) {
+        // The Claude observer's existing canonical service projection; ordinary
+        // agent provenance must never be substituted for this background notice.
+        ensure!(message.to_cutex_session_id.as_deref() == Some(&binding.owner_id), "task carry recipient mismatch");
+        let (notice, text) = crate::agent_bus::claude_task::model_text(message)?;
+        let mut e = Envelope {
+            version: 2, owner_id: binding.owner_id.clone(), thread_id: binding.thread_id.clone(),
+            runtime_generation: binding.runtime_generation,
+            message: Message { id: message.id.clone(), source: Source { kind: SourceKind::Service,
+                id: crate::agent_bus::claude_task::SOURCE_ID.into() },
+                event_type: crate::agent_bus::claude_task::EVENT_TYPE.into(),
+                delivery: Delivery::AfterTurn, text },
+            view: Some(crate::agent_bus::claude_task::view(message, &notice)?), semantic_sha256: String::new(),
+        };
+        e.semantic_sha256 = e.digest();
+        e.validate_shape()?;
+        e
+    } else { envelope(message, binding)? };
+    agent_message_view(&mut e, message, meta, fallback_name)?;
+    let limit = crate::app_server::external_input::size::ReceiverLimit::from_policy(&binding.canonical_byte_limit);
+    fit_envelope(&mut e, message, limit, &crate::config::documents::current(),
+        crate::documents::DocumentStore::open_default, false)?;
+    Ok(e)
+}
+
+#[cfg(test)]
+#[path = "bus_bridge_owner_carry_tests.rs"]
+mod owner_carry_tests;
+
 fn agent_message_view(
     e: &mut Envelope,
     message: &AgentBusMessage,
@@ -899,11 +950,12 @@ mod job_projection_compatibility_tests {
 pub(super) fn deliver_presentations(
     options: &AppServerAgentBusBridgeOptions,
     generation: u64,
+    schedule: &mut crate::management::v2::agent_bus_state::PresentationSchedule,
 ) -> anyhow::Result<()> {
     use crate::app_server::presentation::PresentationClient;
     let repository = agent_bus_message_repository()?;
     let now = Utc::now().timestamp();
-    let ids = repository.due_presentations(&options.cutex_session_id, now)?;
+    let ids = repository.due_presentations_scheduled(&options.cutex_session_id, now, schedule)?;
     if ids.is_empty() {
         return Ok(());
     }
@@ -998,7 +1050,7 @@ fn busy_wake_candidate(message: &AgentBusMessage, job_passive: bool) -> bool {
         && message.delivery_mode == crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn
 }
 
-fn awaited_job_completion(message: &AgentBusMessage, session: &str) -> bool {
+pub(super) fn awaited_job_completion(message: &AgentBusMessage, session: &str) -> bool {
     if message.sender_kind != AgentMessageKind::JobServiceSystem
         || message.control_type.as_deref() != Some(crate::agent_bus::job_completion::SCHEMA_V2)
     {
@@ -1072,7 +1124,7 @@ pub(super) fn job_notice_plan(messages: &[AgentBusMessage], now_epoch_secs: u64,
 
 /// Whether `session` waits on a delegation (`delegation_await`): its notices
 /// are never held then.
-fn awaiting_delegations(session: &str) -> bool {
+pub(super) fn awaiting_delegations(session: &str) -> bool {
     crate::asks::store::AskStore::open_default()
         .and_then(|store| store.peek())
         .ok()
@@ -1082,7 +1134,7 @@ fn awaiting_delegations(session: &str) -> bool {
 
 /// Deliver an awaited job completion `passive` (re-digested): it starts no
 /// turn of its own (§2.4).
-fn route_job_completion(e: &mut Envelope, passive: bool) -> anyhow::Result<()> {
+pub(super) fn route_job_completion(e: &mut Envelope, passive: bool) -> anyhow::Result<()> {
     if passive && e.message.delivery != Delivery::Passive {
         e.message.delivery = Delivery::Passive;
         e.semantic_sha256 = e.digest();
@@ -1115,7 +1167,7 @@ fn ack_removed_task_service_message(
 /// or an idle recipient, starts a turn exactly like `after_turn`. The Bus
 /// message keeps its `after_turn` mode (wake kind, loop guard, receipts are
 /// unchanged); only the native envelope differs. Frozen envelopes keep theirs.
-fn wake_at_next_step(e: &mut Envelope, next_step: bool) -> anyhow::Result<()> {
+pub(super) fn wake_at_next_step(e: &mut Envelope, next_step: bool) -> anyhow::Result<()> {
     if e.message.delivery == Delivery::AfterTurn && next_step {
         e.message.delivery = Delivery::Soon;
         e.semantic_sha256 = e.digest();
@@ -1166,6 +1218,7 @@ pub(super) fn deliver(
     let mut messages = messages;
     messages.sort_by_key(|message| !job_plan.passive.contains(&message.id));
     for polled in messages {
+        let mut fenced_ledger = Vec::new();
         let result = (|| -> anyhow::Result<bool> {
             if repository.suppress_native_delivery(&options.cutex_session_id, &polled.id)? {
                 let acked = bus.ack(&options.registration.id, &[polled.id.clone()])?;
@@ -1300,7 +1353,8 @@ pub(super) fn deliver(
             // Spill at delivery: a message frozen over the budget (before
             // Phase 2, or by a path that skipped the spill) that the native
             // never took becomes an overlength notice now.
-            if observed.delivery_state == DeliveryState::Unknown {
+            if observed.delivery_state == DeliveryState::Unknown
+                && !repository.owner_delivery_blocked(&options.cutex_session_id, &message.id)? {
                 let documents = crate::documents::DocumentStore::open_default;
                 if let Some(spilled) = spill_frozen(repository, &frozen, &message, receiver_limit, &settings, documents, false)? {
                     frozen = spilled;
@@ -1310,6 +1364,12 @@ pub(super) fn deliver(
                 }
             }
             if observed.delivery_state == DeliveryState::Unknown {
+                // A carried identity remains queryable for genuine receipts,
+                // but Unknown is never permission to submit it independently.
+                if repository.owner_delivery_blocked(&options.cutex_session_id, &message.id)? {
+                    held_wakes += 1;
+                    return Ok(false);
+                }
                 // A frozen key is not proof of native acceptance. Reconcile
                 // current membership before every new submit, passive too;
                 // status/receipt recovery above remains available while paused.
@@ -1330,6 +1390,8 @@ pub(super) fn deliver(
                 let refused = |error: &anyhow::Error| crate::app_server::external_input::size::is_size_rejection(&format!("{error:#}"));
                 let starts_turn = current.message.delivery != Delivery::Passive && !client.thread_busy()?;
                 let prepared_turn = starts_turn.then(|| crate::management::v2::admission::prepare_turn(&options.cutex_session_id, "delivery", None));
+                // 054 §2.9: frozen, native IO starts now.
+                repository.input_ledger_sending(&options.cutex_session_id, &message.id);
                 observed = match client.submit(&current) {
                     Ok(mut submitted) => submitted.statuses.remove(0),
                     Err(error) if refused(&error) => {
@@ -1399,7 +1461,7 @@ pub(super) fn deliver(
                 "recipient permanently retired"
             );
             validate_target(&message, &options.cutex_session_id, &roster)?;
-            crate::session::store::with_session_store_lock(&path, || {
+            let (committed, ledger) = crate::management::v2::agent_bus_state::input_ledger_deferred(|| crate::session::store::with_session_store_lock(&path, || {
                 client.fence()?;
                 repository.record_external_input_delivered(
                     &options.cutex_session_id,
@@ -1408,7 +1470,10 @@ pub(super) fn deliver(
                     &receipt,
                     generation,
                 )
-            })?;
+            }));
+            // 054: no ledger IO under the authority fence (`_mutation`): applied below.
+            fenced_ledger = ledger;
+            committed?;
             // r217h1 wake wait log (no content). `soon` = read early; an
             // `after_turn` wake read within 15 s of queueing got a turn at
             // once (idle), a later one waited for a turn end.
@@ -1441,6 +1506,7 @@ pub(super) fn deliver(
             mark_acknowledged(status, count, 0);
             Ok(true)
         })();
+        crate::management::v2::agent_bus_state::input_ledger_apply(fenced_ledger);
         match result {
             Ok(progress) => outcome.made_progress |= progress,
             Err(error) => {
@@ -1485,6 +1551,139 @@ pub(super) fn deliver(
     // Held wakes are looked at again on the bridge's next poll (2-5 s).
     if held_wakes > 0 {
         outcome.retained_pending = true;
+    }
+    Ok(outcome)
+}
+
+/// Test hook (054 S12; debug builds only): a private test home
+/// (`CUTEX_TEST_PRIVATE_HOME` == `HOME`, with its `.cutex-test-private-home`
+/// marker) and `CUTEX_TEST_FAKE_EXTERNAL_INPUT=1` let a seeded, unreviewed
+/// app-server runtime (the E2E fake) receive bus messages over
+/// `thread/externalInput/{submit,status}` without the reviewed stock
+/// bundle `ExternalInputClient` requires. It freezes, writes `sending`,
+/// submits, and records what the fake reports (`observe_external_input`, so
+/// the RC8 ledger mapping runs). Only a `context_persisted` status with a
+/// well-formed receipt is committed (`record_external_input_delivered`,
+/// which validates it) and ACKed.
+#[cfg(debug_assertions)]
+pub(super) fn test_fake_external_input() -> bool {
+    if std::env::var("CUTEX_TEST_FAKE_EXTERNAL_INPUT").as_deref() != Ok("1") {
+        return false;
+    }
+    let (Ok(private), Ok(home)) = (std::env::var("CUTEX_TEST_PRIVATE_HOME"), std::env::var("HOME")) else {
+        return false;
+    };
+    private == home && std::path::Path::new(&private).join(".cutex-test-private-home").is_file()
+}
+
+#[cfg(debug_assertions)]
+pub(super) fn deliver_test_fake(
+    bus: &dyn RuntimeAgentBus,
+    options: &AppServerAgentBusBridgeOptions,
+    messages: Vec<AgentBusMessage>,
+    status: &Arc<Mutex<AppServerAgentBusBridgeStatus>>,
+) -> anyhow::Result<DeliverySweepOutcome> {
+    use anyhow::Context as _;
+    use crate::agent_bus::delivery::{busy_wait_for, wake_timing, WakeTiming};
+    let mut outcome = DeliverySweepOutcome { had_messages: !messages.is_empty(), ..Default::default() };
+    if messages.is_empty() {
+        return Ok(outcome);
+    }
+    let owner = options.cutex_session_id.as_str();
+    let sessions = crate::session::store::load_cutex_session_store_shared()?;
+    let record = sessions.sessions.get(owner).context("test fake: session missing")?;
+    let runtime = record.app_server_runtime.as_ref().context("test fake: no app-server runtime")?;
+    let endpoint = crate::app_server::runtime::endpoint_from_runtime_binding(runtime)?;
+    let client = crate::app_server::client::AppServerClient::connect(
+        crate::app_server::client::AppServerClientOptions::new(endpoint),
+    )?;
+    // Capability belongs to this exact live RPC connection. Legacy debug
+    // fakes intentionally accept after-turn input while busy (S08/S09);
+    // only 057-capable peers opt into the new source-side busy admission.
+    let owner_carries_capable = client.initialize_response().get("ownerInputCarries")
+        .and_then(serde_json::Value::as_u64) == Some(1);
+    let binding = crate::launch::stock::ExternalInputBinding {
+        version: 1,
+        owner_id: owner.to_string(),
+        thread_id: options.thread_id.clone(),
+        runtime_generation: record.runtime_generation,
+        canonical_byte_limit: Default::default(),
+    };
+    let repository = agent_bus_message_repository()?;
+    for polled in messages {
+        let result = (|| -> anyhow::Result<bool> {
+            let lane = crate::management::v2::user_input::session_input_lock(owner)?;
+            let _guard = match lane.try_lock() {
+                Ok(guard) => guard,
+                Err(crate::management::v2::session_coordination::ReservationError::WouldBlock) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            let message = repository.canonical_message(&polled.id)?;
+            let unfrozen = repository.snapshot_by_message_id(&message.id)?.is_some_and(|snapshot| snapshot.external_input.is_none());
+            let asks = crate::asks::store::AskStore::open_default()?;
+            let paused = crate::asks::pause_admission::is_held(&asks, owner)?;
+            let mut next_step = false;
+            // Explicit holds/reservations always block independent delivery.
+            // New busy/timing admission is negotiated separately so old fake
+            // transport scenarios retain their existing native-inbox behavior.
+            if unfrozen {
+                if paused || repository.owner_delivery_blocked(owner, &message.id)? { return Ok(false); }
+                if owner_carries_capable && message.delivery_mode.trigger_turn() {
+                    let response = client.handle().request("thread/read", serde_json::json!({
+                        "threadId": binding.thread_id, "includeTurns": false
+                    }))?;
+                    let busy = response["thread"]["status"]["type"] == "active";
+                    if busy_wake_candidate(&message, false) {
+                        let age = std::time::Duration::from_secs((Utc::now().timestamp().max(0) as u64)
+                            .saturating_sub(message.created_at_epoch_secs));
+                        let timing = wake_timing(age, busy_wait_for(&message), || Some(busy));
+                        if timing == WakeTiming::Hold { return Ok(false); }
+                        next_step = timing == WakeTiming::NextStep;
+                    }
+                    let joins_running = busy && (next_step
+                        || message.delivery_mode == crate::agent_bus::delivery::AgentDeliveryMode::Soon);
+                    if !joins_running && (busy || !crate::management::v2::admission::delivery_may_start(owner, &message.id)?) {
+                        return Ok(false);
+                    }
+                }
+            }
+            let frozen = repository.freeze_external_input(owner, &message.id, |m| {
+                let mut e = envelope(m, &binding)?;
+                wake_at_next_step(&mut e, next_step)?;
+                Ok(e)
+            })?;
+            if !repository.owner_delivery_blocked(owner, &message.id)?
+                && !crate::asks::pause_admission::is_held(&asks, owner)? {
+                repository.input_ledger_sending(owner, &message.id);
+                client.handle().request("thread/externalInput/submit", serde_json::to_value(&frozen)?)?;
+            }
+            let mut params = serde_json::json!({"version": 1, "ownerId": owner, "threadId": binding.thread_id,
+                "runtimeGeneration": binding.runtime_generation});
+            params["messages"] = serde_json::to_value([frozen.key()])?;
+            let response: crate::app_server::external_input::Response =
+                serde_json::from_value(client.handle().request("thread/externalInput/status", params)?)?;
+            let Some(observed) = response.statuses.into_iter().next() else { return Ok(false) };
+            repository.observe_external_input(&message.id, &frozen, &observed)?;
+            // A fake that reports context_persisted with a well-formed receipt
+            // (`Receipt::digest_id`) gets the ordinary commit and ACK.
+            match observed.receipt {
+                Some(receipt) if observed.delivery_state == DeliveryState::ContextPersisted => {
+                    repository.record_external_input_delivered(owner, &message.id, &frozen, &receipt, binding.runtime_generation)?;
+                    let count = bus.ack(&options.registration.id, &[message.id.clone()])?;
+                    mark_acknowledged(status, count, 0);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        })();
+        match result {
+            Ok(true) => outcome.made_progress = true,
+            Ok(false) => outcome.retained_pending = true,
+            Err(error) => {
+                mark_error(status, format!("test fake external input {}: {error:#}", polled.id));
+                outcome.retained_pending = true;
+            }
+        }
     }
     Ok(outcome)
 }
@@ -2508,9 +2707,9 @@ mod tests {
         assert_eq!(terminal_code(validate_target(&start_message(control, WORKER, Some(STRANGER)), WORKER, &roster("create", "complete", OPERATOR, WORKER))), invalid);
         // Director claim does not match the project's authority.
         let mut other = roster("create", "complete", DIRECTOR, WORKER);
-        for authority in other.projects.values_mut() {
+        other.projects.for_each_value_mut(|_, authority| {
             authority.authorized_director_session = serde_json::from_value(serde_json::json!(STRANGER)).unwrap();
-        }
+        });
         assert_eq!(terminal_code(validate_target(&start_message(control, WORKER, None), WORKER, &other)), invalid);
         // Not a create / replace, or before the message phase.
         assert_eq!(terminal_code(validate_target(&start_message(control, WORKER, None), WORKER, &roster("restart", "complete", DIRECTOR, WORKER))), invalid);

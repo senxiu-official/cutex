@@ -5,6 +5,7 @@
 
 pub mod command;
 pub mod file_lock;
+pub mod lock_accounting;
 pub mod file_stamp;
 pub mod heap;
 pub mod shared_assets;

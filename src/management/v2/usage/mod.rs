@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod estimate;
 pub mod external;
+mod index;
 mod model;
 mod pricing;
 mod prices;
@@ -52,6 +53,10 @@ pub use prices::save_price_table;
 pub use prices::ModelPrice;
 pub use prices::UsagePriceTable;
 pub use query::aggregate_usage;
+pub use query::UsageAggregation;
+pub use index::ReadStats as UsageReadStats;
+pub use index::SyncStats as UsageIndexSync;
+pub use store::UsageIndexVerification;
 pub use query::UsageGroupKey;
 pub use query::UsageLabels;
 pub use query::UsageQuery;
@@ -184,32 +189,51 @@ pub fn canonicalize_ledger_profiles(
     directory: &crate::profiles::identity::ProfileNameDirectory,
 ) {
     for entry in &mut ledger.entries {
-        let (id, name, deleted, observed) = match entry {
-            UsageLedgerEntry::Usage(sample) => (
-                &mut sample.profile_id,
-                &mut sample.profile,
-                Some(&mut sample.profile_deleted),
-                sample.observed_at.clone(),
-            ),
-            UsageLedgerEntry::ResetBoundary(boundary) => (
-                &mut boundary.profile_id,
-                &mut boundary.profile,
-                None,
-                boundary.observed_at.clone(),
-            ),
-        };
-        let observed_at = model::parse_timestamp(&observed)
-            .ok()
-            .map(|at| at.with_timezone(&chrono::Utc));
-        let Some(resolved) = directory.resolve(id.as_deref(), name.as_deref(), observed_at) else {
-            continue;
-        };
-        *id = resolved.id;
-        *name = Some(resolved.name);
-        if let Some(deleted) = deleted {
-            *deleted = resolved.state == crate::profiles::identity::ProfileState::Deleted;
+        match entry {
+            UsageLedgerEntry::Usage(sample) => canonicalize_sample_profile(sample, directory),
+            UsageLedgerEntry::ResetBoundary(boundary) => {
+                if let Some(resolved) = resolve_profile(
+                    directory,
+                    boundary.profile_id.as_deref(),
+                    boundary.profile.as_deref(),
+                    &boundary.observed_at,
+                ) {
+                    boundary.profile_id = resolved.id;
+                    boundary.profile = Some(resolved.name);
+                }
+            }
         }
     }
+}
+
+/// [`canonicalize_ledger_profiles`] for one sample.
+pub fn canonicalize_sample_profile(
+    sample: &mut UsageSample,
+    directory: &crate::profiles::identity::ProfileNameDirectory,
+) {
+    let Some(resolved) = resolve_profile(
+        directory,
+        sample.profile_id.as_deref(),
+        sample.profile.as_deref(),
+        &sample.observed_at,
+    ) else {
+        return;
+    };
+    sample.profile_id = resolved.id;
+    sample.profile = Some(resolved.name);
+    sample.profile_deleted = resolved.state == crate::profiles::identity::ProfileState::Deleted;
+}
+
+fn resolve_profile(
+    directory: &crate::profiles::identity::ProfileNameDirectory,
+    id: Option<&str>,
+    name: Option<&str>,
+    observed: &str,
+) -> Option<crate::profiles::identity::ResolvedProfile> {
+    let observed_at = model::parse_timestamp(observed)
+        .ok()
+        .map(|at| at.with_timezone(&chrono::Utc));
+    directory.resolve(id, name, observed_at)
 }
 
 #[cfg(test)]
@@ -217,16 +241,79 @@ mod report_tests;
 #[cfg(test)]
 mod tests;
 
-/// Ledger entries from the month files that can hold local days `[from, to]`.
-pub fn load_usage_ledger_for_days(
+/// Which samples [`visit_usage_samples_for_days`] hands over.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UsageSampleSelection<'a> {
+    /// `?source=` of `GET /v2/usage`: `cutex`, `external` or a source id.
+    pub source: Option<&'a str>,
+    /// Only samples whose (current) profile id is one of these.
+    pub profile_ids: Option<&'a [String]>,
+}
+
+/// Usage samples that can fall on local days `[from, to]` (the month files
+/// the old reader opened: one day of slack each side), selected through the
+/// usage index and decoded one at a time in ledger order, with profiles
+/// canonicalized as [`canonicalize_ledger_profiles`]. Rows of a disabled
+/// extra source are kept but not counted. Returns the invalid-line warnings
+/// of those month files and the work counters.
+pub fn visit_usage_samples_for_days(
     from: chrono::NaiveDate,
     to: chrono::NaiveDate,
-) -> anyhow::Result<UsageLedger> {
+    selection: UsageSampleSelection<'_>,
+    visit: impl FnMut(&UsageSample),
+) -> anyhow::Result<(Vec<String>, UsageReadStats)> {
     let root = runtime_dir()?.join("management-v2");
-    let (first, last) = query::month_bounds(from, to);
-    // Rows of a disabled extra source are kept but not counted.
     let hidden = external::disabled_source_ids();
-    store::load_usage_ledger_months_at(&root, &first, &last, &hidden)
+    let directory = crate::profiles::identity::ProfileNameDirectory::load();
+    visit_usage_samples_for_days_at(&root, &hidden, &directory, from, to, selection, visit)
+}
+
+fn visit_usage_samples_for_days_at(
+    root: &Path,
+    hidden: &std::collections::HashSet<String>,
+    directory: &crate::profiles::identity::ProfileNameDirectory,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+    selection: UsageSampleSelection<'_>,
+    mut visit: impl FnMut(&UsageSample),
+) -> anyhow::Result<(Vec<String>, UsageReadStats)> {
+    let (first, last) = query::month_bounds(from, to);
+    // The instants of local days [from, to] (the daemon reports in
+    // chrono::Local), with an hour of margin for offset changes; the
+    // aggregation applies the exact local day.
+    let filter = index::SampleFilter {
+        from_ms: local_midnight_ms(from) - MARGIN_MS,
+        to_ms: local_midnight_ms(to + chrono::Duration::days(1)) + MARGIN_MS,
+        source: selection.source.map(str::to_string),
+        profile_ids: selection.profile_ids.map(<[String]>::to_vec),
+    };
+    store::read_usage_samples_at(root, (&first, &last), hidden, &filter, |mut sample| {
+        canonicalize_sample_profile(&mut sample, directory);
+        let wanted = selection.profile_ids.is_none_or(|ids| {
+            sample.profile_id.as_ref().is_some_and(|id| ids.iter().any(|wanted| wanted == id))
+        });
+        if wanted {
+            visit(&sample);
+        }
+        Ok(())
+    })
+}
+
+/// Build or catch up the usage index now (kit migration step); reports do
+/// this themselves on every read.
+pub fn sync_usage_index() -> anyhow::Result<UsageIndexSync> {
+    store::sync_usage_index_at(&runtime_dir()?.join("management-v2"))
+}
+
+/// Compare the index with the old full reader (kit verification after
+/// [`sync_usage_index`]); fails on the first difference.
+pub fn verify_usage_index() -> anyhow::Result<UsageIndexVerification> {
+    store::verify_usage_index_at(&runtime_dir()?.join("management-v2"))
+}
+
+/// Path of the usage index database (kit disk accounting).
+pub fn usage_index_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(runtime_dir()?.join("management-v2").join(index::USAGE_INDEX_FILE))
 }
 
 pub fn load_quota_history(
@@ -253,3 +340,36 @@ pub fn load_price_context(
     context.profile_categories = profile_categories;
     Ok((context, warnings))
 }
+
+const MARGIN_MS: i64 = 3_600_000;
+
+/// First instant of local `day` (ms). A midnight skipped by a clock change
+/// falls back to the widest offset, so the bound only ever widens.
+fn local_midnight_ms(day: chrono::NaiveDate) -> i64 {
+    use chrono::TimeZone;
+    let naive = day.and_time(chrono::NaiveTime::MIN);
+    match chrono::Local.from_local_datetime(&naive).earliest() {
+        Some(at) => at.timestamp_millis(),
+        None => naive.and_utc().timestamp_millis() - 14 * MARGIN_MS,
+    }
+}
+
+/// Daemon start: bring the usage index up to the ledger in the background
+/// (normally a stat per file; a full build if the kit step did not run), so
+/// the first report does not pay for it. Reports still catch up themselves.
+pub fn start_index_catch_up() {
+    let spawned = std::thread::Builder::new()
+        .name("cutex-usage-index".to_string())
+        .spawn(|| {
+            if let Err(error) = sync_usage_index() {
+                eprintln!("usage index: startup catch-up failed: {error:#}");
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("usage index: could not start catch-up: {error}");
+    }
+}
+
+#[cfg(test)]
+#[path = "index_tests.rs"]
+mod index_tests;

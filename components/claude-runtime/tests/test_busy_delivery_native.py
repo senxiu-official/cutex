@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -71,13 +72,19 @@ async def test_real_cli_consumes_hook_or_falls_back_once(tmp_path, monkeypatch, 
             self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
 
-    server = ThreadingHTTPServer(('127.0.0.1', 25970), Handler)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     spec = importlib.util.find_spec('claude_agent_sdk')
-    cli = Path(spec.origin).parent / '_bundled' / 'claude.exe'
-    account = ApiAccount('loopback-fixture', 'ANTHROPIC_API_KEY', 'http://127.0.0.1:25970',
+    bundled = Path(spec.origin).parent / '_bundled'
+    cli = Path(os.environ.get('CUTEX_TEST_CLAUDE_CLI') or bundled / ('claude.exe' if os.name == 'nt' else 'claude'))
+    key_file = tmp_path / 'keys' / 'loopback.json'
+    key_file.parent.mkdir()
+    key = 'fixture-only-' + secrets.token_hex(24)
+    key_file.write_text(json.dumps({'apiKey': key}), encoding='utf-8')
+    key_file.chmod(0o600)
+    account = ApiAccount('loopback-fixture', 'ANTHROPIC_API_KEY', f'http://127.0.0.1:{server.server_port}',
         {'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1', 'DISABLE_TELEMETRY': '1', 'DISABLE_ERROR_REPORTING': '1'},
-        'local-fixture-not-a-real-key')
+        key, key_file)
     driver = OfficialSdkDriver(cli, tmp_path / 'native-config', api_account=account)
     h = SubHarness(Settings(work, tmp_path / 'adapter', model='claude-sonnet-4-6', backend='subscription', mock=False,
                             thinking='disabled', external_owner_id='owner', external_runtime_generation=7), driver)
@@ -165,16 +172,18 @@ async def test_real_cli_owner_wake_reads_notes_in_its_first_request(tmp_path, mo
             self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
 
-    server = ThreadingHTTPServer(('127.0.0.1', 25970), Handler)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     bundled = Path(importlib.util.find_spec('claude_agent_sdk').origin).parent / '_bundled'
-    cli = bundled / ('claude.exe' if os.name == 'nt' else 'claude')
+    cli = Path(os.environ.get('CUTEX_TEST_CLAUDE_CLI') or bundled / ('claude.exe' if os.name == 'nt' else 'claude'))
     key_file = tmp_path / 'keys' / 'loopback.json'  # the key helper reads it
     key_file.parent.mkdir()
-    key_file.write_text(json.dumps({'apiKey': 'local-fixture-not-a-real-key'}), encoding='utf-8')
-    account = ApiAccount('loopback-fixture', 'ANTHROPIC_API_KEY', 'http://127.0.0.1:25970',
+    key = 'fixture-only-' + secrets.token_hex(24)
+    key_file.write_text(json.dumps({'apiKey': key}), encoding='utf-8')
+    key_file.chmod(0o600)
+    account = ApiAccount('loopback-fixture', 'ANTHROPIC_API_KEY', f'http://127.0.0.1:{server.server_port}',
         {'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1', 'DISABLE_TELEMETRY': '1', 'DISABLE_ERROR_REPORTING': '1'},
-        'local-fixture-not-a-real-key', key_file)
+        key, key_file)
     driver = OfficialSdkDriver(cli, tmp_path / 'native-config', api_account=account)
     h = SubHarness(Settings(work, tmp_path / 'adapter', model='claude-sonnet-4-6', backend='subscription', mock=False,
                             thinking='disabled'), driver)

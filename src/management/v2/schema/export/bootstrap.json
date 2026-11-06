@@ -5,6 +5,23 @@
   "description": "GET /v2/sessions/{id}/bootstrap[?turnLimit=N][&compact=1] and GET /v2/sessions/{id}/history?limit=&cursor=[&compact=1]. `native.result` is the app-server `thread/read` result (its own generated schema); with compact=1 tool items may carry `truncated: true`.",
   "anyOf": [{ "$ref": "#/$defs/bootstrap" }, { "$ref": "#/$defs/history" }, { "$ref": "#/$defs/historyTurn" }],
   "$defs": {
+    "autoRetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempt", "maxAttempts", "scheduledAt", "at", "turnId", "planId", "phase", "holdsAdmission"],
+      "properties": {
+        "attempt": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "maxAttempts": { "const": 3 },
+        "scheduledAt": { "type": "string" },
+        "at": { "type": "string" },
+        "turnId": { "type": "string", "minLength": 1 },
+        "planId": { "type": "string", "minLength": 1 },
+        "phase": { "enum": ["pending", "firing", "binding", "uncertain"] },
+        "holdsAdmission": { "type": "boolean" },
+        "threadId": { "type": "string" },
+        "runtimeGeneration": { "type": "integer", "minimum": 0 }
+      }
+    },
     "checkpoint": {
       "type": "object",
       "required": ["streamId", "sequence", "cursor"],
@@ -64,6 +81,7 @@
             "$ref": "#/$defs/admissionItem"
           }
         },
+        "autoRetry": { "anyOf": [{ "$ref": "#/$defs/autoRetry" }, { "type": "null" }] },
         "nextStep": {
           "type": "array",
           "items": {
@@ -179,7 +197,7 @@
           ]
         },
         "waitReason": {
-          "enum": ["resultCoalescing", "nativeReceipt"]
+          "enum": ["resultCoalescing", "nativeReceipt", "autoRetry"]
         },
         "held": {
           "enum": [
@@ -263,7 +281,11 @@
         "agentBusSentMessages": { "type": "array" },
         "ownerNotifications": { "type": "array", "items": { "type": "object" }, "description": "Agent → owner messages of this session, oldest first (capability owner-messages)." },
         "latestPlan": { "type": ["object", "null"] },
-        "latestTokenUsage": { "type": ["object", "null"] }
+        "latestTokenUsage": { "type": ["object", "null"] },
+        "inputs": { "type": "array", "items": { "type": "object" }, "description": "input-ledger-v1 (054 §2.7): unsettled input records plus those settled in the last 15 minutes." },
+        "delivery": { "type": "object", "description": "input-ledger-v1: SessionDelivery (054 §2.6), when one was published." },
+        "stateRevision": { "type": "integer", "minimum": 0 },
+        "ledgerEpoch": { "type": "string" }
       }
     },
     "bootstrap": {

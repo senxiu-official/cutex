@@ -1,0 +1,483 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:components-index:v1",
+  "title": "Cutex signed component index v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "cutex/components-index/v1"
+    },
+    "channel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "publishedAt": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "recommended": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "releases": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "version": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                },
+                "payload": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                },
+                "compatible": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "allCapabilities": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                      },
+                      "uniqueItems": true
+                    }
+                  },
+                  "required": [
+                    "allCapabilities"
+                  ]
+                },
+                "assetTag": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                },
+                "platforms": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                  },
+                  "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "maxLength": 56,
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.tar\\.gz$"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$"
+                      },
+                      "size": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 4294967296
+                      },
+                      "signatureName": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.tar\\.gz\\.minisig$"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "sha256",
+                      "size",
+                      "signatureName"
+                    ]
+                  }
+                },
+                "yanked": {
+                  "type": "boolean"
+                },
+                "yankReason": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "externalRuntime": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "schema": {
+                          "const": "cutex/external-runtime/v1"
+                        },
+                        "name": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 64,
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                        },
+                        "version": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 64,
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                        },
+                        "payload": {
+                          "const": "adapter-v1"
+                        },
+                        "externalRoot": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "properties": {
+                            "kind": {
+                              "const": "npm-prefix"
+                            },
+                            "packages": {
+                              "type": "object",
+                              "minProperties": 1,
+                              "additionalProperties": {
+                                "type": "string",
+                                "minLength": 1
+                              }
+                            },
+                            "cliEntry": {
+                              "type": "string",
+                              "minLength": 1,
+                              "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\x00-\\x1f:]+$"
+                            },
+                            "catalogEntry": {
+                              "type": "string",
+                              "minLength": 1,
+                              "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\x00-\\x1f:]+$"
+                            }
+                          },
+                          "required": [
+                            "kind",
+                            "packages",
+                            "cliEntry"
+                          ]
+                        },
+                        "node": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "properties": {
+                            "range": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "recommended": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "features": {
+                              "type": "array",
+                              "items": {
+                                "const": "node:sqlite"
+                              },
+                              "uniqueItems": true
+                            }
+                          },
+                          "required": [
+                            "range",
+                            "recommended",
+                            "features"
+                          ]
+                        },
+                        "checks": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "properties": {
+                            "rg": {
+                              "type": "boolean"
+                            },
+                            "nodePty": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "rg",
+                            "nodePty"
+                          ]
+                        },
+                        "environment": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "properties": {
+                            "installRoot": {
+                              "enum": [
+                                "DSH_INSTALL_ROOT",
+                                "KIMI_INSTALL_ROOT"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "installRoot"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "schema",
+                        "name",
+                        "version",
+                        "payload",
+                        "externalRoot",
+                        "node",
+                        "checks",
+                        "environment"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "externalRuntimeSha256": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "version",
+                "payload",
+                "compatible",
+                "assetTag",
+                "platforms",
+                "yanked",
+                "yankReason",
+                "externalRuntime",
+                "externalRuntimeSha256"
+              ],
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "payload": {
+                        "const": "adapter-v1"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "externalRuntime": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                          "schema": {
+                            "const": "cutex/external-runtime/v1"
+                          },
+                          "name": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 64,
+                            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                          },
+                          "version": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 64,
+                            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                          },
+                          "payload": {
+                            "const": "adapter-v1"
+                          },
+                          "externalRoot": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                              "kind": {
+                                "const": "npm-prefix"
+                              },
+                              "packages": {
+                                "type": "object",
+                                "minProperties": 1,
+                                "additionalProperties": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              },
+                              "cliEntry": {
+                                "type": "string",
+                                "minLength": 1,
+                                "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\x00-\\x1f:]+$"
+                              },
+                              "catalogEntry": {
+                                "type": "string",
+                                "minLength": 1,
+                                "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\x00-\\x1f:]+$"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "packages",
+                              "cliEntry"
+                            ]
+                          },
+                          "node": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                              "range": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "recommended": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "features": {
+                                "type": "array",
+                                "items": {
+                                  "const": "node:sqlite"
+                                },
+                                "uniqueItems": true
+                              }
+                            },
+                            "required": [
+                              "range",
+                              "recommended",
+                              "features"
+                            ]
+                          },
+                          "checks": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                              "rg": {
+                                "type": "boolean"
+                              },
+                              "nodePty": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "rg",
+                              "nodePty"
+                            ]
+                          },
+                          "environment": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                              "installRoot": {
+                                "enum": [
+                                  "DSH_INSTALL_ROOT",
+                                  "KIMI_INSTALL_ROOT"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "installRoot"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "schema",
+                          "name",
+                          "version",
+                          "payload",
+                          "externalRoot",
+                          "node",
+                          "checks",
+                          "environment"
+                        ]
+                      },
+                      "externalRuntimeSha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "payload": {
+                        "const": "bundled-v1"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "externalRuntime": {
+                        "type": "null"
+                      },
+                      "externalRuntimeSha256": {
+                        "type": "null"
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "name",
+          "recommended",
+          "releases"
+        ]
+      },
+      "minItems": 1
+    }
+  },
+  "required": [
+    "schema",
+    "channel",
+    "sequence",
+    "publishedAt",
+    "components"
+  ]
+}

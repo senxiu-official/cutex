@@ -167,7 +167,7 @@ fn usage_labels() -> (usage::UsageLabels, Vec<String>) {
         Err(error) => warnings.push(format!("agent names unavailable: {error:#}")),
     }
     match crate::agent_management::AgentManagementStore::open_default()
-        .and_then(|store| store.snapshot().map_err(anyhow::Error::new))
+        .and_then(|store| store.directory_snapshot_shared().map_err(anyhow::Error::new))
     {
         Ok(snapshot) => {
             let mut projects = HashMap::new();
@@ -191,19 +191,6 @@ fn usage_labels() -> (usage::UsageLabels, Vec<String>) {
     }
     labels.sources = usage::external::source_labels();
     (labels, warnings)
-}
-
-/// `?source=`: keep cutex's own rows, every extra source's, or one source's.
-fn retain_source(ledger: &mut usage::UsageLedger, filter: &str) {
-    ledger.entries.retain(|entry| match entry {
-        usage::UsageLedgerEntry::Usage(sample) => match (filter, &sample.source) {
-            ("cutex", source) => source.is_none(),
-            ("external", source) => source.is_some(),
-            (id, Some(source)) => source.id == id,
-            (_, None) => false,
-        },
-        usage::UsageLedgerEntry::ResetBoundary(_) => filter == "cutex",
-    });
 }
 
 pub(super) fn handle(
@@ -244,19 +231,8 @@ pub(super) fn handle(
                 Ok(range) => range,
                 Err(message) => return bad_request(stream, &message),
             };
-            let mut ledger = match usage::load_usage_ledger_for_days(from, to) {
-                Ok(ledger) => ledger,
-                Err(error) => return unavailable(stream, error),
-            };
-            if let Some(filter) = params.source.as_deref() {
-                retain_source(&mut ledger, filter);
-            }
             // Rows are attributed by profile id and shown under the current
             // name; untraceable rows keep their name with profileState deleted.
-            usage::canonicalize_ledger_profiles(
-                &mut ledger,
-                &crate::profiles::identity::ProfileNameDirectory::load(),
-            );
             let mut price_warnings = Vec::new();
             let prices = match usage::load_prices() {
                 Ok(loaded) => {
@@ -286,8 +262,18 @@ pub(super) fn handle(
                 to,
                 group_by: params.group_by.unwrap_or_else(|| vec![UsageGroupKey::Day]),
             };
-            let mut result =
-                usage::aggregate_usage(&ledger, &query, &labels, pricing.as_ref(), &local_date);
+            let mut aggregation =
+                usage::UsageAggregation::new(&query, &labels, pricing.as_ref(), &local_date);
+            let selection = usage::UsageSampleSelection {
+                source: params.source.as_deref(),
+                profile_ids: None,
+            };
+            let ledger_warnings =
+                match usage::visit_usage_samples_for_days(from, to, selection, |sample| aggregation.add(sample)) {
+                    Ok((warnings, _)) => warnings,
+                    Err(error) => return unavailable(stream, error),
+                };
+            let mut result = aggregation.finish(ledger_warnings);
             result.recording_since = usage::load_usage_state_snapshot()
                 .ok()
                 .and_then(|state| state.observed_since);
@@ -656,23 +642,25 @@ fn profile_categories() -> HashMap<String, crate::profiles::provider_category::P
 pub(super) fn profile_usage_windows(profile_ids: &[String]) -> anyhow::Result<serde_json::Value> {
     let today = Local::now().date_naive();
     let first = today - Duration::days(29);
-    let mut ledger = usage::load_usage_ledger_for_days(first, today)?;
-    usage::canonicalize_ledger_profiles(&mut ledger, &crate::profiles::identity::ProfileNameDirectory::load());
-    ledger.entries.retain(|entry| match entry {
-        usage::UsageLedgerEntry::Usage(sample) => sample
-            .profile_id
-            .as_ref()
-            .is_some_and(|id| profile_ids.iter().any(|wanted| wanted == id)),
-        usage::UsageLedgerEntry::ResetBoundary(_) => false,
-    });
     let prices = usage::load_prices().ok().map(|loaded| loaded.table);
     let pricing = usage::load_price_context(prices, profile_categories()).ok().map(|(context, _)| context);
     let labels = usage::UsageLabels::default();
-    let window = |days: i64| {
-        let query = usage::UsageQuery { from: today - Duration::days(days - 1), to: today, group_by: vec![UsageGroupKey::Profile] };
-        usage::aggregate_usage(&ledger, &query, &labels, pricing.as_ref(), &local_date)
-    };
-    let (day, week, month) = (window(1), window(7), window(30));
+    let queries = [1_i64, 7, 30].map(|days| usage::UsageQuery {
+        from: today - Duration::days(days - 1),
+        to: today,
+        group_by: vec![UsageGroupKey::Profile],
+    });
+    // One pass over the selected samples feeds all three windows.
+    let mut windows = queries
+        .each_ref()
+        .map(|query| usage::UsageAggregation::new(query, &labels, pricing.as_ref(), &local_date));
+    let selection = usage::UsageSampleSelection { source: None, profile_ids: Some(profile_ids) };
+    let (warnings, _) = usage::visit_usage_samples_for_days(first, today, selection, |sample| {
+        for window in &mut windows {
+            window.add(sample);
+        }
+    })?;
+    let [day, week, month] = windows.map(|window| window.finish(warnings.clone()));
     Ok(json!({
         "today": day.totals,
         "last7Days": week.totals,

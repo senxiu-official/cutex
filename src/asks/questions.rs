@@ -167,9 +167,8 @@ pub fn resolve(
         clear_input_hold(state, &question.ask_id, now);
         return Err(AskError::new("stale", "the attempt or runtime that asked this question was superseded"));
     }
-    if !answers.is_object() {
-        return Err(AskError::new("invalid_arguments", "answers must be an object keyed by question id"));
-    }
+    crate::management::v2::question_answers::validate_answers(&question.questions, answers)
+        .map_err(|message| AskError::new("invalid_arguments", &message))?;
     let by = match responder {
         Responder::Owner => "owner".to_string(),
         Responder::Agent(session) => session.clone(),
@@ -331,6 +330,24 @@ mod tests {
         assert_eq!(state.deliveries.values().filter(|d| d.kind == DeliveryKind::Question).count(), 2);
         // The owner answers first; the requester then gets already_resolved.
         let answers = json!({"q0": {"answers": ["sqlite"]}});
+        let invalid = store
+            .with_state(|state| {
+                resolve(
+                    state,
+                    &first,
+                    &Responder::Owner,
+                    &json!({"wrong":{"answers":["sqlite"]}}),
+                    Some(1),
+                    now,
+                )
+            })
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(invalid.code, "invalid_arguments");
+        assert_eq!(
+            store.snapshot().unwrap().questions[&first].state,
+            QuestionState::Open
+        );
         store.with_state(|state| resolve(state, &first, &Responder::Owner, &answers, Some(1), now)).unwrap().unwrap();
         let late = store
             .with_state(|state| resolve(state, &first, &Responder::Agent(REQUESTER.into()), &answers, Some(1), now))

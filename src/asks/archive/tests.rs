@@ -1069,3 +1069,210 @@ fn benchmark_eva_shaped_split() {
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// ---- r273 rolling archive and indexed cold lookup ----
+
+fn closed_at(state: &mut AskState, action: &str, at: &str, parent: Option<&str>) -> String {
+    let mut request = new_ask(action, "completed synthetic brief");
+    request.parent_ask = parent.map(str::to_string);
+    let id = state.create_ask(request, stamp(at)).unwrap().0.ask_id;
+    let ask = state.asks.get_mut(&id).unwrap();
+    ask.execution = ExecutionState::Cancelled;
+    ask.closed = Some(CloseOutcome::Abandoned);
+    ask.closed_at = Some(crate::asks::now_rfc3339(stamp(at)));
+    state.notices.clear();
+    id
+}
+
+fn cold_ask_ids(path: &Path) -> BTreeSet<String> {
+    identities(path).unwrap().into_iter().filter(|(kind, _)| kind == "asks").map(|(_, id)| id).collect()
+}
+
+fn rolling_now() -> DateTime<Utc> {
+    stamp("2026-11-01T12:00:00Z")
+}
+
+#[test]
+fn rolling_pass_moves_only_closed_older_than_the_age_and_keeps_the_fixed_cutoff() {
+    let (store, dir) = temp_store("archive-rolling");
+    let path = dir.join(crate::management::v2::hot_store::DATABASE_FILE);
+    let mut state = AskState::default();
+    let before_cutoff = closed_at(&mut state, "a", "2026-10-23T00:00:00Z", None);
+    let rolling = closed_at(&mut state, "b", "2026-10-28T00:00:00Z", None);
+    let recent = closed_at(&mut state, "c", "2026-10-31T00:00:00Z", None);
+    let open_ask = state.create_ask(new_ask("open", "open"), stamp("2026-10-20T00:00:00Z")).unwrap().0.ask_id;
+    state.notices.clear();
+    store.with_state(|target| *target = state).unwrap();
+    // Without a policy (no startup split yet) nothing rolls.
+    let report = store.rolling_archive_pass(chrono::Duration::hours(48), 200, rolling_now()).unwrap();
+    assert_eq!(report.moved.rows, 0);
+    assert!(!store.archive_configured().unwrap());
+    store.archive_before(Some(cutoff()), cutoff()).unwrap();
+    assert_eq!(cold_ask_ids(&path), BTreeSet::from([before_cutoff.clone()]));
+
+    let report = store.rolling_archive_pass(chrono::Duration::hours(48), 200, rolling_now()).unwrap();
+    assert_eq!(report.moved.asks, 1, "{report:?}");
+    assert_eq!(report.deferred_asks, 0);
+    assert_eq!(cold_ask_ids(&path), BTreeSet::from([before_cutoff.clone(), rolling.clone()]));
+    let hot = store.shared().unwrap();
+    assert!(hot.asks.contains_key(&recent) && hot.asks.contains_key(&open_ask));
+    assert!(!hot.asks.contains_key(&rolling));
+    // History and single lookups still see it.
+    assert_eq!(store.lookup_ask(&rolling).unwrap().unwrap().ask_id, rolling);
+    assert!(store.history_snapshot().unwrap().asks.contains_key(&rolling));
+    // The fixed cutoff policy is untouched: r271.x reads the same policy and
+    // its own startup pass neither fails nor re-plans these rows.
+    assert_eq!(persisted_cutoff(&path).unwrap(), Some(cutoff()));
+    assert!(store.archive_before(None, rolling_now()).is_ok());
+    // Format: no new table, only rows in the existing cold table.
+    let db = open(&path).unwrap();
+    let tables: BTreeSet<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(tables, BTreeSet::from(["hot_store_meta", "hot_store_rows", "asks_archive_meta", "asks_archive_rows"].map(String::from)));
+    drop(db);
+    // Idempotent: a second pass finds nothing; the outgoing restore brings
+    // rolled rows back like any other cold rows.
+    assert_eq!(store.rolling_archive_pass(chrono::Duration::hours(48), 200, rolling_now()).unwrap().moved.rows, 0);
+    store.restore_archived_for_rollback(true).unwrap();
+    assert!(store.shared().unwrap().asks.contains_key(&rolling));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rolling_pass_is_bounded_and_moves_whole_reference_components() {
+    let (store, dir) = temp_store("archive-rolling-bounded");
+    let path = dir.join(crate::management::v2::hot_store::DATABASE_FILE);
+    let mut state = AskState::default();
+    let parent = closed_at(&mut state, "p", "2026-10-26T00:00:00Z", None);
+    let child = closed_at(&mut state, "c", "2026-10-27T00:00:00Z", Some(&parent));
+    let mut singles = Vec::new();
+    for (index, day) in ["26", "27", "28"].iter().enumerate() {
+        singles.push(closed_at(&mut state, &format!("s{index}"), &format!("2026-10-{day}T06:00:00Z"), None));
+    }
+    store.with_state(|target| *target = state).unwrap();
+    store.archive_before(Some(cutoff()), cutoff()).unwrap();
+    assert!(cold_ask_ids(&path).is_empty());
+    let mut passes = 0;
+    loop {
+        let before = cold_ask_ids(&path);
+        let report = store.rolling_archive_pass(chrono::Duration::hours(48), 1, rolling_now()).unwrap();
+        if report.moved.rows == 0 { break; }
+        passes += 1;
+        let after = cold_ask_ids(&path);
+        // Parent and child always move in the same pass.
+        assert_eq!(after.contains(&parent), after.contains(&child), "{report:?}");
+        assert!(report.moved.asks <= 2);
+        assert_eq!(report.moved.asks, after.len() - before.len());
+        // No hot row names a cold ask.
+        let hot = store.shared().unwrap();
+        for ask in hot.asks.values() {
+            assert!(ask.parent_ask.as_ref().is_none_or(|p| !after.contains(p)));
+        }
+        assert!(passes < 10);
+    }
+    assert_eq!(passes, 4, "3 single delegations + one parent/child component");
+    assert_eq!(cold_ask_ids(&path).len(), 5);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rolling_pass_is_safe_under_concurrent_writes() {
+    let (store, dir) = temp_store("archive-rolling-concurrent");
+    let path = dir.join(crate::management::v2::hot_store::DATABASE_FILE);
+    let mut state = AskState::default();
+    let mut old = BTreeSet::new();
+    for index in 0..30 {
+        old.insert(closed_at(&mut state, &format!("old{index}"), "2026-10-27T00:00:00Z", None));
+    }
+    let open_ask = state.create_ask(new_ask("open", "open"), stamp("2026-10-27T00:00:00Z")).unwrap().0.ask_id;
+    state.notices.clear();
+    let initial_revision = state.asks[&open_ask].revision;
+    store.with_state(|target| *target = state).unwrap();
+    store.archive_before(Some(cutoff()), cutoff()).unwrap();
+    const WRITES: u64 = 150;
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let writer = crate::asks::store::AskStore::at(&dir);
+            for index in 0..WRITES {
+                writer.with_state(|state| {
+                    let _ = index;
+                    state.asks.get_mut(&open_ask).unwrap().revision += 1;
+                }).unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut replans = 0;
+        while cold_ask_ids(&path).len() < old.len() || !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let report = store.rolling_archive_pass(chrono::Duration::hours(48), 7, rolling_now()).unwrap();
+            replans += report.replans;
+            assert!(report.moved.asks <= 7);
+        }
+        writer.join().unwrap();
+        eprintln!("rolling archive under writes: {replans} replans");
+    });
+    assert_eq!(cold_ask_ids(&path), old);
+    let hot = store.shared().unwrap();
+    assert_eq!(hot.asks.len(), 1);
+    assert_eq!(hot.asks[&open_ask].revision, initial_revision + WRITES, "no write lost");
+    let history = store.history_snapshot().unwrap();
+    assert_eq!(history.asks.len(), old.len() + 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn indexed_cold_lookup_matches_the_full_identity_scan_and_is_not_rebuilt_per_lookup() {
+    let (store, dir) = temp_store("archive-index");
+    let path = dir.join(crate::management::v2::hot_store::DATABASE_FILE);
+    let mut state = AskState::default();
+    let mut ids = Vec::new();
+    for index in 0..12 {
+        ids.push(closed_at(&mut state, &format!("x{index}"), "2026-10-23T00:00:00Z", None));
+    }
+    let open_ask = state.create_ask(new_ask("open", "open"), stamp("2026-10-27T00:00:00Z")).unwrap().0.ask_id;
+    state.notices.clear();
+    store.with_state(|target| *target = state).unwrap();
+    store.archive_before(Some(cutoff()), cutoff()).unwrap();
+    let brute = |inputs: &[&str]| -> BTreeSet<RowKey> {
+        let mut seeds = VecDeque::new();
+        for (kind, id) in identities(&path).unwrap() {
+            if inputs.iter().any(|input| identity_matches(input, &id)) {
+                let _ = kind;
+                seeds.push_back(id);
+            }
+        }
+        let db = Connection::open(&path).unwrap();
+        connected_rows(&db, seeds, false).unwrap().into_keys().collect()
+    };
+    let target = &ids[3];
+    let hex = &target["ask-".len()..];
+    let inputs: Vec<String> = vec![
+        target.clone(),
+        format!("delegation-{}", &hex[..8]),
+        format!("ask-{}", &hex[..6]),
+        hex[..10].to_string(),
+        format!("…{}", &hex[hex.len() - 6..]),
+        hex[hex.len() - 7..].to_string(),
+        "worker-name".into(),
+        "ans-nothing".into(),
+    ];
+    for input in &inputs {
+        let indexed: BTreeSet<RowKey> = matching_rows(&path, &[input]).unwrap().into_keys().collect();
+        assert_eq!(indexed, brute(&[input]), "input {input}");
+    }
+    assert!(matching_rows(&path, &[target]).unwrap().contains_key(&("asks".to_string(), target.clone())));
+    // Hot writes move the generation, not the cold set: no rebuild.
+    let builds = IDENTITY_INDEX_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+    for index in 0..5 {
+        let _ = index;
+        store.with_state(|state| state.asks.get_mut(&open_ask).unwrap().revision += 1).unwrap();
+        matching_rows(&path, &[&hex[..8]]).unwrap();
+    }
+    assert_eq!(IDENTITY_INDEX_BUILDS.load(std::sync::atomic::Ordering::Relaxed), builds);
+    // A promotion changes the cold set: the next short lookup sees it.
+    store.promote_history(target).unwrap();
+    assert!(matching_rows(&path, &[&hex[..8]]).unwrap().is_empty());
+    assert_eq!(brute(&[&hex[..8]]), BTreeSet::new());
+    std::fs::remove_dir_all(dir).unwrap();
+}

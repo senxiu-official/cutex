@@ -438,7 +438,8 @@ fn pending_creates(root: &Path) -> Result<BTreeSet<String>> {
         AgentActionPhase, AgentManagementSnapshot, AgentManagementStoreSchema, AgentOperationKind,
     };
     let relative = Path::new("runtime/agent-management/v1/agent-management-v1.json");
-    if metadata(root, relative)?.is_none() {
+    let sql = Path::new("runtime/agent-management/v1/roster.sqlite3");
+    if metadata(root, relative)?.is_none() && metadata(root, sql)?.is_none() {
         return Ok(BTreeSet::new());
     }
     // snapshot() intentionally treats a missing lock as an empty store. Cleanup
@@ -452,8 +453,11 @@ fn pending_creates(root: &Path) -> Result<BTreeSet<String>> {
         .is_some_and(|meta| meta.is_file()),
         "action store lock missing or invalid"
     );
-    let snapshot: AgentManagementSnapshot =
-        serde_json::from_value(json(root, relative)?.context("action store disappeared")?)?;
+    // 058 S4: the committed SQL rows while authoritative, else the JSON.
+    let snapshot: AgentManagementSnapshot = crate::agent_management::read_committed_roster(
+        &root.join("runtime/agent-management/v1"),
+    )?
+    .context("action store disappeared")?;
     // Match the store reader's bootstrap evidence checks. Project migrations
     // only affect roster state, which is not used for pending create identity.
     ensure!(
@@ -696,7 +700,15 @@ fn obligations(root: &Path, records: &[&CutexSessionRecord], native_id: &str) ->
             }
         }
     }
-    if let Some(approvals) = json(root, Path::new("runtime/approvals/approvals.json"))? {
+    let approval_sql=Path::new("runtime/approvals/approvals.sqlite3");
+    if metadata(root,approval_sql)?.is_some() {
+        for suffix in ["-wal","-shm"] {
+            metadata(root,&PathBuf::from(format!("{}{suffix}",approval_sql.display())))?;
+        }
+        let blocked=crate::approvals::ApprovalStore::existing_active_obligation(&root.join("runtime/approvals/approvals.json"),|record|mentions(&serde_json::to_value(record).expect("approval serializes"),&ids))?
+            .context("approval SQL disappeared during discovery")?;
+        if blocked {return Ok(true);}
+    } else if let Some(approvals) = json(root, Path::new("runtime/approvals/approvals.json"))? {
         for approval in approvals["approvals"]
             .as_array()
             .context("unknown approvals document")?
@@ -1231,6 +1243,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn sql_approval_obligations_protect_a_retired_home_when_legacy_json_is_stale() {
+        let f=Fixture::new();let session=f.record(true);f.save(session.clone());
+        let path=f.root.join("runtime/approvals/approvals.json");
+        let approvals=crate::approvals::ApprovalStore::at(&path);
+        let request=crate::approvals::ApprovalRequest {
+            kind:crate::approvals::ApprovalKind::ManagedService,reason:"outside_caller_envelope".into(),
+            requester_cutex_session_id:session.cutex_session_id,requester_name:None,project_id:None,
+            summary:"retain native home".into(),details:serde_json::json!({}),request_sha256:"synthetic".into(),
+        };
+        assert!(matches!(approvals.gate(request,chrono::Utc::now()).unwrap(),crate::approvals::GateOutcome::Pending{..}));
+        f.state_file("runtime/approvals/approvals.json",serde_json::json!({"approvals":[]}));
+        assert_eq!(f.classified("retired-homes",0)[0].code,"pending_obligation");
+        drop(approvals);
     }
 
     #[test]

@@ -140,6 +140,10 @@ pub struct AgentBusRequestHandlers {
         AgentManagementInvocation,
         AgentManagementRequest,
     ) -> anyhow::Result<Value>,
+    pub automatic_managed_online: fn(
+        &Arc<Mutex<AgentBusState>>,
+        crate::agent_management::AutomaticManagedOnline,
+    ) -> anyhow::Result<Value>,
     pub job_service_completion: fn(
         &Arc<Mutex<AgentBusState>>,
         &crate::agent_bus::identity::JobServiceSystemPrincipal,
@@ -224,7 +228,12 @@ pub fn handle_agent_bus_request(
             if !matches!(request.caller(), crate::agent_bus::agent_auth::BusCaller::Root) {
                 return write_http_response(stream, 403, "Forbidden", "text/plain", b"root credential required");
             }
-            write_json_response(stream, 200, "OK", &serde_json::json!({"scope":"agent_bus_process","timing":crate::management::v2::control_timing::snapshot()}))
+            let mut body = serde_json::json!({"scope":"agent_bus_process","timing":crate::management::v2::control_timing::snapshot()});
+            // Bus-row ledger writes of this process (054 S25); switch off: absent.
+            if let Some(ledger) = crate::management::v2::input_ledger_timing::diagnostics() {
+                body["inputLedger"] = ledger;
+            }
+            write_json_response(stream, 200, "OK", &body)
         }
         ("GET", "/api/agents") => {
             require_service_bridge_token(&request, token, "Agent Bus")?;
@@ -364,7 +373,15 @@ pub fn handle_agent_bus_request(
                                     external_message_id: Some(tell.external_id.to_string()),
                                     sender_facts: Some(tell.facts.clone()),
                                 };
-                                timed_fanout(|| (handlers.send_payload_response)(state, payload))
+                                match timed_fanout(|| (handlers.send_payload_response)(state, payload)) {
+                                    // 054 decision 2: still refused, nothing queued; the
+                                    // caller gets the reason code and the record id.
+                                    Err(error) => match tell_target_unavailable(&error, &caller, tell.external_id, tell.text, tell.wake) {
+                                        Some(refused) => Ok(refused),
+                                        None => Err(error),
+                                    },
+                                    sent => sent,
+                                }
                             };
                             let wake_chain = |from: &str, to: &str, turn: &str| {
                                 crate::management::v2::agent_bus_state::agent_bus_message_repository()
@@ -623,9 +640,25 @@ pub fn handle_agent_bus_request(
                     payload.all_groups = true;
                 }
             }
+            // 054 decision 2: a refused send to a target without an endpoint
+            // is recorded in the target's ledger (switch on only).
+            let refused_tell = crate::management::v2::agent_bus_state::input_ledger_active().then(|| {
+                let id = payload.external_message_id.clone().unwrap_or_else(|| format!("tell-{}", uuid::Uuid::new_v4().simple()));
+                let wake = payload.resolved_delivery_mode() != crate::agent_bus::delivery::AgentDeliveryMode::Passive;
+                // The ledger keeps an 80-character preview only.
+                let preview: String = payload.content.chars().take(200).collect();
+                (payload.from_session_id.clone(), payload.from_agent_id.clone(), id, preview, wake)
+            });
             let response = match timed_fanout(|| (handlers.send_payload_response)(state, payload)) {
                 Ok(response) => response,
                 Err(error) => {
+                    let refused = refused_tell.as_ref().and_then(|(session, agent, id, text, wake)| {
+                        let sender = session.clone().or_else(|| sender_session_of(state, agent.as_deref()?))?;
+                        tell_target_unavailable(&error, &sender, id, text, *wake)
+                    });
+                    if let Some(refused) = refused {
+                        return write_json_response(stream, 409, "Conflict", &refused);
+                    }
                     if let Some(response) = write_agent_target_resolution_error(stream, &error) {
                         return response;
                     }
@@ -636,6 +669,14 @@ pub fn handle_agent_bus_request(
         }
         // Owner stuck-message support (Management `agent-bus-stuck-messages`):
         // root bus credential only (per-agent credentials never reach here).
+        ("GET", "/api/messages/content") => {
+            require_service_bridge_token(&request, token, "Agent Bus")?;
+            let id = crate::http::query::query_value(&request.path, "messageId")
+                .filter(|id| !id.is_empty() && id.len() <= 256)
+                .ok_or_else(|| anyhow!("messageId is required (at most 256 bytes)"))?;
+            let text = crate::agent_bus::queue::queued_message_content(state, &id)?;
+            write_json_response(stream, 200, "OK", &serde_json::json!({"ok": true, "messageId": id, "text": text}))
+        }
         ("GET", "/api/messages/queued") => {
             require_service_bridge_token(&request, token, "Agent Bus")?;
             let queued = crate::agent_bus::queue::queued_agent_messages(state)?;
@@ -788,6 +829,17 @@ pub fn handle_agent_bus_request(
             let response = crate::agent_bus::mcp::archive_mcp::response(&payload, (handlers.managed_archive)(&invocation, &payload));
             write_json_response(stream, 200, "OK", &response)
         }
+        ("POST", "/api/internal/asks/managed-online") => {
+            // No MCP/agent credential can manufacture scheduler authority.
+            if !matches!(request.caller(), crate::agent_bus::agent_auth::BusCaller::Root) {
+                return write_http_response(stream,403,"Forbidden","text/plain",b"root credential required");
+            }
+            require_agent_management_bridge_token(&request, token)?;
+            anyhow::ensure!(request.body.len() <= 8192, "automatic online body too large");
+            let context = serde_json::from_slice(&request.body)?;
+            let response = (handlers.automatic_managed_online)(state, context)?;
+            write_json_response(stream,200,"OK",&response)
+        }
         ("POST", "/api/agent-management/v1/actions") => {
             let mut timing = ControlTrace::new(control_request_path(&request.body, true));
             timing.stage(ControlStage::Validation);
@@ -890,6 +942,25 @@ pub fn handle_agent_bus_request(
                             ))?,
                         );
                     }
+                    // r274.1: the request's allow_unlisted holds for its launch
+                    // review (`profiles::model_check`); member_runtime online /
+                    // restart check the member's model here.
+                    let _model_scope = crate::profiles::model_check::RequestScope::enter(
+                        sparse.as_ref().map_or_else(|| payload.operation.allow_unlisted(), |sparse| sparse.operation.agent().allow_unlisted),
+                    );
+                    if let (None, crate::agent_management::AgentOperation::Online { cutex_session_id, allow_unlisted }
+                        | crate::agent_management::AgentOperation::Restart { cutex_session_id, allow_unlisted }) = (&sparse, &payload.operation)
+                    {
+                        if let Err(refusal) = crate::profiles::model_check::check_runtime_start(cutex_session_id.as_str(), *allow_unlisted) {
+                            return write_control_response(stream, &mut timing,
+                                &serde_json::to_value(agent_management_no_write(
+                                    payload.action_id.clone(),
+                                    "invalid_model",
+                                    &bounded_detail(refusal),
+                                ))?,
+                            );
+                        }
+                    }
                     // Sparse: resolve, authorize and bind the resolution to
                     // the action id first (R2), so the launch policy and its
                     // approval gate see the frozen first resolution (R4).
@@ -909,9 +980,9 @@ pub fn handle_agent_bus_request(
                                     refusal.code,
                                     &bounded_detail(refusal.detail),
                                 );
-                                return write_control_response(stream, &mut timing,
-                                    &serde_json::to_value(response)?,
-                                );
+                                let mut response = serde_json::to_value(response)?;
+                                crate::agent_management::attach_name_hint(&mut response, &sparse.operation.agent().name);
+                                return write_control_response(stream, &mut timing, &response);
                             }
                         },
                         None => payload,
@@ -942,8 +1013,26 @@ pub fn handle_agent_bus_request(
                         )
                     });
                     let Some(sparse_sha256) = sparse_sha256 else {
+                        let online = match &payload.operation {
+                            crate::agent_management::AgentOperation::Online { cutex_session_id, .. } => Some(cutex_session_id.clone()),
+                            _ => None,
+                        };
+                        let resume_as = invocation.clone();
                         let mut response = (handlers.agent_management)(state, invocation, payload)?;
+                        crate::profiles::model_check::attach_warning(&mut response);
                         attach_launch_approval_note(&mut response, approval_note);
+                        // r276: the creator starting an agent whose create never
+                        // finished (runtime start failed) finishes that create too,
+                        // so its task is delivered.
+                        if let Some(agent) = online.filter(|_| response["outcome"]["status"] == "complete") {
+                            let resumed = crate::agent_bus::mcp::action_receipts::dispatch::resume_unfinished_create(
+                                state, &resume_as, &agent, handlers,
+                                |invocation, payload| agent_launch_policy_refusal(invocation, payload, None, &mut None)
+                                    .map(|response| serde_json::to_value(response).expect("serializable policy response")));
+                            if let (Some(resumed), Some(result)) = (resumed, response.pointer_mut("/outcome/receipt/result").filter(|result| result.is_object())) {
+                                result["resumed_create"] = resumed;
+                            }
+                        }
                         return write_control_response(stream, &mut timing, &response);
                     };
                     let full_sha256 = crate::agent_management::full_sha256(&payload);
@@ -955,26 +1044,37 @@ pub fn handle_agent_bus_request(
                         .map(str::to_string);
                     let caller = invocation.caller_cutex_session.clone();
                     let action_id = payload.action_id.clone();
+                    let facade = crate::asks::tools::facade_level(
+                        request.headers.get(crate::asks::tools::FACADE_HEADER).map(String::as_str),
+                    );
+                    // r276: keep the task until it is delegated (see dispatch::create).
+                    let pending = match &delegated {
+                        Some(task) => Some(crate::agent_management::AgentManagementStore::open_default().and_then(|store| {
+                            crate::asks::create_task::remember_pending(&store, action_id.as_str(), crate::asks::create_task::PendingTask {
+                                caller: caller.as_str().to_owned(), task: task.clone(), facade,
+                                recorded_at: chrono::Utc::now().to_rfc3339() })?;
+                            Ok(store)
+                        })?),
+                        None => None,
+                    };
                     let mut response = (handlers.agent_management)(state, invocation, payload)?;
                     if let Some(task) = delegated {
-                        crate::asks::create_task::attach(
-                            &mut response,
-                            caller.as_str(),
-                            &task,
-                            action_id.as_str(),
-                            crate::asks::tools::facade_level(
-                                request
-                                    .headers
-                                    .get(crate::asks::tools::FACADE_HEADER)
-                                    .map(String::as_str),
-                            ),
-                        );
+                        crate::asks::create_task::attach(&mut response, caller.as_str(), &task, action_id.as_str(), facade);
+                    }
+                    if let Some(store) = pending {
+                        if let Err(error) = crate::asks::create_task::settle_pending(&store, action_id.as_str(), &response) {
+                            eprintln!("\x1b[33mwarning:\x1b[0m agent_create {}: pending task not cleared: {error:#}", action_id.as_str());
+                        }
                     }
                     // Design 041: why this profile was picked for "auto:<provider>".
                     crate::management::v2::profile_auto_pick::attach_to_reply(
                         &mut response,
                         action_id.as_str(),
                     );
+                    crate::profiles::model_check::attach_warning(&mut response);
+                    if let Some(sparse) = &sparse {
+                        crate::agent_management::attach_name_hint(&mut response, &sparse.operation.agent().name);
+                    }
                     // The caller binds the receipt to the request it sent.
                     if let Some(digest) = response.pointer_mut("/outcome/receipt/request_sha256") {
                         if full_sha256.is_some_and(|full| digest.as_str() == Some(full.as_str())) {
@@ -1130,6 +1230,50 @@ fn queued_management_starts(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The durable session of a sending runtime agent: its registration, else the
+/// session record whose current runtime it is.
+fn sender_session_of(state: &Arc<Mutex<AgentBusState>>, agent: &str) -> Option<String> {
+    let registered = state.lock().ok()?.agents.get(agent).and_then(|agent| agent.cutex_session_id.clone());
+    registered.or_else(|| {
+        let sessions = crate::session::store::load_cutex_session_store_shared().ok()?;
+        let record = sessions.sessions.values().find(|record| record.current_runtime_agent_id.as_deref() == Some(agent))?;
+        Some(record.cutex_session_id.clone())
+    })
+}
+
+/// 054 owner decision 2: a tell / send to a durable session without a runtime
+/// endpoint stays refused and queues nothing, but the target's ledger gets
+/// `rejected{targetUnavailable}` (surface none) naming the sender, and the
+/// caller gets the reason code and that record's id. `None`: another error,
+/// or the ledger is off (the r273.1 refusal is unchanged then).
+pub(crate) fn tell_target_unavailable(
+    error: &anyhow::Error,
+    sender: &str,
+    message_id: &str,
+    text: &str,
+    wake: bool,
+) -> Option<serde_json::Value> {
+    if !crate::management::v2::agent_bus_state::input_ledger_active() {
+        return None;
+    }
+    let target = error.downcast_ref::<AgentTargetResolutionError>()?;
+    if target.code() != AgentTargetResolutionCode::TargetUnavailable {
+        return None;
+    }
+    let session = target.target_cutex_session_id()?;
+    let sessions = crate::session::store::load_cutex_session_store_shared().ok();
+    let name = crate::management::v2::agent_bus_state::AgentParty::of_session(sessions.as_deref(), sender).name;
+    let id = crate::management::v2::agent_bus_state::input_ledger_tell_refused(session, message_id, sender, name.as_deref(), text, wake)?;
+    Some(serde_json::json!({
+        "ok": false,
+        "status": "no_write",
+        "code": target.code().label(),
+        "reasonCode": "targetUnavailable",
+        "messageId": id,
+        "message": format!("{target}: the agent is offline; nothing was queued"),
+    }))
 }
 
 fn write_agent_target_resolution_error(
@@ -1357,6 +1501,14 @@ fn attach_launch_approval_note(response: &mut serde_json::Value, note: Option<se
     }
 }
 
+/// The request digest of an agent-profile approval (one launch request).
+pub(crate) fn agent_profile_approval_digest(request: &AgentManagementRequest) -> String {
+    crate::approvals::request_digest(&serde_json::json!({
+        "project_id": request.project_id,
+        "operation": request.operation,
+    }))
+}
+
 pub(crate) fn agent_profile_approval_request(
     requester_cutex_session_id: &str,
     requester_name: Option<String>,
@@ -1483,10 +1635,7 @@ fn agent_launch_policy_refusal(
     if !needs_approval {
         return None;
     }
-    let digest = crate::approvals::request_digest(&serde_json::json!({
-        "project_id": request.project_id,
-        "operation": request.operation,
-    }));
+    let digest = agent_profile_approval_digest(request);
     let gate = crate::approvals::ApprovalStore::open_default().and_then(|store| {
         crate::approvals::gate_with_wait(
             &store,
@@ -2877,6 +3026,7 @@ mod tests {
             redrive_ordinary_messages: |_| Ok(0),
             send_payload_response: counted_unreachable_send,
             agent_management: counted_unreachable_agent_management,
+            automatic_managed_online: |_, _| anyhow::bail!("unexpected automatic online"),
             managed_archive: |_, _| panic!("unexpected managed archive"),
             job_service_completion: |_, _, _| anyhow::bail!("unreachable Job Service submit"),
             job_service_completion_query: |_, _| anyhow::bail!("unreachable Job Service query"),
@@ -2932,6 +3082,25 @@ mod tests {
 
     fn route_state() -> Arc<Mutex<AgentBusState>> {
         Arc::new(Mutex::new(AgentBusState::default()))
+    }
+
+    #[test]
+    fn automatic_managed_online_route_requires_root_and_passes_only_internal_context() {
+        let body=serde_json::json!({"ask_id":"delegation-1","target":"cutex.worker",
+            "controller":"cutex.director","reserved_at":"2026-11-05T00:00:00Z"}).to_string();
+        let mut handlers=route_test_handlers();
+        handlers.automatic_managed_online=|_,context| {
+            assert_eq!(context.ask_id,"delegation-1");
+            assert_eq!(context.controller,"cutex.director");
+            Ok(serde_json::json!({"internal":true}))
+        };
+        let path="/api/internal/asks/managed-online";
+        let call=|token:&str|invoke_route_with_handlers(
+            raw_route_request(path,token,"runtime-director",body.as_bytes()),route_state(),handlers);
+        assert!(!call("wrong").starts_with(b"HTTP/1.1 200"));
+        let agent=crate::agent_bus::agent_auth::agent_credential("route-token","runtime-director","cutex.director");
+        assert!(call(&agent).starts_with(b"HTTP/1.1 403"));
+        assert_eq!(http_json(&call("route-token"))["internal"],true);
     }
 
     #[test]
@@ -3016,7 +3185,8 @@ mod tests {
             .record
             .id
         };
-        let stuck = enqueue("runtime-withdraw-a", "stuck");
+        let complete_text = "完整消息 🦀\n".repeat(100);
+        let stuck = enqueue("runtime-withdraw-a", &complete_text);
         let kept = enqueue("runtime-withdraw-a", "kept");
         let get = |token: Option<&str>| {
             let auth = token
@@ -3042,6 +3212,18 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         // Same creation second: ordered by (random) message id.
         assert_eq!(ids, [stuck.clone(), kept.clone()].into_iter().collect());
+
+        let content_request = |credential: Option<&str>, id: &str| {
+            let auth = credential.map(|token| format!("Authorization: Bearer {token}\r\n")).unwrap_or_default();
+            format!("GET /api/messages/content?messageId={id} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n").into_bytes()
+        };
+        assert!(!invoke_route(content_request(None, &stuck), Arc::clone(&state)).starts_with(b"HTTP/1.1 200"));
+        assert!(!invoke_route(content_request(Some("wrong"), &stuck), Arc::clone(&state)).starts_with(b"HTTP/1.1 200"));
+        let full = http_json(&invoke_route(content_request(Some("route-token"), &stuck), Arc::clone(&state)));
+        assert_eq!(full["text"], complete_text);
+        let absent = http_json(&invoke_route(content_request(Some("route-token"), "missing"), Arc::clone(&state)));
+        assert!(absent["text"].is_null());
+        assert_eq!(state.lock().unwrap().messages["runtime-withdraw-a"].len(), 2, "content reads never dequeue");
 
         let body =
             serde_json::json!({"messageIds": [stuck.clone()], "reason": "owner"}).to_string();

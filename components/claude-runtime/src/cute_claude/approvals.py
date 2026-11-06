@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from .store import identifier
 from .errors import require
-from .questions import questions_wire, read_answers
+from .questions import questions_wire, read_answers, valid_no_answer
 
 MODES = {'default', 'acceptEdits', 'auto', 'bypassPermissions'}
 
@@ -140,7 +140,12 @@ class Approvals:
             return
         result = None if 'error' in message else message.get('result')
         if p.kind == 'question':
-            p.future.set_result(read_answers(result, p.questions) if result is not None else None)
+            answers = read_answers(result, p.questions) if result is not None else None
+            # A malformed answer is not a cancellation: other clients (or a
+            # corrected reply from this client) must still be able to answer.
+            if 'error' not in message and answers is None and not valid_no_answer(result, p.questions):
+                return
+            p.future.set_result(answers)
         elif p.kind in {'command', 'fileChange'}:
             p.future.set_result(decision_of(result, p.rules))
         else:

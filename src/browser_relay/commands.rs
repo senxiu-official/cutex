@@ -60,6 +60,9 @@ impl AgentCommand {
 #[serde(deny_unknown_fields)]
 pub struct DeviceError {
     pub code: String,
+    /// browser-error-detail-v1; shape-checked before it is kept.
+    #[serde(default)]
+    pub detail: Option<Value>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -183,11 +186,16 @@ pub(crate) struct Command {
     pub dispatched: bool,
     pub ended: Option<Instant>,
     pub code: Option<RelayError>,
+    /// The desktop's checked failure detail, kept only with its own code.
+    pub detail: Option<Value>,
     pub body: Option<Cached>,
     pub claim: Option<crate::management::v2::request_idempotency::RequestClaim>,
     pub late_results: u64,
     pub open_lease: Option<String>,
     pub started: Instant,
+    pub abort_cause: Option<&'static str>,
+    pub dispatched_at: Option<Instant>,
+    pub running_at: Option<Instant>,
     retention_limit: usize,
 }
 #[derive(Clone)]
@@ -197,6 +205,7 @@ pub struct Receipt {
     pub dispatched: bool,
     pub operation_kind: String,
     pub code: Option<RelayError>,
+    pub detail: Option<Value>,
     pub content: Option<Arc<super::retained::Body>>,
     pub claim: Option<crate::management::v2::request_idempotency::RequestClaim>,
 }
@@ -313,22 +322,10 @@ impl Relay {
             };
         }
         prune_metadata(&mut state);
-        if state.requests.len() >= MAX_METADATA
-            || state
-                .requests
-                .values()
-                .filter(|r| !r.status.terminal())
-                .count()
-                >= MAX_REQUESTS
-            || state
-                .requests
-                .values()
-                .filter(|r| {
-                    r.target.device_id == admission.plan.target.device_id && !r.status.terminal()
-                })
-                .count()
-                >= MAX_DEVICE_REQUESTS
-        {
+        let active = state.requests.values().filter(|r| !r.status.terminal()).count();
+        let device_active = state.requests.values().filter(|r| r.target.device_id == admission.plan.target.device_id && !r.status.terminal()).count();
+        if let Some(cause) = admission_busy_cause(state.requests.len(), active, device_active) {
+            super::audit::record(admission_busy_record(&admission, cause));
             return Err(RelayError::new("busy"));
         }
         let device = state
@@ -385,9 +382,20 @@ impl Relay {
             .as_ref()
             .unwrap()
             .try_send(marker)
-            .map_err(|_| RelayError::new("busy"))?;
+            .map_err(|error| {
+                let cause = match error {
+                    std::sync::mpsc::TrySendError::Full(_) => "dispatch_queue_full",
+                    std::sync::mpsc::TrySendError::Disconnected(_) => "dispatch_queue_disconnected",
+                };
+                super::audit::record(admission_busy_record(&admission, cause));
+                RelayError::new("busy")
+            })?;
         if let Some(id) = &admission.plan.lease_id {
-            state.leases.get_mut(id).unwrap().touched = now;
+            let lease = state.leases.get_mut(id).unwrap();
+            lease.touched = now;
+            if admission.purpose == "agent" {
+                lease.agent_used = now;
+            }
         }
         let key = admission.key.clone();
         let mutating = has_side_effects(&admission.plan.operation);
@@ -412,11 +420,15 @@ impl Relay {
                 dispatched: false,
                 ended: None,
                 code: None,
+                detail: None,
                 body: None,
                 claim: admission.claim,
                 late_results: 0,
                 open_lease: None,
                 started: now,
+                abort_cause: None,
+                dispatched_at: None,
+                running_at: None,
                 retention_limit,
             },
         );
@@ -483,6 +495,7 @@ impl Relay {
         }
         request.status = Status::Dispatched;
         request.dispatched = true;
+        request.dispatched_at = Some(Instant::now());
         let mut fields = json!({"requestId":request.request_id,"dispatchSeq":request.sequence,"remainingMs":remaining.as_millis() as u64,
             "cutexSessionId":request.authority.agent.session,"turnId":request.authority.agent.turn,"target":request.target,"title":request.title,"operation":request.operation,"purpose":request.purpose});
         if let Some(id) = &request.lease_id {
@@ -541,6 +554,7 @@ impl Relay {
             if !result.status.terminal() {
                 if result.status == Status::Running {
                     request.status = Status::Running;
+                    request.running_at.get_or_insert_with(Instant::now);
                 }
                 return Ok(false);
             }
@@ -586,6 +600,12 @@ impl Relay {
         let mutating = request.mutating;
         let mut status = result.status;
         let mut code = result.error.as_ref().map(|e| RelayError::provider(&e.code));
+        let device_code = code;
+        let detail = result
+            .error
+            .as_ref()
+            .and_then(|e| e.detail.as_ref())
+            .and_then(crate::agent_bus::mcp_browser::failure_details);
         let mut valid_projection = None;
         if let Some(projected) = projection {
             match projected {
@@ -634,6 +654,10 @@ impl Relay {
                                     lease.refs.clear();
                                 }
                                 lease.page_generation = projected.page_generation;
+                                // browser_list shows where the tab is now, not where it was granted.
+                                if let Some(url) = projected.url.as_ref().filter(|u| !u.is_empty()) {
+                                    lease.view.url = url.clone();
+                                }
                             }
                         }
                         if status == Status::Succeeded {
@@ -691,6 +715,9 @@ impl Relay {
         }
         let request = state.requests.get_mut(&key).unwrap();
         request.retention_limit = settings.image_retain_bytes as usize;
+        if !request.status.terminal() && code.is_some() && code == device_code {
+            request.detail = detail;
+        }
         finish(request, status, code, valid_projection);
         let rejected_open = if status != Status::Succeeded {
             request.open_lease.clone()
@@ -731,6 +758,7 @@ impl Relay {
             dispatched: request.dispatched,
             operation_kind: request.operation_kind.clone(),
             code: request.code,
+            detail: request.detail.clone(),
             content: request.body.as_ref().map(|b| Arc::clone(&b.value)),
             claim: request.claim.clone(),
         })
@@ -810,6 +838,22 @@ fn cancel_locked(state: &mut State, key: &str, code: &'static str) {
         state::revoke_lease(state, &id, "lease_revoked");
     }
 }
+fn admission_busy_cause(metadata: usize, active: usize, device_active: usize) -> Option<&'static str> {
+    if metadata >= MAX_METADATA { Some("metadata_capacity") }
+    else if active >= MAX_REQUESTS { Some("global_request_capacity") }
+    else if device_active >= MAX_DEVICE_REQUESTS { Some("device_request_capacity") }
+    else { None }
+}
+fn admission_busy_record(admission: &Admission, cause: &'static str) -> super::audit::Record {
+    super::audit::Record {
+        time: chrono::Utc::now(), request_id: admission.request_id.clone(),
+        device_id: admission.plan.target.device_id.clone(), generation: admission.plan.generation.clone(),
+        lease_id: admission.plan.lease_id.clone(), operation_kind: "admission".into(),
+        status: Status::Failed, error: Some("busy"), duration_ms: 0, bytes: 0,
+        late_result: 0, dropped: 0, cleanup: None, abort_cause: None,
+        dispatch_ms: None, running_ms: None, busy_cause: Some(cause),
+    }
+}
 fn finish(
     request: &mut Command,
     status: Status,
@@ -849,7 +893,10 @@ fn finish(
     audit(request);
 }
 fn audit(request: &Command) {
-    super::audit::record(super::audit::Record {
+    super::audit::record(audit_record(request));
+}
+fn audit_record(request: &Command) -> super::audit::Record {
+    super::audit::Record {
         time: chrono::Utc::now(),
         request_id: request.request_id.clone(),
         device_id: request.target.device_id.clone(),
@@ -866,13 +913,18 @@ fn audit(request: &Command) {
         late_result: request.late_results,
         dropped: 0,
         cleanup: None,
-    });
+        busy_cause: None,
+        abort_cause: request.abort_cause,
+        dispatch_ms: request.dispatched_at.map(|at| at.duration_since(request.started).as_millis() as u64),
+        running_ms: request.running_at.map(|at| at.duration_since(request.started).as_millis() as u64),
+    }
 }
 fn abort(request: &mut Command, code: &'static str) {
     if request.status.terminal() {
         return;
     }
     let unknown = request.status.sent() && request.mutating;
+    request.abort_cause = Some(code);
     finish(
         request,
         if unknown {
@@ -969,6 +1021,21 @@ pub(crate) fn sweep_commands(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_busy_admission_causes_are_distinct_and_metadata_only() {
+        use super::*;
+        assert_eq!(admission_busy_cause(MAX_METADATA, 0, 0), Some("metadata_capacity"));
+        assert_eq!(admission_busy_cause(0, MAX_REQUESTS, 0), Some("global_request_capacity"));
+        assert_eq!(admission_busy_cause(0, 0, MAX_DEVICE_REQUESTS), Some("device_request_capacity"));
+        assert_eq!(admission_busy_cause(0, 0, 0), None);
+        let f = Fixture::new();
+        let admission = f.admission("busy", serde_json::json!({"kind":"tabs.open","url":"https://user:SECRET@example.com"}));
+        let record = serde_json::to_value(admission_busy_record(&admission, "dispatch_queue_full")).unwrap();
+        assert_eq!(record["busyCause"], "dispatch_queue_full");
+        assert!(!record.to_string().contains("SECRET"));
+        assert!(record.get("url").is_none());
+    }
+
     use super::super::state::{DesktopIdentity, DeviceStream};
     use super::*;
     struct Fixture {
@@ -1323,6 +1390,18 @@ mod tests {
             Status::OutcomeUnknown
         );
         assert!(!f.relay.state.lock().unwrap().leases.contains_key(&f.lease));
+        {
+            let state = f.relay.state.lock().unwrap();
+            let request = state.requests.get("open").unwrap();
+            assert_eq!(request.abort_cause, Some("deadline_exceeded"));
+            assert!(request.dispatched_at.unwrap() >= request.started);
+            assert!(request.ended.unwrap() >= request.dispatched_at.unwrap());
+            let record = serde_json::to_value(audit_record(request)).unwrap();
+            assert_eq!(record["abortCause"], "deadline_exceeded");
+            assert_eq!(record["error"], "outcome_unknown");
+            assert!(record["dispatchMs"].is_u64());
+            assert!(record.get("url").is_none());
+        }
         let cancel = f.stream.receiver.recv().unwrap();
         assert_eq!(cancel["kind"], "cancel");
         assert_eq!(f.stream.receiver.recv().unwrap()["kind"], "lease-revoked");

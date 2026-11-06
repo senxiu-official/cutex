@@ -78,10 +78,10 @@ impl AgentManagementProvider {
         expected: &ExplicitLaunchContract,
         restore: &ExplicitLaunchContract,
     ) -> anyhow::Result<RuntimePackageRevertReceipt> {
-        let _execution = provider_execution_lock()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("execution lock unavailable"))?;
-        let _mutation = self.store().lock_mutations()?;
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+        // r271 (051 §2): fence-first when the owner route opted in.
+        let lane = super::fence_first::fence_first_session_lane(Some(id.as_str()))?;
+        let _locks = self.entry_locks(lane.as_deref(), true, "runtime package revert")?;
         revert_locked(path, id, expected, restore, |candidate, sessions| {
             let state = self_runtime_guard_state(self)?;
             package_upgrade_subject(candidate, &state)?;
@@ -98,7 +98,9 @@ impl AgentManagementProvider {
         path: &Path,
         id: &CutexSessionId,
     ) -> anyhow::Result<RuntimePackageUpgradeReview> {
-        let _mutation = self.store().lock_mutations()?;
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+        // r271.1: only tries the fence when the caller holds a lane.
+        let _locks = self.fence_locks("runtime package review")?;
         let state = self.store().snapshot()?;
         let sessions = crate::session::store::load_cutex_session_store_from_path(path)?;
         let record = sessions
@@ -116,10 +118,10 @@ impl AgentManagementProvider {
         action_id: &AgentActionId,
         review: &RuntimePackageUpgradeReview,
     ) -> anyhow::Result<RuntimePackageUpgradeReceipt> {
-        let _execution = provider_execution_lock()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("execution lock unavailable"))?;
-        let _mutation = self.store().lock_mutations()?;
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+        // r271 (051 §2): fence-first when the owner route opted in.
+        let lane = super::fence_first::fence_first_session_lane(Some(review.subject.cutex_session_id.as_str()))?;
+        let _locks = self.entry_locks(lane.as_deref(), true, "runtime package upgrade")?;
         crate::session::store::with_locked_session_store(path, |sessions| {
             let record = sessions
                 .sessions

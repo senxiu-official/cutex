@@ -17,13 +17,18 @@ use crate::session::model::CutexSessionStore;
 mod rows;
 mod sqlite;
 
+pub use sqlite::indexed::{
+    changes_at as session_changes_at, get_at as shared_session_row_at, has_prepared_launch_at,
+    host_page_at as host_session_page_at, host_row_at as host_session_row_at, page_at as session_page_at, SessionChange,
+    SessionChanges, SessionPage, SessionFilter, SessionRepository,
+};
 pub use rows::compare_and_swap_session_row;
 pub use rows::load_session_row;
+pub(crate) use rows::update_receipt_row;
 pub use rows::update_session_row;
 pub use rows::with_locked_session_rows;
 pub use rows::SessionRowConflict;
 pub use rows::SessionRows;
-pub(crate) use rows::update_receipt_row;
 // Every receipt map, for row-level writers (not all have one yet).
 #[allow(unused_imports)]
 pub(crate) use rows::{
@@ -70,9 +75,60 @@ pub fn session_database_path(path: &Path) -> PathBuf {
     sqlite::database_path(path)
 }
 
-/// The default store at its latest revision. Returns an owned copy: callers
-/// that only read should use [`load_cutex_session_store_shared`] or
-/// [`with_cutex_session_store`], which do not copy the whole store.
+pub use sqlite::name_ledger::PendingRenameNote;
+
+/// Authority and session-lane fences must already be held by the provider.
+pub(crate) fn rename_formal_name_at(
+    path: &Path, session_id: &str, request: &crate::agent_names::RenameRequest,
+    scope: &crate::agent_names::NameScope, director: Option<&str>, actor: &str,
+) -> anyhow::Result<crate::agent_names::RenameCommit> {
+    with_session_store_lock(path, || sqlite::name_ledger::rename_locked(path,session_id,request,scope,director,actor))
+}
+
+pub(crate) fn formal_name_replay_at(path: &Path, session_id: &str, request: &crate::agent_names::RenameRequest)
+    -> anyhow::Result<Option<crate::agent_names::RenameCommit>> {
+    sqlite::name_ledger::replay_at(path,session_id,request)
+}
+
+pub fn formal_name_history_at(path: &Path, session_id: &str, before: Option<u64>, limit: usize)
+    -> anyhow::Result<crate::agent_names::NameHistoryPage> {
+    sqlite::name_ledger::history_at(path,session_id,before,limit)
+}
+
+pub fn formal_name_claims_at(path: &Path, scope: Option<&crate::agent_names::NameScope>, name: &str)
+    -> anyhow::Result<(u64,Vec<crate::agent_names::NameClaim>)> {
+    sqlite::name_ledger::claims_at(path,scope,name)
+}
+
+pub fn assert_formal_name_available_at(path: &Path, scope: &crate::agent_names::NameScope, name: &str, own: Option<&str>)
+    -> anyhow::Result<()> {
+    sqlite::name_ledger::available_at(path,scope,name,own)
+}
+
+pub fn pending_rename_notes_at(path: &Path, limit: usize) -> anyhow::Result<Vec<PendingRenameNote>> {
+    sqlite::name_ledger::pending_at(path,limit)
+}
+
+pub fn rename_note_at(path:&Path,event:&str,recipient:&str)->anyhow::Result<Option<PendingRenameNote>> {
+    sqlite::name_ledger::note_at(path,event,recipient)
+}
+
+pub fn pending_rename_notes_for_at(path:&Path,recipients:&[String],limit:usize)->anyhow::Result<Vec<PendingRenameNote>> {
+    sqlite::name_ledger::pending_for_at(path,recipients,limit)
+}
+
+pub fn mark_rename_note_delivered_at(path: &Path, event: &str, recipient: &str) -> anyhow::Result<()> {
+    sqlite::name_ledger::delivered_at(path,event,recipient)
+}
+
+#[cfg(test)]
+pub(crate) fn close_session_store(path: &Path) {
+    sqlite::drop_pooled(&sqlite::database_path(path));
+}
+
+/// Legacy logical view with structurally shared maps and individually shared
+/// rows. Hot readers use [`shared_session_row`] or [`session_page_at`], which
+/// avoid initializing a complete compatibility snapshot or reading receipts.
 pub fn load_cutex_session_store() -> anyhow::Result<CutexSessionStore> {
     with_cutex_session_store(|store| {
         note_whole_store_copy();
@@ -116,13 +172,19 @@ pub fn load_cutex_session_store_shared() -> anyhow::Result<Arc<CutexSessionStore
     sqlite::shared(&cutex_sessions_path()?)
 }
 
+/// [`load_cutex_session_store_shared`] for an explicit store path.
+pub(crate) fn load_cutex_session_store_shared_at(path: &Path) -> anyhow::Result<Arc<CutexSessionStore>> {
+    sqlite::shared(path)
+}
+
 /// Runs `read` on the default store without copying it. Each process keeps
 /// one snapshot per database and brings it up to date by parsing only the
 /// rows written since (every commit stamps its rows with the new store
 /// revision); an unchanged store costs one small query. `read` runs on a
 /// shared snapshot outside every lock, so nested reads and writes from
 /// inside `read` are fine.
-pub fn with_cutex_session_store<T>(read: impl FnOnce(&CutexSessionStore) -> T) -> anyhow::Result<T> {
+pub fn with_cutex_session_store<T>(read: impl FnOnce(&CutexSessionStore) -> T,
+) -> anyhow::Result<T> {
     let path = cutex_sessions_path()?;
     with_cutex_session_store_at(&path, read)
 }
@@ -137,13 +199,52 @@ pub(crate) fn with_cutex_session_store_at<T>(
     Ok(read(&store))
 }
 
-/// One record of the store at `path` (key lookup on the shared snapshot,
-/// copying only that record).
+/// One record of the store at `path` (indexed SQL lookup, copying only that row).
 pub(crate) fn session_record_at(
     path: &Path,
     key: &str,
 ) -> anyhow::Result<Option<crate::session::model::CutexSessionRecord>> {
-    with_cutex_session_store_at(path, |store| store.sessions.get(key).cloned())
+    shared_session_row_at(path, key).map(|record| record.map(|record| (*record).clone()))
+}
+
+pub fn shared_session_row(
+    key: &str,
+) -> anyhow::Result<Option<Arc<crate::session::model::CutexSessionRecord>>> {
+    shared_session_row_at(&cutex_sessions_path()?, key)
+}
+
+pub fn owned_session_by_native(
+    native: &str,
+) -> anyhow::Result<Option<Arc<crate::session::model::CutexSessionRecord>>> {
+    sqlite::indexed::owned_by_native_at(&cutex_sessions_path()?, native)
+}
+
+/// Compatibility list routes need all rows in their requested lifecycle, but
+/// never receipts or the opposite lifecycle. New consumers use session_page_at.
+pub fn session_catalog(retired: bool) -> anyhow::Result<CutexSessionStore> {
+    let path = cutex_sessions_path()?;
+    let mut store = CutexSessionStore::default();
+    let mut cursor = None;
+    loop {
+        let Some(page) = session_page_at(
+            &path,
+            retired,
+            cursor.as_deref(),
+            crate::store::PageBudget::LIST_DEFAULT,
+        )?
+        else {
+            break;
+        };
+        for record in page.rows {
+            store
+                .sessions.insert_shared(record.cutex_session_id.clone(), record);
+        }
+        cursor = page.next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(store)
 }
 
 #[track_caller]
@@ -426,7 +527,8 @@ mod tests {
             )
             .unwrap();
         connection
-            .execute("UPDATE meta SET value = '2' WHERE key = 'store_revision'", [])
+            .execute("UPDATE meta SET value = '2' WHERE key = 'store_revision'", [],
+            )
             .unwrap();
         drop(connection);
         assert_eq!(names(&path), vec!["cutex.a".to_string(), "cutex.b".to_string()]);
@@ -434,7 +536,8 @@ mod tests {
         let connection = rusqlite::Connection::open(session_database_path(&path)).unwrap();
         connection.execute("DELETE FROM sessions WHERE key = 'cutex.a'", []).unwrap();
         connection
-            .execute("UPDATE meta SET value = '3' WHERE key = 'store_revision'", [])
+            .execute("UPDATE meta SET value = '3' WHERE key = 'store_revision'", [],
+            )
             .unwrap();
         drop(connection);
         assert_eq!(names(&path), vec!["cutex.b".to_string()]);
@@ -484,9 +587,7 @@ mod tests {
         }
         assert_eq!(sqlite::FULL_READS.with(|count| count.get()), full_reads);
         // A read inside a read (same thread) does not deadlock.
-        let nested = with_cutex_session_store_at(&path, |outer| {
-            (outer.sessions.len(), count(&path))
-        })
+        let nested = with_cutex_session_store_at(&path, |outer| (outer.sessions.len(), count(&path)))
         .unwrap();
         assert_eq!(nested, (1, 1));
         // A write inside a read neither deadlocks nor leaves a stale entry.
@@ -577,7 +678,8 @@ mod tests {
             assert_eq!(reread.store_revision.get(), 42);
             let connection = rusqlite::Connection::open(session_database_path(&path)).unwrap();
             let row: String = connection
-                .query_row("SELECT record_json FROM sessions WHERE key = 'cutex.b'", [], |row| row.get(0))
+                .query_row("SELECT record_json FROM sessions WHERE key = 'cutex.b'", [], |row| row.get(0),
+                )
                 .unwrap();
             assert!(!row.contains('\n'), "compact rows");
             assert_eq!(

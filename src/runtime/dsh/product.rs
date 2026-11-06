@@ -23,6 +23,11 @@ pub fn deployment_path() -> anyhow::Result<PathBuf> {
 
 impl DshDeployment {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if crate::components::dsh_runtime::validate_external_deployment(
+            "dsh-runtime", &self.node, &self.adapter, &self.dsh_cli, &self.install_root, &self.version, None,
+        )? {
+            return Ok(());
+        }
         ensure!(self.version == PINNED_DSH_VERSION, "DSH deployment must pin {PINNED_DSH_VERSION}");
         for path in [&self.node, &self.adapter, &self.dsh_cli] {
             ensure!(path.is_absolute() && path.is_file(), "DSH deployment runtime file missing: {}", path.display());
@@ -36,6 +41,7 @@ impl DshDeployment {
         Ok(())
     }
     pub fn install(&self) -> anyhow::Result<()> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         self.validate()?;
         crate::config::atomic::write_private_pretty_json_atomic(&deployment_path()?, self, "DSH deployment")
     }
@@ -95,6 +101,7 @@ pub struct DshCreateOverrides {
 }
 
 pub fn create_profile_variant_with(name: &str, cwd: &Path, profile: Option<String>, variant: Option<&str>, managed: bool, created_by: Option<crate::session::model::SessionCreatedBy>, overrides: DshCreateOverrides) -> anyhow::Result<CutexSessionRecord> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     ensure!(!name.trim().is_empty() && name.trim() == name && name.chars().count() <= 128 && !name.chars().any(char::is_control), "valid DSH agent name required");
     ensure!(cwd.is_absolute() && cwd.is_dir(), "absolute DSH working directory required");
     let deployment = DshDeployment::selected()?;
@@ -221,12 +228,18 @@ pub fn dsh_project_instruction_files(cwd: &Path) -> Vec<PathBuf> {
 /// `# Memory`. Project AGENTS.md / CLAUDE.md are DSH's own (not repeated).
 /// Returns the text (if any) and every instruction source the agent gets.
 pub fn instructions(record: &CutexSessionRecord) -> (Option<String>, Vec<PathBuf>) {
+    let (text, sources, _) = instructions_with_snapshot(record);
+    (text, sources)
+}
+
+fn instructions_with_snapshot(record: &CutexSessionRecord) -> (Option<String>, Vec<PathBuf>, Option<crate::memory::idle_note::Snapshot>) {
     let cwd = Path::new(&record.cwd);
     let memory = crate::memory::launch_memory_context_or_warn(&record.cutex_session_id);
     let root = memory.as_ref().map(|memory| memory.file_reference_root(cwd)).unwrap_or(cwd);
     let user = crate::memory::harness::user_agents_md();
     let mut sources = user.as_ref().map(|user| user.files.clone()).unwrap_or_default();
     sources.extend(dsh_project_instruction_files(cwd));
+    let snapshot = memory.as_ref().and_then(|memory| memory.index_snapshot.clone());
     let sections = crate::memory::harness::compose_claude_sections(
         crate::memory::harness::launch_harness(record),
         user,
@@ -236,7 +249,7 @@ pub fn instructions(record: &CutexSessionRecord) -> (Option<String>, Vec<PathBuf
         DSH_INSTRUCTIONS_MAX_BYTES,
     );
     let text = crate::memory::harness::join_sections(&sections);
-    ((!text.trim().is_empty()).then_some(text), sources)
+    ((!text.trim().is_empty()).then_some(text), sources, snapshot)
 }
 
 /// Owned configuration only; no key value is ever interpolated into this file.
@@ -263,7 +276,7 @@ pub(super) fn write_patch(record: &CutexSessionRecord) -> anyhow::Result<Vec<Pat
     // The plugin also adds cutex's instructions as one literal system-prompt
     // section (read from a private file: no template escaping, no size cap
     // of a command line).
-    let (instructions, sources) = instructions(record);
+    let (instructions, sources, snapshot) = instructions_with_snapshot(record);
     let instructions_file = session.state_dir.join("cutex-instructions.md");
     if let Some(plugin) = cutex_plugin(session) {
         let plugin = serde_json::to_string(&plugin.to_string_lossy().replace('\\', "/"))?;
@@ -276,6 +289,7 @@ pub(super) fn write_patch(record: &CutexSessionRecord) -> anyhow::Result<Vec<Pat
         }
     }
     crate::config::atomic::write_private_bytes_atomic(&session.patch, text.as_bytes())?;
+    crate::memory::idle_note::launched(&record.cutex_session_id, snapshot.filter(|_| cutex_plugin(session).is_some()), false);
     Ok(sources)
 }
 

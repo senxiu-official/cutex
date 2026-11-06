@@ -202,7 +202,8 @@ fn login_api_key(
     let id = Uuid::new_v4().to_string();
     let mut account = StoredAccount {
         options: Default::default(),
-        browser_tools: false,
+        browser_tools: cutex::profiles::model::browser_tools_default(),
+        browser_tool_surface: Default::default(),
         search_tool: false,
         quota_reader: None,
         private_chatgpt_auth_file: false,

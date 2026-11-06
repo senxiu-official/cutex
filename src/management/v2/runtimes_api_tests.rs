@@ -9,6 +9,32 @@ const SHA_R50: &str = "cff0b90dc1a2aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const SHA_R49: &str = "b49b49b49b49bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const SHA_DEV: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
+#[test]
+fn scratch_registry_and_old_pins_remain_visible_after_managed_selection() {
+    let root=std::env::temp_dir().join(format!("managed-view-{}",uuid::Uuid::new_v4()));
+    let managed_root=root.join("runtime/native");
+    let old=root.join("agent-tmp/Kittiwake/native-r58/codex-app-server").to_string_lossy().into_owned();
+    let new=managed_root.join("0.164.0-hash/codex-app-server").to_string_lossy().into_owned();
+    let mut registry=registry();
+    registry.runtime_paths.clear();
+    registry.runtime_paths.insert(old.clone(),registry.runtime_artifacts[SHA_R50].clone());
+    registry.runtime_paths.insert(new.clone(),registry.runtime_artifacts[SHA_R50].clone());
+    let before=registry.clone();
+    let mut sessions=CutexSessionStore::default();
+    sessions.sessions.insert("old".into(),pinned("old","external","/old-bundle"));
+    sessions.sessions.insert("new".into(),pinned("new","managed","/new-bundle"));
+    let read=|path:&Path|Some(PinnedExecutable{sha256:SHA_R50.into(),path:if path==Path::new("/old-bundle"){old.clone()}else{new.clone()}});
+    let built=build(&Inputs{sessions:&sessions,registry:Some(&registry),
+        selected_native:Some(PinnedExecutable{sha256:SHA_R50.into(),path:new.clone()}),
+        selected_claude_adapter:None,read_manifest:&read,exists:&|_|true,managed_native_root:Some(&managed_root)});
+    let entry=built.native.iter().find(|e|e.selected).unwrap();
+    assert_eq!(entry.selected_managed,Some(true));
+    assert_eq!(entry.external_agent_count,1);assert_eq!(entry.managed_agent_count,1);
+    assert_eq!(entry.agents.iter().find(|a|a.cutex_session_id=="old").unwrap().external_runtime_path,Some(true));
+    assert_eq!(entry.agents.iter().find(|a|a.cutex_session_id=="new").unwrap().external_runtime_path,Some(false));
+    assert_eq!(registry,before);assert!(!root.exists(),"status must not create the managed cache");
+}
+
 fn record(id: &str, name: &str) -> CutexSessionRecord {
     let mut record = CutexSessionRecord::new_at(
         id.into(),
@@ -67,6 +93,77 @@ fn registry() -> NativeVersionRegistry {
     .unwrap()
 }
 
+#[test]
+fn selected_native_version_requires_its_exact_sha() {
+    let sessions = CutexSessionStore::default();
+    let registry = registry();
+    let exists = |_: &str| true;
+    // The selected binary may be older or newer than registry.latest_runtime.
+    // Neither its path nor the latest record identifies these bytes.
+    for (sha, expected) in [(SHA_R49, Some("0.160.0-r49")), (SHA_DEV, None)] {
+        let built = build(&Inputs {
+        managed_native_root: None,
+            sessions: &sessions, registry: Some(&registry),
+            selected_native: Some(PinnedExecutable { sha256: sha.into(), path: "D:/Apps/r58/codex.exe".into() }),
+            selected_claude_adapter: None, read_manifest: &manifests, exists: &exists,
+        });
+        let selected: Vec<_> = built.native.iter().filter(|entry| entry.selected).collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].version.as_deref(), expected);
+        assert_eq!(selected[0].sha256_prefix.as_deref(), Some(&sha[..12]));
+        assert!(!selected[0].latest);
+        let summary = summary_from(&built);
+        assert_eq!(summary["native"]["selected"], json!(expected));
+        assert_eq!(summary["native"]["selectedSha256Prefix"], &sha[..12]);
+        assert_eq!(summary["native"]["latest"], "0.160.0-r50");
+        assert_host_summary_schema(summary);
+    }
+}
+
+#[test]
+fn missing_registry_keeps_selected_sha_unknown() {
+    let sessions = CutexSessionStore::default();
+    let built = build(&Inputs {
+        managed_native_root: None,
+        sessions: &sessions, registry: None,
+        selected_native: Some(PinnedExecutable { sha256: SHA_R50.into(), path: "D:/Apps/r50/codex.exe".into() }),
+        selected_claude_adapter: None, read_manifest: &manifests, exists: &|_| true,
+    });
+    assert_eq!(built.native.len(), 1);
+    assert!(built.native[0].selected);
+    assert!(built.native[0].version.is_none());
+    let summary = summary_from(&built);
+    assert!(summary["native"]["selected"].is_null());
+    assert!(summary["native"]["latest"].is_null());
+    assert_eq!(summary["native"]["selectedSha256Prefix"], &SHA_R50[..12]);
+    assert_host_summary_schema(summary);
+}
+
+fn assert_host_summary_schema(summary: serde_json::Value) {
+    let value = json!({
+        "schema": "cutex/host/v1", "hostId": "host-a", "instanceId": "ci-test",
+        "platform": "windows", "arch": "x86_64", "osVersion": null,
+        "cutexBuild": crate::build_info::build_json(), "runtimes": summary,
+    });
+    crate::management::v2::schema_export::assert_valid("host", "host", &value);
+}
+
+#[test]
+fn absent_selected_deployment_does_not_select_latest_registry_entry() {
+    let sessions = CutexSessionStore::default();
+    let registry = registry();
+    let built = build(&Inputs {
+        managed_native_root: None,
+        sessions: &sessions, registry: Some(&registry), selected_native: None,
+        selected_claude_adapter: None, read_manifest: &manifests, exists: &|_| true,
+    });
+    assert!(built.native.iter().all(|entry| !entry.selected));
+    let summary = summary_from(&built);
+    assert!(summary["native"]["selected"].is_null());
+    assert!(summary["native"]["selectedSha256Prefix"].is_null());
+    assert_eq!(summary["native"]["latest"], "0.160.0-r50");
+}
+
 fn manifests(path: &Path) -> Option<PinnedExecutable> {
     let path = path.to_string_lossy();
     let (sha, exe) = if path.contains("r216") {
@@ -103,6 +200,7 @@ fn runtimes_group_agents_by_native_version_and_claude_runtime() {
     let registry = registry();
     let exists = |path: &str| !path.contains("native-r49");
     let built = build(&Inputs {
+        managed_native_root: None,
         sessions: &sessions,
         registry: Some(&registry),
         selected_native: Some(PinnedExecutable {
@@ -123,10 +221,11 @@ fn runtimes_group_agents_by_native_version_and_claude_runtime() {
     assert_eq!(native[0]["selected"], true);
     assert_eq!(native[0]["latest"], true);
     assert_eq!(native[0]["missing"], false);
-    assert_eq!(native[0]["agentCount"], 2);
+    assert_eq!(native[0]["agentCount"], 3);
     assert_eq!(
         native[0]["agents"],
-        json!([{"cutexSessionId": "cutex.a", "name": "Alpha"}, {"cutexSessionId": "cutex.c", "name": "Gamma"}])
+        json!([{"cutexSessionId": "cutex.a", "name": "Alpha"}, {"cutexSessionId": "cutex.c", "name": "Gamma"},
+            {"cutexSessionId": "cutex.z", "name": "Retired"}])
     );
     assert_eq!(native[1]["release"], "r49");
     assert_eq!(native[1]["selected"], false);
@@ -160,13 +259,22 @@ fn runtimes_group_agents_by_native_version_and_claude_runtime() {
     let summary = summary_from(&built);
     assert_eq!(summary["native"]["selected"], "0.160.0-r50");
     assert_eq!(summary["native"]["latest"], "0.160.0-r50");
-    assert_eq!(summary["native"]["inUse"][0], json!({"release": "r50", "version": "0.160.0-r50", "agents": 2, "selected": true, "missing": false}));
-    assert_eq!(summary["native"]["inUse"].as_array().unwrap().iter().map(|u| u["agents"].as_u64().unwrap()).sum::<u64>(), 5);
+    assert_eq!(summary["native"]["inUse"][0], json!({"release": "r50", "version": "0.160.0-r50", "agents": 3, "selected": true, "missing": false}));
+    assert_eq!(summary["native"]["inUse"].as_array().unwrap().iter().map(|u| u["agents"].as_u64().unwrap()).sum::<u64>(), 6);
     assert_eq!(summary["claude"]["selected"], "claude-r5");
     assert_eq!(summary["claude"]["inUse"][1], json!({"release": "claude-r4", "version": null, "agents": 1, "selected": false, "missing": false}));
     assert_eq!(summary["unpinnedAgents"], 1);
     let text = summary.to_string();
     assert!(!text.contains("Alpha") && !text.contains("D:/"), "{text}");
+}
+
+#[test]
+fn deleted_unreferenced_native_artifacts_are_not_listed_as_installed() {
+    let sessions = CutexSessionStore::default();
+    let registry = registry();
+    let built=build(&Inputs { managed_native_root:None,sessions:&sessions,registry:Some(&registry),
+        selected_native:None,selected_claude_adapter:None,read_manifest:&manifests,exists:&|_|false });
+    assert!(built.native.is_empty());
 }
 
 #[test]
@@ -183,6 +291,7 @@ fn agent_lists_are_capped_but_counted() {
     let registry = registry();
     let exists = |_: &str| true;
     let built = build(&Inputs {
+        managed_native_root: None,
         sessions: &sessions,
         registry: Some(&registry),
         selected_native: None,
@@ -191,7 +300,7 @@ fn agent_lists_are_capped_but_counted() {
         exists: &exists,
     });
     let r50 = &built.native[0];
-    assert!(r50.selected, "registry latest is selected without a deployment");
+    assert!(!r50.selected, "registry latest is not evidence of a selected deployment");
     assert_eq!(r50.agent_count, MAX_AGENTS + 5);
     assert_eq!(r50.agents.len(), MAX_AGENTS);
     assert!(built.claude.is_empty());
@@ -215,6 +324,7 @@ fn resource_matches_its_schema() {
     let registry = registry();
     let exists = |_: &str| true;
     let built = build(&Inputs {
+        managed_native_root: None,
         sessions: &sessions,
         registry: Some(&registry),
         selected_native: None,

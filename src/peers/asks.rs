@@ -18,6 +18,9 @@ pub fn ask_error(error: Error) -> AskError {
         "peer_not_found" => "peer_not_found",
         "peer_unavailable" => "peer_unavailable",
         "peer_unsupported" => "peer_unsupported",
+        "peer_name_resolution_unsupported" => "peer_name_resolution_unsupported",
+        "recipient_archived" => "recipient_archived",
+        "recipient_retired" => "recipient_retired",
         "recipient_outside_boundary" => "recipient_outside_boundary",
         "peer_asks_disabled" => "peer_asks_disabled",
         "delegation_loop" => "delegation_loop",
@@ -30,7 +33,8 @@ pub fn ask_error(error: Error) -> AskError {
         "wake_not_allowed" => "wake_not_allowed",
         _ => "peer_unavailable",
     };
-    AskError::new(code, error.code.clone()).with(error.details)
+    let message = error.details["detail"].as_str().unwrap_or(&error.code).to_owned();
+    AskError::new(code, message).with(error.details)
 }
 fn from_ask(e: AskError) -> Error {
     let mut error = Error::new(e.code, 400);
@@ -169,6 +173,14 @@ pub fn validate_inbound(peer: &Peer, target: &str) -> Result<()> {
         .get(target)
         .filter(|agent| super::policy::visible(peer, agent))
         .ok_or_else(|| Error::new("recipient_outside_boundary", 403))?;
+    let path = crate::session::store::cutex_sessions_path()
+        .map_err(|_| Error::new("persistence_unavailable", 503))?;
+    let (_, record) = crate::session::store::load_session_row(&path, target)
+        .map_err(|_| Error::new("persistence_unavailable", 503))?
+        .ok_or_else(|| Error::new("recipient_outside_boundary", 403))?;
+    if crate::agent_management::agent_execution_blocked(&record) {
+        return Err(Error::new("recipient_outside_boundary", 403));
+    }
     if !super::policy::can_deliver(peer, agent) {
         return Err(Error::new("peer_asks_disabled", 403));
     }
@@ -332,6 +344,10 @@ pub fn receive(store: &AskStore, peer: &Peer, id: &str, request: Create) -> Resu
         &inputs,
     ));
     crate::asks::routing_policy::integration::with_authority(|authority| {
+    // Resolution is not an admission token. Recheck the bound immutable SID
+    // under the lifecycle fence immediately before its first durable enqueue.
+    let current_peer=Store::open().and_then(|s|s.get(&peer.peer_id)).map_err(ask_error)?;
+    validate_inbound(&current_peer, &new.target_cutex_session_id).map_err(ask_error)?;
     let controllers=crate::asks::routing_policy::integration::ControllerView::load(authority)?;
     let routing_host=crate::asks::routing_policy::integration::local_host_id();
     store.with_records(&[id],|state| -> Result<()> {
@@ -379,7 +395,7 @@ pub fn receive(store: &AskStore, peer: &Peer, id: &str, request: Create) -> Resu
         ask.peer_inbound = Some(inbound);
         crate::asks::routing_policy::integration::register_created(&mut next, authority, &mut ask,
             &routing_host, Some(&peer.host_id), now,&controllers).map_err(from_ask)?;
-        next.asks.insert(id.into(), ask);
+        next.asks.insert(id.into(), ask.into());
         *state = next;
         Ok(())
     }).map_err(|e| AskError::new("persistence_unavailable",format!("{e:#}")))?.map_err(ask_error)
@@ -393,6 +409,7 @@ pub fn authorized<'a>(state: &'a AskState, peer: &Peer, id: &str) -> Result<&'a 
     state
         .asks
         .get(id)
+        .map(|a| &**a)
         .filter(|a| matches!(&a.requester,Requester::Peer{peer_id,..}if peer_id==&peer.peer_id))
         .ok_or_else(|| Error::new("ask_not_found", 404))
 }
@@ -601,11 +618,28 @@ pub fn other_hosts() -> Value {
     json!(state.peers.values().filter(|p|p.enabled&&p.pending_until.is_none()&&p.policy.outbound.visibility==Visibility::All).map(|p|{
         let cache=super::routes::cached(&store,p);
         let age=cache["fetchedAt"].as_str().and_then(crate::asks::parse_time).map(|at|(Utc::now()-at).num_seconds().max(0));
-        let agents=cache["agents"].as_array().cloned().unwrap_or_default().into_iter().map(|mut a|{let name=a["name"].as_str().or_else(||a["cutexSessionId"].as_str()).unwrap_or("agent");a["address"]=json!(format!("{name}@{}",p.label));a}).collect::<Vec<_>>();
-        json!({"peerId":p.peer_id,"label":p.label,"status":p.status,"cacheAgeSecs":age,"tells":p.features.iter().any(|f|f==super::tells::FEATURE),"tellWake":super::tells::supports_wake(p),"agents":agents})
+        let names=p.negotiated_features.iter().any(|f|f==super::names::FEATURE);
+        let agents=cache["agents"].as_array().cloned().unwrap_or_default().into_iter().map(|mut a|{let name=if names{a["name"].as_str().or_else(||a["cutexSessionId"].as_str())}else{a["cutexSessionId"].as_str()}.unwrap_or("agent");a["address"]=json!(format!("{name}@{}",p.label));a}).collect::<Vec<_>>();
+        json!({"peerId":p.peer_id,"label":p.label,"status":p.status,"cacheAgeSecs":age,"agentNameResolution":names,"tells":p.features.iter().any(|f|f==super::tells::FEATURE),"tellWake":super::tells::supports_wake(p),"agents":agents})
     }).collect::<Vec<_>>())
 }
 pub fn resolve(target: &str) -> Result<(Peer, Value)> {
+    resolve_scoped(target, None)
+}
+
+pub(crate) fn resolve_action(target:&str,scope:Option<crate::agent_names::NameScope>,
+    caller:&str,tool:&str,action:&str,digest:&str)->Result<(Peer,Value)> {
+    let store=Store::open()?;
+    let key=super::name_bindings::Key{caller,tool,action,digest};
+    if let Some((id,target))=super::name_bindings::lookup(&store,&key)? {
+        return Ok((super::name_bindings::peer(&store,&id)?,target));
+    }
+    let (peer,resolved)=resolve_scoped(target,scope)?;
+    let (id,target)=super::name_bindings::bind(&store,&key,&peer,&resolved)?;
+    Ok((super::name_bindings::peer(&store,&id)?,target))
+}
+
+pub fn resolve_scoped(target: &str, scope: Option<crate::agent_names::NameScope>) -> Result<(Peer, Value)> {
     let (who, label) = target
         .rsplit_once('@')
         .ok_or_else(|| Error::new("id_not_found", 404))?;
@@ -626,45 +660,9 @@ pub fn resolve(target: &str) -> Result<(Peer, Value)> {
     ) {
         return Err(Error::new("peer_unsupported", 409));
     }
-    let mut cache = super::routes::cached(&store, &peer);
-    for attempt in 0..2 {
-        let agents = cache["agents"].as_array().cloned().unwrap_or_default();
-        let index = crate::short_ids::Index::new(agents.iter().filter_map(|a| {
-            Some(crate::short_ids::Entry {
-                id: a["cutexSessionId"].as_str()?.into(),
-                name: a["name"].as_str().map(str::to_string),
-            })
-        }));
-        match index.resolve(who, &index, crate::short_ids::settings().minimum()) {
-            Ok(id) => {
-                return Ok((
-                    peer,
-                    agents
-                        .into_iter()
-                        .find(|a| a["cutexSessionId"] == id)
-                        .unwrap(),
-                ))
-            }
-            Err(e) if attempt == 1 => {
-                let mut error = from_ask(e);
-                error.details["host"] = json!(label);
-                if let Some(candidates) = error.details["candidates"].as_array_mut() {
-                    for c in candidates {
-                        for key in ["id", "short", "name"] {
-                            if let Some(v) = c[key].as_str() {
-                                c[key] = json!(format!("{v}@{label}"));
-                            }
-                        }
-                    }
-                }
-                return Err(error);
-            }
-            _ => {
-                cache = super::routes::refresh(&store, &peer).unwrap_or(cache);
-            }
-        }
-    }
-    Err(Error::new("id_not_found", 404))
+    super::names::resolve(&store, &peer, &crate::agent_names::NameResolutionRequest {
+        target: who.to_owned(), scope,
+    })
 }
 pub fn delegate(
     ctx: &crate::asks::tools::ToolContext<'_>,
@@ -686,17 +684,63 @@ pub fn delegate_fenced(
     title: Option<String>, options: AskOptions, action_id: &str,
     authority: Option<&crate::agent_management::AgentManagementSnapshot>,
 ) -> std::result::Result<Value, AskError> {
+    delegate_scoped_fenced(ctx,target,text,title,options,action_id,None,authority)
+}
+
+/// Resolve and durably bind the remote target before acquiring a broad role
+/// or lifecycle fence. Pass these same normalized arguments to delegation;
+/// that later call reads this pin without repeating resolution network IO.
+pub fn prepare_delegate_target(
+    ctx: &crate::asks::tools::ToolContext<'_>, target: &str, text: &str,
+    title: Option<String>, options: AskOptions, action_id: &str,
+    scope: Option<crate::agent_names::NameScope>,
+) -> std::result::Result<(), AskError> {
+    prepare_delegate_inner(ctx,target,text,&title,&options,action_id,scope).map(|_|()).map_err(ask_error)
+}
+
+fn prepare_delegate_inner(
+    ctx: &crate::asks::tools::ToolContext<'_>, target: &str, text: &str,
+    title: &Option<String>, options: &AskOptions, action_id: &str,
+    scope: Option<crate::agent_names::NameScope>,
+) -> Result<(Peer,Value)> {
+    if text.trim().is_empty() || text.len()>crate::asks::INLINE_BRIEF_MAX_BYTES {
+        return Err(Error::new("remote_unsupported",400));
+    }
+    let state=ctx.store.snapshot()?;
+    let digest=crate::approvals::request_digest(&json!({"target":target,"scope":scope,"text":text,"title":title,"options":options}));
+    let key=super::name_bindings::Key{caller:ctx.caller,tool:crate::asks::tools::AGENT_DELEGATE,action:action_id,digest:&digest};
+    let requester=Requester::Agent{cutex_session_id:ctx.caller.into(),name:None};
+    let existing=state.find_by_action(&requester,action_id).cloned()
+        .or(ctx.store.archived_by_action(&requester,action_id)?);
+    if let Some(existing)=existing {
+        // A pre-upgrade outbox already owns an immutable SID, but has no
+        // original scoped-address digest with which to authorize a new lookup.
+        if super::name_bindings::lookup(&Store::open()?,&key)?.is_none() {
+            let mut error=Error::new("idempotency_conflict",409);
+            error.details=json!({"delegationId":existing.ask_id,"cutexSessionId":existing.target_cutex_session_id,
+                "detail":"This action already has a delegation created by an older version. Read that delegation by its ID; no name was resolved and nothing new was sent."});
+            return Err(error);
+        }
+    }
+    resolve_action(target,scope,ctx.caller,crate::asks::tools::AGENT_DELEGATE,action_id,&digest)
+}
+
+pub fn delegate_scoped_fenced(
+    ctx: &crate::asks::tools::ToolContext<'_>, target: &str, text: &str,
+    title: Option<String>, options: AskOptions, action_id: &str,
+    scope: Option<crate::agent_names::NameScope>,
+    authority: Option<&crate::agent_management::AgentManagementSnapshot>,
+) -> std::result::Result<Value, AskError> {
+    let prepared=prepare_delegate_inner(ctx,target,text,&title,&options,action_id,scope.clone()).map_err(ask_error)?;
     let Some(authority)=authority else {
         return crate::asks::routing_policy::integration::try_with_authority_for_world(ctx.world,|snapshot|
-            delegate_fenced(ctx,target,text,title,options,action_id,Some(snapshot)))?
+            delegate_scoped_fenced(ctx,target,text,title,options,action_id,scope,Some(snapshot)))?
             .ok_or_else(||AskError::new("routing_authority_busy","Lifecycle transition in progress; no peer delegation was enqueued. Retry the same action ID."));
     };
     let result = (|| -> Result<Value> {
-        if text.trim().is_empty() || text.len() > crate::asks::INLINE_BRIEF_MAX_BYTES {
-            return Err(Error::new("remote_unsupported", 400));
-        }
-        let (peer, target) = resolve(target)?;
         let state = ctx.store.snapshot()?;
+        let (peer, target) = prepared;
+        let rename_detail = super::names::detail(&target);
         let parent = state.leases.get(ctx.caller).and_then(|l| match &l.holder {
             LeaseHolder::Ask { ask_id, .. } => Some(ask_id.clone()),
             _ => None,
@@ -813,7 +857,7 @@ pub fn delegate_fenced(
                     accepted: false,
                 },
             });
-            s.asks.insert(a.ask_id.clone(), a.clone());
+            s.asks.insert(a.ask_id.clone(), a.clone().into());
             Ok((a, created))
         })??;
         if hops_exceeded {
@@ -830,6 +874,9 @@ pub fn delegate_fenced(
             let arrival = if ctx.wait { crate::asks::tools::ARRIVAL_WAIT } else { crate::asks::tools::ARRIVAL_NO_WAIT };
             format!("Queued on the other host. Questions go to its owner. {arrival}")
         });
+        if !rename_detail.is_empty() {
+            view["detail"] = json!(format!("{} {}", view["detail"].as_str().unwrap_or_default(), rename_detail));
+        }
         Ok(view)
     })();
     result.map_err(ask_error)

@@ -93,6 +93,7 @@ pub(crate) fn managed_skill_roots_with(record: &CutexSessionRecord, user: Option
 }
 
 pub fn request(id: &str, method: &str, mut params: Value) -> anyhow::Result<Value> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     let lane = crate::management::v2::user_input::session_input_lock(id)?;
     let _operation = lane.reserve()?;
     ensure!(

@@ -545,6 +545,9 @@ class SessionOperations:
                         if 'thread_id' in columns:
                             self.store.db.execute(f'DELETE FROM "{table}" WHERE thread_id=?', (tid,))
                     self.store.db.execute('DELETE FROM threads WHERE id=?', (tid,))
+            # The CLI and its children have exited. Side chats use this same
+            # explicit deletion path; do not retain their prompt snapshots.
+            (self.store.directory / 'system-prompts' / f'{tid}.md').unlink(missing_ok=True)
             self.audit(action_id, data)
         except BaseException:
             self.audit(action_id, data, 'failed')

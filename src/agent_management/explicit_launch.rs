@@ -340,6 +340,7 @@ impl AgentManagementProvider {
         path: &Path,
         request: &ExplicitLaunchRequest,
     ) -> anyhow::Result<serde_json::Value> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         match request {
             ExplicitLaunchRequest::RuntimeStatus { action_id } => Ok(serde_json::to_value(
                 self.runtime_action_status(path, action_id)?,
@@ -496,7 +497,8 @@ impl AgentManagementProvider {
                     contract.migration_action_id.is_none() && contract.version != 3,
                     "migration requires dedicated Human maintenance entry"
                 );
-                let _mutation = self.store().lock_mutations()?;
+                // r271.1: only tries the fence when the caller holds a lane.
+                let _locks = self.fence_locks("launch review")?;
                 {
                     let state = self.store().snapshot()?;
                     let current_project_id = super::archive::guard(&state, cutex_session_id)
@@ -550,10 +552,9 @@ impl AgentManagementProvider {
                     review.contract.migration_action_id.is_none() && review.contract.version != 3,
                     "migration requires dedicated Human maintenance entry"
                 );
-                let _execution = super::provider::provider_execution_lock()
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("execution lock unavailable"))?;
-                let _mutation = self.store().lock_mutations()?;
+                // r271 (051 §2): fence-first when the owner route opted in.
+                let lane = super::fence_first::fence_first_session_lane(Some(review.subject.cutex_session_id.as_str()))?;
+                let _locks = self.entry_locks(lane.as_deref(), true, "activation")?;
                 {
                     crate::session::store::with_locked_session_store(path, |sessions| {
                         if let Some(receipt) =

@@ -215,6 +215,13 @@
             "null"
           ]
         },
+        "idleStopPreset": {
+          "enum": ["1h", "24h", "7d", "forever"]
+        },
+        "stoppedIdle": { "type": "boolean" },
+        "stoppedIdleAt": { "type": ["string", "null"] },
+        "idleWakeFailedAt": { "type": ["string", "null"] },
+        "idleStopAt": { "type": ["string", "null"] },
         "idleTtlMinutes": {
           "type": [
             "integer",
@@ -333,6 +340,7 @@
             "unreachable",
             "starting",
             "stopped",
+            "stoppedIdle",
             "crashLooped"
           ]
         },

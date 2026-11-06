@@ -9,8 +9,10 @@
 //! The profile gate and boundary are rechecked by the scheduler at
 //! admission as for any ask.
 //!
-//! Explicit-launch agents without a live runtime need the owner's reviewed
-//! launch (`ownerStartRequired`), with one exception (owner approval
+//! A current project manager may bring an explicit-launch target online through
+//! typed managed Online, with a fresh review and all automatic constraints.
+//! Otherwise explicit-launch agents without a live runtime need a reviewed
+//! launch (`ownerStartRequired`), with the existing exception (owner approval
 //! 2026-10-14): a delegation from the target's creator or from the
 //! Director of the target's project may start it again on the owner's
 //! latest reviewed launch when that launch ran Ready and still matches the
@@ -39,6 +41,8 @@ pub enum WakeDecision {
     /// Start an explicit-launch agent again on the owner's latest reviewed
     /// launch, for `requester`'s delegation (see the module docs).
     RelaunchReviewed { domain: String, requester: String },
+    /// Fresh review through typed managed Online, with automatic constraints.
+    ManagedOnline { domain: String, requester: String },
     Never(&'static str),
     OverBudget { domain: String },
 }
@@ -76,11 +80,11 @@ pub fn decide(
         .map(|item| item.origin_domain.clone())
         .unwrap_or_else(|| format!("agent:{target}"));
     let mut reviewed_relaunch_by = None;
+    let mut managed_online_by = None;
     if let Some(item) = target_provenance.filter(|item| item.owner_start_required) {
-        // An explicit-launch agent with no live runtime: starting it needs
-        // the owner's reviewed launch. Its creator or its project's Director
-        // may reuse the owner's latest reviewed launch while it still
-        // matches; nobody else, and never without one.
+        // Prefer current typed management authority (fresh review after a
+        // runtime-package upgrade). Preserve the older exact reviewed-relaunch
+        // rule for a creator with that historical authority only.
         let requester = controller.as_deref();
         let creator = [ask.requester.session(), requester]
             .into_iter()
@@ -89,10 +93,13 @@ pub fn decide(
         let director = requester.and_then(|requester| provenance.get(requester)).is_some_and(|requester| {
             requester.director && item.origin_domain.starts_with("project:") && requester.origin_domain == item.origin_domain
         });
-        if !item.reviewed_relaunch || !(creator || director) {
+        if requester.is_some_and(|caller| item.managed_online_by.iter().any(|id| id == caller)) {
+            managed_online_by = requester.map(str::to_string);
+        } else if !item.reviewed_relaunch || !(creator || director) {
             return WakeDecision::Never("ownerStartRequired");
+        } else {
+            reviewed_relaunch_by = requester.map(str::to_string);
         }
-        reviewed_relaunch_by = requester.map(str::to_string);
     }
     if let Some(requester) = controller.as_deref() {
         if state.owner_offline.contains(target) {
@@ -111,13 +118,16 @@ pub fn decide(
             return WakeDecision::Never("policy");
         }
     }
-    let running = state
-        .woken
-        .iter()
-        .filter(|(session, (woken_domain, _))| *woken_domain == domain && online(session))
-        .count();
+    // A retry reuses its target's slot; pending starts of other targets count
+    // before their first online presence, including across scheduler ticks.
+    let running = runtime_budget_used(state, &domain, online)
+        - usize::from(state.woken.get(target).is_some_and(|(d, _)| d == &domain)
+            && (pending_wake(state,target).is_some() || online(target)));
     if running >= online_budget {
         return WakeDecision::OverBudget { domain };
+    }
+    if let Some(requester) = managed_online_by {
+        return WakeDecision::ManagedOnline { domain, requester };
     }
     match reviewed_relaunch_by {
         Some(requester) => WakeDecision::RelaunchReviewed { domain, requester },
@@ -170,6 +180,23 @@ pub fn recently_woken(state: &AskState, target: &str, now: DateTime<Utc>) -> boo
 /// Record a wake attempt (counts against the domain's runtime budget).
 pub fn record_wake(state: &mut AskState, target: &str, domain: &str, now: DateTime<Utc>) {
     state.woken.insert(target.to_string(), (domain.to_string(), now_rfc3339(now)));
+    state.presence.entry(target.to_string()).or_default().wake_pending = Some(now_rfc3339(now));
+}
+
+pub fn runtime_budget_used(state: &AskState, domain: &str, online: &dyn Fn(&str) -> bool) -> usize {
+    state.woken.iter().filter(|(session, (d, _))| d == domain
+        && (pending_wake(state,session).is_some() || online(session))).count()
+}
+
+pub fn pending_wake<'a>(state: &'a AskState, target: &str) -> Option<&'a str> {
+    state.presence.get(target).and_then(|p|p.wake_pending.as_deref())
+}
+
+/// Never release a newer retry's slot on an older background completion.
+pub fn finish_wake(state: &mut AskState, target: &str, reserved_at: &str) {
+    if pending_wake(state,target) == Some(reserved_at) {
+        state.presence.get_mut(target).unwrap().wake_pending = None;
+    }
 }
 
 /// Over budget: hold the ask `blocked(budget)` and notify the owner once.
@@ -199,9 +226,9 @@ pub const OWNER_ACTION_EVENT: &str = "cutex/ask/ownerActionRequired";
 /// What a wake refusal means for the requester (tool results, texts).
 pub fn never_detail(reason: &str) -> &'static str {
     match reason {
-        "ownerStopped" => "the owner took it offline",
+        "ownerStopped" => "it was taken offline by the owner or a host upgrade; an explicit online action is required from the owner or an authorized project manager (its Director, or a permitted operator)",
         "ownerPaused" => "the owner paused its delegations",
-        "ownerStartRequired" => "it can only be started by the owner",
+        "ownerStartRequired" => "automatic wake needs an eligible prior launch review or current managed-online authority; the owner can bring it online, or an authorized project Director or permitted operator can use member_runtime(change=\"online\", cutex_session_id=\"<target>\")",
         "archived" => "it is archived",
         "policy" => "it is neither your child nor an agent of your project",
         "budget" => "the runtime budget of its domain is used up",
@@ -260,8 +287,13 @@ pub fn record_owner_action(state: &mut AskState, target: &str, reason: &str, det
     fresh
 }
 
-/// The target is online again: forget who was told.
-pub fn clear_owner_action(state: &mut AskState, target: &str) {
+/// The target is online again (or has no queued asks): retire obsolete
+/// unsubmitted notices and forget who was told. Reserved inputs stay frozen.
+pub fn clear_owner_action(state: &mut AskState, target: &str, now: DateTime<Utc>) {
+    let asks = state.owner_action.get(target).cloned().unwrap_or_default();
+    for ask_id in asks {
+        super::delivery::supersede_blocked_owner_action(state, &ask_id, now);
+    }
     state.owner_action.remove(target);
     forget_owner_action_told(state, target);
 }
@@ -447,10 +479,14 @@ mod tests {
         assert_eq!(decide(&state, &peers, &ask, true, 6, &offline), WakeDecision::Never("archived"));
         note_owner_runtime_action(&mut state, TARGET, true);
         assert_eq!(decide(&state, &peers, &ask, false, 6, &offline), WakeDecision::Never("ownerStopped"));
+        let detail = never_detail("ownerStopped");
+        assert!(detail.contains("taken offline by the owner or a host upgrade"));
+        assert!(detail.contains("explicit online action") && detail.contains("Director") && detail.contains("permitted operator"));
         note_owner_runtime_action(&mut state, TARGET, false);
         // Budget: one runtime already woken in the domain and still online.
         record_wake(&mut state, "other", "project:alpha", now);
         assert!(matches!(decide(&state, &peers, &ask, false, 1, &online), WakeDecision::OverBudget { .. }));
+        finish_wake(&mut state,"other",&now_rfc3339(now));
         assert!(matches!(decide(&state, &peers, &ask, false, 1, &offline), WakeDecision::Wake { .. }));
         hold_over_budget(&mut state, &ask.ask_id, "project:alpha", now);
         assert_eq!(state.asks[&ask.ask_id].hold, Some(Hold::Blocked { by: BlockedReason::Budget }));
@@ -538,6 +574,7 @@ mod tests {
             decide(&state, &eligible, &ask, false, 1, &online),
             WakeDecision::OverBudget { domain: "project:alpha".into() }
         );
+        finish_wake(&mut state,"other",&now_rfc3339(now));
         assert_eq!(decide(&state, &eligible, &ask, false, 1, &offline), relaunch);
     }
 }

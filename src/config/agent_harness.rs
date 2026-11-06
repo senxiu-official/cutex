@@ -8,6 +8,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Opt-in browser instruction shared by the two runtime launch harnesses.
+/// [`BROWSER_INSTRUCTION`] for the script surface (design 059).
+pub const BROWSER_SCRIPT_INSTRUCTION: &str = "\n- When you need to view a web page yourself, use browser_script (`await browser.docs(\"script\")` lists its API); do not use shell to open the system browser. It is for your own inspection, not for showing the owner a result.\n";
+/// [`BROWSER_INSTRUCTION`] for the one-tool surface (design 059).
+pub const BROWSER_COMMAND_INSTRUCTION: &str = "
+- When you need to view a web page yourself, use the browser tool (its docs command lists the rest); do not use shell to open the system browser. It is for your own inspection, not for showing the owner a result.
+";
 pub const BROWSER_INSTRUCTION: &str = "\n- When you need to view a web page yourself, use browser_* tools; do not use shell to open the system browser. They are for your own inspection, not for showing the owner a result.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

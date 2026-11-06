@@ -336,7 +336,75 @@ pub(super) fn reconnect_ready_runtime(
     record: &CutexSessionRecord,
     sessions: &cutex::session::model::CutexSessionStore,
 ) -> anyhow::Result<StockRuntimeReceipt> {
-    ensure!(!cutex::agent_management::agent_execution_blocked(&record), "cannot reconnect an archived agent");
+    let (receipt, binding) = reconnect_preflight(record, sessions)?;
+    super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
+    reconnect_verified(record, receipt)
+}
+
+/// r273.1 (B1): [`reconnect_ready_runtime`] for a lifecycle entry that holds
+/// the registered host fence (native online / recovery). The cheap checks
+/// run under the fence; the live-claim proof (PID + endpoint ownership, a
+/// TCP table read on Windows) runs outside it, and the durable claim must be
+/// unchanged once the fence is back. The reconnect itself is published under
+/// the fence, from the record re-read there (its cheap checks, including the
+/// PID creation time against the binding, run again).
+pub(super) fn reconnect_ready_runtime_outside_fence(
+    cutex_session_id: &str,
+) -> anyhow::Result<StockRuntimeReceipt> {
+    let sessions = cutex::session::store::load_cutex_session_store()?;
+    let record = sessions
+        .sessions
+        .get(cutex_session_id)
+        .context("managed agent disappeared")?;
+    let (_, binding) = reconnect_preflight(record, &sessions)?;
+    cutex::agent_management::verify_claim_outside_host_fence(
+        "native live runtime claim verification",
+        || live_runtime_claim(cutex_session_id),
+        || super::app_server_runtime::verify_exact_live_runtime_claim(record, binding),
+    )?;
+    let sessions = cutex::session::store::load_cutex_session_store()?;
+    let current = sessions
+        .sessions
+        .get(cutex_session_id)
+        .context("managed agent disappeared")?;
+    let (receipt, _) = reconnect_preflight(current, &sessions)?;
+    reconnect_verified(current, receipt)
+}
+
+/// The durable fields a live-claim verification proves, read for the
+/// before / after comparison of [`reconnect_ready_runtime_outside_fence`].
+#[derive(Debug, PartialEq)]
+pub(super) struct LiveRuntimeClaim {
+    runtime_generation: u64,
+    launch_claim_id: Option<String>,
+    binding: Option<CutexAppServerRuntimeBinding>,
+    runtime_pid: Option<u32>,
+    runtime_agent_id: Option<String>,
+    execution_blocked: bool,
+}
+
+pub(super) fn live_runtime_claim(cutex_session_id: &str) -> anyhow::Result<LiveRuntimeClaim> {
+    let record = cutex::session::store::load_cutex_session_store()?
+        .sessions
+        .remove(cutex_session_id)
+        .context("managed agent disappeared")?;
+    Ok(LiveRuntimeClaim {
+        runtime_generation: record.runtime_generation,
+        launch_claim_id: record.app_server_launch_claim_id.clone(),
+        binding: record.app_server_runtime.clone(),
+        runtime_pid: record.runtime_pid,
+        runtime_agent_id: record.current_runtime_agent_id.clone(),
+        execution_blocked: cutex::agent_management::agent_execution_blocked(&record),
+    })
+}
+
+/// Everything [`reconnect_ready_runtime`] checks before the live-claim proof
+/// (all cheap: durable record, receipt, PID identity of the binding).
+fn reconnect_preflight<'a>(
+    record: &'a CutexSessionRecord,
+    sessions: &'a cutex::session::model::CutexSessionStore,
+) -> anyhow::Result<(&'a StockRuntimeReceipt, &'a CutexAppServerRuntimeBinding)> {
+    ensure!(!cutex::agent_management::agent_execution_blocked(record), "cannot reconnect an archived agent");
     ensure!(
         record.app_server_launch_claim_id.is_none(),
         "unresolved runtime claim requires recovery"
@@ -355,11 +423,22 @@ pub(super) fn reconnect_ready_runtime(
         .as_ref()
         .context("runtime binding missing")?;
     verify_stock_process(record, binding)?;
-    super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
+    Ok((receipt, binding))
+}
+
+/// Attach the Management bridge to an occurrence whose live claim was proven.
+fn reconnect_verified(
+    record: &CutexSessionRecord,
+    receipt: &StockRuntimeReceipt,
+) -> anyhow::Result<StockRuntimeReceipt> {
     StockExecutor::default().connect(record, receipt)?;
-    let status = super::app_server_runtime::runtime_manager()
-        .refresh_agent_bus_registration(&record.cutex_session_id)?
-        .context("reconnected runtime has no Agent Bus bridge")?;
+    // A blocking bus call (with retries): outside the fence, claim compared after.
+    let status = cutex::agent_management::verify_claim_outside_host_fence(
+        "agent bus registration refresh",
+        || live_runtime_claim(&record.cutex_session_id),
+        || super::app_server_runtime::runtime_manager().refresh_agent_bus_registration(&record.cutex_session_id),
+    )?
+    .context("reconnected runtime has no Agent Bus bridge")?;
     ensure!(
         status.running
             && status.registered
@@ -1334,8 +1413,9 @@ impl StockRuntimeExecutor for StockExecutor {
                 cutex::session::reviewed_registration::occurrence_launch_cwd(receipt)?;
             registration.groups = record.agent_groups.clone();
             registration.path_key = None;
-            registration.name = receipt.review.subject.formal_name.clone();
-            registration.base_name = Some(receipt.review.subject.formal_name.clone());
+            let current_name = cutex::session::metadata::cutex_session_display_name(record);
+            registration.name = current_name.clone();
+            registration.base_name = Some(current_name);
             let mut options = cutex::app_server::bus_bridge::AppServerAgentBusBridgeOptions::new(
                 registration,
                 &receipt.review.contract.native_id,
@@ -1362,12 +1442,18 @@ impl StockRuntimeExecutor for StockExecutor {
                     config.agent_bus_token = Some("s4-deliberately-invalid-fixture-token".into());
                 }
             }
-            manager.start_agent_bus_bridge(
-                &record.cutex_session_id,
-                Arc::new(cutex::agent_bus::client::AgentBusHttpClient::from_config(
-                    &config,
-                )),
-                options,
+            // Registers on the bus (with retries): outside the fence when a
+            // reconnect still holds it; an ordinary start already released it.
+            cutex::agent_management::verify_claim_outside_host_fence(
+                "agent bus bridge start",
+                || live_runtime_claim(&record.cutex_session_id),
+                || manager.start_agent_bus_bridge(
+                    &record.cutex_session_id,
+                    Arc::new(cutex::agent_bus::client::AgentBusHttpClient::from_config(
+                        &config,
+                    )),
+                    options,
+                ),
             )?;
         }
         #[cfg(feature = "stock-launch-test-hook")]
@@ -1519,6 +1605,7 @@ pub(super) fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus
     let mut timing = StartupTiming::new();
     // All foreground entry points reconcile exactly once, including Recent Sessions.
     online(id, false)?;
+    let runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
     timing.mark("owner-ready-and-reconnected");
     let store = cutex::session::store::load_cutex_session_store()?;
     let record = store
@@ -1675,7 +1762,7 @@ pub(super) fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus
     )?;
     timing.mark("display-and-profile-prepared");
     let (status, diagnostic) =
-        foreground_status(&mut layout.apply_remote_tui_auth(launch).to_command())?;
+        foreground_status_with_reference(&mut layout.apply_remote_tui_auth(launch).to_command(), runtime_reference)?;
     ensure!(
         status.success(),
         "stock CLI failed ({status}); owner was not restarted{}",
@@ -1694,9 +1781,24 @@ pub(super) fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus
 pub(super) fn foreground_status(
     command: &mut std::process::Command,
 ) -> anyhow::Result<(std::process::ExitStatus, String)> {
+    foreground_status_inner(command, None)
+}
+
+pub(super) fn foreground_status_with_reference(
+    command: &mut std::process::Command,
+    runtime_reference: cutex::runtime::reference_guard::SharedGuard,
+) -> anyhow::Result<(std::process::ExitStatus, String)> {
+    foreground_status_inner(command, Some(runtime_reference))
+}
+
+fn foreground_status_inner(
+    command: &mut std::process::Command,
+    runtime_reference: Option<cutex::runtime::reference_guard::SharedGuard>,
+) -> anyhow::Result<(std::process::ExitStatus, String)> {
     use std::io::{Read, Write};
     const LIMIT: usize = 16 * 1024;
     let mut child = command.stderr(std::process::Stdio::piped()).spawn()?;
+    drop(runtime_reference);
     let mut stderr = child
         .stderr
         .take()

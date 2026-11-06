@@ -6,9 +6,9 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.2.0 Beautiful World**: persistent agent communication and delegation improvements, project services, account-aware Profiles and runtime variants. Ships native 0.164.0-r58 and Claude runtime claude-r32 with bundled Python. Kimi and DSH are experimental and are not included in the 0.2.0 binaries; they are planned for a later public update. Upgrading from 0.1.5 changes durable communication to format v2 and requires explicit one-way confirmation; older releases require offline data restoration. See [CHANGELOG.md](CHANGELOG.md).
+**0.2.1 — Beautiful World**: agent rename and name history, persistent browser scripting, clearer queued-message delivery, per-user layout memory and idle service sleep. Includes native 0.164.0-r59 and Claude runtime claude-r40; optional DSH and Kimi adapters use dsh-r3 and kimi-r3. This update migrates durable state to SQLite and requires explicit one-way confirmation; retain a backup before upgrading. See [CHANGELOG.md](CHANGELOG.md).
 
-> **Known gaps in 0.2.x** (being fixed; this note goes away when they are):
+> **Current limitations:**
 > - **Phone push / pairing a phone**: there is no public phone app yet.
 >
 > Claude agents need the optional `claude-runtime` component and long-running jobs (Linux) the
@@ -24,7 +24,9 @@ Clients talk to it through the Management v2 HTTP / SSE API. The main client is 
 [desktop app](https://github.com/senxiu-official/cutex-desktop). There is also a command line
 (`cutex …`) and a session TUI (`cutex` with no arguments).
 
-Linux and Windows x64.
+Supported hosts: Linux x64 and Windows x64.
+
+The 0.2 series is named **Beautiful World**; the 0.1 series is **First Take**.
 
 ## Features
 
@@ -57,7 +59,7 @@ Linux and Windows x64.
   Devices pair with a one-time code and get their own tokens. Other users can be given access to
   specific projects and agents, and manage their own devices.
 
-**Tools agents get**
+**Agent tools**
 - The `cutex` MCP server gives each agent the bus, delegation, alarm and project tools above,
   filtered by its role.
 - Services: agents register the web services they run (`service_register`, `service_list`, …);
@@ -102,8 +104,7 @@ Linux and Windows x64.
 ## Install
 
 Install from the release binaries or build from source. The full guide covers both, for cutex,
-cute-codex, the optional components and the desktop on Linux and Windows. It is written so that either
-you or an AI coding agent can follow it end to end:
+cute-codex, the optional components and the desktop on Linux and Windows. The guide includes complete commands for manual or agent-assisted installation:
 
 **[AGENT-INSTALL.md](https://github.com/senxiu-official/cutex-desktop/blob/release/docs/install/AGENT-INSTALL.md)**
 (in the cutex-desktop repository)

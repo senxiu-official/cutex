@@ -7,6 +7,7 @@
 pub mod archive;
 pub mod boot_fence;
 pub mod config;
+pub mod creation_identity;
 /// One-time load migration `session-cwd-normalize` (escaped Windows cwds).
 pub mod cwd_migration;
 pub mod duplicate_resume_projection;
@@ -30,6 +31,7 @@ pub mod reviewed_registration;
 pub mod service;
 pub mod start_quick_actions;
 pub mod status_projection;
+pub mod shared_rows;
 pub mod store;
 
 pub mod fork;

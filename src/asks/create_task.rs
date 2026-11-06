@@ -126,6 +126,79 @@ pub fn attach_with(
     set(response, delegation);
 }
 
+/// `agent_create` tasks not delegated yet, by create action id, in the Agent
+/// Management store's additive `extra` map (r276). The task is kept from the
+/// call until its delegation is made (or the create ends without an agent), so
+/// a create whose runtime start failed can still deliver it when it is
+/// finished later: an exact retry or the creator's `member_runtime online`.
+pub const PENDING_TASKS_EXTENSION: &str = "create_pending_tasks_v1";
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingTask {
+    pub caller: String,
+    pub task: String,
+    pub facade: u32,
+    pub recorded_at: String,
+}
+
+/// The pending task of create `action_id`, if any.
+pub fn pending_task(snapshot: &crate::agent_management::AgentManagementSnapshot, action_id: &str) -> Option<PendingTask> {
+    snapshot.extra.get(PENDING_TASKS_EXTENSION)?.get(action_id).cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+/// Keeps `task` for create `action_id` (idempotent: an exact retry keeps the first).
+pub fn remember_pending(store: &crate::agent_management::AgentManagementStore, action_id: &str, task: PendingTask) -> anyhow::Result<()> {
+    let task = serde_json::to_value(&task)?;
+    update_pending_tasks(store, |tasks| {
+        if tasks.contains_key(action_id) {
+            return false;
+        }
+        tasks.insert(action_id.to_string(), task);
+        true
+    })
+}
+
+/// Drops the pending task of create `action_id` once `response` settled it:
+/// its delegation was made (or definitely refused), or the create ended
+/// without an agent. An unfinished create or an uncertain delegation keeps it.
+pub fn settle_pending(store: &crate::agent_management::AgentManagementStore, action_id: &str, response: &Value) -> anyhow::Result<()> {
+    let delegation = &response["outcome"]["receipt"]["result"]["delegation"];
+    let settled = match response["outcome"]["status"].as_str() {
+        Some("complete") => created_agent(response).is_none() || (delegation.is_object() && !is_uncertain(delegation)),
+        Some("no_write") => true,
+        _ => false,
+    };
+    if !settled {
+        return Ok(());
+    }
+    update_pending_tasks(store, |tasks| tasks.remove(action_id).is_some())
+}
+
+/// The one write of the pending tasks: `change` says whether it changed them.
+fn update_pending_tasks(
+    store: &crate::agent_management::AgentManagementStore,
+    change: impl FnOnce(&mut serde_json::Map<String, Value>) -> bool,
+) -> anyhow::Result<()> {
+    store.with_state(true, |mut state| {
+        let mut tasks = match state.extra.get(PENDING_TASKS_EXTENSION) {
+            Some(Value::Object(tasks)) => tasks.clone(),
+            Some(_) => return Ok((state, (), false)),
+            None => serde_json::Map::new(),
+        };
+        if !change(&mut tasks) {
+            return Ok((state, (), false));
+        }
+        if tasks.is_empty() {
+            state.extra.remove(PENDING_TASKS_EXTENSION);
+        } else {
+            state.extra.insert(PENDING_TASKS_EXTENSION.to_string(), Value::Object(tasks));
+        }
+        Ok((state, (), true))
+    })?;
+    Ok(())
+}
+
 /// Shared with receipt reconstruction: an uncertain child must never become a
 /// definite "not delivered" parent failure, even for legacy cached replies.
 pub(crate) fn is_uncertain(value: &Value) -> bool {

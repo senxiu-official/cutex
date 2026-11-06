@@ -330,7 +330,7 @@ mod tests {
             "cutex.state-sync".to_string(),
             Some("thread-state-sync".to_string()),
             "devbox".to_string(),
-            "/tmp/state-sync".to_string(),
+            if cfg!(windows) { "C:/tmp/state-sync" } else { "/tmp/state-sync" }.to_string(),
             None,
             "2026-08-10T00:00:00Z".to_string(),
         )
@@ -538,10 +538,11 @@ mod tests {
         // Old home: agents started with full access and no network
         // (fresh-agent migration kept the old defaults).
         let mut record = record();
-        record.managed_cwd = Some("/tmp/state-sync".into());
+        let cwd = if cfg!(windows) { "C:/tmp/state-sync" } else { "/tmp/state-sync" };
+        record.managed_cwd = Some(cwd.into());
         record.permission_defaults = Some("danger-full-access".into());
         record.approval_policy = Some("never".into());
-        let switch = auto_switch(true, serde_json::json!(["/tmp/state-sync", "/extra/a", "/extra/a", "", "/extra/b"]));
+        let switch = auto_switch(true, serde_json::json!([cwd, "/extra/a", "/extra/a", "", "/extra/b"]));
         assert!(apply_durable_notification(&mut record, 7, &switch, "t").unwrap());
         assert_eq!(record.sandbox_network_access, Some(true));
         assert_eq!(record.sandbox_writable_roots, vec!["/extra/a".to_string(), "/extra/b".to_string()]);

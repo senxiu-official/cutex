@@ -8,12 +8,14 @@ use super::*;
 pub fn archive_authority_snapshot() -> Result<AgentManagementSnapshot, AgentManagementError> {
     let store = super::super::AgentManagementStore::open_default()
         .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
-    let has_data=store.root().join("agent-management-v1.json").try_exists()
+    let has_data=(store.root().join("agent-management-v1.json").try_exists()
+        .map_err(|_| AgentManagementError::PersistenceUnavailable)?)
+        || super::super::roster_sql::database_path(store.root()).try_exists()
         .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
     let has_lock=store.root().join("agent-management-v1.lock").try_exists()
         .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
     if has_data && !has_lock { return Err(AgentManagementError::InvalidStore); }
-    store.snapshot()
+    store.directory_snapshot()
 }
 
 /// Authority failure is never permission to start/send/restore. Keep this
@@ -118,6 +120,9 @@ pub(super) fn legacy_archive_ambiguous(
     });
     if proven_soft {
         return false;
+    }
+    if let Some(evidence) = &state.legacy_close_projection {
+        return evidence.contains(&record.cutex_session_id);
     }
     state.phase_events.values().any(|event| {
         let target_matches = event

@@ -57,7 +57,7 @@ fn insert_ask(state: &mut AskState, id: &str, project: &str) -> DelegationRef {
     request.ask_id = Some(id.into());
     request.project_id = Some(project.into());
     let ask = AskState::provisional(&request, Utc::now());
-    state.asks.insert(id.into(), ask);
+    state.asks.insert(id.into(), ask.into());
     let reference = reference(id);
     retain_root(&mut state.lineage, reference.clone());
     reference

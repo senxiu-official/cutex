@@ -558,7 +558,7 @@ fn parse_provider(
             }
         }
         App::Codex => {
-            provider.key = non_empty(settings.get("auth").and_then(|auth| auth.get("OPENAI_API_KEY"))).map(Secret);
+            provider.key = settings.get("auth").and_then(super::api_key::from_auth).map(str::to_owned).map(Secret);
             let config = settings.get("config").and_then(Value::as_str).unwrap_or_default();
             if !config.trim().is_empty() {
                 match config.parse::<toml::Table>() {

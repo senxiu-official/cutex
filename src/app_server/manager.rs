@@ -157,6 +157,9 @@ fn drain_control_events(client: AppServerClient, stop_rx: mpsc::Receiver<()>) {
 }
 
 pub trait AppServerRuntimeEventSink: Send + Sync + 'static {
+    /// Process-local status fanout only; no store access, journaling or RPCs.
+    fn handle_background_work(&self, _context: &AppServerRuntimeEventContext,
+        _work: Option<super::background_work::BackgroundWork>) -> anyhow::Result<()> { Ok(()) }
     /// Ephemeral owner conversations must not enter raw diagnostic files.
     /// Defaults to the existing behavior for all other consumers. This hook
     /// only controls diagnostics; handle_event still receives every event.
@@ -279,6 +282,7 @@ impl AppServerRuntimeEventContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerManagedRuntimeStatus {
+    pub background_work: Option<super::background_work::BackgroundWork>,
     pub cutex_session_id: String,
     pub thread_id: String,
     pub runtime_generation: u64,
@@ -298,6 +302,20 @@ pub struct AppServerManagedRuntimeStatus {
     pub initialized_user_agent: Option<String>,
     pub last_event_at: Option<String>,
     pub last_error: Option<String>,
+}
+
+impl AppServerManagedRuntimeStatus {
+    /// A lost observation connection cannot prove either running or idle.
+    /// Reconnect replaces this with a fresh thread/resume (rollout) snapshot.
+    pub fn mask_disconnected_turn(&mut self) {
+        if !self.connected {
+            self.background_work = Default::default();
+            self.active_turn_id = None;
+            self.active_turn_observed_at = None;
+            self.thread_status = Some(serde_json::json!({"type":"unknown"}));
+            self.thread_status_observed_at = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -639,6 +657,18 @@ impl AppServerRuntimeManager {
         Ok(runtime.handle.clone())
     }
 
+    /// 057: exact connection capability, discarded with the runtime generation.
+    /// A missing/unknown flag must never authorize reserving other inputs.
+    pub fn owner_carries_supported(&self, session: &str, generation: u64) -> bool {
+        let Ok(runtimes) = self.runtimes.lock() else { return false };
+        let Some(runtime) = runtimes.get(session) else { return false };
+        let Ok(status) = runtime.status.lock() else { return false };
+        status.connected && status.runtime_generation == generation
+            && runtime.runtime_alive.load(Ordering::Acquire)
+            && runtime.handle.disconnect_reason().is_none()
+            && runtime.supports_owner_carries
+    }
+
     pub fn status(
         &self,
         cutex_session_id: &str,
@@ -665,6 +695,7 @@ impl AppServerRuntimeManager {
                             status.connected = false;
                             status.last_error = Some(reason);
                         }
+                        status.mask_disconnected_turn();
                         status
                     })
                     .map_err(|_| anyhow::anyhow!("app-server runtime status lock was poisoned"))
@@ -715,6 +746,7 @@ impl AppServerRuntimeManager {
             .map_err(|_| anyhow::anyhow!("app-server runtime status lock was poisoned"))?;
         status.active_turn_id = active_turn_id;
         status.active_turn_observed_at = Some(Utc::now().to_rfc3339());
+        status.mask_disconnected_turn();
         Ok(())
     }
 
@@ -833,18 +865,24 @@ impl AppServerRuntimeManager {
         &self,
         cutex_session_id: &str,
     ) -> anyhow::Result<Option<AppServerAgentBusBridgeStatus>> {
-        let runtimes = self
-            .runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("app-server runtime manager lock was poisoned"))?;
-        let runtime = runtimes
-            .get(cutex_session_id)
-            .with_context(|| format!("app-server runtime is not connected: {cutex_session_id}"))?;
-        runtime
-            .agent_bus_bridge
-            .as_ref()
-            .map(AppServerAgentBusBridge::refresh_registration)
-            .transpose()
+        let refresh = {
+            let runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("app-server runtime manager lock was poisoned"))?;
+            let runtime = runtimes
+                .get(cutex_session_id)
+                .with_context(|| format!("app-server runtime is not connected: {cutex_session_id}"))?;
+            runtime
+                .agent_bus_bridge
+                .as_ref()
+                .map(AppServerAgentBusBridge::registration_refresh)
+        };
+        // Never under the manager lock: the bus's register handler holds its
+        // state lock and may read this manager (endpointChanged event), so the
+        // two wait on each other until the client's 120 s read timeout, with
+        // every bus request stalled behind the state lock (EVA 2026-11-04).
+        refresh.map(|refresh| refresh.run()).transpose()
     }
 
     pub fn agent_bus_bridge_status(
@@ -1072,6 +1110,10 @@ impl AppServerRuntimeManager {
         )?;
         let handle = client.handle();
         let commands = AppServerCommands::new(handle.clone());
+        let (memory_snapshot, historical_resume) = match &bootstrap {
+            ThreadBootstrap::Resume(p) => (p.launch_augmentation.as_ref().and_then(|a| a.memory.as_ref()).and_then(|m| m.index_snapshot.clone()), true),
+            ThreadBootstrap::Start(p) => (p.launch_augmentation.as_ref().and_then(|a| a.memory.as_ref()).and_then(|m| m.index_snapshot.clone()), false),
+        };
         let bootstrap = resolve_bootstrap_launch_augmentation(&handle, bootstrap);
         let developer_instructions = match &bootstrap {
             ThreadBootstrap::Resume(params) => params.developer_instructions.clone(),
@@ -1100,8 +1142,20 @@ impl AppServerRuntimeManager {
                 );
             }
         }
+        if let Some(snapshot) = memory_snapshot.filter(|snapshot| developer_instructions.as_ref().is_some_and(|text| text.contains(&snapshot.path))) {
+            let deferred = historical_resume && thread_response.pointer("/thread/turns").and_then(Value::as_array).is_none_or(|turns| !turns.is_empty());
+            crate::memory::idle_note::launched(cutex_session_id, Some(snapshot), deferred);
+        }
+        crate::memory::idle_note::transport::install(&handle, cutex_session_id, &response_thread_id, runtime_generation);
 
-        if let Some(turn) = active_turn_id_from_thread_response(&thread_response) {
+        // r274.2 item 4: a runtime that outlived a management restart keeps
+        // running its turn. Recover that turn's identity here, before the
+        // event worker starts, or the runtime status, admission, delivery and
+        // the input ledger take the agent for idle until it ends.
+        let active_turn_id = recover_active_turn(&thread_response, &response_thread_id, &mut |method: &str, params: Value| {
+            handle.request_with_timeout(method, params, ACTIVE_TURN_READ_TIMEOUT).map_err(|error| error.to_string())
+        });
+        if let Some(turn) = active_turn_id.clone() {
             crate::management::v2::admission::turn_started(cutex_session_id);
             if let Ok(store) = crate::asks::store::AskStore::open_default() {
                 let _ = store.inspect(|state| crate::management::v2::admission::restore_lease_turn(cutex_session_id, &turn, state));
@@ -1122,11 +1176,12 @@ impl AppServerRuntimeManager {
             &thread_settings_from_resume_response(&thread_response),
         );
         let status = Arc::new(Mutex::new(AppServerManagedRuntimeStatus {
+            background_work: Default::default(),
             cutex_session_id: cutex_session_id.to_string(),
             thread_id: response_thread_id.clone(),
             runtime_generation,
             connected: true,
-            active_turn_id: active_turn_id_from_thread_response(&thread_response),
+            active_turn_id,
             active_turn_observed_at: Some(bootstrap_observed_at.clone()),
             thread_status: thread_response.pointer("/thread/status").cloned(),
             thread_status_observed_at: Some(bootstrap_observed_at.clone()),
@@ -1177,6 +1232,9 @@ impl AppServerRuntimeManager {
             ownership.activate();
         }
         let worker = thread::spawn(move || {
+            if let Err(error) = super::background_work::attach(client.handle(), worker_status.clone(), event_context.clone(), event_sink.clone()) {
+                mark_error(&worker_status, format!("background inventory observer: {error:#}"));
+            }
             run_event_worker(
                 client,
                 stop_rx,
@@ -1190,6 +1248,7 @@ impl AppServerRuntimeManager {
         });
         let runtime = ManagedRuntime {
             developer_instructions,
+            supports_owner_carries: initialize_response.get("ownerInputCarries").and_then(Value::as_u64) == Some(1),
             supports_cutex_ingress,
             endpoint,
             handle,
@@ -1221,6 +1280,7 @@ impl AppServerRuntimeManager {
 
 struct ManagedRuntime {
     developer_instructions: Option<String>,
+    supports_owner_carries: bool,
     supports_cutex_ingress: bool,
     endpoint: AppServerEndpoint,
     handle: AppServerHandle,
@@ -1285,10 +1345,16 @@ fn run_event_worker(
     let mut carried: Option<AppServerEvent> = None;
     let mut deferred_diagnostics: Vec<(AppServerEvent, usize)> = Vec::new();
     let mut deferred_bytes: usize = 0;
+    // A bound turn whose turn/completed was lost (r274 S18, turn_stall.rs).
+    let mut stall = super::turn_stall::Watch::new(&event_context);
     loop {
         if stop_rx.try_recv().is_ok() {
             mark_disconnected(&status, "runtime manager disconnected the client");
             break;
+        }
+        if carried.is_none() {
+            // A synthesized turn/completed takes the native event's path.
+            carried = stall.poll(&status, &origin);
         }
         deferred_diagnostics.retain(|(event, bytes)| {
             if event_context.full_text_item_terminal && crate::management::v2::native_events::is_live_text_delta(event) {
@@ -1323,7 +1389,9 @@ fn run_event_worker(
                     client.recv_event_timeout(Duration::ZERO).ok().flatten()
                 });
                 update_runtime_status_from_event(&status, &event);
+                stall.observe(&event);
                 let owned = ownership.as_mut().is_none_or(|ownership| ownership.handles(&event));
+                if owned { origin.observe_request_hook(&event); }
                 replay_taken_over_events(
                     ownership.as_mut(),
                     &journal,
@@ -1560,6 +1628,50 @@ fn active_turn_id_from_thread_response(response: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Bound on the one turn lookup of [`recover_active_turn`] (the connect
+/// path waits on it).
+const ACTIVE_TURN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The turn the runtime is running at (re)connect, from the runtime's own
+/// facts (r274.2 item 4, host-a 11-03).
+///
+/// The bootstrap response names it when its turns include the in-progress
+/// one (Codex `thread/resume` with turns, `initialTurnsPage`). The Claude
+/// adapter's `thread/resume` has the thread status but no turns
+/// (`protocol.py` `_thread_response`), and Codex has none with
+/// `excludeTurns`; so when the thread status is `active` and no turn is
+/// named, ONE `thread/turns/list` page (newest turn, no items) asks the
+/// runtime which turn runs. Its newest turn counts only while
+/// `inProgress`; an idle / not-loaded / unknown status, an unreadable page
+/// or a newest turn that already ended recover nothing (no guess: the
+/// stall check and lease reconcile keep their own rules).
+fn recover_active_turn(
+    response: &Value,
+    thread_id: &str,
+    call: &mut dyn FnMut(&str, Value) -> Result<Value, String>,
+) -> Option<String> {
+    if let Some(turn) = active_turn_id_from_thread_response(response) {
+        return Some(turn);
+    }
+    if response.pointer("/thread/status/type").and_then(Value::as_str) != Some("active") {
+        return None;
+    }
+    let page = match call(
+        "thread/turns/list",
+        serde_json::json!({"threadId": thread_id, "cursor": null, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"}),
+    ) {
+        Ok(page) => page,
+        Err(error) => {
+            eprintln!("cutex: thread {thread_id} is active but its running turn could not be read on connect: {error}");
+            return None;
+        }
+    };
+    let newest = page.get("data").and_then(Value::as_array).and_then(|turns| turns.first())?;
+    (newest.get("status").and_then(Value::as_str) == Some("inProgress"))
+        .then(|| newest.get("id").and_then(Value::as_str).map(str::to_string))
+        .flatten()
+}
+
 fn thread_settings_from_resume_response(response: &Value) -> Value {
     let mut settings = serde_json::Map::new();
     for (source, target) in [
@@ -1728,7 +1840,10 @@ fn mark_disconnected(status: &Arc<Mutex<AppServerManagedRuntimeStatus>>, reason:
     if let Ok(mut status) = status.lock() {
         status.connected = false;
         status.last_error = Some(reason.to_string());
+        status.mask_disconnected_turn();
     }
+    // r274: the late-adoption observer re-plans without a store change.
+    super::late_adoption::note_connection_lost();
 }
 
 /// The adapter sends `claude/*` notifications only to a peer that asked for
@@ -1749,8 +1864,10 @@ fn claude_observer_notifications(options: &mut AppServerClientOptions) {
     options
         .extra_capabilities
         .insert("claudeExtensions".to_string(), Value::Bool(true));
-    options.opt_out_notification_methods =
-        CLAUDE_OBSERVER_OPT_OUTS.iter().map(|method| method.to_string()).collect();
+    options.opt_out_notification_methods = CLAUDE_OBSERVER_OPT_OUTS.iter()
+        // 054 §2.11: the input ledger maps contextPersisted (stageChanged is not opted out).
+        .filter(|method| !(**method == "claude/input/contextPersisted" && crate::management::v2::input_ledger::enabled()))
+        .map(|method| method.to_string()).collect();
 }
 
 #[cfg(test)]
@@ -1838,6 +1955,7 @@ mod tests {
         });
         let runtime_alive = Arc::new(AtomicBool::new(true));
         let status = Arc::new(Mutex::new(AppServerManagedRuntimeStatus {
+            background_work: Default::default(),
             cutex_session_id: "saturated-close".to_string(),
             thread_id: "thread-1".to_string(),
             runtime_generation: 1,
@@ -1867,6 +1985,7 @@ mod tests {
                 "saturated-close".to_string(),
                 ManagedRuntime {
                     developer_instructions: None,
+                    supports_owner_carries: false,
                     supports_cutex_ingress: true,
                     endpoint: AppServerEndpoint::LoopbackWebSocket {
                         url: "ws://127.0.0.1:1".to_string(),
@@ -1906,6 +2025,50 @@ mod tests {
             .status("saturated-close")
             .expect("runtime status")
             .is_none());
+    }
+
+    /// EVA 2026-11-04: a refresh held the manager lock across the bus call,
+    /// while the bus's register handler read this manager. Everything behind
+    /// the lock and the bus's state lock stalled for the 120 s read timeout.
+    #[test]
+    fn registration_refresh_leaves_the_manager_free_during_the_bus_call() {
+        struct ReadsManager {
+            manager: Mutex<Option<AppServerRuntimeManager>>,
+            answered: AtomicUsize,
+        }
+        impl RuntimeAgentBus for ReadsManager {
+            fn register(&self, _: &AgentBusRegisterRequest) -> anyhow::Result<()> {
+                let Some(manager) = self.manager.lock().unwrap().clone() else { return Ok(()) };
+                let (done, wait) = mpsc::sync_channel(1);
+                thread::spawn(move || {
+                    let _ = done.send(manager.status("saturated-close").map(|status| status.is_some()));
+                });
+                if matches!(wait.recv_timeout(Duration::from_secs(5)), Ok(Ok(true))) {
+                    self.answered.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+            fn unregister(&self, _: &str) -> anyhow::Result<bool> { Ok(true) }
+            fn poll(&self, _: &str) -> anyhow::Result<Vec<AgentBusMessage>> { Ok(vec![]) }
+            fn ack(&self, _: &str, ids: &[String]) -> anyhow::Result<usize> { Ok(ids.len()) }
+        }
+        let (manager, _) = connected_saturated_manager();
+        let bus = Arc::new(ReadsManager { manager: Mutex::new(None), answered: AtomicUsize::new(0) });
+        let mut options = AppServerAgentBusBridgeOptions::new(AgentBusRegisterRequest {
+            id: "runtime-refresh".into(), name: "refresh".into(), base_name: None,
+            thread_name: None, path_key: None, session_id: Some("thread-1".into()),
+            profile: "test".into(), cwd: "/test".into(), pid: 42,
+            host_id: Some("test-host".into()), groups: vec![],
+            registration_class: AgentRegistrationClass::Persistent,
+        }, "thread-1");
+        options.registration_only = true;
+        manager.ensure_agent_bus_bridge("saturated-close", bus.clone(), options).unwrap();
+        *bus.manager.lock().unwrap() = Some(manager.clone());
+        let status = manager.refresh_agent_bus_registration("saturated-close").unwrap().unwrap();
+        assert!(status.registered);
+        assert!(bus.answered.load(Ordering::SeqCst) >= 1, "the manager answered during the bus call");
+        *bus.manager.lock().unwrap() = None;
+        manager.disconnect("saturated-close").unwrap();
     }
 
     #[test]
@@ -1974,6 +2137,46 @@ mod tests {
         });
 
         assert!(active_turn_id_from_thread_response(&response).is_none());
+    }
+
+    /// r274.2 item 4 (host-a 11-03): the Claude adapter's resume is `active`
+    /// with no turns; the running turn comes from ONE `thread/turns/list`
+    /// page (newest, no items). A resume that names it, or a thread that is
+    /// not active, reads nothing; an ended newest turn or an unreadable page
+    /// recovers nothing.
+    #[test]
+    fn connect_recovers_the_running_turn_from_the_runtime() {
+        let active = json!({"thread": {"id": "t", "status": {"type": "active", "activeFlags": []}, "turns": []}});
+        let mut calls = Vec::new();
+        let page = |data: Value| {
+            move |method: &str, params: Value| -> Result<Value, String> {
+                assert_eq!(method, "thread/turns/list");
+                assert_eq!(params, json!({"threadId": "t", "cursor": null, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"}));
+                Ok(json!({"data": data.clone(), "nextCursor": null}))
+            }
+        };
+        let mut running = page(json!([{"id": "live", "status": "inProgress", "items": []}]));
+        assert_eq!(recover_active_turn(&active, "t", &mut running).as_deref(), Some("live"));
+        let mut ended = page(json!([{"id": "done", "status": "completed", "items": []}]));
+        assert_eq!(recover_active_turn(&active, "t", &mut ended), None, "the newest turn already ended");
+        let mut empty = page(json!([]));
+        assert_eq!(recover_active_turn(&active, "t", &mut empty), None);
+        let mut unreadable = |_: &str, _: Value| -> Result<Value, String> { Err("unreadable".into()) };
+        assert_eq!(recover_active_turn(&active, "t", &mut unreadable), None);
+        let mut record = |method: &str, _: Value| -> Result<Value, String> {
+            calls.push(method.to_string());
+            Err("must not be called".into())
+        };
+        let named = json!({"thread": {"id": "t", "status": {"type": "active"},
+            "turns": [{"id": "named", "status": "inProgress", "items": []}]}});
+        assert_eq!(recover_active_turn(&named, "t", &mut record).as_deref(), Some("named"));
+        for status in ["idle", "notLoaded", "systemError", "unknown"] {
+            let response = json!({"thread": {"id": "t", "status": {"type": status}, "turns": []}});
+            assert_eq!(recover_active_turn(&response, "t", &mut record), None, "{status}");
+        }
+        let missing = json!({"thread": {"id": "t", "turns": []}});
+        assert_eq!(recover_active_turn(&missing, "t", &mut record), None);
+        assert!(calls.is_empty(), "{calls:?}");
     }
 
     #[cfg(unix)]
@@ -2429,6 +2632,7 @@ mod tests {
                     launch_augmentation: Some(crate::memory::LaunchAugmentation {
                         harness: None,
                         memory: Some(crate::memory::LaunchMemoryContext {
+                            index_snapshot: None,
                             instructions: crate::memory::render_memory_instructions(&scope, None),
                             scope,
                             project_workspace_root: None,
@@ -2810,10 +3014,180 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
+    /// r273.1 O1: Management adopted an Agent-Bus-launched runtime
+    /// (generation 1); the Bus took it offline (the native exits, this
+    /// connection drops) and brought it online again (generation 2). The dead
+    /// generation-1 entry stays in this manager until something replaces it;
+    /// it must not count as "this process already holds the runtime", or the
+    /// late-adoption observer never adopts generation 2 and Management keeps
+    /// reporting the agent offline.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_older_generation_entry_does_not_block_late_adoption_of_a_relaunch() {
+        use crate::app_server::late_adoption::{local_connection_covers, LateAdoptionPlanner, RuntimeOccurrence, SETTLE};
+        let directory = std::env::temp_dir().join(format!("cx-o1-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        fs::create_dir(&directory).expect("create test directory");
+        let socket_path = directory.join("a.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+        let server = thread::spawn(move || {
+            for generation in 1..=2 {
+                let (stream, _) = listener.accept().expect("accept client");
+                let mut socket = tungstenite::accept(stream).expect("accept websocket");
+                initialize_test_connection(&mut socket);
+                let resume = read_json(&mut socket);
+                write_json(
+                    &mut socket,
+                    json!({"id": resume["id"].clone(), "result": {"thread": {"id": "thread-1"}}}),
+                );
+                if generation == 1 {
+                    // The Bus stops the generation-1 native (offline).
+                    socket.close(None).expect("close generation 1");
+                } else {
+                    let _ = socket.read();
+                }
+            }
+        });
+        let manager = AppServerRuntimeManager::without_event_sink();
+        let endpoint = AppServerEndpoint::UnixSocket { socket_path: socket_path.clone() };
+        let journal = directory.join("native-events.jsonl").display().to_string();
+        let schema = AppServerSchemaIdentity {
+            version: "test-schema".to_string(),
+            sha256: "test-schema-sha256".to_string(),
+        };
+        let resume = ThreadResumeParams { thread_id: "thread-1".to_string(), ..Default::default() };
+        let connect = |generation| {
+            manager.connect_endpoint(
+                "cutex-o1", endpoint.clone(), journal.clone(), schema.clone(),
+                ThreadBootstrap::Resume(resume.clone()), generation, "host", None,
+            )
+        };
+        connect(1).expect("adopt generation 1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while manager.status("cutex-o1").unwrap().is_some_and(|status| status.connected) {
+            assert!(std::time::Instant::now() < deadline, "generation 1 never dropped");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // What the observer asks of this process for the durable occurrence.
+        let local = |manager: &AppServerRuntimeManager| {
+            manager.status("cutex-o1").unwrap().map(|status| (status.connected, status.runtime_generation))
+        };
+        assert_eq!(local(&manager), Some((false, 1)), "the dead entry stays until replaced");
+        let occurrence = |generation| RuntimeOccurrence {
+            cutex_session_id: "cutex-o1".into(),
+            runtime_generation: generation,
+            pid: 4242,
+            started_at: "2026-11-02T00:00:00Z".into(),
+            runtime_agent_id: "stock.o1".into(),
+        };
+        // r274: a dead entry of the same generation no longer covers it either.
+        assert!(!local_connection_covers(local(&manager), &occurrence(1)), "same generation, dead");
+        let relaunched = occurrence(2);
+        assert!(!local_connection_covers(local(&manager), &relaunched));
+        let mut planner = LateAdoptionPlanner::default();
+        let start = std::time::Instant::now();
+        let known = |o: &RuntimeOccurrence| local_connection_covers(local(&manager), o);
+        assert!(planner.plan(vec![relaunched.clone()], start, known).is_empty(), "settling");
+        assert_eq!(planner.plan(vec![relaunched.clone()], start + SETTLE, known), vec![relaunched.clone()]);
+        // Adoption replaces the dead entry; afterwards the observer stops.
+        connect(2).expect("adopt generation 2");
+        assert_eq!(local(&manager), Some((true, 2)));
+        assert!(manager.handle_for_generation("cutex-o1", 2).is_ok());
+        planner.adopted(&relaunched, start + SETTLE);
+        assert!(planner.plan(vec![relaunched.clone()], start + SETTLE * 2, known).is_empty());
+        assert!(manager.disconnect("cutex-o1").expect("disconnect"));
+        server.join().expect("server thread");
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    /// r274: the observation link to a live runtime drops while the runtime
+    /// (same binding, same generation) lives on. The drop is announced to the
+    /// late-adoption observer (no store change needed), the dead entry no
+    /// longer covers the occurrence, and reconnecting the same generation
+    /// replaces it; a live entry is left alone.
+    #[test]
+    fn a_dropped_same_generation_link_is_announced_and_reconnectable() {
+        use crate::app_server::late_adoption::{connection_losses, local_connection_covers, RuntimeOccurrence};
+        use std::net::TcpListener;
+        fn read_text<S: std::io::Read + std::io::Write>(socket: &mut tungstenite::WebSocket<S>) -> Value {
+            loop {
+                match socket.read().expect("read websocket") {
+                    tungstenite::Message::Text(text) => return serde_json::from_str(text.as_ref()).expect("json"),
+                    tungstenite::Message::Ping(payload) => socket.send(tungstenite::Message::Pong(payload)).expect("pong"),
+                    message => panic!("unexpected websocket message: {message:?}"),
+                }
+            }
+        }
+        fn write_text<S: std::io::Read + std::io::Write>(socket: &mut tungstenite::WebSocket<S>, value: Value) {
+            socket.send(tungstenite::Message::Text(value.to_string().into())).expect("write websocket");
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("ws://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = thread::spawn(move || {
+            for link in 1..=2 {
+                let (stream, _) = listener.accept().expect("accept client");
+                let mut socket = tungstenite::accept(stream).expect("accept websocket");
+                let initialize = read_text(&mut socket);
+                write_text(&mut socket, json!({"id": initialize["id"].clone(), "result": {"userAgent": "test"}}));
+                assert_eq!(read_text(&mut socket)["method"], "initialized");
+                let resume = read_text(&mut socket);
+                write_text(&mut socket, json!({"id": resume["id"].clone(), "result": {"thread": {"id": "thread-1"}}}));
+                if link == 1 {
+                    // The link drops; the runtime itself stays up.
+                    socket.close(None).expect("close link 1");
+                    let _ = socket.flush();
+                } else {
+                    let _ = socket.read();
+                }
+            }
+        });
+        let directory = std::env::temp_dir().join(format!("cx-r274-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let manager = AppServerRuntimeManager::without_event_sink();
+        let endpoint = AppServerEndpoint::LoopbackWebSocket { url, bearer_token: None };
+        let journal = directory.join("native-events.jsonl").display().to_string();
+        let schema = AppServerSchemaIdentity { version: "test-schema".into(), sha256: "test-schema-sha256".into() };
+        let resume = ThreadResumeParams { thread_id: "thread-1".to_string(), ..Default::default() };
+        let session = format!("cutex-r274-{}", uuid::Uuid::new_v4().simple());
+        let connect = || {
+            manager.connect_endpoint(
+                &session, endpoint.clone(), journal.clone(), schema.clone(),
+                ThreadBootstrap::Resume(resume.clone()), 1, "host", None,
+            )
+        };
+        let local = || manager.status(&session).unwrap().map(|status| (status.connected, status.runtime_generation));
+        let occurrence = RuntimeOccurrence {
+            cutex_session_id: session.clone(),
+            runtime_generation: 1,
+            pid: 4242,
+            started_at: "2026-11-02T00:00:00Z".into(),
+            runtime_agent_id: "stock.r274".into(),
+        };
+        let losses = connection_losses();
+        connect().expect("connect link 1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while local() != Some((false, 1)) {
+            assert!(std::time::Instant::now() < deadline, "link 1 never dropped: {:?}", local());
+            thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while connection_losses() == losses {
+            assert!(std::time::Instant::now() < deadline, "the drop was not announced");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!local_connection_covers(local(), &occurrence), "a dead same-generation entry does not cover");
+        connect().expect("reconnect the same generation");
+        assert_eq!(local(), Some((true, 1)), "the dead entry was replaced");
+        assert!(local_connection_covers(local(), &occurrence), "a live entry: no churn");
+        assert!(manager.disconnect(&session).expect("disconnect"));
+        server.join().expect("server thread");
+        let _ = fs::remove_dir_all(directory);
+    }
+
     #[test]
     fn native_turn_events_update_active_turn_status() {
         let session = format!("admission-native-events-{}", uuid::Uuid::new_v4());
         let status = Arc::new(Mutex::new(AppServerManagedRuntimeStatus {
+            background_work: Default::default(),
             cutex_session_id: session.clone(),
             thread_id: "thread-1".to_string(),
             runtime_generation: 1,
@@ -3024,6 +3398,11 @@ mod tests {
                     &mut socket,
                     json!({ "id": resume["id"].clone(), "result": { "thread": { "id": "thread-1", "status": { "type": "active", "activeFlags": [] } } } }),
                 );
+                let turns = read_json(&mut socket);
+                assert_eq!(turns["method"], "thread/turns/list");
+                write_json(&mut socket, json!({"id": turns["id"].clone(), "result": {
+                    "data": [{"id":"turn-1","status":"inProgress","items":[]}], "nextCursor": null
+                }}));
                 subscribers.push(socket);
             }
         });
@@ -3297,7 +3676,17 @@ mod tests {
         loop {
             match socket.read().expect("read websocket") {
                 Message::Text(text) => {
-                    return serde_json::from_str(text.as_ref()).expect("parse websocket JSON");
+                    let request: Value = serde_json::from_str(text.as_ref()).expect("parse websocket JSON");
+                    let inventory = match request.get("method").and_then(Value::as_str) {
+                        Some("claude/tasks/list") => Some(json!({"tasks":[],"completeInventory":false})),
+                        Some("thread/backgroundTerminals/list" | "thread/loaded/list") => Some(json!({"data":[],"nextCursor":null})),
+                        _ => None,
+                    };
+                    if let Some(result) = inventory {
+                        write_json(socket, json!({"id":request["id"],"result":result}));
+                        continue;
+                    }
+                    return request;
                 }
                 Message::Ping(payload) => socket
                     .send(Message::Pong(payload))

@@ -11,6 +11,10 @@ impl AgentManagementProvider {
     ) -> Result<AgentArchiveReceipt, AgentManagementError> {
         let state = self.store().snapshot()?;
         let id = &request.review.cutex_session_id;
+        let project = state.agents.get(id).and_then(|agent|super::super::current_project_id(&state,agent));
+        let _name_scope = crate::agent_names::mutation_scope::enter(
+            crate::agent_names::NameScope::for_project(project.as_ref().map(|project|project.as_str())),
+        );
         let restoring = request.review.operation == AgentArchiveOperation::Restore;
         let permanent = request.review.operation == AgentArchiveOperation::PermanentRetire;
         let finishing_permanent = permanent
@@ -72,6 +76,17 @@ impl AgentManagementProvider {
                     before.durable_revision(),
                 )?;
                 require_free_restore_name(&sessions, &before)?;
+                if let Some(name) = before.formal_agent_name.as_deref() {
+                    crate::session::store::assert_formal_name_available_at(
+                        path, &crate::agent_names::mutation_scope::current(), name, Some(id.as_str()),
+                    ).map_err(|error| {
+                        if let Some(detail)=error.downcast_ref::<crate::agent_names::NameError>() {
+                            let mut detail=detail.clone();detail.details["name"]=serde_json::json!(name);
+                            return anyhow::Error::new(detail);
+                        }
+                        error
+                    })?;
+                }
             } else if !(permanent && before.is_retired()) {
                 crate::session::archive::validate_retire_preconditions(
                     &before,
@@ -213,6 +228,11 @@ impl AgentManagementProvider {
                     .insert(request.action_id.to_string(), receipt.clone());
                 if let Err(error) = crate::session::store::save_locked_session_store(path, sessions)
                 {
+                    // The name guard runs inside the SQLite transaction before
+                    // commit. A collision is a known refusal, never uncertainty.
+                    if error.downcast_ref::<crate::agent_names::NameError>().is_some() {
+                        return Err(error);
+                    }
                     receipt.stage = AgentArchiveStage::Uncertain;
                     receipt.error = Some(format!(
                         "durable_commit_uncertain_replay_same_action: {error:#}"
@@ -223,6 +243,18 @@ impl AgentManagementProvider {
             })
         })();
         outcome.map_err(|error| {
+            if let Some(name_error) = error.downcast_ref::<crate::agent_names::NameError>() {
+                if matches!(name_error.code, "agent_name_reserved" | "agent_name_conflict") {
+                    let mut name_error = name_error.clone();
+                    if name_error.code == "agent_name_conflict" {
+                        name_error.code = "agent_name_taken";
+                    }
+                    name_error.message.push_str("; rename this archived agent before restoring it");
+                    name_error.details["scope"] = serde_json::to_value(crate::agent_names::mutation_scope::current()).unwrap();
+                    name_error.details["renameRequired"] = serde_json::json!(true);
+                    return AgentManagementError::NameConflict(name_error);
+                }
+            }
             error
                 .downcast_ref::<AgentManagementError>()
                 .cloned()
@@ -235,14 +267,17 @@ fn require_free_restore_name(
     sessions: &crate::session::model::CutexSessionStore,
     record: &CutexSessionRecord,
 ) -> anyhow::Result<()> {
-    if let Some(holder) = crate::session::metadata::live_formal_name_holder(sessions, record) {
-        return Err(
-            crate::session::archive::CutexSessionArchiveError::AgentNameTaken {
-                name: record.formal_agent_name.clone().unwrap_or_default(),
-                holder: holder.cutex_session_id.clone(),
-            }
-            .into(),
-        );
+    if let Some(holder) = sessions.sessions.values().find(|other| {
+        other.cutex_session_id != record.cutex_session_id && !other.is_retired()
+            && record.formal_agent_name.as_deref().zip(other.formal_agent_name.as_deref())
+                .is_some_and(|(name,other)|name.eq_ignore_ascii_case(other))
+    }) {
+        let name = record.formal_agent_name.clone().unwrap_or_default();
+        let mut error = crate::agent_names::NameError::new("agent_name_taken",
+            format!("the name '{name}' belongs to the active agent {}; rename this archived agent before restoring it",holder.cutex_session_id));
+        error.details = serde_json::json!({"name":name,"holderSessionIds":[holder.cutex_session_id],
+            "scope":crate::agent_names::mutation_scope::current(),"renameRequired":true});
+        return Err(AgentManagementError::NameConflict(error).into());
     }
     Ok(())
 }

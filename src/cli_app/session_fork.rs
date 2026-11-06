@@ -391,6 +391,7 @@ pub(crate) fn fork_for_management(
     cutex_session_id: &str,
     request: &SessionForkRequest,
 ) -> Result<Value, UserInputExecutionError> {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared().map_err(|e| failed("runtime reference fence", e, json!({})))?;
     let lane = cutex::management::v2::user_input::session_input_lock(cutex_session_id)
         .map_err(|error| failed("reserving fork source", error, json!({})))?;
     let _operation = lane.reserve()
@@ -406,6 +407,12 @@ pub(crate) fn fork_for_management(
         )
     })?;
     let source = store.sessions[&key].clone();
+    let roster = cutex::memory::load_agent_management_directory()
+        .map_err(|error|failed("reading fork name scope",error,json!({})))?;
+    let name_project = cutex::memory::project_for_session(&roster,&source.cutex_session_id);
+    let _name_scope = cutex::agent_names::mutation_scope::enter(
+        cutex::agent_names::NameScope::for_project(name_project.as_ref().map(|project|project.as_str())),
+    );
     if source.dsh_session.is_some() {
         return super::dsh_structure::fork(principal, &source, request);
     }

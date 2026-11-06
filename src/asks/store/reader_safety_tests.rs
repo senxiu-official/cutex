@@ -31,7 +31,7 @@ fn reader_writer_process_probe() {
         let (mut ask, _) = s.create_ask(tests::new_ask("seed", "fixture"), Utc::now()).unwrap();
         s.asks.clear();
         ask.body = tests::body(&"x".repeat(32*1024));
-        for n in 0..256 { ask.ask_id = format!("probe-{n}"); s.asks.insert(ask.ask_id.clone(), ask.clone()); }
+        for n in 0..256 { ask.ask_id = format!("probe-{n}"); s.asks.insert(ask.ask_id.clone(), ask.clone().into()); }
     }).unwrap();
     std::fs::write(dir.join("private-reader-probe"), b"owned synthetic test").unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())

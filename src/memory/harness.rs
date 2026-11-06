@@ -128,7 +128,7 @@ fn agent_name(record: &CutexSessionRecord) -> String {
 
 /// Project (display name, id) of a session, best effort.
 fn project_of(cutex_session_id: &str) -> Option<(String, String)> {
-    let snapshot = super::load_agent_management_snapshot().ok()?;
+    let snapshot = super::load_agent_management_directory().ok()?;
     let project_id = super::project_for_session(&snapshot, cutex_session_id)?;
     let presentation = crate::agent_management::effective_presentation(
         &project_id,
@@ -160,7 +160,7 @@ pub fn harness_facts(record: &CutexSessionRecord) -> HarnessFacts {
 /// `Director of project X` / `operator of project X`, from the Agent
 /// Management store at launch (the same facts that select the tools).
 fn role_of(cutex_session_id: &str) -> Option<String> {
-    let snapshot = super::load_agent_management_snapshot().ok()?;
+    let snapshot = super::load_agent_management_directory().ok()?;
     let name = |project: &crate::agent_management::ProjectId| {
         crate::agent_management::effective_presentation(project, snapshot.project_presentations.get(project)).display_name
     };
@@ -180,14 +180,19 @@ fn role_of(cutex_session_id: &str) -> Option<String> {
 
 /// The `# Cutex` section for `record` (ignores the toggle).
 pub fn render_cutex_harness(record: &CutexSessionRecord) -> String {
-    render_with_browser(&harness_facts(record), crate::agent_bus::tool_policy::browser_tools_for_record(record))
+    render_with_browser(&harness_facts(record), crate::agent_bus::tool_policy::browser_surface_for_record(record))
 }
 
-fn render_with_browser(facts: &HarnessFacts, browser: bool) -> String {
+fn render_with_browser(facts: &HarnessFacts, browser: Option<crate::agent_bus::mcp_browser::Surface>) -> String {
     let mut out = render_cutex_harness_with(facts);
     // `browser` already requires an agent or a quick chat whose profile
     // opted in; a quick chat has the browser tools without the cutex tools.
-    if browser { out.push_str(crate::config::agent_harness::BROWSER_INSTRUCTION); }
+    match browser {
+        Some(crate::agent_bus::mcp_browser::Surface::Legacy) => out.push_str(crate::config::agent_harness::BROWSER_INSTRUCTION),
+        Some(crate::agent_bus::mcp_browser::Surface::Command) => out.push_str(crate::config::agent_harness::BROWSER_COMMAND_INSTRUCTION),
+        Some(crate::agent_bus::mcp_browser::Surface::Script) => out.push_str(crate::config::agent_harness::BROWSER_SCRIPT_INSTRUCTION),
+        None => {}
+    }
     out
 }
 
@@ -212,10 +217,17 @@ pub fn launch_harness(record: &CutexSessionRecord) -> Option<String> {
 /// `project_doc_max_bytes` default), per scope.
 pub const AGENTS_MD_MAX_BYTES: usize = 32 * 1024;
 
-/// Most bytes of the whole Claude system prompt append. The SDK passes it
-/// on the Claude Code command line (`--append-system-prompt`): Windows caps
-/// a whole command line at 32767 UTF-16 units, Linux one argument at 128 KiB.
-pub const CLAUDE_APPEND_MAX_BYTES: usize = if cfg!(windows) { 16 * 1024 } else { 64 * 1024 };
+/// File-backed appends share the DSH/Kimi instruction budget. Old adapters
+/// still pass the text in argv and retain their conservative platform budget.
+pub const CLAUDE_APPEND_MAX_BYTES: usize = 64 * 1024;
+pub const CLAUDE_LEGACY_APPEND_MAX_BYTES: usize = if cfg!(windows) { 16 * 1024 } else { 64 * 1024 };
+
+/// Never leave a partial instruction/index line in a shortened section.
+fn whole_line_prefix(text: &str, budget: usize) -> &str {
+    if text.len() <= budget { return text; }
+    let prefix = crate::asks::byte_prefix(text, budget);
+    &text[..prefix.rfind('\n').map_or(0, |end| end + 1)]
+}
 
 /// AGENTS.md text of one scope and the files it came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,10 +241,12 @@ impl AgentsMd {
     /// The section the way Codex shows project docs (cut at
     /// [`AGENTS_MD_MAX_BYTES`]).
     pub fn section(&self) -> String {
-        let shown = crate::asks::byte_prefix(&self.text, AGENTS_MD_MAX_BYTES);
+        let shown = whole_line_prefix(&self.text, AGENTS_MD_MAX_BYTES);
         let mut out = format!("# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{shown}\n", self.label);
         if shown.len() < self.text.len() {
             out.push_str(&format!("[truncated at {} KiB]\n", AGENTS_MD_MAX_BYTES / 1024));
+            out.push_str("Read the full instruction files before working:\n");
+            for file in &self.files { out.push_str(&format!("- {}\n", file.display())); }
         }
         out.push_str("</INSTRUCTIONS>");
         out
@@ -331,18 +345,30 @@ pub fn user_agents_md() -> Option<AgentsMd> {
 /// project AGENTS.md files that a CLAUDE.md next to them imports are left to
 /// Claude Code (no double injection); every other AGENTS.md stays here.
 pub fn claude_system_append_sections(record: &CutexSessionRecord) -> Vec<(&'static str, String)> {
+    let file_append = record.claude_session.as_ref().is_some_and(|session|
+        crate::runtime::claude::adapter_features(&session.deployment.adapter_source)["systemAppendFile"] == true);
+    claude_system_append_sections_with_transport(record, file_append)
+}
+
+pub fn claude_system_append_sections_with_transport(record: &CutexSessionRecord, file_append: bool) -> Vec<(&'static str, String)> {
+    claude_system_append_with_snapshot(record, file_append).0
+}
+
+pub fn claude_system_append_with_snapshot(record: &CutexSessionRecord, file_append: bool) -> (Vec<(&'static str, String)>, Option<super::idle_note::Snapshot>) {
     let cwd = Path::new(&record.cwd);
     let claude_md = crate::runtime::claude::code_sources::project_settings_active(record);
     let memory = super::launch_memory_context_or_warn(&record.cutex_session_id);
     let root = memory.as_ref().map(|memory| memory.file_reference_root(cwd)).unwrap_or(cwd);
-    compose_claude_sections(
+    let snapshot = memory.as_ref().and_then(|memory| memory.index_snapshot.clone());
+    let sections = compose_claude_sections(
         launch_harness(record),
         user_agents_md(),
         project_agents_md_except(cwd, |dir| claude_md && claude_md_imports_agents_md(dir)),
         super::render_file_citation_instructions(root),
         memory.map(|memory| memory.instructions),
-        CLAUDE_APPEND_MAX_BYTES,
-    )
+        if file_append { CLAUDE_APPEND_MAX_BYTES } else { CLAUDE_LEGACY_APPEND_MAX_BYTES },
+    );
+    (sections, snapshot)
 }
 
 /// [`claude_system_append_sections`] from its parts, within `budget` bytes:
@@ -382,11 +408,12 @@ pub fn compose_claude_sections(
     }
     let mut sections = build(false, false, None);
     if let Some(memory) = &memory {
-        let note = "\n[# Memory cut here to fit the system prompt; read the rest of MEMORY.md from the memory directory above]";
+        let pointer = memory.lines().find(|line| line.starts_with("Full index: "))
+            .unwrap_or("Full index: MEMORY.md in the project's memory directory.");
+        let note = format!("\n[# Memory cut here to fit the system prompt. Before relying on memory, read the full index; this excerpt is incomplete.]\n{pointer}\n");
         let used = join_sections(&sections).len() + 2;
         let room = budget.saturating_sub(used + note.len());
-        let cut = crate::asks::byte_prefix(memory, room);
-        let cut = &cut[..cut.rfind('\n').unwrap_or(cut.len())];
+        let cut = whole_line_prefix(memory, room).trim_end_matches('\n');
         sections.push(("memory", format!("{cut}{note}")));
     }
     sections
@@ -487,6 +514,68 @@ mod tests {
         assert!(text.len() <= small, "{}", text.len());
         assert!(tiny[1].1.contains("too long") && tiny[2].1.contains("too long"));
         assert!(text.contains("— more\n[# Memory cut here"), "cut on a line boundary: {}", &text[text.len() - 300..]);
+    }
+
+    #[test]
+    fn file_append_keeps_a_normal_chinese_index_and_full_agents() {
+        let index = format!("{}- [last](last.md) — 中文最后一行\n", "- [记忆](memory.md) — 中文索引记录\n".repeat(199));
+        let index = format!("{}{}", "中".repeat((25 * 1024 - index.len()) / 3), index);
+        let memory = format!("# Memory\nFull index: `/memory/MEMORY.md`\n{}\n## Current MEMORY.md\n{index}", "instructions\n".repeat(200));
+        for budget in [CLAUDE_APPEND_MAX_BYTES, crate::runtime::kimi::KIMI_INSTRUCTIONS_MAX_BYTES] {
+            let sections = compose_claude_sections(Some(render_cutex_harness_with(&facts())), Some(docs("user", 3000)), Some(docs("repo", 20000)), "# File references\n".into(), Some(memory.clone()), budget);
+            let text = join_sections(&sections);
+            assert!(text.len() <= budget && text.contains(&index));
+            assert_eq!(sections.iter().find(|(id, _)| *id == "agentsMdProject").unwrap().1, docs("repo", 20000).section());
+        }
+        let legacy = join_sections(&compose_claude_sections(Some(render_cutex_harness_with(&facts())), Some(docs("user", 3000)), Some(docs("repo", 20000)), "# File references\n".into(), Some(memory), 16 * 1024));
+        assert!(!legacy.contains("中文最后一行") && legacy.contains("Before relying on memory, read the full index"));
+        assert!(legacy.contains("Full index: `/memory/MEMORY.md`"));
+    }
+
+    #[test]
+    fn shortening_never_keeps_a_partial_first_line() {
+        assert_eq!(whole_line_prefix("中文大行\nnext\n", 5), "");
+        assert_eq!(whole_line_prefix("first\n中文大行\n", 10), "first\n");
+        let text = docs("repo", AGENTS_MD_MAX_BYTES + 10).section();
+        assert!(!text.contains("rrrr") && text.contains("Read the full instruction files before working"));
+    }
+
+    /// Read exactly the explicitly supplied MEMORY.md, never the surrounding home.
+    #[test]
+    #[ignore = "opt-in read-only project index comparison"]
+    fn project_index_append_budget_probe() {
+        let path = std::path::PathBuf::from(std::env::var("CUTEX_APPEND_PROBE_INDEX").expect("explicit MEMORY.md path"));
+        assert_eq!(path.file_name().unwrap(), "MEMORY.md");
+        let bytes = std::fs::read(&path).unwrap();
+        let index = String::from_utf8(bytes.clone()).unwrap();
+        let scope = super::super::ProjectMemoryScope { project_id: crate::agent_management::ProjectId::new("cutex-e").unwrap(), dir: path.parent().unwrap().to_path_buf() };
+        let memory = super::super::render_memory_instructions(&scope, Some(&index));
+        let project = std::env::var("CUTEX_APPEND_PROBE_PROJECT").ok().and_then(|p| project_agents_md(Path::new(&p)));
+        let user = std::env::var("CUTEX_APPEND_PROBE_USER").ok().and_then(|p| read_agents_file(Path::new(&p))).map(|(path, text)| AgentsMd { label: "the user".into(), files: vec![path], text });
+        let mut rows = Vec::new();
+        // Reproduce r276.1 with the same facts/files: its shorter guidance,
+        // original note and byte-prefix/last-newline implementation.
+        let legacy_memory = memory
+            .replace(&format!("Full index: `{}`\n\n", scope.dir.join("MEMORY.md").display()), "")
+            .replace(". Prepend new entries at the top so the newest memories survive truncation; update an existing entry in place:", ":");
+        let mut baseline = vec![("cutex", render_cutex_harness_with(&facts()))];
+        if let Some(user) = &user { baseline.push(("agentsMdUser", user.pointer())); }
+        if let Some(project) = &project { baseline.push(("agentsMdProject", project.pointer())); }
+        baseline.push(("fileReferences", "# File references\n\nRead file links relative to C:/Tools/cutex-desktop.\n".into()));
+        let note = "\n[# Memory cut here to fit the system prompt; read the rest of MEMORY.md from the memory directory above]";
+        let room = (16_usize * 1024).saturating_sub(join_sections(&baseline).len() + 2 + note.len());
+        let cut = crate::asks::byte_prefix(&legacy_memory, room);
+        let cut = &cut[..cut.rfind('\n').unwrap_or(cut.len())];
+        baseline.push(("memory", format!("{cut}{note}")));
+        let text = join_sections(&baseline);
+        rows.push(serde_json::json!({"revision":"4eddce22 baseline","budget":16384,"appendBytes":text.len(),"keptEntries":index.lines().filter(|line| line.starts_with("- [") && text.contains(*line)).count(),"lastLinePresent":text.contains(index.lines().last().unwrap()),"projectAgentsFull":false,"cutNote":true}));
+        for budget in [16 * 1024, CLAUDE_APPEND_MAX_BYTES] {
+            let text = join_sections(&compose_claude_sections(Some(render_cutex_harness_with(&facts())), user.clone(), project.clone(), "# File references\n\nRead file links relative to C:/Tools/cutex-desktop.\n".into(), Some(memory.clone()), budget));
+            rows.push(serde_json::json!({"budget":budget,"appendBytes":text.len(),"keptEntries":index.lines().filter(|line| line.starts_with("- [") && text.contains(*line)).count(),"lastLinePresent":text.contains(index.lines().last().unwrap()),"projectAgentsFull":project.as_ref().is_some_and(|p|text.contains(&p.section())),"cutNote":text.contains("# Memory cut here")}));
+        }
+        println!("APPEND_PROBE {}", serde_json::json!({"indexBytes":bytes.len(),"lines":index.lines().count(),"entries":index.lines().filter(|line|line.starts_with("- [")).count(),"utf16Units":index.encode_utf16().count(),"rows":rows}));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "read-only probe changed the index");
+        assert_eq!(rows[2]["lastLinePresent"], true);
     }
 
     fn facts() -> HarnessFacts {
@@ -623,13 +712,16 @@ mod tests {
 
     #[test]
     fn browser_harness_only_with_explicit_tools_opt_in() {
+        use crate::agent_bus::mcp_browser::Surface;
         let mut f = facts();
-        assert!(!render_with_browser(&f, false).contains("browser_*"));
-        assert!(render_with_browser(&f, true).contains("use browser_* tools"));
+        assert!(!render_with_browser(&f, None).contains("browser"));
+        assert!(render_with_browser(&f, Some(Surface::Legacy)).contains("use browser_* tools"));
+        let command = render_with_browser(&f, Some(Surface::Command));
+        assert!(command.contains("use the browser tool") && !command.contains("browser_*"));
         // A quick chat: browser tools without the cutex agent tools.
         f.cutex_tools = false;
-        let text = render_with_browser(&f, true);
+        let text = render_with_browser(&f, Some(Surface::Legacy));
         assert!(text.contains("use browser_* tools") && !text.contains("## Cutex tools"));
-        assert!(!render_with_browser(&f, false).contains("browser_*"));
+        assert!(!render_with_browser(&f, None).contains("browser_*"));
     }
 }

@@ -1,0 +1,30 @@
+{
+  "schema": "cutex/external-runtime/v1",
+  "name": "dsh-runtime",
+  "version": "dsh-r3",
+  "payload": "adapter-v1",
+  "externalRoot": {
+    "kind": "npm-prefix",
+    "packages": {
+      "@deepseek-ai/dsh": "0.2.1-rc.3",
+      "@deepseek-ai/dsh-session-format-catalog": "0.2.1-rc.3",
+      "ws": "8.22.0"
+    },
+    "cliEntry": "node_modules/@deepseek-ai/dsh/lib/bin.js",
+    "catalogEntry": "node_modules/@deepseek-ai/dsh-session-format-catalog/lib/index.js"
+  },
+  "node": {
+    "range": ">=24.9.0 <25",
+    "recommended": "24.21.0",
+    "features": [
+      "node:sqlite"
+    ]
+  },
+  "checks": {
+    "rg": false,
+    "nodePty": false
+  },
+  "environment": {
+    "installRoot": "DSH_INSTALL_ROOT"
+  }
+}

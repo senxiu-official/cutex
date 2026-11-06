@@ -87,15 +87,7 @@ impl HumanCreateAgentRequest {
                 "requestId must be a non-empty string of at most 256 characters",
             ));
         }
-        if self.name.trim().is_empty()
-            || self.name.trim() != self.name
-            || self.name.chars().count() > HUMAN_AGENT_NAME_MAX_CHARS
-            || self.name.chars().any(char::is_control)
-        {
-            return Err(validation_error(
-                "name must be a trimmed, non-empty agent name of at most 128 characters",
-            ));
-        }
+        crate::agent_names::validate_new_name(&self.name).map_err(validation_error)?;
         if let Some(profile) = &self.profile {
             if profile.trim().is_empty() || profile.chars().any(char::is_control) {
                 return Err(validation_error("profile must be a non-empty string"));

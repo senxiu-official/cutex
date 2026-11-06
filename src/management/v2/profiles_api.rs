@@ -1035,6 +1035,7 @@ const PATCH_FIELDS: &[&str] = &[
     "nativeSubagents",
     "delegationWait",
     "browserTools",
+    "browserToolSurface",
     "proxy",
     "searchTool",
     "privateChatgptAuthFile",
@@ -1445,6 +1446,11 @@ pub(crate) fn parse_patch(body: &[u8]) -> Result<ProfileApiPatch, String> {
             Some(Value::Bool(value)) => Some(*value),
             Some(_) => return Err("browserTools: must be a boolean".into()),
         },
+        browser_tool_surface: match body.get("browserToolSurface") {
+            None => None,
+            Some(value) => Some(value.as_str().and_then(crate::profiles::model::BrowserToolSurface::parse)
+                .ok_or("browserToolSurface: must be auto, command, script or legacy")?),
+        },
         proxy: match body.get("proxy") {
             None => None,
             Some(Value::Null) => Some(crate::config::proxy::ProxyUpdate(Map::from_iter([("mode".to_string(), json!("inherit"))]))),
@@ -1693,6 +1699,9 @@ mod tests {
         assert_eq!(parse_patch(br#"{"proxy":null}"#).unwrap().proxy.unwrap().0["mode"], "inherit");
         assert!(parse_patch(br#"{"proxy":"http://x"}"#).is_err());
         assert_eq!(parse_patch(br#"{"browserTools":true}"#).unwrap().browser_tools,Some(true));
+        assert_eq!(parse_patch(br#"{"browserToolSurface":"legacy"}"#).unwrap().browser_tool_surface,Some(crate::profiles::model::BrowserToolSurface::Legacy));
+        assert_eq!(parse_patch(br#"{}"#).unwrap().browser_tool_surface,None);
+        for bad in [br#"{"browserToolSurface":"evaluate"}"#.as_slice(),br#"{"browserToolSurface":null}"#,br#"{"browserToolSurface":1}"#] { assert!(parse_patch(bad).unwrap_err().starts_with("browserToolSurface: ")); }
         assert_eq!(parse_patch(br#"{"browserTools":false}"#).unwrap().browser_tools,Some(false));
         assert_eq!(parse_patch(br#"{}"#).unwrap().browser_tools,None);
         for bad in [br#"{"browserTools":null}"#.as_slice(),br#"{"browserTools":"true"}"#,br#"{"browserTools":1}"#] {

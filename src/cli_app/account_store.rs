@@ -300,10 +300,7 @@ fn auth_file_has_non_empty_api_key(path: &Path) -> bool {
         .flatten()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .is_some_and(|auth| {
-            auth.get("OPENAI_API_KEY")
-                .or_else(|| auth.get("openai_api_key"))
-                .and_then(Value::as_str)
-                .is_some_and(|key| !key.trim().is_empty())
+            cutex::profiles::api_key::from_auth(&auth).is_some()
         })
 }
 
@@ -418,6 +415,7 @@ fn migrate_legacy_store_v2_to_v3(
         let account = StoredAccount {
             options: Default::default(),
             browser_tools: false,
+            browser_tool_surface: Default::default(),
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,

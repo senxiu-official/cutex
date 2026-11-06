@@ -181,6 +181,76 @@ pub fn plan_with_protected_roots(
     cutoff: DateTime<Utc>,
     sidecar: &BTreeSet<String>,
 ) -> anyhow::Result<BTreeSet<RowKey>> {
+    plan_graph(state, cutoff, sidecar).map(|(movable, _)| movable)
+}
+
+/// One bounded rolling pass (r273): the rows of whole reference components
+/// of the movable set, oldest component first, until `max_asks` asks are
+/// selected (at least one component). A component is closed under every
+/// reference among movable rows, so moving any union of components leaves
+/// no retained row naming a moved one; the rest stay for the next pass.
+/// Returns the selected keys and how many movable asks were deferred.
+pub fn plan_rolling(
+    state: &AskState,
+    cutoff: DateTime<Utc>,
+    sidecar: &BTreeSet<String>,
+    max_asks: usize,
+) -> anyhow::Result<(BTreeSet<RowKey>, usize)> {
+    let (movable, edges) = plan_graph(state, cutoff, sidecar)?;
+    // Undirected adjacency restricted to the movable set.
+    let mut adjacent: BTreeMap<&RowKey, Vec<&RowKey>> = BTreeMap::new();
+    for (source, targets) in &edges {
+        if !movable.contains(source) {
+            continue;
+        }
+        for target in targets.iter().filter(|target| movable.contains(*target)) {
+            adjacent.entry(source).or_default().push(target);
+            adjacent.entry(target).or_default().push(source);
+        }
+    }
+    let mut seen: BTreeSet<&RowKey> = BTreeSet::new();
+    let mut components: Vec<(String, usize, Vec<&RowKey>)> = Vec::new();
+    for key in &movable {
+        if !seen.insert(key) {
+            continue;
+        }
+        let mut members = vec![key];
+        let mut queue = VecDeque::from([key]);
+        while let Some(next) = queue.pop_front() {
+            for neighbour in adjacent.get(next).into_iter().flatten() {
+                if seen.insert(neighbour) {
+                    members.push(neighbour);
+                    queue.push_back(neighbour);
+                }
+            }
+        }
+        let asks: Vec<&RowKey> = members.iter().copied().filter(|k| k.0 == "asks").collect();
+        let oldest = asks
+            .iter()
+            .filter_map(|k| state.asks.get(&k.1).and_then(|ask| ask.closed_at.clone()))
+            .min()
+            .unwrap_or_default();
+        components.push((oldest, asks.len(), members));
+    }
+    components.sort_by(|a, b| a.0.cmp(&b.0));
+    let total_asks: usize = components.iter().map(|c| c.1).sum();
+    let mut selected = BTreeSet::new();
+    let mut asks = 0;
+    for (_, count, members) in components {
+        if asks >= max_asks.max(1) {
+            break;
+        }
+        asks += count;
+        selected.extend(members.into_iter().cloned());
+    }
+    Ok((selected, total_asks.saturating_sub(asks)))
+}
+
+fn plan_graph(
+    state: &AskState,
+    cutoff: DateTime<Utc>,
+    sidecar: &BTreeSet<String>,
+) -> anyhow::Result<(BTreeSet<RowKey>, BTreeMap<RowKey, BTreeSet<RowKey>>)> {
     let rows = super::store::ask_state_rows(state)?;
     let mut candidates = BTreeSet::new();
     for (id, ask) in &state.asks {
@@ -336,7 +406,7 @@ pub fn plan_with_protected_roots(
         }
     }
     candidates.retain(|key| !protected.contains(key));
-    Ok(candidates)
+    Ok((candidates, edges))
 }
 
 fn open(path: &Path) -> anyhow::Result<Connection> {
@@ -466,6 +536,30 @@ pub fn move_rows(
     cutoff: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<MoveReport> {
+    move_rows_with_policy(path, expected, keys, Some(cutoff), now)
+}
+
+/// Rolling archive move (r273): same copy-verify-remove transaction and
+/// generation CAS, under an existing policy whose fixed cutoff is left as
+/// it is. The on-disk format is unchanged (rows in `asks_archive_rows`, the
+/// persisted cutoff untouched), so r271.x reads these rows like any other
+/// cold rows and its own startup pass keeps using its fixed cutoff.
+pub fn move_rows_rolling(
+    path: &Path,
+    expected: u64,
+    keys: &BTreeSet<RowKey>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<MoveReport> {
+    move_rows_with_policy(path, expected, keys, None, now)
+}
+
+fn move_rows_with_policy(
+    path: &Path,
+    expected: u64,
+    keys: &BTreeSet<RowKey>,
+    cutoff: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<MoveReport> {
     let mut db = open(path)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current = generation(&tx, expected)?;
@@ -477,14 +571,20 @@ pub fn move_rows(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    if let Some((version, value)) = persisted {
-        anyhow::ensure!(
+    match (persisted, cutoff) {
+        (Some((version, value)), Some(cutoff)) => anyhow::ensure!(
             version == ARCHIVE_SCHEMA && super::parse_time(&value) == Some(cutoff),
             "ask archive cutoff/schema mismatch; explicit reconfiguration required"
-        );
-    } else {
-        tx.execute("INSERT INTO asks_archive_meta(singleton,schema_version,cutoff,active) VALUES(1,?1,?2,1)",
-            params![ARCHIVE_SCHEMA, super::now_rfc3339(cutoff)])?;
+        ),
+        (Some((version, _)), None) => anyhow::ensure!(
+            version == ARCHIVE_SCHEMA,
+            "ask archive schema mismatch; no rolling archive"
+        ),
+        (None, Some(cutoff)) => {
+            tx.execute("INSERT INTO asks_archive_meta(singleton,schema_version,cutoff,active) VALUES(1,?1,?2,1)",
+                params![ARCHIVE_SCHEMA, super::now_rfc3339(cutoff)])?;
+        }
+        (None, None) => anyhow::bail!("ask archive policy missing; the startup archive pass creates it first"),
     }
     let mut report = MoveReport {
         generation: expected,
@@ -564,6 +664,29 @@ pub fn history_rows(path: &Path) -> anyhow::Result<Rows> {
             result.insert(key, bytes);
         }
     }
+    append_archived_rows(&tx, &mut result)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Only the permanent cold rows (digest-verified). History readers that
+/// already hold the decoded hot generation (under the ask store lock, so no
+/// move can run concurrently) decode just these instead of every hot row
+/// again (r273 stab).
+pub fn archived_rows(path: &Path) -> anyhow::Result<Rows> {
+    let db = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    let tx = db.unchecked_transaction()?;
+    let mut result = Rows::new();
+    append_archived_rows(&tx, &mut result)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+fn append_archived_rows(tx: &rusqlite::Transaction<'_>, result: &mut Rows) -> anyhow::Result<()> {
     if tx
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='asks_archive_rows'",
@@ -593,8 +716,7 @@ pub fn history_rows(path: &Path) -> anyhow::Result<Rows> {
             );
         }
     }
-    tx.commit()?;
-    Ok(result)
+    Ok(())
 }
 
 /// Cheap namespace inventory for short-ID collision detection. It contains
@@ -750,29 +872,154 @@ pub fn find_by_action(
 
 /// Read just the cold connected components named by an explicit resource
 /// argument. Do not rebuild all historical answers to resolve an agent name.
+///
+/// r273: no scan of every archived identity per lookup. An exact identity
+/// (or agent name) is one indexed `row_key` probe; a short ID uses a
+/// per-process forward/reverse hex index of the cold identities, rebuilt
+/// only when the cold set changed (row count or newest `archived_at`, read
+/// only when the hot generation moved). Matches are confirmed with the same
+/// [`identity_matches`] rule as before.
 pub fn matching_rows(path: &Path, inputs: &[&str]) -> anyhow::Result<Rows> {
-    let mut seeds = VecDeque::new();
-    for (kind, id) in identities(path)? {
-        if inputs.iter().any(|input| identity_matches(input, &id)) {
-            if kind == "artifacts" {
-                if let Some(artifact) =
-                    record::<super::model::ArtifactRecord>(path, "artifacts", &id)?
-                {
-                    seeds.extend(artifact.asks);
-                }
-            }
-            seeds.push_back(id);
-        }
-    }
     let db = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     db.busy_timeout(Duration::from_secs(5))?;
     let tx = db.unchecked_transaction()?;
+    let mut matched: BTreeSet<RowKey> = BTreeSet::new();
+    let mut index = None;
+    {
+        let mut exact = tx.prepare("SELECT collection FROM asks_archive_rows WHERE row_key=?1")?;
+        for input in inputs {
+            for kind in exact.query_map([input], |r| r.get::<_, String>(0))? {
+                matched.insert((kind?, (*input).to_string()));
+            }
+            let q = crate::short_ids::query(input);
+            if !q.valid_hex {
+                continue; // identity_matches needs a valid hex query beyond exact.
+            }
+            let index = match &index {
+                Some(index) => index,
+                None => index.insert(identity_index(&tx, path)?),
+            };
+            for key in index.candidates(&q) {
+                if identity_matches(input, &key.1) {
+                    matched.insert(key.clone());
+                }
+            }
+        }
+    }
+    let mut seeds = VecDeque::new();
+    for (kind, id) in matched {
+        if kind == "artifacts" {
+            if let Some(artifact) = record_in::<super::model::ArtifactRecord>(&tx, "artifacts", &id)? {
+                seeds.extend(artifact.asks);
+            }
+        }
+        seeds.push_back(id);
+    }
     let rows = connected_rows(&tx, seeds, false)?;
     tx.commit()?;
     Ok(rows)
+}
+
+fn record_in<T: DeserializeOwned>(db: &Connection, kind: &str, id: &str) -> anyhow::Result<Option<T>> {
+    let row: Option<(Vec<u8>, String)> = db
+        .query_row(
+            "SELECT value_json,sha256 FROM asks_archive_rows WHERE collection=?1 AND row_key=?2",
+            params![kind, id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(bytes, digest)| {
+        anyhow::ensure!(digest == super::sha256_hex(&bytes), "archived record digest mismatch");
+        serde_json::from_slice(&bytes).map_err(Into::into)
+    })
+    .transpose()
+}
+
+/// Cold identities by the hex [`identity_matches`] compares (forward for
+/// prefixes, reversed for suffixes).
+struct IdentityIndex {
+    forward: BTreeMap<String, Vec<RowKey>>,
+    reverse: BTreeMap<String, Vec<RowKey>>,
+}
+
+impl IdentityIndex {
+    fn candidates(&self, q: &crate::short_ids::Query) -> Vec<&RowKey> {
+        fn range<'a>(map: &'a BTreeMap<String, Vec<RowKey>>, prefix: &str, out: &mut Vec<&'a RowKey>) {
+            for (hex, keys) in map.range(prefix.to_string()..) {
+                if !hex.starts_with(prefix) {
+                    break;
+                }
+                out.extend(keys);
+            }
+        }
+        let mut out = Vec::new();
+        if !q.suffix_only {
+            range(&self.forward, &q.hex, &mut out);
+        }
+        range(&self.reverse, &q.hex.chars().rev().collect::<String>(), &mut out);
+        out
+    }
+}
+
+type IdentityToken = (u64, i64, Option<String>);
+
+fn identity_index_cache() -> &'static std::sync::Mutex<Option<(std::path::PathBuf, IdentityToken, std::sync::Arc<IdentityIndex>)>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::path::PathBuf, IdentityToken, std::sync::Arc<IdentityIndex>)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+static IDENTITY_INDEX_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn identity_index(db: &Connection, path: &Path) -> anyhow::Result<std::sync::Arc<IdentityIndex>> {
+    let generation: u64 = db
+        .query_row("SELECT generation FROM hot_store_meta WHERE store='asks'", [], |r| r.get::<_, i64>(0))
+        .optional()?
+        .map(u64::try_from)
+        .transpose()?
+        .unwrap_or(0);
+    let mut cache = identity_index_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((cached_path, token, index)) = cache.as_mut() {
+        if cached_path.as_path() == path {
+            if token.0 == generation {
+                return Ok(index.clone());
+            }
+            // Every move/promotion also bumps the hot generation, but most
+            // generations are ordinary hot writes: confirm the cold set with
+            // one aggregate before rebuilding.
+            let (count, newest): (i64, Option<String>) = db.query_row(
+                "SELECT count(*),max(archived_at) FROM asks_archive_rows",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if token.1 == count && token.2 == newest {
+                token.0 = generation;
+                return Ok(index.clone());
+            }
+        }
+    }
+    let (count, newest): (i64, Option<String>) = db.query_row(
+        "SELECT count(*),max(archived_at) FROM asks_archive_rows",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut index = IdentityIndex { forward: BTreeMap::new(), reverse: BTreeMap::new() };
+    let mut query = db.prepare("SELECT collection,row_key FROM asks_archive_rows")?;
+    for row in query.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let key = row?;
+        let hex = crate::short_ids::query(&key.1).hex;
+        index.reverse.entry(hex.chars().rev().collect()).or_default().push(key.clone());
+        index.forward.entry(hex).or_default().push(key);
+    }
+    #[cfg(test)]
+    IDENTITY_INDEX_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let index = std::sync::Arc::new(index);
+    *cache = Some((path.to_path_buf(), (generation, count, newest), index.clone()));
+    Ok(index)
 }
 
 pub(crate) fn identity_matches(input: &str, id: &str) -> bool {

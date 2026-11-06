@@ -184,6 +184,8 @@ impl Encoded {
     }
 }
 struct Subscriber {
+    text: bool,
+    status: bool,
     id: u64,
     life: Weak<()>,
     session: Option<String>,
@@ -239,6 +241,23 @@ impl Default for LiveHub {
     }
 }
 impl LiveHub {
+    /// Small replaceable session facts share the bounded live SSE queue, but
+    /// are independent of text anchors, turn closure and full-text capability.
+    /// No durable sequence/cursor is allocated and no disk is consulted.
+    pub fn publish_background_work(&self, session: &str, host: &str, generation: u64, thread: &str,
+        work: Option<crate::app_server::background_work::BackgroundWork>) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        prune(&mut state);
+        let frame = LiveFrame {
+            version: 1, kind: "sessionStatus", gap_scope: None,
+            cutex_session_id: session.into(), host_id: host.into(), runtime_generation: generation,
+            thread_id: thread.into(), turn_id: None, item_id: "backgroundWork".into(),
+            method: crate::app_server::background_work::METHOD.into(),
+            producer_epoch: self.inner.epoch.clone(), revision: 0, start_offset: 0, end_offset: 0, anchor: None,
+            params: serde_json::json!({"cutexSessionId":session,"runtimeGeneration":generation,"backgroundWork":work}),
+        };
+        fanout(&mut state, Encoded::new(frame));
+    }
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -293,6 +312,9 @@ impl LiveHub {
         session: Option<String>,
         wake: Option<Arc<StreamWake>>,
     ) -> Result<LiveSubscription, LiveCapacityError> {
+        self.subscribe_selected(session, wake, true, true)
+    }
+    pub(crate) fn subscribe_selected(&self, session: Option<String>, wake: Option<Arc<StreamWake>>, text: bool, status: bool) -> Result<LiveSubscription, LiveCapacityError> {
         let life = Arc::new(());
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         prune(&mut state);
@@ -303,6 +325,8 @@ impl LiveHub {
         state.next_sub = state.next_sub.wrapping_add(1);
         if state.subscribers.len() < MAX_SUBSCRIBERS {
             state.subscribers.push(Subscriber {
+                text,
+                status,
                 id,
                 life: Arc::downgrade(&life),
                 session,
@@ -319,6 +343,7 @@ impl LiveHub {
             inner: self.inner.clone(),
             id,
             _life: life,
+            status,
         })
     }
     /// Recognition is independent of subscribers, budgets and validation. A
@@ -941,6 +966,8 @@ fn fanout(state: &mut State, encoded: Encoded) {
     let mut total = payload_bytes(state, None);
     let mut session_total = payload_bytes(state, Some(&key.session));
     for index in 0..state.subscribers.len() {
+        if (encoded.frame.kind == "sessionStatus" && !state.subscribers[index].status)
+            || (encoded.frame.kind != "sessionStatus" && !state.subscribers[index].text) { continue; }
         if state.subscribers[index]
             .session
             .as_ref()
@@ -1057,11 +1084,13 @@ fn record_peaks(state: &mut State) {
 }
 
 pub struct LiveSubscription {
+    status: bool,
     inner: Arc<Inner>,
     id: u64,
     _life: Arc<()>,
 }
 impl LiveSubscription {
+    pub(crate) fn wants_status(&self) -> bool { self.status }
     pub fn pop(&self) -> Option<LiveDelivery> {
         self.pop_internal(None)
     }
@@ -1150,6 +1179,26 @@ impl Drop for LiveDelivery {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn status_only_subscriber_ignores_text_and_text_only_subscriber_ignores_status() {
+        let hub=LiveHub::new();
+        let status=hub.subscribe_selected(None,None,false,true).unwrap();
+        let text=hub.subscribe_selected(None,None,true,false).unwrap();
+        hub.publish_background_work("cutex.a","devbox",1,"root",Some(Default::default()));
+        let delivery=status.pop().unwrap();
+        assert_eq!(delivery.frame().kind,"sessionStatus");
+        assert!(delivery.frame().anchor.is_none(),"idle status does not need a text anchor");
+        assert!(text.pop().is_none());
+        drop(delivery);
+        hub.publish_background_work("cutex.a","devbox",1,"root",None);
+        assert!(status.pop().unwrap().frame().params["backgroundWork"].is_null());
+        assert!(text.pop().is_none());
+        let now=Instant::now();
+        hub.ingest(frame("text-item","token"),now);
+        due(&hub,now+WINDOW);
+        assert_eq!(text.pop().unwrap().frame().params["delta"],"token");
+        assert!(status.pop().is_none(),"sidebar status subscription receives no text tokens");
+    }
     #[test]
     fn terminal_capability_is_strict_and_missing_runtimes_keep_legacy_path() {
         assert!(!supports_full_text_terminal(&json!({})));

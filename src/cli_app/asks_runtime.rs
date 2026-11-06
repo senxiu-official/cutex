@@ -51,6 +51,42 @@ fn reconnect_live_runtime(session: &str) -> anyhow::Result<u64> {
     Ok(record.runtime_generation)
 }
 
+/// r274 decision 2 (input ledger switch on): a queued owner message for a
+/// Codex agent whose live runtime this process lost (a disconnect) leads to
+/// a reconnect, as a pending ask or result does: `reconnect` is background,
+/// at most one per session every [`RECONNECT_RETRY`], and never launches.
+/// Connecting flushes the queue. Claude and DSH reconnect on their own.
+fn reconnect_for_owner_queue(runtime: &ManagementAskRuntime) {
+    if !cutex::management::v2::input_ledger::enabled() {
+        return;
+    }
+    let sessions = match cutex::management::v2::user_input::user_input_repository()
+        .and_then(|queue| queue.sessions_with_queued_items())
+    {
+        Ok(sessions) => sessions,
+        Err(error) => return eprintln!("asks: owner queue reconnect check: {error:#}"),
+    };
+    for session in owner_queue_reconnects(sessions, |session| {
+        let Some(record) = record(session) else { return false };
+        if record.claude_session.is_some() || record.dsh_session.is_some() {
+            return false;
+        }
+        let connected = app_server_runtime::runtime_manager().status(session).ok().flatten()
+            .is_some_and(|status| status.connected && status.runtime_generation == record.runtime_generation);
+        !connected && cutex::asks::wake::runtime_binding_live(&record)
+    }) {
+        if let Err(error) = runtime.reconnect(&session) {
+            eprintln!("asks: reconnect of {session} for queued owner input failed: {error:#}");
+        }
+    }
+}
+
+/// The sessions with queued owner input whose live Codex runtime is not
+/// connected here (pure).
+fn owner_queue_reconnects(sessions: Vec<String>, disconnected_live: impl Fn(&str) -> bool) -> Vec<String> {
+    sessions.into_iter().filter(|session| disconnected_live(session)).collect()
+}
+
 #[derive(Default)]
 pub(crate) struct ManagementAskRuntime {
     /// One ExternalInput connection per session and runtime generation.
@@ -63,6 +99,19 @@ pub(super) fn record(session: &str) -> Option<cutex::session::model::CutexSessio
     cutex::session::store::with_cutex_session_store(|store| store.sessions.get(session).cloned())
         .ok()
         .flatten()
+}
+
+fn finish_wake_attempt(session: &str, reserved_at: Option<&str>) {
+    let Some(reserved_at) = reserved_at else { return };
+    let live = record(session).filter(cutex::asks::wake::runtime_binding_live);
+    if let Some(record) = &live { refresh_session_presence(session, Some(record.runtime_generation)); }
+    if let Ok(store) = AskStore::open_default() {
+        let _ = store.with_state(|state| {
+            if live.is_none() || state.presence.get(session).is_some_and(|p| p.online) {
+                cutex::asks::wake::finish_wake(state, session, reserved_at);
+            }
+        });
+    }
 }
 
 fn envelope(client: &ExternalInputClient, submission: &Submission) -> anyhow::Result<Envelope> {
@@ -147,6 +196,19 @@ impl ManagementAskRuntime {
     }
 }
 
+impl ManagementAskRuntime {
+    /// r276 agent pause on cute-codex: the bound `thread/toolGate/set`.
+    pub(crate) fn set_native_tool_gate(&self, session: &str, held: bool) -> anyhow::Result<super::tool_gate::Push> {
+        let record = record(session).ok_or_else(|| anyhow::anyhow!("no such session"))?;
+        self.with_client(session, record.runtime_generation, |client| {
+            if !client.supports_tool_gate() {
+                return Ok(super::tool_gate::Push::Unsupported);
+            }
+            client.set_tool_gate(held).map(|_| super::tool_gate::Push::Set)
+        })?
+    }
+}
+
 /// Which transport carries an exact (generation + turn fenced) interrupt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExactInterruptRoute {
@@ -174,10 +236,6 @@ fn exact_interrupt_route(record: &cutex::session::model::CutexSessionRecord) -> 
     }
 }
 
-pub(crate) fn pause_admission_outcome(session:&str)->Option<SubmitOutcome> {
-    gate_outcome(AskStore::open_default().and_then(|store|cutex::asks::pause_admission::gate(&store,session)))
-}
-
 fn gate_outcome(gate:anyhow::Result<cutex::asks::pause_admission::Gate>)->Option<SubmitOutcome> {
     use cutex::asks::pause_admission::Gate;
     match gate {
@@ -188,8 +246,8 @@ fn gate_outcome(gate:anyhow::Result<cutex::asks::pause_admission::Gate>)->Option
     }
 }
 
-/// [`pause_admission_outcome`] for a caller that already holds the session
-/// lane right after the scheduler's lease write. That write wakes the
+/// The pause gate for a submit/steer path (usually holding the session
+/// lane) right after the scheduler's lease write. That write wakes the
 /// admission thread, whose short fence holds (`list_admission`) then collide
 /// with this one-shot try-lock on every retry: the ask is refused
 /// `authority_busy`, requeued, leased again, and starves (seen on DSH in the
@@ -197,21 +255,23 @@ fn gate_outcome(gate:anyhow::Result<cutex::asks::pause_admission::Gate>)->Option
 /// (never blocks on the fence, so a lifecycle action holding it still
 /// defers this admission); a pause or any error is final at once.
 pub(crate) fn pause_admission_outcome_in_lane(session:&str)->Option<SubmitOutcome> {
-    const TRIES: u32 = 25;
-    const STEP: Duration = Duration::from_millis(20);
-    let store = match AskStore::open_default() {
-        Ok(store) => store,
-        Err(error) => return gate_outcome(Err(error)),
-    };
-    for attempt in 1..=TRIES {
-        let gate = cutex::asks::pause_admission::gate(&store, session);
-        if attempt < TRIES && matches!(gate, Ok(cutex::asks::pause_admission::Gate::Deferred)) {
-            std::thread::sleep(STEP);
-            continue;
-        }
-        return gate_outcome(gate);
-    }
-    unreachable!("the last attempt returns")
+    gate_outcome(AskStore::open_default().and_then(|store|cutex::asks::pause_admission::gate_bounded(&store,session)))
+}
+
+/// `thread/read includeTurns:true` (the whole native history) and the turn
+/// in it: r273.1's read, and the fallback of the single-turn read.
+fn full_history_turn(session: &str, thread_id: String, turn_id: &str) -> Option<serde_json::Value> {
+    let thread = app_server_user_input::session_manager(session)
+        .commands(session)
+        .ok()?
+        .thread_read(&cutex::app_server::commands::ThreadReadParams { thread_id, include_turns: true })
+        .ok()?;
+    thread
+        .pointer("/thread/turns")?
+        .as_array()?
+        .iter()
+        .find(|turn| turn.get("id").and_then(serde_json::Value::as_str) == Some(turn_id))
+        .cloned()
 }
 
 impl AskRuntime for ManagementAskRuntime {
@@ -249,6 +309,9 @@ impl AskRuntime for ManagementAskRuntime {
             && self
                 .with_client(session, record.runtime_generation, ExternalInputClient::supports_exclusive_turn)
                 .unwrap_or(false);
+        #[cfg(debug_assertions)]
+        let exclusive_admission = exclusive_admission
+            || (online && cutex::asks::test_fake_ingress::supports_exclusive_turn(session, record.runtime_generation).unwrap_or(false));
         TargetStatus {
             online,
             runtime_generation: record.runtime_generation,
@@ -288,6 +351,10 @@ impl AskRuntime for ManagementAskRuntime {
                 return SubmitOutcome::Busy { reason: "active_turn".into() };
             }
         }
+        #[cfg(debug_assertions)]
+        if let Some(outcome) = cutex::asks::test_fake_ingress::submit_exclusive(session, generation, submission) {
+            return outcome;
+        }
         let mut size = (None, None);
         let result = self.with_client_policy(session, generation, |client| {
             if !client.supports_exclusive_turn() {
@@ -317,6 +384,10 @@ impl AskRuntime for ManagementAskRuntime {
         }
         if record(session).is_some_and(|record| record.dsh_session.is_some()) {
             return super::asks_dsh::message_status(session, generation, submission);
+        }
+        #[cfg(debug_assertions)]
+        if let Some(status) = cutex::asks::test_fake_ingress::message_status(session, generation, submission) {
+            return status;
         }
         let result = self.with_client_policy(session, generation, |client| {
             let envelope = envelope(client, submission)?;
@@ -409,19 +480,36 @@ impl AskRuntime for ManagementAskRuntime {
             .map_err(|error| anyhow::anyhow!("mcpServer/tool/call: {error}"))
     }
 
+    /// One turn, not the whole history (054 §2.12 b): the cached turn index
+    /// (`thread/turns/list`, tail only once built) and that turn's items
+    /// (`thread/items/list`). Runtimes without the paged methods, and a turn
+    /// too large to read whole, fall back to the full `thread/read`.
     fn read_turn(&self, session: &str, turn_id: &str) -> Option<serde_json::Value> {
-        let thread_id = record(session)?.app_server_thread_id()?.to_string();
-        let thread = app_server_user_input::session_manager(session)
-            .commands(session)
-            .ok()?
-            .thread_read(&cutex::app_server::commands::ThreadReadParams { thread_id, include_turns: true })
-            .ok()?;
-        thread
-            .pointer("/thread/turns")?
-            .as_array()?
-            .iter()
-            .find(|turn| turn.get("id").and_then(serde_json::Value::as_str) == Some(turn_id))
-            .cloned()
+        let record = record(session)?;
+        let thread_id = record.app_server_thread_id()?.to_string();
+        // Behind the input ledger switch like every 054 change; off: the
+        // r273.1 full read below.
+        if !cutex::management::v2::input_ledger::enabled() {
+            return full_history_turn(session, thread_id, turn_id);
+        }
+        let handle = app_server_user_input::session_manager(session).handle(session).ok()?;
+        let key = cutex::management::v2::turn_index::Key::new(session, &thread_id, "live", record.runtime_generation);
+        let mut call = |method: &str, params: serde_json::Value| {
+            handle.request(method, params).map_err(|error| match error {
+                cutex::app_server::client::AppServerClientError::Rpc(error) => {
+                    cutex::management::v2::history::HistoryCallError::Rpc(json!({"code": error.code, "message": error.message, "data": error.data}))
+                }
+                other => cutex::management::v2::history::HistoryCallError::Unavailable(other.to_string()),
+            })
+        };
+        match cutex::management::v2::history::read_complete_turn(&key, &thread_id, turn_id, &mut call) {
+            Ok(turn) => return turn.map(|turn| turn.turn().clone()),
+            // Not complete within the reader's budget: the old full read.
+            Err(cutex::management::v2::history::HistoryCallError::Rpc(error))
+                if error.pointer("/data/code").and_then(serde_json::Value::as_str) == Some("history_turn_incomplete") => {}
+            Err(_) => return None,
+        }
+        full_history_turn(session, thread_id, turn_id)
     }
 
     fn respond_question(
@@ -439,6 +527,9 @@ impl AskRuntime for ManagementAskRuntime {
             Ok(ServerResponseClaimDecision::Submit) => {}
             Ok(ServerResponseClaimDecision::Deduplicated) => return RespondOutcome::Submitted,
             Ok(ServerResponseClaimDecision::InProgress) => return RespondOutcome::NotSent("in progress".into()),
+            Ok(ServerResponseClaimDecision::InvalidAnswer(message)) => {
+                return RespondOutcome::NotSent(message)
+            }
             Ok(_) => return RespondOutcome::AlreadyResolved,
             Err(error) => return RespondOutcome::NotSent(format!("{error:#}")),
         }
@@ -475,6 +566,7 @@ impl AskRuntime for ManagementAskRuntime {
     /// take seconds). The ask stays `blocked(runtimeDown)` until online.
     fn wake(&self, session: &str) -> anyhow::Result<()> {
         let session = session.to_string();
+        let reservation = cutex::asks::wake::pending_wake(&AskStore::open_default()?.snapshot()?,&session).map(str::to_string);
         std::thread::Builder::new()
             .name("cutex-asks-wake".into())
             .spawn(move || {
@@ -495,6 +587,7 @@ impl AskRuntime for ManagementAskRuntime {
                     Ok(true)
                 })();
                 if let Err(error) = admitted { eprintln!("asks: auto-wake admission for {session} unavailable: {error:#}"); }
+                finish_wake_attempt(&session, reservation.as_deref());
             })?;
         Ok(())
     }
@@ -505,6 +598,7 @@ impl AskRuntime for ManagementAskRuntime {
     /// the review under its locks; a refusal is reported like a failed wake.
     fn relaunch_reviewed(&self, session: &str, requester: &str, ask_id: &str) -> anyhow::Result<()> {
         let session = session.to_string();
+        let reservation = cutex::asks::wake::pending_wake(&AskStore::open_default()?.snapshot()?,&session).map(str::to_string);
         let requester = requester.to_string();
         let ask_id = ask_id.to_string();
         std::thread::Builder::new()
@@ -540,7 +634,37 @@ impl AskRuntime for ManagementAskRuntime {
                     Ok(())
                 })();
                 if let Err(error) = admitted { eprintln!("asks: reviewed relaunch admission for {session} unavailable: {error:#}"); }
+                finish_wake_attempt(&session, reservation.as_deref());
             })?;
+        Ok(())
+    }
+
+    fn managed_online(&self, context: cutex::agent_management::AutomaticManagedOnline) -> anyhow::Result<()> {
+        std::thread::Builder::new().name("cutex-asks-managed-online".into()).spawn(move || {
+            let config = cutex::config::store::load_codez_config();
+            match cutex::agent_bus::client::agent_bus_automatic_managed_online(&config, &context) {
+                Ok(response) if response["outcome"]["status"] == "complete" => {
+                    eprintln!("asks: automatic managed online of {} completed", context.target);
+                }
+                Ok(response) => {
+                    let outcome=&response["outcome"];
+                    let detail=outcome["detail"].as_str().or_else(||outcome["failure"]["detail"].as_str()).unwrap_or("");
+                    eprintln!("asks: automatic managed online of {} refused ({})", context.target, outcome["status"]);
+                    // A pause/stop/controller change racing with dispatch is
+                    // an ordinary automatic admission refusal, never a new
+                    // owner-action question. Other real launch refusals keep
+                    // their actionable, truthful explicit-start guidance.
+                    if !cutex::agent_management::AutomaticManagedOnline::admission_hold(detail)
+                        && !matches!(outcome["code"].as_str(),Some("automatic_wake_stale" | "host_busy")) {
+                        cutex::asks::wake::record_owner_action_default(&context.target,
+                            "ownerStartRequired", &format!("{detail}; {}",cutex::asks::wake::never_detail("ownerStartRequired")));
+                    }
+                }
+                // Outcome uncertain: keep the durable budget reservation.
+                // Provider completion releases it; a later tick may retry it.
+                Err(error) => eprintln!("asks: automatic managed online transport for {}: {error:#}", context.target),
+            }
+        })?;
         Ok(())
     }
 
@@ -566,7 +690,9 @@ impl AskRuntime for ManagementAskRuntime {
     }
 
     fn steer_note(&self, session: &str, generation: u64, submission: &Submission) -> SubmitOutcome {
-        if let Some(outcome)=pause_admission_outcome(session){return outcome;}
+        // Bounded retry like the ACP/native/Claude exclusive paths: a brief
+        // fence hold must not refuse (and requeue) the note `authority_busy`.
+        if let Some(outcome)=pause_admission_outcome_in_lane(session){return outcome;}
         if record(session).is_some_and(|record| record.claude_session.is_some()) {
             if cutex::asks::returns::is_next_step_event(&submission.message_id) {
                 return super::asks_claude::submit(session, generation, submission);
@@ -575,6 +701,10 @@ impl AskRuntime for ManagementAskRuntime {
         }
         if record(session).is_some_and(|record| record.dsh_session.is_some()) {
             return SubmitOutcome::Unsupported("DSH has no next-step admission".into());
+        }
+        #[cfg(debug_assertions)]
+        if let Some(outcome) = cutex::asks::test_fake_ingress::steer_note(session, generation, submission) {
+            return outcome;
         }
         let mut size = (None, None);
         let result = self.with_client_policy(session, generation, |client| {
@@ -609,6 +739,10 @@ impl AskRuntime for ManagementAskRuntime {
         if record.dsh_session.is_some() {
             return false;
         }
+        #[cfg(debug_assertions)]
+        if let Some(soon) = cutex::asks::test_fake_ingress::supports_soon(session, generation) {
+            return soon;
+        }
         self.with_client(session, generation, ExternalInputClient::supports_soon)
             .unwrap_or(false)
     }
@@ -618,7 +752,13 @@ impl AskRuntime for ManagementAskRuntime {
     }
 
     fn resume_gate(&self, session: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(!cutex::asks::pause_admission::is_held(&AskStore::open_default()?,session)?,"agent_paused");
+        // A busy fence is not a pause: ride out a brief hold, then report the
+        // retryable deferral itself rather than a misleading `agent_paused`.
+        match cutex::asks::pause_admission::gate_bounded(&AskStore::open_default()?, session)? {
+            cutex::asks::pause_admission::Gate::Open => {},
+            cutex::asks::pause_admission::Gate::Paused => anyhow::bail!("agent_paused"),
+            cutex::asks::pause_admission::Gate::Deferred => return Err(cutex::asks::pause_admission::Deferred.into()),
+        }
         let record = record(session).ok_or_else(|| anyhow::anyhow!("no such session"))?;
         if record.claude_session.is_some() {
             return super::asks_claude::resume(session);
@@ -631,6 +771,64 @@ impl AskRuntime for ManagementAskRuntime {
     }
 }
 
+/// r273 rolling archive settings: `CUTEX_ASKS_ROLLING_ARCHIVE_HOURS` (age of
+/// a closed delegation before it moves to cold storage; default 48, `0`
+/// disables), `CUTEX_ASKS_ROLLING_ARCHIVE_BATCH` (delegations per pass,
+/// default 200) and `CUTEX_ASKS_ROLLING_ARCHIVE_INTERVAL_SECS` (default 900).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RollingArchiveSettings {
+    pub max_age: chrono::Duration,
+    pub batch: usize,
+    pub interval: Duration,
+}
+
+pub(crate) fn rolling_archive_settings(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<Option<RollingArchiveSettings>> {
+    use anyhow::Context as _;
+    let number = |name: &str, default: u64| -> anyhow::Result<u64> {
+        var(name).map(|value| value.trim().parse::<u64>().with_context(|| format!("{name} must be a whole number")))
+            .transpose().map(|value| value.unwrap_or(default))
+    };
+    let hours = number("CUTEX_ASKS_ROLLING_ARCHIVE_HOURS", 48)?;
+    if hours == 0 { return Ok(None); }
+    Ok(Some(RollingArchiveSettings {
+        max_age: chrono::Duration::hours(i64::try_from(hours.min(24 * 365 * 10))?),
+        batch: usize::try_from(number("CUTEX_ASKS_ROLLING_ARCHIVE_BATCH", 200)?.clamp(1, 10_000))?,
+        interval: Duration::from_secs(number("CUTEX_ASKS_ROLLING_ARCHIVE_INTERVAL_SECS", 900)?.clamp(30, 86_400)),
+    }))
+}
+
+/// Background rolling archive (r273): the startup split uses a fixed cutoff,
+/// so without this the hot set grows forever. One bounded pass per interval
+/// (sooner while a backlog remains), first one 2 min after start; never on
+/// a request or admission path.
+fn spawn_rolling_archive() -> anyhow::Result<()> {
+    let Some(settings) = rolling_archive_settings(|name| std::env::var(name).ok())? else {
+        eprintln!("asks: rolling archive disabled (CUTEX_ASKS_ROLLING_ARCHIVE_HOURS=0)");
+        return Ok(());
+    };
+    std::thread::Builder::new().name("cutex-asks-rolling-archive".into()).spawn(move || {
+        std::thread::sleep(Duration::from_secs(120));
+        loop {
+            let started = std::time::Instant::now();
+            let next = match AskStore::open_default().and_then(|store| store.rolling_archive_pass(settings.max_age, settings.batch, Utc::now())) {
+                Ok(report) => {
+                    if report.moved.rows != 0 || report.fence_busy != 0 || report.replans != 0 {
+                        eprintln!("asks: rolling archive moved {} records / {} bytes ({} delegations) in {} ms; {} deferred, {} replans, {} fence-busy",
+                            report.moved.rows, report.moved.bytes, report.moved.asks, started.elapsed().as_millis(),
+                            report.deferred_asks, report.replans, report.fence_busy);
+                    }
+                    if report.deferred_asks != 0 || (report.moved.rows == 0 && report.fence_busy + report.replans != 0) {
+                        Duration::from_secs(60)
+                    } else { settings.interval }
+                }
+                Err(error) => { eprintln!("asks: rolling archive pass failed: {error:#}"); settings.interval }
+            };
+            std::thread::sleep(next);
+        }
+    })?;
+    Ok(())
+}
+
 /// The driver: scheduler ticks, Management v2 notices, owner-queue flushes
 /// the scheduler unblocked, and periodic pruning.
 pub(crate) fn spawn_scheduler() -> anyhow::Result<()> {
@@ -641,6 +839,7 @@ pub(crate) fn spawn_scheduler() -> anyhow::Result<()> {
         .map(|value|cutex::asks::archive::activation_cutoff(now,Some(&value))).transpose()?;
     let archived=AskStore::open_default()?.archive_before(requested,now)?;
     if archived.rows!=0 {eprintln!("asks: archived {} records / {} bytes ({} delegations)",archived.rows,archived.bytes,archived.asks);}
+    spawn_rolling_archive()?;
     cutex::peers::worker::spawn()?;
     super::model_overload_retry::spawn_worker()?;
     super::claude_quota_continue::spawn_worker()?;
@@ -701,7 +900,18 @@ pub(crate) fn spawn_scheduler() -> anyhow::Result<()> {
                     app_server_user_input::flush_queued_if_idle(&session)?;
                     Ok(())
                 })();
-                if let Err(error) = result { eprintln!("admission: {session}: {error:#}"); }
+                match result {
+                    Ok(()) => cutex::management::v2::admission::admission_settled(&session),
+                    Err(error) => match cutex::management::v2::admission::retry_deferred(&session, &error) {
+                        // A deferral is retried with backoff; log the start of a
+                        // streak and then sparsely, not every retry (host-a
+                        // 2026-11-01: 322 identical lines in 11 minutes).
+                        Some(streak) => if streak.is_power_of_two() {
+                            eprintln!("admission: {session}: {error:#} (deferral #{streak}; retrying with backoff)");
+                        },
+                        None => eprintln!("admission: {session}: {error:#}"),
+                    },
+                }
             }
         }
     })?;
@@ -714,6 +924,12 @@ pub(crate) fn spawn_scheduler() -> anyhow::Result<()> {
             let mut last_receipt_prune: Option<std::time::Instant> = None;
             let mut last_archive=std::time::Instant::now();
             let mut ticks: u64 = 0;
+            // 054 decision 9: delegations that ended `outcomeUnknown` before
+            // the input ledger existed get their `uncertain` record once, so
+            // the owner can dismiss them (no-op with the switch off).
+            if let Err(error) = AskStore::open_default().and_then(|store| cutex::asks::ledger::backfill_outcome_unknown(&store)) {
+                eprintln!("asks: input ledger backfill warning: {error:#}");
+            }
             loop {
                 // Agent → owner messages made in the Agent Bus process.
                 cutex::management::v2::owner_notify::publish_default();
@@ -724,6 +940,11 @@ pub(crate) fn spawn_scheduler() -> anyhow::Result<()> {
                     if let Err(error) = AskStore::open_default().and_then(|store| refresh_presence(&store)) {
                         eprintln!("asks: presence warning: {error:#}");
                     }
+                    reconnect_for_owner_queue(&runtime);
+                }
+                // r276: tell live runtimes about agent pauses (tool gate).
+                if let Err(error) = AskStore::open_default().and_then(|store| super::tool_gate::reconcile(&store, &runtime)) {
+                    eprintln!("agent pause: tool gate warning: {error:#}");
                 }
                 ticks += 1;
                 if last_archive.elapsed()>=Duration::from_secs(300) {
@@ -902,6 +1123,7 @@ fn observe_presence(
             runtime_generation: Some(record.runtime_generation),
             turn_id: status.as_ref().and_then(|status| status.active_turn_id.clone()),
             agent_pause: None,
+            wake_pending: None,
         },
         runtime_generation: record.runtime_generation,
         binding_live: runtime_binding_live(record),
@@ -934,6 +1156,8 @@ fn merge_presence(
         entry.lifecycle_generation = Some(generation);
         entry.online = true;
     }
+    entry.wake_pending = if entry.online { None }
+        else { previous.and_then(|previous| previous.wake_pending.clone()) };
     entry
 }
 
@@ -958,9 +1182,28 @@ fn refresh_presence(store: &AskStore) -> anyhow::Result<()> {
     refresh_observed_presence(store, &observed)
 }
 
+/// Reclaim a lost dispatch only when no delegation still needs it and a fresh
+/// session read under the launch fence proves no runtime/claim owns the slot.
+fn reconcile_abandoned_wakes(
+    state: &cutex::asks::store::AskState,
+    presence: &mut std::collections::BTreeMap<String, cutex::asks::store::Presence>,
+    absent: &std::collections::BTreeSet<String>,
+) {
+    if absent.is_empty() { return; }
+    let waiting: std::collections::BTreeSet<_> = state.asks.values()
+        .filter(|ask|ask.execution==cutex::asks::model::ExecutionState::Queued || ask.resume_pending())
+        .map(|ask|ask.target_cutex_session_id.as_str()).collect();
+    for session in absent {
+        if !waiting.contains(session.as_str()) {
+            if let Some(entry)=presence.get_mut(session) { entry.wake_pending=None; }
+        }
+    }
+}
+
 fn refresh_observed_presence(store: &AskStore, observed: &[(String, ObservedPresence)]) -> anyhow::Result<()> {
     use cutex::asks::{pause_admission, project_control};
-    let merged = |state: &cutex::asks::store::AskState, projects: &project_control::ProjectControlState| {
+    let merged = |state: &cutex::asks::store::AskState, projects: &project_control::ProjectControlState,
+                  absent: &std::collections::BTreeSet<String>| {
         let mut presence = std::collections::BTreeMap::new();
         for (session, observed) in observed {
             let paused = state.pauses.contains_key(session)
@@ -979,13 +1222,23 @@ fn refresh_observed_presence(store: &AskStore, observed: &[(String, ObservedPres
                 presence.entry(session.clone()).or_default().paused = paused;
             }
         }
+        reconcile_abandoned_wakes(state,&mut presence,absent);
         presence
     };
     let _ = pause_admission::try_with_authority(|snapshot| {
+        let pending=store.inspect(|state|state.presence.iter()
+            .filter(|(_,p)|p.wake_pending.is_some()).map(|(id,_)|id.clone()).collect::<Vec<_>>())?;
+        let absent = if pending.is_empty() {std::collections::BTreeSet::new()} else {
+            cutex::session::store::with_cutex_session_store(|sessions|pending.into_iter().filter(|id|
+                sessions.sessions.get(id).is_some_and(|record|record.explicit_launch.is_some()
+                    && record.app_server_runtime.is_none() && record.app_server_launch_claim_id.is_none()
+                    && record.current_runtime_agent_id.is_none() && record.runtime_pid.is_none()))
+                .collect::<std::collections::BTreeSet<_>>())?
+        };
         let changed = store.inspect(|state| {
             let projects = project_control::project_snapshot(state, snapshot);
-            let presence = merged(state, &projects);
-            projects != state.project_control || presence != state.presence
+            let presence = merged(state, &projects, &absent);
+            projects != state.project_control || presence != *state.presence
                 || presence.values().any(|p| !p.busy && p.agent_pause.as_ref().is_some_and(|pause|
                     pause.phase == cutex::asks::store::AgentPausePhase::Pausing))
         })?;
@@ -993,7 +1246,7 @@ fn refresh_observed_presence(store: &AskStore, observed: &[(String, ObservedPres
         // Keep the same authority guard; re-read inside the final transaction
         // because presence observers may have changed AskState in the meantime.
         pause_admission::with_state_in(store, snapshot, |state, _| {
-        state.presence = merged(state, &state.project_control);
+        state.presence = merged(state, &state.project_control, &absent).into();
         pause_admission::reconcile_in(state, snapshot);
         let sessions: Vec<_> = state.presence.iter()
             .filter(|(_, presence)| presence.agent_pause.is_some())
@@ -1086,6 +1339,42 @@ fn refresh_observed_session_presence(store: &AskStore, session: &str, observed: 
 mod presence_tests {
     use super::*;
     use cutex::asks::store::Presence;
+
+    #[test]
+    fn automatic_managed_presence_keeps_pending_slot_until_online_is_proven() {
+        let pending=Presence {wake_pending:Some("reservation-1".into()),..Default::default()};
+        let offline=merge_presence(observed(false,2,false),Some(&pending),None,false);
+        assert_eq!(offline.wake_pending.as_deref(),Some("reservation-1"));
+        let online=merge_presence(observed(false,3,true),Some(&pending),Some(3),false);
+        assert!(online.online);
+        assert!(online.wake_pending.is_none());
+    }
+
+    #[test]
+    fn automatic_managed_cancelled_lost_dispatch_releases_only_provably_unowned_slot() {
+        use cutex::asks::{store::{AskState,NewAsk},model::{AskBody,AskOptions,Requester}};
+        const TARGET:&str="cutex.lost-dispatch";
+        let mut state=AskState::default();
+        state.create_ask(NewAsk {
+            ask_id:None,action_id:"lost-dispatch".into(),
+            requester:Requester::Agent {cutex_session_id:"cutex.director".into(),name:None},
+            target_cutex_session_id:TARGET.into(),target_name:None,project_id:None,
+            body:AskBody {text:"work".into(),text_artifact:None,text_bytes:4,
+                text_sha256:cutex::asks::sha256_hex(b"work"),attachments:Vec::new()},
+            title:None,options:AskOptions::default(),follow_up_of:None,parent_ask:None,gate:None,
+        },Utc::now()).unwrap();
+        let mut presence=std::collections::BTreeMap::from([(TARGET.into(),Presence {
+            wake_pending:Some("reservation-1".into()),..Default::default()
+        })]);
+        let absent=std::collections::BTreeSet::from([TARGET.into()]);
+        reconcile_abandoned_wakes(&state,&mut presence,&absent);
+        assert!(presence[TARGET].wake_pending.is_some(),"queued work retains its reservation");
+        state.asks.clear();
+        reconcile_abandoned_wakes(&state,&mut presence,&Default::default());
+        assert!(presence[TARGET].wake_pending.is_some(),"without absence proof keep the slot");
+        reconcile_abandoned_wakes(&state,&mut presence,&absent);
+        assert!(presence[TARGET].wake_pending.is_none());
+    }
 
     #[test]
     fn exact_interrupt_reenters_existing_session_lane_before_binding_check() {
@@ -1306,5 +1595,36 @@ mod envelope_tests {
         let plain = build_envelope(&binding(), false, &ask(false)).unwrap();
         assert_eq!(plain.semantic_sha256, envelope.semantic_sha256);
         assert_eq!(build_envelope(&binding(), true, &ask(false)).unwrap().version, 1);
+    }
+}
+
+#[cfg(test)]
+mod rolling_archive_settings_tests {
+    use super::*;
+
+    #[test]
+    fn rolling_archive_defaults_disable_and_validation() {
+        let none = |_: &str| None;
+        let defaults = rolling_archive_settings(none).unwrap().unwrap();
+        assert_eq!(defaults.max_age, chrono::Duration::hours(48));
+        assert_eq!(defaults.batch, 200);
+        assert_eq!(defaults.interval, Duration::from_secs(900));
+        assert_eq!(rolling_archive_settings(|name: &str| (name == "CUTEX_ASKS_ROLLING_ARCHIVE_HOURS").then(|| "0".to_string())).unwrap(), None);
+        let custom = rolling_archive_settings(|name: &str| match name {
+            "CUTEX_ASKS_ROLLING_ARCHIVE_HOURS" => Some("72".into()),
+            "CUTEX_ASKS_ROLLING_ARCHIVE_BATCH" => Some("0".into()),
+            "CUTEX_ASKS_ROLLING_ARCHIVE_INTERVAL_SECS" => Some("5".into()),
+            _ => None,
+        }).unwrap().unwrap();
+        assert_eq!((custom.max_age, custom.batch, custom.interval), (chrono::Duration::hours(72), 1, Duration::from_secs(30)));
+        assert!(rolling_archive_settings(|_: &str| Some("two days".into())).is_err());
+    }
+
+    #[test]
+    fn queued_owner_input_reconnects_only_disconnected_live_codex_runtimes() {
+        let sessions = vec!["connected".to_string(), "lost".to_string(), "stopped".to_string()];
+        let picked = owner_queue_reconnects(sessions, |session| session == "lost");
+        assert_eq!(picked, ["lost"]);
+        assert!(owner_queue_reconnects(Vec::new(), |_| true).is_empty());
     }
 }

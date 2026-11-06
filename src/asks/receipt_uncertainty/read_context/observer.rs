@@ -10,6 +10,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use super::super::read_views::{CurrentObserver, ReceiptReadContext};
 
+pub(super) fn current(id: &str) -> anyhow::Result<Option<CurrentObserver>> {
+    let path = crate::session::store::cutex_sessions_path()?;
+    Ok(read_at(&path, &BTreeSet::from([id.to_string()]))?.remove(id))
+}
+
 pub(super) fn attach(mut context: ReceiptReadContext) -> ReceiptReadContext {
     if context.is_empty() {
         return context;

@@ -70,6 +70,10 @@ pub struct SparseAgentSpec {
     /// DeepSeek API-key profile). Default: the profile's default variant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
+    /// r274.1 (additive): accept a model the profile's model list does not
+    /// show (`profiles::model_check`). Absent from the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unlisted: bool,
 }
 
 /// How a sparse create / replace hands over its `task`.
@@ -291,6 +295,9 @@ pub struct ProfileFacts {
     /// DSH / Kimi: the variant's default effort (off / low / high / max), if any.
     pub default_reasoning: Option<String>,
     pub default_model: Option<String>,
+    /// Codex profiles on the native list: that list, or why it is unreadable
+    /// (None: not checked here; see `profiles::model_check`).
+    pub models: Option<Result<crate::profiles::model_check::ModelList, String>>,
 }
 
 fn given(value: &Option<String>) -> Option<&str> {
@@ -316,7 +323,8 @@ pub fn resolve_spec(
             )
         })?;
     let facts = profile(requested_profile)?;
-    let model = match given(&agent.model).filter(|model| *model != "default") {
+    let explicit_model = given(&agent.model).filter(|model| *model != "default");
+    let mut model = match explicit_model {
         Some(model) => model.to_string(),
         None => facts.default_model.clone().ok_or_else(|| {
             refuse(
@@ -362,6 +370,27 @@ pub fn resolve_spec(
     }
     if facts.dsh {
         crate::profiles::dsh::validate_catalog_model(&model).map_err(|error| refuse("invalid_model", error.to_string()))?;
+    }
+    if let Some(list) = facts.models.clone() {
+        use crate::profiles::model_check;
+        // A unique short form of a listed model (e.g. "astra" for
+        // gpt-6-astra) is used and reported; several matches are refused.
+        if let (Ok(models), Some(requested), false) = (&list, explicit_model, agent.allow_unlisted) {
+            if !models.contains(requested) {
+                match model_check::alias(models, requested) {
+                    model_check::Alias::One(resolved) => {
+                        model_check::note_resolved(requested, &resolved);
+                        model = resolved;
+                    }
+                    model_check::Alias::Many(candidates) => {
+                        return Err(refuse("invalid_model", model_check::ambiguous(&facts.name, requested, &candidates)));
+                    }
+                    model_check::Alias::None => {}
+                }
+            }
+        }
+        model_check::decide(&facts.name, &model, &model_check::check_with(list, &model), agent.allow_unlisted)
+            .map_err(|error| refuse("invalid_model", error))?;
     }
     let sandbox = match given(&agent.sandbox) {
         Some(value) => SandboxLevel::parse(value).ok_or_else(|| {
@@ -661,9 +690,8 @@ pub fn admit(
         caller,
         sparse,
         || {
-            let sessions = crate::session::store::load_cutex_session_store_shared()
-                .map_err(|_| unavailable())?;
-            sessions.sessions.get(caller.as_str()).cloned().ok_or_else(|| {
+            crate::session::store::shared_session_row(caller.as_str())
+                .map_err(|_| unavailable())?.as_deref().cloned().ok_or_else(|| {
                 refuse("stale_runtime_identity", "the calling agent has no durable session")
             })
         },
@@ -882,6 +910,96 @@ fn payload_conflict(action_id: &AgentActionId) -> SparseRefusal {
     )
 }
 
+/// The confusion hint for an agent `name` that is also a profile or a model
+/// on this host (case-insensitive; a model also by a short form, see
+/// `model_check::Alias`), e.g. an agent "astra" meant as model gpt-6-astra.
+/// `models`: (profile, model slug) pairs.
+pub fn name_hint(name: &str, profiles: &[String], models: &[(String, String)]) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(profile) = profiles.iter().find(|profile| profile.eq_ignore_ascii_case(name)) {
+        return Some(format!("the name '{name}' is also a profile ({profile}); did you mean profile '{profile}'?"));
+    }
+    let mut matched: Vec<&(String, String)> = models.iter().filter(|(_, slug)| slug.eq_ignore_ascii_case(name)).collect();
+    if matched.is_empty() {
+        matched = models
+            .iter()
+            .filter(|(_, slug)| crate::profiles::model_check::names_model(slug, name))
+            .collect();
+    }
+    let mut slugs: Vec<&str> = Vec::new();
+    for (_, slug) in &matched {
+        if !slugs.contains(&slug.as_str()) {
+            slugs.push(slug);
+        }
+    }
+    let on = match slugs.as_slice() {
+        [] => return None,
+        [slug] => {
+            let mut profiles: Vec<&str> = Vec::new();
+            for (profile, _) in &matched {
+                if !profiles.contains(&profile.as_str()) {
+                    profiles.push(profile);
+                }
+            }
+            return Some(format!(
+                "the name '{name}' is also a model on this host ({slug}, profile {}); did you mean model '{slug}'?",
+                profiles.join(", ")
+            ));
+        }
+        several => several.iter().take(5).copied().collect::<Vec<_>>().join(", "),
+    };
+    Some(format!("the name '{name}' is also a model on this host ({on}); did you mean model '{name}'?"))
+}
+
+/// The profile names and the native-list models of this host for [`name_hint`].
+fn host_names() -> (Vec<String>, Vec<(String, String)>) {
+    let Ok(store) = crate::profiles::settings_api::load_store() else {
+        return (Vec::new(), Vec::new());
+    };
+    let profiles = crate::profiles::identity::available_profile_names(&store);
+    let mut models = Vec::new();
+    for account in &store.accounts {
+        if !crate::profiles::model_check::applies(account) {
+            continue;
+        }
+        if let Ok(list) = crate::profiles::model_check::list_for(account) {
+            models.extend(list.slugs.into_iter().map(|slug| (account.name.clone(), slug)));
+        }
+    }
+    (profiles, models)
+}
+
+/// agent_create / member_replace reply: when the new agent's `name` is also a
+/// profile or model here, a completed reply carries `name_warning` and an
+/// `active_agent_name_taken` refusal ends with the same hint.
+pub fn attach_name_hint(response: &mut serde_json::Value, name: &str) {
+    attach_name_hint_with(response, name, host_names)
+}
+
+fn attach_name_hint_with(
+    response: &mut serde_json::Value,
+    name: &str,
+    names: impl FnOnce() -> (Vec<String>, Vec<(String, String)>),
+) {
+    let outcome = &response["outcome"];
+    let complete = outcome["status"] == "complete" && outcome.pointer("/receipt/result").is_some_and(|result| result.is_object());
+    let taken = outcome["status"] == "no_write" && outcome["code"] == "active_agent_name_taken";
+    if !complete && !taken {
+        return;
+    }
+    let (profiles, models) = names();
+    let Some(hint) = name_hint(name, &profiles, &models) else { return };
+    if complete {
+        response["outcome"]["receipt"]["result"]["name_warning"] = serde_json::Value::String(hint);
+    } else if let Some(detail) = response.pointer_mut("/outcome/detail") {
+        let text = format!("{} Note: {hint}", detail.as_str().unwrap_or_default());
+        *detail = serde_json::Value::String(text);
+    }
+}
+
 #[cfg(test)]
 fn live_profile_facts(requested: &str) -> Result<ProfileFacts, SparseRefusal> {
     live_profile_facts_variant(requested, None)
@@ -948,6 +1066,7 @@ fn live_profile_facts_variant(requested: &str, variant: Option<&str>) -> Result<
         name: account.name.clone(),
         claude: account.cli_kind == crate::profiles::model::CliKind::Claude,
         default_model,
+        models: crate::profiles::model_check::applies(account).then(|| crate::profiles::model_check::list_for(account)),
         ..Default::default()
     })
 }
@@ -972,6 +1091,115 @@ mod tests {
             let failure = live_profile_facts_variant(profile, Some("codex")).unwrap_err();
             assert_eq!(failure.code, "unknown_variant");
         }
+    }
+
+    /// r274.1: a Codex profile on the native list refuses a model the list
+    /// does not show (invalid_model, naming the allowed models, the source
+    /// and allow_unlisted); allow_unlisted and an unreadable list let it
+    /// through with a warning; the default model is checked too.
+    #[test]
+    fn codex_models_are_checked_against_the_native_list() {
+        use crate::profiles::model_check::{ModelList, RequestScope};
+        let list = || ModelList::from_rows(
+            &[serde_json::json!({"slug": "gpt-6.1-sol"}), serde_json::json!({"slug": "gpt-6-astra"})],
+            &serde_json::json!({"kind": "nativeCache", "fetchedAt": "2026-11-03T03:00:00Z"}),
+        );
+        let facts = |models: Result<ModelList, String>, default: &str| {
+            let default = default.to_string();
+            move |name: &str| Ok(ProfileFacts { name: name.into(), default_model: Some(default.clone()), models: Some(models.clone()), ..Default::default() })
+        };
+        let _scope = RequestScope::enter(false);
+        let agent = SparseAgentSpec { name: "sol-review".into(), profile: Some("Ada".into()), model: Some("gpt-sol-6.1".into()), ..Default::default() };
+        let refused = resolve_spec(&agent, &caller(), facts(Ok(list()), "gpt-6.1-sol")).unwrap_err();
+        assert_eq!(refused.code, "invalid_model");
+        assert!(refused.detail.contains("Allowed models: gpt-6.1-sol, gpt-6-astra."), "{}", refused.detail);
+        assert!(refused.detail.contains("models_cache.json (fetched 2026-11-03T03:00:00Z)"), "{}", refused.detail);
+        assert!(refused.detail.contains("allow_unlisted: true"), "{}", refused.detail);
+        let listed = SparseAgentSpec { model: Some("gpt-6-astra".into()), ..agent.clone() };
+        assert_eq!(resolve_spec(&listed, &caller(), facts(Ok(list()), "gpt-6.1-sol")).unwrap().model, "gpt-6-astra");
+        let default = SparseAgentSpec { model: None, ..agent.clone() };
+        assert_eq!(resolve_spec(&default, &caller(), facts(Ok(list()), "gpt-old")).unwrap_err().code, "invalid_model");
+        let allowed = SparseAgentSpec { allow_unlisted: true, ..agent.clone() };
+        assert_eq!(resolve_spec(&allowed, &caller(), facts(Ok(list()), "gpt-6.1-sol")).unwrap().model, "gpt-sol-6.1");
+        let mut reply = serde_json::json!({"outcome": {"status": "complete", "receipt": {"result": {"kind": "created"}}}});
+        crate::profiles::model_check::attach_warning(&mut reply);
+        assert!(reply["outcome"]["receipt"]["result"]["model_warning"].as_str().unwrap().contains("allowed by allow_unlisted"));
+        let spec = resolve_spec(&agent, &caller(), facts(Err("no local runtime deployment is selected".into()), "gpt-6.1-sol")).unwrap();
+        assert_eq!(spec.model, "gpt-sol-6.1");
+        let mut reply = serde_json::json!({"outcome": {"status": "complete", "receipt": {"result": {"kind": "created"}}}});
+        crate::profiles::model_check::attach_warning(&mut reply);
+        assert!(reply["outcome"]["receipt"]["result"]["model_warning"].as_str().unwrap().contains("could not be read"));
+        // Profiles without a native list (facts.models None) are not checked here.
+        let unchecked = |name: &str| Ok(ProfileFacts { name: name.into(), default_model: Some("x".into()), ..Default::default() });
+        assert_eq!(resolve_spec(&agent, &caller(), unchecked).unwrap().model, "gpt-sol-6.1");
+        // allow_unlisted is absent from the wire (and the digest) when false.
+        assert!(serde_json::to_value(&agent).unwrap().get("allow_unlisted").is_none());
+        assert_eq!(serde_json::to_value(&allowed).unwrap()["allow_unlisted"], true);
+    }
+
+    /// agent-create aliases: a unique short form resolves (and is reported),
+    /// several matches are refused with the candidates, allow_unlisted and
+    /// the default model are taken literally.
+    #[test]
+    fn a_unique_model_short_form_resolves_and_an_ambiguous_one_is_refused() {
+        use crate::profiles::model_check::{ModelList, RequestScope};
+        let list = ModelList::from_rows(
+            &[serde_json::json!({"slug": "gpt-6.1-sol"}), serde_json::json!({"slug": "gpt-6-astra"}), serde_json::json!({"slug": "gpt-6.1-sol-mini"})],
+            &serde_json::json!({"kind": "nativeCache"}),
+        );
+        let facts = |name: &str| Ok(ProfileFacts { name: name.into(), default_model: Some("astra".into()), models: Some(Ok(list.clone())), ..Default::default() });
+        let _scope = RequestScope::enter(false);
+        let agent = SparseAgentSpec { name: "reviewer".into(), profile: Some("Ada".into()), model: Some("astra".into()), ..Default::default() };
+        assert_eq!(resolve_spec(&agent, &caller(), facts).unwrap().model, "gpt-6-astra");
+        let mut reply = serde_json::json!({"outcome": {"status": "complete", "receipt": {"result": {"kind": "created"}}}});
+        crate::profiles::model_check::attach_warning(&mut reply);
+        assert_eq!(reply["outcome"]["receipt"]["result"]["model_resolved"], serde_json::json!({"requested": "astra", "resolved": "gpt-6-astra"}));
+        let sol = SparseAgentSpec { model: Some("sol".into()), ..agent.clone() };
+        let refused = resolve_spec(&sol, &caller(), facts).unwrap_err();
+        assert_eq!(refused.code, "invalid_model");
+        assert!(refused.detail.contains("matches several of its models: gpt-6.1-sol, gpt-6.1-sol-mini."), "{}", refused.detail);
+        let unknown = SparseAgentSpec { model: Some("astr".into()), ..agent.clone() };
+        assert!(resolve_spec(&unknown, &caller(), facts).unwrap_err().detail.contains("Allowed models:"));
+        let literal = SparseAgentSpec { allow_unlisted: true, ..agent.clone() };
+        assert_eq!(resolve_spec(&literal, &caller(), facts).unwrap().model, "astra");
+        let default = SparseAgentSpec { model: None, ..agent.clone() };
+        assert_eq!(resolve_spec(&default, &caller(), facts).unwrap_err().code, "invalid_model", "the configured default is not aliased");
+    }
+
+    #[test]
+    fn a_name_that_is_also_a_profile_or_model_gets_a_hint() {
+        let profiles = vec!["Ada".to_string(), "Ceobe".to_string()];
+        let models = vec![
+            ("Ada".to_string(), "gpt-6-astra".to_string()),
+            ("Jasmine".to_string(), "gpt-6-astra".to_string()),
+            ("Ada".to_string(), "gpt-6.1-sol".to_string()),
+            ("Ada".to_string(), "gpt-6.1-sol-mini".to_string()),
+        ];
+        let names = || (profiles.clone(), models.clone());
+        assert_eq!(
+            name_hint("astra", &profiles, &models).unwrap(),
+            "the name 'astra' is also a model on this host (gpt-6-astra, profile Ada, Jasmine); did you mean model 'gpt-6-astra'?"
+        );
+        assert_eq!(name_hint("ceobe", &profiles, &models).unwrap(), "the name 'ceobe' is also a profile (Ceobe); did you mean profile 'Ceobe'?");
+        assert!(name_hint("sol", &profiles, &models).unwrap().contains("(gpt-6.1-sol, gpt-6.1-sol-mini); did you mean model 'sol'?"));
+        assert_eq!(name_hint("sol-review", &profiles, &models), None);
+        assert_eq!(name_hint("astr", &profiles, &models), None);
+
+        let mut created = serde_json::json!({"outcome": {"status": "complete", "receipt": {"result": {"kind": "created"}}}});
+        attach_name_hint_with(&mut created, "astra", names);
+        assert!(created["outcome"]["receipt"]["result"]["name_warning"].as_str().unwrap().contains("did you mean model 'gpt-6-astra'?"));
+        let mut taken = serde_json::json!({"outcome": {"status": "no_write", "code": "active_agent_name_taken", "detail": "the name 'astra' is held."}});
+        attach_name_hint_with(&mut taken, "astra", names);
+        assert_eq!(
+            taken["outcome"]["detail"],
+            "the name 'astra' is held. Note: the name 'astra' is also a model on this host (gpt-6-astra, profile Ada, Jasmine); did you mean model 'gpt-6-astra'?"
+        );
+        let mut other = serde_json::json!({"outcome": {"status": "no_write", "code": "invalid_model", "detail": "d"}});
+        attach_name_hint_with(&mut other, "astra", || unreachable!("not read for other refusals"));
+        assert_eq!(other["outcome"]["detail"], "d");
+        let mut plain = serde_json::json!({"outcome": {"status": "complete", "receipt": {"result": {"kind": "created"}}}});
+        attach_name_hint_with(&mut plain, "reviewer", names);
+        assert!(plain["outcome"]["receipt"]["result"].get("name_warning").is_none());
     }
 
     #[test]
@@ -1331,7 +1559,7 @@ mod tests {
 
     fn no_sparse_side_effects(store: &super::super::AgentManagementStore) {
         let snapshot = store.snapshot().unwrap();
-        assert!(snapshot.sparse_requests.is_empty(), "{:?}", snapshot.sparse_requests.keys());
+        assert!(snapshot.sparse_requests.is_empty(), "{:?}", snapshot.sparse_requests.keys().collect::<Vec<_>>());
         assert!(snapshot.actions.is_empty());
     }
 
@@ -1478,7 +1706,7 @@ mod tests {
             requested: "auto:anthropic".into(),
             provider: "anthropic".into(),
             picked: "AlphaProfile".into(),
-            picked_id: "id-alpha-profile".into(),
+            picked_id: "id-AlphaProfile".into(),
             rule: "only_candidate".into(),
             reason: "AlphaProfile: the only candidate".into(),
             model: None,

@@ -6,6 +6,17 @@ use serde_json::Value;
 /// Additive Management features beyond the frozen v2 baseline. Clients
 /// feature-detect on these strings (and the boolean `features` map).
 pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
+    // 2026-11-03: design 056 phase 1 (r275), opaque per-person layout sections.
+    ("user-layout", "userLayout"),
+    // 2026-11-04: session resources carry `activity.lastTurnError {turnId,
+    // message, code, codexErrorInfo, at, consecutive}` or null: the last turn
+    // that ended `failed` (Codex and Claude runtimes), cleared by a later
+    // `completed` turn, kept by `interrupted`, persisted with the session
+    // activity. `code`: refresh_token_reused | unauthorized | the
+    // codexErrorInfo string / single object key | other. Failures of the
+    // unauthorized family notify the owner (system notice `turnAuthFailed`,
+    // at most once per profile per rolling hour).
+    ("turn-error-surface", "turnErrorSurface"),
     // r266 controls; continuation child kinds are discovered separately.
     ("delegation-routing-v1", "delegationRoutingV1"),
     ("delegation-review-refs", "delegationReviewRefs"),
@@ -14,6 +25,11 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("delegation-continuation-v1", "delegationContinuationV1"),
     ("agent-activity-v1", "agentActivityV1"),
     ("agent-bus-message-settlement-v1", "agentBusMessageSettlementV1"),
+    (
+        crate::management::v2::agent_bus_settlement_model::STALE_ACK_FEATURE,
+        "agentBusStaleAckSettlementV1",
+    ),
+    (super::question_answers::FEATURE, "userInputOptionsV1"),
     ("image-input-steering", "imageInputSteering"),
     ("live-text-deltas", "liveTextDeltas"),
     ("director-address", "directorAddress"),
@@ -24,6 +40,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("include-hidden", "includeHidden"),
     // cutex/session/metadata/update + note/avatar/displayNameOverride.
     ("session-metadata", "sessionMetadata"),
+    ("session-background-work", "sessionBackgroundWork"),
     // Project workspace_root (set_workspace_root mutation, summaries).
     ("project-workspace-root", "projectWorkspaceRoot"),
     // POST /v2/human/agents.
@@ -157,6 +174,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // services are not reclaimed with their archived registrant and do not
     // block deleting it (the delete clears the registrant).
     ("services-project-scope", "servicesProjectScope"),
+    ("service-idle-presets-v1", "serviceIdlePresetsV1"),
     // Owner Management GET /v2/services/{slug}/eligible-owners: all known
     // non-archived sessions, including hidden, unnamed and offline sessions.
     ("services-eligible-owners", "servicesEligibleOwners"),
@@ -278,6 +296,9 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // GET /v2/approvals, POST /v2/approvals/{id}/approve|deny and the
     // cutex/approvals/changed host event.
     ("owner-approvals", "ownerApprovals"),
+    // S10 bounded limit/cursor pages for approvals, owner notifications and
+    // safety checks (docs/management/owner-store-pages.md).
+    ("owner-notify-approval-pages-v1", "ownerNotifyApprovalPagesV1"),
     // Design 047: root-only host-side automatic approval rules and audit.
     ("approval-auto-rules", "approvalAutoRules"),
     // Same-mode authority narrowing preserves the exact stored deadline (no renewal/typed confirm).
@@ -525,6 +546,10 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // expectedSemanticSha256?, allowProtected?} (terminal
     // owner_message_discarded + live withdraw + audit fact; idempotent).
     ("agent-bus-stuck-messages", "agentBusStuckMessages"),
+    // Read-only cleanup support; each is independently negotiated by clients.
+    ("asks-updated-before-cursor-v1", "asksUpdatedBeforeCursorV1"),
+    ("agent-bus-message-content-v1", "agentBusMessageContentV1"),
+    ("admission-hidden-receipts-v1", "admissionHiddenReceiptsV1"),
     ("health-check", "healthCheck"),
     // Input overflow (cutex-desktop docs/research/input-overflow-documents.md):
     // delegation / result / bus texts are fitted to the receiver's byte
@@ -607,6 +632,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // native version registry entries and Claude runtimes with the agents
     // pinned to each, plus the cutex release (schema export runtimes).
     ("runtimes-view", "runtimesView"),
+    ("runtime-prune-v1", "runtimePruneV1"),
     // GET /v2/runtimes/idle + POST /v2/runtimes/stop-idle (root): which online
     // agents are idle (stoppable / caution / blocked with reasons) and a batch
     // stop, wakeable by default or as the owner's stop (design 031).
@@ -652,6 +678,8 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // for the turn end. Read per delivery (no restart).
     ("wake-busy-wait", "wakeBusyWait"),
     ("owner-rotation", "ownerRotation"), // /v2/director-rotations (owner_rotation_api.rs), mutation rotate_director, event cutex/ownerRotation/updated
+    (crate::agent_names::RENAME_FEATURE, "formalAgentNameRenameV1"),
+    (crate::agent_names::FEATURE, "agentNameResolutionV1"),
     // planLabel order: a manual planLabel (PATCH) overrides the signed-in
     // ChatGPT account's plan (source "manual"); without one the account's
     // live plan shows ("account"), then the legacy plan_type. Live plan: a
@@ -732,6 +760,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // cutex/quotaAutoContinue/changed; schema export `quota-auto-continue`.
     ("claude-quota-auto-continue", "claudeQuotaAutoContinue"),
     ("model-overload-auto-retry", "modelOverloadAutoRetry"),
+    ("model-overload-retry-visible", "modelOverloadRetryVisible"),
     // Usage-limit reset credits of a profile's account:
     // GET /v2/profiles/{p}/reset-credits[?refresh=true] (count, expiry, rows;
     // read on request, cached 60 s per account) and POST
@@ -866,6 +895,26 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("browser-relay-v1", "browserRelayV1"),
     // Root + loopback owner recovery for stuck browser idempotency rows.
     ("browser-idempotency-clear", "browserIdempotencyClear"),
+    // Design 059: profile `browserToolSurface` (auto | command | legacy) in
+    // /v2/profiles items + PATCH; auto/command offer the one `browser` tool
+    // where the runtime carries it.
+    ("browser-tool-surface-v1", "browserToolSurfaceV1"),
+    // Design 059: a tabs.open result may say `loadState: "loading"` (the
+    // tab exists and is controlled; its first load continues). Desktops
+    // send it only to hosts listing this feature.
+    ("browser-open-stages-v1", "browserOpenStagesV1"),
+    // A failed device result may carry `error.detail` {stage?, url?,
+    // netError? {code, name}, reason?, field?}: where it failed, the
+    // (display-redacted) page, Chromium's net error, what was busy, which
+    // field was invalid. Shape-checked here and in the façade.
+    ("browser-error-detail-v1", "browserErrorDetailV1"),
+    // A tab.act result may say `newTab: true` (the click opened a new tab;
+    // it is granted under the opener lease, see browser-popup-grant), and
+    // snapshot / find nodes of links and images may carry `url`.
+    ("browser-page-links-v1", "browserPageLinksV1"),
+    // Design 059 S2: profile browserToolSurface accepts `script`
+    // (browser_script in a per-session Node kernel on this host).
+    ("browser-script-v1", "browserScriptV1"),
     // Codex profile webSearch (native `web_search` mode: "disabled" |
     // "cached" | "indexed" | "live" | null = not set, native default) in
     // /v2/profiles items + detail config + PATCH (null clears); stored as the
@@ -921,7 +970,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // `web_search` = one separate non-streaming Responses request to the
     // same profile's provider / model with only the built-in
     // `{"type":"web_search"}` tool, answer text + url_citation sources back,
-    // per-agent rate limit 20 / h, provider timeout 90 s, token usage in the
+    // provider timeout 90 s, token usage in the
     // usage ledger. Owner switch only: no preset turns it on.
     ("profile-search-tool", "profileSearchTool"),
     // cutex/session/metadata/update avatar gains optional `color` (#rrggbb)
@@ -979,6 +1028,10 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // backend updates keep installed components in step. Static per build:
     // component state is only in GET /v2/components.
     ("components", "components"),
+    ("component-index-v1", "componentIndexV1"),
+    ("external-runtime-root-v1", "externalRuntimeRootV1"),
+    ("component-dsh-adapter-v1", "componentDshAdapterV1"),
+    ("component-kimi-adapter-v1", "componentKimiAdapterV1"),
     // create_project {create_workspace_root: true} (project-mutations): a
     // missing workspace_root is created (missing tail only, no `.` / `..`,
     // as the daemon user) instead of refused with workspace_root_not_found;
@@ -1054,6 +1107,8 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // (sessions_watch.rs): writes of other processes (agent_create in the
     // Agent Bus service) now reach live event streams.
     ("sessions-changed-event", "sessionsChangedEvent"),
+    (super::session_deltas::CAPABILITY, "sessionDeltasV1"),
+    (super::session_deltas::HOST_CAPABILITY, "sessionDeltasHostV1"),
     // 2026-10-15 (owner decision): agent_create / member_replace `task` is a
     // delegation from the calling agent to the new agent (asks/create_task.rs):
     // the agent starts idle, then the task goes through agent_delegate, so its
@@ -1461,6 +1516,21 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // r266: /v2/kimi/accounts (Kimi subscription logins, device code driven
     // by Management; never a token on the wire).
     ("kimi-accounts", "kimiAccounts"),
+    // r271 owner admission (desktop design 050 §5). A busy host authority
+    // fence is `admission_busy` / `queuedReason: hostBusy`, never a pause;
+    // `queuedReason` on queued submits and events.
+    ("owner-admission-busy-v1", "ownerAdmissionBusyV1"),
+    // `allowHeld: true` on cutex/userInput/submit: `disposition: "held"`
+    // (`heldBy: hostBusy`), `cutex/userInput/held`, then the usual outcome
+    // events or `cutex/userInput/failed` code `admission_timeout`.
+    ("owner-admission-held-v1", "ownerAdmissionHeldV1"),
+    // queue/list `ownerAdmission {state, reason}` + `admissionFresh`.
+    ("owner-admission-state-v1", "ownerAdmissionStateV1"),
+    // r276: cutex/runtime/closing / closed carry `requestedBy {kind: agent,
+    // runtimeAgentId, cutexSessionId?, name?}` when an agent's own `cutex`
+    // CLI asked for the stop; without it a stop is the owner's or the CLI's
+    // (`reason: cutex_cli`).
+    ("runtime-stop-requested-by", "runtimeStopRequestedBy"),
     #[cfg(target_os = "linux")]
     ("job-service", "jobService"),
 ];
@@ -1474,7 +1544,29 @@ fn capabilities_with_jobs(jobs: super::human_jobs::JobCapabilities) -> Value {
     if crate::components::kimi_runtime::advertised() {
         add_kimi_runtime_feature(&mut value);
     }
+    add_input_ledger_feature(&mut value, super::input_ledger::enabled());
     value
+}
+
+/// 054 §4.1 / 057: ledger, owner surfaces, then atomic owner carries,
+/// are the last features, and only while the internal switch is on; off, the
+/// answer is r273.1's byte for byte.
+fn add_input_ledger_feature(value: &mut Value, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    if let Some(features) = value.get_mut("features").and_then(Value::as_object_mut) {
+        features.insert("inputLedgerV1".into(), Value::Bool(true));
+        features.insert("ownerInputNextupV1".into(), Value::Bool(true));
+        features.insert("ownerIdleBusyTimelineV1".into(), Value::Bool(true));
+        features.insert("ownerCarriesV1".into(), Value::Bool(true));
+    }
+    if let Some(list) = value.get_mut("featureList").and_then(Value::as_array_mut) {
+        list.push(Value::String(super::input_ledger::CAPABILITY.into()));
+        list.push(Value::String(super::input_ledger::OWNER_INPUT_NEXTUP_CAPABILITY.into()));
+        list.push(Value::String(super::input_ledger::OWNER_CARRIES_CAPABILITY.into()));
+        list.push(Value::String(super::input_ledger::OWNER_IDLE_BUSY_TIMELINE_CAPABILITY.into()));
+    }
 }
 
 /// r266: the Kimi Code runtime is offered only after installation (like
@@ -1562,6 +1654,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn input_ledger_v1_is_last_and_only_while_the_switch_is_on() {
+        let base = capabilities_with_optional_dsh(super::super::human_jobs::JobCapabilities::default(), true);
+        let mut off = base.clone();
+        add_kimi_runtime_feature(&mut off);
+        let before = serde_json::to_string(&off).unwrap();
+        add_input_ledger_feature(&mut off, false);
+        assert_eq!(serde_json::to_string(&off).unwrap(), before, "off: byte for byte unchanged");
+        let mut on = base;
+        add_kimi_runtime_feature(&mut on);
+        add_input_ledger_feature(&mut on, true);
+        let list = on["featureList"].as_array().unwrap();
+        assert_eq!(&list[list.len() - 4..], [json!("input-ledger-v1"), json!("owner-input-nextup-v1"), json!("owner-carries-v1"), json!("owner-idle-busy-timeline-v1")]);
+        assert_eq!(on["features"]["inputLedgerV1"], true);
+        assert_eq!(on["features"]["ownerInputNextupV1"], true);
+        assert_eq!(on["features"]["ownerCarriesV1"], true);
+        assert_eq!(on["features"]["ownerIdleBusyTimelineV1"], true);
+    }
+
+    #[test]
     fn optional_dsh_is_advertised_only_after_installation() {
         for installed in [false, true, false] {
             let value = capabilities_with_optional_dsh(super::super::human_jobs::JobCapabilities::default(), installed);
@@ -1602,6 +1713,14 @@ mod tests {
             ("delegation-continuation-v1", "delegationContinuationV1"),
             ("agent-activity-v1", "agentActivityV1"),
             ("agent-bus-message-settlement-v1", "agentBusMessageSettlementV1"),
+            (
+                crate::management::v2::agent_bus_settlement_model::STALE_ACK_FEATURE,
+                "agentBusStaleAckSettlementV1",
+            ),
+            (
+                super::super::question_answers::FEATURE,
+                "userInputOptionsV1",
+            ),
         ] {
             assert_eq!(value["features"][key], true);
             assert!(value["featureList"].as_array().unwrap().iter().any(|item| item == flag));
@@ -1679,6 +1798,7 @@ mod tests {
             "agentExternalGrants",
             "agentToolRoles",
             "ownerApprovals",
+            "ownerNotifyApprovalPagesV1",
             "approvalsLive",
             "approvalDecisionNotice",
             "profileNativeSubagents",
@@ -1713,6 +1833,9 @@ mod tests {
             "queueIdleStart",
             "queueReorder",
             "admissionOrder",
+            "asksUpdatedBeforeCursorV1",
+            "agentBusMessageContentV1",
+            "admissionHiddenReceiptsV1",
             "inputOverflowDocuments",
             "recordArchive",
             "sessionStoreRetention",
@@ -1740,6 +1863,11 @@ mod tests {
             "crossHostTellWake",
             "peersV2",
             "browserRelayV1",
+            "browserToolSurfaceV1",
+            "browserOpenStagesV1",
+            "browserErrorDetailV1",
+            "browserPageLinksV1",
+            "browserScriptV1",
             "skillsArchive",
             "projectCreateWorkspaceRoot",
             "profileDeleteDetachArchived",
@@ -1769,6 +1897,7 @@ mod tests {
             "userHome",
             "userHomePagePins",
             "serviceTiles",
+            "turnErrorSurface",
         ] {
             assert_eq!(value["features"][key], true, "{key}");
         }
@@ -1778,7 +1907,7 @@ mod tests {
         let list = value["featureList"].as_array().unwrap();
         assert!(list.iter().any(|name| name == "task-service-removed"));
         assert!(list.iter().any(|name| name == "wake-busy-wait"));
-        for name in ["notes", "side-chat", "queue-reorder", "admission-order", "stop-holds-ridealongs", "admission-owner-yield", "admission-ridealong-detail"] {
+        for name in ["notes", "side-chat", "queue-reorder", "admission-order", "stop-holds-ridealongs", "admission-owner-yield", "admission-ridealong-detail", "turn-error-surface"] {
             assert!(list.iter().any(|listed| listed == name), "{name}");
         }
         assert!(list.iter().any(|name| name == "artifacts"));

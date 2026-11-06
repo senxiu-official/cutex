@@ -7,10 +7,41 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, net::TcpStream, path::PathBuf, sync::Mutex};
 
 pub const FEATURE: &str = "model-overload-auto-retry";
+pub const VISIBLE_FEATURE: &str = "model-overload-retry-visible";
 pub const PATH: &str = "/v2/model-overload-retry";
 pub const CHANGED_EVENT: &str = "cutex/modelOverloadRetry/changed";
 pub const CONTINUE_TEXT: &str = "Continue.";
 pub const DELAYS: [i64; 3] = [15, 45, 120];
+
+/// Presentation only: never used to admit, cancel or replay work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoRetry {
+    pub thread_id: String,
+    pub runtime_generation: u64,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub scheduled_at: String,
+    pub at: String,
+    pub turn_id: String,
+    pub plan_id: String,
+    pub phase: Phase,
+    /// A matching retained admission lease actually blocks other work.
+    pub holds_admission: bool,
+}
+
+/// Typed evidence from a daemon-created plan and a validated native receipt.
+/// Neither Continue text nor a user-supplied source marker is evidence.
+pub fn retry_evidence(plan: &Plan, turn: Option<&str>) -> Value {
+    let mut evidence = json!({
+        "failedTurnId": plan.failed_turn["id"], "attempt": plan.attempt,
+        "maxAttempts": DELAYS.len(), "planId": plan.plan_id,
+        "messageId": plan.message_id, "threadId": plan.thread_id,
+        "runtimeGeneration": plan.runtime_generation,
+    });
+    if let Some(turn) = turn { evidence["turnId"] = json!(turn); }
+    evidence
+}
 
 pub fn overloaded(turn: &Value) -> bool {
     turn["status"] == "failed"
@@ -34,6 +65,9 @@ pub enum Phase {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Plan {
+    /// Preserve old uncertain-send digests across an upgrade. New attempts use v2.
+    #[serde(default = "legacy_envelope_version")]
+    pub envelope_version: u32,
     pub plan_id: String,
     pub thread_id: String,
     pub runtime_generation: u64,
@@ -56,6 +90,8 @@ pub struct Plan {
     #[serde(default)]
     pub binding_turn_id: Option<String>,
 }
+
+fn legacy_envelope_version() -> u32 { 1 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settlement {
@@ -88,6 +124,36 @@ fn stamp(now: DateTime<Utc>) -> String {
 }
 
 impl State {
+    pub fn auto_retry(
+        &self, session: &str, thread: Option<&str>, generation: u64,
+        lease: Option<&crate::asks::model::AdmissionLease>, active_turn: Option<&str>,
+    ) -> Option<AutoRetry> {
+        let entry = self.sessions.get(session)?;
+        if entry.settlement.is_some() { return None; }
+        let plan = entry.plan.as_ref()?;
+        if thread != Some(plan.thread_id.as_str()) || generation != plan.runtime_generation
+            || plan.phase == Phase::Running
+            || active_turn.is_some_and(|id| id != plan.turn_id && plan.binding_turn_id.as_deref() != Some(id))
+        { return None; }
+        let held = match (&plan.lease, lease) {
+            (None, None) => false,
+            (Some(expected), Some(actual)) if expected.holder == actual.holder
+                && expected.cutex_session_id == session && actual.cutex_session_id == session
+                && expected.native_message_id == actual.native_message_id
+                && actual.runtime_generation == generation
+                && actual.turn_id.as_deref().is_some_and(|id|
+                    id == plan.turn_id || plan.binding_turn_id.as_deref() == Some(id)) => true,
+            _ => return None,
+        };
+        Some(AutoRetry {
+            thread_id: plan.thread_id.clone(), runtime_generation: generation,
+            attempt: plan.attempt, max_attempts: DELAYS.len() as u32,
+            scheduled_at: plan.scheduled_at.clone(), at: plan.at.clone(),
+            turn_id: plan.turn_id.clone(), plan_id: plan.plan_id.clone(),
+            phase: plan.phase.clone(), holds_admission: held,
+        })
+    }
+
     pub fn view(&self, session: &str) -> Value {
         let entry = self.sessions.get(session);
         let pending = entry
@@ -175,6 +241,7 @@ impl State {
             .map(|p| p.plan_id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         entry.plan = Some(Plan {
+            envelope_version: 2,
             message_id: format!("cutex-model-overload-{plan_id}-{attempt}"),
             plan_id,
             thread_id: thread.into(),
@@ -419,6 +486,17 @@ pub fn holds_default(session: &str, turn: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Queue callers already hold AskStore; do not reacquire it here.
+pub fn auto_retry_default(
+    session: &str, lease: Option<&crate::asks::model::AdmissionLease>,
+) -> Option<AutoRetry> {
+    let records = crate::session::store::load_cutex_session_store_shared().ok()?;
+    let record = records.sessions.values().find(|r| r.cutex_session_id == session && r.is_active())?;
+    let store = Store::open_default().ok()?;
+    if store.is_disabled() { return None; }
+    store.snapshot().ok()?.auto_retry(session, record.app_server_thread_id(), record.runtime_generation, lease, None)
+}
+
 pub fn cancellation_outcome(reason: &str) -> &'static str {
     match reason {
         "receiptUnresolved" | "resumeUnavailable" => "failed",
@@ -439,6 +517,24 @@ pub fn publish(session: &str, reason: &str) {
     let Ok(state) = Store::open_default().and_then(|s| s.snapshot()) else {
         return;
     };
+    publish_state(session, reason, &state, None);
+}
+
+pub fn publish_fired(session: &str, plan: &Plan, turn: &str) {
+    let Ok(state) = Store::open_default().and_then(|s| s.snapshot()) else { return; };
+    publish_state(session, "fired", &state, Some(retry_evidence(plan, Some(turn))));
+}
+
+fn changed_payload(session: &str, reason: &str, state: &State, evidence: Option<Value>) -> Value {
+    let retry = evidence.or_else(|| state.sessions.get(session)?.plan.as_ref().map(|p|
+        retry_evidence(p, (p.phase == Phase::Running).then_some(p.turn_id.as_str()))));
+    let mut payload = json!({"cutexSessionId":session,
+        "hostId":crate::platform::host::current_host_name(),"reason":reason,"modelOverloadRetry":state.view(session)});
+    if let Some(retry) = retry { payload["retry"] = retry; }
+    payload
+}
+
+fn publish_state(session: &str, reason: &str, state: &State, evidence: Option<Value>) {
     let Ok(events) = super::repository::management_v2_repository() else {
         return;
     };
@@ -447,9 +543,9 @@ pub fn publish(session: &str, reason: &str) {
         super::services::HOST_EVENT_SESSION_ID,
         super::model::EventCorrelation::default(),
         CHANGED_EVENT,
-        json!({"cutexSessionId":session,
-            "hostId":crate::platform::host::current_host_name(),"reason":reason,"modelOverloadRetry":state.view(session)}),
+        changed_payload(session, reason, state, evidence),
     );
+    super::admission::changed(session);
 }
 
 /// Firing has not submitted. Uncertain may have executed and must never be
@@ -863,7 +959,8 @@ pub fn finish_binding(
         let e = s.sessions.get_mut(session)?;
         let p = e.plan.as_mut()?;
         if p.message_id != plan.message_id || p.phase != Phase::Binding || p.binding_turn_id.as_deref() != Some(turn) { return None; }
-        e.last = Some(json!({"at":Utc::now().to_rfc3339(),"result":"fired","reason":null,"attempt":plan.attempt}));
+        e.last = Some(json!({"at":Utc::now().to_rfc3339(),"result":"fired","reason":null,"attempt":plan.attempt,
+            "retry": retry_evidence(plan, Some(turn))}));
         p.turn_id = turn.into(); p.phase = Phase::Running; p.binding_turn_id = None;
         p.lease = p.lease.take().map(|mut l| { l.turn_id=Some(turn.into()); l });
         let early = p.early_terminal.take();

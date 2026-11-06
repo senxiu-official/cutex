@@ -63,8 +63,7 @@ fn read(path: &Path, route: &Route) -> anyhow::Result<(AuthCustody, Option<ApiKe
                         .is_none_or(|v| v.is_null() || v.as_str() == Some("apikey")),
                 "API profile requires API credentials"
             );
-            let key = value["OPENAI_API_KEY"]
-                .as_str()
+            let key = crate::profiles::api_key::from_auth(&value)
                 .filter(|key| !key.is_empty() && !key.chars().any(char::is_control))
                 .context("API credential missing")?;
             (None, Some(ApiKey(key.into())))
@@ -146,6 +145,51 @@ mod tests {
             &serde_json::json!({"OPENAI_API_KEY":"test-key-two"}),
         );
         assert_ne!(review_auth(&path, &Route::GlmApiKey).unwrap(), before);
+    }
+
+    /// r274.1 (C): an existing agent's stored model that the native list
+    /// does not show is launched as stored: the review keeps the stored model
+    /// over the profile's own model and never consults the list (only a new
+    /// managed agent's launch review does, `validate_listed_model`).
+    #[test]
+    fn a_stored_unlisted_model_is_never_replaced_on_resume() {
+        use base64::Engine;
+        let root = fixture();
+        let id_token = format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"https://api.openai.com/auth":{"chatgpt_user_id":"fixture-user"}}"#)
+        );
+        write(&root.0, &serde_json::json!({"auth_mode":"chatgpt","OPENAI_API_KEY":null,
+            "tokens":{"id_token":id_token,"access_token":"fixture-access","refresh_token":"fixture-refresh","account_id":"fixture-account"},"last_refresh":null}));
+        let config = "cutex_provider_mode='selected_profile_v2'\ncli_auth_credentials_store='file'\nmodel='gpt-6.1-sol'\n";
+        let stored = "gpt-sol-6.1".to_string();
+        let (projection, model, _) = Config::parse(config).unwrap()
+            .review(&uuid::Uuid::new_v4().to_string(), root.0.join("auth.json"), Some(&stored), None)
+            .expect("a stored unlisted model still reviews");
+        assert_eq!(projection.route, Route::ChatgptFile);
+        assert!(projection.catalog.is_none());
+        assert_eq!(model, stored, "the stored model is launched, not the profile's");
+    }
+
+    #[test]
+    fn lowercase_api_auth_reviews_as_api_profile_without_rewriting_credentials() {
+        let root = fixture();
+        let key = format!("fixture-{}", uuid::Uuid::new_v4());
+        let config = "cutex_provider_mode='selected_profile_v2'\ncli_auth_credentials_store='file'\nmodel='manual-model'\nmodel_provider='relay'\n[model_providers.relay]\nname='relay'\nbase_url='http://127.0.0.1:9/v1'\nwire_api='responses'\nrequires_openai_auth=false\nenv_key='OPENAI_API_KEY'\n";
+        for auth in [serde_json::json!({"openai_api_key":key,"auth_mode":"apikey","tokens":null}),
+            serde_json::json!({"OPENAI_API_KEY":null,"openai_api_key":key,"auth_mode":"apikey","tokens":null})] {
+            write(&root.0, &auth);
+            let path = root.0.join("auth.json");
+            let bytes = std::fs::read(&path).unwrap();
+            let (projection, _, _) = Config::parse(config).unwrap()
+                .review(&uuid::Uuid::new_v4().to_string(), path.clone(), None, None)
+                .expect("lowercase legacy credential must select the API route");
+            assert_eq!(projection.route, Route::ApiKey);
+            assert!(read_api_key(&path).unwrap().0 == key, "selected credential differs");
+            assert!(std::fs::read(&path).unwrap() == bytes, "reading must preserve credential bytes");
+            assert!(!serde_json::to_string(&projection).unwrap().contains(&key), "projection must not expose credentials");
+        }
     }
     #[test]
     fn windows_private_atomic_write_passes_the_credential_check() {

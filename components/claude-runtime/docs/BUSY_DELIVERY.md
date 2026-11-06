@@ -1,14 +1,13 @@
 # Claude busy wake and delegation result delivery
 
-Task 07, based on Cutex `47cab2d`, extends the r8 external-input path.
+The selected signed Claude component implements the external-input delivery contract described here. Host and runtime capabilities gate each path.
 
 Before accepting a new Agent Bus wake, Cutex uses the shared `wake_timing` /
 `wake_busy_wait()` policy. A busy recipient holds an unfrozen message until the
 configured deadline. An idle recipient receives it immediately. After the
 deadline, a subscription adapter advertising `externalInputDeliveries: soon`
 accepts a frozen native `soon` envelope. Its digest never changes on retries.
-Existing r7 inbox identities and existing frozen r8 envelopes keep their route;
-r7 and r8 adapters without the new capability retain after-turn delivery.
+Existing inbox identities and frozen envelopes keep their route. Adapters without the required capability retain after-turn delivery.
 
 The adapter enqueues `soon` in the existing durable FIFO and adds a `busy_inputs`
 record in the same transaction. A main-agent PostToolUse callback must match the
@@ -19,13 +18,17 @@ receipt's reserved `turnId` remains stable; the legacy result receipt exposes
 `contextTurnId` separately. Source, framing, asks, attempt and structured view
 remain external data. No owner `turn/start` or `turn/steer` route is used.
 The claim and hook return run without yielding; a turn end that wins before the
-claim leaves the input untouched for its FIFO fallback. Timeline notifications
-for an injected wake are published with the later context acknowledgement.
+claim leaves the input untouched for its FIFO fallback. The
+timeline item of an injected wake is published right after the claiming hook
+returns (scheduled, not awaited), like an owner steer; earlier adapters waited for
+the context acknowledgement. The item is not a context receipt.
 
 A hook offer and ordinary item output do **not** count as context persistence.
-The existing r8 successful SDK Result remains the acknowledgement boundary.
+In the current adapter, a newly appended, complete native main-chain context attachment can
+confirm its exact offered inputs before the turn ends. The existing successful
+SDK Result remains a fallback acknowledgement boundary.
 Native inputs then receive their ordinary stable context receipt; legacy result
-status sets `contextPersisted`. Interrupted, crashed or unreturned offers stay
+status sets `contextPersisted`. Unconfirmed interrupted, crashed or unreturned offers stay
 unknown/held, with no automatic requeue. A restart turns unfinished `injecting`
 claims into `uncertain`. An input not claimed by a hook still starts exactly one
 ordinary FIFO turn after the current turn. This includes long turns with no
@@ -44,15 +47,11 @@ never authorize generating a new result identity.
 `cutex-wake-read` keeps `idle_turn`, `turn_end` and `early_next_step`; delegation
 results retain their existing log paths. The consuming turn determines whether
 a queued soon input actually took the early path or fell back to a new turn.
-An early receipt also feeds `cutex-wake-counterfactual`. As in r8, the read log
+An early receipt also feeds `cutex-wake-counterfactual`. For legacy delivery, the read log
 timestamp reflects confirmed persistence, which can be later than the hook
 offer. Timing observations affect diagnostics only, never delivery decisions.
 
-The new SQLite table is an additive schema-2 migration. Neither manifests nor
-release versions are changed in this task. Before deployment, integrate the
-AlarmSystem route from task 01 and the account/runtime fixes from task 04. When
-integrating the separate owner-steer branch, preserve the terminal ordering:
-close tool-context admission before awaiting terminal receipt publication.
+The SQLite table is an additive schema-2 migration. Keep terminal ordering: close tool-context admission before awaiting terminal receipt publication. Release compatibility and recovery follow the signed backend migration metadata.
 
 The opt-in native probe uses the installed SDK's bundled CLI explicitly, a
 private home and a fake Anthropic provider on loopback port 25970. It uses no
@@ -79,14 +78,14 @@ wake, and the adapter also writes the user message into the running turn (item s
 `steered: true`); `acknowledge` does not emit it again. Unclaimed at turn end, the FIFO runs it as
 the next turn. A resend with the same client id is deduplicated by the queue.
 
-### Interrupt and unread steers (claude-r17, claude-r18)
+### Interrupt and unread steers
 
 A steer the turn never read is dropped (input state `interrupted`) when the owner interrupts: since
-claude-r18 at the `turn/interrupt` request, before the abort reaches Claude Code (claude-r17: only
+the adapter at the `turn/interrupt` request, before the abort reaches Claude Code (earlier adapters only
 when the turn ended `interrupted` / `failed`). The desktop's interrupt & send reads the stopped turn
 and resends every steer it did not record (a new client id, merged with the composer text), so the
-adapter must not deliver it as well: before claude-r17 the stale `soon` row was injected into the
-resent turn at its next PostToolUse, or ran as one more turn after it (owner notes, claude-r16). A
+adapter must not deliver it as well: in earlier adapters the stale `soon` row was injected into the
+resent turn at its next PostToolUse, or ran as one more turn after it (observed with earlier adapters). A
 hook between the request and the abort, and a turn that completes anyway, now find nothing to
 inject. If the interrupt request itself fails, the dropped steers are queued again. A steer with
 images (no `busy_inputs` row, never a hook) carries `metadata.steer` and is dropped the same way.
@@ -113,16 +112,15 @@ nothing left to inject.
 - `/compact` reads no notes; they wait for the next turn.
 
 Before claude-r21 an owner turn skipped pending notes to keep its text as written: they came only
-after its first tool call, and a turn without tool calls never saw them (owner's 唤醒 on hachimi,
-2026-10-19). Codex consumes passive ExternalInput at a turn's first input boundary, so both runtimes
+after its first tool call, and a turn without tool calls never saw them (observed in earlier turn-start delivery). Codex consumes passive ExternalInput at a turn's first input boundary, so both runtimes
 now behave alike. Opt-in check against the bundled CLI and a loopback model:
 `test_real_cli_owner_wake_reads_notes_in_its_first_request` (CLI 2.1.299, SDK 0.2.166, Linux): the
 note is in the first and only request, the owner's `@path` expands, the note's does not.
 
-## Autonomous turns (claude-r18 decision)
+## Autonomous turns
 
 Claude Code starts a turn by itself when a background task finishes: a `run_in_background` Bash
-command, and since claude-r23 a background subagent (its task notification). That turn has no adapter
+command or a background subagent (its task notification). That turn has no adapter
 input: the reader reports its messages only as `claude/runtime/event` (`whileIdle: true`, kind and
 status only, no content), nothing reaches the timeline, and the PreToolUse hook denies every tool
 (`No active turn accepts tools. …`, `subscription.NO_TURN_TOOLS`). Attributing it to a synthetic
@@ -142,13 +140,33 @@ other non-rate-limit frame extends an open window; the autonomous Result closes 
 arrives while the window is open is held in order, not refused, and submitted when the window closes,
 or after at most 120 s (`AUTONOMOUS_WAIT_SECONDS`, logged to stderr) anyway. The owner keeps reading
 while an input waits; `turn/interrupt` of a held input fails it as interrupted before submission, and
-close or a supervised reconnect fails held inputs as never submitted. A task notification that arrives
-while an adapter turn runs (claude-r23) opens the 10 s start window at that turn's Result
-(`RuntimeOwner.notified_in_turn`): Claude Code may start its own turn right after that Result, before
-any frame of it reaches the adapter, so the next input waits for it the same way. If Claude Code folded
-the notification into the running turn instead, the next input only waits out the 10 s window.
+close or a supervised reconnect fails held inputs as never submitted. A background task's
+notification that arrives while an adapter turn runs opens the 10 s start window at that
+turn's Result (`RuntimeOwner.notified_in_turn`): Claude Code may start its own turn right after that
+Result, before any frame of it reaches the adapter, so the next input waits for it the same way
+(`heldByNotification`).
 
-## Background subagents (claude-r23)
+Two kinds of in-turn notification no longer arm it:
+
+- A foreground task's. Claude Code 2.1.314 registers a foreground Bash command that runs 2 s or more
+  as a `local_bash` task (`task_started` with `is_backgrounded: false`) and sends `task_notification`
+  when it ends in the foreground; its result goes back to the model inside the running turn, so no turn
+  follows. A task counts as foreground only when its `task_started` said `is_backgrounded: false`, no
+  `task_updated` patch moved it to the background (`is_backgrounded: true`) and the adapter did not
+  start it as a background command or subagent (`RuntimeTasks.background_notice`). A notification of
+  a task the adapter never saw start counts as background.
+- A background task's that Claude Code folded into the running turn. Claude Code drains queued
+  notifications into the model request after a tool round. A main-chain user frame with tool results
+  after the notification (`RuntimeOwner.notice_drained`), then a main-chain model frame (`stream_event`
+  or `assistant`) of that next request clears `notified_in_turn`. A model frame alone does not: it may
+  belong to the request that was already streaming when the notification came, and if that request is
+  the turn's last, Claude Code starts its own turn after the Result. A replayed user message (no tool
+  result) is no tool round either.
+
+A background notification after the turn's last tool round keeps the 10 s window. If Claude Code
+folded such a notification into the running turn anyway, the next input only waits out the window.
+
+## Background subagents
 
 Owner decisions of 2026-10-19 and 2026-10-21; behaviour of Claude Code 2.1.301 / SDK 0.2.166 as
 recorded by the probe of 2026-10-21 (cutex-desktop `docs/research/claude-background-subagents-probe-result.md`,
@@ -206,7 +224,7 @@ Linux, 2026-10-21) passed: the subagent read, slept and wrote for 26.5 s after i
 turn of the main agent completed meanwhile, `notifyParent` arrived completed with its reply, its
 transcript closed and the parent timeline kept none of its tools.
 
-## Claude Code's notification turn (claude-r23)
+## Claude Code's notification turn
 
 What it is. When a background task ends, Claude Code emits task_updated / task_notification and then
 starts a turn of its own (`system/init`, an assistant reply, a Result; about 2-3 s in the probe, also
@@ -234,7 +252,7 @@ account. Its usage is not attributed to any turn.
 
 Alternatives rejected.
 - Adopting it as a visible turn: the adapter would have to own a turn Claude Code started (input,
-  receipts, interrupt, usage), and it races cutex's next input; that undoes the r18 decision.
+  receipts, interrupt, usage), and it races cutex's next input; that would violate the managed-turn boundary.
 - `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`: per the probe it turns background work off entirely
   (`run_in_background` subagents become foreground, Bash rejects the argument), not only this turn.
 - Answering it with tools allowed: tool effects without owner, receipts or approvals.
@@ -249,31 +267,103 @@ model sees the result twice (in the notification turn and in the cutex message);
 message is a visible turn where it can act. cutex sends one message per `noticeId`, also when the
 adapter repeats the notice (a resume replay).
 
-## Validation (Windows, 2026-10-11)
+## Validation
 
-| Check | Baseline `47cab2d` | Task 07 |
-| --- | --- | --- |
-| Adapter pytest | 380 passed, 6 skipped | 394 passed, 10 skipped |
-| Rust library | 1534 passed, 10 failed, 13 ignored | 1535 passed, same 10 failed, 13 ignored |
-| Rust cutex binary | 714 passed, 14 failed, 5 ignored | 717 passed, 13 failed, 5 ignored |
-| Rust integration | 3 passed, 2 failed, 2 ignored | Same |
-| Opt-in SDK/CLI loopback | Not present | 4 passed |
+Release acceptance is recorded by the GitHub Actions build and upgrade gates. Historical private probe counts are not a release result. Use an isolated marked home for adapter tests and report the exact public candidate and SDK/CLI versions. Hook offers, native context proof and interrupted uncertain outcomes need separate assertions.
 
-The new Rust timing, metadata/receipt/digest and durable restart tests pass.
-The complete Rust suites remain red on pre-existing Windows path, manifest,
-notification, profile and TUI cases. The parallel binary run additionally hit
-`ordinary_redrive_targets_only_current_durable_runtime_generation` with a
-removed temporary stream-state directory. Serial rerun of its unchanged module
-passed that case (13 passed, 3 failed); all three remaining failures also appear
-in the baseline. This is not a claim that the full suite is green.
+## Owner insert progress
 
-Both revisions used `--locked` debug builds with private marked homes and the
-handoff's two prescribed skips. Baseline `--tests` stopped at the existing lib
-failures, so the integration targets and cutex-mcp were also run explicitly with
-`--no-fail-fast`; the final task run used `--lib --bins --tests --no-fail-fast`.
-The native probe used SDK `0.2.164`, CLI `2.1.292`, SHA-256
-`eb95bb65955f8b1702e800815f9a2c0388a5de0f196c354c7ee1dd5cb9a2ba23`.
-All four wake/result × tool/no-tool cases verified marker visibility in the
-second provider request, confirmed context receipts, and one or two turns as
-appropriate. No Linux, real model, full management daemon or desktop acceptance
-is claimed.
+Adapter 0.8.7 emits durable `claude/input/stageChanged` notifications with
+`{threadId, turnId, messageId, clientId, stage}`. Stages are monotonic for an
+insert: `registered`, `offered`, `contextPersisted`. Only owner inserts with a
+client ID receive these events. Registration and hook offers are committed
+synchronously with the inbox transaction; live publication follows the same
+per-thread order. A random publication token committed with each journal event
+prevents an abandoned transaction from publishing a later retry that reused its
+SQLite sequence number. Existing `claude/input/contextPersisted` events remain
+and additionally carry the client ID (null for inputs without one).
+
+Stages can skip: `offered` specifically proves the authenticated tool-gap
+context return. If the current turn finishes before a tool gap, the queued
+insert runs as the next ordinary turn and advances directly from `registered`
+to `contextPersisted`, carrying the actual consuming turn ID. A failed or
+interrupted turn never manufactures a successful context receipt. Reconnects
+can replay the durable stage journal without reoffering input.
+
+While a terminal SDK callback is closing input admission, `turn/steer` returns
+RPC error -32009 with `data.reason = "turnFinishing"` before parsing/enqueueing
+input. Cutex is responsible for retaining that message for the next turn and
+must not call it steered. A foreground turn held behind an autonomous native
+notification publishes `heldByNotification` in active flags; thread reads use
+the same projection, and result/quiet-window/interrupt/close release the flag.
+
+Terminal settlement, `turn/completed`, idle and input status now precede the
+observational context-metric refresh. That refresh stays serialized with the
+worker: the next input may be accepted while it waits, but the next native query
+still waits for the read. Metric results are bound to the captured owner, native
+connection generation and turn, and are discarded if that binding changes.
+Existing sessions retain their runtime pins; a changed payload requires a new component identity.
+
+## Prompt native context receipts
+
+Earlier adapters exposed progress but still called busy-input acknowledgement only from the
+successful SDK Result callback. Native PostToolUse context had already been
+written to the session transcript, so contextPersisted could lag offered by the
+rest of a long turn. SDK callback hooks do not emit hook_response events in the
+pinned CLI, and a tool-result UserMessage precedes the context attachment;
+neither callback return nor that UserMessage is a persistence receipt.
+
+The current adapter watches only sessions with pending authenticated offers. It captures the
+current native owner, connection generation, bridge binding, exact claimed
+message IDs, hook/tool identity, full returned context and transcript EOF before
+the hook returns. A bounded incremental reader requires a complete new main-
+chain attachment for that session, matching PostToolUse hookName/toolUseID,
+exact returned context, and a parent native user/tool-result record for the same
+call. It then emits the existing per-message contextPersisted event and stage.
+No public event shape changes. Persistence here means a complete native record
+is readable; it does not claim a filesystem fsync or successful completion of
+the agent task.
+
+One watcher per pending thread polls at 50 ms and stops when no offers remain.
+Reads are limited to 256 KiB chunks and 16 MiB lines; a terminal flush drains
+its captured EOF up to 32 MiB. Ownership changes, unavailable/replaced/truncated
+files, incomplete or oversized evidence and the five-minute observation bound
+never manufacture a receipt. Inputs are retained; successful terminal fallback
+remains available. Admission closes before terminal/recovery/close awaits,
+while the old binding remains available to verify already-written proof.
+
+A receipt confirms only its named message, never every other offer in the same
+turn. Successful Results separately acknowledge each consumed passive note,
+preserving their prior terminal behavior. A later failed/interrupted turn does
+not erase a context receipt already backed by native proof; an unconfirmed
+offer remains unconfirmed. Existing runtime pins stay unchanged; this requires
+a new immutable component identity, never a replacement for an existing archive.
+
+### Busy `soon` items at injection
+
+Earlier adapters published the `external_event` item of a busy `soon` external input (wake,
+approval notice, `soon` delegation result) only in `acknowledge`, at the
+successful terminal Result, while an owner steer's `userMessage` was published
+when its hook claimed it. The current adapter publishes every claimed item the same way: one
+task per claim, scheduled after the claim and before the hook returns, never
+awaited by the hook, chained per thread so items keep claim order.
+`acknowledge_messages` no longer emits items; before it emits a
+`contextPersisted` it waits for the thread's pending item publication, so a
+receipt never precedes its item. Item ids, shapes and turn ids are unchanged
+(`functionCallOutput` / `external_event`, id = message id, the consuming turn).
+cutex can move the record to its timeline at the item (state `accepted`,
+`turnId`), while `inContext` still comes only from the receipt. An offer whose
+turn then fails or is interrupted keeps its already published item; its input
+stays unconfirmed, as before.
+
+
+## 057 owner carries (claude-rNEXT)
+
+Optional canonical `ownerCarries` on owner start/steer reserves the complete
+batch with the owner in one transaction. Reserved notes cannot be claimed by
+ordinary passive-note delivery. A busy owner and its carries enter the same
+authenticated hook; FIFO fallback keeps the group together. Owner text remains
+the final SDK text block for @path expansion. Native identities/views and exact
+context receipts survive; interruption never converts unknown carries into
+pending passive notes. See [OWNER_CARRIES.md](OWNER_CARRIES.md) for the wire,
+idempotency, limits, receipt boundaries and integration rules.

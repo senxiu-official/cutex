@@ -18,6 +18,8 @@ use std::{
 const ROOT: &str = "access-http-test-root-credential";
 #[path = "archive_api_http_tests.rs"]
 mod archive_api_http_tests;
+#[path = "user_layout_http_tests.rs"]
+mod user_layout_http_tests;
 
 #[test]
 fn event_blobs_follow_session_read_grants_without_exposing_owner_history_media() {

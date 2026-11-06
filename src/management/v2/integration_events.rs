@@ -337,104 +337,309 @@ fn append_owner_event_once_with_repository_policy(
     missing_committed_event: MissingCommittedEventPolicy,
 ) -> anyhow::Result<Option<EventEnvelope>> {
     let key = format!("{owner_cutex_session_id}\u{0}{method}\u{0}{action_id}");
-    let lock_path = repository.root().join(INTEGRATION_DEDUPE_LOCK);
+    let mut input = Some((params, correlation));
+    loop {
+        let mut prepared = match prepare_integration_lookup(repository, &key) {
+            Ok(prepared) => prepared,
+            Err(error) if error.is::<LookupLedgerUnavailable>() => {
+                // A damaged authority is never replaced. The read-only recovery
+                // scan also runs outside the global lock and cannot authorize append.
+                return match find_integration_event(repository,owner_cutex_session_id,method,action_id)? {
+                    Some(event)=>Ok(Some(event)),
+                    None if missing_committed_event==MissingCommittedEventPolicy::AcceptCommittedOutsideRetention=>Ok(None),
+                    None=>anyhow::bail!("integration event dedupe state is unreadable; prior commit cannot be determined"),
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        let result = with_integration_lock(repository, || {
+            let state = open_lookup_ledger(repository)?;
+            // An old writer may have committed while the immutable snapshot was
+            // built. Re-read authority under the fence before using its absence.
+            if state
+                .identity(&key)
+                .inspect_err(|_| ledger::record_warning(repository.root()))?
+                != prepared.identity
+            {
+                return Ok(None);
+            }
+            if prepared.identity == Some(ledger::Identity::Committed) {
+                return match prepared.event.take() {
+                    Some(event) => Ok(Some(Some(event))),
+                    None if missing_committed_event
+                        == MissingCommittedEventPolicy::AcceptCommittedOutsideRetention =>
+                    {
+                        Ok(Some(None))
+                    }
+                    None => anyhow::bail!("committed integration event is no longer retained"),
+                };
+            }
+            if let Some(existing) = prepared.event.take() {
+                state
+                    .commit_event(&key, &existing)
+                    .inspect_err(|_| ledger::record_warning(repository.root()))?;
+                return Ok(Some(Some(existing)));
+            }
+            if prepared.identity == Some(ledger::Identity::Pending) {
+                return match missing_committed_event {
+                    MissingCommittedEventPolicy::AcceptCommittedOutsideRetention=>Ok(Some(None)),
+                    MissingCommittedEventPolicy::RequireRetainedEvent=>anyhow::bail!("integration event pending identity is unresolved; prior commit cannot be determined"),
+                };
+            }
+            state
+                .pending(&key)
+                .inspect_err(|_| ledger::record_warning(repository.root()))?;
+            let (params, correlation) = input
+                .take()
+                .expect("input consumed only after the final authority check");
+            let event = repository.append(PendingEvent {
+                cutex_session_id: owner_cutex_session_id.to_string(),
+                host_id: current_host_name(),
+                source: EventSource::Cutex,
+                schema: None,
+                correlation,
+                native: None,
+                cutex: Some(CutexMessage {
+                    method: method.to_string(),
+                    params,
+                }),
+            })?;
+            state
+                .commit_event(&key, &event)
+                .inspect_err(|_| ledger::record_warning(repository.root()))?;
+            Ok(Some(Some(event)))
+        })?;
+        if let Some(result) = result {
+            return Ok(result);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LookupLedgerUnavailable(String);
+impl std::fmt::Display for LookupLedgerUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"{}",self.0)}
+}
+impl std::error::Error for LookupLedgerUnavailable {}
+
+fn open_lookup_ledger(repository: &EventRepository) -> anyhow::Result<ledger::Ledger> {
+    ledger::Ledger::open(repository.root()).map_err(|error| {
+        ledger::record_warning(repository.root());
+        anyhow::Error::new(LookupLedgerUnavailable(format!("{error:#}")))
+    })
+}
+
+fn with_integration_lock<T>(
+    repository: &EventRepository,
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     fs::create_dir_all(repository.root())?;
-    let lock = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&lock_path)?;
-    lock.lock_exclusive()?;
-    let result = (|| -> anyhow::Result<Option<EventEnvelope>> {
-        let loaded = ledger::Ledger::open(repository.root())
-            .inspect_err(|_| ledger::record_warning(repository.root()));
-        let state = match loaded {
-            Ok(state) => state,
-            Err(error) => {
-                // Do not overwrite unreadable/future state or invent a second
-                // event when its original may already have expired. A job's
-                // terminal observation is optional presentation: skip that fact
-                // while allowing durable completion-message storage to continue.
-                eprintln!("health warning: integration event dedupe unavailable: {error:#}");
-                return match find_integration_event(repository, owner_cutex_session_id, method, action_id)? {
-                Some(event) => Ok(Some(event)),
-                None if missing_committed_event == MissingCommittedEventPolicy::AcceptCommittedOutsideRetention => Ok(None),
-                None => anyhow::bail!("integration event dedupe state is unreadable; prior commit cannot be determined"),
-            };
+        .open(repository.root().join(INTEGRATION_DEDUPE_LOCK))?;
+    let guard = crate::platform::lock_accounting::FileGuard::acquire(
+        file,
+        crate::platform::lock_accounting::Lock::Integration,
+    )?;
+    #[cfg(test)]
+    let held = LookupHeld::enter();
+    let result = action();
+    #[cfg(test)]
+    drop(held);
+    drop(guard);
+    #[cfg(test)]
+    {
+        let snapshot = crate::platform::lock_accounting::snapshot();
+        let thread = format!("{:?}", std::thread::current().id());
+        if let Some(sample) = snapshot["recent"].as_array().and_then(|samples| {
+            samples
+                .iter()
+                .rev()
+                .find(|sample| sample["lock"] == "integration" && sample["thread"] == thread)
+        }) {
+            if let Some(hold) = sample["holdNs"].as_u64() {
+                LOOKUP_MAX_HOLD_NS.with(|n| n.set(n.get().max(hold)));
             }
-        };
-        // The obsolete timestamp sidecar is advisory only and is deliberately
-        // neither read nor rewritten. Its corruption cannot block completion.
-        let identity = state
-            .identity(&key)
-            .inspect_err(|_| ledger::record_warning(repository.root()))?;
-        if identity == Some(ledger::Identity::Committed) {
-            return match find_integration_event(
-                repository,
-                owner_cutex_session_id,
-                method,
-                action_id,
-            )? {
-                Some(event) => Ok(Some(event)),
-                None if missing_committed_event
-                    == MissingCommittedEventPolicy::AcceptCommittedOutsideRetention =>
-                {
-                    // `committed` is written only after EventRepository::append has
-                    // durably committed the envelope. Management v2 intentionally
-                    // expires exact cursors, so a presentation-only watchdog replay
-                    // may acknowledge that durable commit without inventing a new
-                    // envelope or extending the bounded event retention window.
-                    Ok(None)
-                }
-                None => anyhow::bail!("committed integration event is no longer retained"),
-            };
         }
-        if let Some(existing) =
-            find_integration_event(repository, owner_cutex_session_id, method, action_id)?
-        {
-            state
-                .commit(&key)
-                .inspect_err(|_| ledger::record_warning(repository.root()))?;
-            return Ok(Some(existing));
-        }
-        if identity == Some(ledger::Identity::Pending) {
-            // The process may have died after the journal fsync, and its
-            // envelope may already have expired. Absence is not proof that
-            // append did not commit. Keep the identity for reconciliation.
-            eprintln!("health warning: integration event dedupe has unresolved pending identity; refusing to rematerialize owner fact");
-            return match missing_committed_event {
-                MissingCommittedEventPolicy::AcceptCommittedOutsideRetention => Ok(None),
-                MissingCommittedEventPolicy::RequireRetainedEvent => anyhow::bail!(
-                    "integration event pending identity is unresolved; prior commit cannot be determined"
-                ),
-            };
-        }
-        state
-            .pending(&key)
-            .inspect_err(|_| ledger::record_warning(repository.root()))?;
-        let event = repository.append(PendingEvent {
-            cutex_session_id: owner_cutex_session_id.to_string(),
-            host_id: current_host_name(),
-            source: EventSource::Cutex,
-            schema: None,
-            correlation,
-            native: None,
-            cutex: Some(CutexMessage {
-                method: method.to_string(),
-                params,
-            }),
-        })?;
-        state
-            .commit(&key)
-            .inspect_err(|_| ledger::record_warning(repository.root()))?;
-        Ok(Some(event))
-    })();
-    let _ = FileExt::unlock(&lock);
-    if let Err(error) = &result {
-        eprintln!("health warning: integration event dedupe unavailable; owner fact retained for retry: {error:#}");
     }
     result
+}
+
+struct PreparedLookup { identity:Option<ledger::Identity>,event:Option<EventEnvelope> }
+type LookupState=(Option<ledger::Identity>,Option<(String,String,u64)>,Option<super::repository::LookupCheckpoint>);
+fn lookup_state(repository: &EventRepository, key: &str) -> anyhow::Result<LookupState> {
+    with_integration_lock(repository, || {
+        let state = open_lookup_ledger(repository)?;
+        Ok((
+            state
+                .identity(key)
+                .inspect_err(|_| ledger::record_warning(repository.root()))?,
+            state.location(key)?,
+            state.lookup_checkpoint()?,
+        ))
+    })
+}
+
+/// Only cache builders serialize here, never while holding the business fence.
+/// Every scan uses stable handles and byte limits outside BOTH repository and
+/// integration locks. Publication contains bounded prepared metadata only.
+fn prepare_integration_lookup(
+    repository: &EventRepository,
+    key: &str,
+) -> anyhow::Result<PreparedLookup> {
+    let (identity, location, _) = lookup_state(repository, key)?;
+    if let Some((stream, cursor, sequence)) = location {
+        return Ok(PreparedLookup {
+            identity,
+            event: checked_integration_cursor(repository, key, &stream, &cursor, sequence)?,
+        });
+    }
+    let builder = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(
+            repository
+                .root()
+                .join("integration-event-lookup-builder.lock"),
+        )?;
+    builder.lock_exclusive()?;
+    loop {
+        let (identity, location, mut expected) = lookup_state(repository, key)?;
+        if let Some((stream, cursor, sequence)) = location {
+            return Ok(PreparedLookup {
+                identity,
+                event: checked_integration_cursor(repository, key, &stream, &cursor, sequence)?,
+            });
+        }
+        let snapshot = repository.integration_read_snapshot()?;
+        let mut reader = snapshot.reader(expected.as_ref())?;
+        let mut stale = false;
+        let mut locations = Vec::new();
+        let mut metadata_bytes = 0;
+        let mut checkpoint = None;
+        let mut published_bytes = 0;
+        loop {
+            let batch = reader.batch(8)?;
+            let done = batch.is_none();
+            if let Some((events, end)) = batch {
+                #[cfg(test)]
+                LOOKUP_SCANNED.with(|n| n.set(n.get() + events.len()));
+                for location in events.iter().filter_map(ledger::Location::of) {
+                    metadata_bytes += location.bytes();
+                    locations.push(location);
+                }
+                checkpoint = Some(end);
+            }
+            if !done
+                && locations.len() < 128
+                && metadata_bytes < 64 * 1024
+                && reader.bytes - published_bytes < 4 * 1024 * 1024
+            {
+                continue;
+            }
+            if let Some(end) = checkpoint.take() {
+                let published = with_integration_lock(repository, || {
+                    let state = open_lookup_ledger(repository)?;
+                    if state.lookup_checkpoint()? != expected {
+                        return Ok(false);
+                    }
+                    state.index_prepared(&locations, &end)?;
+                    Ok(true)
+                })?;
+                if !published {
+                    stale = true;
+                    break;
+                }
+                expected = Some(end);
+                locations.clear();
+                metadata_bytes = 0;
+                published_bytes = reader.bytes;
+            }
+            if done {
+                break;
+            }
+        }
+        if stale {
+            continue;
+        }
+        let (latest, location, _) = lookup_state(repository, key)?;
+        if let Some((stream, cursor, sequence)) = location {
+            return Ok(PreparedLookup {
+                identity: latest,
+                event: checked_integration_cursor(repository, key, &stream, &cursor, sequence)?,
+            });
+        }
+        if latest != identity {
+            continue;
+        }
+        return Ok(PreparedLookup {
+            identity,
+            event: None,
+        });
+    }
+}
+
+#[cfg(test)]
+pub(super) fn lookup_lock_held() -> bool {
+    LOOKUP_LOCK_DEPTH.with(|n| n.get() != 0)
+}
+#[cfg(test)]
+thread_local! {
+    static LOOKUP_LOCK_DEPTH:std::cell::Cell<u32>=const {std::cell::Cell::new(0)};
+    static LOOKUP_MAX_HOLD_NS:std::cell::Cell<u64>=const {std::cell::Cell::new(0)};
+}
+#[cfg(test)]
+struct LookupHeld(std::time::Instant);
+#[cfg(test)]
+impl LookupHeld {
+    fn enter()->Self {LOOKUP_LOCK_DEPTH.with(|n|n.set(n.get()+1));Self(std::time::Instant::now())}
+}
+#[cfg(test)]
+impl Drop for LookupHeld {
+    fn drop(&mut self) {
+        LOOKUP_LOCK_DEPTH.with(|n|n.set(n.get()-1));
+        LOOKUP_MAX_HOLD_NS.with(|n|n.set(n.get().max(self.0.elapsed().as_nanos() as u64)));
+    }
+}
+#[cfg(test)]
+fn find_indexed_integration_event(
+    repository: &EventRepository,
+    _state: &ledger::Ledger,
+    key: &str,
+) -> anyhow::Result<Option<EventEnvelope>> {
+    Ok(prepare_integration_lookup(repository, key)?.event)
+}
+
+fn checked_integration_cursor(
+    repository: &EventRepository,
+    key: &str,
+    stream: &str,
+    cursor: &str,
+    sequence: u64,
+) -> anyhow::Result<Option<EventEnvelope>> {
+    let event = repository.event_at_cursor(stream, cursor, sequence)?;
+    if let Some(event) = &event {
+        let observed = event
+            .cutex
+            .as_ref()
+            .zip(event.correlation.management_request_id.as_ref())
+            .map(|(message, action)| {
+                format!(
+                    "{}\u{0}{}\u{0}{}",
+                    event.cutex_session_id, message.method, action
+                )
+            });
+        anyhow::ensure!(
+            observed.as_deref() == Some(key),
+            "integration cursor cache identity mismatch"
+        );
+    }
+    Ok(event)
 }
 
 fn find_integration_event(
@@ -454,6 +659,8 @@ fn find_integration_event(
                 cutex_session_id: Some(owner_cutex_session_id.to_string()),
             })
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        #[cfg(test)]
+        LOOKUP_SCANNED.with(|count| count.set(count.get() + page.scanned_count));
         if let Some(event) = page.events.into_iter().find(|event| {
             event
                 .cutex
@@ -469,6 +676,13 @@ fn find_integration_event(
         after = page.next_cursor;
     }
 }
+
+#[cfg(test)]
+thread_local! { static LOOKUP_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+#[path = "integration_events_scale_tests.rs"]
+mod scale_tests;
 
 #[cfg(test)]
 mod tests {

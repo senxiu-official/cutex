@@ -17,7 +17,7 @@ fn fixture() -> (store::Store, AskStore, AskRecord, store::Peer) {
         outcome: None,
         reason: None,
     });
-    state.asks.insert(ask.ask_id.clone(), ask.clone());
+    state.asks.insert(ask.ask_id.clone(), ask.clone().into());
     peers
         .insert(peer.clone(), &super::token::generate())
         .unwrap();
@@ -53,10 +53,10 @@ fn inbound(asks: &AskStore, mut ask: AskRecord, peer: &store::Peer) -> AskRecord
     ask.revision += 1;
     asks.with_state(|s| {
         s.asks.clear();
-        s.asks.insert(ask.ask_id.clone(), ask.clone());
+        s.asks.insert(ask.ask_id.clone(), ask.clone().into());
     })
     .unwrap();
-    asks.snapshot().unwrap().asks[&ask.ask_id].clone()
+    (*asks.snapshot().unwrap().asks[&ask.ask_id]).clone()
 }
 
 fn wait_for_change(asks: &AskStore, ask: &AskRecord, action: &str) -> serde_json::Value {
@@ -397,7 +397,7 @@ fn local_intermediaries_inherit_maximum_peer_hops_through_parent_chain() {
         next_attempt_at: None,
         failures: 0,
     });
-    state.asks.insert(incoming.ask_id.clone(), incoming.clone());
+    state.asks.insert(incoming.ask_id.clone(), incoming.clone().into());
     let mut local = crate::asks::store::tests::new_ask("local-hop", "delegate to local X");
     local.parent_ask = Some(incoming.ask_id.clone());
     let (local, _) = state.create_ask(local, Utc::now()).unwrap();
@@ -649,7 +649,7 @@ fn retention_keeps_expired_mirror_until_its_remote_close_is_acknowledged() {
         outcome: Some("abandoned".into()),
         reason: Some("expired".into()),
     });
-    state.asks.insert(ask.ask_id.clone(), ask.clone());
+    state.asks.insert(ask.ask_id.clone(), ask.clone().into());
     assert!(state.closed_before(30, Utc::now()).is_empty());
     state.prune(Utc::now());
     assert!(state.asks.contains_key(&ask.ask_id));

@@ -443,7 +443,7 @@ pub fn route_json(
             context.store.get(slug)?;
             let sessions = crate::session::store::load_cutex_session_store_shared()
                 .map_err(ServicesError::unavailable)?;
-            let projects = crate::memory::load_agent_management_snapshot()
+            let projects = crate::memory::load_agent_management_directory()
                 .map_err(ServicesError::unavailable)?;
             Ok((
                 200,
@@ -781,6 +781,21 @@ pub fn start_supervisor() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn view_ticket_start_does_not_override_a_persistent_manual_stop() {
+        let root = std::env::temp_dir().join(format!("cutex-idle-ticket-{}", uuid::Uuid::new_v4()));
+        let store = ServiceStore::new(&root, "fixture").with_port_probe(|_| true);
+        store.register(serde_json::from_value(json!({"slug":"manual", "runtime":"managed", "lifetime":"persistent", "port":31482, "command":["must-not-execute"]})).unwrap(), &Caller::Owner).unwrap();
+        store.set_stopped("manual", true).unwrap();
+        let supervisor = Supervisor::new(store.clone(), Box::new(|_| {}));
+        let context = ServicesContext { store: store.clone(), supervisor: Some(supervisor), owner_check: |_| Ok(()), caller: "root".into() };
+        let path = "/v2/services/manual/view-ticket";
+        assert_eq!(route_json(&context, "POST", path, &parse_path(path).unwrap(), br#"{"start":true}"#).unwrap_err().code, "service_manually_stopped");
+        assert!(store.get("manual").unwrap().stopped);
+        drop(context);
+        assert!(root.starts_with(std::env::temp_dir()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn eligible_owner_routes_are_read_only_and_owner_only() {

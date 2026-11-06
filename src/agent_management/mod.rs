@@ -6,6 +6,8 @@
 //! without creating real Agents.
 
 mod archive;
+mod automatic_online;
+pub use automatic_online::AutomaticManagedOnline;
 mod bootstrap_intent;
 mod create_abandon;
 mod durable_adoption;
@@ -13,6 +15,12 @@ mod durable_import;
 /// Child ⊆ creator permission check for agent-initiated launches.
 pub mod envelope;
 mod explicit_launch;
+mod fence_first;
+mod host_hold;
+pub use host_hold::{
+    host_fence_registered, host_fence_releases, outside_host_fence, verify_claim_outside_host_fence,
+};
+pub use fence_first::{fence_first_active, with_fence_first};
 /// Delivery state of create / replace start messages (read-only).
 pub mod first_message;
 mod human_config;
@@ -24,6 +32,7 @@ mod migration;
 #[cfg(target_os = "linux")]
 mod migration_files;
 mod model;
+mod names;
 #[cfg(target_os = "linux")]
 pub use migration::*;
 mod projects;
@@ -31,7 +40,17 @@ mod provider;
 mod runtime_package;
 mod stock_runtime;
 mod session_delete;
+pub mod pending_forget;
 mod sparse;
+mod name_projection;
+mod roster_map;
+mod roster_sql;
+pub use roster_sql::{
+    ensure_legacy_authoritative as ensure_roster_legacy_authoritative,
+    export_previous as export_roster_previous, import_legacy as import_roster_legacy,
+    read_committed as read_committed_roster, status as roster_status, ExportReport as RosterExportReport,
+    ImportReport as RosterImportReport,
+};
 mod store;
 
 pub use archive::*;

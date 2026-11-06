@@ -38,8 +38,31 @@ use crate::role_revision::RuntimeAgentId;
 const AGENT_BUS_POLL_WAIT_MS: &str = "2000";
 const AGENT_BUS_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 // Reviewed registration verifies the frozen artifact set before publication.
-// This is one bounded request, never an automatic registration retry.
+// One bounded request; a runtime start retries it only while the bus is
+// unreachable or overloaded (`app_server::bus_bridge::register_with_retry`).
 const AGENT_REGISTRATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+const AGENT_BUS_CONNECT_CONTEXT: &str = "Failed to connect cutex agent bus";
+const AGENT_BUS_READ_CONTEXT: &str = "Failed to read agent bus response";
+const AGENT_BUS_NON_SUCCESS_PREFIX: &str = "cutex agent bus returned non-success";
+
+/// The agent bus could not be reached or did not answer in time (connect or
+/// read failure such as 10060, or 429 / 502 / 503 / 504 like its in-flight
+/// limit): a passing condition, not a refusal of the request.
+pub fn agent_bus_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| match cause.downcast_ref::<crate::http::client::HttpStatusError>() {
+        Some(status) => {
+            status.to_string().starts_with(AGENT_BUS_NON_SUCCESS_PREFIX)
+                && matches!(status.status, 429 | 502 | 503 | 504)
+        }
+        None => agent_bus_unavailable_text(&cause.to_string()),
+    })
+}
+
+/// [`agent_bus_unavailable`] for an error kept only as text (a runtime
+/// receipt's `error`).
+pub fn agent_bus_unavailable_text(text: &str) -> bool {
+    text.contains(AGENT_BUS_CONNECT_CONTEXT) || text.contains(AGENT_BUS_READ_CONTEXT)
+}
 const AGENT_MANAGEMENT_ACTION_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +123,17 @@ impl AgentBusHttpClient {
     }
 
     pub fn poll(&self, agent_id: &str) -> anyhow::Result<Vec<AgentBusMessage>> {
-        let response = self.request("GET", &agent_bus_poll_path(agent_id), None)?;
+        self.poll_with_wait(agent_id, AGENT_BUS_POLL_WAIT_MS)
+    }
+
+    /// Inspect one recipient without waiting for new messages. Shared serial
+    /// observers have their own wake/deadline and must not long-poll each seat.
+    pub fn poll_now(&self, agent_id: &str) -> anyhow::Result<Vec<AgentBusMessage>> {
+        self.poll_with_wait(agent_id, "0")
+    }
+
+    fn poll_with_wait(&self, agent_id: &str, wait_ms: &str) -> anyhow::Result<Vec<AgentBusMessage>> {
+        let response = self.request("GET", &agent_bus_poll_path(agent_id, wait_ms), None)?;
         serde_json::from_value::<AgentBusPollResponse>(response)
             .map(|response| response.messages)
             .context("Failed to parse agent poll response")
@@ -145,6 +178,19 @@ impl AgentBusHttpClient {
             .context("agent bus queued message listing is malformed")
     }
 
+    /// Read one complete queued message, without ACK or dequeue (root token).
+    pub fn queued_message_content(&self, message_id: &str) -> anyhow::Result<Option<String>> {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("messageId", message_id).finish();
+        let response = self.request("GET", &format!("/api/messages/content?{query}"), None)?;
+        require_ok_response(&response, "queued message content")?;
+        match response.get("text") {
+            Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text.clone())),
+            _ => anyhow::bail!("queued message content response is malformed"),
+        }
+    }
+
     /// Remove message ids from every in-memory runtime queue (root token);
     /// returns `(agent_id, message_id)` pairs removed.
     pub fn withdraw_messages(
@@ -177,11 +223,11 @@ impl AgentBusHttpClient {
     }
 }
 
-fn agent_bus_poll_path(agent_id: &str) -> String {
+fn agent_bus_poll_path(agent_id: &str, wait_ms: &str) -> String {
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("agent_id", agent_id)
         .append_pair("ack", "1")
-        .append_pair("wait_ms", AGENT_BUS_POLL_WAIT_MS)
+        .append_pair("wait_ms", wait_ms)
         .finish();
     format!("/api/messages/poll?{query}")
 }
@@ -388,6 +434,18 @@ pub fn agent_bus_update_agent_groups(
         Some(&body),
     )?;
     serde_json::from_value(response).context("Failed to parse agent group update response")
+}
+
+/// Root-only scheduler transport; deliberately has no agent sender header.
+pub fn agent_bus_automatic_managed_online(
+    config: &CodezConfig,
+    context: &crate::agent_management::AutomaticManagedOnline,
+) -> anyhow::Result<Value> {
+    let token = config.agent_bus_token.as_deref().filter(|t| !t.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("automatic online requires a configured Agent Bus root token"))?;
+    agent_bus_http_json_with_timeout(&agent_bus_base_url(agent_bus_port(config)), "POST",
+        "/api/internal/asks/managed-online", Some(token), Some(&serde_json::to_vec(context)?),
+        AGENT_MANAGEMENT_ACTION_TIMEOUT)
 }
 
 pub fn agent_bus_submit_agent_management(
@@ -645,7 +703,7 @@ fn submit_authenticated_agent_control_with_headers(
         format!(
             "X-Cutex-Mcp-Thread-Id: {thread}\r\nX-Cutex-Mcp-Generation: {}\r\nX-Cutex-Facade: delegations={}, {}\r\n{fenced_headers}",
             fence.generation,
-            crate::asks::tools::FACADE_AGENT_PAUSE,
+            crate::asks::tools::FACADE_AGENT_NAMES,
             crate::approvals::FACADE_APPROVAL_NOTE
         )
     } else {
@@ -825,9 +883,9 @@ fn agent_bus_http_json_with_timeout(
         invalid_url_context: &format!("Invalid agent bus URL: {url}"),
         only_http_message: "Only http:// agent bus URLs are supported",
         missing_host_message: &format!("Agent bus URL has no host: {url}"),
-        connect_context: "Failed to connect cutex agent bus",
-        read_context: "Failed to read agent bus response",
-        non_success_prefix: "cutex agent bus returned non-success",
+        connect_context: AGENT_BUS_CONNECT_CONTEXT,
+        read_context: AGENT_BUS_READ_CONTEXT,
+        non_success_prefix: AGENT_BUS_NON_SUCCESS_PREFIX,
         parse_context: "Failed to parse agent bus JSON response",
         ok_text_as_null: false,
     })
@@ -1072,8 +1130,12 @@ mod tests {
     #[test]
     fn poll_path_percent_encodes_agent_id_and_requests_explicit_ack() {
         assert_eq!(
-            agent_bus_poll_path("agent id/one"),
+            agent_bus_poll_path("agent id/one", AGENT_BUS_POLL_WAIT_MS),
             "/api/messages/poll?agent_id=agent+id%2Fone&ack=1&wait_ms=2000"
+        );
+        assert_eq!(
+            agent_bus_poll_path("agent id/one", "0"),
+            "/api/messages/poll?agent_id=agent+id%2Fone&ack=1&wait_ms=0"
         );
     }
 
@@ -1152,6 +1214,15 @@ mod tests {
 
     #[test]
     fn runtime_client_registers_polls_in_ack_mode_and_acknowledges() {
+        runtime_client_poll_and_acknowledge(false);
+    }
+
+    #[test]
+    fn runtime_client_polls_without_wait_and_acknowledges() {
+        runtime_client_poll_and_acknowledge(true);
+    }
+
+    fn runtime_client_poll_and_acknowledge(immediate: bool) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test bus");
         let base_url = format!(
             "http://{}",
@@ -1177,7 +1248,10 @@ mod tests {
             assert_eq!(request.method, "GET");
             assert_eq!(
                 request.path,
-                "/api/messages/poll?agent_id=runtime+id%2Fone&ack=1&wait_ms=2000"
+                format!(
+                    "/api/messages/poll?agent_id=runtime+id%2Fone&ack=1&wait_ms={}",
+                    if immediate { "0" } else { "2000" }
+                )
             );
             write_json_response(
                 &mut stream,
@@ -1243,7 +1317,12 @@ mod tests {
                 registration_class: AgentRegistrationClass::Persistent,
             })
             .expect("register runtime");
-        let messages = client.poll("runtime id/one").expect("poll messages");
+        let messages = if immediate {
+            client.poll_now("runtime id/one")
+        } else {
+            client.poll("runtime id/one")
+        }
+        .expect("poll messages");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].delivery_mode, AgentDeliveryMode::Soon);
         assert_eq!(

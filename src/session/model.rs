@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-use std::collections::HashMap;
+use crate::session::shared_rows::{SharedHashRows, SharedOrdRows};
 
 use chrono::Utc;
 
@@ -229,20 +229,20 @@ pub fn parse_cutex_session_quick_action_mode(
 pub struct CutexSessionStore {
     /// Latest proven stopped native occurrence, saved with runtime clearing.
     #[serde(default)]
-    pub native_stop_receipts: std::collections::BTreeMap<String, NativeStopReceipt>,
+    pub native_stop_receipts: SharedOrdRows<NativeStopReceipt>,
     #[serde(default)]
     pub explicit_launch_receipts:
-        std::collections::BTreeMap<String, crate::agent_management::ExplicitLaunchActionReceipt>,
+        SharedOrdRows<crate::agent_management::ExplicitLaunchActionReceipt>,
     #[serde(default)]
     pub human_adoption_receipts:
-        std::collections::BTreeMap<String, crate::agent_management::HumanAdoptReceipt>,
+        SharedOrdRows<crate::agent_management::HumanAdoptReceipt>,
     /// Archive transition receipt committed atomically with its durable state.
     #[serde(default)]
     pub agent_archive_receipts:
-        std::collections::BTreeMap<String, crate::agent_management::AgentArchiveReceipt>,
+        SharedOrdRows<crate::agent_management::AgentArchiveReceipt>,
     /// Exact receipts for Human import naming; committed atomically with the name.
     #[serde(default)]
-    pub formal_name_receipts: std::collections::BTreeMap<String, FormalAgentNameReceipt>,
+    pub formal_name_receipts: SharedOrdRows<FormalAgentNameReceipt>,
     /// Explicit-launch actions removed by receipt retention
     /// (`crate::session::receipt_retention`): a replay or status query of one
     /// of these keys fails with `explicit_launch_action_pruned` instead of
@@ -251,17 +251,14 @@ pub struct CutexSessionStore {
     #[serde(
         default,
         rename = "explicitLaunchTombstones",
-        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+        skip_serializing_if = "SharedOrdRows::is_empty"
     )]
-    pub explicit_launch_tombstones: std::collections::BTreeMap<
-        String,
-        crate::session::receipt_retention::ExplicitLaunchTombstone,
-    >,
+    pub explicit_launch_tombstones: SharedOrdRows<crate::session::receipt_retention::ExplicitLaunchTombstone>,
     /// Internal compare-and-swap generation for cross-process writers.
     #[serde(default, rename = "storeRevision")]
     pub store_revision: StoreRevisionCell,
     #[serde(default)]
-    pub sessions: HashMap<String, CutexSessionRecord>,
+    pub sessions: SharedHashRows<CutexSessionRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -476,6 +473,10 @@ pub fn validate_session_avatar(avatar: &CutexSessionAvatar) -> Result<(), &'stat
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CutexSessionRecord {
+    /// Stable creation operation, captured before first publication. Names,
+    /// titles and cwd must never substitute for this binding in recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_action: Option<String>,
     /// Execution selection, never identity. Survives all runtime clearing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explicit_launch: Option<crate::agent_management::ExplicitLaunchContract>,
@@ -686,6 +687,7 @@ impl CutexSessionRecord {
             .transpose()?;
         Ok(Self {
             explicit_launch: None,
+            creation_action: crate::session::creation_identity::current_action(),
             claude_session: None,
             dsh_session: None,
             profile_binding: None,

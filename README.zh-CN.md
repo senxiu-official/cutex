@@ -6,9 +6,9 @@
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
-**0.2.0 Beautiful World**：改进持久化智能体通信、委托与项目服务，支持按账户管理的 Profile 和运行时变体。提供原生运行时 0.164.0-r58，Claude 运行时 claude-r32 自带 Python；Kimi 和 DSH 为实验功能，不包含在 0.2.0 二进制发行中，计划随后续公开更新提供。从 0.1.5 升级会将通信数据改为格式 v2，须明确确认不可自动回退；使用旧版本前要先离线恢复数据。详见 [CHANGELOG.md](CHANGELOG.md)。
+**0.2.1 — Beautiful World**：智能体改名与名字历史、持久浏览器脚本、清晰的排队消息投递、个人布局记忆和服务空闲休眠。提供原生运行时 0.164.0-r59、Claude 运行时 claude-r40，以及可选的 dsh-r3 / kimi-r3 适配器。本次更新将持久状态迁入 SQLite，须明确确认单向升级；升级前保留备份。详见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **0.2.x 的已知缺口**（正在修，修好后删除这段）：
+> **当前限制：**
 > - **手机推送 / 配对手机**：还没有公开的手机应用。
 >
 > Claude 智能体需要可选组件 `claude-runtime`，长时间作业（Linux）需要 `job-service`：在托管安装上运行 `cutex component install <名字>`，或点桌面端的「安装」按钮（[components/README.md](components/README.md)）。
@@ -23,6 +23,8 @@ Profile 和用量。
 （不带参数运行 `cutex`）。
 
 支持 Linux 和 Windows（x64）。
+
+0.2 系列统一使用 **Beautiful World** 名称；0.1 系列为 **First Take**。
 
 ## 功能
 

@@ -101,7 +101,7 @@ impl Fixture {
                 *s = AskState::default();
                 self.routing.seed_policy(s);
                 s.asks
-                    .extend(records.into_iter().map(|a| (a.ask_id.clone(), a)));
+                    .extend(records.into_iter().map(|a| (a.ask_id.clone(), a.into())));
             })
             .unwrap();
     }

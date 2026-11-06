@@ -103,11 +103,11 @@ can still read the app-server's `/proc/<pid>/environ`, and Claude API accounts
 (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` in the Claude Code process env) are
 inherited by Claude Code's Bash tool.
 
-A future native (r53) will never pass the active provider's `env_key` to model-reachable
-child processes and can read the key from the launch-selected `--auth-file` instead.
-cutex still exports the key and keeps the `-c` override for every native: **r52 and older
-agents need the exported key** (no auth-file fallback) and the override, so neither may be
-dropped while any agent can run on r52.
+Provider-key isolation must be checked for the selected native: a runtime supporting
+the launch-selected `--auth-file` can read it without exposing the provider key to
+model-reachable child processes. Older pinned natives can still require the exported
+key and the `-c` shell override. Do not remove either compatibility mechanism while
+an agent remains pinned to a native that depends on it.
 
 Debug builds only: `CUTEX_DEBUG_SHARED_AGENT_BUS_TOKEN=1` in the daemon environment makes
 every launch path hand out the root token again (for debugging old adapters). Release
@@ -144,9 +144,9 @@ directional:
 - The grant names the agent, not its creator tree or project: X's children, X's project
   and its other members stay invisible to P.
 - Only agents currently in P benefit; a member that leaves P loses the grant.
-- Because X cannot list the sender, a message from P to X carries a header line (r208, agent messaging v2):
+- Because X cannot list the sender, a message from P to X carries a header line (agent messaging v2):
   `Reply: this sender is not in your agent_list; answer with agent_tell to="<sender cutex_session_id>"`
-  (before r208 it was a line appended to the text). Clients see `replyOnly: true`.
+  (the older encoding appended a line to the text). Clients see `replyOnly: true`.
 - Removing the grant (PATCH without it) cuts both directions on the next bus request.
   Alarms already set keep their target (as for links).
 - A grant whose agent is already inside P is harmless (P sees it anyway).
@@ -211,13 +211,42 @@ adapter defines must have exactly one row (unit test).
 | `web_search` | everyone whose profile has `searchTool` on (Codex API-key profiles; also the owner's quick chats), see `docs/PROFILE-SEARCH-TOOL.md` |
 | `agent_create`, `agent_archive`, `member_runtime`, `member_replace` | project managers: the project's Director or an Agent Operator grant |
 
-`agent_list` lists only what the caller may address (its project, or the agents it
-created outside a project, plus links), own project first and offline agents last, at most
-`limit` (default 50) per call with `next_cursor`; paired hosts appear in `otherHosts` as a
-count plus up to 10 idle / busy agents each, and `host` / `include_offline` / `cursor` page
-one host (docs/PEERS.md).
+`agent_list` is a compact tool projection of the existing communication boundary. By default it
+lists online members of the caller's own project **and directly, explicitly linked projects**,
+own project first. `agents_total` / `agents_offline` count the selected scope, and `projects`
+provides each included project's total and offline count. `offline_hint` points to
+`include_offline:true`, which includes offline members of all listed projects with the same paging.
+An offline `name` lookup never needs that flag. A compact row outside the caller's project has
+`project`; own-project compact rows omit it. `project` narrows the list to one visible project id.
 
-`director_rotate` (Directors only) was removed in r219 together with the Director seat copy and the
+`other_projects` remains count-only for projects visible by a route other than a direct explicit
+link: specific directional `external_agents` grants (only the granted agents, never their whole
+project), or `cross_project:host` visibility without a direct link. A link of a linked project is
+not itself a direct link. Existing permissions are unchanged; `project` or `name` can still query
+these visible agents. Reverse reply-only grants do not confer visibility and are not counted.
+
+Outside a project, reachable standalone creator-family agents (including linked standalone
+families, or all allowed standalone agents in host-wide mode) retain their existing default;
+directly linked projects are also expanded. An explicit link from a project to a standalone family
+has no project to label and remains in `other_agents` counts. Yourself, archived/disabled agents
+and native subagents are excluded from lists; a concrete `name` may look up your own enabled agent.
+
+List rows have `name`, `id`, `profile`, `model`, `status`, `queue`, `project` for another project, plus `is_director` when true
+and `agent_pause` / `pauseReasons` when set. `name` (concrete name/full or short ID) uses the same
+resolver as a delegate target, returning one agent's full allowed fields, including first-message
+and activity details. `project` also scopes name candidates. Cross-domain profile/model redaction
+is unchanged. Unknown or invisible targets are not exposed by the query.
+
+`limit` defaults to 50 (maximum 200); repeat `next_cursor` with the same project/include_offline/host
+filters. `otherHosts` contains per-host counts and capability/status metadata, without previews;
+`host` lists one host's compact page, and `name@host` or `host` + `name` returns one full exported
+agent. Peer directory wire formats, caches and HTTP agent/session APIs remain unchanged, including
+compatibility with older peers. Open delegations, incoming delegations, questions, unclaimed
+results and pending Director reviews are retained; finalized/superseded/aborted Director changes
+and resolved reviews are omitted. Unknown review states remain visible rather than being hidden.
+
+
+`director_rotate` (Directors only) was removed with the legacy Task Service together with the Director seat copy and the
 legacy `cutex-director` / `cutex-release` seats (see `docs/r219-removals.md`): the Director role comes
 only from the Agent Management project authority (`authorized_director_session`), and a
 `director_rotate` call answers `tool_removed`.
@@ -287,7 +316,7 @@ allocates, a scratch dir another session also works in) and every root of the re
 compared as before. The exempt path is part of the target capabilities digest (`targetCaps` in the
 snapshot versions), so another session starting to work in it makes an earlier review stale.
 
-Claude agents' tool switches count too (2026-10-18, r243 acceptance). A Claude agent has no OS
+Claude agents' tool switches count too (2026-10-18 acceptance). A Claude agent has no OS
 sandbox: its sandbox label only names the composer preset (完全访问 / 自动 record
 `danger-full-access`, 每次询问 `read-only`, 自动编辑 `workspace-write`), so a Claude requester with
 command execution off looked like a superset of any Codex target. Now a Claude agent whose next
@@ -308,7 +337,11 @@ The owner decides in a client. The agent retries the **same** call (same argumen
 `{status:"no_write", code:"approval_denied"}`. Pending and approved records lapse after
 24 h; decided records are pruned after 7 days (max 500). The request is bound by a SHA-256
 digest of its canonical JSON; env values are part of the digest but only env keys are
-stored. Store: `<cutex runtime dir>/approvals/approvals.json` (private, file-locked).
+stored. Canonical store: `<cutex runtime dir>/approvals/approvals.sqlite3`
+(private StoreDb, indexed rows and transactional writers). The previous
+`approvals.json` is retained for one-time import and explicit stopped-writer R1
+export; it is not read again during ordinary operation. See
+[S10 storage and pages](management/owner-store-pages.md).
 Fail closed: without a readable store the call answers `approvals_unavailable` /
 `persistence_unavailable`.
 
@@ -316,6 +349,9 @@ Management v2 (root credential only):
 
 - `GET /v2/approvals?state=pending|all` (default `pending`) →
   `{hostId, approvals: [ApprovalRecord]}`, newest first.
+  Hosts advertising `owner-notify-approval-pages-v1` also accept `limit`/`cursor`
+  and return `nextCursor`; without either page parameter the complete legacy
+  list remains available during client migration.
 - `POST /v2/approvals/{approvalId}/approve` and `/deny`, body `{note?, client?}` (note ≤ 1000 chars) →
   `{approval}`; 404 `approval_not_found`; 409 `approval_not_pending` (`details.state`).
   `approval-decided-by`: the decided record carries `decidedBy {by: "owner", connection:
@@ -350,7 +386,7 @@ Opt-in, so older callers keep the immediate answer:
 
 - Façade: env `CUTEX_MCP_APPROVAL_WAIT_SECS` (1–120). cutex writes it into the Codex
   launch's `mcp_servers.cutex.env` (Codex's own MCP tool timeout is 300 s) and passes it to
-  Claude adapters that declare `features.approvalWait` (claude-r16+) through the descriptor's
+  Claude adapters that declare `features.approvalWait` through the descriptor's
   `approvalWaitSecs`; such an adapter gives the façade the hold and a 150 s timeout to
   `service_register`, `service_update`, `agent_create`, `member_replace` (and `delegation_wait`,
   whose Bus wait is 120 s). A pinned older façade or adapter ignores it.
@@ -416,13 +452,17 @@ small projects.
 - `send` (removed 2026-10-07; use `agent_delegate` / `agent_tell`) had `delivery_mode` `after_turn | soon | passive`;
   `interrupt` is no longer offered and answers `unsupported_delivery_mode`. The description
   says replies arrive as a new turn (`[message from <name>]`) and not to poll.
-- `agent_tell {to, text, wake?}` (r208): a note by default (`passive`, starts no turn). `wake: true` sends
+- `agent_tell {to, text, wake?}`: a note by default (`passive`, starts no turn). `wake: true` sends
   `after_turn` and is allowed only where `agent_delegate` to that target would run without owner review
   (target visible in `agent_list`, agent-enabled, delegation gate not required); otherwise `wake_not_allowed`
   and nothing is sent. Loop guard: a wake back to the agent whose wake started the caller's current turn
   continues that chain (`wakeChain` + 1); a chain above 3 is sent as a note (`wakeDowngraded: true`). The
-  result is `{ok, to, name, deliveryKind, recipientState, wakeDowngraded?, detail}`; `detail` says what
+  result is `{ok, to, name, messageId?, deliveryKind, recipientState, wakeDowngraded?, detail}`; `detail` says what
   will happen given the recipient's state (busy / idle / offline) at send time.
+  For local plain notes and delegation revisions, `messageId` is the bus send receipt's `id`, equal to
+  that send's `cutex/agentBus/messageSent.params.messageId`. Replaying the same `action_id` returns the
+  same ID. It is omitted when no local bus ID is known, including cross-host tells (the receiving
+  host's `messageId` is not a local event ID), refusals, and uncertain outcomes. No ID is invented.
 - `agent_create {name, task?, task_mode?, ...}` / `member_replace {..., task?, task_mode?}`
   (capability `agent-create-task-delegation`, 2026-10-15): `task` is delegated from the caller
   to the new agent. The agent starts idle (no start message); the Agent Bus then runs
@@ -513,7 +553,7 @@ Migration:
 ## 12. Deferred (owner is designing the ask primitive)
 
 These stay proposals; `agent_ask` / `agent_wait` / `agent_start` / `agent_tell` will
-replace `send` (the Task Service tools were removed in r219, see `docs/r219-removals.md`):
+replace `send` (the legacy Task Service tools were removed, see `docs/r219-removals.md`):
 
 - U4 (naming): done 2026-10-07 — `<object>_<verb>` without the `cutex_` prefix
   (see §5), old names

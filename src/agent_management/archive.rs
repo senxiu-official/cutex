@@ -6,6 +6,16 @@ use crate::session::{archive::record_has_runtime_claim, model::CutexSessionRecor
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Run `archive` (one provider archive call) with the r271 lock order
+/// (`fence_first`): the caller holds no session lane; the provider takes the
+/// host fence, then only tries the archived session's lane and `extra_lane`.
+pub fn with_archive_fence_first<T>(
+    extra_lane: Option<&'static crate::management::v2::session_coordination::OperationLane>,
+    archive: impl FnOnce() -> T,
+) -> T {
+    super::with_fence_first(None, extra_lane, archive)
+}
+
 #[path = "archive_policy.rs"]
 mod policy;
 pub use policy::*;
@@ -163,6 +173,62 @@ mod tests {
         record
     }
 
+    /// r271 (051 §2): a Management archive takes the host fence holding
+    /// nothing and only tries the session lane. A lane held past the budget
+    /// is a retryable HostBusy with nothing archived, and the fence is free
+    /// between tries; a lane released during the tries lets it commit.
+    #[test]
+    fn fence_first_archive_only_tries_the_lane() {
+        let f = Fixture::new();
+        let mut runtime = Offline { stops: 0, reject: false };
+        let request = f.request(AgentArchiveOperation::Archive, "archive-fence-first");
+        let lane = crate::management::v2::session_coordination::session_lane("cutex.archive-test").unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let lane = lane.clone();
+            std::thread::spawn(move || {
+                let _reservation = lane.reserve().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+        };
+        held_rx.recv().unwrap();
+        // While the archive retries, another thread can take the fence.
+        let probe = {
+            let root = f.root.join("provider");
+            std::thread::spawn(move || {
+                let store = AgentManagementStore::open(&root).unwrap();
+                let end = std::time::Instant::now() + std::time::Duration::from_millis(300);
+                let mut free = 0;
+                while std::time::Instant::now() < end {
+                    if store.try_lock_delivery_mutations().unwrap().is_some() { free += 1; }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                free
+            })
+        };
+        let started = std::time::Instant::now();
+        let error = with_archive_fence_first(None, || f.execute(&request, &mut runtime)).unwrap_err();
+        assert!(matches!(error, AgentManagementError::HostBusy(_)), "{error}");
+        assert_eq!(error.code(), "admission_busy");
+        assert!(started.elapsed() >= super::super::fence_first::FENCE_FIRST_BUDGET);
+        assert!(probe.join().unwrap() > 0, "the fence is never kept while the lane is busy");
+        assert_eq!(runtime.stops, 0);
+        let sessions = load_cutex_session_store_from_path(&f.path).unwrap();
+        assert!(sessions.sessions["cutex.archive-test"].is_active(), "nothing archived");
+        // The lane holder finishes during the tries: the archive commits.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            release_tx.send(()).unwrap();
+        });
+        let receipt = with_archive_fence_first(None, || f.execute(&request, &mut runtime)).unwrap();
+        assert_eq!(receipt.stage, AgentArchiveStage::Committed);
+        releaser.join().unwrap();
+        holder.join().unwrap();
+        assert!(lane.try_lock().is_ok());
+    }
+
     #[test]
     fn d1r2_archive_restore_identity_and_exact_historical_replay() {
         let f = Fixture::new();
@@ -206,12 +272,78 @@ mod tests {
         successor.codex_session_id = Some("native-successor".into());
         successor.archive_state = crate::session::model::CutexSessionArchiveState::Active;
         successor.retired_at = None;
+        successor.formal_agent_name = Some("formal agent".into());
         sessions.sessions.insert("cutex.successor".into(), successor);
         save_cutex_session_store_to_path(&f.path, &sessions).unwrap();
+        runtime.reject = true; // Name refusal must precede adapter preparation.
         let error = f.execute(&restore, &mut runtime).unwrap_err().to_string();
         assert!(error.contains("agent_name_taken") && error.contains("cutex.successor"), "{error}");
         let after = load_cutex_session_store_from_path(&f.path).unwrap();
         assert!(after.sessions["cutex.archive-test"].is_retired());
+    }
+
+    #[test]
+    fn archived_owner_rename_breaks_reused_then_reserved_name_restore_deadlock() {
+        use crate::agent_names::{NameScope, RenameRequest};
+        let mut f=Fixture::new();
+        f.provider.current_names_path=Some(f.path.clone());
+        let principal=HumanManagementPrincipal::authenticated();
+        let a=CutexSessionId::new("cutex.archive-test").unwrap();
+        let b=CutexSessionId::new("cutex.successor").unwrap();
+        let managed=|id:CutexSessionId,native:&str| ManagedAgentRecord {
+            project_id:None,created_by_director_session:None,created_by_operator_session:None,
+            cutex_session_id:id,native_session_id:native.into(),created_at:super::super::store::now(),retired_at:None,
+            spec:ManagedAgentSpec {name:"Formal Agent".into(),cwd:f.root.to_string_lossy().into_owned(),
+                profile:Some("test".into()),runtime_backend:"host".into(),model:"test".into(),reasoning:"low".into(),
+                permissions:"read-only".into(),approval_policy:"never".into(),sandbox_mode:"read-only".into(),
+                groups:vec![],expose_to_im:false,pin:false},
+        };
+        f.provider.store().with_state(true,|mut state| {
+            state.agents.insert(a.clone(),managed(a.clone(),"native-test"));
+            state.agents.insert(b.clone(),managed(b.clone(),"native-successor"));
+            Ok((state,(),true))
+        }).unwrap();
+        let mut runtime=Offline {stops:0,reject:false};
+        f.execute(&f.request(AgentArchiveOperation::Archive,"archive-reuse-a"),&mut runtime).unwrap();
+        let mut sessions=load_cutex_session_store_from_path(&f.path).unwrap();
+        let mut successor=sessions.sessions[a.as_str()].clone();
+        successor.cutex_session_id=b.as_str().into();successor.codex_session_id=Some("native-successor".into());
+        successor.archive_state=crate::session::model::CutexSessionArchiveState::Active;successor.retired_at=None;
+        sessions.sessions.insert(b.as_str().into(),successor.clone());
+        save_cutex_session_store_to_path(&f.path,&sessions).unwrap();
+        let taken=f.execute(&f.request(AgentArchiveOperation::Restore,"restore-taken-a"),&mut runtime).unwrap_err();
+        assert_eq!(taken.code(),"agent_name_taken");
+        f.provider.rename_formal_name_for_management(&principal,b.as_str(),&RenameRequest {
+            request_id:"rename-successor".into(),expected_revision:successor.durable_revision(),name:"Successor New".into(),
+        }).unwrap();
+        let reserved=f.execute(&f.request(AgentArchiveOperation::Restore,"restore-reserved-a"),&mut runtime).unwrap_err();
+        assert_eq!(reserved.code(),"agent_name_reserved");
+        let AgentManagementError::NameConflict(detail)=reserved else {panic!("typed reservation required")};
+        assert_eq!(detail.details["holderSessionIds"],serde_json::json!([b.as_str()]));
+        assert_eq!(detail.details["scope"],serde_json::to_value(NameScope::Unassigned).unwrap());
+        assert_eq!(detail.details["renameRequired"],true);
+        // Refusal happens before runtime.prepare, even if that adapter would fail.
+        runtime.reject=true;
+        assert_eq!(f.execute(&f.request(AgentArchiveOperation::Restore,"restore-before-prepare"),&mut runtime).unwrap_err().code(),"agent_name_reserved");
+        runtime.reject=false;
+        let archived=load_cutex_session_store_from_path(&f.path).unwrap().sessions[a.as_str()].clone();
+        let request=RenameRequest {request_id:"rename-archived-a".into(),expected_revision:archived.durable_revision(),name:"Archived New".into()};
+        let renamed=f.provider.rename_formal_name_for_management(&principal,a.as_str(),&request).unwrap();
+        assert_eq!(renamed.event.scope,NameScope::Unassigned);
+        let current=load_cutex_session_store_from_path(&f.path).unwrap().sessions[a.as_str()].clone();
+        assert!(current.is_retired());assert_eq!(current.retired_at,archived.retired_at);
+        assert!(agent_execution_blocked_in(&f.provider.store().snapshot().unwrap(),&current));
+        let notes=crate::session::store::pending_rename_notes_at(&f.path,100).unwrap();
+        assert!(notes.iter().any(|note|note.event_id==renamed.event.event_id&&note.recipient_session_id==a.as_str()));
+        let restored=f.execute(&f.request(AgentArchiveOperation::Restore,"restore-renamed-a"),&mut runtime).unwrap().result.unwrap();
+        assert!(restored.is_active());assert_eq!(restored.formal_agent_name.as_deref(),Some("Archived New"));
+        assert_eq!(restored.codex_session_id,archived.codex_session_id);
+        let (_,claims)=crate::session::store::formal_name_claims_at(&f.path,Some(&NameScope::Unassigned),"Formal Agent").unwrap();
+        let holders:std::collections::BTreeSet<_>=claims.iter().map(|claim|claim.cutex_session_id.as_str()).collect();
+        assert_eq!(holders,std::collections::BTreeSet::from([a.as_str(),b.as_str()]));
+        let replay=f.provider.rename_formal_name_for_management(&principal,a.as_str(),&request).unwrap();
+        assert!(replay.replayed);assert_eq!(replay.event,renamed.event);
+        assert_eq!(runtime.stops,1,"rename and restore do not start or stop a runtime");
     }
 
     /// A committed archive settles the agent's open delegations as target
@@ -1058,10 +1190,13 @@ impl AgentManagementProvider {
         occurrence: Option<&ReviewedArchiveOccurrence>,
         authorize: impl FnOnce(&AgentManagementSnapshot, &CutexSessionId, AgentArchiveOperation) -> Result<(), AgentManagementError>,
     ) -> Result<AgentArchiveReceipt, AgentManagementError> {
-        let _execution = super::provider::provider_execution_lock()
-            .lock()
-            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
-        let _mutation = self.store().lock_mutations()?;
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared().map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        // r271 lock order (051 §2): Management archives take the host fence
+        // holding nothing and then only TRY the session lane(s). A lane holder
+        // may be inside a native call outside the fence; waiting for its lane
+        // under the fence would hold the fence for that whole call.
+        let session_lane = super::fence_first::fence_first_session_lane(Some(request.review.cutex_session_id.as_str()))?;
+        let _locks = self.entry_locks(session_lane.as_deref(), true, "archive")?;
         authorize(&self.store().snapshot()?, &request.review.cutex_session_id, request.review.operation)?;
         #[cfg(test)]
         AFTER_ARCHIVE_AUTHORIZE.with(|hook| { if let Some(run) = hook.borrow_mut().take() { run(); } });
@@ -1069,6 +1204,7 @@ impl AgentManagementProvider {
     }
 
     /// Caller holds execution/mutation locks. Settle asks only after releasing them.
+    /// (Fence-first archives also hold the session lane(s) here.)
     pub(super) fn execute_agent_archive_under_locks(
         &self, path: &Path, request: &AgentArchiveRequest,
         runtime: &mut dyn AgentArchiveRuntime,

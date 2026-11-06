@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,17 @@ from .subscription_auth import SubscriptionSetupError
 AUTONOMOUS_QUIET_SECONDS = 3.0
 AUTONOMOUS_START_SECONDS = 10.0
 AUTONOMOUS_WAIT_SECONDS = 120.0
+
+
+def tool_results(message: Any) -> bool:
+    """Whether a user frame carries tool results (a tool round of the turn)."""
+    content = field(message, 'content')
+    if not isinstance(content, list):
+        inner = field(message, 'message')
+        content = inner.get('content') if isinstance(inner, dict) else None
+    return isinstance(content, list) and any(
+        (block.get('type') if isinstance(block, dict) else type(block).__name__) in {'tool_result', 'ToolResultBlock'}
+        for block in content)
 
 
 class TurnInterrupted(ProviderError):
@@ -66,7 +78,7 @@ def system_prompt_option(store: Any, tid: str, append: str, resume: bool) -> tup
 
     Claude Code records a session's system prompt on its first request and sends
     that record on every later request and resume (`snapshot`, default on), even
-    when a later launch passes another `--append-system-prompt`, until a
+    when a later launch passes another append (text or file), until a
     compaction re-records the launch's current prompt. A changed host prompt
     (harness text, runtime limits, instructions, auto mode) would otherwise never
     reach the model. So a resume whose `append` differs from the recorded one, or
@@ -82,6 +94,33 @@ def system_prompt_option(store: Any, tid: str, append: str, resume: bool) -> tup
     elif (store.thread_properties(tid).get(PROMPT_RECORD) or {}).get('digest') != digest:
         option['snapshot'] = False
     return option, digest
+
+
+def file_backed_system_prompt(option: dict, directory: Path, tid: str) -> tuple[dict, dict[str, str]]:
+    """Keep the Claude preset/snapshot, moving only its append out of argv.
+
+    SDK 0.2.175 passes extra_args through to its bundled CLI 2.1.314, whose
+    --append-system-prompt-file reads UTF-8. The SDK still sends snapshot in
+    initialize. The caller has the native-session lease before writing this
+    per-thread file; forks have different thread IDs. Files remain available
+    for the whole native process/subagent lifetime and are replaced on resume.
+    """
+    uuid.UUID(tid)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = directory / f'{tid}.md'
+    fd, temporary = tempfile.mkstemp(prefix='.append-', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(option['append'].encode('utf-8'))
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary)
+    return {key: value for key, value in option.items() if key != 'append'}, {
+        'append-system-prompt-file': str(path),
+    }
 
 
 def field(obj: Any, key: str, default: Any = None) -> Any:
@@ -283,9 +322,14 @@ class RuntimeOwner:
         # Loop-time end of an autonomous turn's quiet window (None: none seen),
         # the inputs held behind it and when the first of them stops waiting.
         self.autonomous_until: float | None = None
-        # A task notification seen while an adapter turn ran: Claude Code may start its
-        # own notification turn right after that turn's Result (claude-r23).
+        # A background task's notification seen while an adapter turn ran: Claude Code may
+        # start its own notification turn right after that turn's Result (claude-r23).
+        # Cleared when the turn's next model request must carry it (claude-r36):
+        # `notice_drained` is a main-chain tool result after it.
         self.notified_in_turn = False
+        self.notice_drained = False
+        self.notification_held = False
+        self.finishing_turn_id = None
         self.deferred: list[Run] = []
         self.deferred_until: float | None = None
         self.client = self.bridge = self.reader = self.process = self.lease = None
@@ -494,7 +538,19 @@ class RuntimeOwner:
             return
         if self.active is not None:
             if TYPES.get(typ, field(message, 'subtype')) == 'task_notification':
-                self.notified_in_turn = True
+                # A foreground task's notification starts no turn: its result
+                # returns to the model inside this one (claude-r36).
+                if self.tasks.background_notice(message):
+                    self.notified_in_turn, self.notice_drained = True, False
+            elif self.notified_in_turn and typ in {'UserMessage', 'user'} and tool_results(message):
+                # Claude Code drains queued notifications into the request after a
+                # tool round, so they reach the model in this turn. A replayed user
+                # message is no such evidence.
+                self.notice_drained = True
+            elif self.notified_in_turn and self.notice_drained and typ in {
+                    'StreamEvent', 'stream_event', 'AssistantMessage', 'assistant'}:
+                # That request runs: the notification is folded into this turn.
+                self.notified_in_turn = self.notice_drained = False
             return
         if typ in {'ResultMessage', 'result'}:
             self.autonomous_until = None
@@ -533,10 +589,21 @@ class RuntimeOwner:
         self.deferred.clear()
         self.deferred_until = None
 
+    async def _publish_notification_hold(self):
+        held = bool(self.deferred and self.autonomous_until is not None)
+        if held == self.notification_held:
+            return
+        self.notification_held = held
+        active = self.engine.store.db.execute("SELECT 1 FROM turns WHERE thread_id=? AND state='inProgress'", (self.tid,)).fetchone()
+        flags = getattr(self.engine, 'active_flags', lambda tid: ['heldByNotification'] if held else [])(self.tid)
+        await self.engine.emit(self.tid, 'thread/status/changed', {
+            'threadId': self.tid, 'status': {'type': 'active', 'activeFlags': flags} if active else {'type': 'idle'}})
+
     async def _event(self, message: Any) -> None:
         self._check_identity(message)
         typ = message_type(message)
         self._observe_autonomous(message, typ)
+        await self._publish_notification_hold()
         if await self.tasks.observe(message, self.active.turn_id if self.active else None):
             return
         # Subagent text and reasoning must never become the parent's reply.
@@ -586,6 +653,9 @@ class RuntimeOwner:
             # Close tool-context admission before callbacks emit/await receipts.
             # A late PostToolUse cannot claim another input at the turn boundary.
             self.bridge.accepting = False
+            self.finishing_turn_id = active.turn_id
+            await self.engine.busy_delivery.context_receipts.flush(self.tid, active.turn_id)
+            await self.engine.busy_delivery.context_receipts.close(self.tid)
             try:
                 await active.callback(message)
             except ProviderError:
@@ -595,7 +665,7 @@ class RuntimeOwner:
             self.active = None
             if self.notified_in_turn:
                 # The next input waits like after an idle notification (start window).
-                self.notified_in_turn = False
+                self.notified_in_turn = self.notice_drained = False
                 self.autonomous_until = asyncio.get_running_loop().time() + AUTONOMOUS_START_SECONDS
             self.reconnect_attempts = 0
             self.interrupt_deadline = None
@@ -629,10 +699,13 @@ class RuntimeOwner:
                 if not self.deferred:
                     self.deferred_until = asyncio.get_running_loop().time() + AUTONOMOUS_WAIT_SECONDS
                 self.deferred.append(command)
+                await self._publish_notification_hold()
                 return True
             self.autonomous_until = None
+            await self._publish_notification_hold()
             self.engine.metrics.context.pop(self.tid, None)
             self.active = command
+            self.finishing_turn_id = None
             self.bridge.begin_turn(command.turn_id)
             await self.status('working')
             # Native UUID was allocated durably before connect; attempted means
@@ -739,7 +812,7 @@ class RuntimeOwner:
                 self.connected_at = int(time.time() * 1000)
                 # The replaced child's autonomous turn ended with it.
                 self.autonomous_until = None
-                self.notified_in_turn = False
+                self.notified_in_turn = self.notice_drained = False
                 self.reader = asyncio.create_task(self._read(), name=f'claude-sdk-reader:{self.tid}')
                 await self.status('waiting')
                 command.future.set_result(None)
@@ -786,6 +859,7 @@ class RuntimeOwner:
                 self.deferred.remove(held)
                 if not self.deferred:
                     self.deferred_until = None
+                await self._publish_notification_hold()
                 held.future.set_exception(TurnInterrupted('Interrupted before query submission.'))
                 if command.future and not command.future.done(): command.future.set_result(None)
                 return True
@@ -825,7 +899,13 @@ class RuntimeOwner:
             raise failure
         self.reconnect_attempts += 1
         self.last_error = str(failure)[:512]
+        self.bridge.accepting = False
+        if self.active:
+            self.finishing_turn_id = self.active.turn_id
         await self.status('reconnecting')
+        if self.active:
+            await self.engine.busy_delivery.context_receipts.flush(self.tid, self.active.turn_id)
+        await self.engine.busy_delivery.context_receipts.close(self.tid)
         self.bridge.revoke()
         await self.bridge.cancel_tools()
         self.reader.cancel()
@@ -846,7 +926,8 @@ class RuntimeOwner:
         # Inputs already queued in this mailbox are failed, never replayed.
         self._fail_deferred(failure)
         self.autonomous_until = None
-        self.notified_in_turn = False
+        await self._publish_notification_hold()
+        self.notified_in_turn = self.notice_drained = False
         controls = []
         while not self.mailbox.empty():
             pending = self.mailbox.get_nowait()
@@ -965,11 +1046,21 @@ class RuntimeOwner:
 
             if failure:
                 self.last_error = str(failure)[:512]
+            if self.bridge:
+                self.bridge.accepting = False
+                if self.active:
+                    self.finishing_turn_id = self.active.turn_id
             try:
                 await self.status('closing')
             except BaseException as exc:
                 record_cleanup(exc, 'publish-close')
             tools_stopped = True
+            try:
+                if self.active:
+                    await self.engine.busy_delivery.context_receipts.flush(self.tid, self.active.turn_id)
+                await self.engine.busy_delivery.context_receipts.close(self.tid)
+            except BaseException as exc:
+                record_cleanup(exc, 'context-receipts')
             if self.bridge:
                 self.bridge.revoke()
                 try:
@@ -1010,6 +1101,10 @@ class RuntimeOwner:
             # interrupted result. Surface unknown outcome, never auto-resubmit.
             active, self.active = self.active, None
             self._fail_deferred(failure or TurnInterrupted('Runtime closed before query submission.'))
+            try:
+                await self._publish_notification_hold()
+            except BaseException as exc:
+                record_cleanup(exc, 'publish-notification-release')
             self.state = 'closed' if closed else 'close_unverified'
             if not closed and not self.last_error:
                 self.last_error = 'Child exit or host-tool cleanup could not be verified; another writer is blocked.'

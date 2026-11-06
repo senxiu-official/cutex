@@ -106,7 +106,8 @@ fn launch_binding_matches_occurrence_and_validates_frozen_bytes() {
     ] {
         assert!(launch_bindings(&receipts, session, thread, generation, Some(profile)).unwrap().is_empty());
     }
-    let ExplicitLaunchActionReceipt::Runtime(receipt) = receipts.explicit_launch_receipts.values_mut().next().unwrap() else { panic!() };
+    let ExplicitLaunchActionReceipt::Runtime(receipt) = receipts.explicit_launch_receipts.keys().next().cloned()
+            .and_then(|key| receipts.explicit_launch_receipts.get_mut(&key)).unwrap() else { panic!() };
     receipt.stage = StockRuntimeStage::Ready;
     assert_eq!(context(&receipts, "Astra [285K]").initial.request_model.as_deref(), Some("gpt-6-astra"));
     std::fs::write(&catalog.path, "{}").unwrap();

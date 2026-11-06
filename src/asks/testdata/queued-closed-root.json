@@ -1,0 +1,15 @@
+{
+  "execution": "queued",
+  "hold": null,
+  "attempts": [],
+  "closed": null,
+  "closedAt": null,
+  "revision": 11,
+  "options": {
+    "ifBusy": "queue",
+    "review": false,
+    "questions": "requester",
+    "notify": "turn",
+    "context": {"kind": "brief"}
+  }
+}

@@ -472,7 +472,7 @@ pub fn patch_source(id: &str, patch: SourcePatch) -> Result<SourceSpec, SourceEr
                 .ok_or_else(|| SourceError::Invalid("billing must be subscription or api".into()))?,
         ),
     };
-    update_sources(|sources| {
+    let spec=update_sources(|sources| {
         let index = sources
             .iter()
             .position(|entry| entry.id == id)
@@ -494,7 +494,11 @@ pub fn patch_source(id: &str, patch: SourcePatch) -> Result<SourceSpec, SourceEr
         }
         sources[index] = spec.to_config();
         Ok(spec)
-    })
+    })?;
+    if !spec.enabled {
+        if let Ok(root)=ledger_root() {discovery::forget(&root,&spec.id);}
+    }
+    Ok(spec)
 }
 
 /// Remove a source from the config; `purge` also deletes its rows.
@@ -507,6 +511,7 @@ pub fn remove_source(root: &Path, id: &str, purge: bool) -> Result<bool, SourceE
         }
         Ok(())
     })?;
+    discovery::forget(root,id);
     if purge {
         return store::purge_external_source(root, id).map_err(|error| SourceError::Internal(format!("{error:#}")));
     }
@@ -608,13 +613,20 @@ fn save_state(root: &Path, id: &str, state: &ScanState) -> anyhow::Result<()> {
     crate::config::atomic::write_private_pretty_json_atomic(&dir.join(STATE_FILE), state, "usage source scan state")
 }
 
+pub(super) fn forget_checkpoints_at(root:&Path,id:&str)->anyhow::Result<()> {
+    discovery::forget(root,id);
+    checkpoints::forget(root,id)
+}
+
 /// `status` object of a source resource.
 pub fn status_json(root: &Path, id: &str) -> Value {
-    let state = load_state(root, id);
+    let (state,files) = checkpoints::status(root,id).ok().flatten().unwrap_or_else(|| {
+        let state=load_state(root,id); let files=state.files.len();(state,files)
+    });
     json!({
         "lastScanAt": state.last_scan_at,
         "lastScanMs": state.last_scan_ms,
-        "files": state.files.len(),
+        "files": files,
         "rows": state.rows,
         "lastRows": state.last_rows,
         "errors": state.last_errors,
@@ -686,6 +698,10 @@ pub fn scan_source_at(
     host_id: &str,
     now: DateTime<Utc>,
 ) -> anyhow::Result<ScanSummary> {
+    scan_source_mode(root,spec,host_id,now,true)
+}
+
+fn scan_source_mode(root:&Path,spec:&SourceSpec,host_id:&str,now:DateTime<Utc>,force_discovery:bool) -> anyhow::Result<ScanSummary> {
     let key = source_dir(root, &spec.id);
     {
         let mut set = running().lock().map_err(|_| anyhow::anyhow!("scan registry poisoned"))?;
@@ -693,7 +709,8 @@ pub fn scan_source_at(
             return Ok(ScanSummary { busy: true, ..ScanSummary::default() });
         }
     }
-    let result = scan_locked(root, spec, host_id, now);
+    let result = scan_locked(root, spec, host_id, now,force_discovery);
+    if result.is_err() {discovery::forget(root,&spec.id);}
     if let Ok(mut set) = running().lock() {
         set.remove(&key);
     }
@@ -701,6 +718,149 @@ pub fn scan_source_at(
 }
 
 fn scan_locked(
+    root: &Path,
+    spec: &SourceSpec,
+    host_id: &str,
+    now: DateTime<Utc>,
+    force_discovery: bool,
+) -> anyhow::Result<ScanSummary> {
+    if spec.kind == SourceKind::Zcode {
+        // The source ID can be reused with another kind after removal.
+        checkpoints::forget(root, &spec.id)?;
+        return scan_legacy_locked(root, spec, host_id, now);
+    }
+    let started = std::time::Instant::now();
+    let checkpoints = checkpoints::Checkpoints::open(root, spec)?;
+    let (mut state, _) = checkpoints.header()?;
+    // Install the watcher before discovery so appends during the first walk
+    // remain dirty for a later pass. Pending unsettled tails also stay active.
+    let (hint_full, hints) = discovery::poll(root, spec);
+    let full = force_discovery || hint_full || checkpoints.needs_discovery;
+    let mut files = if full {
+        discover(spec.kind, &spec.path)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        hints
+            .into_iter()
+            .filter_map(|path| discovery::relative(spec, &path).map(|relative| (relative, path)))
+            .collect()
+    };
+    for relative in checkpoints.pending()? {
+        files
+            .entry(relative.clone())
+            .or_insert_with(|| spec.path.join(relative));
+    }
+    let native_threads = if spec.kind == SourceKind::Codex {
+        Some(store::native_thread_index(root)?)
+    } else {
+        None
+    };
+    let context = RowContext {
+        spec,
+        host_id,
+        now,
+        native_threads: native_threads.as_ref(),
+    };
+    let mut changes = BTreeMap::new();
+    let mut errors = Vec::new();
+    let mut rows = 0u64;
+    let mut retry = Vec::new();
+    if full {
+        for relative in checkpoints.paths()? {
+            if !files.contains_key(&relative) {
+                changes.insert(relative, None);
+            }
+        }
+    }
+    for (relative, path) in files {
+        if discovery::relative(spec, &path).as_deref() != Some(relative.as_str()) {
+            changes.insert(relative, None);
+            continue;
+        }
+        let meta = match fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => meta,
+            Ok(_) => {
+                changes.insert(relative, None);
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                changes.insert(relative, None);
+                continue;
+            }
+            Err(error) => {
+                errors.push(format!("{relative}: {}", error.kind()));
+                retry.push(path);
+                continue;
+            }
+        };
+        crate::store::metrics::note(
+            "usage-source-checkpoints",
+            crate::store::OpCounts {
+                rows_visited: 1,
+                ..Default::default()
+            },
+        );
+        let signature = file_signature(&meta);
+        let previous = checkpoints.get(&relative)?;
+        let mut file_state = match previous {
+            Some(previous)
+                if previous.inode == signature.2
+                    && previous.len <= signature.0
+                    && previous.offset <= signature.0 =>
+            {
+                if previous.len == signature.0
+                    && previous.mtime_ms == signature.1
+                    && previous.offset == previous.len
+                {
+                    continue;
+                }
+                previous
+            }
+            _ => FileState::default(),
+        };
+        match scan_file(&path, &relative, &mut file_state, &context) {
+            Ok(entries) => {
+                if let Err(error) = store::append_external_entries(root, &spec.id, &entries) {
+                    errors.push(format!("{relative}: ledger write failed: {error:#}"));
+                    retry.push(path);
+                    continue;
+                }
+                rows += entries.len() as u64;
+                file_state.len = signature.0;
+                file_state.mtime_ms = signature.1;
+                file_state.inode = signature.2;
+                changes.insert(relative, Some(file_state));
+            }
+            Err(error) => {
+                errors.push(format!("{relative}: {}", error.kind()));
+                retry.push(path);
+            }
+        }
+    }
+    state.last_scan_at = Some(now.to_rfc3339());
+    state.last_scan_ms = Some(started.elapsed().as_millis() as u64);
+    state.last_rows = rows;
+    state.rows = state.rows.saturating_add(rows);
+    state.last_errors = errors.len() as u64;
+    state.errors = errors
+        .iter()
+        .rev()
+        .take(MAX_ERRORS_KEPT)
+        .rev()
+        .cloned()
+        .collect();
+    let files = checkpoints.commit(&state, &changes)?;
+    discovery::retry(root, spec, retry);
+    Ok(ScanSummary {
+        files,
+        rows,
+        errors: errors.len() as u64,
+        busy: false,
+    })
+}
+
+fn scan_legacy_locked(
     root: &Path,
     spec: &SourceSpec,
     host_id: &str,
@@ -713,11 +873,11 @@ fn scan_locked(
         state = ScanState { version: STATE_VERSION, path: path_key, ..ScanState::default() };
     }
     let files = discover(spec.kind, &spec.path);
-    let thread_ids = match spec.kind {
-        SourceKind::Codex => store::ledger_thread_ids(root).unwrap_or_default(),
-        SourceKind::ClaudeCode | SourceKind::Zcode => HashSet::new(),
+    let native_threads = match spec.kind {
+        SourceKind::Codex => Some(store::native_thread_index(root)?),
+        SourceKind::ClaudeCode | SourceKind::Zcode => None,
     };
-    let context = RowContext { spec, host_id, now, thread_ids: &thread_ids };
+    let context = RowContext { spec, host_id, now, native_threads: native_threads.as_ref() };
     let mut errors = Vec::new();
     let mut rows = 0_u64;
     let mut seen = HashSet::new();
@@ -816,6 +976,7 @@ fn walk(
         return;
     };
     for entry in entries.filter_map(Result::ok) {
+        crate::store::metrics::note("usage-source-checkpoints",crate::store::OpCounts{rows_visited:1,..Default::default()});
         // Never follow links: a source reads only its own tree.
         let Ok(kind) = entry.file_type() else { continue };
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -834,10 +995,15 @@ struct RowContext<'a> {
     spec: &'a SourceSpec,
     host_id: &'a str,
     now: DateTime<Utc>,
-    thread_ids: &'a HashSet<String>,
+    native_threads: Option<&'a super::index::UsageIndex>,
 }
 
 impl RowContext<'_> {
+    fn native_thread_exists(&self, thread: &str) -> std::io::Result<bool> {
+        self.native_threads.map_or(Ok(false), |index| index.native_thread_exists(thread))
+            .map_err(std::io::Error::other)
+    }
+
     fn settled(&self, timestamp: &str) -> bool {
         parse_timestamp(timestamp)
             .map(|at| (self.now - at.with_timezone(&Utc)).num_seconds() >= SETTLE_SECS)
@@ -928,6 +1094,7 @@ fn scan_file(
 fn next_line(reader: &mut impl BufRead, position: &mut u64, buffer: &mut Vec<u8>) -> std::io::Result<Option<u64>> {
     buffer.clear();
     let read = reader.read_until(b'\n', buffer)?;
+    crate::store::metrics::note("usage-source-checkpoints",crate::store::OpCounts{bytes_read:read as u64,..Default::default()});
     if read == 0 || buffer.last() != Some(&b'\n') {
         return Ok(None);
     }
@@ -1194,6 +1361,7 @@ fn scan_codex(
             consumed = position;
             continue;
         }
+        crate::store::metrics::note("usage-source-checkpoints",crate::store::OpCounts{bytes_decoded:buffer.len() as u64,..Default::default()});
         let Ok(line) = serde_json::from_slice::<CodexLine>(&buffer) else {
             consumed = position;
             continue;
@@ -1235,7 +1403,7 @@ fn scan_codex(
                     continue;
                 };
                 let thread = str_of("thread_id").or_else(|| cursor.session.clone()).unwrap_or_else(|| stem.clone());
-                if cursor.skip || context.thread_ids.contains(&thread) || tokens.detailed_is_zero() {
+                if cursor.skip || context.native_thread_exists(&thread)? || tokens.detailed_is_zero() {
                     continue;
                 }
                 let turn = str_of("turn_id").or_else(|| cursor.turn.clone()).unwrap_or_else(|| response.clone());
@@ -1253,7 +1421,7 @@ fn scan_codex(
                     continue;
                 };
                 let thread = cursor.session.clone().unwrap_or_else(|| stem.clone());
-                if cursor.skip || context.thread_ids.contains(&thread) || tokens.detailed_is_zero() {
+                if cursor.skip || context.native_thread_exists(&thread)? || tokens.detailed_is_zero() {
                     continue;
                 }
                 let turn = cursor.turn.clone().unwrap_or_else(|| format!("{thread}:{total}"));
@@ -1301,9 +1469,10 @@ pub fn scan_all_enabled() {
     let host = crate::platform::host::current_host_name();
     for spec in configured_sources().iter().filter_map(SourceSpec::from_config) {
         if !spec.enabled {
+            discovery::forget(&root,&spec.id);
             continue;
         }
-        match scan_source_at(&root, &spec, &host, Utc::now()) {
+        match scan_source_mode(&root, &spec, &host, Utc::now(),false) {
             Ok(summary) if summary.errors > 0 => {
                 eprintln!("usage source {}: {} files, {} rows, {} errors", spec.id, summary.files, summary.rows, summary.errors);
             }
@@ -1359,6 +1528,11 @@ pub fn start_scanner() {
 
 #[path = "external_zcode.rs"]
 mod zcode;
+
+#[path = "external_checkpoints.rs"]
+mod checkpoints;
+#[path = "external_discovery.rs"]
+mod discovery;
 
 #[cfg(test)]
 #[path = "external_tests.rs"]

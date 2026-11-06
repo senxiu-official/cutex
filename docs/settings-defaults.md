@@ -25,7 +25,7 @@ Esc closes an active editor first. Categorized Settings then unwinds Value -> Op
 
 Validation: scoped model/effort drafts and discard, profile/shared inheritance, preference persistence and creation cutoff, adoption retries with fixed creation settings, Settings cancellation routes, and terminal UI checks. The full TUI suite retains three previously documented environment/fixture failures (installed-runtime expectation, invalid synthetic native ID, and fixture owner collision).
 
-### Settings presentation (r42)
+### Settings presentation
 
 Editable and actionable setting labels are white; read-only labels and values are
 light gray. Selection changes the background without replacing semantic foreground

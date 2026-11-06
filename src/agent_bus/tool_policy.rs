@@ -53,12 +53,16 @@ pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
     rule("browser_open", Audience::Everyone),
     rule("browser_claim", Audience::Everyone),
     rule("browser_visit", Audience::Everyone),
+    rule("browser", Audience::Everyone),
+    rule("browser_script", Audience::Everyone),
+    rule("browser_script_reset", Audience::Everyone),
     // Delegations (委托, asks design §6.3): every role, inside the boundary.
     // delegation_wait is also subject to the profile's delegationWait.
     rule("director_handover_review", Audience::ProjectDirectors),
     rule("director_start_review", Audience::ProjectDirectors),
     rule("director_start_read", Audience::ProjectDirectors),
     rule("agent_list", Audience::Everyone),
+    rule("agent_name_history", Audience::Everyone),
     rule("action_status", Audience::Everyone),
     rule("agent_pause", Audience::ProjectDirectors),
     rule("agent_resume", Audience::ProjectDirectors),
@@ -196,8 +200,8 @@ pub fn retain_tools_except(list: &mut Value, removed: &[&str]) {
 
 /// The tools an owned session (the owner's quick chat) is offered: the
 /// browser tools and `web_search`, each only when its profile opts in.
-fn owned_session_tools(browser: bool, search: bool) -> Vec<&'static str> {
-    let mut tools: Vec<&'static str> = if browser { crate::agent_bus::mcp_browser::TOOLS.to_vec() } else { Vec::new() };
+fn owned_session_tools(browser: Option<crate::agent_bus::mcp_browser::Surface>, search: bool) -> Vec<&'static str> {
+    let mut tools: Vec<&'static str> = browser.map_or_else(Vec::new, |surface| surface.tools().to_vec());
     if search {
         tools.push(crate::agent_bus::web_search::TOOL);
     }
@@ -223,7 +227,7 @@ pub fn tools_list_for_session(cutex_session_id: &str) -> Value {
     if owned_session(cutex_session_id) {
         // A quick chat is no Agent Bus agent: at most the browser tools and
         // web_search.
-        let allowed: Vec<String> = owned_session_tools(browser_tools_enabled(cutex_session_id), search)
+        let allowed: Vec<String> = owned_session_tools(browser_surface(cutex_session_id), search)
             .into_iter()
             .map(str::to_string)
             .collect();
@@ -238,7 +242,7 @@ pub fn tools_list_for_session(cutex_session_id: &str) -> Value {
             .collect();
         retain_tools(&mut list, &allowed);
     }
-    crate::agent_bus::mcp_browser::filter_listing(&mut list, browser_tools_enabled(cutex_session_id));
+    crate::agent_bus::mcp_browser::filter_listing(&mut list, browser_surface(cutex_session_id));
     if !search {
         retain_tools_except(&mut list, &[crate::agent_bus::web_search::TOOL]);
     }
@@ -251,9 +255,68 @@ pub fn browser_tools_enabled(cutex_session_id: &str) -> bool {
     browser_tools_for_record(&record)
 }
 
+/// The browser tool surface a session's model is offered; `None` = no
+/// browser tools (fails closed like [`browser_tools_enabled`]).
+pub fn browser_surface(cutex_session_id: &str) -> Option<crate::agent_bus::mcp_browser::Surface> {
+    browser_surface_for_record(&session_record(cutex_session_id)?)
+}
+
+pub fn browser_surface_for_record(record: &crate::session::model::CutexSessionRecord) -> Option<crate::agent_bus::mcp_browser::Surface> {
+    with_profiles(|store| browser_surface_for_record_in(record, store)).flatten()
+}
+
+/// The browser decisions' one read of the profile store (`None`: unreadable).
+fn with_profiles<T>(read: impl FnOnce(&crate::profiles::model::AccountsStore) -> T) -> Option<T> {
+    crate::profiles::settings_api::load_store().ok().map(|store| read(&store))
+}
+
+/// Design 059: the profile's `browserToolSurface` (default auto). `auto` and
+/// `command` give the one `browser` tool where the runtime can carry it, else
+/// the legacy tools; a Claude adapter must declare `browserCommand` (its
+/// image handling is by tool name). Read at each listing, so a running
+/// session moves to a new choice at its next runtime start; calls to either
+/// surface's names stay accepted.
+pub fn browser_surface_for_record_in(
+    record: &crate::session::model::CutexSessionRecord,
+    profiles: &crate::profiles::model::AccountsStore,
+) -> Option<crate::agent_bus::mcp_browser::Surface> {
+    use crate::agent_bus::mcp_browser::Surface;
+    use crate::profiles::model::BrowserToolSurface;
+    if !browser_tools_for_record_in(record, profiles) { return None; }
+    let profile = crate::profiles::session_profile::effective(record, profiles)?;
+    Some(match profile.browser_tool_surface {
+        BrowserToolSurface::Legacy => Surface::Legacy,
+        BrowserToolSurface::Command => {
+            if runtime_carries_browser_command(record) { Surface::Command } else { Surface::Legacy }
+        }
+        // Owner decision (059): full-access agents get the script surface
+        // when this host can run kernels; others the one-tool surface.
+        BrowserToolSurface::Auto | BrowserToolSurface::Script => {
+            if !runtime_carries_browser_command(record) { Surface::Legacy }
+            else if runtime_carries_browser_script(record)
+                && crate::browser_relay::owner::full_access(record, None)
+                && crate::browser_relay::script::node().is_some() { Surface::Script }
+            else { Surface::Command }
+        }
+    })
+}
+
+fn runtime_carries_browser_script(record: &crate::session::model::CutexSessionRecord) -> bool {
+    if record.runtime_backend != crate::session::model::CutexSessionRuntimeBackend::ClaudeSubscription { return true; }
+    record.claude_session.as_ref().is_some_and(|session| {
+        crate::runtime::claude::adapter_features(&session.deployment.adapter_source)["browserScript"] == true
+    })
+}
+
+fn runtime_carries_browser_command(record: &crate::session::model::CutexSessionRecord) -> bool {
+    if record.runtime_backend != crate::session::model::CutexSessionRuntimeBackend::ClaudeSubscription { return true; }
+    record.claude_session.as_ref().is_some_and(|session| {
+        crate::runtime::claude::adapter_features(&session.deployment.adapter_source)["browserCommand"] == true
+    })
+}
+
 pub fn browser_tools_for_record(record: &crate::session::model::CutexSessionRecord) -> bool {
-    let Ok(store) = crate::profiles::settings_api::load_store() else { return false; };
-    browser_tools_for_record_in(record, &store)
+    with_profiles(|store| browser_tools_for_record_in(record, store)).unwrap_or(false)
 }
 
 /// Sessions that may hold browser tools at all: Agent Bus agents and the
@@ -304,9 +367,7 @@ fn owned_session(cutex_session_id: &str) -> bool {
     session_record(cutex_session_id).is_some_and(|record| record.is_owned_session())
 }
 
-fn session_record(cutex_session_id: &str) -> Option<crate::session::model::CutexSessionRecord> {
-    let store = crate::session::store::load_cutex_session_store_shared().ok()?;
-    store.sessions.values().find(|record| record.cutex_session_id == cutex_session_id).cloned()
+fn session_record(cutex_session_id: &str) -> Option<crate::session::model::CutexSessionRecord> { crate::session::store::shared_session_row(cutex_session_id).ok()?.map(|record| (*record).clone())
 }
 
 /// Whether `cutex_session_id` is offered `delegation_wait`: its profile's
@@ -373,7 +434,7 @@ pub const LEGACY_ALLOWED: &[&str] = &[crate::asks::tools::DOCUMENT_READ];
 /// `POST /api/mcp/v1/toolset` response body for a resolved caller.
 pub fn toolset_response(cutex_session_id: &str, roles: AgentRoles) -> Value {
     let wait = delegation_wait_enabled(cutex_session_id);
-    let browser = browser_tools_enabled(cutex_session_id);
+    let browser = browser_surface(cutex_session_id);
     let search = search_tool_enabled(cutex_session_id);
     if owned_session(cutex_session_id) {
         // Quick chat: browser tools / web_search only (or none); no roles,
@@ -390,7 +451,7 @@ pub fn toolset_response(cutex_session_id: &str, roles: AgentRoles) -> Value {
     let tools: Vec<&str> = tool_names_for_audience(roles, &audience)
         .into_iter()
         .filter(|tool| wait || *tool != crate::asks::tools::DELEGATION_WAIT)
-        .filter(|tool| browser || !crate::agent_bus::mcp_browser::is_tool(tool))
+        .filter(|tool| !crate::agent_bus::mcp_browser::is_tool(tool) || browser.is_some_and(|surface| surface.tools().contains(tool)))
         .filter(|tool| search || !crate::agent_bus::web_search::is_tool(tool))
         .chain(LEGACY_ALLOWED.iter().copied())
         .collect();
@@ -411,8 +472,8 @@ mod tests {
         assert!(!browser_tools_enabled("cutex.browser-missing"));
         for runtime in [crate::asks::tools::ToolRuntime::Codex,crate::asks::tools::ToolRuntime::Claude] {
             let mut listed=crate::agent_bus::mcp::tools_for(runtime,true);
-            assert_eq!(listed["tools"].as_array().unwrap().iter().filter(|t| t["name"].as_str().is_some_and(crate::agent_bus::mcp_browser::is_tool)).count(),crate::agent_bus::mcp_browser::TOOLS.len());
-            crate::agent_bus::mcp_browser::filter_listing(&mut listed,false);
+            assert_eq!(listed["tools"].as_array().unwrap().iter().filter(|t| t["name"].as_str().is_some_and(crate::agent_bus::mcp_browser::is_tool)).count(),crate::agent_bus::mcp_browser::TOOLS.len()+3,"all surfaces defined");
+            crate::agent_bus::mcp_browser::filter_listing(&mut listed,None);
             assert_eq!(listed["tools"].as_array().unwrap().iter().filter(|t| t["name"].as_str().is_some_and(crate::agent_bus::mcp_browser::is_tool)).count(),0);
         }
     }
@@ -483,6 +544,48 @@ mod tests {
         assert!(!browser_eligible_session(&named) && !browser_tools_for_record_in(&named, &on));
     }
 
+    /// Design 059: one surface per session from the profile's choice; a
+    /// Claude adapter without `browserCommand` keeps the legacy tools.
+    #[test]
+    fn browser_surface_follows_profile_choice_and_runtime_support() {
+        use crate::agent_bus::mcp_browser::Surface;
+        use crate::profiles::model::BrowserToolSurface;
+        use crate::session::model::CutexSessionRuntimeBackend;
+        let codex = quick_chat_record();
+        let mut claude = quick_chat_record();
+        claude.explicit_launch = None;
+        claude.runtime_backend = CutexSessionRuntimeBackend::ClaudeSubscription;
+        let mut store = profiles(true);
+        assert_eq!(browser_surface_for_record_in(&codex, &store), Some(Surface::Command), "auto");
+        assert_eq!(browser_surface_for_record_in(&claude, &store), Some(Surface::Legacy), "no claude_session: no declared support");
+        store.accounts[0].browser_tool_surface = BrowserToolSurface::Legacy;
+        assert_eq!(browser_surface_for_record_in(&codex, &store), Some(Surface::Legacy));
+        store.accounts[0].browser_tool_surface = BrowserToolSurface::Command;
+        assert_eq!(browser_surface_for_record_in(&codex, &store), Some(Surface::Command));
+        assert_eq!(browser_surface_for_record_in(&claude, &store), Some(Surface::Legacy));
+        assert_eq!(browser_surface_for_record_in(&codex, &profiles(false)), None);
+        // Auto/script: full access + a supported Node on this host → scripts.
+        let mut full = codex.clone();
+        full.sandbox_mode = Some("danger-full-access".into());
+        full.approval_policy = Some("never".into());
+        let scripts = if crate::browser_relay::script::node().is_some() { Surface::Script } else { Surface::Command };
+        assert_eq!(browser_surface_for_record_in(&full, &store), Some(Surface::Command), "command stays command");
+        store.accounts[0].browser_tool_surface = BrowserToolSurface::Script;
+        assert_eq!(browser_surface_for_record_in(&full, &store), Some(scripts));
+        assert_eq!(browser_surface_for_record_in(&codex, &store), Some(Surface::Command), "not full access");
+        assert_eq!(browser_surface_for_record_in(&full, &profiles(true)), Some(scripts), "auto");
+        let mut full_claude = claude.clone();
+        full_claude.sandbox_mode = full.sandbox_mode.clone();
+        full_claude.approval_policy = full.approval_policy.clone();
+        assert_eq!(browser_surface_for_record_in(&full_claude, &store), Some(Surface::Legacy), "no declared support");
+        store.accounts[0].browser_tool_surface = BrowserToolSurface::Command;
+        // Stored only when not auto: older binaries read the store unchanged.
+        let auto = serde_json::to_value(&profiles(true).accounts[0]).unwrap();
+        assert!(auto.get("browser_tool_surface").is_none());
+        let legacy = serde_json::to_value(&store.accounts[0]).unwrap();
+        assert_eq!(legacy["browser_tool_surface"], "command");
+    }
+
     #[test]
     fn quick_chat_toolset_and_listing_hold_only_browser_tools() {
         use crate::config::instance::{set_test_selection, Selection};
@@ -494,7 +597,8 @@ mod tests {
         let mut sessions = crate::session::model::CutexSessionStore::default();
         sessions.sessions.insert(id.clone(), record.clone());
         crate::session::store::save_cutex_session_store(&sessions).unwrap();
-        let browser: Vec<&str> = crate::agent_bus::mcp_browser::TOOLS.to_vec();
+        // Auto surface on a Codex quick chat: the one `browser` tool (design 059).
+        let browser: Vec<&str> = vec![crate::agent_bus::mcp_browser::COMMAND];
         let names = |list: &Value| -> Vec<String> {
             list["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
         };
@@ -540,7 +644,10 @@ mod tests {
             let listing=tools_list_for_session(&record.cutex_session_id);
             let tools=listing["tools"].as_array().unwrap();
             assert!(tools.iter().any(|tool|tool["name"]=="web_search"));
-            for name in crate::agent_bus::mcp_browser::TOOLS { assert!(tools.iter().any(|tool|tool["name"]==*name),"{name}"); }
+            // Auto surface (design 059): Claude without a declared adapter keeps the legacy tools.
+            let surface = browser_surface_for_record_in(record, &store).unwrap();
+            for name in surface.tools() { assert!(tools.iter().any(|tool|tool["name"]==*name),"{name}"); }
+            assert_eq!(tools.iter().filter(|tool|tool["name"].as_str().is_some_and(crate::agent_bus::mcp_browser::is_tool)).count(), surface.tools().len());
             let mut opted_out=record.clone(); opted_out.profile=Some("Disabled".into());
             assert!(!browser_tools_for_record_in(&opted_out,&store));
             assert!(!crate::agent_bus::web_search::enabled_for_record_in(&opted_out,&store));
@@ -598,7 +705,7 @@ mod tests {
         for search in [true, false] {
             let mut store = crate::profiles::model::AccountsStore::default();
             store.accounts.push(serde_json::from_value(serde_json::json!({
-                "id": "browsing-id", "name": "Browsing", "source": "api-key", "search_tool": search,
+                "id": "browsing-id", "name": "Browsing", "source": "api-key", "search_tool": search, "browser_tools": false,
             })).unwrap());
             crate::profiles::store::save_store(&store).unwrap();
             assert_eq!(search_tool_enabled(&agent.cutex_session_id), search);

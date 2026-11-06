@@ -136,9 +136,19 @@ fn read_auth(account: &StoredAccount) -> anyhow::Result<Option<Value>> {
 fn api_key_of(auth: &Value) -> Option<&str> {
     let has_tokens = auth.get("tokens").is_some_and(|tokens| !tokens.is_null());
     (!has_tokens)
-        .then(|| auth.get("OPENAI_API_KEY").and_then(Value::as_str))
+        .then(|| super::api_key::from_auth(auth))
         .flatten()
         .filter(|key| !key.trim().is_empty())
+}
+
+#[cfg(test)]
+#[test]
+fn lowercase_api_key_transfer_recognizes_legacy_auth_without_tokens() {
+    let key = format!("fixture-{}", uuid::Uuid::new_v4());
+    for auth in [json!({"openai_api_key":key}), json!({"OPENAI_API_KEY":null,"openai_api_key":key})] {
+        assert!(api_key_of(&auth) == Some(key.as_str()), "portable key lookup must accept legacy casing");
+    }
+    assert!(api_key_of(&json!({"openai_api_key":key,"tokens":{"id_token":"fixture"}})).is_none(), "account tokens must not be exported as an API credential");
 }
 
 /// Which credential `account` uses (from its auth.json, else its source).
@@ -1143,7 +1153,8 @@ mod tests {
         assert!(state
             .path
             .unwrap()
-            .starts_with(lifecycle::profile_dir(&imported.account).unwrap()));
+            .canonicalize().unwrap()
+            .starts_with(lifecycle::profile_dir(&imported.account).unwrap().canonicalize().unwrap()));
         assert_eq!(
             catalog_overlay::load(&imported.account).unwrap(),
             Some(overlay)

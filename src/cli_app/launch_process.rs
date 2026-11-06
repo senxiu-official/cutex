@@ -52,9 +52,7 @@ pub(crate) fn run_codex_process(
     }
     if !agent_mode && effective_codex_args.first().is_some_and(|arg| arg == "resume") {
         if let Some(native) = effective_codex_args.get(1).filter(|arg| !arg.starts_with('-')) {
-            let store = cutex::session::store::load_cutex_session_store()?;
-            if let Some(record) = store.sessions.values().find(|r| r.is_owned_session()
-                && r.codex_session_id.as_deref() == Some(native)) {
+            if let Some(record) = cutex::session::store::owned_session_by_native(native)? {
                 anyhow::ensure!(effective_codex_args.len() == 2,
                     "This Cutex session has a dedicated runtime; resume without extra native overrides or use Recent Sessions");
                 super::stock_lifecycle::online(&record.cutex_session_id, false)?;
@@ -72,8 +70,11 @@ pub(crate) fn run_codex_process(
         return super::stock_lifecycle::attach(&id);
     }
     if !agent_mode {
+        let runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
         if let Some(mut command) = super::light_standalone::command(account, &effective_codex_args)? {
-            let status = command.status().context("Failed to start ordinary light session")?;
+            let mut child = command.spawn().context("Failed to start ordinary light session")?;
+            drop(runtime_reference);
+            let status = child.wait().context("Failed to wait for ordinary light session")?;
             std::process::exit(exit_code_from_status(status));
         }
     }

@@ -79,6 +79,20 @@ class RuntimeTasks:
         return {'tasks': [self._public(row) for row in self.rows.values()], 'source': 'observedSdkLifecycle',
                 'completeInventory': False}
 
+    def background_notice(self, message):
+        """Whether a task_notification may make Claude Code start its own turn.
+
+        Claude Code also notifies the end of a foreground task: a Bash command
+        that ran 2 s or more is registered as a ``local_bash`` task with
+        ``is_backgrounded: false`` and notified when it ends in the foreground
+        (claude-r36). Its result goes back to the model in the running turn, so
+        it starts no turn. Only a task known to be foreground, never moved to the
+        background, counts as foreground; an unknown task counts as background.
+        """
+        task_id = field(message, 'task_id')
+        row = self.rows.get(task_id) if isinstance(task_id, str) else None
+        return row is None or bool(row.get('background')) or row.get('_backgrounded') is not False
+
     def require_running(self, task_id):
         task = self.rows.get(task_id)
         if not task or task['status'] in TERMINAL or task['status'] == 'unknown':
@@ -309,6 +323,12 @@ class RuntimeTasks:
             row['status'] = 'running'
         patch = field(message, 'patch', {})
         patch = patch if isinstance(patch, dict) else {}
+        # Foreground or background as Claude Code registered it; a foreground task
+        # moved to the background (task_updated) stays there.
+        moved = field(message, 'is_backgrounded') if subtype == 'task_started' else (
+            patch.get('is_backgrounded') if subtype == 'task_updated' else None)
+        if isinstance(moved, bool) and row.get('_backgrounded') is not True:
+            row['_backgrounded'] = moved
         status = field(message, 'status') or patch.get('status')
         corrected_failure = previous == 'completed' and status in {'failed', 'stopped', 'killed', 'cancelled'}
         if status in TERMINAL | {'running', 'pending'}:

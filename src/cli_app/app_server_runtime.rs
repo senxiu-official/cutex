@@ -21,7 +21,7 @@ use cutex::app_server::manager::AppServerRuntimeManager;
 use cutex::app_server::runtime::cleanup_runtime_binding_files;
 use cutex::app_server::runtime::thread_resume_params_for_session_with_model_provider;
 use cutex::app_server::runtime::AppServerRuntimeLayout;
-use cutex::management::v2::activity::record_activity_event;
+use cutex::management::v2::activity::record_activity_event_for_profile;
 use cutex::management::v2::model::AppServerSchema;
 use cutex::management::v2::model::AppServerSchemaChannel;
 use cutex::management::v2::native_events::pending_event_from_app_server;
@@ -149,6 +149,12 @@ fn handle_runtime_native_event(
     if super::thread_titles::claim_event(event) {
         return Ok(RuntimeEventSinkDisposition::IgnoredForeignThreadEvent);
     }
+    // r276 agent pause: the tool calls cute-codex holds on the bound thread.
+    if let cutex::app_server::client::AppServerEvent::Notification(notification) = event {
+        if notification.method == super::tool_gate::CODEX_CHANGED {
+            super::tool_gate::note_changed(&context.cutex_session_id, &context.thread_id, notification.params.as_ref());
+        }
+    }
     let native_context = native_event_context(context);
     let session = context.cutex_session_id.as_str();
     let root = context.thread_id.as_str();
@@ -267,19 +273,35 @@ fn publish_runtime_event(
         if synchronize_before_publish {
             app_server_state_sync::handle_runtime_event(context, event)?;
         }
-        management_v2_repository()?.append(pending)?;
+        let bytes = cutex::management::v2::runtime_journal::retained_cost(&pending);
+        cutex::management::v2::runtime_journal::submit(pending, bytes, |_| Ok(()))?;
         return Ok(());
     }
     if synchronize_before_publish {
         app_server_state_sync::handle_runtime_event(context, event)?;
     }
-    if let Some(envelope) = cutex::management::v2::native_events::append_observed_event(pending)? {
-    if let Err(err) = record_activity_event(&envelope) {
-        eprintln!("\x1b[33mwarning:\x1b[0m failed to update session activity: {err:#}");
-    }
+    let bytes = cutex::management::v2::runtime_journal::retained_cost(&pending);
+    let context = context.clone();
+    let event = event.clone();
+    cutex::management::v2::runtime_journal::submit(pending, bytes, move |envelope| {
+        complete_runtime_event(&context, &event, synchronize_before_publish, envelope)
+    })?;
+    Ok(())
+}
+
+fn complete_runtime_event(
+    context: &AppServerRuntimeEventContext,
+    event: &cutex::app_server::client::AppServerEvent,
+    synchronize_before_publish: bool,
+    envelope: Option<cutex::management::v2::model::EventEnvelope>,
+) -> anyhow::Result<()> {
+    if let Some(envelope) = envelope {
     // Resolved by profile id: after a rename a live runtime reports under the
     // new name (docs/profile-id-and-runtimes.md).
     let profile = context.current_profile();
+    if let Err(err) = record_activity_event_for_profile(&envelope, profile.id.as_deref(), profile.name.as_deref()) {
+        eprintln!("\x1b[33mwarning:\x1b[0m failed to update session activity: {err:#}");
+    }
     if let Err(err) =
         record_usage_event_for_runtime(&envelope, profile.id.as_deref(), profile.name.as_deref(), &context.usage)
     {
@@ -323,6 +345,11 @@ fn record_dsh_latest_state(envelope: &cutex::management::v2::model::EventEnvelop
 
 struct ManagementEventSink;
 impl cutex::app_server::manager::AppServerRuntimeEventSink for ManagementEventSink {
+    fn handle_background_work(&self, context: &AppServerRuntimeEventContext,
+        work: Option<cutex::app_server::background_work::BackgroundWork>) -> anyhow::Result<()> {
+        cutex::management::v2::repository::publish_background_work(context, work);
+        Ok(())
+    }
     fn handle_live_connection_boundary(&self, context: &AppServerRuntimeEventContext) -> anyhow::Result<()> {
         management_v2_repository()?.invalidate_live(&context.cutex_session_id, context.runtime_generation);
         Ok(())
@@ -663,9 +690,12 @@ fn verify_recovered_runtime_state(
     {
         anyhow::bail!("reconnected runtime identity/generation does not match the durable claim");
     }
-    let registration = runtime_manager()
-        .refresh_agent_bus_registration(&expected.cutex_session_id)?
-        .context("reconnected runtime has no Agent Bus bridge")?;
+    let registration = cutex::agent_management::verify_claim_outside_host_fence(
+        "agent bus registration refresh",
+        || super::stock_lifecycle::live_runtime_claim(&expected.cutex_session_id),
+        || runtime_manager().refresh_agent_bus_registration(&expected.cutex_session_id),
+    )?
+    .context("reconnected runtime has no Agent Bus bridge")?;
     if !registration.registered || registration.runtime_agent_id != runtime_agent_id {
         anyhow::bail!("reconnected runtime Agent Bus identity is not exact");
     }
@@ -677,14 +707,92 @@ pub(super) fn verify_exact_live_runtime_claim(
     binding: &CutexAppServerRuntimeBinding,
 ) -> anyhow::Result<()> {
     let initial_process_started_at = process_started_at(binding.pid)?;
-    verify_exact_live_runtime_claim_with_probe(
+    let started = std::time::Instant::now();
+    let result = verify_exact_live_runtime_claim_with_probe(
         record,
         binding,
         initial_process_started_at,
         EXACT_ENDPOINT_OWNERSHIP_ATTEMPTS,
         EXACT_ENDPOINT_OWNERSHIP_RETRY_DELAY,
-        || binding_endpoint_is_owned_by_process(binding, binding.pid),
-    )
+        || endpoint_ownership_probe(binding),
+    );
+    note_live_claim_verification(started.elapsed());
+    result
+}
+
+/// r273.1 (B1) seam: the endpoint ownership probe (Linux `/proc`, macOS
+/// peer PID, Windows TCP table). Unit tests replace it per thread.
+fn endpoint_ownership_probe(binding: &CutexAppServerRuntimeBinding) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    if let Some(result) = ENDPOINT_OWNERSHIP_PROBE_FOR_TEST
+        .with(|probe| probe.borrow_mut().as_mut().map(|probe| probe(binding)))
+    {
+        return result;
+    }
+    binding_endpoint_is_owned_by_process(binding, binding.pid)
+}
+
+#[cfg(test)]
+type EndpointOwnershipProbe = Box<dyn FnMut(&CutexAppServerRuntimeBinding) -> anyhow::Result<bool>>;
+
+#[cfg(test)]
+thread_local! {
+    static ENDPOINT_OWNERSHIP_PROBE_FOR_TEST: std::cell::RefCell<Option<EndpointOwnershipProbe>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with this thread's endpoint ownership probe replaced (tests).
+#[cfg(test)]
+pub(super) fn with_endpoint_ownership_probe_for_test<R>(
+    probe: impl FnMut(&CutexAppServerRuntimeBinding) -> anyhow::Result<bool> + 'static,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Reset(Option<EndpointOwnershipProbe>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            ENDPOINT_OWNERSHIP_PROBE_FOR_TEST.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let _reset = Reset(
+        ENDPOINT_OWNERSHIP_PROBE_FOR_TEST.with(|slot| slot.borrow_mut().replace(Box::new(probe))),
+    );
+    f()
+}
+
+/// A live-claim verification at least this slow is logged (with whether the
+/// host fence was held), so the B1 split is observable in a daemon log.
+const SLOW_LIVE_CLAIM_VERIFICATION: Duration = Duration::from_millis(500);
+
+/// Last live-claim verification on this thread: (duration, host fence held).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LiveClaimVerification {
+    pub(super) elapsed: Duration,
+    pub(super) host_fence_held: bool,
+}
+
+thread_local! {
+    static LAST_LIVE_CLAIM_VERIFICATION: std::cell::Cell<Option<LiveClaimVerification>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn note_live_claim_verification(elapsed: Duration) {
+    let host_fence_held = cutex::agent_management::host_fence_registered();
+    LAST_LIVE_CLAIM_VERIFICATION.with(|last| {
+        last.set(Some(LiveClaimVerification { elapsed, host_fence_held }))
+    });
+    if elapsed >= SLOW_LIVE_CLAIM_VERIFICATION {
+        eprintln!(
+            "cutex-host-hold: live runtime claim verification took {} ms (host fence held: {host_fence_held})",
+            elapsed.as_millis()
+        );
+    }
+}
+
+/// The last live-claim verification this thread ran (observability, tests).
+#[allow(dead_code)]
+pub(super) fn last_live_claim_verification() -> Option<LiveClaimVerification> {
+    LAST_LIVE_CLAIM_VERIFICATION.with(std::cell::Cell::get)
 }
 
 /// `/proc/net/unix` and `/proc/<pid>/fd` are two separately observed kernel
@@ -940,10 +1048,15 @@ fn linux_unix_socket_peer_credentials(path: &Path) -> Option<libc::ucred> {
         .then_some(credentials)
 }
 
+/// r273.1 (B1): the listener owner comes from the kernel TCP tables
+/// (`GetExtendedTcpTable`, `TCP_TABLE_OWNER_PID_LISTENER`, IPv4 and IPv6),
+/// not from a `powershell Get-NetTCPConnection` child (3.2 s per call on
+/// host-a, inside the host fence). Same rule as before: some listener on the
+/// endpoint's port, on any local address, is owned by `pid`. A table that
+/// cannot be read is an error (fail closed, as a failed PowerShell query was);
+/// no matching listener row is `Ok(false)`.
 #[cfg(windows)]
 fn windows_loopback_listener_is_owned_by_process(url: &str, pid: u32) -> anyhow::Result<bool> {
-    use std::process::{Command, Stdio};
-
     let url = url::Url::parse(url).context("runtime loopback endpoint is invalid")?;
     let host = url
         .host_str()
@@ -952,21 +1065,95 @@ fn windows_loopback_listener_is_owned_by_process(url: &str, pid: u32) -> anyhow:
         anyhow::bail!("runtime endpoint is not loopback");
     }
     let port = url.port().context("runtime endpoint omitted its port")?;
-    let script = format!(
-        "Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess"
-    );
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .stdin(Stdio::null())
-        .output()
+    let owners = windows_tcp_listener_owners(port)
         .context("failed to query loopback listener ownership")?;
-    if !output.status.success() {
-        anyhow::bail!("loopback listener ownership query failed");
+    Ok(owners.contains(&pid))
+}
+
+/// Owning PIDs of every TCP listener (IPv4 and IPv6) on local `port`.
+#[cfg(windows)]
+fn windows_tcp_listener_owners(port: u16) -> anyhow::Result<Vec<u32>> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    let mut owners = Vec::new();
+    // dwLocalPort carries the port in network byte order in its low 16 bits.
+    let local_port = |raw: u32| u16::from_be(raw as u16);
+    for row in windows_tcp_listener_rows::<MIB_TCPROW_OWNER_PID>(AF_INET)? {
+        if local_port(row.dwLocalPort) == port {
+            owners.push(row.dwOwningPid);
+        }
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .any(|owner| owner == pid))
+    for row in windows_tcp_listener_rows::<MIB_TCP6ROW_OWNER_PID>(AF_INET6)? {
+        if local_port(row.dwLocalPort) == port {
+            owners.push(row.dwOwningPid);
+        }
+    }
+    Ok(owners)
+}
+
+/// One `GetExtendedTcpTable(.., TCP_TABLE_OWNER_PID_LISTENER, ..)` snapshot
+/// for `family`, copied out row by row. `Row` is `MIB_TCPROW_OWNER_PID` for
+/// `AF_INET` or `MIB_TCP6ROW_OWNER_PID` for `AF_INET6`; the table is a `u32`
+/// entry count followed by the rows (`MIB_TCP*TABLE_OWNER_PID`).
+#[cfg(windows)]
+fn windows_tcp_listener_rows<Row: Copy>(family: u16) -> anyhow::Result<Vec<Row>> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+
+    // Both row types are u32 / u8 arrays: a u32 buffer is aligned for them.
+    let header = std::mem::size_of::<u32>();
+    let rows_offset = header.max(std::mem::align_of::<Row>());
+    let mut size: u32 = 0;
+    let mut buffer: Vec<u32> = Vec::new();
+    // The table can grow between the size query and the copy: retry a few times.
+    for _ in 0..8 {
+        let words = (size as usize).div_ceil(std::mem::size_of::<u32>());
+        buffer.resize(words.max(1), 0);
+        let mut capacity = (buffer.len() * std::mem::size_of::<u32>()) as u32;
+        let status = unsafe {
+            GetExtendedTcpTable(
+                buffer.as_mut_ptr().cast(),
+                &mut capacity,
+                0,
+                u32::from(family),
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if status == ERROR_INSUFFICIENT_BUFFER {
+            anyhow::ensure!(capacity as usize > buffer.len() * std::mem::size_of::<u32>(),
+                "GetExtendedTcpTable asked for no larger buffer");
+            size = capacity;
+            continue;
+        }
+        anyhow::ensure!(status == NO_ERROR, "GetExtendedTcpTable failed (family {family}): error {status}");
+        let filled = (capacity as usize).min(buffer.len() * std::mem::size_of::<u32>());
+        anyhow::ensure!(filled >= header, "GetExtendedTcpTable returned a truncated table");
+        let entries = buffer[0] as usize;
+        let row_size = std::mem::size_of::<Row>();
+        let needed = entries
+            .checked_mul(row_size)
+            .and_then(|bytes| bytes.checked_add(rows_offset))
+            .context("GetExtendedTcpTable entry count overflows")?;
+        let available = buffer.len() * std::mem::size_of::<u32>();
+        anyhow::ensure!(
+            entries == 0 || needed <= available,
+            "GetExtendedTcpTable entry count exceeds its buffer"
+        );
+        let base = buffer.as_ptr().cast::<u8>();
+        let rows = (0..entries)
+            .map(|index| unsafe {
+                std::ptr::read_unaligned(base.add(rows_offset + index * row_size).cast::<Row>())
+            })
+            .collect();
+        return Ok(rows);
+    }
+    anyhow::bail!("GetExtendedTcpTable kept growing (family {family})")
 }
 
 pub(crate) fn classify_persisted_runtime_recovery(
@@ -1337,6 +1524,15 @@ pub(crate) fn adopt_persisted_runtimes(
                             record = current.clone();
                         }
                     }
+                    // r271: busy host fence under a lane; the lane-free sweep
+                    // clears the claim. Never stop or reconnect over it now.
+                    Err(error) if cutex::asks::pause_admission::is_deferred(&error) => {
+                        summary.failures.push(format!(
+                            "{}: launch claim kept (host busy): {error:#}",
+                            record.cutex_session_id
+                        ));
+                        continue;
+                    }
                     Err(error) => summary.failures.push(format!(
                         "{}: launch claim kept: {error:#}",
                         record.cutex_session_id
@@ -1451,21 +1647,27 @@ pub(crate) fn adopt_persisted_runtimes(
 /// costs one revision query per tick. Never launches, stops or clears
 /// anything: only an exact live claim is reconnected, through the same paths
 /// as startup adoption.
+///
+/// r274: it also reconnects a runtime whose observation link from this
+/// process dropped while the runtime (same binding and generation) lives on.
+/// The runtime manager announces each lost connection
+/// (`late_adoption::note_connection_lost`), so this needs no store change and
+/// no per-tick scan; such a reconnect happens at most once per
+/// `late_adoption::RECONNECT_INTERVAL` per occurrence.
 pub(crate) fn observe_late_runtimes(current_host: &str) {
-    use cutex::app_server::late_adoption::{adoption_candidate, LateAdoptionPlanner, TICK};
+    use cutex::app_server::late_adoption::{adoption_candidate, connection_losses, LateAdoptionPlanner, TICK};
     let mut planner = LateAdoptionPlanner::default();
-    let mut last_revision = None;
     loop {
         std::thread::sleep(TICK);
+        // Read before the store: a loss during this plan re-plans next tick.
+        let losses = connection_losses();
         let store = match cutex::session::store::load_cutex_session_store_shared() {
             Ok(store) => store,
             Err(_) => continue,
         };
-        let revision = store.store_revision.get();
-        if last_revision == Some(revision) && !planner.has_pending() {
+        if !planner.should_plan(store.store_revision.get(), losses, std::time::Instant::now()) {
             continue;
         }
-        last_revision = Some(revision);
         let candidates = cutex::session::boot_fence::with_host_probe(|host| {
             store
                 .sessions
@@ -1479,21 +1681,22 @@ pub(crate) fn observe_late_runtimes(current_host: &str) {
         });
         drop(store);
         let now = std::time::Instant::now();
-        let due = planner.plan(candidates, now, |id| {
+        let due = planner.plan(candidates, now, |occurrence| {
+            let id = occurrence.cutex_session_id.as_str();
             cutex::app_server::late_adoption::disconnected_locally_since(id, now)
-                || !matches!(runtime_manager().status(id), Ok(None))
+                || local_connection_covers(id, occurrence).unwrap_or(true)
         });
         for occurrence in due {
             match adopt_late_runtime(&occurrence, current_host) {
                 Ok(true) => {
-                    planner.adopted(&occurrence);
+                    planner.adopted(&occurrence, std::time::Instant::now());
                     println!(
                         "app-server runtime adopted after startup: {} (pid {}, generation {})",
                         occurrence.cutex_session_id, occurrence.pid, occurrence.runtime_generation
                     );
                 }
                 // Changed or connected meanwhile: the next tick decides again.
-                Ok(false) => planner.adopted(&occurrence),
+                Ok(false) => planner.adopted(&occurrence, std::time::Instant::now()),
                 Err(error) => {
                     if planner.failed(&occurrence, format!("{error:#}"), std::time::Instant::now()) {
                         eprintln!(
@@ -1505,6 +1708,19 @@ pub(crate) fn observe_late_runtimes(current_host: &str) {
             }
         }
     }
+}
+
+/// Whether this process's live connection entry accounts for `occurrence`;
+/// a dead entry of the same (r274) or an older generation (r273.1 O1) does
+/// not (see `late_adoption::local_connection_covers`).
+fn local_connection_covers(
+    cutex_session_id: &str,
+    occurrence: &cutex::app_server::late_adoption::RuntimeOccurrence,
+) -> anyhow::Result<bool> {
+    let local = runtime_manager()
+        .status(cutex_session_id)?
+        .map(|status| (status.connected, status.runtime_generation));
+    Ok(cutex::app_server::late_adoption::local_connection_covers(local, occurrence))
 }
 
 /// Reconnects one settled occurrence. `Ok(false)`: nothing to do any more
@@ -1527,7 +1743,7 @@ fn adopt_late_runtime(
     };
     if cutex::app_server::late_adoption::adoption_candidate(&record, current_host, live).as_ref()
         != Some(occurrence)
-        || runtime_manager().status(&record.cutex_session_id)?.is_some()
+        || local_connection_covers(&record.cutex_session_id, occurrence)?
     {
         return Ok(false);
     }
@@ -1903,6 +2119,55 @@ mod tests {
         record.runtime_pid = Some(pid);
         record.runtime_generation = 7;
         record
+    }
+
+    /// r273.1 (B1) seam: the real `verify_exact_live_runtime_claim` runs
+    /// its endpoint ownership probe through the per-thread test seam, and its
+    /// duration (and whether the host fence was held) is observable. On
+    /// Windows the probe was a 3.2 s PowerShell child under the fence.
+    #[test]
+    fn live_claim_verification_probe_is_injectable_and_timed() {
+        let pid = std::process::id();
+        let mut record = exact_claimed_record(pid);
+        let started = process_started_at(pid).expect("own start time");
+        let binding = record.app_server_runtime.as_mut().unwrap();
+        binding.started_at = (started + chrono::Duration::seconds(1)).to_rfc3339();
+        let binding = binding.clone();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let expected_pid = pid;
+        with_endpoint_ownership_probe_for_test(
+            move |probe_binding| {
+                seen.set(seen.get() + 1);
+                assert_eq!(probe_binding.pid, expected_pid);
+                std::thread::sleep(Duration::from_millis(120));
+                Ok(true)
+            },
+            || verify_exact_live_runtime_claim(&record, &binding).expect("verified"),
+        );
+        assert_eq!(calls.get(), 1);
+        let last = last_live_claim_verification().expect("timed");
+        assert!(last.elapsed >= Duration::from_millis(120), "{last:?}");
+        assert!(!last.host_fence_held, "no registered hold on a test thread");
+
+        // Not owned: bounded re-observation, then fail closed.
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = attempts.clone();
+        let error = with_endpoint_ownership_probe_for_test(
+            move |_| {
+                seen.set(seen.get() + 1);
+                Ok(false)
+            },
+            || verify_exact_live_runtime_claim(&record, &binding).unwrap_err(),
+        );
+        assert_eq!(attempts.get(), EXACT_ENDPOINT_OWNERSHIP_ATTEMPTS);
+        assert!(format!("{error:#}").contains("not live and owned"), "{error:#}");
+        // A probe error fails closed at once.
+        let error = with_endpoint_ownership_probe_for_test(
+            |_| anyhow::bail!("loopback listener ownership query failed"),
+            || verify_exact_live_runtime_claim(&record, &binding).unwrap_err(),
+        );
+        assert!(format!("{error:#}").contains("ownership query failed"), "{error:#}");
     }
 
     #[test]

@@ -107,6 +107,14 @@ pub(super) fn dispatch(
         .unwrap_or_default();
     crate::asks::lifecycle::mark_reverted_default(cutex_session_id, &removed);
     crate::notes::mark_reverted_default(cutex_session_id, &removed);
+    // r274.2 §9.6: the input ledger follows (records bound to a removed turn
+    // become `discarded{historyReverted}`). Logged, never failing the
+    // committed revert; the startup recovery repairs a missed write.
+    super::input_ledger_revert::after_revert(
+        cutex_session_id,
+        &removed,
+        result.get("actionId").and_then(Value::as_str),
+    );
     append_cutex_event(
         event_repository,
         cutex_session_id,

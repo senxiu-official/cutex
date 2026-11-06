@@ -27,7 +27,7 @@ cutex human config undo NAME ORIGINAL_ACTION_ID
 Names may be a unique formal/display name, native UUID, or exact durable ID.
 `stop` interrupts the runtime while retaining history. `--force`
 uses the existing forced stop path when graceful interruption is unavailable.
-`cutex human tasks ...` and `--cancel-tasks` were removed in r219 with the
+`cutex human tasks ...` and `--cancel-tasks` were removed with the
 legacy Task Service (see [r219-removals.md](../r219-removals.md)).
 
 Configuration changes affect the next launch. The current runtime keeps its own

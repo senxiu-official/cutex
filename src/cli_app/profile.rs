@@ -287,10 +287,7 @@ pub(crate) fn cmd_profile_copy(
 fn api_key_auth(raw: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(raw).is_ok_and(|auth| {
         auth.get("tokens").is_none_or(serde_json::Value::is_null)
-            && auth
-                .get("OPENAI_API_KEY")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|key| !key.trim().is_empty())
+            && cutex::profiles::api_key::from_auth(&auth).is_some()
     })
 }
 
@@ -1568,7 +1565,7 @@ fn cmd_profile_models(target: &str, refresh: bool, apply: bool) -> anyhow::Resul
     let catalog = if refresh || cached.is_none() {
         let auth: serde_json::Value = serde_json::from_slice(&fs::read(&files.auth_path)?)
             .map_err(|_| anyhow!("Invalid profile credential file"))?;
-        let key = auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str)
+        let key = cutex::profiles::api_key::from_auth(&auth)
             .filter(|key| !key.is_empty()).context("API model discovery requires an API-key profile; subscriptions use native model discovery")?;
         let proxy = cutex::config::proxy_outbound::OutboundProxy::for_profile(account, &load_codez_config());
         let catalog = model_discovery::fetch(base, key, &proxy)?;

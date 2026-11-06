@@ -159,7 +159,7 @@ fn publish_current(session: &str) {
 
 fn envelope(session: &str, plan: &Plan) -> Envelope {
     let mut envelope = Envelope {
-        version: 1,
+        version: plan.envelope_version,
         owner_id: session.into(),
         thread_id: plan.thread_id.clone(),
         runtime_generation: plan.runtime_generation,
@@ -173,7 +173,11 @@ fn envelope(session: &str, plan: &Plan) -> Envelope {
             delivery: Delivery::AfterTurn,
             text: retry::CONTINUE_TEXT.into(),
         },
-        view: None,
+        view: (plan.envelope_version == 2).then(|| cutex::app_server::external_input::view::StructuredView {
+            schema: "cutex.model-overload-retry.v1".into(),
+            data: json!({"failedTurnId": plan.turn_id, "attempt": plan.attempt,
+                "maxAttempts": retry::DELAYS.len(), "planId": plan.plan_id}),
+        }),
         semantic_sha256: String::new(),
     };
     envelope.semantic_sha256 = envelope.digest();
@@ -226,10 +230,11 @@ fn bound_with_hook(
     after_rebind: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     retry::begin_binding(store, session, plan, turn)?;
+    retry::publish(session, "binding");
     retry::rebind(asks, session, plan, turn)?;
     after_rebind()?;
     let (early, message) = retry::finish_binding(store, session, plan, turn)?;
-    retry::publish(session, "fired");
+    retry::publish_fired(session, plan, turn);
     if let Some(message) = message.filter(|v| v["turnId"].as_str() == Some(turn)) {
         cutex::asks::observe::observe(asks, session, "item/completed", &message, Utc::now())?;
     }
@@ -352,10 +357,11 @@ fn fire(
     if !store.automatic_enabled() {
         return Ok(());
     }
-    let Some(plan) = cutex::asks::pause_admission::unless_paused(asks,session,|_|
+    let Some(mut plan) = cutex::asks::pause_admission::unless_paused(asks,session,|_|
         store.update(|s| s.claim(session, &pending.plan_id, now)))?.transpose()?.flatten() else {
         return Ok(());
     };
+    retry::publish(session, "firing");
     let handle = match eligibility(&plan) {
         Ok(handle) => handle,
         Err(reason) if reason.downcast_ref::<cutex::asks::pause_admission::Deferred>().is_some()=>{
@@ -368,6 +374,16 @@ fn fire(
             return Ok(());
         }
     };
+    // Keep retry behavior on old pinned runtimes. Only a proven-unsent claim
+    // can choose v1; once Uncertain, its envelope/digest must never change.
+    if plan.envelope_version == 2 && !handle.initialize_response().is_some_and(cutex::app_server::external_input::structured_view_supported) {
+        plan = store.update(|state| {
+            let current = state.sessions.get_mut(session)?.plan.as_mut()?;
+            if current.message_id != plan.message_id || current.phase != Phase::Firing { return None; }
+            current.envelope_version = 1;
+            Some(current.clone())
+        })?.ok_or_else(|| anyhow::anyhow!("retry changed before legacy envelope selection"))?;
+    }
     // Eligibility may have taken time. Recheck before reopening the native
     // gate, not just before submitting the new retry. No RPC under AskStore.
     match cutex::asks::pause_admission::gate(asks,session) {
@@ -417,6 +433,7 @@ fn send(
         Err(error)=>{postpone_unsent(store,session,plan)?;return Err(error);},
     };
     reserved.ok_or_else(||anyhow::anyhow!("retry superseded before send"))?;
+    retry::publish(session, "uncertain");
     let result = (|| -> anyhow::Result<String> {
         anyhow::ensure!(
             !store.is_disabled(),
@@ -481,13 +498,17 @@ fn send(
 /// Firing is a local claim, not a native send. Only this proven-unsent phase
 /// may return to Pending; Uncertain/Binding can never be rearmed here.
 fn postpone_unsent(store:&Store,session:&str,plan:&Plan)->anyhow::Result<()> {
-    store.update(|state|{
+    let changed = store.update(|state|{
         if let Some(current)=state.sessions.get_mut(session).and_then(|e|e.plan.as_mut())
             .filter(|p|p.message_id==plan.message_id&&p.phase==Phase::Firing) {
             current.phase=Phase::Pending;
             current.at=(Utc::now()+chrono::Duration::seconds(2)).to_rfc3339();
+            return true;
         }
-    })
+        false
+    })?;
+    if changed { retry::publish(session, "scheduled"); }
+    Ok(())
 }
 
 // Bounded read-only reconciliation. No status, error, or timeout authorizes
@@ -567,9 +588,10 @@ pub(super) fn spawn_worker() -> anyhow::Result<()> {
         .spawn(move || loop {
             if let Ok(state) = store.snapshot() {
                 for (session, entry) in state.sessions {
-                    if entry.settlement.is_some() {
-                        if let Err(error) = retry::recover_settlement(&store, &asks, &session) {
-                            eprintln!("retry settlement: {error:#}");
+                    if let Some(settlement) = entry.settlement {
+                        match retry::recover_settlement(&store, &asks, &session) {
+                            Ok(()) => retry::publish(&session, retry::cancellation_outcome(&settlement.reason)),
+                            Err(error) => eprintln!("retry settlement: {error:#}"),
                         }
                         continue;
                     }

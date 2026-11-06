@@ -34,6 +34,9 @@ pub mod operations;
 pub mod project_control;
 pub mod pause_admission;
 pub mod lineage;
+pub mod lease_reconcile;
+pub mod ledger;
+pub mod owner_carries;
 pub mod create_task;
 pub mod delivery;
 pub mod directory;
@@ -46,6 +49,8 @@ pub mod render;
 pub mod returns;
 pub mod revisions;
 pub mod scheduler;
+mod admission_failure;
+pub mod shared;
 pub mod store;
 pub mod short_ids;
 pub mod tools;
@@ -53,6 +58,9 @@ pub mod view;
 pub mod views;
 pub mod waits;
 pub mod wake;
+/// Debug-only E2E hook (054 S14–S18): asks over a fake runtime's ExternalInput.
+#[cfg(debug_assertions)]
+pub mod test_fake_ingress;
 
 #[cfg(test)]
 mod control_load_tests;

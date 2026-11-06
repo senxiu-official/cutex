@@ -413,6 +413,8 @@ pub enum ReturnItem {
         answer_bytes: usize,
         review: bool,
         flags: Vec<&'static str>,
+        /// The native turn's error (`metadata.last_error`), when it had one.
+        error: Option<String>,
     },
     Question {
         ask_id: String,
@@ -427,6 +429,25 @@ pub enum ReturnItem {
         target: String,
         state: String,
     },
+}
+
+/// `<code>: <message>` for a stored turn error. Providers often put a JSON
+/// object in the message (alone or after a status prefix); plain text is
+/// shown as it is.
+pub fn turn_error_text(error: &str) -> String {
+    let error = error.trim();
+    let json = error.find('{').map_or("", |start| &error[start..]);
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(json) else {
+        return error.to_string();
+    };
+    let inner = object.get("error").and_then(Value::as_object).unwrap_or(&object);
+    let text = |keys: &[&str]| keys.iter().find_map(|key| inner.get(*key).or_else(|| object.get(*key)).and_then(Value::as_str));
+    match (text(&["code", "type"]), text(&["message", "detail"])) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (None, Some(message)) => message.to_string(),
+        (Some(code), None) => code.to_string(),
+        (None, None) => error.to_string(),
+    }
 }
 
 /// Plain-language line for an answer flag (requester-facing).
@@ -446,7 +467,7 @@ pub fn state_note(state: &str, target: &str, ask_id: &str) -> Option<String> {
     let target = crate::short_ids::display(target);
     match state {
         super::delivery::BLOCKED_OWNER_ACTION => Some(format!(
-            "{target} is offline and cutex cannot start it; only the owner can bring it online. The delegation stays queued until then: wait, delegate to another agent, or cancel it with delegation_stop(delegation=\"{ask_id}\")."
+            "{target} is offline and cutex cannot automatically start it. Ask the owner or an authorized project manager (its Director, or a permitted operator) to explicitly bring it online, subject to the normal launch checks. The delegation stays queued until then: wait, delegate to another agent, or cancel it with delegation_stop(delegation=\"{ask_id}\")."
         )),
         super::awaits::WAITING_STATE => Some(format!(
             "{target} ended its turn to wait for jobs of this delegation (a stage, not the result); it continues by itself when they finish. To make it continue now: delegation_resume(delegation=\"{ask_id}\"); to cancel it and its jobs: delegation_stop(delegation=\"{ask_id}\", stop_jobs=true)."
@@ -455,7 +476,7 @@ pub fn state_note(state: &str, target: &str, ask_id: &str) -> Option<String> {
             "Control of {ask_id} (to {target}) passed to you as the project's current Director (handover); the original requester and handler stay as they were. Results and questions of it come to you from now on; what was already given to the earlier controller stays there and is not sent again. Read it with delegation_read(delegation=\"{ask_id}\")."
         )),
         OWNER_STOPPED_STATE => Some(format!(
-            "The owner stopped the turn handling it. Decide: read the partial result with delegation_read(delegation=\"{ask_id}\"), send a follow-up with agent_delegate(follow_up=\"{ask_id}\"), delegate to another agent, or close it with delegation_close(delegation=\"{ask_id}\", outcome=\"abandoned\")."
+            "The turn handling it was stopped by the owner or a host upgrade. If {target} is offline, it stays offline until the owner or an authorized project manager (its Director, or a permitted operator) explicitly brings it online, subject to the normal launch checks. Decide: read the partial result with delegation_read(delegation=\"{ask_id}\"), send a follow-up with agent_delegate(follow_up=\"{ask_id}\"), delegate to another agent, or close it with delegation_close(delegation=\"{ask_id}\", outcome=\"abandoned\")."
         )),
         super::EVENT_TOO_LARGE => Some(format!(
             "The delegation message was larger than {target} accepts (receiver byte policy) even with its long parts (brief, previous answer) replaced by delegation_read pointers, so it was never delivered and nothing ran. Send it again with a shorter title and fewer attachments (put long material in a file and name its path). {ask_id} is closed as failed."
@@ -463,8 +484,14 @@ pub fn state_note(state: &str, target: &str, ask_id: &str) -> Option<String> {
         super::SUBMIT_FAILED => Some(format!(
             "cutex could not deliver it to {target} (the runtime kept failing); nothing ran. Try again later, delegate to another agent, or tell the owner."
         )),
+        code if super::admission_failure::permanent(code) => Some(format!(
+            "This delegation was closed as failed before a new attempt could start: {code}. Its queued request cannot be admitted and no new work was sent to {target}. If the work is still needed, arrange a new delegation with current routing authority."
+        )),
         _ => None,
     }
+    .map(|note| if state == super::delivery::BLOCKED_OWNER_ACTION {
+        format!("{note} An authorized manager can use member_runtime(change=\"online\", cutex_session_id=\"{target}\").")
+    } else { note })
 }
 
 /// State item after the owner stopped an ask's turn (r208).
@@ -504,7 +531,7 @@ pub fn return_piece(item: &ReturnItem, level: u8, preview_bytes: usize, limit: O
         _ => BRIEF_PREVIEW_MIN.min(preview_bytes),
     };
     match item {
-        ReturnItem::Answer { ask_id, title, target, status, answer_id, revision, inline, answer_bytes, review, flags } => {
+        ReturnItem::Answer { ask_id, title, target, status, answer_id, revision, inline, answer_bytes, review, flags, error } => {
             let target = crate::short_ids::display(target);
             let visible_id = crate::short_ids::display(ask_id);
             let ask_id = visible_id.as_str();
@@ -522,7 +549,10 @@ pub fn return_piece(item: &ReturnItem, level: u8, preview_bytes: usize, limit: O
             }
             let inline_cap = answer_inline_cap(level, preview_bytes);
             match inline.as_deref() {
-                None => piece.push_str("(the turn ended without a final message)"),
+                None => match error.as_deref().filter(|_| *status == AnswerStatus::Failed) {
+                    Some(error) => piece.push_str(&format!("(the turn failed: {})", turn_error_text(error))),
+                    None => piece.push_str("(the turn ended without a final message)"),
+                },
                 Some(text) if *answer_bytes <= inline_cap && text.len() <= inline_cap => piece.push_str(text),
                 Some(text) => {
                     // `inline` holds the answer's first 8 KiB - 200 bytes
@@ -672,6 +702,16 @@ mod tests {
 
     #[test]
     fn undeliverable_states_tell_the_requester_what_to_do() {
+        let offline = state_note(super::super::delivery::BLOCKED_OWNER_ACTION, "Kimi", "ask-1").unwrap();
+        assert!(offline.contains("cannot automatically start it"));
+        assert!(offline.contains("Director") && offline.contains("permitted operator"));
+        assert!(offline.contains("delegation stays queued"));
+        let stopped = state_note(OWNER_STOPPED_STATE, "Kimi", "ask-1").unwrap();
+        assert!(stopped.contains("stopped by the owner or a host upgrade"));
+        // Interrupting a turn does not necessarily take the runtime offline.
+        assert!(stopped.contains("If Kimi is offline"));
+        assert!(stopped.contains("explicitly brings it online") && stopped.contains("normal launch checks"));
+        assert!(stopped.contains("delegation_read") && stopped.contains("agent_delegate") && stopped.contains("delegation_close"));
         let too_large = state_note(crate::asks::EVENT_TOO_LARGE, "Kimi", "ask-1").unwrap();
         assert!(too_large.contains("larger than Kimi accepts"));
         assert!(too_large.contains("previous answer"));
@@ -699,6 +739,7 @@ mod tests {
             answer_bytes: 8000,
             review: n == 0,
             flags: vec!["sharedTurn"],
+            error: None,
         };
         let (kind, text) = return_text(&(0..10).map(answer).collect::<Vec<_>>());
         assert_eq!(kind, ANSWER_EVENT);
@@ -815,6 +856,7 @@ mod tests {
             answer_bytes: text.len(),
             review: false,
             flags: vec![],
+            error: None,
         };
         let piece = return_piece(&item(1, &long), 1, 800, Some(9_000));
         let shown = crate::app_server::external_input::size::preview(&long, 800);
@@ -861,5 +903,39 @@ mod tests {
         ), "{text}");
         assert_eq!(text.matches("[overlength delegation result]").count(), 2);
         assert!(!text.contains("read_overlength_content"));
+    }
+
+    /// A failed turn with no final message says why it failed; a turn
+    /// without an error keeps the old line.
+    #[test]
+    fn failed_answers_show_the_turn_error() {
+        let item = |status: AnswerStatus, error: Option<&str>| ReturnItem::Answer {
+            ask_id: "ask-1".into(),
+            title: "t".into(),
+            target: "Kimi".into(),
+            status,
+            answer_id: "ans-1".into(),
+            revision: 1,
+            inline: None,
+            answer_bytes: 0,
+            review: false,
+            flags: vec![],
+            error: error.map(str::to_string),
+        };
+        let json = r#"{"code":"model_not_found","message":"The 'gpt-sol-6.1' model is not supported"}"#;
+        let piece = return_piece(&item(AnswerStatus::Failed, Some(json)), 0, 800, None);
+        assert!(piece.ends_with("(the turn failed: model_not_found: The 'gpt-sol-6.1' model is not supported)"), "{piece}");
+        let nested = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad model"}}"#;
+        assert_eq!(turn_error_text(nested), "invalid_request_error: bad model");
+        let prefixed = r#"unexpected status 400 Bad Request: {"detail":"model not allowed"}"#;
+        assert_eq!(turn_error_text(prefixed), "model not allowed");
+        let piece = return_piece(&item(AnswerStatus::Failed, Some("stream disconnected")), 0, 800, None);
+        assert!(piece.ends_with("(the turn failed: stream disconnected)"), "{piece}");
+        for (status, error) in [(AnswerStatus::Failed, None), (AnswerStatus::Interrupted, Some("x"))] {
+            let piece = return_piece(&item(status, error), 0, 800, None);
+            assert!(piece.ends_with("(the turn ended without a final message)"), "{piece}");
+        }
+        let view = crate::asks::returns::item_json(&item(AnswerStatus::Failed, Some(json)));
+        assert_eq!(view["error"], json);
     }
 }

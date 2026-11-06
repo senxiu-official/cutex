@@ -108,7 +108,8 @@ async def test_side_sees_parent_context_and_never_writes_into_it(ph, native):
     client = ph.sdk.clients[-1]
     assert client is not parent_client and client.options.resume == side_sid
     # The parent's system prompt (Claude Code keeps a resumed session's own; same cache prefix).
-    assert client.options.system_prompt == parent_client.options.system_prompt
+    from fake_sdk import rendered_system_prompt
+    assert rendered_system_prompt(client.options) == rendered_system_prompt(parent_client.options)
     blocks = [b['text'] for b in client.messages[0]['message']['content']]
     assert blocks == [SIDE_DEVELOPER_INSTRUCTIONS, SIDE_BOUNDARY_PROMPT, 'hello']
     shown = [e for e in chat['events'] if e['method'] == 'thread/presentation/appended'
@@ -221,5 +222,6 @@ async def test_side_is_refused_without_the_sdk_backend(h):
 
 def test_features_declare_side_chat_and_busy_fork():
     features = json.loads((Path(__file__).parents[1] / 'src/cute_claude/features.json').read_text())
-    assert int(features['release'].removeprefix('claude-r')) >= 21  # sideChat since claude-r21
+    # Development integration uses NEXT until the combined component is cut.
+    assert features['release'] == 'claude-rNEXT' or int(features['release'].removeprefix('claude-r')) >= 21
     assert features['features']['sideChat'] is True and features['features']['forkWhileBusy'] is True

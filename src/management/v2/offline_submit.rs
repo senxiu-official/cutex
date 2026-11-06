@@ -40,12 +40,186 @@ pub const START_REASON: &str = "offline-submit";
 
 static STARTS_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
+/// How long one background start keeps retrying a busy host (r271.1): the
+/// 050 `admission_busy` / `hostBusy` answer means nothing started, so the
+/// start is tried again after `retryAfterMs` instead of failing the queue.
+#[cfg(not(test))]
+const HOST_BUSY_START_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(test)]
+const HOST_BUSY_START_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The last background start of a session (this process), for callers that
+/// must not call the queued input done before its runtime is up (owner
+/// rotation's first message to the new Director).
+#[derive(Clone, Debug, PartialEq)]
+pub enum StartOutcome {
+    Starting,
+    Online,
+    Failed { code: String, message: String, retryable: bool },
+}
+
+static START_OUTCOMES: OnceLock<Mutex<std::collections::HashMap<String, StartOutcome>>> = OnceLock::new();
+
+fn note_start_outcome(cutex_session_id: &str, outcome: StartOutcome) {
+    START_OUTCOMES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(cutex_session_id.to_string(), outcome);
+}
+
+/// See [`StartOutcome`]; `None` when no background start ran in this process.
+pub fn start_outcome(cutex_session_id: &str) -> Option<StartOutcome> {
+    START_OUTCOMES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(cutex_session_id)
+        .cloned()
+}
+
+/// `online` again while the host answers `admission_busy` (nothing started),
+/// pausing `retryAfterMs` plus jitter, holding no lane or fence, within
+/// [`HOST_BUSY_START_BUDGET`]. Any other answer is returned as is.
+fn retry_host_busy(
+    mut online: impl FnMut() -> Result<Value, UserInputExecutionError>,
+) -> Result<Value, UserInputExecutionError> {
+    let deadline = std::time::Instant::now() + HOST_BUSY_START_BUDGET;
+    loop {
+        match online() {
+            Err(error)
+                if error.code == crate::asks::pause_admission::ADMISSION_BUSY_CODE
+                    && error.retryable
+                    && std::time::Instant::now() < deadline =>
+            {
+                let after = error.details.get("retryAfterMs").and_then(Value::as_u64).unwrap_or(1_000);
+                let jitter = (uuid::Uuid::new_v4().as_u128() % 500) as u64;
+                let pause = std::time::Duration::from_millis(after + jitter);
+                #[cfg(test)]
+                let pause = pause.min(std::time::Duration::from_millis(20));
+                std::thread::sleep(pause);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// What the background start needs, captured from the submit request.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct StartPlan {
     pub cutex_session_id: String,
     pub session: Value,
     pub submit_request_id: String,
+}
+
+/// `cutex/userInput/submit` from the HTTP route. With the input ledger on, an
+/// owner message ALWAYS starts an offline agent (owner decision 8, r274
+/// Director decision 2), with or without `startIfOffline`; other callers and
+/// the switch off keep the flag's behaviour.
+pub(super) fn dispatch_owner_submit(
+    event_repository: &EventRepository,
+    context: ManagementRequestContext,
+    owner: Option<HumanManagementPrincipal>,
+    cutex_session_id: &str,
+    session: &Value,
+    request: &ValidatedCutexRequest,
+) -> Result<Value, UserInputExecutionError> {
+    let request = owner_starts_offline(owner.is_some() && super::input_ledger::enabled(), request);
+    dispatch(event_repository, context, owner, cutex_session_id, session, &request)
+}
+
+/// `request` with `startIfOffline: true` when `always` (an owner message,
+/// switch on); unchanged otherwise. A malformed flag is left for the usual
+/// validation error.
+fn owner_starts_offline(always: bool, request: &ValidatedCutexRequest) -> ValidatedCutexRequest {
+    let mut request = request.clone();
+    if always {
+        if let Some(params) = request.params.as_object_mut() {
+            if params.get(START_IF_OFFLINE).is_none_or(Value::is_boolean) {
+                params.insert(START_IF_OFFLINE.to_string(), Value::Bool(true));
+            }
+        }
+    }
+    request
+}
+
+/// `cutex/userInput/queue/steer` refused because the agent is offline
+/// (`session_offline` / `app_server_unavailable`): with the input ledger on
+/// and the owner asking, the agent is started (Director decision 2): the item
+/// stays queued, goes past a queue pause like an offline submit, waits
+/// `waiting{agentOffline}` (nextUp) and is flushed when the runtime connects.
+/// The refusal itself is unchanged on the wire except `details.runtimeStarting:
+/// true` (the steer result schema has no queued disposition).
+pub(super) fn start_for_offline_steer(
+    context: ManagementRequestContext,
+    owner: Option<HumanManagementPrincipal>,
+    cutex_session_id: &str,
+    session: &Value,
+    request: &ValidatedCutexRequest,
+    error: UserInputExecutionError,
+) -> UserInputExecutionError {
+    let Some(queue_id) = offline_steer_item(owner.is_some() && super::input_ledger::enabled(), session, request, &error) else {
+        return error;
+    };
+    let Some(item) = user_input_repository().ok()
+        .and_then(|queue| queue.list(cutex_session_id).ok())
+        .and_then(|(_, items)| items.into_iter().find(|item| item.queue_id == queue_id))
+    else {
+        return error;
+    };
+    if let Err(mark) = user_input_repository().and_then(|queue| queue.mark_bypass_pause(cutex_session_id, &queue_id)) {
+        eprintln!("\x1b[33mwarning:\x1b[0m failed to let offline steer {queue_id} through the queue pause: {mark:#}");
+    }
+    super::input_ledger_owner::offline_waiting(cutex_session_id, &item.client_user_message_id);
+    if session.pointer("/runtime/status").and_then(Value::as_str) != Some("starting") {
+        spawn_start(context, owner, StartPlan {
+            cutex_session_id: cutex_session_id.to_string(),
+            session: session.clone(),
+            submit_request_id: request.request_id.clone(),
+        });
+    }
+    let mut error = error;
+    if !error.details.is_object() {
+        error.details = json!({});
+    }
+    error.details["runtimeStarting"] = Value::Bool(true);
+    error
+}
+
+/// `cutex/input/interruptSend` found the runtime gone (owner decision 8):
+/// its input waits first in the queue (`waiting{agentOffline}`); start the
+/// agent, unless a start is running already.
+pub(super) fn start_for_interrupt_send(
+    context: ManagementRequestContext,
+    owner: Option<HumanManagementPrincipal>,
+    cutex_session_id: &str,
+    session: &Value,
+    request_id: &str,
+) {
+    if session.pointer("/runtime/status").and_then(Value::as_str) == Some("starting") {
+        return;
+    }
+    spawn_start(context, owner, StartPlan {
+        cutex_session_id: cutex_session_id.to_string(),
+        session: session.clone(),
+        submit_request_id: request_id.to_string(),
+    });
+}
+
+/// The queue item an offline `queue/steer` refusal should start the agent
+/// for (pure): the owner asked with the switch on, the refusal says the
+/// runtime is offline, a native thread is bound (a start can resume it) and
+/// the runtime is not connected.
+fn offline_steer_item(owner_on: bool, session: &Value, request: &ValidatedCutexRequest, error: &UserInputExecutionError) -> Option<String> {
+    if !owner_on || error.outcome_unknown || !matches!(error.code.as_str(), "session_offline" | "app_server_unavailable") {
+        return None;
+    }
+    let connected = session.pointer("/runtime/appServerConnected").and_then(Value::as_bool).unwrap_or(false);
+    let thread_bound = session.pointer("/native/threadId").and_then(Value::as_str).is_some_and(|thread| !thread.is_empty());
+    if connected || !thread_bound {
+        return None;
+    }
+    request.params.get("queueId").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)
 }
 
 pub(super) fn dispatch(
@@ -129,6 +303,9 @@ pub(super) fn dispatch_marking_bypass(
             &request,
         );
     }
+    // An offline start queues the input; `allowHeld` only shapes an online
+    // submit's busy-host answer.
+    if let Some(object) = request.params.as_object_mut() { object.remove("allowHeld"); }
     // Claude agents too: `cutex/runtime/online` starts the adapter runtime and
     // the post-start flush submits through the Claude runtime manager.
     let params = request
@@ -136,17 +313,26 @@ pub(super) fn dispatch_marking_bypass(
         .as_object_mut()
         .expect("validated submit params object");
     let follow_up = params.get("strategy").and_then(Value::as_str) == Some("queue");
+    let original_strategy = match params.get("strategy").and_then(Value::as_str) {
+        Some("queue") => super::user_input::UserInputStrategy::Queue,
+        Some("interrupt") => super::user_input::UserInputStrategy::Interrupt,
+        _ => super::user_input::UserInputStrategy::Auto,
+    };
     let agent_paused = session.get("agentPause").is_some_and(Value::is_object);
     // Offline there is no active turn to steer, interrupt or match.
     params.insert("strategy".to_string(), json!("queue"));
     params.remove("expectedTurnId");
-    let mut result = dispatch_user_input_submit(
-        event_repository,
-        handle_user_input,
-        cutex_session_id,
-        session,
-        &request,
-    )?;
+    // Owner decision 8: the input ledger records it on nextUp,
+    // waiting{agentOffline} (no-op while the switch is off).
+    let mut result = super::input_ledger_owner::with_offline_start(original_strategy, agent_paused, || {
+        dispatch_user_input_submit(
+            event_repository,
+            handle_user_input,
+            cutex_session_id,
+            session,
+            &request,
+        )
+    })?;
     if result.get("queue").is_some_and(Value::is_object) {
         if agent_paused {
             return Ok(result);
@@ -201,6 +387,7 @@ fn spawn_start(
             return;
         }
     }
+    note_start_outcome(&plan.cutex_session_id, StartOutcome::Starting);
     let spawned = std::thread::Builder::new()
         .name("cutex-offline-submit-start".to_string())
         .spawn(move || {
@@ -215,6 +402,9 @@ fn spawn_start(
                 )
             });
             if let Err(error) = outcome {
+                note_start_outcome(&plan.cutex_session_id, StartOutcome::Failed {
+                    code: "persistence_unavailable".into(), message: format!("{error:#}"), retryable: true,
+                });
                 eprintln!(
                     "\x1b[33mwarning:\x1b[0m offline submit start for {} failed: {error:#}",
                     plan.cutex_session_id
@@ -259,7 +449,9 @@ pub(super) fn run_start(
     };
     match dispatch_runtime_mutation(
         repository,
-        |session_id, _method, params| online(session_id, params),
+        // One start: a busy host is retried inside it, so its events are one
+        // `onlineRequested` and one outcome (r271.1).
+        |session_id, _method, params| retry_host_busy(|| online(session_id, params.clone())),
         id,
         &plan.session,
         &start_request,
@@ -269,6 +461,7 @@ pub(super) fn run_start(
             // (`asks::wake::note_owner_start`; after the start, like every
             // owner start, so no asks relaunch races it).
             clear_owner_stop(id);
+            note_start_outcome(id, StartOutcome::Online);
             // Items queued while the start was running may have missed the
             // connect-time flush. A flush failure is reported by the flush
             // itself (`cutex/userInput/failed`); the items stay queued.
@@ -280,6 +473,9 @@ pub(super) fn run_start(
             Ok(true)
         }
         Err(error) => {
+            note_start_outcome(id, StartOutcome::Failed {
+                code: error.code.clone(), message: error.message.clone(), retryable: error.retryable,
+            });
             let queue_ids = queued_ids(id);
             let details = if error.details.is_object() {
                 error.details.clone()
@@ -357,7 +553,7 @@ mod tests {
         ));
         if command.params.strategy == UserInputStrategy::Queue {
             return Ok(UserInputSubmitExecution {
-                join_refusal: None,
+                join_refusal: None, queued_reason: None,
                 disposition: UserInputDisposition::Queued,
                 app_server_accepted: false,
                 native_request_id: None,
@@ -380,7 +576,7 @@ mod tests {
             });
         }
         Ok(UserInputSubmitExecution {
-            join_refusal: None,
+            join_refusal: None, queued_reason: None,
             disposition: UserInputDisposition::Started,
             app_server_accepted: true,
             native_request_id: Some(json!("native-1")),
@@ -655,6 +851,88 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn host_busy() -> UserInputExecutionError {
+        crate::management::v2::server::admission_busy_user_input_error(
+            "route",
+            anyhow::anyhow!("hostBusy: fence contention"),
+        )
+    }
+
+    /// r271.1: a busy host (`admission_busy`, nothing started) is retried
+    /// inside the one background start: one `onlineRequested`, no failure
+    /// events, the queue flushed once it is up.
+    #[test]
+    fn a_busy_host_is_retried_inside_the_start() {
+        let (root, repository) = repository();
+        let calls = RefCell::new(0);
+        let flushed = RefCell::new(0);
+        let online = |_: &str, _: Value| {
+            *calls.borrow_mut() += 1;
+            if *calls.borrow() <= 2 {
+                return Err(host_busy());
+            }
+            Ok(json!({ "runtimeGeneration": 4, "status": "online", "runtimeAgentId": "agent-1" }))
+        };
+        let started = run_start(
+            &repository,
+            &plan("busy-f"),
+            online,
+            |_| {
+                *flushed.borrow_mut() += 1;
+                Ok(1)
+            },
+            |_| vec!["queue-1".into()],
+            |_| {},
+        )
+        .expect("start");
+        assert!(started);
+        assert_eq!(*calls.borrow(), 3);
+        assert_eq!(*flushed.borrow(), 1);
+        assert_eq!(
+            methods(&repository, "busy-f"),
+            ["cutex/runtime/onlineRequested", "cutex/runtime/online"]
+        );
+        assert_eq!(start_outcome("busy-f"), Some(StartOutcome::Online));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Past the budget the busy host is the start's real outcome, reported
+    /// once (and recorded for owner rotation as a retryable failure).
+    #[test]
+    fn a_host_busy_past_the_budget_fails_the_start_once() {
+        let (root, repository) = repository();
+        let calls = RefCell::new(0);
+        let online = |_: &str, _: Value| {
+            *calls.borrow_mut() += 1;
+            Err(host_busy())
+        };
+        let started = run_start(
+            &repository,
+            &plan("busy-g"),
+            online,
+            |_| panic!("no flush"),
+            |_| vec!["queue-1".into()],
+            |_| panic!("a failed start keeps the owner-stop mark"),
+        )
+        .expect("failure is reported, not raised");
+        assert!(!started);
+        assert!(*calls.borrow() > 2, "retried: {}", calls.borrow());
+        assert_eq!(
+            methods(&repository, "busy-g"),
+            [
+                "cutex/runtime/onlineRequested",
+                "cutex/runtime/failed",
+                "cutex/userInput/startFailed"
+            ]
+        );
+        let Some(StartOutcome::Failed { code, retryable, .. }) = start_outcome("busy-g") else {
+            panic!("failed outcome")
+        };
+        assert_eq!(code, crate::asks::pause_admission::ADMISSION_BUSY_CODE);
+        assert!(retryable);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn start_failure_keeps_queue_and_reports_it() {
         let (root, repository) = repository();
@@ -700,5 +978,56 @@ mod tests {
             Some("management-1")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Owner decision 8 / r274 decision 2 (switch on): an owner submit to an
+    /// offline agent always asks for the start, with or without the flag;
+    /// with the switch off (or another caller) the request is unchanged.
+    #[test]
+    fn owner_submits_always_start_an_offline_agent_with_the_switch_on() {
+        for start in [None, Some(json!(false)), Some(json!(true))] {
+            let request = request(start.clone());
+            let owner = owner_starts_offline(true, &request);
+            assert_eq!(owner.params[START_IF_OFFLINE], json!(true), "{start:?}");
+            assert_eq!(owner_starts_offline(false, &request).params, request.params, "{start:?}: unchanged");
+        }
+        // A malformed flag keeps its validation error.
+        let malformed = owner_starts_offline(true, &request(Some(json!("yes"))));
+        assert_eq!(malformed.params[START_IF_OFFLINE], json!("yes"));
+        // Through the dispatch: no flag, offline, owner default → queued + start.
+        let (root, repository) = repository();
+        let starts = RefCell::new(0);
+        let result = dispatch_marking_bypass(&repository, fake_submit, "owner-default", &session(false, "offline"),
+            &owner_starts_offline(true, &request(None)), |_| *starts.borrow_mut() += 1, |_| {}).expect("queued");
+        assert_eq!(result["runtimeStarting"], json!(true));
+        assert_eq!(*starts.borrow(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// r274 decision 2: an offline `queue/steer` refusal starts the agent for
+    /// its item only for the owner with the switch on, a bound thread and a
+    /// disconnected runtime; an unknown outcome or another error never does.
+    #[test]
+    fn an_offline_queue_steer_starts_the_agent_only_for_the_owner() {
+        let steer = |queue_id: &str| ValidatedCutexRequest {
+            request_id: "steer-1".into(),
+            method: super::super::queue_order::STEER_METHOD.into(),
+            params: json!({"queueId": queue_id, "expectedRevision": 1}),
+        };
+        let offline = super::super::queue_order::session_offline();
+        let unavailable = UserInputExecutionError { stage: "queue".into(), code: "app_server_unavailable".into(),
+            message: String::new(), retryable: true, details: json!({}), outcome_unknown: false };
+        assert_eq!(offline_steer_item(true, &session(false, "offline"), &steer("q1"), &offline), Some("q1".into()));
+        assert_eq!(offline_steer_item(true, &session(false, "offline"), &steer("q1"), &unavailable), Some("q1".into()));
+        assert_eq!(offline_steer_item(false, &session(false, "offline"), &steer("q1"), &offline), None, "switch off / not the owner");
+        assert_eq!(offline_steer_item(true, &session(true, "online"), &steer("q1"), &offline), None, "connected");
+        let mut unbound = session(false, "offline");
+        unbound["native"]["threadId"] = json!("");
+        assert_eq!(offline_steer_item(true, &unbound, &steer("q1"), &offline), None, "no bound thread: nothing to resume");
+        let mut unknown = unavailable.clone();
+        unknown.outcome_unknown = true;
+        assert_eq!(offline_steer_item(true, &session(false, "offline"), &steer("q1"), &unknown), None);
+        let refused = super::super::queue_order::steer_unavailable("turnFinishing");
+        assert_eq!(offline_steer_item(true, &session(false, "offline"), &steer("q1"), &refused), None);
     }
 }

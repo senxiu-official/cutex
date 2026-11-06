@@ -40,6 +40,7 @@ impl BootstrapExecutionPermit<'_> {
     }
 
     pub fn adopt(&self, path: &std::path::Path, native: &str) -> anyhow::Result<CutexSessionId> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         use crate::session::service::*;
         use crate::session::store::*;
         self.intent.validate_evidence()?;
@@ -150,6 +151,7 @@ impl BootstrapExecutionPermit<'_> {
         id: &CutexSessionId,
         runtime: &mut dyn StockRuntimeExecutor,
     ) -> anyhow::Result<StockRuntimeReceipt> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         self.intent.validate_evidence()?;
         self.intent
             .validate_authority(&self.provider.store().snapshot()?)?;
@@ -368,6 +370,7 @@ impl AgentManagementProvider {
         &self,
         review: &BootstrapIntentReview,
     ) -> anyhow::Result<BootstrapIntentReview> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         let _execution = super::provider::provider_execution_lock()
             .lock()
             .map_err(|_| anyhow::anyhow!("bootstrap execution lock unavailable"))?;

@@ -80,18 +80,7 @@ pub fn handover_project(
             Ok::<(), AskError>(())
         })
         .map_err(store::unavailable)??;
-        store.update(|state| {
-            for item in &committed {
-                if let Some(current) = state.asks.get_mut(&item.ask_id) {
-                    if current.controller_revision == item.controller_revision
-                        && current.controller == item.controller
-                    {
-                        current.summary_pending = false;
-                    }
-                }
-            }
-            Ok(())
-        })?;
+        store.finish_summaries(&committed)?;
     }
     Ok(committed.into_iter().map(|o| o.ask_id).collect())
 }
@@ -136,15 +125,23 @@ impl Store {
         })
     }
     pub(crate) fn finish_summary(&self, item: &Ownership) -> Result<(), AskError> {
-        self.update(|state| {
+        self.finish_summaries(std::slice::from_ref(item))
+    }
+    fn finish_summaries(&self,items:&[Ownership])->Result<(),AskError>{
+        self.update_if(|state| {
+            let mut changed=false;
+            for item in items {
             if let Some(current) = state.asks.get_mut(&item.ask_id) {
                 if current.controller_revision == item.controller_revision
                     && current.controller == item.controller
+                    && current.summary_pending
                 {
                     current.summary_pending = false;
+                    changed=true;
                 }
             }
-            Ok(())
+            }
+            Ok(((),changed))
         })
     }
     pub(crate) fn repair_summaries_with(
@@ -160,6 +157,7 @@ impl Store {
             .collect();
         let mut repaired = 0;
         let mut error = None;
+        let mut completed=Vec::new();
         for item in pending {
             match apply(&item) {
                 Ok(false) => continue,
@@ -171,18 +169,10 @@ impl Store {
                 }
                 Ok(true) => {}
             }
-            self.update(|state| {
-                if let Some(current) = state.asks.get_mut(&item.ask_id) {
-                    if current.controller_revision == item.controller_revision
-                        && current.controller == item.controller
-                    {
-                        current.summary_pending = false;
-                    }
-                }
-                Ok(())
-            })?;
+            completed.push(item);
             repaired += 1;
         }
+        if !completed.is_empty(){self.finish_summaries(&completed)?;}
         if let Some(error) = error {
             return Err(error);
         }
@@ -444,7 +434,7 @@ impl Store {
                 ));
             }
         }
-        self.update(|state| {
+        self.update_if(|state| {
             if let Some(old) = state.approved_scopes.get(&scope.id) {
                 if old != &scope {
                     return Err(AskError::new(
@@ -452,7 +442,7 @@ impl Store {
                         "Scope ID already has another payload",
                     ));
                 }
-                return Ok(());
+                return Ok(((),false));
             }
             for id in &scope.ask_ids {
                 let ask = &asks.asks[id];
@@ -474,7 +464,7 @@ impl Store {
                 });
             }
             state.approved_scopes.insert(scope.id.clone(), scope);
-            Ok(())
+            Ok(((),true))
         })
     }
     /// CAS protects a concurrent second Director change or a second reviewer.
@@ -497,7 +487,7 @@ impl Store {
                 "Only the current Director or owner may review",
             ));
         }
-        self.update(|state| {
+        self.update_if(|state| {
             let mut review = state.reviews.get(id).cloned().ok_or_else(|| {
                 AskError::new("review_not_found", "Handover review does not exist")
             })?;
@@ -517,7 +507,7 @@ impl Store {
                 && review.actor.as_deref() == Some(actor)
                 && (!accept || review.resolved_to.as_deref().unwrap_or(&review.to)==current_director)
             {
-                return Ok(());
+                return Ok(((),false));
             }
             let scoped_owner_grant=!review.provenance_known && state.approved_scopes.get(&review.change_id).is_some_and(|scope|scope.project_id==project && scope.director==current_director && scope.expected_epoch==epoch && scope.ask_ids.contains(&ask.ask_id));
             if !owner && !scoped_owner_grant && state.asks.get(&ask.ask_id).is_some_and(|o|o.owner_hold){return Err(AskError::new("owner_review_required","A discarded or recovered handover requires an owner decision"));}
@@ -592,7 +582,7 @@ impl Store {
             review.revision += 1;
             review.actor = Some(actor.into());
             state.reviews.insert(id.into(),review);
-            Ok(())
+            Ok(((),true))
         })
     }
 }

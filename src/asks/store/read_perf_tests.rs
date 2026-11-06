@@ -3,6 +3,39 @@ use super::*;
 use crate::management::v2::hot_store::{self, RowChange};
 use std::time::Instant;
 
+#[test]
+#[ignore = "EVA-sized unrelated routing delta scale probe"]
+fn waste_scale_a12_routing_delta() {
+    let mut before=crate::test_support::waste_scale::asks();
+    for n in 0..5000 {let id=format!("project-{n}");before.routing.policies.insert(id.clone(),
+        crate::asks::routing_policy::ProjectDelegationPolicy{project_id:id,revision:1,
+            member_mode:Default::default(),updated_by:None,updated_at:None});}
+    let mut after=before.clone();after.revision+=1;
+    let mut samples=Vec::new();let mut routing_puts=0;
+    for _ in 0..20 {let t=Instant::now();let changes=ask_state_changes(&before,&after).unwrap();samples.push(t.elapsed());
+        routing_puts+=changes.iter().filter(|row|matches!(row,RowChange::Put{collection,key,..}if collection=="state"&&key=="routing")).count();}
+    crate::test_support::waste_scale::emit("a12_unrelated_routing_delta",&samples,routing_puts as u64,json!({"asks_bytes":serde_json::to_vec(&before).unwrap().len(),"routing_bytes":serde_json::to_vec(&before.routing).unwrap().len()}));
+}
+
+#[test]
+fn waste_guard_unchanged_routing_does_not_encode_but_keeps_old_reader_fence(){
+    let before=crate::test_support::waste_scale::asks();let mut after=before.clone();after.revision+=1;
+    let changes=ask_state_changes(&before,&after).unwrap();
+    assert!(!changes.iter().any(|row|matches!(row,RowChange::Put{collection,key,..}if collection=="state"&&key=="routing")));
+    let (store,dir)=tests::temp_store("guard-routing-fence");
+    store.with_state(|state|state.wait_cancel.insert("synthetic".into(),1)).unwrap();
+    let first=hot_store::verified_rows(&store.database_path(),"asks").unwrap().unwrap();
+    let key=("state".into(),"routing".into());let guard=first.rows.get(&key).expect("initial writer must install old-reader fence").clone();
+    store.with_state(|state|state.wait_cancel.insert("synthetic".into(),2)).unwrap();
+    let second=hot_store::verified_rows(&store.database_path(),"asks").unwrap().unwrap();
+    assert_eq!(second.rows.get(&key),Some(&guard));
+    // A pre-r266 store may already have a nonzero generation without routing.
+    hot_store::commit(&store.database_path(),"asks",second.generation,vec![RowChange::Delete{collection:"state".into(),key:"routing".into()}]).unwrap();
+    store.with_state(|state|state.wait_cancel.insert("synthetic".into(),3)).unwrap();
+    assert!(hot_store::has_row(&store.database_path(),"asks","state","routing").unwrap());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn fixture(bytes: usize) -> AskState {
     let mut state = AskState::default();
     let (mut ask, _) = state.create_ask(tests::new_ask("perf-seed", "seed"), Utc::now()).unwrap();
@@ -10,7 +43,7 @@ fn fixture(bytes: usize) -> AskState {
     ask.body = tests::body(&"representative-text ".repeat(bytes / 1024 / 20));
     for n in 0..1024 {
         ask.ask_id = format!("perf-{n}");
-        state.asks.insert(ask.ask_id.clone(), ask.clone());
+        state.asks.insert(ask.ask_id.clone(), ask.clone().into());
     }
     for n in 0..9513 {
         let id = format!("art-{n:064x}");

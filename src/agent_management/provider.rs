@@ -376,15 +376,42 @@ pub trait AuthorityTransitionHook: Send + Sync {
     fn recover(&self, _snapshot: &AgentManagementSnapshot) -> Result<(), AgentManagementError> {
         Ok(())
     }
+    /// Existing/custom hooks keep the complete snapshot contract. A hook may
+    /// opt into directory recovery only if it never reads historical fields.
+    fn recovery_uses_directory(&self) -> bool {false}
 }
 
 pub struct AgentManagementProvider {
     store: AgentManagementStore,
-    current_names_path: Option<std::path::PathBuf>,
+    automatic_online: Option<AutomaticManagedOnline>,
+    pub(super) current_names_path: Option<std::path::PathBuf>,
     phase_observer: Arc<dyn AgentManagementPhaseObserver>,
     authority_hook: Option<Arc<dyn AuthorityTransitionHook>>,
     #[cfg(test)]
     fail_after_predecessor_close_once: Arc<AtomicBool>,
+}
+
+#[cfg(not(test))]
+const IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(test)]
+const IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Single-flight keys of one provider entry: its action and the agent it
+/// targets (create targets a name the durable reservation already fences).
+fn in_flight_keys(request: &AgentManagementRequest) -> Vec<String> {
+    let mut keys = vec![format!("action:{}", request.action_id.as_str())];
+    let agent = match &request.operation {
+        AgentOperation::Online { cutex_session_id, .. }
+        | AgentOperation::Offline { cutex_session_id }
+        | AgentOperation::Restart { cutex_session_id, .. }
+        | AgentOperation::Close { cutex_session_id } => Some(cutex_session_id),
+        AgentOperation::Replace { predecessor_cutex_session_id, .. } => Some(predecessor_cutex_session_id),
+        _ => None,
+    };
+    if let Some(agent) = agent {
+        keys.push(format!("agent:{}", agent.as_str()));
+    }
+    keys
 }
 
 pub(super) fn provider_execution_lock() -> &'static Mutex<()> {
@@ -392,11 +419,66 @@ pub(super) fn provider_execution_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+
+/// The durable session record's current configuration and name for one
+/// roster agent; returns whether that session is retired.
+fn project_current_names(
+    agent: &mut ManagedAgentRecord,
+    sessions: &crate::session::model::CutexSessionStore,
+) -> Result<bool, AgentManagementError> {
+    let record = sessions
+        .sessions
+        .get(agent.cutex_session_id.as_str())
+        .filter(|record| record.cutex_session_id == agent.cutex_session_id.as_str())
+        .ok_or_else(|| {
+            AgentManagementError::OwnerActionRequired(format!(
+                "durable_name_observation_unavailable: {}",
+                agent.cutex_session_id.as_str()
+            ))
+        })?;
+    if record.explicit_launch.as_ref().is_some_and(|contract| {
+        contract.native_id == agent.native_session_id
+            && record.codex_session_id.as_deref()
+                == Some(agent.native_session_id.as_str())
+    }) && record.runtime_backend
+        == crate::session::model::CutexSessionRuntimeBackend::Host
+    {
+        // Current configuration belongs to the durable native record.
+        // Creation specs/receipts remain immutable provenance, not a
+        // second authority that can reject legitimate Human edits.
+        agent.spec.runtime_backend = "host".into();
+        agent.spec.cwd =
+            crate::session::metadata::cutex_session_launch_cwd(record).into();
+        agent.spec.profile = record.profile.clone();
+        agent.spec.model = record.model_defaults.clone().unwrap_or_default();
+        agent.spec.reasoning = record.reasoning_defaults.clone().unwrap_or_default();
+        agent.spec.permissions = record.permission_defaults.clone().unwrap_or_default();
+        agent.spec.approval_policy = record.approval_policy.clone().unwrap_or_default();
+        agent.spec.sandbox_mode = record.sandbox_mode.clone().unwrap_or_default();
+        agent.spec.groups = record.agent_groups.clone();
+        agent.spec.expose_to_im = record.exposed_to_backend;
+        agent.spec.pin = record.quick_action
+            == crate::session::model::CutexSessionQuickActionMode::Pinned;
+    }
+    let retired = record.is_retired();
+    if let Some(name) = &record.formal_agent_name {
+        if name.trim().is_empty() || name.chars().any(char::is_control) {
+            return Err(AgentManagementError::OwnerActionRequired(format!(
+                "malformed_formal_agent_name: {}",
+                agent.cutex_session_id.as_str()
+            )));
+        }
+        agent.spec.name = name.clone();
+    }
+    Ok(retired)
+}
+
 impl AgentManagementProvider {
     pub fn open(root: impl Into<std::path::PathBuf>) -> Result<Self, AgentManagementError> {
         let root = root.into();
         Ok(Self {
             store: AgentManagementStore::open(&root)?,
+            automatic_online: None,
             current_names_path: None,
             phase_observer: Arc::new(NoopPhaseObserver),
             authority_hook: None,
@@ -408,6 +490,7 @@ impl AgentManagementProvider {
     pub fn open_default() -> anyhow::Result<Self> {
         Ok(Self {
             store: AgentManagementStore::open_default()?,
+            automatic_online: None,
             current_names_path: Some(crate::session::store::cutex_sessions_path()?),
             phase_observer: Arc::new(NoopPhaseObserver),
             authority_hook: crate::director_address::management::default_authority_hook(),
@@ -420,6 +503,28 @@ impl AgentManagementProvider {
         self.authority_hook.clone()
     }
 
+    /// Internal scheduler entry only. Execution still uses the complete typed
+    /// lifecycle operation; automatic constraints are additional, never a
+    /// replacement for its authorization, recovery or identity checks.
+    pub fn with_automatic_online(mut self, context: AutomaticManagedOnline) -> Self {
+        self.automatic_online = Some(context);
+        self
+    }
+
+    pub(super) fn check_automatic_online(&self) -> anyhow::Result<()> {
+        if let Some(context) = &self.automatic_online {
+            let authority = self.store.directory_snapshot_shared()?;
+            let budget = crate::asks::budget::AskLimits::load().agent_started_online_per_domain;
+            crate::asks::pause_admission::with_state_in(
+                &crate::asks::store::AskStore::open_default()?, &authority,
+                |state, authority| context.validate(state, authority, budget),
+            )??;
+            crate::profiles::model_check::check_runtime_start(&context.target, false)
+                .map_err(|reason| anyhow::anyhow!("invalid_model: {reason}"))?;
+        }
+        Ok(())
+    }
+
     /// Runs the authority hook's startup recovery under the provider
     /// execution lock, so no bind can interleave with it.
     pub fn recover_authority_hook(&self) -> Result<(), AgentManagementError> {
@@ -429,7 +534,8 @@ impl AgentManagementProvider {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Same fence as a bind: no other process can bind meanwhile.
         let _mutation = self.store.lock_mutations()?;
-        hook.recover(&self.store.snapshot()?)
+        let snapshot = if hook.recovery_uses_directory() {self.store.directory_snapshot()?} else {self.store.snapshot()?};
+        hook.recover(&snapshot)
     }
 
     pub fn with_authority_hook(mut self, hook: Arc<dyn AuthorityTransitionHook>) -> Self {
@@ -470,72 +576,22 @@ impl AgentManagementProvider {
     pub(crate) fn current_name_snapshot(
         &self,
     ) -> Result<AgentManagementSnapshot, AgentManagementError> {
-        let mut snapshot = self.store.snapshot()?;
-        // Custom lifecycle adapters may use an isolated store. Their committed
-        // archive receipts still suppress ordinary lifecycle/name reservations.
-        if self.current_names_path.is_none() {
-            let mut receipts = snapshot.agent_archive_actions.values()
-                .filter(|r| r.stage == AgentArchiveStage::Committed)
-                .collect::<Vec<_>>();
-            receipts.sort_by_key(|r| r.result.as_ref().map(|v| v.durable_revision()).unwrap_or(0));
-            let projection = receipts.into_iter().filter_map(|r| r.result.as_ref())
-                .filter_map(|r| CutexSessionId::new(r.cutex_session_id.clone()).ok().map(|id| (id, r.is_retired())))
-                .collect();
-            snapshot.reversible_archive_projection = projection;
-        }
-        if let Some(path) = &self.current_names_path {
-            let sessions = crate::session::store::load_cutex_session_store_from_path(path)
-                .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
-            for agent in snapshot.agents.values_mut() {
-                let record = sessions
-                    .sessions
-                    .get(agent.cutex_session_id.as_str())
-                    .filter(|record| record.cutex_session_id == agent.cutex_session_id.as_str())
-                    .ok_or_else(|| {
-                        AgentManagementError::OwnerActionRequired(format!(
-                            "durable_name_observation_unavailable: {}",
-                            agent.cutex_session_id.as_str()
-                        ))
-                    })?;
-                if record.explicit_launch.as_ref().is_some_and(|contract| {
-                    contract.native_id == agent.native_session_id
-                        && record.codex_session_id.as_deref()
-                            == Some(agent.native_session_id.as_str())
-                }) && record.runtime_backend
-                    == crate::session::model::CutexSessionRuntimeBackend::Host
-                {
-                    // Current configuration belongs to the durable native record.
-                    // Creation specs/receipts remain immutable provenance, not a
-                    // second authority that can reject legitimate Human edits.
-                    agent.spec.runtime_backend = "host".into();
-                    agent.spec.cwd =
-                        crate::session::metadata::cutex_session_launch_cwd(record).into();
-                    agent.spec.profile = record.profile.clone();
-                    agent.spec.model = record.model_defaults.clone().unwrap_or_default();
-                    agent.spec.reasoning = record.reasoning_defaults.clone().unwrap_or_default();
-                    agent.spec.permissions = record.permission_defaults.clone().unwrap_or_default();
-                    agent.spec.approval_policy = record.approval_policy.clone().unwrap_or_default();
-                    agent.spec.sandbox_mode = record.sandbox_mode.clone().unwrap_or_default();
-                    agent.spec.groups = record.agent_groups.clone();
-                    agent.spec.expose_to_im = record.exposed_to_backend;
-                    agent.spec.pin = record.quick_action
-                        == crate::session::model::CutexSessionQuickActionMode::Pinned;
-                }
-                snapshot
-                    .reversible_archive_projection
-                    .insert(agent.cutex_session_id.clone(), record.is_retired());
-                if let Some(name) = &record.formal_agent_name {
-                    if name.trim().is_empty() || name.chars().any(char::is_control) {
-                        return Err(AgentManagementError::OwnerActionRequired(format!(
-                            "malformed_formal_agent_name: {}",
-                            agent.cutex_session_id.as_str()
-                        )));
-                    }
-                    agent.spec.name = name.clone();
-                }
-            }
-        }
-        Ok(snapshot)
+        let raw = self.store.directory_snapshot_shared()?;
+        let Some(path) = &self.current_names_path else {
+            // Custom lifecycle adapters may use an isolated store. Their committed
+            // archive receipts still suppress ordinary lifecycle/name reservations.
+            return Ok(super::name_projection::with_archive_projection(self.store.root(), raw));
+        };
+        let sessions = crate::session::store::load_cutex_session_store_shared_at(path)
+            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        super::name_projection::with_current_names(
+            self.store.root(),
+            path,
+            raw,
+            super::pending_forget::pending(),
+            sessions,
+            project_current_names,
+        )
     }
 
     #[cfg(test)]
@@ -1057,6 +1113,13 @@ impl AgentManagementProvider {
         request: &AgentManagementRequest,
         lifecycle: &dyn AgentLifecycle,
     ) -> AgentManagementResponse {
+        let _name_scope = crate::agent_names::mutation_scope::enter(
+            crate::agent_names::NameScope::for_project(request.project_id.as_ref().map(|project|project.as_str())),
+        );
+        let _runtime_reference = match crate::runtime::reference_guard::acquire_shared() {
+            Ok(permit) => permit,
+            Err(error) => return no_write(&request.action_id, "runtime_reference_unavailable", &error.to_string()),
+        };
         let response = self.execute_with_lifecycle_locks(invocation, request, lifecycle);
         // Provider/session locks are gone before asks settlement.
         self.settle_soft_archive_for_request(request, lifecycle);
@@ -1069,20 +1132,71 @@ impl AgentManagementProvider {
         request: &AgentManagementRequest,
         lifecycle: &dyn AgentLifecycle,
     ) -> AgentManagementResponse {
-        let _execution = match provider_execution_lock().lock() {
-            Ok(execution) => execution,
-            Err(_) => {
-                return no_write(
-                    &request.action_id,
-                    "persistence_unavailable",
-                    "Agent Management execution lock is unavailable",
-                )
+        // r273 (051 step 3): the execution mutex and the host fence are
+        // registered, not held on this frame, so the runtime-online wait of
+        // a create/start releases them (host_hold.rs). One entry per action
+        // and per target agent at a time in this process; a duplicate waits
+        // for the first outside every lock and then replays its receipt.
+        let keys = in_flight_keys(request);
+        let deadline = std::time::Instant::now() + IN_FLIGHT_WAIT;
+        loop {
+            let execution = match provider_execution_lock().lock() {
+                Ok(execution) => execution,
+                Err(_) => {
+                    return no_write(
+                        &request.action_id,
+                        "persistence_unavailable",
+                        "Agent Management execution lock is unavailable",
+                    )
+                }
+            };
+            let mutation = match self.store.lock_mutations() {
+                Ok(mutation) => mutation,
+                Err(error) => return error_response(&request.action_id, error),
+            };
+            let hold = super::host_hold::HostHold::enter(&self.store, Some(execution), mutation);
+            match super::host_hold::InFlight::try_register(keys.clone()) {
+                Ok(Some(flight)) => {
+                    let response = self.execute_registered(invocation, request, lifecycle);
+                    drop(hold);
+                    drop(flight);
+                    return response;
+                }
+                Ok(None) => {
+                    drop(hold);
+                    if !super::host_hold::InFlight::wait_clear(&keys, deadline) {
+                        return error_response(
+                            &request.action_id,
+                            AgentManagementError::HostBusy(
+                                "hostBusy: another lifecycle action for this agent is still running; retry the same action".into(),
+                            ),
+                        );
+                    }
+                }
+                Err(error) => return error_response(&request.action_id, error),
             }
-        };
-        let _mutation = match self.store.lock_mutations() {
-            Ok(mutation) => mutation,
-            Err(error) => return error_response(&request.action_id, error),
-        };
+        }
+    }
+
+    /// Caller registered the execution mutex and the fence (HostHold) and
+    /// this action's in-flight keys.
+    fn execute_registered(
+        &self,
+        invocation: &AgentManagementInvocation,
+        request: &AgentManagementRequest,
+        lifecycle: &dyn AgentLifecycle,
+    ) -> AgentManagementResponse {
+        if let Some(context) = &self.automatic_online {
+            if invocation.caller_cutex_session.as_str() != context.controller
+                || !matches!(&request.operation, AgentOperation::Online { cutex_session_id, allow_unlisted: false }
+                    if cutex_session_id.as_str() == context.target)
+            {
+                return no_write(&request.action_id, "automatic_wake_stale", "automatic online identity mismatch");
+            }
+            if let Err(error) = self.check_automatic_online() {
+                return no_write(&request.action_id, "automatic_wake_blocked", &error.to_string());
+            }
+        }
         if let Err(error) = request.validate() {
             return error_response(&request.action_id, error);
         }
@@ -1193,7 +1307,7 @@ impl AgentManagementProvider {
                 .map(|action| action.action_id.clone())
                 .collect()
         }
-        if pending(&self.store.snapshot()?).is_empty() {
+        if !self.store.has_unfinished_rotation()? {
             return Ok(0);
         }
         let _execution = provider_execution_lock()
@@ -1223,8 +1337,8 @@ impl AgentManagementProvider {
         request: &AuthorizedAgentManagementRequest<'_>,
         lifecycle: &dyn AgentLifecycle,
     ) -> Option<AgentManagementResponse> {
-        let (AgentOperation::Online { cutex_session_id }
-        | AgentOperation::Restart { cutex_session_id }) = &request.operation
+        let (AgentOperation::Online { cutex_session_id, .. }
+        | AgentOperation::Restart { cutex_session_id, .. }) = &request.operation
         else {
             return None;
         };
@@ -1333,7 +1447,7 @@ impl AgentManagementProvider {
         if legacy_offline_revision_conflict_candidate(action) {
             let cutex_session_id = match &request.operation {
                 AgentOperation::Offline { cutex_session_id }
-                | AgentOperation::Restart { cutex_session_id }
+                | AgentOperation::Restart { cutex_session_id, .. }
                 | AgentOperation::Close { cutex_session_id } => cutex_session_id,
                 _ => return Ok(HistoricalBootstrapContinuation::None),
             };
@@ -1425,11 +1539,14 @@ impl AgentManagementProvider {
                 "the most recent native bootstrap attempt window is unavailable",
             ));
         };
-        let reconciliation = if interrupted {
-            lifecycle.reconcile_interrupted_native_bootstrap(spec, &started_at, &failed_at)
-        } else {
-            lifecycle.reconcile_ambiguous_native_bootstrap(spec, &started_at, &failed_at)
-        }
+        let reconciliation = crate::session::creation_identity::with_action(
+            &format!("agent-action:{}", request.action_id.as_str()),
+            || if interrupted {
+                lifecycle.reconcile_interrupted_native_bootstrap(spec, &started_at, &failed_at)
+            } else {
+                lifecycle.reconcile_ambiguous_native_bootstrap(spec, &started_at, &failed_at)
+            },
+        )
         .unwrap_or_else(|error| NativeBootstrapIdentityReconciliation::Unavailable {
             reason: format!("{}: {}", error.code, error.detail),
         });
@@ -1788,7 +1905,7 @@ impl AgentManagementProvider {
                     },
                 )
             }
-            AgentOperation::Online { cutex_session_id } => {
+            AgentOperation::Online { cutex_session_id, .. } => {
                 let (agent, observation) =
                     self.online_existing(request, cutex_session_id, lifecycle)?;
                 self.complete(
@@ -1827,7 +1944,7 @@ impl AgentManagementProvider {
                     AgentManagementResult::Lifecycle { agent, observation },
                 )
             }
-            AgentOperation::Restart { cutex_session_id } => {
+            AgentOperation::Restart { cutex_session_id, .. } => {
                 let agent = self.active_agent(&request.project_id, cutex_session_id)?;
                 let (before, after) = match action.historical_runtime_occurrence_fence.as_ref() {
                     Some(fence) => lifecycle
@@ -2068,9 +2185,15 @@ impl AgentManagementProvider {
                 ));
             }
             match if let Some(permit) = &permit {
-                lifecycle.bootstrap_reviewed(permit)
+                crate::session::creation_identity::with_action(
+                    &format!("agent-action:{}",request.action_id.as_str()),
+                    ||lifecycle.bootstrap_reviewed(permit),
+                )
             } else {
-                lifecycle.bootstrap_native_with_creator(spec, action.created_by.as_ref())
+                crate::session::creation_identity::with_action(
+                    &format!("agent-action:{}", request.action_id.as_str()),
+                    || lifecycle.bootstrap_native_with_creator(spec, action.created_by.as_ref()),
+                )
             } {
                 Ok(native_session_id) => {
                     action = self.capture_native_session(request, &native_session_id)?;
@@ -2115,9 +2238,15 @@ impl AgentManagementProvider {
                         .confirm_reviewed_bootstrap(permit, &native_session_id)
                         .map_err(lifecycle_error)?;
                 }
-                lifecycle.adopt_reviewed(permit, &native_session_id)
+                crate::session::creation_identity::with_action(
+                    &format!("agent-action:{}",request.action_id.as_str()),
+                    ||lifecycle.adopt_reviewed(permit,&native_session_id),
+                )
             } else {
-                lifecycle.adopt_native_with_creator(&native_session_id, spec, action.created_by.as_ref())
+                crate::session::creation_identity::with_action(
+                    &format!("agent-action:{}", request.action_id.as_str()),
+                    || lifecycle.adopt_native_with_creator(&native_session_id, spec, action.created_by.as_ref()),
+                )
             }
             .map_err(lifecycle_error)?;
             action = self.capture_adopted_agent(
@@ -2140,6 +2269,7 @@ impl AgentManagementProvider {
             }
             action = self.set_phase(request, AgentActionPhase::Configured)?;
         }
+        let registered_sequence = Some(action.phase_sequence);
         if matches!(action.phase, AgentActionPhase::Configured) {
             if let Some(permit) = &permit {
                 lifecycle
@@ -2159,6 +2289,7 @@ impl AgentManagementProvider {
                     )
                     .map_err(lifecycle_error)?;
             }
+            self.ensure_action_unchanged(request, registered_sequence)?;
             action = self.set_phase(request, AgentActionPhase::Online)?;
         } else if matches!(action.phase, AgentActionPhase::Online) {
             if let Some(permit) = &permit {
@@ -2179,6 +2310,7 @@ impl AgentManagementProvider {
                     )
                     .map_err(lifecycle_error)?;
             }
+            self.ensure_action_unchanged(request, registered_sequence)?;
         }
         let observation = lifecycle
             .observe(&cutex_session_id)
@@ -2335,6 +2467,8 @@ impl AgentManagementProvider {
         let before = lifecycle
             .observe(cutex_session_id)
             .map_err(lifecycle_error)?;
+        let registered_sequence = self.action_phase_sequence(request)?;
+        self.check_automatic_online().map_err(|error| AgentManagementError::OwnerActionRequired(error.to_string()))?;
         lifecycle
             .online_managed(
                 &RuntimeExecutionPermit {
@@ -2345,6 +2479,10 @@ impl AgentManagementProvider {
                 cutex_session_id,
             )
             .map_err(lifecycle_error)?;
+        // The online wait may have run outside the fence: compare the action
+        // and re-read the agent (an archive may have landed) before readiness.
+        self.ensure_action_unchanged(request, registered_sequence)?;
+        let agent = self.active_agent(&request.project_id, cutex_session_id)?;
         let after = lifecycle
             .observe(cutex_session_id)
             .map_err(lifecycle_error)?;
@@ -2499,6 +2637,16 @@ impl AgentManagementProvider {
         allowed_predecessor: Option<&CutexSessionId>,
         caller: &CutexSessionId,
     ) -> Result<(), AgentManagementError> {
+        crate::agent_names::validate_new_name(&spec.name)
+            .map_err(AgentManagementError::InvalidRequest)?;
+        if let Some(path) = self.current_names_path.as_deref() {
+            crate::session::store::assert_formal_name_available_at(
+                path,&crate::agent_names::mutation_scope::current(),&spec.name,
+                allowed_predecessor.map(|id|id.as_str()),
+            ).map_err(|error|if error.downcast_ref::<crate::agent_names::NameError>().is_some() {
+                AgentManagementError::Conflict("agent_name_reserved_in_target_scope")
+            } else { AgentManagementError::PersistenceUnavailable })?;
+        }
         let snapshot = self.current_name_snapshot()?;
         let holder = snapshot.agents.values().find(|agent| {
             agent.retired_at.is_none()
@@ -2697,6 +2845,34 @@ impl AgentManagementProvider {
         Ok(action)
     }
 
+    /// r273 (051 step 3): phase 3 of a start whose online wait ran outside
+    /// the host fence. The fence is held again; the action must still be the
+    /// unfinished record this entry registered (same phase sequence, no
+    /// response) before anything is published for it.
+    fn ensure_action_unchanged(
+        &self,
+        request: &AuthorizedAgentManagementRequest<'_>,
+        expected_phase_sequence: Option<u64>,
+    ) -> Result<(), AgentManagementError> {
+        let state = self.store.snapshot()?;
+        let current = state.actions.get(&request.action_id);
+        if current.map(|action| action.phase_sequence) != expected_phase_sequence
+            || current.is_some_and(|action| action.response.is_some())
+        {
+            return Err(AgentManagementError::OwnerActionRequired(
+                "the action changed while its runtime came online; replay the same action to read its outcome".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn action_phase_sequence(
+        &self,
+        request: &AuthorizedAgentManagementRequest<'_>,
+    ) -> Result<Option<u64>, AgentManagementError> {
+        Ok(self.store.snapshot()?.actions.get(&request.action_id).map(|action| action.phase_sequence))
+    }
+
     fn set_phase(
         &self,
         request: &AuthorizedAgentManagementRequest<'_>,
@@ -2772,9 +2948,9 @@ impl AgentManagementProvider {
                 operator_cutex_session_id,
                 ..
             } => (Some(operator_cutex_session_id.clone()), None),
-            AgentOperation::Online { cutex_session_id }
+            AgentOperation::Online { cutex_session_id, .. }
             | AgentOperation::Offline { cutex_session_id }
-            | AgentOperation::Restart { cutex_session_id }
+            | AgentOperation::Restart { cutex_session_id, .. }
             | AgentOperation::Close { cutex_session_id } => (Some(cutex_session_id.clone()), None),
             AgentOperation::Replace {
                 predecessor_cutex_session_id,
@@ -3048,9 +3224,9 @@ impl AgentManagementProvider {
                 .as_ref()
                 .map(|authority| authority.authorized_director_session.clone());
             let target_cutex_session_id = match &request.operation {
-                AgentOperation::Online { cutex_session_id }
+                AgentOperation::Online { cutex_session_id, .. }
                 | AgentOperation::Offline { cutex_session_id }
-                | AgentOperation::Restart { cutex_session_id }
+                | AgentOperation::Restart { cutex_session_id, .. }
                 | AgentOperation::Close { cutex_session_id } => Some(cutex_session_id.clone()),
                 AgentOperation::Create { .. }
                 | AgentOperation::QueryManaged
@@ -3128,6 +3304,17 @@ fn captured_creator(caller: &CutexSessionId, role: AgentManagementRole) -> Optio
         AgentManagementRole::ReceiptReplay => return None,
     };
     Some(SessionCreatedBy::Agent { cutex_session_id: caller.clone(), role: Some(role) })
+}
+
+/// The same project/role authorization used by typed Online, for automatic
+/// admission hints. The provider repeats it under its mutation fence.
+pub fn can_online_managed(snapshot: &AgentManagementSnapshot, caller: &str, target: &str) -> bool {
+    let (Ok(caller), Ok(target)) = (CutexSessionId::new(caller), CutexSessionId::new(target)) else { return false };
+    let Some(agent) = snapshot.agents.get(&target) else { return false };
+    if agent.retired_at.is_some() || snapshot.reversible_archive_projection.get(&target) == Some(&true) { return false; }
+    let Some(project) = super::projects::current_project_id(snapshot, agent) else { return false };
+    authorize_operation(snapshot, &caller, &project,
+        &AgentOperation::Online { cutex_session_id: target, allow_unlisted: false }).is_ok()
 }
 
 fn authorize_operation(
@@ -3290,9 +3477,9 @@ fn project_management_role(
 
 fn operation_target(operation: &AgentOperation) -> Option<&CutexSessionId> {
     match operation {
-        AgentOperation::Online { cutex_session_id }
+        AgentOperation::Online { cutex_session_id, .. }
         | AgentOperation::Offline { cutex_session_id }
-        | AgentOperation::Restart { cutex_session_id }
+        | AgentOperation::Restart { cutex_session_id, .. }
         | AgentOperation::Close { cutex_session_id } => Some(cutex_session_id),
         AgentOperation::Replace {
             predecessor_cutex_session_id,
@@ -4622,6 +4809,7 @@ mod tests {
 
     use super::*;
     include!("provider_archive_tests.rs");
+    include!("provider_host_hold_tests.rs");
 
     const REAL_LEGACY_NO_SID_DETAIL: &str =
         "owner_action_required: native_session_unknown: native exec exited exit status: 1 without one captured SID";
@@ -4671,6 +4859,14 @@ mod tests {
         launch_count: usize,
         agents: BTreeMap<CutexSessionId, AgentRuntimeObservation>,
         messages: HashMap<String, String>,
+        online_gate: Option<std::sync::Arc<OnlineGate>>,
+        online_delay: Option<std::time::Duration>,
+        online_bus_failures: u32,
+        online_register: Option<std::sync::Arc<dyn crate::app_server::bus_bridge::RuntimeAgentBus>>,
+        /// r273.1 (B1): the native adapter's second release point, the live
+        /// runtime claim proof before its reconnect (a Windows TCP table
+        /// read, before r273.1 a 3.2 s PowerShell child under the fence).
+        live_claim_gate: Option<std::sync::Arc<OnlineGate>>,
     }
 
     #[derive(Default)]
@@ -5243,6 +5439,62 @@ mod tests {
         }
 
         fn online(&self, cutex_session_id: &CutexSessionId) -> Result<(), LifecycleFailure> {
+            {
+                let mut state = self.state.lock().unwrap();
+                if state.online_bus_failures > 0 {
+                    state.online_bus_failures -= 1;
+                    return Err(LifecycleFailure::outcome_unknown("agent_bus_unavailable", "Failed to read agent bus response"));
+                }
+            }
+            // A slow runtime start, as the production adapters run it: the
+            // spawn + readiness wait outside a registered host fence.
+            let (gate, delay) = {
+                let state = self.state.lock().unwrap();
+                (state.online_gate.clone(), state.online_delay)
+            };
+            if let Some(delay) = delay {
+                crate::agent_management::outside_host_fence("fake online", || {
+                    STORM_ONLINE_WAITING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(delay);
+                    STORM_ONLINE_WAITING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                    .map_err(|error| LifecycleFailure::outcome_unknown("host_fence", error.to_string()))?;
+            }
+            if let Some(gate) = gate {
+                crate::agent_management::outside_host_fence("fake online", || gate.pass())
+                    .map_err(|error| LifecycleFailure::outcome_unknown("host_fence", error.to_string()))?;
+            }
+            // As stock_lifecycle::reconnect_verified: the bus registration, with
+            // its retries, outside the fence (taken: only the first start has it).
+            let register = self.state.lock().unwrap().online_register.take();
+            if let Some(bus) = register {
+                let registration = serde_json::from_value(serde_json::json!({"id": "fake.retry", "name": "retry", "profile": "p", "cwd": "."})).unwrap();
+                crate::agent_management::verify_claim_outside_host_fence(
+                    "fake agent bus registration",
+                    || Ok(()),
+                    || crate::app_server::bus_bridge::register_with_retry(bus.as_ref(), &registration),
+                )
+                .map_err(|error| LifecycleFailure::outcome_unknown("agent_bus_unavailable", format!("{error:#}")))?;
+            }
+            let live_claim_gate = self.state.lock().unwrap().live_claim_gate.clone();
+            if let Some(gate) = live_claim_gate {
+                // As stock_lifecycle::reconnect_ready_runtime_outside_fence:
+                // the claim is read under the fence, the proof runs outside
+                // it, and the claim must be unchanged once the fence is back.
+                crate::agent_management::verify_claim_outside_host_fence(
+                    "fake live runtime claim verification",
+                    || {
+                        let state = self.state.lock().unwrap();
+                        let agent = state.agents.get(cutex_session_id);
+                        Ok(agent.map(|agent| (agent.runtime_generation, agent.runtime_agent_ids.clone())))
+                    },
+                    || {
+                        gate.pass();
+                        Ok(())
+                    },
+                )
+                .map_err(|error| LifecycleFailure::outcome_unknown("live_runtime_claim_changed", format!("{error:#}")))?;
+            }
             let mut state = self.state.lock().unwrap();
             state
                 .log
@@ -6215,6 +6467,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn automatic_managed_online_uses_typed_recovery_and_preserves_identity() {
+        let _home = crate::config::paths::test_home_env_lock();
+        let root = root("automatic-managed-online");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider,"bind","cutex.director",None);
+        let lifecycle = FakeLifecycle::default();
+        let agent = created_agent(&completed(provider.execute(&invocation("cutex.director"),
+            &create_request("create","managed-worker",AgentStartMode::BootstrapOnly),&lifecycle)));
+        let offline = AgentManagementRequest { schema:AgentManagementSchema::V1,action_id:action("offline"),
+            project_id:Some(project()),operation:AgentOperation::Offline {cutex_session_id:agent.cutex_session_id.clone()} };
+        completed(provider.execute(&invocation("cutex.director"),&offline,&lifecycle));
+        let asks = crate::asks::store::AskStore::open_default().unwrap();
+        let now = chrono::Utc::now();
+        let context = asks.with_state(|state| {
+            let mut ask = crate::asks::store::tests::new_ask("automatic-typed-online","work");
+            ask.requester = crate::asks::model::Requester::Agent { cutex_session_id:"cutex.director".into(),name:None };
+            ask.target_cutex_session_id = agent.cutex_session_id.as_str().to_string();
+            ask.project_id = Some(project().as_str().to_string());
+            let ask_id=state.create_ask(ask,now).unwrap().0.ask_id;
+            crate::asks::wake::record_wake(state,agent.cutex_session_id.as_str(),"project:cutex-project",now);
+            AutomaticManagedOnline {ask_id,target:agent.cutex_session_id.as_str().to_string(),controller:"cutex.director".into(),
+                reserved_at:crate::asks::now_rfc3339(now)}
+        }).unwrap();
+        let provider=provider.with_automatic_online(context);
+        let online=AgentManagementRequest {schema:AgentManagementSchema::V1,action_id:action("automatic-online"),
+            project_id:Some(project()),operation:AgentOperation::Online {cutex_session_id:agent.cutex_session_id.clone(),allow_unlisted:false}};
+        // A stop committed after scheduler reservation must refuse before any
+        // lifecycle/recovery callback or action write. Explicit Online retains
+        // its separate authority to recover this state.
+        asks.with_state(|state| { state.owner_offline.insert(agent.cutex_session_id.as_str().to_string()); }).unwrap();
+        let before=lifecycle.state.lock().unwrap().log.clone();
+        let blocked=provider.execute(&invocation("cutex.director"),&online,&lifecycle);
+        assert!(matches!(blocked.outcome,AgentManagementOutcome::NoWrite {ref detail,..} if detail.starts_with("ownerStopped")));
+        assert_eq!(lifecycle.state.lock().unwrap().log,before);
+        assert!(!provider.store.snapshot().unwrap().actions.contains_key(&online.action_id));
+        asks.with_state(|state| { state.owner_offline.remove(agent.cutex_session_id.as_str());
+            crate::asks::agent_pause::pause(state,agent.cutex_session_id.as_str(),"owner",None,chrono::Utc::now()); }).unwrap();
+        let blocked=provider.execute(&invocation("cutex.director"),&online,&lifecycle);
+        assert!(matches!(blocked.outcome,AgentManagementOutcome::NoWrite {ref detail,..} if detail.starts_with("ownerPaused")));
+        assert_eq!(lifecycle.state.lock().unwrap().log,before);
+        asks.with_state(|state| {state.pauses.remove(agent.cutex_session_id.as_str());
+            if let Some(p)=state.presence.get_mut(agent.cutex_session_id.as_str()) {p.agent_pause=None;} }).unwrap();
+        let receipt=completed(provider.execute(&invocation("cutex.director"),&online,&lifecycle));
+        let AgentManagementResult::Lifecycle {agent:after,observation} = receipt.result else {panic!("wrong result")};
+        assert_eq!(agent.cutex_session_id,after.cutex_session_id);
+        assert_eq!(agent.native_session_id,after.native_session_id);
+        assert!(observation.app_server_runtime);
+        let state=asks.snapshot().unwrap();
+        assert!(state.questions.is_empty());
+        assert!(!state.owner_action.contains_key(agent.cutex_session_id.as_str()));
+        asks.with_state(|state|crate::asks::wake::finish_wake(state,agent.cutex_session_id.as_str(),&crate::asks::now_rfc3339(now))).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn ready_observation(agent: &ManagedAgentRecord) -> AgentRuntimeObservation {
         let runtime_id = "runtime:ready:1".to_string();
         let mut observation = observation(
@@ -6983,6 +7290,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
         let restarted =
@@ -7089,6 +7397,7 @@ mod tests {
                 "restart",
                 AgentOperation::Restart {
                     cutex_session_id: id.clone(),
+                    allow_unlisted: false,
                 },
             ),
             (
@@ -7476,6 +7785,7 @@ mod tests {
             let mut altered = request.clone();
             altered.operation = AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             };
             assert!(!matches!(
                 provider
@@ -7534,6 +7844,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
         lifecycle.offline(&created.cutex_session_id).unwrap();
@@ -7623,6 +7934,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
         seed_lifecycle_revision_conflict_receipt(&provider, &request, &created.cutex_session_id);
@@ -7661,6 +7973,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
         lifecycle.offline(&created.cutex_session_id).unwrap();
@@ -7707,6 +8020,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
         lifecycle.offline(&created.cutex_session_id).unwrap();
@@ -7756,6 +8070,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
         lifecycle.offline(&created.cutex_session_id).unwrap();
@@ -7855,6 +8170,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
         seed_lifecycle_revision_conflict_receipt(&provider, &request, &created.cutex_session_id);
@@ -7906,6 +8222,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
         let original = seed_lifecycle_revision_conflict_receipt(
@@ -7965,6 +8282,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Online {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
 
@@ -8013,12 +8331,14 @@ mod tests {
                 "online-legacy",
                 AgentOperation::Online {
                     cutex_session_id: created.cutex_session_id.clone(),
+                    allow_unlisted: false,
                 },
             ),
             (
                 "restart-legacy",
                 AgentOperation::Restart {
                     cutex_session_id: created.cutex_session_id.clone(),
+                    allow_unlisted: false,
                 },
             ),
         ] {
@@ -8078,6 +8398,7 @@ mod tests {
                 project_id: Some(project()),
                 operation: AgentOperation::Online {
                     cutex_session_id: created.cutex_session_id.clone(),
+                    allow_unlisted: false,
                 },
             };
 
@@ -8118,6 +8439,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Online {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
 
@@ -8154,6 +8476,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Online {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
 
@@ -8193,6 +8516,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Online {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
 
@@ -8233,6 +8557,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
 
@@ -8743,6 +9068,7 @@ mod tests {
             project_id: Some(project()),
             operation: AgentOperation::Restart {
                 cutex_session_id: created.cutex_session_id.clone(),
+                allow_unlisted: false,
             },
         };
         completed(provider.execute(&invocation("cutex.director"), &restart, &lifecycle));
@@ -9642,6 +9968,38 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// r276 (EVA 2026-11-04): the runtime start of a create fails on an agent
+    /// bus timeout. The agent exists, the create stays resumable at
+    /// `configured`, and an exact retry finishes it.
+    #[test]
+    fn a_bus_timeout_at_runtime_start_leaves_a_create_an_exact_retry_finishes() {
+        let root = root("bus-timeout-resume");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        lifecycle.state.lock().unwrap().online_bus_failures = 2;
+        let request = create_request("bus-timeout", "worker", AgentStartMode::BootstrapOnly);
+        for _ in 0..2 {
+            let failed = provider.execute(&invocation("cutex.director"), &request, &lifecycle);
+            let AgentManagementOutcome::OwnerActionRequired { failure } = &failed.outcome else {
+                panic!("expected owner_action_required: {:?}", failed.outcome);
+            };
+            assert!(failure.detail.contains("agent_bus_unavailable: Failed to read agent bus response"), "{}", failure.detail);
+            let snapshot = provider.store().snapshot().unwrap();
+            let action = &snapshot.actions[&request.action_id];
+            assert_eq!(action.phase, AgentActionPhase::Configured);
+            assert!(action.response.is_none(), "resumable");
+            assert!(action.known_successor_cutex_session.is_some());
+        }
+        let agent = created_agent(&completed(provider.execute(&invocation("cutex.director"), &request, &lifecycle)));
+        assert_eq!(lifecycle.bootstrap_count(), 1, "the agent is not created again");
+        let snapshot = provider.store().snapshot().unwrap();
+        assert!(snapshot.actions[&request.action_id].response.is_some());
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(agent.spec.name, "worker");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn real_known_sid_failure_is_resumable_and_reservations_block_bypass() {
         let root = root("known-sid-resume");
@@ -10129,18 +10487,18 @@ mod tests {
                         .with_state(true, |mut state| {
                             state.actions.get_mut(&target.action_id).unwrap().operation =
                                 AgentOperationKind::Online;
-                            for event in state
-                                .phase_events
-                                .values_mut()
-                                .filter(|event| event.action_id == target.action_id)
-                            {
-                                event.operation = AgentOperationKind::Online;
-                            }
-                            let failure = state
+                            state.phase_events.for_each_value_mut(|_, event| {
+                                if event.action_id == target.action_id {
+                                    event.operation = AgentOperationKind::Online;
+                                }
+                            });
+                            let failure_key = state
                                 .failure_events
-                                .values_mut()
-                                .find(|failure| failure.action_id == target.action_id)
+                                .iter()
+                                .find(|(_, failure)| failure.action_id == target.action_id)
+                                .map(|(key, _)| key.clone())
                                 .unwrap();
+                            let failure = state.failure_events.get_mut(&failure_key).unwrap();
                             failure.operation = AgentOperationKind::Online;
                             let AgentManagementOutcome::OwnerActionRequired { failure } =
                                 &mut state
@@ -10460,12 +10818,14 @@ mod tests {
                 "operator-online",
                 AgentOperation::Online {
                     cutex_session_id: managed.cutex_session_id.clone(),
+                    allow_unlisted: false,
                 },
             ),
             (
                 "operator-restart",
                 AgentOperation::Restart {
                     cutex_session_id: managed.cutex_session_id.clone(),
+                    allow_unlisted: false,
                 },
             ),
         ] {

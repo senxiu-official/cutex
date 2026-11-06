@@ -63,7 +63,8 @@ impl NativeLaunch {
     /// Called only inside TerminalShell handoff. Never exits the outer process
     /// or retries a launch whose external result is unknown.
     pub(super) fn interactive(&self, native_id: Option<&str>) -> anyhow::Result<ExitStatus> {
-        run_interactive(&mut self.interactive_command(native_id)?)
+        let runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
+        run_interactive(&mut self.interactive_command(native_id)?, runtime_reference)
     }
 
     fn interactive_command(&self, native_id: Option<&str>) -> anyhow::Result<Command> {
@@ -112,6 +113,7 @@ impl NativeLaunch {
     /// `endpoint` whose replies may be up to `max_message_bytes` (history
     /// readers: one native turn can be tens of MB).
     pub(super) fn endpoint_bounded(&self, max_message_bytes: Option<usize>) -> anyhow::Result<OwnedStdioEndpoint> {
+        let _runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
         let command = if let Some(deployment) =
             cutex::launch::local_deployment::LocalDeployment::selected()?
         {
@@ -182,8 +184,8 @@ impl NativeLaunch {
     }
 }
 
-fn run_interactive(command: &mut Command) -> anyhow::Result<ExitStatus> {
-    let (status, diagnostic) = super::stock_lifecycle::foreground_status(command)
+fn run_interactive(command: &mut Command, runtime_reference: cutex::runtime::reference_guard::SharedGuard) -> anyhow::Result<ExitStatus> {
+    let (status, diagnostic) = super::stock_lifecycle::foreground_status_with_reference(command, runtime_reference)
         .map_err(|error| anyhow::anyhow!("native launch result unknown; inspect Recent before creating again: {error}"))?;
     anyhow::ensure!(status.success(), "local native CLI failed ({status}){}",
         if diagnostic.is_empty() { String::new() } else { format!(": {diagnostic}") });
@@ -245,7 +247,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_failure_keeps_exit_status_and_stderr() {
-        let error = run_interactive(Command::new("sh").args(["-c", "printf 'active writer test' >&2; exit 1"]))
+        let _home = crate::cli_app::test_home::IsolatedTestHome::new("native-failure").unwrap();
+        let reference = cutex::runtime::reference_guard::acquire_shared().unwrap();
+        let error = run_interactive(Command::new("sh").args(["-c", "printf 'active writer test' >&2; exit 1"]), reference)
             .unwrap_err().to_string();
         assert!(error.contains("local native CLI failed (exit status: 1)"));
         assert!(error.contains("active writer test"));

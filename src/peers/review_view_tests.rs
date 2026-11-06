@@ -23,7 +23,7 @@ fn pending_outbox_uses_stable_timestamp_and_observes_real_changes_without_writes
             outcome: None,
             reason: None,
         });
-    state.asks.insert(ask.ask_id.clone(), ask.clone());
+    state.asks.insert(ask.ask_id.clone(), ask.clone().into());
     asks.with_state(|s| *s = state).unwrap();
     let peers = store::State {
         settings: super::policy::Settings {
@@ -317,7 +317,7 @@ fn batched_peer_views_keep_each_peers_inbound_outbound_and_dead_letters_separate
     ];
     state.asks = records
         .into_iter()
-        .map(|ask| (ask.ask_id.clone(), ask))
+        .map(|ask| (ask.ask_id.clone(), ask.into()))
         .collect();
     // Persist the explicit fixture without queue_snapshots coalescing its outboxes.
     crate::config::atomic::write_private_pretty_json_atomic(

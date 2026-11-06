@@ -13,6 +13,7 @@ pub mod launch;
 pub mod lifecycle;
 pub mod managed_launch;
 pub mod process_scope;
+pub mod reference_guard;
 pub mod session_online;
 pub mod stop;
 

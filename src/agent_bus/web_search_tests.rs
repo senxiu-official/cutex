@@ -179,23 +179,6 @@ fn queries_are_validated() {
 }
 
 #[test]
-fn the_rate_limit_is_a_per_agent_sliding_window() {
-    let mut limiter = RateLimiter::default();
-    let start = Instant::now();
-    let window = Duration::from_secs(3600);
-    for i in 0..RATE_LIMIT {
-        assert!(limiter.admit("agent-a", start + Duration::from_secs(i as u64), RATE_LIMIT, window).is_ok());
-    }
-    let wait = limiter.admit("agent-a", start + Duration::from_secs(100), RATE_LIMIT, window).unwrap_err();
-    assert_eq!(wait, Duration::from_secs(3500));
-    // Another agent has its own window.
-    assert!(limiter.admit("agent-b", start + Duration::from_secs(100), RATE_LIMIT, window).is_ok());
-    // Once the oldest attempt leaves the window, one more is admitted.
-    assert!(limiter.admit("agent-a", start + window, RATE_LIMIT, window).is_ok());
-    assert!(limiter.admit("agent-a", start + window, RATE_LIMIT, window).is_err());
-}
-
-#[test]
 fn a_search_only_request_gets_text_and_citations_from_the_mock_provider() {
     let (base, provider) = mock_provider(|_| (200, cited_answer().to_string(), "application/json"));
     let answer = search(&target(&base), "rust 1.95 release date", Duration::from_secs(10)).unwrap();

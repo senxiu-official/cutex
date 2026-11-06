@@ -4,9 +4,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const FEATURE: &str = "agent-bus-message-settlement-v1";
+pub const STALE_ACK_FEATURE: &str = "agent-bus-stale-ack-settlement-v1";
+pub const STALE_ACK_MIN_WAIT_SECS: u64 = 300;
 pub const CLOSE_PATH: &str = "/v2/agent-bus/stuck-messages/close";
 pub const EVIDENCE_TTL_SECS: i64 = 180;
 pub const EVENT_METHOD: &str = "cutex/agentBus/messageSettlementUpdated";
+
+/// Durable age proof; collector independently verifies any later completed turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StaleAckEvidence {
+    pub queued_at: DateTime<Utc>,
+    /// Start of ACK wait, or the conservative legacy business timestamp.
+    pub accepted_at: DateTime<Utc>,
+    pub min_wait_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub later_completed_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_attempt_id: Option<String>,
+}
 
 /// Observations from an authenticated connection to an already-running adapter.
 /// This is assignment/terminal evidence, never proof of delivery or no effects.
@@ -32,6 +48,10 @@ pub struct Evidence {
     pub observed_at: DateTime<Utc>,
     /// Digest of the validated native/local/history observations, without text.
     pub observation_sha256: String,
+    // Old strict readers reject this additive field (fail closed). Committed
+    // closures retain the existing business-format v8 fence; no downgrade path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_ack: Option<StaleAckEvidence>,
 }
 
 impl Evidence {
@@ -61,13 +81,51 @@ impl Evidence {
                 .into_iter()
                 .all(|value| digest(value))
                 && uuid::Uuid::parse_str(&self.attempt_id).is_ok_and(|id| !id.is_nil())
-                && matches!(self.processing_state.as_str(), "held" | "output_observed")
-                && matches!(
+                && (matches!(self.processing_state.as_str(), "held" | "output_observed")
+                    || (self.stale_ack.is_some()
+                        && matches!(
+                            self.processing_state.as_str(),
+                            "claimed" | "pending" | "none"
+                        )))
+                && (matches!(
                     self.terminal_status.as_str(),
                     "completed" | "interrupted" | "failed"
-                ),
+                ) || (matches!(self.terminal_status.as_str(), "inProgress" | "unknown")
+                    && self
+                        .stale_ack
+                        .as_ref()
+                        .is_some_and(|proof| proof.later_completed_turn_id.is_some()))),
             "invalid settlement evidence shape"
         );
+        if let Some(proof) = &self.stale_ack {
+            anyhow::ensure!(
+                proof
+                    .native_attempt_id
+                    .as_ref()
+                    .is_none_or(|attempt| attempt == &self.attempt_id)
+                    && (proof.native_attempt_id.is_some()
+                        || (matches!(self.processing_state.as_str(), "pending" | "none")
+                            && proof.later_completed_turn_id.is_some()))
+                    && (self.processing_state != "none"
+                        || (proof.native_attempt_id.is_none()
+                            && proof.later_completed_turn_id.is_some()
+                            && self.actual_turn_id == "unassigned"
+                            && self.terminal_status == "unknown"))
+                    && proof.min_wait_secs == STALE_ACK_MIN_WAIT_SECS
+                    && proof.accepted_at >= proof.queued_at
+                    && proof
+                        .accepted_at
+                        .checked_add_signed(chrono::Duration::seconds(
+                            STALE_ACK_MIN_WAIT_SECS as i64
+                        ))
+                        .is_some_and(|ready| ready <= self.observed_at)
+                    && proof
+                        .later_completed_turn_id
+                        .as_ref()
+                        .is_none_or(|turn| bounded(turn) && turn != &self.actual_turn_id),
+                "invalid stale acknowledgement evidence"
+            );
+        }
         Ok(())
     }
 
@@ -103,6 +161,8 @@ pub struct EvidenceView {
     pub actual_turn_id: String,
     pub terminal_status: String,
     pub observed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_ack: Option<StaleAckEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,6 +211,7 @@ impl SettlementRecord {
                 actual_turn_id: self.evidence.actual_turn_id.clone(),
                 terminal_status: self.evidence.terminal_status.clone(),
                 observed_at: self.evidence.observed_at,
+                stale_ack: self.evidence.stale_ack.clone(),
             },
             closure: self.closure.clone(),
         }

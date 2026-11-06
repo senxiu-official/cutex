@@ -12,6 +12,12 @@ pub const MAX_CONTEXT_MESSAGES: usize = 4096;
 
 mod observer;
 
+/// Narrow existing-store identity for a settlement display/commit fence.
+/// Unlike the session writer opener this never imports or repairs a store.
+pub fn current_observer(id: &str) -> anyhow::Result<Option<super::read_views::CurrentObserver>> {
+    observer::current(id)
+}
+
 /// Production entry after the caller's owned AskState read returns.
 pub fn load(asks: &[&AskRecord]) -> ReceiptReadContext {
     load_for_asks(

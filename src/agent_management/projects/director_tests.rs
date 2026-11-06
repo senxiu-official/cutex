@@ -335,8 +335,7 @@ fn legacy_store_without_project_states_migrates_on_load() {
     let fixture = fixture(&[agent(Some(&project("legacy")), "cutex.legacy-director")]);
     // The pre-migration shape: an authority without a project_states record.
     let path = fixture.root.join("agent-management-v1.json");
-    let mut json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut json = serde_json::to_value(crate::agent_management::store::committed_for_tests(&fixture.root)).unwrap();
     json["projects"] = serde_json::json!({
         "legacy": {
             "project_id": "legacy",
@@ -347,7 +346,7 @@ fn legacy_store_without_project_states_migrates_on_load() {
     });
     json["project_states"] = serde_json::json!({});
     std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-    crate::agent_management::store::invalidate_snapshot_cache();
+    crate::agent_management::store::reimport_legacy_for_tests(&fixture.root);
     let snapshot = fixture.provider.store().snapshot().unwrap();
     let state = &snapshot.project_states[&project("legacy")];
     assert_eq!(state.lifecycle, ProjectLifecycle::Active);

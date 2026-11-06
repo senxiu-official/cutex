@@ -67,6 +67,7 @@ pub enum ServerResponseClaimDecision {
     IdempotencyConflict,
     Resolved,
     NotFound,
+    InvalidAnswer(String),
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -133,15 +134,52 @@ pub fn claim_response(
     validate_native_response(native_response)?;
     let body_sha256 = canonical_request_sha256(canonical_body)?;
     mutate_store(|store| {
-        claim_response_in_store(
+        claim_validated_response_in_store(
             store,
             cutex_session_id,
             runtime_generation,
             response_id,
             body_sha256,
-            native_request_id,
+            native_response,
         )
     })
+}
+
+fn claim_validated_response_in_store(
+    store: &mut PendingNativeServerRequestStore,
+    cutex_session_id: &str,
+    runtime_generation: u64,
+    response_id: &str,
+    body_sha256: String,
+    native_response: &Value,
+) -> anyhow::Result<ServerResponseClaimDecision> {
+    let native_request_id = native_response
+        .get("id")
+        .context("native server response omitted id")?;
+    let invalid = store
+        .requests
+        .iter()
+        .find(|request| {
+            request.cutex_session_id == cutex_session_id
+                && request.runtime_generation == runtime_generation
+                && request_id(&request.native) == Some(native_request_id)
+                && request.resolution == NativeServerRequestResolution::Pending
+                && request.response_claim.is_none()
+        })
+        .and_then(|request| {
+            super::question_answers::validate_native_answer(&request.native, native_response).err()
+        });
+    if let Some(message) = invalid {
+        return Ok(ServerResponseClaimDecision::InvalidAnswer(message));
+    }
+    claim_response_in_store(
+        store,
+        cutex_session_id,
+        runtime_generation,
+        response_id,
+        body_sha256,
+        native_request_id,
+    )
 }
 
 fn claim_response_in_store(
@@ -562,6 +600,82 @@ fn secure_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_question_answer_does_not_claim_or_resolve_the_request() {
+        let native = json!({
+            "id":"question-1", "method":"item/tool/requestUserInput",
+            "params":{"questions":[{
+                "id":"q0", "question":"Legacy text", "options":null, "isOther":true,
+                "cutexQuestionOptions":{
+                    "version":1,"question":"Which platforms?","multiSelect":true,
+                    "options":[
+                        {"label":"Windows","description":"PC","preview":"<b>Text only</b>"},
+                        {"label":"Linux","description":"Server"}
+                    ]
+                }
+            }]}
+        });
+        let mut store = PendingNativeServerRequestStore {
+            version: 1,
+            requests: vec![PendingNativeServerRequest {
+                cutex_session_id: "cutex-question".into(),
+                runtime_generation: 7,
+                native: native.clone(),
+                created_at: "2026-10-30T00:00:00Z".into(),
+                resolution: NativeServerRequestResolution::Pending,
+                response_claim: None,
+            }],
+        };
+        let invalid =
+            json!({"id":"question-1","result":{"answers":{"q0":{"answers":["Linux","Linux"]}}}});
+        assert!(matches!(
+            claim_validated_response_in_store(
+                &mut store,
+                "cutex-question",
+                7,
+                "answer-1",
+                "a".repeat(64),
+                &invalid
+            )
+            .unwrap(),
+            ServerResponseClaimDecision::InvalidAnswer(_)
+        ));
+        assert_eq!(
+            store.requests[0].resolution,
+            NativeServerRequestResolution::Pending
+        );
+        assert!(store.requests[0].response_claim.is_none());
+        assert_eq!(
+            store.requests[0].native, native,
+            "validation must preserve rich metadata"
+        );
+        let valid = json!({"id":"question-1","result":{"answers":{"q0":{"answers":["Linux","Windows","Other OS"]}}}});
+        assert_eq!(
+            claim_validated_response_in_store(
+                &mut store,
+                "cutex-question",
+                7,
+                "answer-1",
+                "b".repeat(64),
+                &valid
+            )
+            .unwrap(),
+            ServerResponseClaimDecision::Submit
+        );
+        assert_eq!(
+            claim_validated_response_in_store(
+                &mut store,
+                "cutex-question",
+                7,
+                "answer-2",
+                "c".repeat(64),
+                &invalid
+            )
+            .unwrap(),
+            ServerResponseClaimDecision::Resolved
+        );
+    }
 
     #[test]
     fn pending_request_identity_includes_generation_and_preserves_raw_native_message() {

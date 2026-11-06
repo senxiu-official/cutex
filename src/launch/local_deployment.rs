@@ -19,6 +19,7 @@ pub struct LocalDeployment {
 impl LocalDeployment {
     /// Select an installed artifact template; existing agent bindings are not rewritten.
     pub fn install(&self) -> anyhow::Result<()> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         ensure!(
             cfg!(any(target_os = "linux", target_os = "macos", windows)),
             "local runtime deployment is unsupported on this platform"
@@ -40,11 +41,8 @@ impl LocalDeployment {
             bundle.soon_ingress(),
             "local deployment requires compatible light runtime"
         );
-        crate::config::atomic::write_private_pretty_json_atomic(
-            &crate::config::paths::runtime_dir()?.join("light/deployment.json"),
-            self,
-            "local runtime selection",
-        )
+        let managed = super::native_managed::copy(self)?;
+        super::native_managed::select_default(&managed)
     }
 
     pub fn source_home() -> anyhow::Result<PathBuf> {
@@ -122,7 +120,7 @@ impl LocalDeployment {
             Some(&selected_bundle.facade),
             Some(&selected_bundle.schema),
         ])
-        .any(|(left, right)| left != right);
+        .any(|(left, right)| left.map(|file| &file.sha256) != right.map(|file| &file.sha256));
         changed
     }
 
@@ -197,8 +195,9 @@ impl LocalDeployment {
         let destination = crate::config::paths::runtime_dir()?
             .join("light/agents")
             .join(&native_id);
+        let managed = super::native_managed::copy(self)?;
         let mut bundle: super::stock::StockBundle =
-            serde_json::from_slice(&std::fs::read(&self.bundle_manifest)?)?;
+            serde_json::from_slice(&std::fs::read(&managed.bundle_manifest)?)?;
         ensure!(
             bundle.soon_ingress(),
             "local default runtime requires supported light protocol"

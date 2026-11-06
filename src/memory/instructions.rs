@@ -11,6 +11,8 @@ pub const MEMORY_INDEX_MAX_BYTES: usize = 25 * 1024;
 /// Launch-time memory context for one project Agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchMemoryContext {
+    /// Metadata of the exact read used for this launch, never a preview side effect.
+    pub index_snapshot: Option<super::idle_note::Snapshot>,
     pub scope: ProjectMemoryScope,
     /// The rendered `# Memory` section (instructions + current index).
     pub instructions: String,
@@ -55,7 +57,7 @@ impl LaunchMemoryContext {
 pub fn launch_memory_context(
     cutex_session_id: &str,
 ) -> anyhow::Result<Option<LaunchMemoryContext>> {
-    let snapshot = super::load_agent_management_snapshot()?;
+    let snapshot = super::load_agent_management_directory()?;
     let Some(scope) = super::memory_scope_for_session(&snapshot, cutex_session_id)? else {
         return Ok(None);
     };
@@ -73,6 +75,7 @@ pub fn launch_memory_context(
         .filter(|root| !root.trim().is_empty())
         .map(PathBuf::from);
     Ok(Some(LaunchMemoryContext {
+        index_snapshot: Some(super::idle_note::Snapshot::new(&scope, index.as_deref().unwrap_or(""))),
         scope,
         instructions,
         project_workspace_root,
@@ -328,6 +331,8 @@ You have a persistent, file-based memory shared by every agent in project `{proj
 
 `{dir}`
 
+Full index: `{index_path}`
+
 Use it to remember what will matter in future conversations: who the user is and how they like to work, feedback they have given, decisions and context about this project that are not in the code, and where to find things outside the repository.
 
 ## How to save a memory
@@ -355,7 +360,7 @@ Types:
 - `project`: goals, decisions, constraints, deadlines and who does what, when not derivable from the code or git history.
 - `reference`: pointers to external resources (dashboards, documents, tickets, hosts, channels).
 
-Then add or update exactly one line for it in the index `{index_path}`:
+Then add or update exactly one line for it in the index `{index_path}`. Prepend new entries at the top so the newest memories survive truncation; update an existing entry in place:
 
 `- [Title](file-name.md) — one-line hook`
 
@@ -381,7 +386,7 @@ The index holds no memory content of its own. It is loaded into every agent's co
             out.push_str(&kept);
             if truncated {
                 out.push_str(&format!(
-                    "\n[MEMORY.md truncated to {MEMORY_INDEX_MAX_LINES} lines / {} KB; read the full file at {index_path} and keep the index concise]\n",
+                    "\n[MEMORY.md truncated to {MEMORY_INDEX_MAX_LINES} lines / {} KB; before relying on memory, read the full file at {index_path}. Keep the index concise.]\n",
                     MEMORY_INDEX_MAX_BYTES / 1024
                 ));
             }
@@ -470,6 +475,7 @@ mod tests {
         assert_eq!(independent.runtime_workspace_roots, None);
 
         let memory = LaunchMemoryContext {
+            index_snapshot: None,
             scope: scope(),
             instructions: render_memory_instructions(&scope(), None),
             project_workspace_root: None,
@@ -497,6 +503,7 @@ mod tests {
     #[test]
     fn file_references_use_project_workspace_root_when_set() {
         let memory = LaunchMemoryContext {
+            index_snapshot: None,
             scope: scope(),
             instructions: render_memory_instructions(&scope(), None),
             project_workspace_root: Some(PathBuf::from("/projects/alpha")),
@@ -517,6 +524,7 @@ mod tests {
         LaunchAugmentation {
             harness: None,
             memory: Some(LaunchMemoryContext {
+                index_snapshot: None,
                 scope: scope(),
                 instructions: render_memory_instructions(&scope(), None),
                 project_workspace_root: None,
@@ -669,6 +677,7 @@ mod tests {
     #[test]
     fn merges_with_existing_instructions_and_builds_roots() {
         let context = LaunchMemoryContext {
+            index_snapshot: None,
             scope: scope(),
             instructions: "# Memory\nbody\n".to_string(),
             project_workspace_root: None,

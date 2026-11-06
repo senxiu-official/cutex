@@ -37,7 +37,14 @@ impl Reply {
         }
     }
     fn error(error: RelayError, approval: Option<&str>) -> Self {
+        Self::error_with(error, None, approval)
+    }
+    /// With the desktop's checked failure detail (browser-error-detail-v1).
+    fn error_with(error: RelayError, detail: Option<&Value>, approval: Option<&str>) -> Self {
         let mut value = error.value();
+        if let Some(detail) = detail {
+            value["error"]["details"] = detail.clone();
+        }
         if let Some(id) = approval {
             value["error"]["details"]["approvalId"] = json!(id);
         }
@@ -48,17 +55,25 @@ impl Reply {
             retained: None,
         }
     }
+    /// An MCP result (`{content, isError?}`) as is.
+    pub(super) fn mcp(value: Value) -> Self {
+        Self::success(value)
+    }
+    /// One JSON text block.
+    pub(super) fn text(value: Value) -> Self {
+        Self::success(super::results::text_result(value))
+    }
     fn capacity(full: request_idempotency::CapacityExceeded) -> Self {
         let mut value = RelayError::new("idempotency_capacity_exceeded").value();
         value["error"]["details"] = full.details();
         Self { status: 503, value: Arc::new(value), delivered: None, retained: None }
     }
 }
-fn repository() -> Result<&'static RequestIdempotencyRepository> {
+pub(super) fn repository() -> Result<&'static RequestIdempotencyRepository> {
     request_idempotency::request_idempotency_repository()
         .map_err(|_| RelayError::new("browser_unavailable"))
 }
-fn prefix(agent: &auth::AgentContext) -> String {
+pub(super) fn prefix(agent: &auth::AgentContext) -> String {
     format!(
         "browser:{:x}:",
         Sha256::digest(format!("{}\0{}", agent.credential_identity, agent.session).as_bytes())
@@ -358,6 +373,8 @@ pub fn submit(
         }
         let mut plan = plan.ok_or(RelayError::new("unsupported_operation"))?;
         normalize_operation(&mut plan)?;
+        let popup_opener = if input.tool == "browser_act" { plan.lease_id.clone() } else { None };
+        let admitted_at = Instant::now();
         let expected_identity = agent.clone();
         let identity_request = SimpleHttpRequest {
             method: "POST".into(),
@@ -419,6 +436,10 @@ pub fn submit(
             relay.enqueue(admission)?;
         }
         let reply = wait(relay, repo, &key, stream, true);
+        let reply = match (reply, popup_opener) {
+            (Ok(reply), Some(opener)) => Ok(with_new_tab(relay, reply, &opener, admitted_at)),
+            (reply, _) => reply,
+        };
         if let Ok(receipt) = relay.receipt(&key) {
             let _ = settle_admission(repo, &claim, receipt);
         }
@@ -437,6 +458,26 @@ pub fn submit(
             }
         }
     }
+}
+/// How long a click that opened a tab waits for that tab's lease (the desktop
+/// grants it once the tab's first navigation commits or fails).
+pub const POPUP_GRANT_WAIT: Duration = Duration::from_secs(5);
+/// A click result saying `newTab: true` names the tab it opened, now under
+/// this agent's control, or says it is still on its way.
+fn with_new_tab(relay: &Relay, reply: Reply, opener: &str, since: Instant) -> Reply {
+    if reply.status != 200 {
+        return reply;
+    }
+    let Some(mut body) = reply.value.pointer("/content/0/text").and_then(Value::as_str).and_then(|t| serde_json::from_str::<Value>(t).ok()) else { return reply; };
+    if body["newTab"] != true {
+        return reply;
+    }
+    body["newTab"] = match relay.await_popup(opener, since, POPUP_GRANT_WAIT) {
+        Some(lease) => json!({"guestId": lease.target.guest_id, "title": lease.title, "url": safe_url(&lease.url),
+            "note": "This click opened a new tab, now under your control; read it by this guestId."}),
+        None => json!({"pending": true, "note": "This click opened a new tab that is not under your control yet; check browser_list shortly."}),
+    };
+    Reply { value: Arc::new(super::results::text_result(body)), ..reply }
 }
 /// How long browser_claim waits for the desktop's own grant of the pending
 /// approval before answering approval_required.
@@ -546,10 +587,11 @@ fn wait(
                     retained: Some(content),
                 });
             }
-            return Ok(Reply::error(
+            return Ok(Reply::error_with(
                 receipt
                     .code
                     .unwrap_or(RelayError::new("request_result_not_retained")),
+                receipt.detail.as_ref(),
                 None,
             ));
         }
@@ -591,6 +633,11 @@ pub fn status(
     let old = repo
         .browser_lookup(&prefix(&agent), id)
         .map_err(|_| RelayError::new("browser_unavailable"))?;
+    // A definite refusal releases its row so the caller can resend; another
+    // agent's rows are not visible under this prefix. Either way nothing is kept.
+    if old.is_empty() {
+        return Err(RelayError::new("request_result_not_retained"));
+    }
     if old.len() != 1 {
         return Err(RelayError::new("permission_denied"));
     }
@@ -796,7 +843,7 @@ mod tests {
     #[test]
     fn browser_deterministic_refusal_classification_is_operation_and_dispatch_specific() {
         let mut receipt = Receipt { key: "k".into(), status: Status::Failed, dispatched: true,
-            operation_kind: "tab.act".into(), code: None, content: None, claim: None };
+            operation_kind: "tab.act".into(), code: None, detail: None, content: None, claim: None };
         for kind in ["tab.act", "tab.navigate", "tabs.open"] {
             receipt.operation_kind = kind.into();
             for code in ["permission_denied", "target_hidden", "owner_paused", "invalid_request", "browser_identity_unavailable", "unsupported_operation", "scope_invalid", "scope_unsupported", "navigation_failed", "service_auth_failed", "service_unavailable", "deadline_exceeded", "cancelled", "outcome_unknown"] {
@@ -833,7 +880,7 @@ mod tests {
         let scope = format!("{prefix}device");
         let BeginRequest::Forward(old) = repo.begin(&scope, "r", &json!({})).unwrap() else { panic!(); };
         let old_receipt = Receipt { key: "k".into(), status: Status::Failed, dispatched: true,
-            operation_kind: "tab.act".into(), code: Some(RelayError::new("target_hidden")), content: None, claim: Some(old) };
+            operation_kind: "tab.act".into(), code: Some(RelayError::new("target_hidden")), detail: None, content: None, claim: Some(old) };
         settle_receipt(&repo, &old_receipt).unwrap();
         let BeginRequest::Forward(new) = repo.begin(&scope, "r", &json!({})).unwrap() else { panic!(); };
         settle_admission(&repo, &new, old_receipt).unwrap();

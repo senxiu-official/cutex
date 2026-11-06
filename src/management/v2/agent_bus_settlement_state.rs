@@ -1,7 +1,7 @@
 //! Same-row durable evidence, close audit and recoverable per-session outbox.
 use super::super::agent_bus_settlement_model::{
     CloseOutcome, CloseRequest, Closure, Evidence, Refusal, SettlementRecord, SettlementView,
-    EVENT_METHOD,
+    StaleAckEvidence, EVENT_METHOD, STALE_ACK_MIN_WAIT_SECS,
 };
 use super::*;
 
@@ -12,6 +12,50 @@ pub(super) const EVIDENCE_STORE: &str = "agent_bus_settlement_evidence";
 struct ObservationRow {
     version: u8,
     record: SettlementRecord,
+}
+
+/// Attach only the requested evidence inside the caller's business-row snapshot.
+/// Observation failures stay non-authoritative, as with refresh_observations.
+pub(super) fn observe_selected(
+    db: &rusqlite::Connection,
+    messages: &mut BTreeMap<String, StoredAgentBusMessage>,
+) -> bool {
+    let result = (|| -> anyhow::Result<()> {
+        for (id, stored) in messages.iter_mut() {
+            if stored.settlement.is_some() {
+                continue;
+            }
+            let Some(bytes) =
+                super::super::hot_store::verified_row(db, EVIDENCE_STORE, "evidence", id)?
+            else {
+                continue;
+            };
+            let row: ObservationRow = serde_json::from_slice(&bytes)?;
+            row.record.evidence.validate_shape()?;
+            anyhow::ensure!(
+                row.version == 1
+                    && row.record.closure.is_none()
+                    && row.record.request.is_none()
+                    && row.record.audit.is_none()
+                    && row.record.pending_sessions.is_empty(),
+                "invalid settlement observation"
+            );
+            if validate_settlement_record(stored, &row.record).is_ok() {
+                stored.observed_settlement = Some(row.record);
+            }
+        }
+        Ok(())
+    })();
+    let available = result.is_ok();
+    if let Err(error) = result {
+        for stored in messages.values_mut() {
+            stored.observed_settlement = None;
+        }
+        eprintln!(
+            "settlement observation rejected (business state remains authoritative): {error:#}"
+        );
+    }
+    available
 }
 
 fn current_record(stored: &StoredAgentBusMessage) -> Option<&SettlementRecord> {
@@ -95,6 +139,10 @@ pub(super) fn settlement_closed(stored: &StoredAgentBusMessage) -> bool {
 }
 
 fn ordinary(stored: &StoredAgentBusMessage) -> bool {
+    ordinary_agent(stored, false)
+}
+
+fn ordinary_agent(stored: &StoredAgentBusMessage, allow_passive: bool) -> bool {
     stored.canonical_envelope.as_ref().is_some_and(|message| {
         message.kind == crate::agent_bus::model::AgentBusEnvelopeKind::Message
             && message.sender_kind.is_agent()
@@ -110,14 +158,151 @@ fn ordinary(stored: &StoredAgentBusMessage) -> bool {
                 envelope.message.event_type == "agent_message"
                     && envelope.message.source.kind
                         == crate::app_server::external_input::SourceKind::Agent
-                    && envelope.message.delivery
-                        != crate::app_server::external_input::Delivery::Passive
+                    && (allow_passive
+                        || envelope.message.delivery
+                            != crate::app_server::external_input::Delivery::Passive)
             })
 }
 
+/// Only the canonical Claude Task service record may cross the control fence.
+/// Reconstruct frozen text/view using the producer's provenance-checked helpers.
+fn claude_task(stored: &StoredAgentBusMessage) -> bool {
+    use crate::agent_bus::claude_task as task;
+    use crate::app_server::external_input::{Delivery, SourceKind};
+    let Some(message) = &stored.canonical_envelope else {
+        return false;
+    };
+    let Some(envelope) = &stored.snapshot.external_input else {
+        return false;
+    };
+    let Ok((notice, text)) = task::model_text(message) else {
+        return false;
+    };
+    let Ok(view) = task::view(message, &notice) else {
+        return false;
+    };
+    let Ok(request) = task::send_request(&stored.owner_cutex_session_id, &notice) else {
+        return false;
+    };
+    stored.snapshot.from_cutex_session_id.is_none()
+        && message.id == stored.snapshot.message_id
+        && message.to_cutex_session_id.as_deref() == Some(stored.owner_cutex_session_id.as_str())
+        && stored.snapshot.to_cutex_session_id == stored.owner_cutex_session_id
+        && message.external_action_id.is_none()
+        && message.display_source.is_none()
+        && message.submit_mode.is_none()
+        && message.trigger_turn
+        && message.content == request.content
+        && stored.snapshot.content == message.content
+        && stored.snapshot.delivery_mode == "after_turn"
+        && envelope.version == 2
+        && envelope.owner_id == stored.owner_cutex_session_id
+        && envelope.message.id == message.id
+        && envelope.message.source.kind == SourceKind::Service
+        && envelope.message.source.id == task::SOURCE_ID
+        && envelope.message.event_type == task::EVENT_TYPE
+        // Ingress promotes an after-turn Task wake to Soon at a next-step
+        // boundary. Canonical content/view still bind the original delivery.
+        && matches!(envelope.message.delivery, Delivery::AfterTurn | Delivery::Soon)
+        && envelope.message.text == text
+        && envelope.view.as_ref() == Some(&view)
+        && envelope.semantic_sha256 == envelope.digest()
+}
+
+fn stale_kind(stored: &StoredAgentBusMessage) -> bool {
+    (ordinary_agent(stored, true)
+        && stored.canonical_envelope.as_ref().is_some_and(|message| {
+            message.id == stored.snapshot.message_id
+                && message.to_cutex_session_id.as_deref()
+                    == Some(stored.owner_cutex_session_id.as_str())
+                && message.from_cutex_session_id == stored.snapshot.from_cutex_session_id
+                && stored
+                    .snapshot
+                    .external_input
+                    .as_ref()
+                    .is_some_and(|envelope| {
+                        Some(envelope.message.source.id.as_str())
+                            == message.from_cutex_session_id.as_deref()
+                            && (envelope.message.delivery
+                                != crate::app_server::external_input::Delivery::Passive
+                                || (message.delivery_mode
+                                    == crate::agent_bus::delivery::AgentDeliveryMode::Passive
+                                    && stored.snapshot.delivery_mode == "passive"))
+                    })
+        }))
+        || claude_task(stored)
+}
+
+/// Legacy business timestamps are conservative: later business observations
+/// can delay eligibility, but can never move acceptance earlier than enqueue.
+fn accepted_at(stored: &StoredAgentBusMessage) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(
+        stored
+            .inbox_accepted_at
+            .as_deref()
+            .unwrap_or(&stored.updated_at),
+    )
+    .ok()
+    .map(|time| time.with_timezone(&Utc))
+}
+
+fn stale_candidate(stored: &StoredAgentBusMessage, now: DateTime<Utc>) -> Option<StaleAckEvidence> {
+    if !stale_kind(stored) || !delivery_eligible(stored) || settlement_closed(stored) {
+        return None;
+    }
+    let envelope = stored.snapshot.external_input.as_ref()?;
+    let local = stored.snapshot.local_inbox_receipt.as_ref()?;
+    let status = stored.snapshot.external_input_last_observed.as_ref()?;
+    if envelope.validate().is_err()
+        || envelope.owner_id != stored.owner_cutex_session_id
+        || envelope.message.id != stored.snapshot.message_id
+        || local["durable"] != true
+        || local["receiptScope"] != "local-inbox"
+        || local["threadId"] != envelope.thread_id
+        || local["messageId"] != envelope.message.id
+        || local["contextPersisted"] == true
+        || !local["semanticSha256"].as_str().is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+        || status.message_id != envelope.message.id
+        || status.semantic_sha256 != envelope.semantic_sha256
+    {
+        return None;
+    }
+    let queued_at = DateTime::parse_from_rfc3339(stored.queued_at.as_deref()?)
+        .ok()?
+        .with_timezone(&Utc);
+    let accepted_at = accepted_at(stored)?;
+    if accepted_at < queued_at
+        || accepted_at
+            .checked_add_signed(chrono::Duration::seconds(STALE_ACK_MIN_WAIT_SECS as i64))?
+            > now
+    {
+        return None;
+    }
+    Some(StaleAckEvidence {
+        queued_at,
+        accepted_at,
+        min_wait_secs: STALE_ACK_MIN_WAIT_SECS,
+        later_completed_turn_id: None,
+        native_attempt_id: status.processing.attempt_id.clone(),
+    })
+}
+
 fn eligible(stored: &StoredAgentBusMessage) -> bool {
-    ordinary(stored)
-        && stored.snapshot.state == "inbox_accepted"
+    (ordinary(stored) || stale_kind(stored)) && delivery_eligible(stored)
+}
+
+fn evidence_kind(stored: &StoredAgentBusMessage, evidence: &Evidence) -> bool {
+    if evidence.stale_ack.is_some() {
+        stale_kind(stored)
+    } else {
+        ordinary(stored)
+    }
+}
+
+fn delivery_eligible(stored: &StoredAgentBusMessage) -> bool {
+    stored.snapshot.state == "inbox_accepted"
         && stored.snapshot.a4_receipt.is_none()
         && stored.snapshot.external_input_receipt.is_none()
         && stored
@@ -148,6 +333,20 @@ pub(super) fn settlement_view(
     })
 }
 
+/// UUIDv5 bookkeeping for a passive input with no assigned turn. This is never
+/// a native attempt claim; only stale passive evidence may use this identity.
+fn unassigned_attempt_id(thread: &str) -> String {
+    let mut sha = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+    sha.update(uuid::Uuid::NAMESPACE_URL.as_bytes());
+    sha.update(format!("cute-claude:external:{thread}:unassigned").as_bytes());
+    let digest = sha.finish();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest.as_ref()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
 fn evidence_bound(stored: &StoredAgentBusMessage, evidence: &Evidence) -> bool {
     let Some(envelope) = &stored.snapshot.external_input else {
         return false;
@@ -159,6 +358,14 @@ fn evidence_bound(stored: &StoredAgentBusMessage, evidence: &Evidence) -> bool {
         return false;
     };
     evidence.validate_shape().is_ok()
+        && evidence_kind(stored, evidence)
+        && evidence.stale_ack.as_ref().is_none_or(|proof| {
+            stale_candidate(stored, evidence.observed_at).is_some_and(|candidate| {
+                candidate.queued_at == proof.queued_at
+                    && candidate.accepted_at == proof.accepted_at
+                    && candidate.min_wait_secs == proof.min_wait_secs
+            })
+        })
         && evidence.schema_version == 1
         && evidence.runtime == "claude"
         && evidence.recipient_id == stored.owner_cutex_session_id
@@ -174,7 +381,27 @@ fn evidence_bound(stored: &StoredAgentBusMessage, evidence: &Evidence) -> bool {
         && local["semanticSha256"] == evidence.local_semantic_sha256
         && status.message_id == evidence.message_id
         && status.semantic_sha256 == evidence.semantic_sha256
-        && status.processing.attempt_id.as_deref() == Some(evidence.attempt_id.as_str())
+        && match &evidence.stale_ack {
+            None => status.processing.attempt_id.as_deref() == Some(evidence.attempt_id.as_str()),
+            Some(proof) => {
+                proof.native_attempt_id == status.processing.attempt_id
+                    && match status.processing.attempt_id.as_deref() {
+                        Some(attempt) => attempt == evidence.attempt_id,
+                        None => {
+                            proof.later_completed_turn_id.is_some()
+                                && (status.processing.state
+                                    == crate::app_server::external_input::ProcessingState::Pending
+                                    || (status.processing.state
+                                        == crate::app_server::external_input::ProcessingState::None
+                                        && envelope.message.delivery
+                                            == crate::app_server::external_input::Delivery::Passive
+                                        && evidence.actual_turn_id == "unassigned"
+                                        && evidence.attempt_id
+                                            == unassigned_attempt_id(&evidence.thread_id)))
+                        }
+                    }
+            }
+        }
         && match evidence.processing_state.as_str() {
             "held" => {
                 status.processing.state == crate::app_server::external_input::ProcessingState::Held
@@ -183,18 +410,21 @@ fn evidence_bound(stored: &StoredAgentBusMessage, evidence: &Evidence) -> bool {
                 status.processing.state
                     == crate::app_server::external_input::ProcessingState::OutputObserved
             }
+            "claimed" if evidence.stale_ack.is_some() => {
+                status.processing.state
+                    == crate::app_server::external_input::ProcessingState::Claimed
+            }
+            "pending" if evidence.stale_ack.is_some() => {
+                status.processing.state
+                    == crate::app_server::external_input::ProcessingState::Pending
+            }
+            "none" if evidence.stale_ack.is_some() => {
+                status.processing.state == crate::app_server::external_input::ProcessingState::None
+            }
             _ => false,
         }
         && !evidence.actual_turn_id.trim().is_empty()
         && uuid::Uuid::parse_str(&evidence.attempt_id).is_ok_and(|id| !id.is_nil())
-        && matches!(
-            evidence.processing_state.as_str(),
-            "held" | "output_observed"
-        )
-        && matches!(
-            evidence.terminal_status.as_str(),
-            "interrupted" | "failed" | "completed"
-        )
         && evidence.observation_sha256.len() == 64
         && evidence
             .observation_sha256
@@ -213,6 +443,20 @@ pub(super) fn validate_settlement_record(
         .as_ref()
         .context("settlement has no frozen native identity")?;
     record.evidence.validate_shape()?;
+    if let Some(proof) = &record.evidence.stale_ack {
+        anyhow::ensure!(
+            stored.queued_at.as_deref().and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                .is_some_and(|queued| queued.with_timezone(&Utc) == proof.queued_at)
+                && evidence_kind(stored, &record.evidence)
+                // A legacy fallback is updated by close itself. Bind it before
+                // commit; historical closure/audit must survive that timestamp.
+                && (record.closure.is_some() || accepted_at(stored) == Some(proof.accepted_at))
+                && (record.evidence.processing_state != "none"
+                    || (envelope.message.delivery == crate::app_server::external_input::Delivery::Passive
+                        && record.evidence.attempt_id == unassigned_attempt_id(&record.evidence.thread_id))),
+            "stale acknowledgement durable identity changed"
+        );
+    }
     anyhow::ensure!(
         record.evidence.schema_version == 1
             && record.evidence.message_id == stored.snapshot.message_id
@@ -254,7 +498,10 @@ fn check_candidate(
     request: &CloseRequest,
     now: DateTime<Utc>,
 ) -> Result<(), Refusal> {
-    if !ordinary(stored) {
+    if !(ordinary(stored)
+        || (stale_kind(stored)
+            && current_record(stored).is_some_and(|record| record.evidence.stale_ack.is_some())))
+    {
         return Err(conflict(
             "message_protected",
             "only ordinary active agent messages with bound terminal evidence may be closed",
@@ -330,6 +577,29 @@ fn replay(
 }
 
 impl AgentBusMessageRepository {
+    /// Coherent frozen identity + durable age/provenance proof for the collector.
+    pub fn stale_ack_candidate_context(
+        &self,
+        message_id: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<(AgentBusMessageSnapshot, StaleAckEvidence)>> {
+        self.read(|store| {
+            Ok(store.messages.get(message_id).and_then(|stored| {
+                stale_candidate(stored, now).map(|proof| (stored.snapshot.clone(), proof))
+            }))
+        })
+    }
+
+    pub fn stale_ack_candidate(
+        &self,
+        message_id: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<StaleAckEvidence>> {
+        Ok(self
+            .stale_ack_candidate_context(message_id, now)?
+            .map(|(_, proof)| proof))
+    }
+
     /// Source-derived kit guards: raw row bytes from an already-open read-only
     /// WAL snapshot. They do not open repositories, create locks, or deserialize
     /// business rows through a decoder that ignores future fields.
@@ -519,6 +789,24 @@ impl AgentBusMessageRepository {
         request
             .validate()
             .map_err(|error| anyhow::anyhow!(error.message))?;
+        let database = self.root.join(super::super::hot_store::DATABASE_FILE);
+        if let Some(result) =
+            super::super::hot_store::verified_snapshot(&database, "agent_bus", |db, _| {
+                let mut ids = super::super::hot_store::close_request_keys(db, &request.request_id)?;
+                ids.push(request.message_id.clone());
+                ids.sort();
+                ids.dedup();
+                let keys = ids
+                    .into_iter()
+                    .map(|id| ("message".into(), id))
+                    .chain(std::iter::once(("state".into(), "version".into())));
+                let rows = super::super::hot_store::bus_changes::keyed_rows(db, "agent_bus", keys)?;
+                let store = super::bus_store_from_rows(&rows)?;
+                Ok(replay(&store, request, actor, Utc::now()))
+            })?
+        {
+            return Ok(result);
+        }
         self.read(|store| Ok(replay(store, request, actor, Utc::now())))
     }
 
@@ -527,7 +815,7 @@ impl AgentBusMessageRepository {
         request: &CloseRequest,
         now: DateTime<Utc>,
     ) -> anyhow::Result<Result<AgentBusMessageSnapshot, Refusal>> {
-        self.read(|store| {
+        self.read_selected(Some(&[request.message_id.clone()]), |store| {
             if !store.messages.contains_key(&request.message_id) {
                 return Ok(Err(Refusal::new(
                     404,
@@ -606,7 +894,7 @@ impl AgentBusMessageRepository {
                 "an authenticated owner actor is required",
             )));
         }
-        self.update_message(&request.message_id, |store| {
+        self.update_keyed(super::DirtyRows::Messages(vec![request.message_id.clone()]), Some(&request.request_id), |store| {
             let now = clock();
             match replay(store, request, actor, now) {
                 Ok(Some(outcome)) => return Ok((Ok(outcome), false)),
@@ -684,7 +972,7 @@ impl AgentBusMessageRepository {
         &self,
         publish: &dyn Fn(&str, &str, Value) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let pending = self.read(|store| {
+        let pending = self.read_matching(super::super::hot_store::settlement_outbox_rows, |store| {
             Ok(store
                 .messages
                 .values()
@@ -840,6 +1128,14 @@ mod tests {
                 .unwrap();
             self.repo.record_local_inbox(TO,id,&json!({"messageId":id,"threadId":"thread","turnId":"reserved",
                 "semanticSha256":"b".repeat(64),"durable":true,"receiptScope":"local-inbox","state":"queued"})).unwrap();
+            // The acceptance API uses the wall clock; pin fixture time explicitly.
+            self.repo
+                .mutate_message(id, |store| {
+                    store.messages.get_mut(id).unwrap().inbox_accepted_at =
+                        Some(self.now.to_rfc3339());
+                    Ok(())
+                })
+                .unwrap();
             let attempt = uuid::Uuid::new_v4().to_string();
             let status = Status {
                 message_id: id.into(),
@@ -864,6 +1160,7 @@ mod tests {
                 .observe_external_input(id, &envelope, &status)
                 .unwrap();
             let evidence = Evidence {
+                stale_ack: None,
                 observing_generation: None,
                 schema_version: 1,
                 runtime: "claude".into(),
@@ -903,6 +1200,8 @@ mod tests {
             self.repo.get(id).unwrap().unwrap()
         }
     }
+    include!("agent_bus_stale_ack_tests.rs");
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);

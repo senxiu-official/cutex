@@ -1,5 +1,7 @@
 //! Process-local asks lock diagnostics. Fixed labels only: no paths, resource
-//! IDs, request IDs, caller names, payloads or error text are accepted.
+//! IDs, request IDs, caller names, payloads or error text are accepted. The
+//! slow line's `site` is the lock call's compile-time source location
+//! (`#[track_caller]`, `src/...rs:line`), like lock accounting's `caller`.
 //! There are 64 atomic live slots; overflow loses diagnostics, never admission.
 //! Snapshotting does not acquire a store lock. Records/slow stderr output are
 //! constructed only AFTER this guard has closed its OS lock handle.
@@ -207,11 +209,14 @@ struct Span {
     serial: u64,
     previous: Option<(usize, u64)>,
     acquired: bool,
+    /// Source location of the lock call (compile-time constant, `file:line`):
+    /// which call site held or waited, in the slow line.
+    site: &'static std::panic::Location<'static>,
     // TLS stage attribution and span completion must stay on the lock thread.
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl Span {
-    fn begin(operation: Operation, mode: Mode) -> Option<Self> {
+    fn begin(operation: Operation, mode: Mode, site: &'static std::panic::Location<'static>) -> Option<Self> {
         let r = registry();
         let index = r.slots.iter().position(|s| {
             s.phase
@@ -244,6 +249,7 @@ impl Span {
             serial,
             previous,
             acquired: false,
+            site,
             _thread: std::marker::PhantomData,
         })
     }
@@ -324,7 +330,8 @@ impl Drop for Span {
             let value = json!({"schema":1,"timestamp":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),
                 "pid":std::process::id(),"operation":op.label(),"mode":mode.label(),
                 "acquisition":if self.acquired {"acquired"} else {"failed"},"released":true,
-                "waitNs":wait,"holdNs":hold,"reclaimNs":reclaim,"stagesNs":stages});
+                "waitNs":wait,"holdNs":hold,"reclaimNs":reclaim,"stagesNs":stages,
+                "site":format!("{}:{}", self.site.file(), self.site.line())});
             #[cfg(test)]
             if TEST_SINK.with(|sink| {
                 let hook = sink.borrow_mut().take();
@@ -348,6 +355,7 @@ impl Drop for Span {
 pub struct Waiter {
     span: Option<Span>,
     untracked: Option<SuppressedCurrent>,
+    accounting: Option<crate::platform::lock_accounting::Attempt>,
 }
 // An overflowing nested scope must not charge its stages to an outer holder.
 struct SuppressedCurrent(Option<(usize, u64)>);
@@ -357,15 +365,31 @@ impl Drop for SuppressedCurrent {
     }
 }
 impl Waiter {
+    #[track_caller]
     pub fn new(operation: Operation, mode: Mode) -> Self {
-        let span = Span::begin(operation, mode);
+        let span = Span::begin(operation, mode, std::panic::Location::caller());
         let untracked = span
             .is_none()
             .then(|| SuppressedCurrent(CURRENT.with(|current| current.replace(None))));
-        Self { span, untracked }
+        let accounting = if matches!(mode, Mode::Exclusive) {
+            Some(crate::platform::lock_accounting::Attempt::begin(
+                crate::platform::lock_accounting::Lock::AsksWrite,
+                crate::platform::lock_accounting::Kind::Blocking,
+            ))
+        } else {
+            None
+        };
+        Self {
+            span,
+            untracked,
+            accounting,
+        }
     }
     /// Call only after successful OS acquisition on `file`.
     pub fn acquired(mut self, file: File) -> LockGuard {
+        if let Some(attempt) = &mut self.accounting {
+            attempt.acquired();
+        }
         if let Some(span) = &mut self.span {
             span.acquired();
         }
@@ -373,6 +397,7 @@ impl Waiter {
             file: Some(file),
             span: self.span.take(),
             untracked: self.untracked.take(),
+            accounting: self.accounting.take(),
         }
     }
 }
@@ -388,11 +413,13 @@ pub struct LockGuard {
     file: Option<File>,
     span: Option<Span>,
     untracked: Option<SuppressedCurrent>,
+    accounting: Option<crate::platform::lock_accounting::Attempt>,
 }
 pub struct Released {
     span: Option<Span>,
 }
 impl LockGuard {
+    #[track_caller]
     pub fn acquire(file: File, operation: Operation, mode: Mode) -> io::Result<Self> {
         let waiter = Waiter::new(operation, mode);
         let result = match mode {
@@ -411,20 +438,28 @@ impl LockGuard {
     /// File close releases the OS lock BEFORE any reclaim or slow-log output.
     pub fn release(mut self) -> Released {
         drop(self.file.take());
+        if let Some(a) = &mut self.accounting {
+            a.released();
+        }
         drop(self.untracked.take());
         let mut span = self.span.take();
         if let Some(span) = &mut span {
             span.released();
         }
+        drop(self.accounting.take());
         Released { span }
     }
 }
 impl Drop for LockGuard {
     fn drop(&mut self) {
         drop(self.file.take());
+        if let Some(a) = &mut self.accounting {
+            a.released();
+        }
         if let Some(mut span) = self.span.take() {
             span.released();
         }
+        drop(self.accounting.take());
     }
 }
 impl Drop for Released {
@@ -498,7 +533,8 @@ pub fn snapshot() -> Value {
         }
     }
     json!({"schema":1,"scope":"process","pid":std::process::id(),"approximate":true,
-        "capacity":SLOTS,"completed":r.completed.load(Ordering::Relaxed),"untracked":r.lost.load(Ordering::Relaxed),"active":active})
+        "capacity":SLOTS,"completed":r.completed.load(Ordering::Relaxed),"untracked":r.lost.load(Ordering::Relaxed),"active":active,
+        "accounting":crate::platform::lock_accounting::snapshot()})
 }
 
 #[cfg(test)]
@@ -657,7 +693,8 @@ mod tests {
         assert_eq!(record["released"], true);
         assert!(record["reclaimNs"].as_u64().unwrap() >= 40_000_000);
         assert_eq!(record["stagesNs"]["reclaim"], record["reclaimNs"]);
-        assert_eq!(record.as_object().unwrap().len(), 11);
+        assert_eq!(record.as_object().unwrap().len(), 12);
+        assert!(record["site"].as_str().is_some_and(|site| site.contains(".rs:")), "{record}");
         assert!(record["holdNs"].as_u64().unwrap() < record["reclaimNs"].as_u64().unwrap());
     }
 

@@ -18,7 +18,7 @@ pub fn replacement_hint(old: &str, caller: Option<&str>) -> Result<Option<Value>
         .map_err(store::unavailable)?
         .read()
         .map_err(store::unavailable)?;
-    let roster = crate::memory::load_agent_management_snapshot().map_err(store::unavailable)?;
+    let roster = crate::memory::load_agent_management_directory().map_err(store::unavailable)?;
     let config = crate::config::store::load_codez_config_checked().map_err(store::unavailable)?;
     let boundary =
         crate::agent_bus::boundary::AgentBoundary::from_snapshot(&config.agent_security, &roster);
@@ -49,7 +49,7 @@ pub fn replacement_hint(old: &str, caller: Option<&str>) -> Result<Option<Value>
     Ok(record.map(|(change,current)|json!({"projectId":change.project_id,"previousDirector":old,"currentDirector":current.authorized_director_session,"authorityEpoch":current.authority_epoch,"changeId":change.change_id,"targetRef":{"kind":"projectDirector","projectId":change.project_id},"automaticForwarding":false})))
 }
 pub fn reviews_for(caller: &str) -> Result<Value, AskError> {
-    let roster = crate::memory::load_agent_management_snapshot().map_err(store::unavailable)?;
+    let roster = crate::memory::load_agent_management_directory().map_err(store::unavailable)?;
     let projects: std::collections::BTreeSet<_> = roster
         .projects
         .values()
@@ -99,7 +99,7 @@ pub(crate) fn review_handover_as(
     let roster_store = crate::agent_management::AgentManagementStore::open_default()
         .map_err(store::unavailable)?;
     let _fence = roster_store.lock_mutations().map_err(store::unavailable)?;
-    let roster = roster_store.snapshot().map_err(store::unavailable)?;
+    let roster = roster_store.directory_snapshot_shared().map_err(store::unavailable)?;
     let store = Store::open_default()?;
     let before = store.snapshot()?;
     let review = before
@@ -177,7 +177,7 @@ pub fn read_start(caller: &str, args: &Value) -> Result<Value, AskError> {
     let roster_store = crate::agent_management::AgentManagementStore::open_default()
         .map_err(store::unavailable)?;
     let _fence = roster_store.lock_mutations().map_err(store::unavailable)?;
-    let roster = roster_store.snapshot().map_err(store::unavailable)?;
+    let roster = roster_store.directory_snapshot_shared().map_err(store::unavailable)?;
     let ext = mg::ManagementStore::open_default()
         .map_err(store::unavailable)?
         .read()
@@ -231,7 +231,7 @@ pub(crate) fn review_start_as(
     let roster_store = crate::agent_management::AgentManagementStore::open_default()
         .map_err(store::unavailable)?;
     let _fence = roster_store.lock_mutations().map_err(store::unavailable)?;
-    let roster = roster_store.snapshot().map_err(store::unavailable)?;
+    let roster = roster_store.directory_snapshot_shared().map_err(store::unavailable)?;
     let store = mg::ManagementStore::open_default().map_err(store::unavailable)?;
     let before = store.read().map_err(store::unavailable)?;
     let review = before

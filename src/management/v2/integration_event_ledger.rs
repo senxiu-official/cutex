@@ -20,7 +20,34 @@ const MARKER: &[u8] = b"{\"ledgerVersion\":2}\n";
 
 pub(super) struct Ledger(Connection);
 
-#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Location {
+    key: String,
+    stream: String,
+    cursor: String,
+    sequence: u64,
+}
+impl Location {
+    pub(super) fn of(event: &super::EventEnvelope) -> Option<Self> {
+        let (message, action) = event
+            .cutex
+            .as_ref()
+            .zip(event.correlation.management_request_id.as_ref())?;
+        Some(Self {
+            key: format!(
+                "{}\u{0}{}\u{0}{}",
+                event.cutex_session_id, message.method, action
+            ),
+            stream: event.stream_id.clone(),
+            cursor: event.cursor.clone(),
+            sequence: event.sequence,
+        })
+    }
+    pub(super) fn bytes(&self) -> usize {
+        self.key.len() + self.stream.len() + self.cursor.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Identity {
     Pending,
     Committed,
@@ -92,6 +119,28 @@ impl Ledger {
             "integration dedupe database is missing; restore its backup"
         );
         transaction.commit()?;
+        // Optional lookup cache only. The authoritative v1 identities schema,
+        // marker, health and downgrade export remain unchanged; older writers
+        // ignore these tables. Losing cache rows requires journal catch-up,
+        // never forgetting a pending/committed identity.
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS integration_locations (
+            identity TEXT PRIMARY KEY, stream_id TEXT NOT NULL, cursor TEXT NOT NULL, sequence INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS integration_lookup_checkpoint (
+            id INTEGER PRIMARY KEY CHECK(id=1), stream_id TEXT NOT NULL, cursor TEXT NOT NULL,
+            sequence INTEGER NOT NULL DEFAULT 0, next_offset INTEGER NOT NULL DEFAULT 0
+        );")?;
+        // Existing advisory checkpoints predate byte offsets; sequence zero
+        // deliberately forces a rebuild, never an absence decision.
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(integration_lookup_checkpoint)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<Result<_, _>>()?;
+        for column in ["sequence", "next_offset"] {
+            if !columns.iter().any(|name| name == column) {
+                connection.execute_batch(&format!("ALTER TABLE integration_lookup_checkpoint ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"))?;
+            }
+        }
         // A v2 marker intentionally makes r256 fail closed until an explicit
         // downgrade export. First persist the DB, then the marker, then permit
         // new appends. Reimporting v1 after an interrupted migration is safe.
@@ -125,12 +174,101 @@ impl Ledger {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn commit(&self, key: &str) -> anyhow::Result<()> {
         self.0.execute(
             "INSERT INTO identities(identity,state) VALUES(?1,1) \
              ON CONFLICT(identity) DO UPDATE SET state=1 WHERE state=0",
             [key],
         )?;
+        Ok(())
+    }
+
+    pub(super) fn location(&self, key: &str) -> anyhow::Result<Option<(String, String, u64)>> {
+        let row: Option<(String, String, i64)> = self
+            .0
+            .query_row(
+                "SELECT stream_id,cursor,sequence FROM integration_locations WHERE identity=?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(stream, cursor, sequence)| Ok((stream, cursor, u64::try_from(sequence)?)))
+            .transpose()
+    }
+
+    pub(super) fn lookup_checkpoint(
+        &self,
+    ) -> anyhow::Result<Option<super::super::repository::LookupCheckpoint>> {
+        let value:Option<(String,String,i64,i64)>=self
+            .0
+            .query_row(
+                "SELECT stream_id,cursor,sequence,next_offset FROM integration_lookup_checkpoint WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?,row.get(2)?,row.get(3)?)),
+            )
+            .optional()?;
+        value
+            .map(|(stream, cursor, sequence, offset)| {
+                Ok((
+                    stream,
+                    cursor,
+                    u64::try_from(sequence)?,
+                    u64::try_from(offset)?,
+                ))
+            })
+            .transpose()
+    }
+
+    #[cfg(test)]
+    pub(super) fn index_locations(
+        &self,
+        events: &[super::EventEnvelope],
+        checkpoint: &super::super::repository::LookupCheckpoint,
+    ) -> anyhow::Result<()> {
+        self.index_prepared(
+            &events.iter().filter_map(Location::of).collect::<Vec<_>>(),
+            checkpoint,
+        )
+    }
+
+    pub(super) fn index_prepared(
+        &self,
+        locations: &[Location],
+        checkpoint: &super::super::repository::LookupCheckpoint,
+    ) -> anyhow::Result<()> {
+        let transaction = self.0.unchecked_transaction()?;
+        for location in locations {
+            Self::index_location(&transaction, location)?;
+        }
+        transaction.execute("INSERT INTO integration_lookup_checkpoint(id,stream_id,cursor,sequence,next_offset) VALUES(1,?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET stream_id=excluded.stream_id,cursor=excluded.cursor,sequence=excluded.sequence,next_offset=excluded.next_offset",rusqlite::params![checkpoint.0,checkpoint.1,i64::try_from(checkpoint.2)?,i64::try_from(checkpoint.3)?])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn index_event(connection: &Connection, event: &super::EventEnvelope) -> anyhow::Result<()> {
+        if let Some(location) = Location::of(event) {
+            Self::index_location(connection, &location)?;
+        }
+        Ok(())
+    }
+
+    fn index_location(connection: &Connection, location: &Location) -> anyhow::Result<()> {
+        connection.execute("INSERT INTO integration_locations(identity,stream_id,cursor,sequence) VALUES(?1,?2,?3,?4)
+            ON CONFLICT(identity) DO UPDATE SET stream_id=excluded.stream_id,cursor=excluded.cursor,sequence=excluded.sequence
+            WHERE integration_locations.stream_id!=excluded.stream_id",rusqlite::params![location.key,location.stream,location.cursor,i64::try_from(location.sequence)?])?;
+        Ok(())
+    }
+
+    pub(super) fn commit_event(
+        &self,
+        key: &str,
+        event: &super::EventEnvelope,
+    ) -> anyhow::Result<()> {
+        let transaction = self.0.unchecked_transaction()?;
+        transaction.execute("INSERT INTO identities(identity,state) VALUES(?1,1) ON CONFLICT(identity) DO UPDATE SET state=1 WHERE state=0",[key])?;
+        Self::index_event(&transaction, event)?;
+        transaction.commit()?;
         Ok(())
     }
 

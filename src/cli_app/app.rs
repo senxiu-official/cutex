@@ -380,6 +380,13 @@ pub(crate) fn skips_startup_migrations(cli: &Cli) -> bool {
         }) | Some(CommandKind::Service { command: ServiceCommand::Status })
             | Some(CommandKind::Storage {
                 command: StorageCommand::RollbackExport { .. }
+                    | StorageCommand::RosterStatus
+                    | StorageCommand::RosterImport { .. }
+                    | StorageCommand::OwnerInputImport { .. }
+                    | StorageCommand::RosterExport { .. }
+                    | StorageCommand::NotificationStore { .. }
+                    | StorageCommand::ApprovalStore { .. }
+                    | StorageCommand::SessionRowsImport { .. }
             })
     )
 }

@@ -11,6 +11,7 @@ pub(super) fn run(
     deployment: Option<&Path>,
     dry_run: bool,
 ) -> anyhow::Result<serde_json::Value> {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
     use anyhow::Context;
     let target = match deployment {
         Some(file) => {

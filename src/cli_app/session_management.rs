@@ -45,6 +45,7 @@ pub(crate) fn cmd_session_adopt(
     expose_to_im: bool,
     pin: bool,
 ) -> anyhow::Result<()> {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
     if current_cwd && cwd.is_some() {
         anyhow::bail!("Use either --cwd or --current-cwd, not both");
     }
@@ -541,6 +542,7 @@ mod tests {
         StoredAccount {
             options: Default::default(),
             browser_tools: false,
+            browser_tool_surface: Default::default(),
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,

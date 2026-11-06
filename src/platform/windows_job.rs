@@ -114,6 +114,7 @@ fn configure_new_job(job: OwnedHandle) -> anyhow::Result<OwnedHandle> {
 
 /// Give the runtime root its own (non-inheritable) handle to its job, so the
 /// job outlives the spawning daemon but not the root.
+#[expect(clippy::not_unsafe_ptr_arg_deref, reason = "the target process HANDLE is an opaque kernel object identifier")]
 pub fn transfer_job_handle(job: &OwnedHandle, process: HANDLE) -> anyhow::Result<()> {
     let mut retained = std::ptr::null_mut();
     check(unsafe {

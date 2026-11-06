@@ -371,6 +371,10 @@ async def test_native_subscription_note_in_an_unanswered_interrupted_turn_is_rel
     assert again['turn_id'] != turn and h.store.pending_notes(tid) == 0
     assert any(item['id'] == 'note' for item in h.store.items(again['turn_id']))
     await service.observe_event(tid, 'claude/input/contextPersisted', {'threadId': tid, 'turnId': again['turn_id'], 'messageId': 'wake-2'})
+    # The wake's receipt does not prove another input. A successful SDK Result
+    # now emits a separate, explicit receipt for each consumed passive note.
+    assert service._status(tid, 'note', note['semanticSha256'])['receipt'] is None
+    await service.observe_event(tid, 'claude/input/contextPersisted', {'threadId': tid, 'turnId': again['turn_id'], 'messageId': 'note'})
     persisted = service._status(tid, 'note', note['semanticSha256'])
     assert persisted['deliveryState'] == 'context_persisted' and persisted['receipt']['turnId'] == again['turn_id']
     h.store.finish(tid, again['turn_id'], 'completed')

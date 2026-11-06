@@ -51,9 +51,14 @@ pub fn exported(peer: &Peer) -> Result<Value> {
     let directory = crate::asks::directory::Directory::load()
         .map_err(|_| Error::new("persistence_unavailable", 503))?;
     let state = crate::asks::store::AskStore::open_default()?.snapshot()?;
-    let agents:Vec<_>=directory.agents.values().filter(|a|super::policy::visible(peer,a)).map(|a|json!({
-        "cutexSessionId":a.cutex_session_id,"name":a.name,"short":crate::short_ids::Index::new(directory.agents.values().filter(|a|super::policy::visible(peer,a)).map(|a|crate::short_ids::Entry{id:a.cutex_session_id.clone(),name:a.name.clone()})).short(&a.cutex_session_id,6),
-        "status":state.presence.get(&a.cutex_session_id).map(|p|match p.status(){"idle"=>"idle","busy"=>"busy",_=>"offline"}).unwrap_or("offline"),"runtime":if a.claude{"claude"}else{"codex"}
+    let authority = crate::asks::directory::Directory::director_snapshot_shared()
+        .map_err(|_| Error::new("persistence_unavailable", 503))?;
+    let visible:Vec<_>=directory.agents.values().filter(|a|super::policy::visible(peer,a)).collect();
+    let index=crate::short_ids::Index::new(visible.iter().map(|a|crate::short_ids::Entry{id:a.cutex_session_id.clone(),name:a.name.clone()}));
+    let agents:Vec<_>=visible.into_iter().map(|a|json!({
+        "cutexSessionId":a.cutex_session_id,"name":a.name,"short":index.short(&a.cutex_session_id,6),
+        "status":state.presence.get(&a.cutex_session_id).map(|p|match p.status(){"idle"=>"idle","busy"=>"busy",_=>"offline"}).unwrap_or("offline"),"runtime":if a.claude{"claude"}else{"codex"},
+        "scope":crate::agent_names::NameScope::for_project(crate::memory::project_for_session(&authority,&a.cutex_session_id).as_ref().map(|p|p.as_str()))
     })).collect();
     Ok(json!({"fetchedAt":super::now(),"agents":agents}))
 }
@@ -65,6 +70,13 @@ pub fn refresh(store: &Store, peer: &Peer) -> Result<Value> {
     result
 }
 fn refresh_inner(store: &Store, peer: &Peer) -> Result<Value> {
+    let peer = &refresh_capabilities(store, peer)?;
+    refresh_directory(store, peer)
+}
+
+/// Re-probe capabilities before binding a name, including on an old successful
+/// directory cache hit. A downgrade or failed probe cannot reuse stale features.
+pub fn refresh_capabilities(store: &Store, peer: &Peer) -> Result<Peer> {
     let hello = super::client::call(store, peer, "GET", "/peer/v1/hello", None)?;
     super::profiles::note_hello(&peer.peer_id, &hello);
     store.with(|s| {
@@ -77,7 +89,10 @@ fn refresh_inner(store: &Store, peer: &Peer) -> Result<Value> {
     if let Err(error) = super::pair::validate_hello(peer, &hello) {
         return Err(error);
     }
-    let peer = &store.get(&peer.peer_id)?;
+    store.get(&peer.peer_id)
+}
+
+fn refresh_directory(store: &Store, peer: &Peer) -> Result<Value> {
     let value = super::client::call(store, peer, "GET", "/peer/v1/agents", None)?;
     let mut value = value;
     let agents = value["agents"]
@@ -175,6 +190,7 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
                 Ok(json!({"removed":true}))
             }
             ("GET", "/peer/v1/agents") => exported(&peer),
+            ("POST", super::names::ROUTE) => super::names::receive(&peer, data),
             ("GET", super::profiles::ROUTE | super::profiles::AVATAR_ROUTE) => {
                 super::profiles::handle(path)
             }

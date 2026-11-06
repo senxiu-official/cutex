@@ -31,6 +31,22 @@ pub(super) fn stop_and_commit(
     force: bool,
 ) -> anyhow::Result<ProcessTerminateOutcome> {
     let lane = cutex::management::v2::user_input::session_input_lock(&record.cutex_session_id)?;
+    // r273 (051 §2): a lifecycle entry that registered the host fence does
+    // not wait for this lane under it (the "host lock, then session lock"
+    // order); the stop re-reads and compares the occurrence under the lane.
+    if cutex::agent_management::host_fence_registered() && !lane.held_by_current_thread() {
+        return cutex::agent_management::outside_host_fence("native stop", || {
+            stop_and_commit_under_lane(&lane, record, force)
+        })?;
+    }
+    stop_and_commit_under_lane(&lane, record, force)
+}
+
+fn stop_and_commit_under_lane(
+    lane: &cutex::management::v2::session_coordination::OperationLane,
+    record: &CutexSessionRecord,
+    force: bool,
+) -> anyhow::Result<ProcessTerminateOutcome> {
     let _operation = lane.reserve()?;
     let current = cutex::session::store::load_cutex_session_store()?;
     let current = current.sessions.get(&record.cutex_session_id)

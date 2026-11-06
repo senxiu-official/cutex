@@ -376,6 +376,7 @@ impl AgentManagementProvider {
         session_path: &Path,
         request: &DurableImportRequest,
     ) -> Result<DurableImportReceipt, AgentManagementError> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared().map_err(|_| AgentManagementError::PersistenceUnavailable)?;
         validate_request(request)?;
         let _execution = super::provider::provider_execution_lock()
             .lock()

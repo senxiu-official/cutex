@@ -67,6 +67,7 @@ impl ClaudeDeployment {
     }
 
     pub fn install(&self) -> anyhow::Result<()> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         self.validate()?;
         write_private_pretty_json_atomic(&deployment_path()?, self, "Claude deployment")
     }
@@ -426,6 +427,7 @@ pub fn create_profile(name:&str,cwd:&Path,model:&str,allow_write:Option<bool>,al
 /// legacy callers keep None. Stamped before the first session row is persisted.
 #[allow(clippy::too_many_arguments)]
 pub fn create_profile_with_creator(name:&str,cwd:&Path,model:&str,allow_write:Option<bool>,allow_exec:Option<bool>,profile:Option<String>,managed:bool,effort:Option<crate::profiles::appearance::ClaudeEffort>,created_by:Option<crate::session::model::SessionCreatedBy>)->anyhow::Result<CutexSessionRecord> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     ensure!(
         !name.trim().is_empty()
             && name.trim() == name
@@ -663,10 +665,12 @@ fn write_system_append(record: &CutexSessionRecord, session: &ClaudeSession, fea
     if features["systemAppend"] != true {
         return Ok(None);
     }
-    let text = crate::memory::harness::join_sections(&crate::memory::harness::claude_system_append_sections(record));
+    let (sections, snapshot) = crate::memory::harness::claude_system_append_with_snapshot(record, features["systemAppendFile"] == true);
+    let text = crate::memory::harness::join_sections(&sections);
     let path = session.state_dir.join(SYSTEM_APPEND_FILE);
     crate::config::atomic::write_private_bytes_atomic(&path, text.as_bytes())
         .with_context(|| format!("write Claude system prompt append {}", path.display()))?;
+    crate::memory::idle_note::launched(&record.cutex_session_id, snapshot, false);
     Ok(Some(path))
 }
 
@@ -980,6 +984,7 @@ pub fn start(id: &str) -> anyhow::Result<Value> {
 }
 
 pub fn start_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Result<Value> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     let lane = crate::management::v2::user_input::session_input_lock(id)?;
     let _operation = lane.reserve()?;
     let initial = record(id)?;
@@ -1445,6 +1450,7 @@ fn validate_observation_occurrence(
 pub fn attach(id: &str) -> anyhow::Result<()> {attach_status(id).map(|_|())}
 
 pub fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus> {
+    let runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     let live = status(id)?;
     ensure!(
         matches!(
@@ -1470,7 +1476,7 @@ pub fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus> {
     write_private_pretty_json_atomic(&ui, &json!({"statusLine":order,"statusFile":status_file,
         "useColors":preferences.get("tui").and_then(|t|t.get("status_line_use_colors")).and_then(|v|v.as_bool()).unwrap_or(true),
         "preferencesPath":preferences_path,"cutexBinary":std::env::current_exe()?}), "Claude frontend settings")?;
-    let status = Command::new(&session.deployment.python)
+    let mut child = Command::new(&session.deployment.python)
         .env("CUTEX_AGENT_STATUS", crate::launch::agent_status::for_record(&record))
         .arg("-u")
         .arg(
@@ -1493,7 +1499,9 @@ pub fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus> {
         .arg(ui)
         .arg("--resume")
         .arg(&session.thread_id)
-        .status()?;
+        .spawn()?;
+    drop(runtime_reference);
+    let status = child.wait()?;
     ensure!(
         status.success(),
         "Claude foreground TUI exited {status}; backend was not restarted"
@@ -1885,6 +1893,23 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(shipped["features"]["systemAppend"], true);
+        assert_eq!(shipped["features"]["systemAppendFile"], true);
+        std::fs::write(root.join("AGENTS.md"), format!("{}\nAGENTS_END\n", "rule\n".repeat(4000))).unwrap();
+        record.runtime_backend = CutexSessionRuntimeBackend::ClaudeSubscription;
+        for file_append in [false, true] {
+            let mut pin = session.clone();
+            pin.deployment.adapter_source = root.join(format!("adapter-{file_append}"));
+            let feature_path = pin.deployment.adapter_source.join("src/cute_claude/features.json");
+            std::fs::create_dir_all(feature_path.parent().unwrap()).unwrap();
+            let flags = json!({"systemAppend":true,"systemAppendFile":file_append});
+            std::fs::write(&feature_path, json!({"features":flags}).to_string()).unwrap();
+            record.claude_session = Some(pin.clone());
+            let path = write_system_append(&record, &pin, &flags).unwrap().unwrap();
+            let text = std::fs::read_to_string(path).unwrap();
+            assert_eq!(text.contains("AGENTS_END"), file_append || !cfg!(windows));
+            let preview = crate::management::v2::agent_harness::harness_view(&record, true);
+            assert_eq!(preview["text"], text, "preview follows the actual component pin's transport budget");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

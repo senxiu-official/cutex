@@ -142,7 +142,7 @@ fn other_profiles_have_their_own_interfaces_and_no_stored_address() {
         "baseUrlDefault":"https://api.moonshot.cn/v1","official":true,"relayAccepted":true}),
         json!({"kind":"kimiNative","baseUrl":"https://api.moonshot.cn/v1",
         "baseUrlDefault":"https://api.moonshot.cn/v1","official":true,"relayAccepted":true})]);
-    // "RelayProfile": a Kimi profile through a relay keeps provider moonshot.
+    // "relay_profile": a Kimi profile through a relay keeps provider moonshot.
     let relay_profile = create("relay_profile", NewProfileKind::ApiKey, Some("moonshot"), Some("https://relay.example/v1"));
     assert_eq!(provider_id(&relay_profile).as_deref(), Some("moonshot"));
     assert_eq!(rows(&relay_profile)[0]["official"], false);

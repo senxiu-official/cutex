@@ -186,6 +186,8 @@ struct Job {
     relay: Arc<Relay>,
     candidate: Candidate,
     deadline: Instant,
+    /// Held until this capture ends; the turn-end release waits for it.
+    _turn: Arc<()>,
 }
 static WORKERS: OnceLock<Option<mpsc::SyncSender<Job>>> = OnceLock::new();
 fn workers() -> Option<&'static mpsc::SyncSender<Job>> {
@@ -218,9 +220,12 @@ fn workers() -> Option<&'static mpsc::SyncSender<Job>> {
         })
         .as_ref()
 }
-pub fn completed(relay: &Arc<Relay>, session: &str, thread: &str, generation: u64, turn: &str) {
+/// Queues this turn's end-of-turn screenshots. The returned handle has one
+/// extra holder per capture still queued or running.
+pub fn completed(relay: &Arc<Relay>, session: &str, thread: &str, generation: u64, turn: &str) -> Arc<()> {
+    let pending = Arc::new(());
     if !identifier(session) || !identifier(thread) || !identifier(turn) {
-        return;
+        return pending;
     }
     let candidates = take(relay, session, thread, generation, turn);
     let deadline = Instant::now() + COMMAND_TIMEOUT;
@@ -233,6 +238,7 @@ pub fn completed(relay: &Arc<Relay>, session: &str, thread: &str, generation: u6
                 relay: Arc::clone(relay),
                 candidate,
                 deadline,
+                _turn: Arc::clone(&pending),
             })
             .is_ok()
         });
@@ -242,12 +248,14 @@ pub fn completed(relay: &Arc<Relay>, session: &str, thread: &str, generation: u6
             }
         }
     }
+    pending
 }
 fn capture(job: Job) {
     let Job {
         relay,
         candidate,
         deadline,
+        _turn,
     } = job;
     if Instant::now() >= deadline
         || !(candidate.authority.identity_current)()
@@ -466,6 +474,7 @@ mod tests {
             relay: Arc::clone(&relay),
             candidate: candidate.clone(),
             deadline: Instant::now() - Duration::from_millis(1),
+            _turn: Arc::new(()),
         });
         assert!(subscription.receiver.try_recv().is_err());
         let worker_relay = Arc::clone(&relay);
@@ -505,6 +514,7 @@ mod tests {
             relay: Arc::clone(&relay),
             candidate: candidate.clone(),
             deadline: Instant::now() + COMMAND_TIMEOUT,
+            _turn: Arc::new(()),
         });
         let items = super::super::shot_store::list("s", "turn").unwrap();
         assert_eq!(items["items"].as_array().unwrap().len(), 1);
@@ -527,6 +537,7 @@ mod tests {
             relay: Arc::clone(&relay),
             candidate,
             deadline: Instant::now() + COMMAND_TIMEOUT,
+            _turn: Arc::new(()),
         });
         assert_eq!(relay.state.lock().unwrap().requests.len(), count);
         done_tx.send(()).unwrap();

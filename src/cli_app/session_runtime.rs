@@ -355,6 +355,10 @@ fn cmd_session_lifecycle_action_with_payload_and_output(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         params["force"] = serde_json::Value::Bool(force);
+        // Only a local daemon (the same install) knows the field.
+        if let Some(requester) = stop_requested_by().filter(|_| cutex_session_host_is_local(&record.host_id, &current_host_name())) {
+            params["requestedBy"] = requester;
+        }
     }
     let body = serde_json::to_vec(&serde_json::json!({
         "requestId": request_id,
@@ -400,6 +404,29 @@ fn cmd_session_lifecycle_action_with_payload_and_output(
         print_management_v2_lifecycle_response(&response);
     }
     Ok(response)
+}
+
+/// r276: a stop run from an agent's own process (its `cutex` CLI inherits
+/// CUTEX_AGENT_ID) says so, so the owner sees who stopped the runtime. The
+/// stop itself is the same.
+pub(super) fn stop_requested_by() -> Option<serde_json::Value> {
+    stop_requested_by_from(std::env::var(cutex::config::env::CUTEX_AGENT_ID_ENV_VAR).ok().as_deref())
+}
+
+fn stop_requested_by_from(agent_id: Option<&str>) -> Option<serde_json::Value> {
+    let id = agent_id.map(str::trim).filter(|id| !id.is_empty() && id.len() <= 200 && !id.chars().any(char::is_control))?;
+    Some(serde_json::json!({"kind": "agent", "runtimeAgentId": id}))
+}
+
+#[cfg(test)]
+mod stop_requested_by_tests {
+    #[test]
+    fn only_an_agent_process_names_itself() {
+        assert_eq!(super::stop_requested_by_from(Some("claude.abc")), Some(serde_json::json!({"kind": "agent", "runtimeAgentId": "claude.abc"})));
+        assert_eq!(super::stop_requested_by_from(Some("  ")), None);
+        assert_eq!(super::stop_requested_by_from(None), None);
+        assert_eq!(super::stop_requested_by_from(Some("bad\u{7}id")), None, "no control characters");
+    }
 }
 
 fn lifecycle_request_credential(

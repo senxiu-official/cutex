@@ -18,7 +18,7 @@
 //! Most approvals are requested in the Agent Bus process (services, agent
 //! profiles), whose event appends never reach Management's live
 //! subscribers. Management serve therefore watches the store
-//! ([`start_watcher`], a metadata check every 2 s, capability
+//! ([`start_watcher`], a bounded SQL change cursor every 2 s, capability
 //! `approvals-live`) and publishes every change it did not publish itself.
 //!
 //! A tool call may hold for the decision (approval-wait,
@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::net::TcpStream;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -44,8 +44,6 @@ use crate::approvals::{ApprovalRecord, ApprovalState, ApprovalStore, DecideError
 use crate::http::server::{write_json_response, SimpleHttpRequest};
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
-/// Re-read the store this often even when its metadata looks unchanged.
-const FULL_READ_INTERVAL: Duration = Duration::from_secs(60);
 
 pub const PATH: &str = "/v2/approvals";
 pub const APPROVALS_CHANGED_EVENT: &str = "cutex/approvals/changed";
@@ -94,6 +92,9 @@ pub fn publish_changed(record: &ApprovalRecord, reason: &str) {
     if let Ok(mut guard) = WATCH.lock() {
         if let Some(watch) = guard.as_mut() {
             watch.known.insert(record.approval_id.clone(), Seen::of(record));
+            while watch.known.len() > 1024 {
+                watch.known.pop_first();
+            }
         }
     }
     append_changed(record, reason);
@@ -116,44 +117,20 @@ fn append_changed(record: &ApprovalRecord, reason: &str) {
 
 #[derive(Default)]
 struct Watch {
-    primed: bool,
-    stamp: Option<(SystemTime, u64)>,
-    last_read: Option<Instant>,
-    /// approvalId → the state (and hold) clients were last told about.
+    store: Option<ApprovalStore>,
+    cursor: Option<crate::store::ChangeCursor>,
+    resyncing: bool,
+    resync_page: Option<String>,
+    // Only local publications awaiting the next SQL page, never history.
     known: BTreeMap<String, Seen>,
-    /// Decided during a hold that never ended (the Agent Bus went away
-    /// mid-hold): the decision notice Management skipped, queued by [`poll`].
-    orphans: Vec<ApprovalRecord>,
-    /// Orphaned holds already handed to [`poll`] (by hold id).
-    orphans_seen: std::collections::BTreeSet<String>,
+    orphans: Vec<(i64, ApprovalRecord)>,
 }
 
 /// `None` outside Management serve (the Agent Bus, the CLI, tests): then
 /// [`publish_changed`] only appends.
 static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
 
-/// What clients know of one record: its state and its hold (approval-wait:
-/// the hold's id and end, so a hold starting or ending is published too).
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Seen {
-    state: ApprovalState,
-    wait: Option<(String, Option<String>)>,
-}
-
-impl Seen {
-    fn of(record: &ApprovalRecord) -> Self {
-        Self {
-            state: record.state,
-            wait: record.wait.as_ref().map(|wait| (wait.id.clone(), wait.end.clone())),
-        }
-    }
-}
-
-fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
-    std::fs::metadata(path)
-        .ok()
-        .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()))
-}
+use crate::approvals::ApprovalSeen as Seen;
 
 fn reason_of(state: ApprovalState) -> &'static str {
     match state {
@@ -165,57 +142,64 @@ fn reason_of(state: ApprovalState) -> &'static str {
     }
 }
 
-/// One watcher step: re-read the store when it changed (or every minute)
-/// and return the records whose state clients have not seen, with the
-/// event reason. The first read only primes. Records pruned from the store
-/// are forgotten silently (they were decided or expired long ago).
 /// A hold this far past its end without ending counts as orphaned.
 const ORPHAN_GRACE_SECS: i64 = 30;
 
-fn step(watch: &mut Watch, path: &Path, force: bool) -> anyhow::Result<Vec<(ApprovalRecord, &'static str)>> {
-    let now_stamp = stamp(path);
-    let stale = watch.last_read.is_none_or(|t| t.elapsed() >= FULL_READ_INTERVAL);
-    if watch.primed && !force && !stale && now_stamp == watch.stamp {
-        return Ok(Vec::new());
+fn step(watch: &mut Watch, path: &Path, _force: bool) -> anyhow::Result<Vec<(ApprovalRecord, &'static str)>> {
+    if watch.store.as_ref().is_none_or(|store| store.path() != path) {
+        watch.store = Some(ApprovalStore::at(path));
+        watch.cursor = None;
+        watch.resyncing = false;
+        watch.resync_page = None;
+        watch.known.clear();
     }
-    let rows = crate::approvals::read_all_at(path)?;
-    watch.stamp = now_stamp;
-    watch.last_read = Some(Instant::now());
+    let store = watch.store.as_ref().expect("watch store initialized").clone();
+    let observed = store.observe(watch.cursor.as_ref());
+    let (cursor, records) = match observed {
+        Ok(page) => page,
+        Err(error) if matches!(error.downcast_ref::<crate::store::StoreError>(), Some(crate::store::StoreError::Resync(_))) => {
+            watch.known.clear();
+            watch.resyncing = true;
+            watch.resync_page = None;
+            store.observe(None)?
+        }
+        Err(error) => return Err(error),
+    };
     let mut changes = Vec::new();
-    if watch.primed {
-        for record in &rows {
-            let seen = Seen::of(record);
-            let known = watch.known.get(&record.approval_id);
-            if known == Some(&seen) {
-                continue;
+    for (key, record, previous) in records {
+        let Some(record)=record else {watch.known.remove(&key);continue;};
+        let seen = Seen::of(&record);
+        if watch.known.get(&record.approval_id) == Some(&seen) || previous.as_ref() == Some(&seen) {
+            continue;
+        }
+        let reason = match previous {
+            Some(previous) if previous.state == seen.state => {
+                if record.state != ApprovalState::Pending { continue; }
+                if record.wait.as_ref().is_some_and(|w| w.end.is_none()) { "waiting" } else { "wait_ended" }
             }
-            // Same state, another hold: `waiting` / `wait_ended` (pending
-            // records only; a decided record's hold ending says nothing new).
-            let reason = match known {
-                Some(known) if known.state == seen.state => match &record.wait {
-                    _ if record.state != ApprovalState::Pending => continue,
-                    Some(wait) if wait.end.is_none() => "waiting",
-                    _ => "wait_ended",
-                },
-                _ => reason_of(record.state),
-            };
-            changes.push((record.clone(), reason));
-        }
+            _ => reason_of(record.state),
+        };
+        watch.known.insert(record.approval_id.clone(),seen);
+        while watch.known.len()>1024 {watch.known.pop_first();}
+        changes.push((record, reason));
     }
-    // A decision made while a hold was active got no notice; if the hold
-    // then never ended (the Agent Bus restarted mid-hold) the requester would
-    // never hear of it. Hand those to the notice once the hold is overdue.
-    let overdue = chrono::Utc::now() - chrono::Duration::seconds(ORPHAN_GRACE_SECS);
-    for record in &rows {
-        let Some(wait) = record.wait.as_ref() else { continue };
-        let decided = matches!(record.state, ApprovalState::Approved | ApprovalState::Denied);
-        let past = crate::approvals::timestamp(&wait.until).is_some_and(|until| until < overdue);
-        if decided && wait.end.is_none() && past && watch.orphans_seen.insert(wait.id.clone()) {
-            watch.orphans.push(record.clone());
+    watch.cursor = Some(cursor);
+    if watch.resyncing {
+        // One budgeted resource reconciliation page per tick. These are UI
+        // state hints; they never replay an action or start an agent turn.
+        let (rows,next)=store.list_page(true,watch.resync_page.as_deref(),crate::store::PageBudget{max_rows:100,max_bytes:256*1024},chrono::Utc::now())?;
+        for record in rows {
+            let seen=Seen::of(&record);
+            if watch.known.get(&record.approval_id)!=Some(&seen) {
+                let reason=reason_of(record.state);
+                watch.known.insert(record.approval_id.clone(),seen);
+                changes.push((record,reason));
+            }
         }
+        while watch.known.len()>1024 {watch.known.pop_first();}
+        watch.resyncing=next.is_some();watch.resync_page=next;
     }
-    watch.known = rows.iter().map(|r| (r.approval_id.clone(), Seen::of(r))).collect();
-    watch.primed = true;
+    watch.orphans.extend(store.claim_orphans(chrono::Utc::now()-chrono::Duration::seconds(ORPHAN_GRACE_SECS))?);
     Ok(changes)
 }
 
@@ -230,8 +214,11 @@ fn poll(force: bool) -> anyhow::Result<()> {
     for (record, reason) in changes {
         append_changed(&record, reason);
     }
-    for record in orphans {
-        queue_decision_notice(&record);
+    let store = ApprovalStore::open_default()?;
+    for (id, record) in orphans {
+        let result = try_queue_decision_notice(&record);
+        store.finish_orphan(id, result.is_ok())?;
+        if let Err(error) = result { eprintln!("approvals: orphan notice could not be queued: {error:#}"); }
     }
     Ok(())
 }
@@ -312,18 +299,17 @@ pub fn decision_notice(record: &ApprovalRecord) -> Option<String> {
 /// made during its hold (approval-wait). Notice ids are per approval and
 /// decision, so a second queue of the same notice is a no-op.
 pub fn queue_decision_notice(record: &ApprovalRecord) {
-    let Some(message) = decision_notice(record) else {
-        return;
-    };
-    let notice_id = format!("{}:{}", record.approval_id, reason_of(record.state));
-    if let Err(error) = crate::agent_bus::alarms::set_system_notice(
-        crate::agent_bus::alarms::APPROVAL_NOTICE_OWNER,
-        &notice_id,
-        &record.requester_cutex_session_id,
-        &message,
-    ) {
+    if let Err(error) = try_queue_decision_notice(record) {
         eprintln!("approvals: decision notice for {} not queued: {error:#}", record.approval_id);
     }
+}
+
+fn try_queue_decision_notice(record: &ApprovalRecord) -> anyhow::Result<()> {
+    let Some(message) = decision_notice(record) else { return Ok(()); };
+    let notice_id = format!("{}:{}", record.approval_id, reason_of(record.state));
+    crate::agent_bus::alarms::set_system_notice(
+        crate::agent_bus::alarms::APPROVAL_NOTICE_OWNER, &notice_id, &record.requester_cutex_session_id, &message,
+    ).map(|_| ())
 }
 
 /// Client facts a decision may carry (`approval-decided-by`): `{app, version,
@@ -425,17 +411,29 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
                     )
                 }
             };
-            match store.list(include_decided, now) {
-                Ok(approvals) => write_json_response(
+            let cursor = crate::http::query::query_value(&request.path, "cursor");
+            let limit = crate::http::query::query_value(&request.path, "limit");
+            let page = if cursor.is_some() || limit.is_some() {
+                let limit = match limit.as_deref().unwrap_or("100").parse::<usize>() {
+                    Ok(limit) if (1..=500).contains(&limit) => limit,
+                    _ => return super::server::write_v2_error(stream,400,"Bad Request","invalid_request","limit: 1-500",false,json!({})),
+                };
+                store.list_page(include_decided,cursor.as_deref(),crate::store::PageBudget{max_rows:limit,max_bytes:256*1024},now)
+            } else {
+                store.list(include_decided,now).map(|rows|(rows,None))
+            };
+            match page {
+                Ok((approvals,next)) => write_json_response(
                     stream,
                     200,
                     "OK",
                     &json!({
                         "hostId": crate::platform::host::current_host_name(),
                         "approvals": approvals,
+                        "nextCursor": next,
                     }),
                 ),
-                Err(error) => unavailable(stream, &error),
+                Err(error) => page_error(stream, &error),
             }
         }
         ("POST", Some(Route::Decide(id, decision))) => {
@@ -525,9 +523,36 @@ fn unavailable(stream: &mut TcpStream, error: &anyhow::Error) -> anyhow::Result<
     )
 }
 
+pub(super) fn page_error(stream:&mut TcpStream,error:&anyhow::Error)->anyhow::Result<()> {
+    match error.downcast_ref::<crate::store::StoreError>() {
+        Some(crate::store::StoreError::Invalid(_))=>super::server::write_v2_error(stream,400,"Bad Request","invalid_cursor","approval cursor is invalid",false,json!({})),
+        Some(crate::store::StoreError::Resync(reason))=>super::server::write_v2_error(stream,409,"Conflict","resync_required","approval cursor needs a fresh page",true,json!({"reason":format!("{reason:?}")})),
+        _=>unavailable(stream,error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watcher_reconciles_an_epoch_gap_in_bounded_resource_pages() {
+        let dir=std::env::temp_dir().join(format!("approvals-watch-gap-{}",uuid::Uuid::new_v4()));
+        let path=dir.join("approvals.json");
+        let rows:Vec<_>=(0..230).map(|i|record(&format!("apr-gap-{i:04}"),crate::approvals::ApprovalKind::ManagedService,ApprovalState::Pending)).collect();
+        write(&path,&rows);let mut watch=Watch::default();
+        assert!(step(&mut watch,&path,false).unwrap().is_empty());
+        let store=ApprovalStore::at(&path);
+        store.database().unwrap().write(|tx|{tx.reset_epoch(crate::store::spec("approvals"))?;Ok(())}).unwrap();
+        let mut ids=std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            let changes=step(&mut watch,&path,false).unwrap();assert!(changes.len()<=100);
+            for (row,_) in changes {assert!(ids.insert(row.approval_id));}
+        }
+        assert_eq!(ids.len(),230);assert!(!watch.resyncing);
+        assert!(step(&mut watch,&path,false).unwrap().is_empty());
+        drop(watch);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn routes_parse_exact_ids_and_actions() {
@@ -579,8 +604,7 @@ mod tests {
     }
 
     fn write(path: &Path, records: &[ApprovalRecord]) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, serde_json::to_vec(&json!({ "approvals": records })).unwrap()).unwrap();
+        ApprovalStore::at(path).with_store(|state| state.approvals = records.to_vec()).unwrap();
     }
 
     #[test]

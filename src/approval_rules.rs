@@ -1,8 +1,8 @@
 //! Host-side automatic owner approvals (design 047).
 //!
-//! Rules live in the owner approval store so matching, the consumed approval
-//! record and the audit row are committed by one private atomic write under
-//! the same lock. No Agent Bus route exposes rule mutation.
+//! Rules live in the owner approval SQL store so matching, the consumed
+//! approval and the audit row commit in one transaction over selected rows.
+//! No Agent Bus route exposes rule mutation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -190,7 +190,7 @@ pub struct ApprovalRuleAudit {
     pub details: Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfirmationToken {
     token: String,
@@ -776,7 +776,7 @@ impl ApprovalStore {
         if draft.high_risk_kinds_explicit.is_empty() || typed_phrase != phrase {
             return Err(RuleError::ConfirmationRequired(phrase));
         }
-        self.with_store(|store| {
+        self.new_confirmation(now, |store| {
             store.approval_rule_confirmations.retain(|row| {
                 !row.consumed
                     && crate::approvals::timestamp(&row.expires_at).is_some_and(|at| at > now)
@@ -796,7 +796,7 @@ impl ApprovalStore {
     pub fn list_rules(&self, now: DateTime<Utc>) -> Result<(u64, Vec<ApprovalRule>), RuleError> {
         let grants = current_directors()?;
         let snapshot = self
-            .rule_list_snapshot()
+            .sql_rule_snapshot(&grants.iter().map(|g|g.session_id.as_str()).collect::<Vec<_>>())
             .map_err(|error| RuleError::Store(format!("{error:#}")))?;
         let mut rules = snapshot.rules;
         let expires = rules.iter_mut().any(|rule| {
@@ -818,7 +818,7 @@ impl ApprovalStore {
         }
         // Persist newly expired flags exactly as before, under the write lock
         // and against the latest file (a concurrent owner mutation may win).
-        self.with_store(|store| {
+        self.edit_all_rules(&grants.iter().map(|g|g.session_id.as_str()).collect::<Vec<_>>(), |store| {
             for rule in &mut store.approval_rules {
                 mark_expired(rule, now);
             }
@@ -845,11 +845,11 @@ impl ApprovalStore {
         now: DateTime<Utc>,
     ) -> Result<(u64, ApprovalRule), RuleError> {
         let draft = normalized_draft(draft, now)?;
-        self.with_store(|store| {
+        self.edit_rules(token, |store| {
             if store.rules_revision != expected_revision {
                 return Err(RuleError::Conflict(store.rules_revision));
             }
-            if store.approval_rules.len() >= MAX_RULES {
+            if store.rule_count >= MAX_RULES {
                 return Err(RuleError::Invalid("approval rule capacity reached".into()));
             }
             consume_confirmation(store, token, &draft, now)?;
@@ -894,7 +894,7 @@ impl ApprovalStore {
             return self.replace_director_rule(id, expected_revision, draft, now);
         }
         let mut draft = normalized_draft(draft, now)?;
-        self.with_store(|store| {
+        self.edit_rule(id, token, |store| {
             if store.rules_revision != expected_revision {
                 return Err(RuleError::Conflict(store.rules_revision));
             }
@@ -991,7 +991,7 @@ impl ApprovalStore {
         let Some((grant, kind)) = target else {
             return Err(RuleError::NotFound);
         };
-        self.with_store(|store| {
+        self.edit_director_rule(&grant.session_id, |store| {
             set_director_rule_enabled_in(
                 store,
                 &grant,
@@ -1016,7 +1016,7 @@ impl ApprovalStore {
                 self.set_director_rule_enabled(id, expected_revision, false, now, None)?;
             return Ok((revision, changed));
         }
-        self.with_store(|store| {
+        self.edit_rule(id, None, |store| {
             let Some(index) = store.approval_rules.iter().position(|rule| rule.rule_id == id) else {
                 // A retry after an uncertain response observes the completed revoke.
                 return Ok((store.rules_revision, false));
@@ -1039,20 +1039,7 @@ impl ApprovalStore {
         cursor: usize,
         limit: usize,
     ) -> Result<(Vec<ApprovalRuleAudit>, Option<usize>), RuleError> {
-        self.with_store(|store| {
-            let rows = store
-                .approval_rule_audit
-                .iter()
-                .rev()
-                .skip(cursor)
-                .take(limit)
-                .cloned()
-                .collect::<Vec<_>>();
-            let next = (cursor + rows.len() < store.approval_rule_audit.len())
-                .then_some(cursor + rows.len());
-            (rows, next)
-        })
-        .map_err(|error| RuleError::Store(format!("{error:#}")))
+        self.sql_audit(cursor, limit).map_err(|error| RuleError::Store(format!("{error:#}")))
     }
 }
 
@@ -1243,6 +1230,7 @@ pub(crate) fn auto_decide(
 }
 
 pub fn has_rollback_blockers(path: &std::path::Path) -> anyhow::Result<bool> {
+    if let Some(blocked)=ApprovalStore::existing_rule_blockers(path)? {return Ok(blocked);}
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -1365,7 +1353,7 @@ mod tests {
     fn large_history_rule_lists_match_legacy_and_persist_new_expirations() {
         let _home = crate::profiles::lifecycle::tests::TestHome::new();
         let (store, dir, now) = large_history_fixture(10_000);
-        let before = std::fs::read(&store.path).unwrap();
+        let before = serde_json::to_vec(&store.export_state().unwrap()).unwrap();
         let expected = legacy_rule_list(&store, now);
         assert_eq!(store.list_rules(now).unwrap(), expected);
         assert_eq!(
@@ -1373,7 +1361,7 @@ mod tests {
             expected
         );
         assert_eq!(
-            std::fs::read(&store.path).unwrap(),
+            serde_json::to_vec(&store.export_state().unwrap()).unwrap(),
             before,
             "a fresh list never rewrites history"
         );
@@ -1385,7 +1373,7 @@ mod tests {
             legacy_rule_list(&reference, later)
         );
         let after: StoreFile =
-            serde_json::from_slice(&std::fs::read(&store.path).unwrap()).unwrap();
+            store.export_state().unwrap();
         assert_eq!(after.rules_revision, 3);
         assert!(after.approval_rules[0].expired && !after.approval_rules[0].enabled);
         assert_eq!(after.approval_rule_audit.len(), 10_000);
@@ -1857,6 +1845,7 @@ mod tests {
                     mark_expired(&mut expired, later);
                     assert!(expired.expired, "a narrowed rule cannot revive after midnight");
                 }
+                drop(store);
                 std::fs::remove_dir_all(dir).unwrap();
             }
         }
@@ -1890,6 +1879,7 @@ mod tests {
                 assert!(crate::approvals::timestamp(updated.expiry.expires_at.as_deref().unwrap()).unwrap()
                     > crate::approvals::timestamp(created.expiry.expires_at.as_deref().unwrap()).unwrap());
                 assert_eq!(store.rule_audit(0, 1).unwrap().0[0].result, "expanded");
+                drop(store);
                 std::fs::remove_dir_all(dir).unwrap();
             }
         }

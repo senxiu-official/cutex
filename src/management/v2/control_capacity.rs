@@ -1,5 +1,5 @@
 //! Reserved control capacity on the existing listener. Heavy reads have a
-//! bounded FIFO wait of their own; control requests never join that queue.
+//! bounded per-priority FIFO waits; control requests never join those queues.
 use crate::http::server::SimpleHttpRequest;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -10,12 +10,23 @@ pub const CONTROL_CONNECTION_RESERVE: usize = 32;
 pub const HEAVY_READ_LIMIT: usize = 2;
 pub const HEAVY_READ_QUEUE_LIMIT: usize = 64;
 pub const HEAVY_READ_WAIT: Duration = Duration::from_secs(3);
+pub const BACKGROUND_READ_WAIT: Duration = Duration::from_secs(30);
+pub const FOREGROUND_QUEUE_RESERVE: usize = 16;
+const READ_PRIORITY_HEADER: &str = "x-cutex-read-priority";
 pub const STREAM_LIMIT: usize = 128;
 pub const FILE_TRANSFER_LIMIT: usize = 2;
 static TRANSFERS: AtomicUsize = AtomicUsize::new(0);
 static HEAVY: HeavyPool = HeavyPool::new(HEAVY_READ_LIMIT, HEAVY_READ_QUEUE_LIMIT);
 static STREAMS: AtomicUsize = AtomicUsize::new(0);
 static REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+#[path="native_admission_scale.rs"]
+mod scale;
+
+#[cfg(test)]
+#[path = "read_priority_tests.rs"]
+mod priority_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkClass {
@@ -44,11 +55,19 @@ pub fn classify(request: &SimpleHttpRequest) -> WorkClass {
     if request.method == "POST" && path == "/v2/browser/commands" {
         return WorkClass::Stream;
     }
+    if request.method == "GET" && path.starts_with("/v2/host/sessions/") {
+        return WorkClass::HeavyRead;
+    }
     if request.method == "GET" && (path.ends_with("/stream") || path == "/v2/summary/events" || fs_watch || side_wait) {
         return WorkClass::Stream;
     }
+    if request.method == "POST" && path == "/v2/host/sessions"
+        || (path == "/v2/runtimes/prune" && matches!(request.method.as_str(), "GET" | "POST")) {
+        return WorkClass::HeavyRead;
+    }
     if request.method == "GET"
-        && (path == "/v2/sessions"
+        && (path == "/v2/runtimes/prune"
+            || path == "/v2/sessions"
             || path.starts_with("/v2/sessions/")
             || path == "/v2/summary"
             || path == "/v2/events"
@@ -75,7 +94,7 @@ pub fn classify(request: &SimpleHttpRequest) -> WorkClass {
             if matches!(
                 body.pointer("/native/message/method")
                     .and_then(|v| v.as_str()),
-                Some("thread/read" | "thread/list" | "thread/items/list" | "thread/loaded/list")
+                Some("thread/read" | "thread/list" | "thread/turns/list" | "thread/items/list" | "thread/loaded/list")
             ) {
                 return WorkClass::HeavyRead;
             }
@@ -141,6 +160,9 @@ impl AdmissionRefusal {
             "heavyReadsActive": self.heavy.0, "heavyReadsWaiting": self.heavy.1,
             "heavyReadLimit": HEAVY_READ_LIMIT, "heavyReadQueueLimit": HEAVY_READ_QUEUE_LIMIT,
             "heavyReadWaitMs": HEAVY_READ_WAIT.as_millis(),
+            "backgroundReadWaitMs": BACKGROUND_READ_WAIT.as_millis(),
+            "backgroundReadLimit": HEAVY_READ_LIMIT - 1,
+            "foregroundQueueReserve": FOREGROUND_QUEUE_RESERVE,
             "connectionsOpen": self.connections_open,
             "bulkConnections": self.bulk_connections,
             "connectionLimit": crate::management::listeners::MAX_CONNECTIONS,
@@ -156,6 +178,7 @@ impl AdmissionRefusal {
 pub struct Permit {
     counter: Option<&'static AtomicUsize>,
     heavy: Option<&'static HeavyPool>,
+    background: bool,
 }
 impl Drop for Permit {
     fn drop(&mut self) {
@@ -165,6 +188,9 @@ impl Drop for Permit {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.active -= 1;
+            if self.background {
+                state.active_background -= 1;
+            }
             drop(state);
             pool.ready.notify_all();
         }
@@ -176,7 +202,8 @@ impl Drop for Permit {
 
 struct HeavyState {
     active: usize,
-    tickets: VecDeque<u64>,
+    active_background: usize,
+    tickets: VecDeque<(u64, bool)>,
     next_ticket: u64,
 }
 struct HeavyPool {
@@ -196,6 +223,7 @@ impl HeavyPool {
             queue_limit,
             state: Mutex::new(HeavyState {
                 active: 0,
+                active_background: 0,
                 tickets: VecDeque::new(),
                 next_ticket: 0,
             }),
@@ -216,26 +244,53 @@ impl HeavyPool {
     }
 
     fn acquire(&'static self, budget: Duration) -> Result<Permit, AdmissionRefusal> {
+        self.acquire_priority(budget, false)
+    }
+
+    // Background work may occupy at most limit-1 slots. A queued background
+    // reader also keeps one slot from being borrowed by more foreground work.
+    // Thus neither priority can starve the other; running work is not preempted.
+    fn eligible(&self, state: &HeavyState, background: bool) -> bool {
+        if state.active >= self.limit {
+            return false;
+        }
+        if background {
+            state.active_background < self.limit.saturating_sub(1)
+        } else {
+            !(state.active_background == 0
+                && state.tickets.iter().any(|(_, bg)| *bg)
+                && state.active >= self.limit.saturating_sub(1))
+        }
+    }
+
+    fn acquire_priority(&'static self, budget: Duration, background: bool) -> Result<Permit, AdmissionRefusal> {
         let started = Instant::now();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.active < self.limit && state.tickets.is_empty() {
+        if self.eligible(&state, background) && !state.tickets.iter().any(|(_, bg)| *bg == background) {
             state.active += 1;
+            state.active_background += usize::from(background);
             return Ok(Permit {
                 counter: None,
                 heavy: Some(self),
+                background,
             });
         }
-        if state.tickets.len() >= self.queue_limit {
+        let queue_limit = if background {
+            self.queue_limit.saturating_sub(FOREGROUND_QUEUE_RESERVE)
+        } else {
+            self.queue_limit
+        };
+        if state.tickets.len() >= queue_limit {
             self.queue_full.fetch_add(1, Ordering::Relaxed);
             return Err(AdmissionRefusal::new(RefusalReason::HeavyReadQueueFull,
                 (state.active, state.tickets.len())));
         }
         let ticket = state.next_ticket;
         state.next_ticket = state.next_ticket.wrapping_add(1);
-        state.tickets.push_back(ticket);
+        state.tickets.push_back((ticket, background));
         self.queued.fetch_add(1, Ordering::Relaxed);
         loop {
             let elapsed = started.elapsed();
@@ -245,7 +300,7 @@ impl HeavyPool {
                 let position = state
                     .tickets
                     .iter()
-                    .position(|value| *value == ticket)
+                    .position(|(value, _)| *value == ticket)
                     .expect("queued heavy read keeps its ticket");
                 state.tickets.remove(position);
                 self.timed_out.fetch_add(1, Ordering::Relaxed);
@@ -259,16 +314,25 @@ impl HeavyPool {
                 self.ready.notify_all();
                 return Err(refusal);
             }
-            if state.active < self.limit && state.tickets.front() == Some(&ticket) {
-                state.tickets.pop_front();
+            if self.eligible(&state, background)
+                && state.tickets.iter().find(|(_, bg)| *bg == background) == Some(&(ticket, background))
+            {
+                let position = state.tickets.iter().position(|(value, _)| *value == ticket).unwrap();
+                state.tickets.remove(position);
                 state.active += 1;
+                state.active_background += usize::from(background);
                 self.wait_ns.fetch_add(
                     elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
                     Ordering::Relaxed,
                 );
+                // Another lane or FIFO successor may now have an available
+                // slot; do not leave it sleeping until this read completes.
+                drop(state);
+                self.ready.notify_all();
                 return Ok(Permit {
                     counter: None,
                     heavy: Some(self),
+                    background,
                 });
             }
             let (next, _) = self
@@ -291,8 +355,12 @@ fn take(counter: &AtomicUsize, limit: usize) -> bool {
 /// here on their own bounded lane. The listener reserves control connections
 /// before admission, so these waiting threads cannot consume that reserve.
 pub fn admit(class: WorkClass) -> Result<Permit, AdmissionRefusal> {
+    admit_priority(class, false)
+}
+
+fn admit_priority(class: WorkClass, background: bool) -> Result<Permit, AdmissionRefusal> {
     if class == WorkClass::HeavyRead {
-        let permit = HEAVY.acquire(HEAVY_READ_WAIT);
+        let permit = HEAVY.acquire_priority(if background { BACKGROUND_READ_WAIT } else { HEAVY_READ_WAIT }, background);
         if permit.is_err() {
             REFUSED.fetch_add(1, Ordering::Relaxed);
         }
@@ -317,11 +385,13 @@ pub fn admit(class: WorkClass) -> Result<Permit, AdmissionRefusal> {
         Ok(Permit {
             counter: Some(counter),
             heavy: None,
+            background: false,
         })
     } else {
         Ok(Permit {
             counter: None,
             heavy: None,
+            background: false,
         })
     }
 }
@@ -334,15 +404,20 @@ pub fn admit_request(
     slot: Option<&mut crate::management::listeners::ConnectionSlot>,
 ) -> Result<Permit, AdmissionRefusal> {
     let class = classify(request);
-    admit_with_bulk(class, || slot.is_none_or(|slot| slot.restrict_to_bulk()))
+    let background = request.headers.get(READ_PRIORITY_HEADER).is_some_and(|value| value == "background");
+    admit_with_bulk_priority(class, background, || slot.is_none_or(|slot| slot.restrict_to_bulk()))
 }
 
 fn admit_with_bulk(class: WorkClass, restrict: impl FnOnce() -> bool) -> Result<Permit, AdmissionRefusal> {
+    admit_with_bulk_priority(class, false, restrict)
+}
+
+fn admit_with_bulk_priority(class: WorkClass, background: bool, restrict: impl FnOnce() -> bool) -> Result<Permit, AdmissionRefusal> {
     if class != WorkClass::Control && !restrict() {
         REFUSED.fetch_add(1, Ordering::Relaxed);
         return Err(AdmissionRefusal::new(RefusalReason::ControlConnectionReserve, HEAVY.counts()));
     }
-    admit(class)
+    admit_priority(class, background)
 }
 
 pub fn snapshot() -> serde_json::Value {
@@ -353,6 +428,8 @@ pub fn snapshot() -> serde_json::Value {
         "connectionLimit": crate::management::listeners::MAX_CONNECTIONS,
         "heavyReadsActive": active, "heavyReadsWaiting": waiting,
         "heavyReadQueueLimit": HEAVY_READ_QUEUE_LIMIT, "heavyReadWaitMs": HEAVY_READ_WAIT.as_millis(),
+        "backgroundReadWaitMs": BACKGROUND_READ_WAIT.as_millis(), "backgroundReadLimit": HEAVY_READ_LIMIT - 1,
+        "foregroundQueueReserve": FOREGROUND_QUEUE_RESERVE,
         "heavyReadsQueuedTotal": HEAVY.queued.load(Ordering::Relaxed),
         "heavyReadWaitNsTotal": HEAVY.wait_ns.load(Ordering::Relaxed),
         "heavyReadWaitTimeouts": HEAVY.timed_out.load(Ordering::Relaxed),
@@ -397,6 +474,26 @@ mod tests {
             body: body.as_bytes().to_vec(),
         }
     }
+    #[test]
+    fn native_turn_pages_share_heavy_capacity() {
+        let held: Vec<_> = (0..HEAVY_READ_LIMIT)
+            .map(|_| admit(WorkClass::HeavyRead).unwrap()).collect();
+        let request = request("POST", "/v2/sessions/cutex.a/app-server/requests",
+            &serde_json::json!({"requestId":"page", "native":{"message":{
+                "id":1,"method":"thread/turns/list","params":{"threadId":"t","limit":10}
+            }}}).to_string());
+        assert_eq!(classify(&request), WorkClass::HeavyRead);
+        let reader = std::thread::spawn(move || admit_request(&request, None).unwrap());
+        wait_for_queue(&HEAVY, 1);
+        assert_eq!(HEAVY.counts(), (2, 1));
+        let control = admit_request(&self::request("POST", "/v2/sessions/cutex.a/app-server/requests",
+            r#"{"native":{"message":{"method":"turn/interrupt"}}}"#), None).unwrap();
+        assert_eq!(HEAVY.counts(), (2, 1));
+        drop((control, held));
+        drop(reader.join().unwrap());
+        assert_eq!(HEAVY.counts(), (0, 0));
+    }
+
     #[test]
     fn costly_routes_cannot_take_control_capacity() {
         for path in [
@@ -759,7 +856,7 @@ mod tests {
             assert!(!output.contains(value));
         }
         let capacity = refusal.details()["capacity"].clone();
-        assert_eq!(capacity.as_object().unwrap().len(), 15);
+        assert_eq!(capacity.as_object().unwrap().len(), 18);
         assert!(capacity.as_object().unwrap().iter().all(|(key, value)|
             key == "approximate" && value == true || value.is_u64()));
     }

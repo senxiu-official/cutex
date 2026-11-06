@@ -61,7 +61,7 @@ pub fn session_paths(session: &str) -> SessionPaths {
 
 /// A project's workspace root from the Agent Management store.
 pub fn project_root(project: &str) -> Option<PathBuf> {
-    let snapshot = crate::memory::load_agent_management_snapshot().ok()?;
+    let snapshot = crate::memory::load_agent_management_directory().ok()?;
     let id = crate::agent_management::ProjectId::new(project).ok()?;
     snapshot
         .project_states
@@ -74,14 +74,14 @@ pub fn project_root(project: &str) -> Option<PathBuf> {
 
 /// The project a session belongs to (member or Director seat).
 pub fn session_project(session: &str) -> Option<String> {
-    let snapshot = crate::memory::load_agent_management_snapshot().ok()?;
+    let snapshot = crate::memory::load_agent_management_directory().ok()?;
     crate::memory::project_for_session(&snapshot, session).map(|project| project.as_str().to_string())
 }
 
 /// Record the owner notice; `publish` = also push it now (management
 /// process only; the Agent Bus process leaves it to the management tick).
 fn record_quota_notice(session: Option<&str>, name: &str, used: u64, quota: u64, publish: bool) {
-    use crate::owner_notify::store::{Level, NewNotification, Origin, OwnerNotifyStore};
+    use crate::owner_notify::store::{Level, NewNotification, OwnerNotifyStore};
     if cfg!(test) {
         return;
     }
@@ -106,9 +106,7 @@ fn record_quota_notice(session: Option<&str>, name: &str, used: u64, quota: u64,
         job: None,
         turn_id: None,
     };
-    let created = store.with_state(|state| {
-        state.create_decided(new, Origin::System, Some(QUOTA_NOTICE_KIND), &settings, &evaluator, None, chrono::Utc::now())
-    });
+    let created = store.create_system(new,Some(QUOTA_NOTICE_KIND),&settings,&evaluator,chrono::Utc::now());
     if let Err(error) = created {
         eprintln!("artifacts: could not notify the owner: {error:#}");
         return;

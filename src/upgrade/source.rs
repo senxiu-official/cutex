@@ -248,7 +248,9 @@ mod tests {
         assert!(Source::parse("https://example.com/x?y=1").is_err());
         assert!(Source::parse("ftp://example.com/x").is_err());
         assert!(Source::parse("relative/dir").is_err());
-        assert!(matches!(Source::parse("file:///srv/mirror").unwrap(), Source::Dir { .. }));
+        let absolute = if cfg!(windows) { "C:/srv/mirror" } else { "/srv/mirror" };
+        let directory = Source::Dir {root: PathBuf::from(absolute)};
+        assert_eq!(Source::parse(&directory.display()).unwrap(), directory);
         assert!(Source::parse("file://relative").is_err());
     }
 

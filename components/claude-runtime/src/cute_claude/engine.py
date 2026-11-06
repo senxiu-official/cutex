@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from typing import Awaitable, Callable
 
 from .config import Settings
 from .errors import RpcError
 from .provider import Provider, ProviderError
-from .store import Store, dump, identifier
+from .store import Store, identifier
+from . import usage_totals
 from .tools import ToolContext, ToolRegistry
 
 Notify = Callable[[str, str, dict], Awaitable[None]]
@@ -187,15 +187,15 @@ class Engine:
             await self.emit(tid, "claude/input/statusChanged", self.store.input_status(tid, record["message_id"]))
 
     def _usage(self, turn_id: str, calls: list[dict]) -> None:
-        self.store.db.execute("UPDATE turns SET usage=? WHERE id=?", (dump({"modelRequests": calls, "mock": self.settings.mock}), turn_id))
+        usage_totals.write_turn_usage(self.store, turn_id, {"modelRequests": calls, "mock": self.settings.mock})
+
+    @classmethod
+    def _totals(cls, calls: list[dict]) -> dict:
+        return cls._sums(usage_totals.request_sums(calls)[:4])
 
     @staticmethod
-    def _totals(calls: list[dict]) -> dict:
-        usage = [c["usage"] for c in calls if isinstance(c.get("usage"), dict)]
-        plain = sum(u.get("input_tokens", 0) for u in usage)
-        created = sum(u.get("cache_creation_input_tokens", 0) for u in usage)
-        cached = sum(u.get("cache_read_input_tokens", 0) for u in usage)
-        output = sum(u.get("output_tokens", 0) for u in usage)
+    def _sums(sums) -> dict:
+        plain, created, cached, output = sums
         return {"totalTokens": plain + created + cached + output, "inputTokens": plain + created + cached,
                 "cachedInputTokens": cached, "cacheWriteInputTokens": created, "outputTokens": output,
                 "reasoningOutputTokens": 0}
@@ -206,9 +206,8 @@ class Engine:
         `modelContextWindow`), so it is the final model request of the turn, not the
         turn's billing sum; `total` stays the thread's billing-style sum. `keep_last`
         repeats the thread's last reported occupancy (usage added after a turn)."""
-        all_calls: list[dict] = []
-        for row in self.store.db.execute("SELECT usage FROM turns WHERE thread_id=?", (tid,)):
-            all_calls.extend(json.loads(row[0]).get("modelRequests", []))
+        # Committed thread totals (058 S2), not a re-sum of every turn.
+        committed = usage_totals.thread_totals(self.store, tid)
         occupancy = self.__dict__.setdefault('_last_occupancy', {})
         if keep_last:
             current = occupancy.get(tid) or self._totals([])
@@ -228,7 +227,11 @@ class Engine:
             windows[tid] = window
         else:
             window = windows.get(tid)
-        token_usage = {"total": self._totals(all_calls), "last": current, "modelContextWindow": window}
+        token_usage = {"total": self._sums(committed.sums[:4]), "last": current, "modelContextWindow": window,
+                       # Part of total used by background subagents (cutex splits it per agent; claude-r35).
+                       "backgroundTotal": self._sums(committed.sums[4:]),
+                       # Grows with each committed change of `total`; equal revision = same totals.
+                       "totalRevision": committed.revision}
         # Runtime-local evidence, never inferred from an account label or copied
         # history. Background subagents cannot change the parent's cache policy.
         ttls = self.__dict__.setdefault('_cache_ttls', {})

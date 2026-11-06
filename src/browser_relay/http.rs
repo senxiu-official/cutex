@@ -35,6 +35,7 @@ pub fn handle(
         return clear_idempotency(stream, request, root);
     }
     let agent_route = path == "/v2/browser/commands"
+        || path == "/v2/browser/scripts"
         || parts.len() >= 5 && parts[1..4] == ["v2", "browser", "commands"];
     let owner_route = matches!(
         path,
@@ -58,6 +59,9 @@ pub fn handle(
         if agent_route {
             if request.path.contains('?') {
                 return Err(RelayError::new("invalid_request"));
+            }
+            if request.method == "POST" && path == "/v2/browser/scripts" {
+                return super::script::submit(request, context);
             }
             if request.method == "POST" && path == "/v2/browser/commands" {
                 return super::agent_api::submit(relay, request, context, stream);
@@ -201,6 +205,10 @@ fn clear_idempotency(
             status: super::commands::Status::Succeeded,
             error: None,
             duration_ms: 0,
+            busy_cause: None,
+            abort_cause: None,
+            dispatch_ms: None,
+            running_ms: None,
             bytes: 0,
             late_result: 0,
             dropped: 0,
@@ -436,7 +444,7 @@ mod tests {
         crate::config::store::save_codez_config(&config).unwrap();
         let profiles:crate::profiles::model::AccountsStore=serde_json::from_value(json!({
             "version":crate::profiles::model::STORE_VERSION,"active_account_id":null,
-            "accounts":[{"id":"on-id","name":"Enabled","browser_tools":true},{"id":"off-id","name":"Disabled"}],
+            "accounts":[{"id":"on-id","name":"Enabled","browser_tools":true},{"id":"off-id","name":"Disabled","browser_tools":false}],
         })).unwrap();
         crate::profiles::store::save_store(&profiles).unwrap();
         let native="018e0000-0000-7000-8000-0000b0009ae6";
@@ -451,6 +459,7 @@ mod tests {
             "schema_version":"test","schema_sha256":"a".repeat(64),"started_at":"2026-10-24T00:00:00Z"})).unwrap());
         let mut context=unused_context();
         context.load_runtime_status=|session|Ok(Some(crate::app_server::manager::AppServerManagedRuntimeStatus {
+            background_work: Default::default(),
             cutex_session_id:session.into(),thread_id:"018e0000-0000-7000-8000-0000b0009ae6".into(),runtime_generation:7,connected:true,
             active_turn_id:None,active_turn_observed_at:None,thread_status:None,thread_status_observed_at:None,
             thread_settings:None,thread_settings_source:None,thread_settings_complete:false,thread_settings_observed_at:None,

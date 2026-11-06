@@ -83,7 +83,7 @@ The daemon re-pins them on request (root credential only; capability
   upgrade is skipped. The revert runs
   in the daemon (`revert_runtime_package_upgrade`) under the same locks as apply,
   including the cross-process session-store lock. **No service has to be
-  stopped**, unlike the one-off r210 repin script, which edited
+  stopped**, unlike an earlier one-off repin script, which edited
   `cutex-sessions.json` from outside the daemon. The previous package must still
   load and validate.
 

@@ -90,9 +90,6 @@ jobs:
           set -euo pipefail
           version="$("$E2E_PYTHON" -c 'import json; print(json.load(open("components/claude-runtime/component.json"))["version"])' | tr -d '\r')"
           PYTHON="$E2E_PYTHON" bash components/claude-runtime/build.sh "${{ matrix.platform }}" "$version" "$RUNNER_TEMP/archives"
-          if [ "$RUNNER_OS" = Linux ] && [ "$version" = claude-r32 ] && [ "$CUTEX_CLAUDE_BUNDLE_CLI" = 1 ]; then
-            "$E2E_PYTHON" ci/.github/ci/claude-r32-compat.py "$RUNNER_TEMP/archives" --source-commit "$(git rev-parse HEAD)"
-          fi
           "$E2E_PYTHON" .github/ci/components.py check claude-runtime "$version" "${{ matrix.platform }}" "$RUNNER_TEMP/archives" --commit "$(git rev-parse HEAD)"
       - name: Install the real Claude Code CLI from npm (path with a space)
         if: inputs.real_claude

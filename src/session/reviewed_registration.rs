@@ -162,6 +162,10 @@ pub fn preserve_reviewed_groups(
         );
     }
     agent.groups = record.agent_groups.clone();
+    if let Some(name)=record.formal_agent_name.as_ref() {
+        agent.name=name.clone();
+        agent.base_name=Some(name.clone());
+    }
     Ok(Some((record.clone(), receipt.review.contract.clone())))
 }
 
@@ -323,6 +327,23 @@ mod tests {
             .unwrap()
             .runtime_generation += 1;
         assert!(preserve_reviewed_groups(&store, &mut agent, "private").is_err());
+    }
+
+    #[test]
+    fn reviewed_reconnect_projects_current_formal_name_without_rewriting_receipt_or_contract() {
+        let (mut store,mut agent)=fixture();
+        let record=store.sessions.get_mut("cutex.test").unwrap();
+        record.formal_agent_name=Some("Renamed by owner".into());
+        record.display_name_override=Some("Owner display alias".into());
+        let historical=serde_json::to_value(store.explicit_launch_receipts.get("reviewed-register")).unwrap();
+        let (record,contract)=preserve_reviewed_groups(&store,&mut agent,"private").unwrap().unwrap();
+        assert_eq!(agent.name,"Renamed by owner");
+        assert_eq!(agent.base_name.as_deref(),Some("Renamed by owner"));
+        assert_eq!(record.display_name_override.as_deref(),Some("Owner display alias"));
+        assert_eq!(record.codex_session_id.as_deref(),Some(contract.native_id.as_str()));
+        assert_eq!(serde_json::to_value(store.explicit_launch_receipts.get("reviewed-register")).unwrap(),historical);
+        let mut wrong=agent.clone();wrong.session_id=Some(uuid::Uuid::new_v4().to_string());
+        assert!(preserve_reviewed_groups(&store,&mut wrong,"private").is_err(),"a different native thread acquires no reviewed ownership");
     }
 
     #[test]

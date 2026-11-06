@@ -49,6 +49,8 @@ impl AdmissionItem {
 #[serde(rename_all = "camelCase")]
 pub struct AdmissionSnapshot {
     #[serde(default)]
+    pub auto_retry: Option<super::model_overload_retry::AutoRetry>,
+    #[serde(default)]
     pub next_step: Vec<AdmissionNextStep>,
     #[serde(default)]
     pub current_turn: Option<AdmissionCurrentTurn>,
@@ -121,6 +123,17 @@ pub struct AdmissionNextStep {
 /// Longest `preview` of a next-step ride-along, in characters (with `…`).
 pub const RIDEALONG_PREVIEW_CHARS: usize = 80;
 
+/// Explain an existing retained-lease block; do not change scheduler eligibility,
+/// fractional order, passive notes or an already accepted native receipt.
+pub(crate) fn project_auto_retry(rows: &mut [AdmissionNextStep], retry: Option<&super::model_overload_retry::AutoRetry>) {
+    if !retry.is_some_and(|retry| retry.holds_admission) { return; }
+    for row in rows {
+        if row.held.is_none() && row.wait_reason.as_deref() != Some("nativeReceipt") {
+            row.wait_reason = Some("autoRetry".into());
+        }
+    }
+}
+
 /// The first non-empty line of `text`, whitespace collapsed, cut on a
 /// character boundary to [`RIDEALONG_PREVIEW_CHARS`] (with `…`).
 pub fn ridealong_preview(text: &str) -> Option<String> {
@@ -154,7 +167,7 @@ pub fn timing(created_at: &str, alarm: bool) -> (String, Option<String>) {
     (timing.into(), deadline.map(|at| at.to_rfc3339()))
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StoredAdmission {
     #[serde(default)]
@@ -165,11 +178,21 @@ pub(crate) struct StoredAdmission {
     pub priority_asks: std::collections::BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OrderEntry {
     key: Vec<u16>,
     enqueued_at: String,
+}
+
+impl StoredAdmission {
+    pub(crate) fn persisted_eq(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        for step in &mut left.snapshot.next_step { step.eligible = false; }
+        for step in &mut right.snapshot.next_step { step.eligible = false; }
+        left == right
+    }
 }
 
 fn between(left: &[u16], right: Option<&[u16]>) -> Vec<u16> {
@@ -464,8 +487,9 @@ pub(crate) fn ask_next_step(state: &AskState, session: &str) -> Vec<AdmissionNex
 /// 30 s owner liveness bound (`admission_wait`) releases it.
 pub fn delivery_may_start(session: &str, id: &str) -> anyhow::Result<bool> {
     let queue = super::user_input::user_input_repository()?;
+    let owner_first = owner_first(session);
     crate::asks::pause_admission::with_state_or(&queue.ask_store(), Ok(false), |state, _|
-        delivery_may_start_with(&queue, session, id, state))?
+        delivery_may_start_first(&queue, session, id, state, owner_first))?
 }
 
 pub(crate) fn project_result_window(
@@ -486,11 +510,25 @@ pub(crate) fn project_result_window(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn delivery_may_start_with(queue: &super::user_input::UserInputRepository, session: &str, id: &str, state: &AskState) -> anyhow::Result<bool> {
+    delivery_may_start_first(queue, session, id, state, owner_first(session))
+}
+
+/// `owner_first` (decision 1, [`owner_first`]): a ride-along waits while the
+/// first waiting admission item is the owner's. Only then: an ask queued
+/// ahead of the owner keeps today's order (the ask may wait for ride-alongs,
+/// so blocking them too would deadlock all three).
+fn delivery_may_start_first(queue: &super::user_input::UserInputRepository, session: &str, id: &str, state: &AskState, owner_first: bool) -> anyhow::Result<bool> {
     {
         if crate::asks::agent_pause::is_paused(state, session)
             || state.leases.contains_key(session) || crate::asks::control::stop_held(state, session) { return Ok(false); }
         let admission = queue.admission_with_state(session, state)?;
+        if owner_first && !owner_priority(session)
+            && admission.items.iter().find(|item| item.state == "waiting").is_some_and(|item| item.kind == "owner")
+        {
+            return Ok(false);
+        }
         if owner_priority(session) {
             if admission.items.iter().any(|item| item.kind == "owner" && item.state == "waiting") {
                 return Ok(false);
@@ -503,25 +541,85 @@ pub(crate) fn delivery_may_start_with(queue: &super::user_input::UserInputReposi
 
 // Notifications are coalesced per session and consumed outside source-store
 // locks. The runtime driver performs both projection publication and idle flush.
-fn changes() -> &'static (std::sync::Mutex<std::collections::BTreeSet<String>>, std::sync::Condvar) {
-    static CHANGES: std::sync::OnceLock<(std::sync::Mutex<std::collections::BTreeSet<String>>, std::sync::Condvar)> = std::sync::OnceLock::new();
+#[derive(Default)]
+struct AdmissionChanges(BTreeMap<String, std::time::Instant>);
+impl AdmissionChanges {
+    fn retry(&mut self, session: &str, at: std::time::Instant) {
+        // Repeated deferrals cannot postpone an existing wake or multiply it.
+        self.0.entry(session.into()).and_modify(|due| *due = (*due).min(at)).or_insert(at);
+    }
+    fn take_ready(&mut self, now: std::time::Instant) -> Vec<String> {
+        let ready: Vec<_> = self.0.iter().filter(|(_, at)| **at <= now).map(|(session, _)| session.clone()).collect();
+        for session in &ready { self.0.remove(session); }
+        ready
+    }
+}
+const ADMISSION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+fn changes() -> &'static (std::sync::Mutex<AdmissionChanges>, std::sync::Condvar) {
+    static CHANGES: std::sync::OnceLock<(std::sync::Mutex<AdmissionChanges>, std::sync::Condvar)> = std::sync::OnceLock::new();
     CHANGES.get_or_init(Default::default)
 }
 pub fn changed(session: &str) {
     let (pending, wake) = changes();
-    pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(session.into());
+    pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0.insert(session.into(), std::time::Instant::now());
     wake.notify_one();
 }
+/// Consecutive deferrals per session (r273 stab). A session whose admission
+/// keeps finding the lifecycle fence busy backs off 1 s, 2 s, 4 s, 8 s
+/// instead of re-running its whole admission pass (and owner-queue flush,
+/// which reads native history) every second for as long as the fence stays
+/// contended (after two quick 1 s retries). A successful pass, or a quiet
+/// minute, resets the streak.
+const ADMISSION_RETRY_MAX_SHIFT: u32 = 3;
+const ADMISSION_RETRY_STREAK_RESET: std::time::Duration = std::time::Duration::from_secs(60);
+fn deferrals() -> &'static std::sync::Mutex<BTreeMap<String, (u32, std::time::Instant)>> {
+    static DEFERRALS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, (u32, std::time::Instant)>>> = std::sync::OnceLock::new();
+    DEFERRALS.get_or_init(Default::default)
+}
+fn next_deferral(session: &str, now: std::time::Instant) -> (u32, std::time::Duration) {
+    let mut streaks = deferrals().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    streaks.retain(|_, (_, at)| now.saturating_duration_since(*at) < ADMISSION_RETRY_STREAK_RESET);
+    let entry = streaks.entry(session.into()).or_insert((0, now));
+    entry.0 = entry.0.saturating_add(1);
+    entry.1 = now;
+    let streak = entry.0;
+    // Two quick retries ride out a short hold; then 2 s, 4 s, 8 s.
+    (streak, ADMISSION_RETRY_DELAY * (1u32 << streak.saturating_sub(2).min(ADMISSION_RETRY_MAX_SHIFT)))
+}
+/// The admission pass for `session` completed: the next deferral starts at 1 s.
+pub fn admission_settled(session: &str) {
+    deferrals().lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(session);
+}
+/// A busy lifecycle fence is a temporary hold, not a consumed admission change.
+/// Returns how many consecutive deferrals this session has had (1 = first).
+pub fn retry_later(session: &str) -> u32 {
+    let now = std::time::Instant::now();
+    let (streak, delay) = next_deferral(session, now);
+    let (pending, wake) = changes();
+    pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retry(session, now + delay);
+    wake.notify_one();
+    streak
+}
+/// `Some(streak)` when the error was a deferral (and a retry is scheduled).
+pub fn retry_deferred(session: &str, error: &anyhow::Error) -> Option<u32> {
+    error.is::<crate::asks::pause_admission::Deferred>().then(|| retry_later(session))
+}
 pub fn take_change(session: &str) -> bool {
-    changes().0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(session)
+    let mut pending = changes().0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if pending.0.get(session).is_some_and(|at| *at <= std::time::Instant::now()) {
+        pending.0.remove(session); true
+    } else { false }
 }
 pub fn take_changes() -> Vec<String> {
-    std::mem::take(&mut *changes().0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)).into_iter().collect()
+    changes().0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_ready(std::time::Instant::now())
 }
 pub fn wait_for_changes(timeout: std::time::Duration) {
     let (pending, wake) = changes();
     let guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = wake.wait_timeout_while(guard, timeout, |items| items.is_empty());
+    let now = std::time::Instant::now();
+    let delay = guard.0.values().min().map(|at| at.saturating_duration_since(now).min(timeout)).unwrap_or(timeout);
+    if !delay.is_zero() { let _ = wake.wait_timeout(guard, delay); }
 }
 #[derive(Default)]
 struct TrackedTurns {
@@ -608,6 +706,13 @@ pub fn owner_yield(session: &str) {
 pub fn owner_yielded(session: &str) -> bool {
     owner_yields().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(session)
 }
+/// Owner decision 1 (054, behind the input ledger switch): an idle agent
+/// takes the owner's message before ride-alongs that are already eligible,
+/// unless the owner yielded this turn (`queue/yield`). Reads the switch
+/// (config.json at most every 5 s): call it outside the host fence.
+pub fn owner_first(session: &str) -> bool {
+    super::input_ledger::enabled() && !owner_yielded(session)
+}
 fn take_owner_yield(session: &str) -> bool {
     owner_yields().lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(session)
 }
@@ -659,6 +764,44 @@ pub(crate) fn current_turn(session: &str, asks: &AskState) -> Option<AdmissionCu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_owner_admission_retry_coalesces_without_postponing_or_spinning() {
+        let now = std::time::Instant::now();
+        let due = now + super::ADMISSION_RETRY_DELAY;
+        let mut changes = super::AdmissionChanges::default();
+        changes.retry("image", due);
+        for _ in 0..100 { changes.retry("image", due + super::ADMISSION_RETRY_DELAY); }
+        assert!(changes.take_ready(now).is_empty(), "deferred work must not hot-loop");
+        assert_eq!(changes.take_ready(due), vec!["image"]);
+        assert!(changes.take_ready(due + super::ADMISSION_RETRY_DELAY).is_empty(), "one wake only");
+    }
+
+    #[test]
+    fn repeated_deferrals_back_off_and_success_resets() {
+        let session = format!("cutex.admission-backoff-{}", uuid::Uuid::new_v4());
+        let now = std::time::Instant::now();
+        let delays: Vec<_> = (0..6).map(|_| super::next_deferral(&session, now).1.as_secs()).collect();
+        assert_eq!(delays, vec![1, 1, 2, 4, 8, 8], "bounded exponential backoff");
+        super::admission_settled(&session);
+        assert_eq!(super::next_deferral(&session, now), (1, super::ADMISSION_RETRY_DELAY));
+        // A quiet minute also starts a fresh streak.
+        let later = now + super::ADMISSION_RETRY_STREAK_RESET + std::time::Duration::from_secs(1);
+        assert_eq!(super::next_deferral(&session, later).0, 1);
+        super::admission_settled(&session);
+    }
+
+    #[test]
+    fn idle_owner_admission_fresh_change_overtakes_retry_and_unrelated_errors_do_not_retry() {
+        let session = format!("cutex.admission-retry-{}", uuid::Uuid::new_v4());
+        super::retry_deferred(&session, &anyhow::anyhow!("unrelated native failure"));
+        assert!(!super::take_change(&session));
+        assert!(!super::changes().0.lock().unwrap().0.contains_key(&session));
+        super::retry_deferred(&session, &anyhow::Error::new(crate::asks::pause_admission::Deferred).context("projection"));
+        assert!(!super::take_change(&session));
+        super::changed(&session);
+        assert!(super::take_change(&session), "fresh source changes need not wait for backoff");
+        assert!(!super::take_change(&session));
+    }
     use super::*;
     #[test]
     fn caller_perf_filter_before_sort_preserves_fifo_and_holds() {
@@ -680,7 +823,7 @@ mod tests {
                 record.state = AttemptState::Running;
                 ask.attempts.push(record);
             }
-            state.asks.insert(ask.ask_id.clone(), ask);
+            state.asks.insert(ask.ask_id.clone(), ask.into());
         }
         // Reference selection uses the previous all-row sort, independently
         // checking order and eligibility; unrelated sessions must never leak.
@@ -991,6 +1134,61 @@ mod tests {
         reopened.ask_store().with_state(|state| control::owner_message(state, &session, "started", chrono::Utc::now())).unwrap();
         assert!(reopened.list_admission(&session).unwrap().3.ridealongs_held.is_none());
         assert!(may_start(&reopened, &answer));
+        super::super::admission_wait::clear(&session);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Owner decision 1 (054, input ledger switch): an idle agent takes the
+    /// owner's message before an eligible ride-along; a waiting owner item
+    /// holds the ride-along back; the owner's yield restores today's order;
+    /// with the switch off nothing changes (ride-along first,
+    /// `rideAlongAhead` in the ledger only).
+    #[test]
+    fn decision_one_owner_goes_before_eligible_ridealongs_behind_the_switch() {
+        use super::super::input_ledger::pin_enabled;
+        use super::super::user_input::{OwnerStart, UserInputOrigin, UserInputOriginKind, UserInputStrategy, UserInputSubmitParams};
+        let root = std::env::temp_dir().join(format!("cutex-v2-owner-first-{}", uuid::Uuid::new_v4()));
+        let session = format!("owner-first-{}", uuid::Uuid::new_v4());
+        let queue = super::super::user_input::UserInputRepository::open(&root).unwrap();
+        queue.ask_store().with_state(|state| {
+            let now = chrono::Utc::now();
+            let mut returned = crate::asks::store::tests::new_ask("returned", "returned result");
+            returned.requester = crate::asks::model::Requester::Agent { cutex_session_id: session.clone(), name: None };
+            let returned = state.create_ask(returned, now).unwrap().0;
+            crate::asks::delivery::record_answer_delivery(state, &returned, "answer", now).unwrap();
+        }).unwrap();
+        let answer = queue.list_admission(&session).unwrap().3.next_step[0].id.clone();
+        let may_start = |id: &str| {
+            let state = queue.ask_store().snapshot().unwrap();
+            delivery_may_start_with(&queue, &session, id, &state).unwrap()
+        };
+
+        let pin = pin_enabled(Some(false));
+        assert_eq!(queue.owner_start_with_reason(&session, None).unwrap(), (OwnerStart::Blocked, "rideAlongAhead"));
+        assert!(may_start(&answer));
+        super::super::admission_wait::clear(&session);
+
+        pin.set(Some(true));
+        assert!(queue.owner_may_start(&session, None).unwrap(), "decision 1: the owner first");
+        assert!(may_start(&answer), "no owner input waiting: the ride-along may go");
+        let params = UserInputSubmitParams {
+            client_user_message_id: "owner-1".into(),
+            origin: UserInputOrigin { kind: UserInputOriginKind::Backend, client_id: "c".into() },
+            strategy: UserInputStrategy::Queue,
+            input: vec![serde_json::json!({"type": "text", "text": "hi"})],
+            expected_turn_id: None,
+            join_delegation: None,
+        };
+        queue.enqueue(&session, "thread", "request-1", &params).unwrap();
+        let owner_item = queue.list(&session).unwrap().1[0].queue_id.clone();
+        assert!(queue.owner_may_start(&session, Some(&owner_item)).unwrap());
+        assert!(!may_start(&answer), "the waiting owner item goes first");
+        owner_yield(&session);
+        assert!(!queue.owner_may_start(&session, Some(&owner_item)).unwrap(), "a yield lets the ride-along go first");
+        assert!(may_start(&answer));
+        owner_started(&session);
+
+        drop(pin);
         super::super::admission_wait::clear(&session);
         let _ = std::fs::remove_dir_all(root);
     }

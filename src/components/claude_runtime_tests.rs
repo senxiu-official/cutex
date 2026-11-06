@@ -4,7 +4,7 @@ use super::*;
 fn bundled_source_install_uses_the_published_release_label() {
     let handler = ClaudeRuntime::default();
     let features: serde_json::Value = serde_json::from_str(include_str!("../../components/claude-runtime/src/cute_claude/features.json")).unwrap();
-    assert_eq!(handler.metadata().version, "claude-r32");
+    assert_eq!(handler.metadata().version, "claude-r39");
     assert_eq!(features["release"], handler.metadata().version);
 }
 use crate::profiles::lifecycle::tests::TestHome;
@@ -256,6 +256,7 @@ fn write_receipt(dir: &Path, version: &str) {
         version: version.into(),
         origin: "signed".into(),
         archive_sha256: None,
+        selection_source: None,
         files,
         unpacked_at: String::new(),
     };

@@ -187,6 +187,9 @@ fn read_response(stream: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>> {
 }
 
 fn decode_response(bytes: &[u8]) -> Result<Value> {
+    // A peer that closes without any HTTP response has not acknowledged the
+    // request. In particular a POST may already be durable at the receiver.
+    if bytes.is_empty() { return Err(Error::new("peer_unreachable",503)); }
     let split = bytes
         .windows(4)
         .position(|v| v == b"\r\n\r\n")
@@ -254,6 +257,7 @@ pub fn call(
     let gate = peer_gate(store, peer);
     let _serial = gate.lock().unwrap_or_else(|poison| poison.into_inner());
     let required = match (method, path) {
+        (_, super::names::ROUTE) => Some(super::names::FEATURE),
         (_, "/peer/v1/agents") => Some("agents.list.v1"),
         (_, "/peer/v1/events") => Some("asks.snapshot.v1"),
         (_, path) if path.starts_with("/peer/v1/asks/") && path.ends_with("/ops") => {
@@ -329,6 +333,12 @@ pub fn call(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn closed_without_response_remains_a_transport_uncertainty() {
+        let error=super::decode_response(b"").unwrap_err();
+        assert_eq!(error.code,"peer_unreachable");assert!(error.is_transport());
+        assert_eq!(super::decode_response(b"malformed").unwrap_err().code,"peer_protocol_error");
+    }
     use super::*;
     use std::net::TcpListener;
     #[test]

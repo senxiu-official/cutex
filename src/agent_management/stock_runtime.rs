@@ -166,14 +166,19 @@ impl AgentManagementProvider {
         id: &CutexSessionId,
         start: impl FnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         let _execution=super::provider::provider_execution_lock().try_lock()
             .map_err(|error|match error {
                 std::sync::TryLockError::WouldBlock=>anyhow::Error::new(crate::asks::pause_admission::Deferred),
                 std::sync::TryLockError::Poisoned(_)=>anyhow::anyhow!("stock execution lock unavailable"),
             })?;
-        let Some(_mutation)=self.store().try_lock_delivery_mutations()? else {
+        let Some(mutation)=self.store().try_lock_delivery_mutations()? else {
             return Err(crate::asks::pause_admission::Deferred.into());
         };
+        // r273 (051 step 3): registered so the start releases the fence only
+        // for its readiness wait, after its claim and spawn are committed
+        // under this guard (a pause still cannot land before the launch).
+        let _hold = super::host_hold::HostHold::enter(self.store(), Some(_execution), mutation);
         self.require_automatic_runtime_start_unpaused(id)?;
         start()
     }
@@ -182,7 +187,7 @@ impl AgentManagementProvider {
     /// read against that exact protected roster; never recursively call gate()
     /// (which would attempt to acquire the same fence again).
     fn require_automatic_runtime_start_unpaused(&self,id:&CutexSessionId)->anyhow::Result<()> {
-        let roster=self.store().snapshot()?;
+        let roster=self.store().directory_snapshot_shared()?;
         let asks=crate::asks::store::AskStore::open_default()?;
         let paused=asks.inspect(|state|state.pauses.contains_key(id.as_str())
             ||crate::asks::pause_admission::is_paused_in(state,&roster,id.as_str()))?;
@@ -196,7 +201,9 @@ impl AgentManagementProvider {
         id: &CutexSessionId,
         restart: bool,
     ) -> anyhow::Result<StockRuntimeReview> {
-        let _mutation = self.store().lock_mutations()?;
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+        // r271.1: only tries the fence when the caller holds a lane.
+        let _locks = self.fence_locks("runtime review")?;
         self.review_stock_runtime_locked(path, id, restart)
     }
 
@@ -269,10 +276,10 @@ impl AgentManagementProvider {
         review: &StockRuntimeReview,
         runtime: &mut dyn StockRuntimeExecutor,
     ) -> anyhow::Result<StockRuntimeReceipt> {
-        let _execution = super::provider::provider_execution_lock()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("stock execution lock unavailable"))?;
-        let _mutation = self.store().lock_mutations()?;
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+        // r271 (051 §2): fence-first when the owner route opted in.
+        let lane = super::fence_first::fence_first_session_lane(Some(review.subject.cutex_session_id.as_str()))?;
+        let _locks = self.entry_locks(lane.as_deref(), true, "start")?.register(self.store());
         self.execute_stock_runtime_locked(path, action_id, review, runtime)
     }
 
@@ -305,6 +312,7 @@ impl AgentManagementProvider {
         action_id: &AgentActionId,
         runtime: &mut dyn StockRuntimeExecutor,
     ) -> anyhow::Result<(StockRuntimeReceipt, AgentActionId)> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         // This entry is automatic provenance (unlike explicit owner Run and
         // maintenance). Reuse the exact provider guard across the fresh pause
         // check and every claim/spawn; never recursively take a pause fence.
@@ -314,9 +322,12 @@ impl AgentManagementProvider {
                 std::sync::TryLockError::WouldBlock=>anyhow::Error::new(crate::asks::pause_admission::Deferred),
                 std::sync::TryLockError::Poisoned(_)=>anyhow::anyhow!("stock execution lock unavailable"),
             })?;
-        let Some(_mutation)=self.store().try_lock_delivery_mutations()? else {
+        let Some(mutation)=self.store().try_lock_delivery_mutations()? else {
             return Err(crate::asks::pause_admission::Deferred.into());
         };
+        // r273: registered, so only the readiness wait (after the claim and
+        // the spawn are committed under this guard) runs outside the fence.
+        let _hold = super::host_hold::HostHold::enter(self.store(), Some(_execution), mutation);
         self.require_automatic_runtime_start_unpaused(id)?;
         let sessions = load_cutex_session_store_from_path(path)?;
         let record = sessions
@@ -521,6 +532,7 @@ impl AgentManagementProvider {
                 })?;
             }
             if receipt.stage == StockRuntimeStage::Prepared {
+                self.check_automatic_online()?;
                 if !rebase {
                     anyhow::ensure!(
                         review.digest_version.digest(record)? == review.subject.durable_sha256,
@@ -582,6 +594,7 @@ impl AgentManagementProvider {
                 })?;
             }
             if receipt.stage == StockRuntimeStage::Claimed {
+                self.check_automatic_online()?;
                 anyhow::ensure!(receipt.publication.is_some(), "publication_missing: legacy uncertain claim has no absence proof; no automatic retry");
                 runtime.publication(&receipt)?;
                 let current = session_record_at(path, id.as_str())?
@@ -667,7 +680,24 @@ impl AgentManagementProvider {
                 "stock owner changed before registration"
             );
             // A lost response reuses this exact binding/runtime/generation; no spawn.
-            if let Err(error) = runtime.connect(&current, &receipt) {
+            // r273 (051 step 3): the claim and the binding are committed, so
+            // the readiness wait runs outside the host fence when this entry
+            // registered it; the Ready commit below compares the claim, the
+            // binding, the generation and the revision it registered.
+            let releases = super::host_hold::host_fence_releases();
+            let connected = super::host_hold::outside_host_fence("stock runtime readiness", || {
+                runtime.connect(&current, &receipt)
+            })?;
+            if connected.is_ok() && rebase && !maintenance_validated
+                && super::host_hold::host_fence_releases() != releases
+            {
+                // An archive or project move may have landed in the window.
+                if let Err(error) = super::archive::runtime_guard(&self.store().snapshot()?, id) {
+                    return abandon_unready_spawn(path, id, receipt, runtime,
+                        anyhow::anyhow!("agent changed while its runtime came online: {error}"));
+                }
+            }
+            if let Err(error) = connected {
                 if rebase {
                     // Ordinary start: never leave a live, unready child holding
                     // the claim (every later start would see launch_in_progress).
@@ -990,6 +1020,75 @@ mod review_digest_tests {
             "configuration":{"profile_name":"alpha","profile_id":"private-profile","inherited":false,"profile_sha256":"c".repeat(64),"account_sha256":"d".repeat(64),"model":"private-model","reasoning":null,"model_provider":"private","provider":{"name":"private","base_url":"http://127.0.0.1:1/v1","wire_api":"responses","requires_openai_auth":false,"supports_websockets":false},"sandbox":"read-only","approval":"on-request"},
             "restart":true
         })).unwrap()
+    }
+
+    fn binding(pid: u32) -> crate::session::model::CutexAppServerRuntimeBinding {
+        serde_json::from_value(json!({
+            "transport":"unix_socket","endpoint":"unix:///private/native.sock","pid":pid,
+            "runtime_dir":"/private/runtime","diagnostic_journal_path":"/private/journal",
+            "schema_version":"stock","schema_sha256":"e".repeat(64),"started_at":"2026-11-04T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    /// 2026-11-04 EVA: s7-activity's start was Abandoned (agent bus 10060
+    /// during readiness), so every exact retry of its create refused. A start
+    /// that provably left nothing running now gets a fresh attempt; one still
+    /// bound or in progress is resumed as before.
+    #[test]
+    fn a_start_that_left_nothing_running_gets_a_fresh_attempt() {
+        use super::super::runtime_permit::current_runtime_attempt;
+        let mut record = record();
+        let reviewed = review(&record);
+        let base = "managed-runtime:create-1";
+        let receipt = |action: &str, stage: StockRuntimeStage| StockRuntimeReceipt {
+            launch_cwd: None,
+            action_id: AgentActionId::new(action).unwrap(),
+            review: reviewed.clone(),
+            stage,
+            claim_id: format!("{action}-claim"),
+            runtime_agent_id: format!("stock.{action}"),
+            expected_generation: 1,
+            binding: Some(binding(4242)),
+            publication: None,
+            error: None,
+            updated_at: "2026-11-04T05:35:40Z".into(),
+        };
+        let store = |receipts: Vec<StockRuntimeReceipt>| {
+            let mut store = crate::session::model::CutexSessionStore::default();
+            for receipt in receipts {
+                store.explicit_launch_receipts.insert(receipt.action_id.to_string(), ExplicitLaunchActionReceipt::Runtime(receipt));
+            }
+            store
+        };
+        let attempt = |store: &crate::session::model::CutexSessionStore, record: &CutexSessionRecord| {
+            let (id, prior) = current_runtime_attempt(base, store, Some(record)).unwrap();
+            (id.as_str().to_string(), prior.map(|prior| prior.stage.clone()))
+        };
+        // Nothing yet: the first attempt.
+        assert_eq!(attempt(&store(vec![]), &record), (base.to_string(), None));
+        // Ready and still bound: the same attempt (a reconnect, not a start).
+        let ready = store(vec![receipt(base, StockRuntimeStage::Ready)]);
+        record.app_server_runtime = Some(binding(4242));
+        assert_eq!(attempt(&ready, &record), (base.to_string(), Some(StockRuntimeStage::Ready)));
+        // Ready but stopped or replaced since: fresh.
+        record.app_server_runtime = None;
+        assert_eq!(attempt(&ready, &record), (format!("{base}:2"), None));
+        record.app_server_runtime = Some(binding(5151));
+        assert_eq!(attempt(&ready, &record), (format!("{base}:2"), None));
+        // A claim in flight keeps the current attempt.
+        record.app_server_launch_claim_id = Some("claim".into());
+        assert_eq!(attempt(&ready, &record).0, base);
+        record.app_server_launch_claim_id = None;
+        // Abandoned: fresh, whatever the record says.
+        let abandoned = store(vec![receipt(base, StockRuntimeStage::Abandoned)]);
+        assert_eq!(attempt(&abandoned, &record), (format!("{base}:2"), None));
+        // A later attempt in progress is resumed as is; abandoned again: the next.
+        let second = format!("{base}:2");
+        let resumed = store(vec![receipt(base, StockRuntimeStage::Abandoned), receipt(&second, StockRuntimeStage::Spawned)]);
+        assert_eq!(attempt(&resumed, &record), (second.clone(), Some(StockRuntimeStage::Spawned)));
+        let again = store(vec![receipt(base, StockRuntimeStage::Abandoned), receipt(&second, StockRuntimeStage::Abandoned)]);
+        assert_eq!(attempt(&again, &record), (format!("{base}:3"), None));
     }
 
     #[test]
@@ -1402,6 +1501,11 @@ mod review_digest_tests {
             }
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod native_token_metadata_tests {
+        include!("native_token_metadata_tests.rs");
     }
 
     #[test]

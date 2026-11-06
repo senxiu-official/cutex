@@ -207,7 +207,8 @@ pub(crate) fn ensure_available(
 pub(crate) fn base_account(name: &str, cli_kind: CliKind, source: &str) -> StoredAccount {
     StoredAccount {
         options: Default::default(),
-        browser_tools: false,
+        browser_tools: super::model::browser_tools_default(),
+        browser_tool_surface: Default::default(),
         search_tool: false,
         quota_reader: None,
         private_chatgpt_auth_file: false,

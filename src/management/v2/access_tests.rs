@@ -92,6 +92,8 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("GET", "/v2/projects/p1/events/stream", Class::Scoped(ProjectEvents)),
         ("GET", "/v2/projects/p1/background", Class::Scoped(ProjectEvents)),
         ("GET", "/v2/asks", Class::Scoped(AskList)),
+        ("GET", "/v2/admission/hidden-receipts", Class::OwnerOnly),
+        ("GET", "/v2/agent-bus/stuck-messages/content", Class::OwnerOnly),
         ("GET", "/v2/asks/ask-abc", Class::Scoped(AskRead)),
         ("GET", "/v2/asks/ask-abc/answer", Class::Scoped(AskAnswer)),
         ("GET", "/v2/users/me", Class::Scoped(SelfProfile)),
@@ -99,6 +101,10 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("GET", "/v2/users/owner/avatar", Class::Scoped(UserAvatar)),
         ("GET", "/v2/users/u-0123456789ab/avatar", Class::Scoped(UserAvatar)),
         ("GET", "/v2/users/me/home", Class::Scoped(UserHome)),
+        ("GET", "/v2/users/me/layout", Class::Scoped(UserLayout)),
+        ("PUT", "/v2/users/me/layout/sidebar", Class::Scoped(UserLayout)),
+        ("DELETE", "/v2/users/me/layout/sidebar", Class::Scoped(UserLayout)),
+        ("PUT", "/v2/users/me/layout/pointer", Class::Scoped(UserLayout)),
         ("PUT", "/v2/users/me/home", Class::Scoped(UserHome)),
         ("GET", "/v2/users/me/home/cover", Class::Scoped(UserHome)),
         ("PUT", "/v2/users/me/home/cover", Class::Scoped(UserHome)),
@@ -284,6 +290,11 @@ fn cutex_and_native_method_tables_are_reviewed_snapshots() {
             "cutex/ownerNotify/delete",
             "cutex/safetyCheck/grant",
             "cutex/safetyCheck/dismiss",
+            "cutex/input/dismiss",
+            "cutex/input/lease/release",
+            "cutex/input/retry",
+            "cutex/input/interruptSend",
+            "cutex/input/hold",
         ]
     );
     assert_eq!(native_need("turn/start"), Need::Owner);
@@ -301,6 +312,7 @@ fn cutex_and_native_method_tables_are_reviewed_snapshots() {
         assert_eq!(native_need(method), Need::Owner, "{method}");
     }
     assert_eq!(cutex_need(""), Need::Owner);
+    assert_eq!(cutex_need("cutex/input/hold"), Need::Owner);
     for method in CUTEX_ASK {
         assert_eq!(cutex_need(method), Need::Ask, "{method}");
         assert!(super::super::asks::is_command(method), "{method}");
@@ -340,9 +352,9 @@ fn delegation_commands_need_a_visible_related_ask() {
         record
     };
     let agent = |id: &str| Requester::Agent { cutex_session_id: id.into(), name: None };
-    state.asks.insert("ask-mine".into(), ask("ask-mine", agent("a1"), "a2"));
-    state.asks.insert("ask-owner".into(), ask("ask-owner", Requester::Owner, "a1"));
-    state.asks.insert("ask-other".into(), ask("ask-other", agent("a1"), "hidden"));
+    state.asks.insert("ask-mine".into(), ask("ask-mine", agent("a1"), "a2").into());
+    state.asks.insert("ask-owner".into(), ask("ask-owner", Requester::Owner, "a1").into());
+    state.asks.insert("ask-other".into(), ask("ask-other", agent("a1"), "hidden").into());
     let question = |id: &str, ask_id: &str| -> crate::asks::model::QuestionRecord {
         serde_json::from_value(json!({
             "questionId": id, "askId": ask_id, "attempt": 1, "runtimeGeneration": 1,
@@ -473,6 +485,10 @@ fn device_scope_needs_per_route_class() {
         assert_eq!(need("GET", path, Value::Null), ScopeNeed::Read, "{path}");
     }
     assert_eq!(need("POST", "/v2/pair", Value::Null), ScopeNeed::Read);
+    assert_eq!(need("GET", "/v2/users/me/layout", Value::Null), ScopeNeed::Read);
+    assert_eq!(need("PUT", "/v2/users/me/layout/sidebar", Value::Null), ScopeNeed::Chat);
+    assert_eq!(need("DELETE", "/v2/users/me/layout/sidebar", Value::Null), ScopeNeed::Chat);
+    assert_eq!(need("PUT", "/v2/users/me/layout/pointer", Value::Null), ScopeNeed::Chat);
     assert_eq!(need("POST", "/v2/identity/claim", Value::Null), ScopeNeed::Read);
     assert_eq!(need("DELETE", "/v2/users/me/devices/mct-self", Value::Null), ScopeNeed::Read, "sign itself out");
     assert_eq!(need("DELETE", "/v2/users/me/devices/mct-other", Value::Null), ScopeNeed::Full);

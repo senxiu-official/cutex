@@ -281,6 +281,7 @@ fn management_and_peer_routes_enforce_the_http_credential_matrix() {
         ("PATCH", owner_write.as_str(), json!({}), 200, ""),
         ("GET", "/peer/v1/hello", json!({}), 200, ""),
         ("GET", "/peer/v1/agents", json!({}), 200, ""),
+        ("POST", super::names::ROUTE, json!({"target":"old","unknown":true}), 400, "invalid_request"),
         ("GET", ask_read.as_str(), json!({}), 404, "ask_not_found"),
         (
             "PUT",
@@ -351,7 +352,7 @@ fn management_and_peer_routes_enforce_the_http_credential_matrix() {
             }
         }
     }
-    assert_eq!(count, 128);
+    assert_eq!(count, 144);
     assert!(store.get(&active_id).unwrap().enabled);
 }
 

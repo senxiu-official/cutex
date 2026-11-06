@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 
 use super::owner_rotation::{
     rotation_body, AgentFacts, ApiError, DelegationCounts, Driver, EffectError, ProjectFacts,
-    Rotation, RotationEffects, RotationStore, StartRequest, UPDATED_EVENT,
+    Rotation, RotationEffects, RotationStore, StartRequest, SuccessorStart, UPDATED_EVENT,
 };
 use crate::agent_management::{AgentActionId, AgentManagementError, ProjectId, ProjectLifecycle};
 use crate::http::server::{write_json_response, SimpleHttpRequest};
@@ -165,7 +165,9 @@ pub fn handle(
     }
     let driver = match driver(context) {
         Ok(driver) => driver,
-        Err(error) => return write_error(stream, &ApiError::new(503, "event_persistence_unavailable", format!("{error:#}"))),
+        Err(error) => { return write_error(stream, &ApiError::new(503, "event_persistence_unavailable", format!("{error:#}")),
+            )
+        }
     };
     start_driver(context);
     let (path, query) = request.path.split_once('?').unwrap_or((request.path.as_str(), ""));
@@ -178,7 +180,7 @@ pub fn handle(
                 Err(error) => {
                     return write_error(
                         stream,
-                        &ApiError::new(400, "invalid_request", format!("strict rotation request parsing failed: {error}")),
+                        &ApiError::new(400, "invalid_request", format!("strict rotation request parsing failed: {error}"),),
                     )
                 }
             };
@@ -195,7 +197,8 @@ pub fn handle(
         ("GET", [id]) => driver
             .store
             .get(id)
-            .map_err(|error| ApiError::new(503, "event_persistence_unavailable", format!("{error:#}")))
+            .map_err(|error| { ApiError::new(503, "event_persistence_unavailable", format!("{error:#}"))
+            })
             .and_then(|rotation| {
                 rotation
                     .map(|rotation| rotation_body(&rotation))
@@ -209,8 +212,8 @@ pub fn handle(
             wake();
             rotation_body(&rotation)
         }),
-        ("GET" | "POST", _) => Err(ApiError::new(404, "not_found", "unknown Director rotation route")),
-        _ => Err(ApiError::new(405, "method_not_allowed", "method not allowed")),
+        ("GET" | "POST", _) => Err(ApiError::new(404, "not_found", "unknown Director rotation route",)),
+        _ => Err(ApiError::new(405, "method_not_allowed", "method not allowed",)),
     };
     match result {
         Ok(body) => write_json_response(stream, 200, "OK", &body),
@@ -237,7 +240,8 @@ fn list(driver: &Driver<DaemonEffects>, query: &str) -> Result<Value, ApiError> 
     let rotations = driver
         .store
         .list(project_id.as_deref(), limit)
-        .map_err(|error| ApiError::new(503, "event_persistence_unavailable", format!("{error:#}")))?;
+        .map_err(|error| { ApiError::new(503, "event_persistence_unavailable", format!("{error:#}"))
+        })?;
     Ok(json!({ "rotations": rotations }))
 }
 
@@ -318,7 +322,9 @@ impl DaemonEffects {
         };
         session
             .map_err(unavailable)?
-            .ok_or_else(|| EffectError::new("session_not_found", format!("{cutex_session_id} does not exist on this host"), false))
+            .ok_or_else(|| { EffectError::new("session_not_found", format!("{cutex_session_id} does not exist on this host"), false,
+            )
+        })
     }
 }
 
@@ -348,15 +354,13 @@ impl RotationEffects for DaemonEffects {
     }
 
     fn agent(&self, cutex_session_id: &str) -> Result<Option<AgentFacts>, EffectError> {
-        let store = crate::session::store::load_cutex_session_store().map_err(unavailable)?;
-        let Some(record) = store
-            .sessions
-            .values()
-            .find(|record| record.cutex_session_id == cutex_session_id)
+        let Some(shared_record) =
+            crate::session::store::shared_session_row(cutex_session_id).map_err(unavailable)?
         else {
             return Ok(None);
         };
-        let project_id = crate::memory::load_agent_management_snapshot()
+        let record = &*shared_record;
+        let project_id = crate::memory::load_agent_management_directory()
             .ok()
             .and_then(|snapshot| {
                 let id = CutexSessionId::new(cutex_session_id.to_string()).ok()?;
@@ -441,6 +445,29 @@ impl RotationEffects for DaemonEffects {
         Ok(())
     }
 
+    fn successor_start(&self, cutex_session_id: &str) -> Result<SuccessorStart, EffectError> {
+        use super::offline_submit::{start_outcome, StartOutcome};
+        let session = self.session(cutex_session_id, false)?;
+        let connected = session.pointer("/runtime/appServerConnected").and_then(Value::as_bool) == Some(true);
+        let outcome = start_outcome(cutex_session_id);
+        // A start of this process brought it up (the queued message was
+        // flushed then), even if it has stopped since.
+        if connected || outcome == Some(StartOutcome::Online) {
+            return Ok(SuccessorStart::Online);
+        }
+        if session.pointer("/runtime/status").and_then(Value::as_str) == Some("starting") {
+            return Ok(SuccessorStart::Starting);
+        }
+        Ok(match outcome {
+            Some(StartOutcome::Starting) => SuccessorStart::Starting,
+            Some(StartOutcome::Failed { code, message, retryable,
+            }) =>
+                SuccessorStart::Failed(EffectError { code, message, retryable,
+            }),
+            _ => SuccessorStart::NotStarted,
+        })
+    }
+
     fn turn_active(&self, cutex_session_id: &str) -> Result<bool, EffectError> {
         let session = self.session(cutex_session_id, false)?;
         Ok(session
@@ -452,22 +479,24 @@ impl RotationEffects for DaemonEffects {
         std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
     }
 
-    fn find_agent_by_name(&self, name: &str, since: &str) -> Result<Option<String>, EffectError> {
-        let since = DateTime::parse_from_rfc3339(since).map_err(invalid)?;
-        let store = crate::session::store::load_cutex_session_store().map_err(unavailable)?;
-        Ok(store
-            .sessions
-            .values()
-            .filter(|record| record.is_active())
-            .filter(|record| {
-                record.formal_agent_name.as_deref() == Some(name)
-                    || crate::session::metadata::cutex_session_presented_name(record) == name
-            })
-            .filter(|record| {
-                DateTime::parse_from_rfc3339(&record.created_at).is_ok_and(|created| created >= since)
-            })
-            .map(|record| record.cutex_session_id.clone())
-            .next())
+    fn find_successor_by_creation(&self, rotation: &Rotation) -> Result<Option<String>, EffectError> {
+        let action = format!("human-agent:owner-rotation-{}-successor", rotation.rotation_id);
+        let mut store = crate::session::store::session_catalog(false).map_err(unavailable)?;
+        let retired = crate::session::store::session_catalog(true).map_err(unavailable)?;
+        for (id, record) in &retired.sessions {
+            store.sessions.insert(id.clone(), record.clone());
+        }
+        let found = crate::session::creation_identity::bound_record(store.sessions.values(), &action)
+            .map_err(|error| EffectError::new("successor_identity_ambiguous", error.to_string(), false))?;
+        let Some(record) = found else { return Ok(None) };
+        if !record.is_active() || record.retired_at.is_some() {
+            return Err(EffectError::new("successor_not_active", "the creation-bound successor is archived or retired", false));
+        }
+        let facts = self.agent(&record.cutex_session_id)?;
+        if facts.as_ref().and_then(|facts| facts.project_id.as_deref()) != Some(rotation.project_id.as_str()) {
+            return Err(EffectError::new("successor_project_unproven", "the creation-bound successor is not a member of the rotation Project; inspect its setup", false));
+        }
+        Ok(Some(record.cutex_session_id.clone()))
     }
 
     fn create_successor(&self, rotation: &Rotation) -> Result<String, EffectError> {
@@ -513,7 +542,8 @@ impl RotationEffects for DaemonEffects {
         (self.context.execute_management_project_mutation)(&principal(), &request).map_err(am_error)?;
         let project = self
             .project(project_id)?
-            .ok_or_else(|| EffectError::new("project_not_found", "the Project disappeared", false))?;
+            .ok_or_else(|| { EffectError::new("project_not_found", "the Project disappeared", false)
+        })?;
         if project.director.as_deref() != Some(successor) {
             return Err(EffectError::new(
                 "stale_project_authority",
@@ -524,7 +554,7 @@ impl RotationEffects for DaemonEffects {
         Ok(project.authority_epoch)
     }
 
-    fn archive(&self, cutex_session_id: &str, request_id: &str, reason: &str) -> Result<(), EffectError> {
+    fn archive(&self, cutex_session_id: &str, request_id: &str, reason: &str,) -> Result<(), EffectError> {
         let repository = super::repository::management_v2_repository().map_err(unavailable)?;
         let session = self.session(cutex_session_id, true)?;
         if session.get("lifecycle").and_then(Value::as_str) == Some("retired") {
@@ -546,7 +576,7 @@ impl RotationEffects for DaemonEffects {
         .map_err(input_error)
     }
 
-    fn ensure_member(&self, project_id: &str, cutex_session_id: &str, action_id: &str) -> Result<(), EffectError> {
+    fn ensure_member(&self, project_id: &str, cutex_session_id: &str, action_id: &str,) -> Result<(), EffectError> {
         if self
             .agent(cutex_session_id)?
             .is_some_and(|agent| agent.project_id.as_deref() == Some(project_id))
@@ -569,7 +599,7 @@ impl RotationEffects for DaemonEffects {
         }
     }
 
-    fn grant_operator(&self, project_id: &str, cutex_session_id: &str, action_id: &str) -> Result<(), EffectError> {
+    fn grant_operator(&self, project_id: &str, cutex_session_id: &str, action_id: &str,) -> Result<(), EffectError> {
         let request = HumanManagementOperatorActionRequest {
             schema: HumanManagementOperatorSchema::V1,
             action_id: AgentActionId::new(action_id).map_err(am_error)?,

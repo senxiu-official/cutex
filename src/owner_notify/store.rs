@@ -1,18 +1,16 @@
 //! Owner notify records and their store (contract §2–§3).
 //!
-//! Every mutation goes through [`OwnerNotifyStore::with_state`] (exclusive
-//! file lock across read-modify-write). Operations on [`OwnerNotifyState`]
-//! are pure and unit-tested without files. Changes queue Management v2
+//! Production mutations select rows in the SQLite repository. Operations on
+//! [`OwnerNotifyState`] are pure transitions over those selected rows, also
+//! unit-tested without files. Changes queue Management v2
 //! notices; the management process publishes them
 //! ([`crate::management::v2::owner_notify::publish_pending_notices`]).
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -30,7 +28,7 @@ pub const RETENTION_DAYS: i64 = 30;
 /// go first).
 pub const MAX_RECORDS: usize = 2000;
 /// Idempotency records of tool calls are kept this long.
-const ACTION_RETENTION_DAYS: i64 = 7;
+pub(super) const ACTION_RETENTION_DAYS: i64 = 7;
 /// Bound on queued notices while the management process is down.
 const MAX_NOTICES: usize = 2000;
 pub const MAX_TEXT_CHARS: usize = 4000;
@@ -290,6 +288,9 @@ pub struct ActionRecord {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OwnerNotifyState {
+    /// Repository transitions contain selected rows; retention runs via SQL.
+    #[serde(skip)]
+    pub(super) selected_rows: bool,
     #[serde(default)]
     pub revision: u64,
     #[serde(default)]
@@ -415,7 +416,7 @@ pub fn resolve_delivery(
 }
 
 impl OwnerNotifyState {
-    fn action_key(caller: &str, action_id: &str) -> String {
+    pub(super) fn action_key(caller: &str, action_id: &str) -> String {
         format!("{caller}\u{1f}{action_id}")
     }
 
@@ -525,7 +526,7 @@ impl OwnerNotifyState {
         };
         self.notifications.insert(record.notification_id.clone(), record.clone());
         self.notice(super::CREATED_EVENT, &record);
-        self.prune(now);
+        if !self.selected_rows { self.prune(now); }
         record
     }
 
@@ -785,36 +786,33 @@ impl OwnerNotifyState {
     }
 }
 
-/// The file-locked store.
-#[derive(Clone, Debug)]
+/// The keyed SQL repository (legacy JSON is import/export only).
+#[derive(Clone)]
 pub struct OwnerNotifyStore {
-    dir: PathBuf,
+    pub(super) dir: PathBuf,
+    pub(super) db: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::store::StoreDb>>>,
 }
 
 impl OwnerNotifyStore {
     pub fn open_default() -> anyhow::Result<Self> {
-        Ok(Self::at(crate::config::paths::runtime_dir()?.join("owner-notify")))
+        static DEFAULT: std::sync::OnceLock<std::sync::Mutex<Option<OwnerNotifyStore>>> = std::sync::OnceLock::new();
+        let dir = crate::config::paths::runtime_dir()?.join("owner-notify");
+        let mut current = DEFAULT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = current.as_ref().filter(|store| store.dir == dir) { return Ok(store.clone()); }
+        let store = Self::at(dir);
+        *current = Some(store.clone());
+        Ok(store)
     }
 
     pub fn at(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self { dir: dir.into(), db: Default::default() }
     }
 
-    fn state_path(&self) -> PathBuf {
+    pub(super) fn state_path(&self) -> PathBuf {
         self.dir.join("owner-notify-v1.json")
     }
 
-    fn lock_file(&self) -> anyhow::Result<std::fs::File> {
-        crate::management::client_tokens::ensure_private_dir(&self.dir)?;
-        Ok(OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.dir.join("owner-notify-v1.lock"))?)
-    }
-
-    fn read_state(path: &std::path::Path) -> anyhow::Result<OwnerNotifyState> {
+    pub(super) fn read_state(path: &std::path::Path) -> anyhow::Result<OwnerNotifyState> {
         match std::fs::read(path) {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Ok(OwnerNotifyState::default()),
             Ok(bytes) => serde_json::from_slice(&bytes).context("owner notify store is not valid JSON"),
@@ -823,29 +821,16 @@ impl OwnerNotifyStore {
         }
     }
 
-    /// Read-only snapshot (empty when the store does not exist yet).
+    /// Explicit whole-store oracle for tests and previous-version export only.
+    #[cfg(test)]
     pub fn snapshot(&self) -> anyhow::Result<OwnerNotifyState> {
-        if !self.state_path().exists() {
-            return Ok(OwnerNotifyState::default());
-        }
-        let lock = self.lock_file()?;
-        lock.lock_shared().context("owner notify store lock")?;
-        Self::read_state(&self.state_path())
+        self.export_state()
     }
 
-    /// Locked read-modify-write; saves only when the state changed.
+    /// Test fixture setup only; production callers select keys before decoding.
+    #[cfg(test)]
     pub fn with_state<T>(&self, mutate: impl FnOnce(&mut OwnerNotifyState) -> T) -> anyhow::Result<T> {
-        let lock = self.lock_file()?;
-        lock.lock_exclusive().context("owner notify store lock")?;
-        let path = self.state_path();
-        let mut state = Self::read_state(&path)?;
-        let before = serde_json::to_vec(&state)?;
-        let result = mutate(&mut state);
-        if serde_json::to_vec(&state)? != before {
-            state.revision += 1;
-            crate::config::atomic::write_private_pretty_json_atomic(&path, &state, "owner notify store")?;
-        }
-        Ok(result)
+        self.edit_selected("1", &[], None, mutate)
     }
 }
 

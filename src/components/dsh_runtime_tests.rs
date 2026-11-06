@@ -91,6 +91,12 @@ impl Drop for Fixture {
     }
 }
 
+fn metadata_version(version: &str) -> String {
+    let mut metadata = Metadata::parse(include_str!("../../components/dsh-runtime/component.json"));
+    metadata.version = version.into();
+    serde_json::to_string(&metadata).unwrap()
+}
+
 struct MockExec {
     version: &'static str,
     calls: Mutex<Vec<String>>,
@@ -187,21 +193,21 @@ fn layout_rejects_wrong_package_version_and_missing_adapter() {
 
 #[test]
 fn source_install_refuses_a_tree_of_another_component_version() {
-    // r267 labels the component dsh-r2. An r1 tree (an older release's
-    // source) would be staged as dsh-r2-source-* around r1 metadata.
+    // Source builds must match this binary's compiled component tag, while
+    // already-installed legacy versions remain independently supported.
     let f = Fixture::new();
     let source = f.payload();
-    let old = include_str!("../../components/dsh-runtime/component.json").replace("\"dsh-r2\"", "\"dsh-r1\"");
+    let old = metadata_version("dsh-r1");
     assert_ne!(old, include_str!("../../components/dsh-runtime/component.json"));
     std::fs::write(source.join("component.json"), old).unwrap();
     let out = f.root.join("out");
     let error = DshRuntime::default().from_source(&source, &out).unwrap_err().to_string();
-    assert!(error.contains("dsh-r1") && error.contains("dsh-r2"), "{error}");
+    assert!(error.contains("dsh-r1") && error.contains(&DshRuntime::default().metadata().version), "{error}");
     assert!(!out.exists());
 }
 
 #[test]
-fn retained_r1_install_stays_advertised_under_an_r2_binary() {
+fn retained_r1_install_stays_advertised_under_a_newer_binary() {
     // A host upgraded from r266 keeps its registered dsh-r1 (source) install
     // until the r2 component is installed; its own metadata identifies it.
     let f = Fixture::new();
@@ -210,7 +216,7 @@ fn retained_r1_install_stays_advertised_under_an_r2_binary() {
     let dir = super::super::version_dir(&layout, NAME, label);
     std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
     std::fs::rename(f.payload(), &dir).unwrap();
-    std::fs::write(dir.join("component.json"), include_str!("../../components/dsh-runtime/component.json").replace("\"dsh-r2\"", "\"dsh-r1\"")).unwrap();
+    std::fs::write(dir.join("component.json"), metadata_version("dsh-r1")).unwrap();
     register(&layout, label);
     select_fixture(&dir);
     assert!(advertised_with(Some(&layout)));
@@ -266,6 +272,195 @@ fn pins_count_saved_deployments_and_exclude_outside_runtime() {
     assert_eq!(pins.get("dsh-r1"), Some(&2));
     assert_eq!(pins.get("dsh-r2"), Some(&1));
     assert_eq!(pins.len(), 2);
+}
+
+#[test]
+fn external_prefix_sessions_pin_adapter_component_without_double_counting() {
+    let f = Fixture::new();
+    let root = f.root.join("components/dsh-runtime");
+    let adapter = root.join("dsh-r7/src/server.mjs");
+    let pins = pins_for(&root, [
+        json!({"adapter": adapter, "install_root": f.root.join("owner-prefix")}),
+        json!({"deployment": {"adapter": adapter, "install_root": f.root.join("owner-prefix")}}),
+        json!({"adapter": root.join("dsh-r2/src/server.mjs"), "install_root": root.join("dsh-r2/runtime")}),
+        json!({"adapter": f.root.join("other/src/server.mjs"), "install_root": f.root.join("owner-prefix")}),
+    ]);
+    assert_eq!(pins.get("dsh-r7"), Some(&2));
+    assert_eq!(pins.get("dsh-r2"), Some(&1));
+    assert_eq!(pins.len(), 2);
+}
+
+fn adapter_fixture(f: &Fixture, name: &str, version: &str) -> PathBuf {
+    let dir = f.root.join("base/components").join(name).join(version);
+    let files = if name == NAME { ADAPTER_FILES } else { crate::components::kimi_runtime::ADAPTER_FILES };
+    for file in files {
+        let path = dir.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "// adapter fixture\n").unwrap();
+    }
+    std::fs::write(dir.join("component.json"), json!({"schema": super::super::COMPONENT_SCHEMA,
+        "name": name, "version": version, "platforms": ["windows-x64", "linux-x64"]}).to_string()).unwrap();
+    let dsh = name == NAME;
+    let contract = json!({"schema": "cutex/external-runtime/v1", "name": name, "version": version,
+        "payload": "adapter-v1", "externalRoot": {
+            "kind": "npm-prefix", "packages": if dsh {
+                json!({"@deepseek-ai/dsh": "0.2.1-rc.3", "@deepseek-ai/dsh-session-format-catalog": "0.2.1-rc.3", "ws": "8.22.0"})
+            } else { json!({"@moonshot-ai/kimi-code": "2.3.3", "ws": "8.22.0"}) },
+            "cliEntry": if dsh { "node_modules/@deepseek-ai/dsh/lib/bin.js" } else { "node_modules/@moonshot-ai/kimi-code/dist/main.mjs" }
+        }, "node": {"range": ">=24.9.0 <25", "recommended": "24.21.0", "features": ["node:sqlite"]},
+        "checks": {"rg": !dsh, "nodePty": !dsh}, "environment": {"installRoot": if dsh { "DSH_INSTALL_ROOT" } else { "KIMI_INSTALL_ROOT" }} });
+    let mut contract = contract;
+    if dsh { contract["externalRoot"]["catalogEntry"] = json!("node_modules/@deepseek-ai/dsh-session-format-catalog/lib/index.js"); }
+    std::fs::write(dir.join("external-runtime.json"), contract.to_string()).unwrap();
+    let hashes: BTreeMap<_, _> = files.iter().map(|file| (file.to_string(), crate::upgrade::manifest::file_sha256_hex(&dir.join(file)).unwrap())).collect();
+    std::fs::write(dir.join("receipt.json"), json!({"schema": super::super::RECEIPT_SCHEMA, "name": name,
+        "version": version, "origin": "signed", "archiveSha256": null, "files": hashes, "unpackedAt": "2026-10-29T00:00:00Z"}).to_string()).unwrap();
+    dir
+}
+
+#[test]
+fn future_adapter_layouts_accept_without_bundled_dependencies_or_readme() {
+    let f = Fixture::new();
+    for (name, version) in [(NAME, "dsh-r7"), (crate::components::kimi_runtime::NAME, "kimi-r8")] {
+        let dir = adapter_fixture(&f, name, version);
+        if name == NAME { check_layout(&dir).unwrap(); verify_payload(&dir).unwrap(); }
+        else { crate::components::kimi_runtime::check_layout(&dir).unwrap(); crate::components::kimi_runtime::verify_payload(&dir).unwrap(); }
+        assert!(!dir.join("README.md").exists());
+        assert!(!dir.join("node_modules").exists());
+        assert!(!dir.join("runtime").exists());
+        let dest = f.root.join(format!("copy-{version}"));
+        let handler: Box<dyn Handler> = if name == NAME { Box::new(DshRuntime::default()) } else { Box::new(crate::components::kimi_runtime::KimiRuntime::default()) };
+        handler.from_source(&dir, &dest).unwrap();
+        assert!(dest.join("external-runtime.json").is_file());
+        assert!(!dest.join("runtime").exists());
+    }
+}
+
+#[test]
+fn adapter_get_and_unverified_select_do_not_probe_or_replace_default() {
+    let f = Fixture::new();
+    let dir = adapter_fixture(&f, NAME, "dsh-r7");
+    let before = b"{\"existing\":\"r2-default\"}";
+    std::fs::create_dir_all(selected_path().unwrap().parent().unwrap()).unwrap();
+    std::fs::write(selected_path().unwrap(), before).unwrap();
+    let external = cached_external_probe(&dir, NAME, false);
+    assert_eq!(external["external"]["checkedAt"], Value::Null);
+    assert_eq!(external["state"], states::NEEDS_USER);
+    let exec = MockExec::new("v24.21.0");
+    let ctx = Context { layout: &Layout { base: f.root.join("base") }, dir, version: "dsh-r7".into(), exec: &exec, previous: None, dry_run: false };
+    let result = DshRuntime::default().select(&ctx).unwrap();
+    assert_eq!(result["selected"], false);
+    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read(selected_path().unwrap()).unwrap(), before);
+}
+
+#[test]
+fn real_node_adapter_restore_uses_pinned_contract_and_external_prefix() {
+    // Explicit opt-in executable in private CI/drills; no install or model call.
+    let Some(node) = std::env::var_os("CUTEX_TEST_EXTERNAL_NODE").map(PathBuf::from) else { return; };
+    let f = Fixture::new();
+    let dir = adapter_fixture(&f, NAME, "dsh-r7");
+    let prefix = f.root.join("owner-npm-prefix");
+    let mut contract = external_contract(&dir, NAME).unwrap();
+    for package in ["@deepseek-ai/dsh", "@deepseek-ai/dsh-session-format-catalog"] {
+        contract.external_root.packages.insert(package.into(), "99.2.0".into());
+    }
+    std::fs::write(dir.join("external-runtime.json"), serde_json::to_vec(&contract).unwrap()).unwrap();
+    for (package, version) in &contract.external_root.packages {
+        let path = prefix.join("node_modules").join(package).join("package.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut metadata = json!({"name": package, "version": version});
+        if package == "ws" { metadata["main"] = json!("index.js"); }
+        if package == "@deepseek-ai/dsh-session-format-catalog" { metadata["main"] = json!("lib/index.js"); }
+        std::fs::write(path, metadata.to_string()).unwrap();
+    }
+    std::fs::write(prefix.join("node_modules/ws/index.js"), "throw Error('entry probe must not load ws');").unwrap();
+    for entry in std::iter::once(&contract.external_root.cli_entry).chain(contract.external_root.catalog_entry.iter()) {
+        let path = prefix.join(entry);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "throw Error('vendor CLI must never execute in readiness probes');").unwrap();
+    }
+    let mut receipt = super::super::read_receipt(&dir).unwrap();
+    receipt.files.insert("external-runtime.json".into(), crate::upgrade::manifest::file_sha256_hex(&dir.join("external-runtime.json")).unwrap());
+    std::fs::write(dir.join("receipt.json"), serde_json::to_vec(&receipt).unwrap()).unwrap();
+    let deployment = DshDeployment { node, adapter: dir.join("src/server.mjs"),
+        dsh_cli: prefix.join(&contract.external_root.cli_entry), install_root: prefix,
+        version: "99.2.0".into() };
+    deployment.validate().unwrap();
+    // A later broken default configuration cannot retarget this saved binding.
+    let layout = Layout { base: f.root.join("base") };
+    let request = serde_json::from_value(json!({"externalRoot": f.root.join("broken-new-default"), "node": deployment.node})).unwrap();
+    let status = super::super::external_runtime::configure(&layout, NAME, &contract, request, &super::super::external_runtime::RealExec).unwrap();
+    assert!(!status.ready());
+    deployment.validate().unwrap();
+    std::fs::write(deployment.install_root.join("node_modules/ws/package.json"), json!({"name": "ws", "version": "0.0.0"}).to_string()).unwrap();
+    assert!(deployment.validate().unwrap_err().to_string().contains("upstream_version_mismatch"));
+}
+
+#[test]
+fn full_component_get_and_capability_polling_never_start_adapter_dependencies() {
+    let Some(sentinel) = std::env::var_os("CUTEX_TEST_PROBE_SENTINEL").map(PathBuf::from) else { return; };
+    let f = Fixture::new();
+    let layout = Layout { base: f.root.join("base") };
+    std::fs::create_dir_all(&layout.base).unwrap();
+    std::fs::write(layout.install_record_path(), "{}").unwrap();
+    let node = f.root.join(if cfg!(windows) { "node.exe" } else { "node" });
+    let rg = f.root.join(if cfg!(windows) { "rg.exe" } else { "rg" });
+    for binary in [&node, &rg] { std::fs::copy(&sentinel, binary).unwrap(); }
+    struct ProbeOk;
+    impl Exec for ProbeOk {
+        fn run(&self, program: &str, args: &[String]) -> anyhow::Result<String> {
+            if program.ends_with(if cfg!(windows) { "rg.exe" } else { "/rg" }) { return Ok("ripgrep 15.0.0".into()); }
+            if args == ["--version"] { return Ok("v24.21.0".into()); }
+            if args.iter().any(|s| s.contains("cutex-entries-v1")) { return Ok(json!({"marker":"cutex-entries-v1", "issues":[]}).to_string()); }
+            if args.iter().any(|s| s.contains("cutex-sqlite-ok")) { return Ok("cutex-sqlite-ok".into()); }
+            Ok("cutex-pty-ok".into())
+        }
+    }
+    let mut state = super::super::State::new();
+    let mut selected_paths = vec![];
+    for (name, version) in [(NAME, "dsh-r7"), (crate::components::kimi_runtime::NAME, "kimi-r8")] {
+        let dir = adapter_fixture(&f, name, version);
+        let contract = external_contract(&dir, name).unwrap();
+        let root = f.root.join(format!("{name}-prefix"));
+        for (package, version) in &contract.external_root.packages {
+            let path = root.join("node_modules").join(package).join("package.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, json!({"name": package, "version": version}).to_string()).unwrap();
+        }
+        for entry in std::iter::once(&contract.external_root.cli_entry).chain(contract.external_root.catalog_entry.iter()) {
+            let path = root.join(entry);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "// not executed").unwrap();
+        }
+        let request = serde_json::from_value(json!({"externalRoot": root, "node": node, "rg": rg})).unwrap();
+        assert!(super::super::external_runtime::configure(&layout, name, &contract, request, &ProbeOk).unwrap().ready());
+        let package = if name == NAME { "@deepseek-ai/dsh" } else { crate::runtime::kimi::KIMI_PACKAGE };
+        let path = if name == NAME { crate::runtime::dsh::deployment_path().unwrap() } else { crate::runtime::kimi::deployment_path().unwrap() };
+        let mut deployment = json!({"node": node, "adapter": dir.join("src/server.mjs"), "install_root": root, "version": contract.external_root.packages[package]});
+        deployment[if name == NAME { "dsh_cli" } else { "kimi_cli" }] = json!(root.join(&contract.external_root.cli_entry));
+        if name != NAME { deployment["rg"] = json!(rg); }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&deployment).unwrap()).unwrap();
+        selected_paths.push((path, serde_json::to_vec(&deployment).unwrap()));
+        state.insert(name.into(), Entry { selected: version.into(), origin: "signed".into(), ..Entry::default() });
+    }
+    super::super::save_state(&layout, &state).unwrap();
+    unsafe { std::env::set_var("CUTEX_INSTALL_BASE", &layout.base); }
+    for handler in [Box::new(DshRuntime::default()) as Box<dyn Handler>, Box::new(crate::components::kimi_runtime::KimiRuntime::default())] {
+        let view = super::super::status_of(Some(&layout), &[], handler.as_ref(), None);
+        assert_eq!(view["state"], states::READY);
+        assert!(handler.configured_by_hand());
+    }
+    assert!(advertised_with(Some(&layout)));
+    assert!(advertised_with(None));
+    assert!(crate::components::kimi_runtime::advertised_with(Some(&layout)));
+    assert!(crate::components::kimi_runtime::advertised_with(None));
+    crate::components::kimi_runtime::register_profile_hooks();
+    assert_eq!(crate::profiles::kimi::component_status().0, crate::profiles::runtime_variants::Status::Supported);
+    assert!(!node.with_extension("log").exists(), "GET/capability polling started Node");
+    assert!(!rg.with_extension("log").exists(), "GET/capability polling started ripgrep");
+    for (path, bytes) in selected_paths { assert_eq!(std::fs::read(path).unwrap(), bytes); }
 }
 
 #[test]
@@ -414,7 +609,7 @@ fn advertised_source_install_accepts_base_metadata_with_matching_source_identity
     ] {
         let dir = super::super::version_dir(&layout, NAME, version);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("component.json"), include_str!("../../components/dsh-runtime/component.json")).unwrap();
+        std::fs::write(dir.join("component.json"), metadata_version("dsh-r2")).unwrap();
         super::super::save_state(&layout, &BTreeMap::from([(NAME.into(), Entry {
             selected: version.into(), origin: origin.into(), installed_at: "2026-10-25T00:00:00Z".into(), last_error: None,
         })])).unwrap();
@@ -430,6 +625,7 @@ fn advertised_registered_install_keeps_repair_card_without_node_or_internal_file
     let dir = super::super::version_dir(&layout, NAME, "dsh-r2");
     std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
     std::fs::rename(payload, &dir).unwrap();
+    std::fs::write(dir.join("component.json"), metadata_version("dsh-r2")).unwrap();
     register(&layout, "dsh-r2");
     assert!(advertised_with(Some(&layout)));
     let deployment = select_fixture(&dir);
@@ -452,6 +648,7 @@ fn advertised_registered_install_disappears_when_root_is_moved_or_entry_removed(
     let dir = super::super::version_dir(&layout, NAME, "dsh-r2");
     std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
     std::fs::rename(f.payload(), &dir).unwrap();
+    std::fs::write(dir.join("component.json"), metadata_version("dsh-r2")).unwrap();
     register(&layout, "dsh-r2");
     select_fixture(&dir);
     assert!(advertised_with(Some(&layout)));

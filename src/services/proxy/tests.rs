@@ -77,6 +77,46 @@ fn request(store: ServiceStore, request: &str) -> String {
     handle.join().unwrap();
     out
 }
+
+#[test]
+fn authenticated_proxy_waits_for_one_idle_start_and_respects_manual_stop() {
+    use crate::services::store::{ServiceCommand, UpdateRequest};
+    use crate::services::supervisor::Supervisor;
+    use std::sync::Arc;
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (_dir, store, cookie) = fixture(port);
+    store.update("demo", UpdateRequest {
+        runtime: Some("managed".into()), lifetime: Some("persistent".into()),
+        command: Some(Some(ServiceCommand::Argv(vec![std::env::current_exe().unwrap().to_string_lossy().into_owned(), "--exact".into(), "services::supervisor::idle_supervisor::tests::private_tcp_fixture".into(), "--ignored".into(), "--nocapture".into()]))),
+        env: Some([("CUTEX_IDLE_TEST_SERVER".into(), Some("1".into()))].into()), ..Default::default()
+    }, &Caller::Owner).unwrap();
+    store.mutate(|registry| { registry.services.get_mut("demo").unwrap().stopped_idle_at = Some(crate::services::store::now_rfc3339()); Ok(()) }).unwrap();
+    let starts = Arc::new(AtomicUsize::new(0)); let count = starts.clone();
+    let supervisor = Supervisor::new(store.clone(), Box::new(move |event| { if event.reason == "started" { count.fetch_add(1, Ordering::SeqCst); } }));
+    supervisor.start().unwrap();
+    let wire = || {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let s = supervisor.clone(); let store = store.clone();
+        let handler = std::thread::spawn(move || {
+            let (mut server, peer) = listener.accept().unwrap();
+            serve_with_supervisor(&mut server, &mut Vec::new(), &ConnectionInfo { peer, remote: false }, &store, "demo", Some(&s));
+        });
+        client.write_all(format!("GET / HTTP/1.1\r\nHost: demo.svc.localhost:24870\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+        let mut out = String::new(); client.read_to_string(&mut out).unwrap(); handler.join().unwrap(); out
+    };
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8).map(|_| scope.spawn(&wire)).collect();
+        for handle in handles { let out = handle.join().unwrap(); assert!(out.starts_with("HTTP/1.1 200"), "{out}"); assert!(out.ends_with("fixture"), "{out}"); }
+    });
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert!(crate::services::traffic::snapshot("demo").last_traffic_at.is_some());
+    supervisor.stop_service("demo").unwrap();
+    let out = wire(); assert!(out.starts_with("HTTP/1.1 503"), "{out}"); assert!(out.contains("service_manually_stopped"), "{out}");
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    supervisor.shutdown();
+}
 #[test]
 fn auth_exchange_reserved_paths_and_cookie_isolation() {
     let (_dir, store, cookie) = fixture(26019);

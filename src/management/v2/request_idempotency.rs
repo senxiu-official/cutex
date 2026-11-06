@@ -110,6 +110,8 @@ pub const READ_ONLY_METHODS: &[&str] = &[
     "cutex/session/groups/get",
     "cutex/focus/get",
     "cutex/userInput/queue/list",
+    "cutex/input/get",
+    "cutex/input/list",
 ];
 
 /// Whether a request of `method` is recorded for `requestId` replay.

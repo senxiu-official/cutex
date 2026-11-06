@@ -1,9 +1,8 @@
 """Real usage policy evidence, without a Claude process, account or network."""
-from types import SimpleNamespace
-
 import pytest
 
 from cute_claude.engine import Engine
+from cute_claude.store import Store
 from cute_claude.subscription import usage_counts
 
 
@@ -20,9 +19,9 @@ def test_usage_counts_preserves_ttl_breakdown_without_counting_tokens_twice():
 
 
 @pytest.mark.asyncio
-async def test_ttl_is_latest_positive_parent_evidence_and_survives_zero_writes():
+async def test_ttl_is_latest_positive_parent_evidence_and_survives_zero_writes(tmp_path):
     engine = Engine.__new__(Engine)
-    engine.store = SimpleNamespace(db=SimpleNamespace(execute=lambda *_: []))
+    engine.store = Store(tmp_path / 'state')  # Committed totals of threads without turns: zero.
     events = []
 
     async def emit(thread, method, params):
@@ -44,3 +43,4 @@ async def test_ttl_is_latest_positive_parent_evidence_and_survives_zero_writes()
     # Actual parent usage can switch back to an hour; both policies choose the shorter one.
     assert (await observe({'cache_creation_ephemeral_1h_input_tokens': 10}))['cacheTtlSeconds'] == 3600
     assert (await observe({'cache_creation_ephemeral_5m_input_tokens': 10, 'cache_creation_ephemeral_1h_input_tokens': 5}))['cacheTtlSeconds'] == 300
+    engine.store.close()

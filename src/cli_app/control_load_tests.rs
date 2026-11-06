@@ -25,6 +25,7 @@ pub(super) fn http_context() -> cutex::management::server::ManagementRequestCont
     context.load_runtime_status = |id| {
         Ok(Some(
             cutex::app_server::manager::AppServerManagedRuntimeStatus {
+                background_work: Default::default(),
                 cutex_session_id: id.into(),
                 thread_id: id.trim_start_matches("cutex.").into(),
                 runtime_generation: 1,
@@ -74,7 +75,7 @@ pub(super) fn http_context() -> cutex::management::server::ManagementRequestCont
                     "duplicate native send"
                 );
                 Ok(UserInputSubmitExecution {
-                    join_refusal: None,
+                    join_refusal: None, queued_reason: None,
                     disposition,
                     app_server_accepted: true,
                     native_request_id: Some(json!(format!(
@@ -531,7 +532,7 @@ fn ten_streaming_sessions_preserve_submit_identity_and_event_order() {
                             |command, method, _, disposition| {
                                 assert_eq!(method, "turn/steer");
                                 assert!(sends.lock().unwrap().insert(command.params.client_user_message_id.clone()), "native duplicate");
-                                Ok(UserInputSubmitExecution { join_refusal: None, disposition, app_server_accepted: true,
+                                Ok(UserInputSubmitExecution { join_refusal: None, queued_reason: None, disposition, app_server_accepted: true,
                                     native_request_id: None, native_method: Some(method.into()),
                                     turn_id: Some("busy-turn".into()), queue: None, queue_paused: false })
                             },

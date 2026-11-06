@@ -8,6 +8,7 @@
 //! runs when the rollback target is older. Supported target syntax is a plain
 //! `N.N.N` public version, r252..r259, r262, or the exact predecessors r263/r264;
 //! older/unknown/dev labels fail closed before any compatibility write.
+//! Public 0.2.0 and later already read the current stores: preparation is a no-op.
 //!
 //! Since 0.1.4:
 //! - Approval records of kind `static_root`: an older release rejects the
@@ -62,6 +63,10 @@ enum RollbackTarget {
 }
 
 impl RollbackTarget {
+    fn reads_current_stores(self) -> bool {
+        matches!(self, Self::Public(major, minor, patch) if (major, minor, patch) >= (0, 2, 0))
+    }
+
     /// Every supported internal rollback target is r252 or newer and reads
     /// both 0.1.4 stored contracts.
     fn supports_0_1_4_state(self) -> bool {
@@ -98,7 +103,6 @@ fn rollback_target(target: &str) -> anyhow::Result<RollbackTarget> {
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("unknown rollback target {target:?}"))?;
     anyhow::ensure!(parts.len() == 3, "unknown rollback target {target:?}");
-    anyhow::ensure!((parts[0], parts[1], parts[2]) < (0, 2, 0), "target {target} already reads the r257 SQLite hot stores");
     Ok(RollbackTarget::Public(parts[0], parts[1], parts[2]))
 }
 
@@ -112,7 +116,9 @@ pub fn validate_target(target: &str) -> anyhow::Result<()> {
 /// the stopped-writer prepare/export path repeats it immediately before any
 /// compatibility mutation.
 pub fn preflight(home: &Path, target: &str) -> anyhow::Result<()> {
-    rollback_target(target)?;
+    // No existing target reads the SQLite roster (058 S4): its R1 export runs first.
+    crate::agent_management::ensure_roster_legacy_authoritative(&home.join("runtime/agent-management/v1"))?;
+    if rollback_target(target)?.reads_current_stores() { return Ok(()); }
     preflight_kimi_profiles(home, target)?;
     preflight_target_stores(home, target)?;
     // After the target's own store checks (which refuse damaged stores first).
@@ -323,6 +329,9 @@ fn preflight_r260_state(home: &Path, target: &str) -> anyhow::Result<()> {
         "target {target} cannot safely preserve {dsh_sessions} DSH session(s); keep r260 or archive/retire the DSH sessions before rollback"
     );
 
+    crate::agent_management::ensure_roster_legacy_authoritative(
+        &home.join("runtime/agent-management/v1"),
+    )?;
     let management_path = home
         .join("runtime/agent-management/v1/agent-management-v1.json");
     if management_path.is_file() {
@@ -347,6 +356,7 @@ fn preflight_r260_state(home: &Path, target: &str) -> anyhow::Result<()> {
 /// `target`: the release label the rollback switches to.
 pub fn prepare(home: &Path, displaced: &Path, target: &str) -> anyhow::Result<Vec<String>> {
     let target_capabilities = rollback_target(target)?;
+    if target_capabilities.reads_current_stores() { return Ok(Vec::new()); }
     preflight(home, target)?;
     let mut notes = Vec::new();
     if !target_capabilities.supports_0_1_4_state() {
@@ -363,6 +373,7 @@ pub fn prepare(home: &Path, displaced: &Path, target: &str) -> anyhow::Result<Ve
 /// rollback runner calls this only after it has stopped the services; the
 /// standalone CLI requires the same condition to be acknowledged explicitly.
 pub fn export_hot_stores(home: &Path, target: &str, daemon_stopped: bool) -> anyhow::Result<Vec<String>> {
+    if rollback_target(target)?.reads_current_stores() { return Ok(Vec::new()); }
     anyhow::ensure!(daemon_stopped, "stop cutex services, then repeat with --daemon-stopped");
     preflight(home, target)?;
     if matches!(rollback_target(target)?, RollbackTarget::Release(262 | 263 | 264)) {
@@ -654,8 +665,10 @@ fn preflight_legacy_target(home: &Path, target: &str) -> anyhow::Result<()> {
 
 fn since_0_1_4(home: &Path, displaced: &Path, notes: &mut Vec<String>) -> anyhow::Result<()> {
     let approvals = home.join(APPROVALS);
-    if approvals.is_file() {
-        let removed = crate::approvals::ApprovalStore::at(&approvals).remove_kind(crate::approvals::ApprovalKind::StaticRoot)?;
+    if approvals.is_file() || approvals.with_extension("sqlite3").is_file() {
+        let store = crate::approvals::ApprovalStore::at(&approvals);
+        let removed = store.remove_kind(crate::approvals::ApprovalKind::StaticRoot)?;
+        store.export_previous()?;
         if !removed.is_empty() {
             save(displaced, "approvals-static-root.json", &json!({ "approvals": removed }))?;
             notes.push(format!("{APPROVALS}: {} static_root approval record(s) removed", removed.len()));
@@ -985,6 +998,25 @@ mod tests {
             assert!(prepare(&home, &temp("displaced"), target).is_err(), "{target}");
             assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "nothing created for {target}");
         }
+    }
+
+    #[test]
+    fn public_sqlite_targets_skip_legacy_conversion_without_touching_stores() {
+        let home = temp("same-format");
+        let asks = crate::asks::store::AskStore::at_runtime(home.join("runtime"));
+        asks.with_state(|state| { state.wait_cancel.insert("cutex.retained".into(), 7); }).unwrap();
+        let before = file_tree(&home);
+        let displaced = home.join("unused-displaced");
+        for target in ["0.2.0", "0.2.1", "1.0.0", "999.0.0"] {
+            validate_target(target).unwrap();
+            preflight(&home, target).unwrap();
+            assert!(prepare(&home, &displaced, target).unwrap().is_empty());
+            assert!(export_hot_stores(&home, target, true).unwrap().is_empty());
+            assert!(export_hot_stores(&home, target, false).unwrap().is_empty());
+            assert_eq!(file_tree(&home), before, "{target} must not inspect/rewrite/export old formats");
+        }
+        assert_eq!(asks.snapshot().unwrap().wait_cancel["cutex.retained"], 7);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Codex `/fast` for Cutex agents. Capability `session-fast-mode` (`features.sessionFastMode`).
 
-## What the native does (cute-codex r52.x)
+## What supporting native runtimes do
 
 - A thread has a selected **service tier**: `priority` (Fast; the catalog tier named "Fast"),
   `flex`, or the explicit standard sentinel `default`. The legacy request value `fast` is

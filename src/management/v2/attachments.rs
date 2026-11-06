@@ -316,6 +316,28 @@ fn uploaded_by_in(root: &Path, cutex_session_id: &str, token_id: &str, path: &st
     dir.join(format!("{name}{}", uploader_marker_suffix(token_id))).is_file()
 }
 
+/// Size of `path` only if it is one of this session's own stored attachments.
+pub(super) fn stored_dimensions(root: &Path, cutex_session_id: &str, path: &str) -> Option<(u32, u32)> {
+    use std::io::Read;
+    let dir = std::fs::canonicalize(root.join(session_dir_name(cutex_session_id))).ok()?;
+    let file = std::fs::canonicalize(path).ok()?;
+    if super::workspace::display_path(&file) != path && file.as_os_str() != path {
+        return None;
+    }
+    let name = file.file_name()?.to_string_lossy().into_owned();
+    if file.parent() != Some(dir.as_path()) || !is_attachment_file_name(&name) {
+        return None;
+    }
+    let handle = std::fs::File::open(&file).ok()?;
+    let total = usize::try_from(handle.metadata().ok()?.len()).ok()?;
+    let mut header = Vec::with_capacity(super::image_dimensions::header_len().min(total));
+    handle
+        .take(super::image_dimensions::header_len() as u64)
+        .read_to_end(&mut header)
+        .ok()?;
+    super::image_dimensions::dimensions_in(&header, total)
+}
+
 /// Remove a deleted session's attachments (best effort).
 pub fn remove_session_attachments(cutex_session_id: &str) {
     let Ok(root) = attachments_root() else {

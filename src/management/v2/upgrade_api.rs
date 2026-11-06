@@ -487,42 +487,55 @@ fn take_schedule_tick(last: &mut Option<Instant>, now: Instant) -> bool {
 
 /// Management serve: state watcher (events) + scheduler.
 pub fn start_watcher() -> anyhow::Result<()> {
-    std::thread::Builder::new().name("cutex-upgrade-watch".into()).spawn(|| {
-        let mut stamp: Option<SystemTime> = None;
-        let mut last_schedule = None;
-        let mut last_settle = Instant::now();
-        // A run this daemon restarted for: announce its state once.
-        let mut first = true;
-        loop {
-            // Detected every round: an unmanaged daemon has nothing to watch
-            // (and never a stand-in path to read or act on).
-            let Some(layout) = layout() else {
-                first = false;
-                std::thread::sleep(WATCH_INTERVAL);
-                continue;
-            };
-            let current = std::fs::metadata(layout.state_path()).and_then(|m| m.modified()).ok();
-            if current != stamp || (first && current.is_some()) {
-                stamp = current;
-                if current.is_some() {
-                    publish(event_params(&State::load(&layout), if first { "startup" } else { "state" }));
+    std::thread::Builder::new()
+        .name("cutex-upgrade-watch".into())
+        .spawn(|| {
+            let mut stamp: Option<SystemTime> = None;
+            let mut last_schedule = None;
+            let mut last_settle = Instant::now();
+            let mut component_base = None;
+            // A run this daemon restarted for: announce its state once.
+            let mut first = true;
+            loop {
+                // Component kit adoption is independent of backend updater ownership.
+                if let Some(component_layout) = crate::components::kit_layout::detect() {
+                    if component_base.as_ref() != Some(&component_layout.base) {
+                        super::components_api::announce_startup(&component_layout);
+                        component_base = Some(component_layout.base.clone());
+                    }
+                    if last_settle.elapsed() >= Duration::from_secs(60) {
+                        last_settle = Instant::now();
+                        super::components_api::settle(&component_layout);
+                    }
+                } else {
+                    component_base = None;
                 }
+                // Detected every round: an unmanaged daemon has nothing to watch
+                // (and never a stand-in path to read or act on).
+                let Some(layout) = layout() else {
+                    first = false;
+                    std::thread::sleep(WATCH_INTERVAL);
+                    continue;
+                };
+                let current = std::fs::metadata(layout.state_path())
+                    .and_then(|m| m.modified())
+                    .ok();
+                if current != stamp || (first && current.is_some()) {
+                    stamp = current;
+                    if current.is_some() {
+                        publish(event_params(
+                            &State::load(&layout),
+                            if first { "startup" } else { "state" },
+                        ));
+                    }
+                }
+                first = false;
+                if take_schedule_tick(&mut last_schedule, Instant::now()) {
+                    scheduled(&layout);
+                }
+                std::thread::sleep(WATCH_INTERVAL);
             }
-            if first {
-                super::components_api::announce_startup(&layout);
-            }
-            first = false;
-            if take_schedule_tick(&mut last_schedule, Instant::now()) {
-                scheduled(&layout);
-            }
-            // Deferred component restarts (Job Service): once no job runs.
-            if last_settle.elapsed() >= Duration::from_secs(60) {
-                last_settle = Instant::now();
-                super::components_api::settle(&layout);
-            }
-            std::thread::sleep(WATCH_INTERVAL);
-        }
-    })?;
+        })?;
     Ok(())
 }
 

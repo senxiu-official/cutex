@@ -26,7 +26,7 @@ fn record(name: &str) -> CutexSessionRecord {
     .expect("record")
 }
 
-fn runtime_receipt(
+pub(super) fn runtime_receipt(
     action: &str,
     session: &str,
 ) -> crate::agent_management::ExplicitLaunchActionReceipt {

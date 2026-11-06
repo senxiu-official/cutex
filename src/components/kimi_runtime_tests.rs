@@ -114,11 +114,13 @@ fn source_install_rejects_links_and_needs_staged_packages() {
     for file in ["package.json", "package-lock.json"] {
         std::fs::write(source.join(file), "{}").unwrap();
     }
-    // r267: a tree of another component version (an older kimi-r1 source) is refused first.
+    // A checkout of another component version must be refused before staging.
     let current = include_str!("../../components/kimi-runtime/component.json");
-    std::fs::write(source.join("component.json"), current.replace("\"kimi-r2\"", "\"kimi-r1\"")).unwrap();
+    let mut old: Metadata = serde_json::from_str(current).unwrap();
+    old.version = "kimi-r1".into();
+    std::fs::write(source.join("component.json"), serde_json::to_vec(&old).unwrap()).unwrap();
     let error = KimiRuntime::default().from_source(&source, &home.root().join("out")).unwrap_err().to_string();
-    assert!(error.contains("kimi-r1") && error.contains("kimi-r2"), "{error}");
+    assert!(error.contains("kimi-r1") && error.contains(&KimiRuntime::default().metadata().version), "{error}");
     std::fs::write(source.join("component.json"), current).unwrap();
     let error = KimiRuntime::default().from_source(&source, &home.root().join("out")).unwrap_err().to_string();
     assert!(error.contains("no packages are downloaded"), "{error}");

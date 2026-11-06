@@ -378,10 +378,7 @@ pub fn upsert_index_line(index: Option<&str>, file: &str, line: &str) -> Option<
         }
     }
     if !replaced {
-        while lines.last().is_some_and(|last| last.trim().is_empty()) {
-            lines.pop();
-        }
-        lines.push(line.to_string());
+        lines.insert(0, line.to_string());
         changed = true;
     }
     changed.then(|| {
@@ -833,7 +830,7 @@ mod tests {
         assert!(upsert_index_line(Some(&created), "test-style.md", &line).is_none());
         let other = "- [other](other.md) — o\n";
         let appended = upsert_index_line(Some(other), "test-style.md", &line).unwrap();
-        assert_eq!(appended, format!("- [other](other.md) — o\n{line}\n"));
+        assert_eq!(appended, format!("{line}\n- [other](other.md) — o\n"));
         let replaced = upsert_index_line(
             Some(&appended),
             "test-style.md",
@@ -845,6 +842,9 @@ mod tests {
         let removed = remove_index_lines(&replaced, "test-style.md").unwrap();
         assert_eq!(removed, other);
         assert!(remove_index_lines(other, "test-style.md").is_none());
+        let old_order = format!("{other}\n{line}\n");
+        let updated = upsert_index_line(Some(&old_order), "test-style.md", "- [t](test-style.md) — revised").unwrap();
+        assert_eq!(updated, format!("{other}\n- [t](test-style.md) — revised\n"));
     }
 
     #[test]

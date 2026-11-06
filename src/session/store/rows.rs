@@ -114,7 +114,8 @@ impl<'a> SessionRows<'a> {
 
     /// Writes one receipt row with the next commit (same transaction as the
     /// session rows of that commit).
-    pub(crate) fn insert_receipt<M: ReceiptMap>(&mut self, key: impl Into<String>, value: M::Value) {
+    pub(crate) fn insert_receipt<M: ReceiptMap>(&mut self, key: impl Into<String>, value: M::Value,
+    ) {
         let key = key.into();
         self.touched.receipts.insert((M::NAME, key.clone()));
         M::map_mut(&mut self.touched.values).insert(key, value);
@@ -232,15 +233,17 @@ pub fn update_session_row<T>(
     key: &str,
     update: impl FnOnce(&mut CutexSessionRecord) -> anyhow::Result<T>,
 ) -> anyhow::Result<Option<T>> {
-    let site = std::panic::Location::caller();
-    with_locked_session_rows(path, |rows| {
-        let Some(record) = rows.session_mut(key) else {
+    let started = std::time::Instant::now();
+    let result = sqlite::indexed::mutate_at(path, key, |row| {
+        let Some(record) = row.as_mut() else {
             return Ok(None);
         };
         let value = update(record)?;
-        commit_at(rows, site)?;
         Ok(Some(value))
     })
+    .map(|(result, _)| result);
+    if result.is_ok() { sqlite::trace_commit("session row", std::panic::Location::caller(), started); }
+    result
 }
 
 /// Compare-and-swap of one session row: writes `new` (or deletes the row
@@ -253,22 +256,20 @@ pub fn compare_and_swap_session_row(
     expected: Option<&CutexSessionRecord>,
     new: Option<CutexSessionRecord>,
 ) -> anyhow::Result<u64> {
-    let site = std::panic::Location::caller();
-    with_locked_session_rows(path, |rows| {
-        if rows.session(key) != expected {
+    let started = std::time::Instant::now();
+    let result = sqlite::indexed::mutate_at(path, key, |row| {
+        if row.as_ref() != expected {
             return Err(SessionRowConflict {
                 key: key.to_string(),
             }
             .into());
         }
-        match new {
-            Some(record) => rows.insert_session(key, record),
-            None => {
-                rows.remove_session(key);
-            }
-        }
-        commit_at(rows, site)
+        *row = new;
+        Ok(())
     })
+    .map(|(_, revision)| revision);
+    if result.is_ok() { sqlite::trace_commit("session CAS", std::panic::Location::caller(), started); }
+    result
 }
 
 /// Writes (or with `None` removes) one receipt row under the store lock.
@@ -278,21 +279,18 @@ pub(crate) fn update_receipt_row<M: ReceiptMap>(
     key: &str,
     value: Option<M::Value>,
 ) -> anyhow::Result<u64> {
-    let site = std::panic::Location::caller();
-    with_locked_session_rows(path, |rows| {
-        match value {
-            Some(value) => rows.insert_receipt::<M>(key, value),
-            None => rows.remove_receipt::<M>(key),
-        }
-        commit_at(rows, site)
-    })
+    let started = std::time::Instant::now();
+    let result = sqlite::indexed::put_receipt_at::<M>(path, key, value);
+    if result.is_ok() { sqlite::trace_commit("receipt row", std::panic::Location::caller(), started); }
+    result
 }
 
 fn commit_at(rows: &mut SessionRows<'_>, site: sqlite::Site) -> anyhow::Result<u64> {
     if rows.touched.is_empty() {
         return Ok(rows.revision);
     }
-    let next = sqlite::commit_rows_locked(rows.path, rows.revision, &mut rows.base, &rows.touched, site)?;
+    let next = sqlite::commit_rows_locked(rows.path, rows.revision, &mut rows.base, &rows.touched, site,
+    )?;
     rows.revision = next;
     rows.touched = TouchedRows::default();
     Ok(next)

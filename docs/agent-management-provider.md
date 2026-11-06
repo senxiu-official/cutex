@@ -15,7 +15,7 @@ cutex agent manage <operation> --request-file <private-json-path>
 
 `<operation>` is one of `create`, `query-managed`, `online`, `offline`,
 `restart`, `close`, `replace`, `grant-operator`, or `revoke-operator`.
-`director-rotate` was removed in r219 (see [r219-removals.md](r219-removals.md)).
+`director-rotate` was removed with the legacy Task Service (see [r219-removals.md](r219-removals.md)).
 The request file must be a private regular file. The caller process supplies its ambient `CUTEX_AGENT_ID`;
 normal Cutex Agent Bus URL and token configuration authenticate that live
 runtime. The consumer must not read or interpret `CUTEX_AGENT_GROUPS`.
@@ -77,7 +77,7 @@ An **Observer** is a read-oriented product role, not a persisted Agent
 Management grant in v1. This change does not infer Observer access from an
 Operator grant.
 
-Removed in r219 (see [r219-removals.md](r219-removals.md)): the Task Service
+Removed legacy interfaces (see [r219-removals.md](r219-removals.md)): the Task Service
 Director seat copy, the legacy global `cutex-director` / `cutex-release` seats,
 and agent-initiated Director rotation. Tool roles, owner-notify `directors`, and
 project managers come only from `authorized_director_session`.
@@ -164,11 +164,11 @@ cross-project, authority-changed, or externally unknowable state fails closed.
 For `close_after_ready`, replay validates and reuses the already-created exact
 successor. It does not bootstrap again or resend the idempotent handoff.
 
-## Director rotation (removed in r219)
+## Director rotation (removed with the legacy Task Service)
 
 `director_rotate` (the coupled project-authority + Task Service seat transfer,
 the `authority_transfer_pending` recovery state, and the Operator grant retained
-for a predecessor) was removed in r219; see [r219-removals.md](r219-removals.md).
+for a predecessor) was removed with the legacy Task Service; see [r219-removals.md](r219-removals.md).
 New requests with it are refused with `tool_removed`, and an in-flight
 `director_rotate` action found on recovery is finished as failed
 (`director_rotate_removed`). The operation kind, `rotation_mode`, and the
@@ -233,10 +233,10 @@ project-authority CAS:
 ```json
 {
   "schema": "cutex/agent-management/legacy-director-ownership-import/v1",
-  "action_id": "legacy-director-import-example-r2-01",
+  "action_id": "legacy-director-import-example-01",
   "project_id": "example-project",
-  "director_cutex_session_id": "cutex.example-director-r2",
-  "expected_authorized_director_session": "cutex.example-director-r2",
+  "director_cutex_session_id": "cutex.example-director",
+  "expected_authorized_director_session": "cutex.example-director",
   "expected_authority_epoch": 1
 }
 ```
@@ -419,12 +419,12 @@ envelope, `action_id` idempotency, optional `expected_authority_epoch` /
 - `clear_director`: clears the Director of an active Project. The former
   Director stays an ordinary member. Refusals name the blocking precondition:
   `director_rotation_in_progress` (a Director rotation action recorded before
-  r219 is still unresolved; recovery finishes it as failed) and
+  the legacy Task Service was removed is still unresolved; recovery finishes it as failed) and
   `project_has_agent_operators` (revoke the Operator grants first).
 
 These three kinds change Agent Management only. The Director is
 `ProjectAuthority.authorized_director_session` and nothing else; the Task
-Service Director seat store they used to leave stale was removed in r219, so
+Service Director seat store they used to leave stale was removed with the legacy Task Service, so
 no seat copy exists to disagree with the authority.
 
 Without a Director, `authority_epoch` is the last Director's epoch (0 if there

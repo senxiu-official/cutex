@@ -175,7 +175,8 @@ class ExternalInputService:
             return {}
         return {'externalInputVersion': 1, 'externalInputVersions': [1, 2],
                 'externalInputDeliveries': ['after_turn', 'passive'] + (['soon'] if self.settings.backend == 'subscription' else []),
-                'externalInputControlVersion': 1}
+                'externalInputControlVersion': 1,
+                **({'ownerInputCarries': 1} if self.settings.backend == 'subscription' else {})}
 
     def _binding(self, params: dict, *, submit=False) -> str:
         require(self.enabled, 'native external input requires a trusted host owner/runtime binding', -32011)
@@ -207,7 +208,16 @@ class ExternalInputService:
                 context = self.store.db.execute('SELECT reverted FROM turns WHERE id=?', (claimed[0],)).fetchone()
                 if context and context[0]:
                     row['state'] = 'reverted'
-        return row or self.store.db.execute('SELECT *,1 AS passive FROM notes WHERE thread_id=? AND message_id=?', (tid, mid)).fetchone()
+        if row is not None:
+            return row
+        note = self.store.db.execute('SELECT *,1 AS passive FROM notes WHERE thread_id=? AND message_id=?', (tid, mid)).fetchone()
+        if note is not None:
+            carrier = json.loads(note['payload']).get('metadata', {}).get('ownerCarrier')
+            if carrier:
+                owner = self.store.db.execute('SELECT state FROM inputs WHERE thread_id=? AND message_id=?', (tid, carrier)).fetchone()
+                if owner and owner[0] in {'interrupted', 'failed', 'uncertain', 'completed'}:
+                    return {**dict(note), 'state': owner[0]}
+        return note
 
     def _status(self, tid: str, mid: str, digest: str) -> dict:
         result = {'messageId': mid, 'semanticSha256': digest, 'deliveryState': 'unknown', 'receipt': None,
@@ -233,6 +243,10 @@ class ExternalInputService:
         result['receipt'] = json.loads(row['receipt']) if row['receipt'] else None
         result['deliveryState'] = 'context_persisted' if row['receipt'] else 'pending'
         if inbox['passive']:
+            if not row['receipt'] and json.loads(inbox['payload']).get('metadata', {}).get('ownerCarrier'):
+                state = inbox['state']
+                result['processing'] = {'state': 'pending' if state == 'reserved' else ('claimed' if state == 'injected' else 'held'),
+                                        'attemptId': row['attempt_id'], 'reason': None if state in {'reserved', 'injected'} else ('interrupted' if state == 'interrupted' else 'request_uncertain')}
             return result
         attempt = row['attempt_id']
         state = inbox['state']
@@ -293,7 +307,8 @@ class ExternalInputService:
             return [], []
         rows = self.store.db.execute('''SELECT n.seq,n.message_id FROM notes n
             JOIN external_inputs e ON e.thread_id=n.thread_id AND e.message_id=n.message_id
-            WHERE n.thread_id=? AND n.turn_id=? AND n.state='injected' AND e.receipt IS NULL ORDER BY n.seq''',
+            WHERE n.thread_id=? AND n.turn_id=? AND n.state='injected' AND e.receipt IS NULL
+              AND json_extract(n.payload,'$.metadata.ownerCarrier') IS NULL ORDER BY n.seq''',
             (tid, turn_id)).fetchall()
         if not rows:
             return [], []
@@ -341,6 +356,10 @@ class ExternalInputService:
         rows = self.store.db.execute('SELECT message_id FROM external_inputs WHERE thread_id=? AND message_id IN (' + candidates + ')',
                                     [tid, *arguments]).fetchall()
         acknowledged = method == 'claude/input/contextPersisted'
+        if acknowledged:
+            # A native attachment proves only its explicitly covered input.
+            # Other offers in this turn can still be waiting for persistence.
+            rows = [row for row in rows if row['message_id'] == params.get('messageId')]
         for row in rows:
             mid = row['message_id']
             inbox = self._inbox(tid, mid)
@@ -391,7 +410,10 @@ class ExternalInputService:
         self.store.db.execute('UPDATE threads SET halted=? WHERE id=?', (int(was_halted), tid))
         return {}, (None if was_halted else lambda: self.server.engine.wake(tid))
 
-    async def _submit(self, peer, tid: str, params: dict):
+    def validate_envelope(self, tid: str, params: dict) -> dict:
+        require(isinstance(params, dict) and not set(params) - BINDING_FIELDS - {'message', 'view', 'semanticSha256'},
+                'invalid canonical external envelope')
+        require(self._binding(params, submit=True) == tid, 'carried thread binding mismatch', -32011)
         message = params.get('message')
         require(isinstance(message, dict) and set(message) == {'id', 'source', 'type', 'delivery', 'text'}, 'invalid external input message')
         mid = text(message['id'], 'message.id', limit=256)
@@ -412,6 +434,53 @@ class ExternalInputService:
         if view is not None:
             envelope['view'] = view
         require(semantic_digest(envelope) == digest, 'external input semantic digest mismatch')
+        return envelope
+
+    @staticmethod
+    def payload(envelope: dict) -> dict:
+        message, view = envelope['message'], envelope.get('view')
+        metadata = {'nativeExternalInput': True}
+        if isinstance(view, dict) and view.get('schema') == 'cutex.agent-message.v1':
+            name = view['data'].get('senderName')
+            if isinstance(name, str) and name.strip():
+                metadata['sourceName'] = name[:256]
+        if message['delivery'] in {'passive', 'soon'}:
+            metadata['deliveryMode'] = message['delivery']
+        payload = {'source': message['source'], 'eventType': message['type'], 'text': message['text'], 'metadata': metadata}
+        if view is not None:
+            payload['view'] = view
+        return payload
+
+    def owner_carries(self, tid: str, values) -> list[dict]:
+        require(self.settings.backend == 'subscription' and self.enabled, 'owner carries require bound subscription runtime', -32011)
+        require(isinstance(values, list) and len(values) <= 100, 'ownerCarries must be an array of at most 100 envelopes')
+        result = [self.validate_envelope(tid, value) for value in values]
+        require(len({e['message']['id'] for e in result}) == len(result), 'duplicate carried identity')
+        require(sum(len(dump(e).encode('utf-8')) for e in result) <= 1024 * 1024, 'ownerCarries exceeds 1 MiB')
+        return result
+
+    def reserve_owner_carries(self, tid: str, carrier: str, values) -> None:
+        # Caller encloses owner enqueue and reservations in one SQLite transaction.
+        for envelope in values:
+            mid = envelope['message']['id']
+            old = self._row(tid, mid)
+            note = self.store.db.execute('SELECT payload FROM notes WHERE thread_id=? AND message_id=?', (tid, mid)).fetchone()
+            if old or self._inbox(tid, mid):
+                require(old is not None and note is not None
+                        and json.loads(old['envelope'])['semanticSha256'] == envelope['semanticSha256']
+                        and json.loads(note[0]).get('metadata', {}).get('ownerCarrier') == carrier,
+                        'carried identity already belongs to another submission', -32010)
+                continue  # Retrying never rearms a claimed/terminal carrier.
+            payload = self.payload(envelope)
+            payload['metadata']['ownerCarrier'] = carrier
+            self.store.enqueue_note(tid, mid, payload, self.settings.max_pending)
+            self.store.db.execute("UPDATE notes SET state='reserved' WHERE thread_id=? AND message_id=?", (tid, mid))
+            self.store.db.execute('INSERT INTO external_inputs(thread_id,message_id,envelope) VALUES(?,?,?)', (tid, mid, dump(envelope)))
+
+    async def _submit(self, peer, tid: str, params: dict):
+        envelope = self.validate_envelope(tid, {k: v for k, v in params.items() if k != 'admission'})
+        message = envelope['message']
+        mid, digest = message['id'], envelope['semanticSha256']
         admission = params.get('admission', 'queue')
         require(isinstance(admission, str) and admission in {'queue', 'exclusive_turn'}, 'unsupported external input admission')
         require(admission != 'exclusive_turn' or message['delivery'] == 'after_turn', 'exclusive turn requires after_turn delivery')
@@ -427,18 +496,7 @@ class ExternalInputService:
             reason = asks.busy_reason(self.server, tid)
             if reason:
                 raise asks.refuse_busy(reason)
-        metadata = {'nativeExternalInput': True}
-        if isinstance(view, dict) and view.get('schema') == 'cutex.agent-message.v1':
-            source_name = view['data'].get('senderName')
-            if isinstance(source_name, str) and source_name.strip():
-                metadata['sourceName'] = source_name[:256]
-        if message['delivery'] == 'passive':
-            metadata['deliveryMode'] = 'passive'
-        if message['delivery'] == 'soon':
-            metadata['deliveryMode'] = 'soon'
-        payload = {'source': source, 'eventType': message['type'], 'text': message['text'], 'metadata': metadata}
-        if view is not None:
-            payload['view'] = view
+        payload = self.payload(envelope)
         with self.store.transaction():
             enqueue = self.store.enqueue_note if message['delivery'] == 'passive' else self.store.enqueue
             receipt = enqueue(tid, mid, payload, self.settings.max_pending)

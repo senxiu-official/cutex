@@ -1,0 +1,1644 @@
+{
+  "started": "2026-11-04T00:18:45.021346+00:00",
+  "exe": "C:/Tools/agent-tmp\\scale-gate\\target\\debug\\cutex.exe",
+  "exe_sha256": "a191557e5058054701de2a60e630bef6c57c057c58618e71a695bbc942c7f4c6",
+  "cases": {
+    "0.01:h1": {
+      "health/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 367824,
+        "latency_median_ms": 40.66429997328669,
+        "latency_p95_ms": 40.66429997328669,
+        "peak_private_bytes": 240832512,
+        "idle_private_bytes": 240771072,
+        "transient_private_bytes": 61440,
+        "response_bytes": 352,
+        "verified": {
+          "stuck_bus_messages": 1
+        }
+      },
+      "health/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 367824,
+        "latency_median_ms": 19.884799956344068,
+        "latency_p95_ms": 20.230299909599125,
+        "peak_private_bytes": 240783360,
+        "idle_private_bytes": 240771072,
+        "transient_private_bytes": 12288,
+        "response_bytes": 352.0,
+        "verified": {
+          "stuck_bus_messages": 1
+        }
+      },
+      "health/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 367824,
+        "latency_median_ms": 23.896400060039014,
+        "latency_p95_ms": 25.897499988786876,
+        "peak_private_bytes": 241188864,
+        "idle_private_bytes": 240783360,
+        "transient_private_bytes": 405504,
+        "response_bytes": 352.0,
+        "verified": {
+          "stuck_bus_messages": 1
+        }
+      },
+      "sessions/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 3067,
+        "latency_median_ms": 183.61730000469834,
+        "latency_p95_ms": 183.61730000469834,
+        "peak_private_bytes": 252481536,
+        "idle_private_bytes": 251203584,
+        "transient_private_bytes": 1277952,
+        "response_bytes": 728847,
+        "verified": {
+          "rows": 166,
+          "first_id": "cutex.scale-00000",
+          "last_id": "cutex.scale-00165"
+        }
+      },
+      "sessions/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 3067,
+        "latency_median_ms": 241.78585002664477,
+        "latency_p95_ms": 247.4505000282079,
+        "peak_private_bytes": 252485632,
+        "idle_private_bytes": 251203584,
+        "transient_private_bytes": 1282048,
+        "response_bytes": 728841.0,
+        "verified": {
+          "rows": 166,
+          "first_id": "cutex.scale-00000",
+          "last_id": "cutex.scale-00165"
+        }
+      },
+      "sessions/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 3067,
+        "latency_median_ms": 302.82225005794317,
+        "latency_p95_ms": 409.51390005648136,
+        "peak_private_bytes": 254582784,
+        "idle_private_bytes": 251207680,
+        "transient_private_bytes": 3375104,
+        "response_bytes": 728856.0,
+        "verified": {
+          "rows": 166,
+          "first_id": "cutex.scale-00000",
+          "last_id": "cutex.scale-00165"
+        }
+      },
+      "host-session-page/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 261,
+        "latency_median_ms": 7.835200056433678,
+        "latency_p95_ms": 7.835200056433678,
+        "peak_private_bytes": 251949056,
+        "idle_private_bytes": 251949056,
+        "transient_private_bytes": 0,
+        "response_bytes": 451,
+        "verified": {
+          "rows": 1,
+          "id": "cutex.scale-00000",
+          "project": "scale-project"
+        }
+      },
+      "host-session-page/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 261,
+        "latency_median_ms": 10.512400011066347,
+        "latency_p95_ms": 11.126199970021844,
+        "peak_private_bytes": 251949056,
+        "idle_private_bytes": 251949056,
+        "transient_private_bytes": 0,
+        "response_bytes": 451.0,
+        "verified": {
+          "rows": 1,
+          "id": "cutex.scale-00000",
+          "project": "scale-project"
+        }
+      },
+      "host-session-page/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 261,
+        "latency_median_ms": 9.772849967703223,
+        "latency_p95_ms": 30.820599989965558,
+        "peak_private_bytes": 252178432,
+        "idle_private_bytes": 251949056,
+        "transient_private_bytes": 229376,
+        "response_bytes": 451.0,
+        "verified": {
+          "rows": 1,
+          "id": "cutex.scale-00000",
+          "project": "scale-project"
+        }
+      },
+      "queue-list/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 2231,
+        "latency_median_ms": 33.09409995563328,
+        "latency_p95_ms": 33.09409995563328,
+        "peak_private_bytes": 252010496,
+        "idle_private_bytes": 251949056,
+        "transient_private_bytes": 61440,
+        "response_bytes": 949,
+        "verified": {
+          "rows": 1,
+          "id": "queue-scale-sentinel",
+          "paused": true
+        }
+      },
+      "queue-list/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 2231,
+        "latency_median_ms": 27.21880003809929,
+        "latency_p95_ms": 39.10789999645203,
+        "peak_private_bytes": 252166144,
+        "idle_private_bytes": 251949056,
+        "transient_private_bytes": 217088,
+        "response_bytes": 949.0,
+        "verified": {
+          "rows": 1,
+          "id": "queue-scale-sentinel",
+          "paused": true
+        }
+      },
+      "queue-list/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 2231,
+        "latency_median_ms": 26.77990001393482,
+        "latency_p95_ms": 35.65780003555119,
+        "peak_private_bytes": 252465152,
+        "idle_private_bytes": 251949056,
+        "transient_private_bytes": 516096,
+        "response_bytes": 949.0,
+        "verified": {
+          "rows": 1,
+          "id": "queue-scale-sentinel",
+          "paused": true
+        }
+      },
+      "usage-day/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 1681145,
+        "latency_median_ms": 72.53889995627105,
+        "latency_p95_ms": 72.53889995627105,
+        "peak_private_bytes": 252157952,
+        "idle_private_bytes": 251953152,
+        "transient_private_bytes": 204800,
+        "response_bytes": 1098,
+        "verified": {
+          "rows": 1,
+          "total": 6
+        }
+      },
+      "usage-day/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 1681145,
+        "latency_median_ms": 90.08964995155111,
+        "latency_p95_ms": 101.7293999902904,
+        "peak_private_bytes": 252387328,
+        "idle_private_bytes": 251953152,
+        "transient_private_bytes": 434176,
+        "response_bytes": 1098.0,
+        "verified": {
+          "rows": 1,
+          "total": 6
+        }
+      },
+      "usage-day/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 1681239.75,
+        "latency_median_ms": 90.61410004505888,
+        "latency_p95_ms": 104.59870006889105,
+        "peak_private_bytes": 258371584,
+        "idle_private_bytes": 251977728,
+        "transient_private_bytes": 6393856,
+        "response_bytes": 1098.0,
+        "verified": {
+          "rows": 1,
+          "total": 6
+        }
+      },
+      "claude-api-quota/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 1679612,
+        "latency_median_ms": 65.42539992369711,
+        "latency_p95_ms": 65.42539992369711,
+        "peak_private_bytes": 258383872,
+        "idle_private_bytes": 258166784,
+        "transient_private_bytes": 217088,
+        "response_bytes": 1042,
+        "verified": {
+          "source": "claudeApi",
+          "last30DaysTotal": 6
+        }
+      },
+      "claude-api-quota/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 1679612,
+        "latency_median_ms": 74.33589996071532,
+        "latency_p95_ms": 75.13479993212968,
+        "peak_private_bytes": 258596864,
+        "idle_private_bytes": 258166784,
+        "transient_private_bytes": 430080,
+        "response_bytes": 1042.0,
+        "verified": {
+          "source": "claudeApi",
+          "last30DaysTotal": 6
+        }
+      },
+      "claude-api-quota/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 1679612,
+        "latency_median_ms": 82.9174000537023,
+        "latency_p95_ms": 87.98650000244379,
+        "peak_private_bytes": 259026944,
+        "idle_private_bytes": 258166784,
+        "transient_private_bytes": 860160,
+        "response_bytes": 1042.0,
+        "verified": {
+          "source": "claudeApi",
+          "last30DaysTotal": 6
+        }
+      },
+      "delegation-restore/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 0,
+        "latency_median_ms": 15.470900107175112,
+        "latency_p95_ms": 15.470900107175112,
+        "peak_private_bytes": 256966656,
+        "idle_private_bytes": 256966656,
+        "transient_private_bytes": 0,
+        "response_bytes": 9974,
+        "verified": {
+          "rows": 10,
+          "closed": "completed"
+        }
+      },
+      "delegation-restore/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 0,
+        "latency_median_ms": 23.438650008756667,
+        "latency_p95_ms": 32.50470000784844,
+        "peak_private_bytes": 257019904,
+        "idle_private_bytes": 256966656,
+        "transient_private_bytes": 53248,
+        "response_bytes": 9974.0,
+        "verified": {
+          "rows": 10,
+          "closed": "completed"
+        }
+      },
+      "delegation-restore/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 0,
+        "latency_median_ms": 20.555349998176098,
+        "latency_p95_ms": 36.03229997679591,
+        "peak_private_bytes": 257032192,
+        "idle_private_bytes": 256966656,
+        "transient_private_bytes": 65536,
+        "response_bytes": 9974.0,
+        "verified": {
+          "rows": 10,
+          "closed": "completed"
+        }
+      },
+      "notifications/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 1764,
+        "latency_median_ms": 23.866200004704297,
+        "latency_p95_ms": 23.866200004704297,
+        "peak_private_bytes": 257028096,
+        "idle_private_bytes": 256970752,
+        "transient_private_bytes": 57344,
+        "response_bytes": 412,
+        "verified": {
+          "rows": 1,
+          "id": "notice-scale-sentinel"
+        }
+      },
+      "notifications/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 1764,
+        "latency_median_ms": 3.7503999774344265,
+        "latency_p95_ms": 3.7902999902144074,
+        "peak_private_bytes": 256970752,
+        "idle_private_bytes": 256970752,
+        "transient_private_bytes": 0,
+        "response_bytes": 412.0,
+        "verified": {
+          "rows": 1,
+          "id": "notice-scale-sentinel"
+        }
+      },
+      "notifications/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 1764,
+        "latency_median_ms": 3.818799974396825,
+        "latency_p95_ms": 4.184799967333674,
+        "peak_private_bytes": 256970752,
+        "idle_private_bytes": 256970752,
+        "transient_private_bytes": 0,
+        "response_bytes": 412.0,
+        "verified": {
+          "rows": 1,
+          "id": "notice-scale-sentinel"
+        }
+      }
+    },
+    "0.01:h10": {
+      "health/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 3649055,
+        "latency_median_ms": 52.37809999380261,
+        "latency_p95_ms": 52.37809999380261,
+        "peak_private_bytes": 327393280,
+        "idle_private_bytes": 327159808,
+        "transient_private_bytes": 233472,
+        "response_bytes": 352,
+        "verified": {
+          "stuck_bus_messages": 1
+        }
+      },
+      "health/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 3649055,
+        "latency_median_ms": 32.14894997654483,
+        "latency_p95_ms": 32.90510002989322,
+        "peak_private_bytes": 327626752,
+        "idle_private_bytes": 327159808,
+        "transient_private_bytes": 466944,
+        "response_bytes": 352.0,
+        "verified": {
+          "stuck_bus_messages": 1
+        }
+      },
+      "health/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 3649055,
+        "latency_median_ms": 41.14900005515665,
+        "latency_p95_ms": 44.123699888587,
+        "peak_private_bytes": 334987264,
+        "idle_private_bytes": 327159808,
+        "transient_private_bytes": 7827456,
+        "response_bytes": 352.0,
+        "verified": {
+          "stuck_bus_messages": 1
+        }
+      },
+      "sessions/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 3070,
+        "latency_median_ms": 176.20830005034804,
+        "latency_p95_ms": 176.20830005034804,
+        "peak_private_bytes": 326529024,
+        "idle_private_bytes": 326311936,
+        "transient_private_bytes": 217088,
+        "response_bytes": 728823,
+        "verified": {
+          "rows": 166,
+          "first_id": "cutex.scale-00000",
+          "last_id": "cutex.scale-00165"
+        }
+      },
+      "sessions/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 3070,
+        "latency_median_ms": 194.3217000225559,
+        "latency_p95_ms": 195.6727000651881,
+        "peak_private_bytes": 328863744,
+        "idle_private_bytes": 326311936,
+        "transient_private_bytes": 2551808,
+        "response_bytes": 728851.5,
+        "verified": {
+          "rows": 166,
+          "first_id": "cutex.scale-00000",
+          "last_id": "cutex.scale-00165"
+        }
+      },
+      "sessions/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 3164.75,
+        "latency_median_ms": 281.1455500195734,
+        "latency_p95_ms": 390.50680003128946,
+        "peak_private_bytes": 327147520,
+        "idle_private_bytes": 326320128,
+        "transient_private_bytes": 827392,
+        "response_bytes": 728844.0,
+        "verified": {
+          "rows": 166,
+          "first_id": "cutex.scale-00000",
+          "last_id": "cutex.scale-00165"
+        }
+      },
+      "host-session-page/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 261,
+        "latency_median_ms": 37.02189994510263,
+        "latency_p95_ms": 37.02189994510263,
+        "peak_private_bytes": 332165120,
+        "idle_private_bytes": 326930432,
+        "transient_private_bytes": 5234688,
+        "response_bytes": 451,
+        "verified": {
+          "rows": 1,
+          "id": "cutex.scale-00000",
+          "project": "scale-project"
+        }
+      },
+      "host-session-page/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 261,
+        "latency_median_ms": 18.97585002006963,
+        "latency_p95_ms": 19.45070002693683,
+        "peak_private_bytes": 337395712,
+        "idle_private_bytes": 326930432,
+        "transient_private_bytes": 10465280,
+        "response_bytes": 451.0,
+        "verified": {
+          "rows": 1,
+          "id": "cutex.scale-00000",
+          "project": "scale-project"
+        }
+      },
+      "host-session-page/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 261,
+        "latency_median_ms": 19.96010000584647,
+        "latency_p95_ms": 20.577200106345117,
+        "peak_private_bytes": 347885568,
+        "idle_private_bytes": 326930432,
+        "transient_private_bytes": 20955136,
+        "response_bytes": 451.0,
+        "verified": {
+          "rows": 1,
+          "id": "cutex.scale-00000",
+          "project": "scale-project"
+        }
+      },
+      "queue-list/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 2231,
+        "latency_median_ms": 24.03009997215122,
+        "latency_p95_ms": 24.03009997215122,
+        "peak_private_bytes": 327012352,
+        "idle_private_bytes": 326950912,
+        "transient_private_bytes": 61440,
+        "response_bytes": 949,
+        "verified": {
+          "rows": 1,
+          "id": "queue-scale-sentinel",
+          "paused": true
+        }
+      },
+      "queue-list/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 2231,
+        "latency_median_ms": 17.551149998325855,
+        "latency_p95_ms": 19.01070005260408,
+        "peak_private_bytes": 327114752,
+        "idle_private_bytes": 326950912,
+        "transient_private_bytes": 163840,
+        "response_bytes": 949.0,
+        "verified": {
+          "rows": 1,
+          "id": "queue-scale-sentinel",
+          "paused": true
+        }
+      },
+      "queue-list/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 2231,
+        "latency_median_ms": 28.06814998621121,
+        "latency_p95_ms": 34.58700003102422,
+        "peak_private_bytes": 327356416,
+        "idle_private_bytes": 326950912,
+        "transient_private_bytes": 405504,
+        "response_bytes": 949.0,
+        "verified": {
+          "rows": 1,
+          "id": "queue-scale-sentinel",
+          "paused": true
+        }
+      },
+      "usage-day/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 16753537,
+        "latency_median_ms": 642.2964000375941,
+        "latency_p95_ms": 642.2964000375941,
+        "peak_private_bytes": 343695360,
+        "idle_private_bytes": 310747136,
+        "transient_private_bytes": 32948224,
+        "response_bytes": 1098,
+        "verified": {
+          "rows": 1,
+          "total": 6
+        }
+      },
+      "usage-day/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 16753726.5,
+        "latency_median_ms": 645.0878499890678,
+        "latency_p95_ms": 645.4902999103069,
+        "peak_private_bytes": 385200128,
+        "idle_private_bytes": 328359936,
+        "transient_private_bytes": 56840192,
+        "response_bytes": 1098.0,
+        "verified": {
+          "rows": 1,
+          "total": 6
+        }
+      },
+      "usage-day/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 16753537,
+        "latency_median_ms": 679.9914499861188,
+        "latency_p95_ms": 704.5186000177637,
+        "peak_private_bytes": 489754624,
+        "idle_private_bytes": 331399168,
+        "transient_private_bytes": 158355456,
+        "response_bytes": 1098.0,
+        "verified": {
+          "rows": 1,
+          "total": 6
+        }
+      },
+      "claude-api-quota/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 16752383,
+        "latency_median_ms": 585.515399929136,
+        "latency_p95_ms": 585.515399929136,
+        "peak_private_bytes": 418148352,
+        "idle_private_bytes": 404131840,
+        "transient_private_bytes": 14016512,
+        "response_bytes": 1042,
+        "verified": {
+          "source": "claudeApi",
+          "last30DaysTotal": 6
+        }
+      },
+      "claude-api-quota/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 16752004,
+        "latency_median_ms": 612.1594499563798,
+        "latency_p95_ms": 613.8042999664322,
+        "peak_private_bytes": 430010368,
+        "idle_private_bytes": 401985536,
+        "transient_private_bytes": 28024832,
+        "response_bytes": 1042.0,
+        "verified": {
+          "source": "claudeApi",
+          "last30DaysTotal": 6
+        }
+      },
+      "claude-api-quota/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 16752004,
+        "latency_median_ms": 730.4932000115514,
+        "latency_p95_ms": 762.3533000005409,
+        "peak_private_bytes": 497217536,
+        "idle_private_bytes": 391421952,
+        "transient_private_bytes": 105795584,
+        "response_bytes": 1042.0,
+        "verified": {
+          "source": "claudeApi",
+          "last30DaysTotal": 6
+        }
+      },
+      "delegation-restore/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 379,
+        "latency_median_ms": 29.293100000359118,
+        "latency_p95_ms": 29.293100000359118,
+        "peak_private_bytes": 446144512,
+        "idle_private_bytes": 446091264,
+        "transient_private_bytes": 53248,
+        "response_bytes": 9974,
+        "verified": {
+          "rows": 10,
+          "closed": "completed"
+        }
+      },
+      "delegation-restore/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 0,
+        "latency_median_ms": 16.972049954347312,
+        "latency_p95_ms": 17.392899957485497,
+        "peak_private_bytes": 446103552,
+        "idle_private_bytes": 446091264,
+        "transient_private_bytes": 12288,
+        "response_bytes": 9974.0,
+        "verified": {
+          "rows": 10,
+          "closed": "completed"
+        }
+      },
+      "delegation-restore/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 0,
+        "latency_median_ms": 22.62634999351576,
+        "latency_p95_ms": 23.23020005133003,
+        "peak_private_bytes": 446529536,
+        "idle_private_bytes": 446103552,
+        "transient_private_bytes": 425984,
+        "response_bytes": 9974.0,
+        "verified": {
+          "rows": 10,
+          "closed": "completed"
+        }
+      },
+      "notifications/N=1": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 7092,
+        "latency_median_ms": 2.331599942408502,
+        "latency_p95_ms": 2.331599942408502,
+        "peak_private_bytes": 446103552,
+        "idle_private_bytes": 446103552,
+        "transient_private_bytes": 0,
+        "response_bytes": 412,
+        "verified": {
+          "rows": 1,
+          "id": "notice-scale-sentinel"
+        }
+      },
+      "notifications/N=2": {
+        "concurrency": 2,
+        "requests": 2,
+        "parse_bytes_per_request": 7092,
+        "latency_median_ms": 13.268200040329248,
+        "latency_p95_ms": 13.299500104039907,
+        "peak_private_bytes": 446222336,
+        "idle_private_bytes": 446103552,
+        "transient_private_bytes": 118784,
+        "response_bytes": 412.0,
+        "verified": {
+          "rows": 1,
+          "id": "notice-scale-sentinel"
+        }
+      },
+      "notifications/N=4": {
+        "concurrency": 4,
+        "requests": 4,
+        "parse_bytes_per_request": 7092,
+        "latency_median_ms": 4.425899998750538,
+        "latency_p95_ms": 4.879400017671287,
+        "peak_private_bytes": 446103552,
+        "idle_private_bytes": 446103552,
+        "transient_private_bytes": 0,
+        "response_bytes": 412.0,
+        "verified": {
+          "rows": 1,
+          "id": "notice-scale-sentinel"
+        }
+      }
+    }
+  },
+  "failures": [
+    {
+      "case": "health/N=1",
+      "metric": "parse_bytes_per_request",
+      "actual": 3649055,
+      "budget": 568120.0
+    },
+    {
+      "case": "health/N=2",
+      "metric": "parse_bytes_per_request",
+      "actual": 3649055,
+      "budget": 568120.0
+    },
+    {
+      "case": "health/N=4",
+      "metric": "parse_bytes_per_request",
+      "actual": 3649055,
+      "budget": 568120.0
+    },
+    {
+      "case": "usage-day/N=1",
+      "metric": "parse_bytes_per_request",
+      "actual": 16753537,
+      "budget": 2538101.5
+    },
+    {
+      "case": "usage-day/N=1",
+      "metric": "transient_private_bytes",
+      "actual": 32948224,
+      "budget": 17186816
+    },
+    {
+      "case": "usage-day/N=1",
+      "metric": "latency_median_ms",
+      "actual": 642.2964000375941,
+      "budget": 340.1555998250842
+    },
+    {
+      "case": "usage-day/N=2",
+      "metric": "parse_bytes_per_request",
+      "actual": 16753726.5,
+      "budget": 2538101.5
+    },
+    {
+      "case": "usage-day/N=2",
+      "metric": "transient_private_bytes",
+      "actual": 56840192,
+      "budget": 34422784
+    },
+    {
+      "case": "usage-day/N=2",
+      "metric": "latency_median_ms",
+      "actual": 645.0878499890678,
+      "budget": 410.35859980620444
+    },
+    {
+      "case": "usage-day/N=4",
+      "metric": "parse_bytes_per_request",
+      "actual": 16753537,
+      "budget": 2538243.625
+    },
+    {
+      "case": "usage-day/N=4",
+      "metric": "transient_private_bytes",
+      "actual": 158355456,
+      "budget": 79896576
+    },
+    {
+      "case": "usage-day/N=4",
+      "metric": "latency_median_ms",
+      "actual": 679.9914499861188,
+      "budget": 412.4564001802355
+    },
+    {
+      "case": "claude-api-quota/N=1",
+      "metric": "parse_bytes_per_request",
+      "actual": 16752383,
+      "budget": 2535802.0
+    },
+    {
+      "case": "claude-api-quota/N=1",
+      "metric": "latency_median_ms",
+      "actual": 585.515399929136,
+      "budget": 311.70159969478846
+    },
+    {
+      "case": "claude-api-quota/N=2",
+      "metric": "parse_bytes_per_request",
+      "actual": 16752004,
+      "budget": 2535802.0
+    },
+    {
+      "case": "claude-api-quota/N=2",
+      "metric": "latency_median_ms",
+      "actual": 612.1594499563798,
+      "budget": 347.3435998428613
+    },
+    {
+      "case": "claude-api-quota/N=4",
+      "metric": "parse_bytes_per_request",
+      "actual": 16752004,
+      "budget": 2535802.0
+    },
+    {
+      "case": "claude-api-quota/N=4",
+      "metric": "transient_private_bytes",
+      "actual": 105795584,
+      "budget": 68829184
+    },
+    {
+      "case": "claude-api-quota/N=4",
+      "metric": "latency_median_ms",
+      "actual": 730.4932000115514,
+      "budget": 381.6696002148092
+    }
+  ],
+  "errors": [],
+  "build": {
+    "product_sha": "5c8eb804607939054ab8af761519049404cbf397",
+    "instrumentation_sha256": "834084519be1febd8fed175e50b8be512899da4c0e6bc2c5b4b0022d183ab75f",
+    "excluded": [
+      "serde_json::from_value (typed conversion)",
+      "direct serde_json::Deserializer (workflow logs, avatar compatibility, integration event ledger)"
+    ],
+    "rewritten_parse_sites": 1062,
+    "rewritten_files": 403
+  },
+  "fixtures": {
+    "0.01:h1": {
+      "synthetic": true,
+      "fixture_version": 2,
+      "anchor": "2026-11-04",
+      "scale": 0.01,
+      "inactive_history_multiplier": 1,
+      "active_sessions": 166,
+      "closed_delegations": 10,
+      "open_delegations": 4,
+      "usage_rows": 3057,
+      "expected": {
+        "active_session_ids": [
+          "cutex.scale-00000",
+          "cutex.scale-00001",
+          "cutex.scale-00002",
+          "cutex.scale-00003",
+          "cutex.scale-00004",
+          "cutex.scale-00005",
+          "cutex.scale-00006",
+          "cutex.scale-00007",
+          "cutex.scale-00008",
+          "cutex.scale-00009",
+          "cutex.scale-00010",
+          "cutex.scale-00011",
+          "cutex.scale-00012",
+          "cutex.scale-00013",
+          "cutex.scale-00014",
+          "cutex.scale-00015",
+          "cutex.scale-00016",
+          "cutex.scale-00017",
+          "cutex.scale-00018",
+          "cutex.scale-00019",
+          "cutex.scale-00020",
+          "cutex.scale-00021",
+          "cutex.scale-00022",
+          "cutex.scale-00023",
+          "cutex.scale-00024",
+          "cutex.scale-00025",
+          "cutex.scale-00026",
+          "cutex.scale-00027",
+          "cutex.scale-00028",
+          "cutex.scale-00029",
+          "cutex.scale-00030",
+          "cutex.scale-00031",
+          "cutex.scale-00032",
+          "cutex.scale-00033",
+          "cutex.scale-00034",
+          "cutex.scale-00035",
+          "cutex.scale-00036",
+          "cutex.scale-00037",
+          "cutex.scale-00038",
+          "cutex.scale-00039",
+          "cutex.scale-00040",
+          "cutex.scale-00041",
+          "cutex.scale-00042",
+          "cutex.scale-00043",
+          "cutex.scale-00044",
+          "cutex.scale-00045",
+          "cutex.scale-00046",
+          "cutex.scale-00047",
+          "cutex.scale-00048",
+          "cutex.scale-00049",
+          "cutex.scale-00050",
+          "cutex.scale-00051",
+          "cutex.scale-00052",
+          "cutex.scale-00053",
+          "cutex.scale-00054",
+          "cutex.scale-00055",
+          "cutex.scale-00056",
+          "cutex.scale-00057",
+          "cutex.scale-00058",
+          "cutex.scale-00059",
+          "cutex.scale-00060",
+          "cutex.scale-00061",
+          "cutex.scale-00062",
+          "cutex.scale-00063",
+          "cutex.scale-00064",
+          "cutex.scale-00065",
+          "cutex.scale-00066",
+          "cutex.scale-00067",
+          "cutex.scale-00068",
+          "cutex.scale-00069",
+          "cutex.scale-00070",
+          "cutex.scale-00071",
+          "cutex.scale-00072",
+          "cutex.scale-00073",
+          "cutex.scale-00074",
+          "cutex.scale-00075",
+          "cutex.scale-00076",
+          "cutex.scale-00077",
+          "cutex.scale-00078",
+          "cutex.scale-00079",
+          "cutex.scale-00080",
+          "cutex.scale-00081",
+          "cutex.scale-00082",
+          "cutex.scale-00083",
+          "cutex.scale-00084",
+          "cutex.scale-00085",
+          "cutex.scale-00086",
+          "cutex.scale-00087",
+          "cutex.scale-00088",
+          "cutex.scale-00089",
+          "cutex.scale-00090",
+          "cutex.scale-00091",
+          "cutex.scale-00092",
+          "cutex.scale-00093",
+          "cutex.scale-00094",
+          "cutex.scale-00095",
+          "cutex.scale-00096",
+          "cutex.scale-00097",
+          "cutex.scale-00098",
+          "cutex.scale-00099",
+          "cutex.scale-00100",
+          "cutex.scale-00101",
+          "cutex.scale-00102",
+          "cutex.scale-00103",
+          "cutex.scale-00104",
+          "cutex.scale-00105",
+          "cutex.scale-00106",
+          "cutex.scale-00107",
+          "cutex.scale-00108",
+          "cutex.scale-00109",
+          "cutex.scale-00110",
+          "cutex.scale-00111",
+          "cutex.scale-00112",
+          "cutex.scale-00113",
+          "cutex.scale-00114",
+          "cutex.scale-00115",
+          "cutex.scale-00116",
+          "cutex.scale-00117",
+          "cutex.scale-00118",
+          "cutex.scale-00119",
+          "cutex.scale-00120",
+          "cutex.scale-00121",
+          "cutex.scale-00122",
+          "cutex.scale-00123",
+          "cutex.scale-00124",
+          "cutex.scale-00125",
+          "cutex.scale-00126",
+          "cutex.scale-00127",
+          "cutex.scale-00128",
+          "cutex.scale-00129",
+          "cutex.scale-00130",
+          "cutex.scale-00131",
+          "cutex.scale-00132",
+          "cutex.scale-00133",
+          "cutex.scale-00134",
+          "cutex.scale-00135",
+          "cutex.scale-00136",
+          "cutex.scale-00137",
+          "cutex.scale-00138",
+          "cutex.scale-00139",
+          "cutex.scale-00140",
+          "cutex.scale-00141",
+          "cutex.scale-00142",
+          "cutex.scale-00143",
+          "cutex.scale-00144",
+          "cutex.scale-00145",
+          "cutex.scale-00146",
+          "cutex.scale-00147",
+          "cutex.scale-00148",
+          "cutex.scale-00149",
+          "cutex.scale-00150",
+          "cutex.scale-00151",
+          "cutex.scale-00152",
+          "cutex.scale-00153",
+          "cutex.scale-00154",
+          "cutex.scale-00155",
+          "cutex.scale-00156",
+          "cutex.scale-00157",
+          "cutex.scale-00158",
+          "cutex.scale-00159",
+          "cutex.scale-00160",
+          "cutex.scale-00161",
+          "cutex.scale-00162",
+          "cutex.scale-00163",
+          "cutex.scale-00164",
+          "cutex.scale-00165"
+        ],
+        "host_match": "cutex.scale-00000",
+        "queue_id": "queue-scale-sentinel",
+        "pending_notification": "notice-scale-sentinel",
+        "bus_sentinel": "bus-scale-sentinel",
+        "bus_history_rows": 18,
+        "roster_actions": 115,
+        "roster_agents": 166,
+        "final_notifications": 1,
+        "usage_total": 6
+      },
+      "files": {
+        "accounts.json": 187,
+        "config.json": 248,
+        "cutex-sessions.json": 200210,
+        "runtime\\asks\\asks-v1.json": 211153,
+        "runtime\\claude\\accounts.json": 151,
+        "runtime\\management-v2\\agent-bus-message-state.json": 365125,
+        "runtime\\management-v2\\user-input-state.json": 31863,
+        "runtime\\owner-notify\\owner-notify-v1.json": 1764,
+        "runtime\\agent-management\\v1\\agent-management-v1.json": 123151,
+        "runtime\\agent-management\\v1\\agent-management-v1.lock": 0,
+        "runtime\\management-v2\\usage-ledger\\2026-11.jsonl": 734031,
+        "runtime\\management-v2\\usage-ledger-external\\scale-external\\2026-11.jsonl": 944076
+      },
+      "calibration": "2026-11-03 audits; 35 MiB bus is historical stress target; current capture 14.06 MiB",
+      "management_port": 24970,
+      "bus_port": 24960,
+      "artifact_files": 10,
+      "artifact_bytes": 175000
+    },
+    "0.01:h10": {
+      "synthetic": true,
+      "fixture_version": 2,
+      "anchor": "2026-11-04",
+      "scale": 0.01,
+      "inactive_history_multiplier": 10,
+      "active_sessions": 166,
+      "closed_delegations": 100,
+      "open_delegations": 4,
+      "usage_rows": 30398,
+      "expected": {
+        "active_session_ids": [
+          "cutex.scale-00000",
+          "cutex.scale-00001",
+          "cutex.scale-00002",
+          "cutex.scale-00003",
+          "cutex.scale-00004",
+          "cutex.scale-00005",
+          "cutex.scale-00006",
+          "cutex.scale-00007",
+          "cutex.scale-00008",
+          "cutex.scale-00009",
+          "cutex.scale-00010",
+          "cutex.scale-00011",
+          "cutex.scale-00012",
+          "cutex.scale-00013",
+          "cutex.scale-00014",
+          "cutex.scale-00015",
+          "cutex.scale-00016",
+          "cutex.scale-00017",
+          "cutex.scale-00018",
+          "cutex.scale-00019",
+          "cutex.scale-00020",
+          "cutex.scale-00021",
+          "cutex.scale-00022",
+          "cutex.scale-00023",
+          "cutex.scale-00024",
+          "cutex.scale-00025",
+          "cutex.scale-00026",
+          "cutex.scale-00027",
+          "cutex.scale-00028",
+          "cutex.scale-00029",
+          "cutex.scale-00030",
+          "cutex.scale-00031",
+          "cutex.scale-00032",
+          "cutex.scale-00033",
+          "cutex.scale-00034",
+          "cutex.scale-00035",
+          "cutex.scale-00036",
+          "cutex.scale-00037",
+          "cutex.scale-00038",
+          "cutex.scale-00039",
+          "cutex.scale-00040",
+          "cutex.scale-00041",
+          "cutex.scale-00042",
+          "cutex.scale-00043",
+          "cutex.scale-00044",
+          "cutex.scale-00045",
+          "cutex.scale-00046",
+          "cutex.scale-00047",
+          "cutex.scale-00048",
+          "cutex.scale-00049",
+          "cutex.scale-00050",
+          "cutex.scale-00051",
+          "cutex.scale-00052",
+          "cutex.scale-00053",
+          "cutex.scale-00054",
+          "cutex.scale-00055",
+          "cutex.scale-00056",
+          "cutex.scale-00057",
+          "cutex.scale-00058",
+          "cutex.scale-00059",
+          "cutex.scale-00060",
+          "cutex.scale-00061",
+          "cutex.scale-00062",
+          "cutex.scale-00063",
+          "cutex.scale-00064",
+          "cutex.scale-00065",
+          "cutex.scale-00066",
+          "cutex.scale-00067",
+          "cutex.scale-00068",
+          "cutex.scale-00069",
+          "cutex.scale-00070",
+          "cutex.scale-00071",
+          "cutex.scale-00072",
+          "cutex.scale-00073",
+          "cutex.scale-00074",
+          "cutex.scale-00075",
+          "cutex.scale-00076",
+          "cutex.scale-00077",
+          "cutex.scale-00078",
+          "cutex.scale-00079",
+          "cutex.scale-00080",
+          "cutex.scale-00081",
+          "cutex.scale-00082",
+          "cutex.scale-00083",
+          "cutex.scale-00084",
+          "cutex.scale-00085",
+          "cutex.scale-00086",
+          "cutex.scale-00087",
+          "cutex.scale-00088",
+          "cutex.scale-00089",
+          "cutex.scale-00090",
+          "cutex.scale-00091",
+          "cutex.scale-00092",
+          "cutex.scale-00093",
+          "cutex.scale-00094",
+          "cutex.scale-00095",
+          "cutex.scale-00096",
+          "cutex.scale-00097",
+          "cutex.scale-00098",
+          "cutex.scale-00099",
+          "cutex.scale-00100",
+          "cutex.scale-00101",
+          "cutex.scale-00102",
+          "cutex.scale-00103",
+          "cutex.scale-00104",
+          "cutex.scale-00105",
+          "cutex.scale-00106",
+          "cutex.scale-00107",
+          "cutex.scale-00108",
+          "cutex.scale-00109",
+          "cutex.scale-00110",
+          "cutex.scale-00111",
+          "cutex.scale-00112",
+          "cutex.scale-00113",
+          "cutex.scale-00114",
+          "cutex.scale-00115",
+          "cutex.scale-00116",
+          "cutex.scale-00117",
+          "cutex.scale-00118",
+          "cutex.scale-00119",
+          "cutex.scale-00120",
+          "cutex.scale-00121",
+          "cutex.scale-00122",
+          "cutex.scale-00123",
+          "cutex.scale-00124",
+          "cutex.scale-00125",
+          "cutex.scale-00126",
+          "cutex.scale-00127",
+          "cutex.scale-00128",
+          "cutex.scale-00129",
+          "cutex.scale-00130",
+          "cutex.scale-00131",
+          "cutex.scale-00132",
+          "cutex.scale-00133",
+          "cutex.scale-00134",
+          "cutex.scale-00135",
+          "cutex.scale-00136",
+          "cutex.scale-00137",
+          "cutex.scale-00138",
+          "cutex.scale-00139",
+          "cutex.scale-00140",
+          "cutex.scale-00141",
+          "cutex.scale-00142",
+          "cutex.scale-00143",
+          "cutex.scale-00144",
+          "cutex.scale-00145",
+          "cutex.scale-00146",
+          "cutex.scale-00147",
+          "cutex.scale-00148",
+          "cutex.scale-00149",
+          "cutex.scale-00150",
+          "cutex.scale-00151",
+          "cutex.scale-00152",
+          "cutex.scale-00153",
+          "cutex.scale-00154",
+          "cutex.scale-00155",
+          "cutex.scale-00156",
+          "cutex.scale-00157",
+          "cutex.scale-00158",
+          "cutex.scale-00159",
+          "cutex.scale-00160",
+          "cutex.scale-00161",
+          "cutex.scale-00162",
+          "cutex.scale-00163",
+          "cutex.scale-00164",
+          "cutex.scale-00165"
+        ],
+        "host_match": "cutex.scale-00000",
+        "queue_id": "queue-scale-sentinel",
+        "pending_notification": "notice-scale-sentinel",
+        "bus_sentinel": "bus-scale-sentinel",
+        "bus_history_rows": 184,
+        "roster_actions": 1150,
+        "roster_agents": 1660,
+        "final_notifications": 5,
+        "usage_total": 6
+      },
+      "files": {
+        "accounts.json": 187,
+        "config.json": 248,
+        "cutex-sessions.json": 2055758,
+        "runtime\\asks\\asks-v1.json": 2017099,
+        "runtime\\claude\\accounts.json": 151,
+        "runtime\\management-v2\\agent-bus-message-state.json": 3647107,
+        "runtime\\management-v2\\user-input-state.json": 314229,
+        "runtime\\owner-notify\\owner-notify-v1.json": 7092,
+        "runtime\\agent-management\\v1\\agent-management-v1.json": 1259668,
+        "runtime\\agent-management\\v1\\agent-management-v1.lock": 0,
+        "runtime\\management-v2\\usage-ledger\\2026-11.jsonl": 7340502,
+        "runtime\\management-v2\\usage-ledger-external\\scale-external\\2026-11.jsonl": 9437338
+      },
+      "calibration": "2026-11-03 audits; 35 MiB bus is historical stress target; current capture 14.06 MiB",
+      "management_port": 24970,
+      "bus_port": 24960,
+      "artifact_files": 100,
+      "artifact_bytes": 1750000
+    }
+  },
+  "homes": [
+    "C:/Users/example-user\\.scale-gate-e391e16ffb",
+    "C:/Users/example-user\\.scale-gate-9cb01d97fd"
+  ],
+  "fixture_audit": {
+    "0.01:h1": {
+      "seed": {
+        "visible_active_sessions": 166,
+        "roster_agents": 166,
+        "roster_actions": 115,
+        "bus_completed_history": 18,
+        "final_notifications": 1,
+        "roster_lock": true,
+        "canonical_roster_timestamps": true
+      },
+      "routes": {
+        "/v2/agent-bus/stuck-messages?limit=10": {
+          "rows": 1,
+          "id": "bus-scale-sentinel"
+        },
+        "/v2/agent-bus/stuck-messages/content?messageId=bus-scale-0": {
+          "id": "bus-scale-0",
+          "bytes": 19938
+        },
+        "/v2/usage?from=2026-11-04&to=2026-11-04&groupBy=day&source=cutex": {
+          "rows": 1,
+          "total": 3
+        },
+        "/v2/usage?from=2026-11-04&to=2026-11-04&groupBy=day&source=scale-external": {
+          "rows": 1,
+          "total": 3
+        }
+      }
+    },
+    "0.01:h10": {
+      "seed": {
+        "visible_active_sessions": 166,
+        "roster_agents": 1660,
+        "roster_actions": 1150,
+        "bus_completed_history": 184,
+        "final_notifications": 5,
+        "roster_lock": true,
+        "canonical_roster_timestamps": true
+      },
+      "routes": {
+        "/v2/agent-bus/stuck-messages?limit=10": {
+          "rows": 1,
+          "id": "bus-scale-sentinel"
+        },
+        "/v2/agent-bus/stuck-messages/content?messageId=bus-scale-0": {
+          "id": "bus-scale-0",
+          "bytes": 19495
+        },
+        "/v2/usage?from=2026-11-04&to=2026-11-04&groupBy=day&source=cutex": {
+          "rows": 1,
+          "total": 3
+        },
+        "/v2/usage?from=2026-11-04&to=2026-11-04&groupBy=day&source=scale-external": {
+          "rows": 1,
+          "total": 3
+        }
+      }
+    }
+  },
+  "startup": {
+    "0.01:h1": {
+      "private_bytes": 240771072,
+      "pids": [
+        40988,
+        118260
+      ],
+      "parse_bytes": {
+        "bus": 2004545,
+        "management": 6213136
+      }
+    },
+    "0.01:h10": {
+      "private_bytes": 333877248,
+      "pids": [
+        48424,
+        61808
+      ],
+      "parse_bytes": {
+        "bus": 20131727,
+        "management": 75458670
+      }
+    }
+  },
+  "first_request": {
+    "0.01:h1": {
+      "health": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 367824,
+        "latency_median_ms": 31.27060004044324,
+        "latency_p95_ms": 31.27060004044324,
+        "peak_private_bytes": 241004544,
+        "idle_private_bytes": 240771072,
+        "transient_private_bytes": 233472,
+        "response_bytes": 352,
+        "verified": {
+          "stuck_bus_messages": 1
+        }
+      },
+      "sessions": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 3067,
+        "latency_median_ms": 227.233299985528,
+        "latency_p95_ms": 227.233299985528,
+        "peak_private_bytes": 252481536,
+        "idle_private_bytes": 240783360,
+        "transient_private_bytes": 11698176,
+        "response_bytes": 728844,
+        "verified": {
+          "rows": 166,
+          "first_id": "cutex.scale-00000",
+          "last_id": "cutex.scale-00165"
+        }
+      },
+      "host-session-page": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 261,
+        "latency_median_ms": 32.33339998405427,
+        "latency_p95_ms": 32.33339998405427,
+        "peak_private_bytes": 252010496,
+        "idle_private_bytes": 251949056,
+        "transient_private_bytes": 61440,
+        "response_bytes": 451,
+        "verified": {
+          "rows": 1,
+          "id": "cutex.scale-00000",
+          "project": "scale-project"
+        }
+      },
+      "queue-list": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 148612,
+        "latency_median_ms": 41.675199987366796,
+        "latency_p95_ms": 41.675199987366796,
+        "peak_private_bytes": 252313600,
+        "idle_private_bytes": 251949056,
+        "transient_private_bytes": 364544,
+        "response_bytes": 949,
+        "verified": {
+          "rows": 1,
+          "id": "queue-scale-sentinel",
+          "paused": true
+        }
+      },
+      "usage-day": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 1681145,
+        "latency_median_ms": 78.97330005653203,
+        "latency_p95_ms": 78.97330005653203,
+        "peak_private_bytes": 252157952,
+        "idle_private_bytes": 251953152,
+        "transient_private_bytes": 204800,
+        "response_bytes": 1098,
+        "verified": {
+          "rows": 1,
+          "total": 6
+        }
+      },
+      "claude-api-quota": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 1679763,
+        "latency_median_ms": 75.85709996055812,
+        "latency_p95_ms": 75.85709996055812,
+        "peak_private_bytes": 258379776,
+        "idle_private_bytes": 258166784,
+        "transient_private_bytes": 212992,
+        "response_bytes": 1042,
+        "verified": {
+          "source": "claudeApi",
+          "last30DaysTotal": 6
+        }
+      },
+      "delegation-restore": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 0,
+        "latency_median_ms": 41.88040003646165,
+        "latency_p95_ms": 41.88040003646165,
+        "peak_private_bytes": 257028096,
+        "idle_private_bytes": 256966656,
+        "transient_private_bytes": 61440,
+        "response_bytes": 9974,
+        "verified": {
+          "rows": 10,
+          "closed": "completed"
+        }
+      },
+      "notifications": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 1764,
+        "latency_median_ms": 14.627999975346029,
+        "latency_p95_ms": 14.627999975346029,
+        "peak_private_bytes": 257028096,
+        "idle_private_bytes": 256970752,
+        "transient_private_bytes": 57344,
+        "response_bytes": 412,
+        "verified": {
+          "rows": 1,
+          "id": "notice-scale-sentinel"
+        }
+      }
+    },
+    "0.01:h10": {
+      "health": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 3649055,
+        "latency_median_ms": 49.303999985568225,
+        "latency_p95_ms": 49.303999985568225,
+        "peak_private_bytes": 333877248,
+        "idle_private_bytes": 333877248,
+        "transient_private_bytes": 0,
+        "response_bytes": 352,
+        "verified": {
+          "stuck_bus_messages": 1
+        }
+      },
+      "sessions": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 3070,
+        "latency_median_ms": 206.5874000545591,
+        "latency_p95_ms": 206.5874000545591,
+        "peak_private_bytes": 326520832,
+        "idle_private_bytes": 326270976,
+        "transient_private_bytes": 249856,
+        "response_bytes": 728832,
+        "verified": {
+          "rows": 166,
+          "first_id": "cutex.scale-00000",
+          "last_id": "cutex.scale-00165"
+        }
+      },
+      "host-session-page": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 261,
+        "latency_median_ms": 32.492300029844046,
+        "latency_p95_ms": 32.492300029844046,
+        "peak_private_bytes": 326991872,
+        "idle_private_bytes": 326930432,
+        "transient_private_bytes": 61440,
+        "response_bytes": 451,
+        "verified": {
+          "rows": 1,
+          "id": "cutex.scale-00000",
+          "project": "scale-project"
+        }
+      },
+      "queue-list": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 150519,
+        "latency_median_ms": 53.15539997536689,
+        "latency_p95_ms": 53.15539997536689,
+        "peak_private_bytes": 327319552,
+        "idle_private_bytes": 326946816,
+        "transient_private_bytes": 372736,
+        "response_bytes": 949,
+        "verified": {
+          "rows": 1,
+          "id": "queue-scale-sentinel",
+          "paused": true
+        }
+      },
+      "usage-day": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 16753537,
+        "latency_median_ms": 663.754399982281,
+        "latency_p95_ms": 663.754399982281,
+        "peak_private_bytes": 351571968,
+        "idle_private_bytes": 326950912,
+        "transient_private_bytes": 24621056,
+        "response_bytes": 1098,
+        "verified": {
+          "rows": 1,
+          "total": 6
+        }
+      },
+      "claude-api-quota": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 16752155,
+        "latency_median_ms": 656.1235999688506,
+        "latency_p95_ms": 656.1235999688506,
+        "peak_private_bytes": 418144256,
+        "idle_private_bytes": 404131840,
+        "transient_private_bytes": 14012416,
+        "response_bytes": 1042,
+        "verified": {
+          "source": "claudeApi",
+          "last30DaysTotal": 6
+        }
+      },
+      "delegation-restore": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 0,
+        "latency_median_ms": 24.4067000458017,
+        "latency_p95_ms": 24.4067000458017,
+        "peak_private_bytes": 446152704,
+        "idle_private_bytes": 446091264,
+        "transient_private_bytes": 61440,
+        "response_bytes": 9974,
+        "verified": {
+          "rows": 10,
+          "closed": "completed"
+        }
+      },
+      "notifications": {
+        "concurrency": 1,
+        "requests": 1,
+        "parse_bytes_per_request": 7092,
+        "latency_median_ms": 26.085599907673895,
+        "latency_p95_ms": 26.085599907673895,
+        "peak_private_bytes": 446156800,
+        "idle_private_bytes": 446103552,
+        "transient_private_bytes": 53248,
+        "response_bytes": 412,
+        "verified": {
+          "rows": 1,
+          "id": "notice-scale-sentinel"
+        }
+      }
+    }
+  },
+  "bus_idle": {
+    "0.01:h1": {
+      "seconds": 6,
+      "parse_bytes": 5721,
+      "peak_private_bytes": 257028096
+    },
+    "0.01:h10": {
+      "seconds": 6,
+      "parse_bytes": 8150,
+      "peak_private_bytes": 449286144
+    }
+  },
+  "raw_receipt_sha256": "1131f142a61766bcb1c01bb8ed5f2256200e991999cc7afd522b7a3383ff4c1b",
+  "raw_receipt_path": "C:/Tools/agent-tmp\\scale-gate\\inactive-visible-v2\\results.json",
+  "supersedes": "d651ed2c: sessions and host results were empty and invalid; roster was never loaded",
+  "gate_exit_code": 1
+}

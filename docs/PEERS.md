@@ -24,15 +24,20 @@ mutations require a loopback listener connection.
 
 `agent_list` keeps its answer small with a paired host (a host with hundreds of
 offline agents made it ~50K characters, over Claude Code's tool-result limit).
-By default `otherHosts[]` carries per host `agentCount`, `offlineCount`,
-`listedCount`, at most 10 idle / busy agents (rows unchanged: `cutexSessionId`,
-`name`, `short`, `status`, `runtime`, `address`) and, when agents were left out,
-`more`: the call that lists them. `agent_list {"host": "<label>"}` pages that
-host's agents instead of the local ones (`limit`, default 50, max 200; `cursor` =
-the previous `next_cursor`); `include_offline: true` includes offline agents (an
-offline peer agent is not auto-started). Local agents are always listed, own
-project first, offline ones last, paged by the same `limit` / `cursor`
-(`agents_total`, `agents_offline`, `next_cursor`).
+By default `otherHosts[]` carries only per-host `agentCount`, `offlineCount`, status,
+capabilities and a `more` hint. `agent_list {"host":"<label>"}` pages that host's compact
+agent rows (`name`, `id`, `profile`, `model`, `status`, `queue`, plus Director/pause facts
+when set). `limit` defaults to 50 (max 200); `cursor` takes `next_cursor` with the same
+filters. `include_offline:true` includes offline agents; `name@host` or `host` + `name`
+looks up one full exported row even offline. No offline runtime is auto-started. The
+peer directory wire format is unchanged, so old peers still export their existing rows.
+Local tool rows default to online members of the caller's own project and directly linked
+projects, own project first. Other-project rows carry `project`; `projects` counts each project's
+offline members, available with `include_offline:true`. Projects visible only via external-agent
+grants or host-wide access stay count-only. `project` narrows to a visible local project, and
+`name` returns one full local agent. These are presentation filters;
+project links, external grants and cross-host communication policies do not change.
+
 
 `human peer list` and `human peer remove <peerId>` inspect/remove relationships;
 `peers` is an alias of `peer`. Exports and remote visibility default to empty/

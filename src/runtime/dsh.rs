@@ -59,6 +59,30 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+
+/// Kimi's rg comes from this session's frozen options, never the current deployment.
+/// Canonicalize the PATH key because Windows treats `Path` and `PATH` as one key.
+pub(super) fn prepend_kimi_rg_path(session: &DshSession, env: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
+    if session.flavor != AcpFlavor::Kimi {
+        return Ok(());
+    }
+    let Some(rg) = session.kimi.as_ref().and_then(|options| options.rg.as_deref()) else {
+        return Ok(());
+    };
+    ensure!(rg.is_absolute(), "session-pinned Kimi rg must be absolute");
+    let parent = rg.parent().context("session-pinned Kimi rg has no parent")?;
+    let inherited = env.get("PATH").or_else(|| env.get("Path"));
+    let mut paths = vec![parent.to_path_buf()];
+    if let Some(path) = inherited {
+        paths.extend(std::env::split_paths(path));
+    }
+    let joined = std::env::join_paths(paths).context("build session-pinned Kimi rg PATH")?;
+    let joined = joined.into_string().map_err(|_| anyhow::anyhow!("Kimi rg PATH must be Unicode"))?;
+    env.remove("Path");
+    env.insert("PATH".into(), joined);
+    Ok(())
+}
+
 struct LaunchScopeGuard {
     id: String,
     armed: bool,
@@ -225,6 +249,7 @@ fn require_private_test() -> anyhow::Result<()> {
 }
 
 pub fn create(request: Create) -> anyhow::Result<CutexSessionRecord> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     require_spike()?;
     ensure!(
         !request.name.trim().is_empty() && request.name.len() <= 128,
@@ -293,6 +318,7 @@ pub fn create(request: Create) -> anyhow::Result<CutexSessionRecord> {
 }
 
 pub fn start(id: &str) -> anyhow::Result<CutexSessionRecord> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     let store = crate::session::store::load_cutex_session_store()?;
     let record = store
         .sessions
@@ -387,6 +413,7 @@ pub fn start(id: &str) -> anyhow::Result<CutexSessionRecord> {
             home.join("sessions")
         }
         Some(kimi) => {
+            prepend_kimi_rg_path(session, &mut env)?;
             // Kimi Code: a private KIMI_CODE_HOME, XDG dirs and temp dir per
             // agent, and its background features off (Phase-0 facts).
             let tmp = home.join("tmp");

@@ -81,6 +81,252 @@ fn cutex(session: &str, method: &str, params: Value) -> EventEnvelope {
 
 const AT: &str = "2026-10-23T01:00:00Z";
 
+fn submitted_start(kind: &str, disposition: &str, turn: &str) -> EventEnvelope {
+    let mut event = cutex("cutex.a", "cutex/userInput/submitted", json!({
+        "origin": {"kind": kind, "clientId": "desktop-client"},
+        "disposition": disposition, "appServerAccepted": true, "turnId": turn,
+    }));
+    // Production submitted events carry threadId in correlation.
+    event.correlation.thread_id = Some("root-a".into());
+    event
+}
+
+fn origin_turn(method: &str, id: &str, source: Value) -> EventEnvelope {
+    let mut turn = json!({"id": id, "status": "completed"});
+    if !source.is_null() {
+        turn["source"] = source;
+    }
+    native("cutex.a", AT, method, json!({"threadId": "root-a", "turn": turn}))
+}
+
+#[test]
+fn origin_accepted_owner_starts_cover_desktop_and_local_controllers() {
+    let facts = FakeFacts::new();
+    for kind in ["other", "android", "backend", "tui", "agent_bus", "automation", "future"] {
+        let mut pending = Pending::default();
+        normalize(&submitted_start(kind, "started", "t"), &facts, &mut pending);
+        // Start may follow the accepted-submit event and contain no inputs.
+        normalize(&origin_turn("turn/started", "t", Value::Null), &facts, &mut pending);
+        let rows = normalize(&origin_turn("turn/completed", "t", Value::Null), &facts, &mut pending);
+        let expected = match kind {
+            "agent_bus" | "automation" => Some("external"),
+            "future" => None,
+            _ => Some("owner"),
+        };
+        assert_eq!(rows[0].row.turn_origin.as_deref(), expected, "{kind}");
+        assert!(pending.turn_origins.is_empty());
+    }
+    for source in [json!({"kind":"user","id":"local-controller"}), json!({"kind":"owner","id":"owner"})] {
+        let mut pending = Pending::default();
+        normalize(&origin_turn("turn/started", "t", source), &facts, &mut pending);
+        assert_eq!(normalize(&origin_turn("turn/completed", "t", Value::Null), &facts, &mut pending)[0].row.turn_origin.as_deref(), Some("owner"));
+    }
+}
+
+#[test]
+fn origin_external_start_survives_owner_steer_restart_and_itemless_completion() {
+    let facts = FakeFacts::new();
+    for kind in ["agent", "service"] {
+        let mut pending = Pending::default();
+        // Remote provenance is not compared with any local/global host id.
+        let source = json!({"kind":kind,"id":"different-host/agent-or-alarm-job-result"});
+        let start = origin_turn("turn/started", "t", source);
+        normalize(&start, &facts, &mut pending);
+        normalize(&submitted_start("other", "steered", "t"), &facts, &mut pending);
+        let mut pending: Pending = serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
+        normalize(&start, &facts, &mut pending); // duplicate start replay
+        let rows = normalize(&origin_turn("turn/completed", "t", Value::Null), &facts, &mut pending);
+        assert_eq!(rows[0].row.turn_origin.as_deref(), Some("external"));
+        assert!(pending.turn_origins.is_empty());
+    }
+}
+
+#[test]
+fn origin_managed_start_overrides_native_projection_but_steer_does_not() {
+    let facts = FakeFacts::new();
+    for (native_kind, managed_kind, expected) in [
+        ("owner", "automation", "external"),
+        ("agent", "other", "owner"),
+    ] {
+        let mut pending = Pending::default();
+        let start = origin_turn("turn/started", "t", json!({"kind":native_kind,"id":"original"}));
+        normalize(&start, &facts, &mut pending);
+        normalize(&submitted_start(managed_kind, "started", "t"), &facts, &mut pending);
+        // Native replay and a later owner steer cannot undo the managed START.
+        normalize(&start, &facts, &mut pending);
+        normalize(&submitted_start("other", "steered", "t"), &facts, &mut pending);
+        let mut restored: Pending = serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
+        let rows = normalize(&origin_turn("turn/completed", "t", Value::Null), &facts, &mut restored);
+        assert_eq!(rows[0].row.turn_origin.as_deref(), Some(expected));
+    }
+}
+
+#[test]
+fn origin_native_user_message_without_source_remains_unknown_after_serde() {
+    let facts = FakeFacts::new();
+    let mut pending = Pending::default();
+    let start = native("cutex.a", AT, "turn/started", json!({"threadId":"root-a","turn":{
+        "id":"t","items":[{"type":"userMessage","text":"legacy projected input"}]
+    }}));
+    normalize(&start, &facts, &mut pending);
+    let mut restored: Pending = serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
+    let rows = normalize(&origin_turn("turn/completed", "t", Value::Null), &facts, &mut restored);
+    let encoded = serde_json::to_value(&rows[0].row).unwrap();
+    assert!(encoded.get("turnOrigin").is_none());
+    assert_eq!(serde_json::from_value::<ProjectEvent>(encoded).unwrap().turn_origin, None);
+}
+
+#[test]
+fn origin_checkpoint_journal_preserves_starter_with_later_owner_items() {
+    let facts = FakeFacts::new();
+    let temp = TempDir::new("turn-origin-checkpoint");
+    let mut journal = temp.journal();
+    let mut pending = Pending::default();
+    normalize(&submitted_start("agent_bus", "started", "t"), &facts, &mut pending);
+    journal.commit(&[], &[("pending", serde_json::to_string(&pending).unwrap()),
+        ("sourceCheckpoint", serde_json::to_string(&("s", "c2:start")).unwrap())]).unwrap();
+    drop(journal);
+    let mut restored = Persisted::load(&temp.journal()).unwrap();
+    assert_eq!(restored.checkpoint, Some(("s".into(), "c2:start".into())));
+    normalize(&submitted_start("other", "steered", "t"), &facts, &mut restored.pending);
+    let end = native("cutex.a", AT, "turn/completed", json!({"threadId":"root-a","turn":{
+        "id":"t","status":"completed","items":[{"type":"userMessage","text":"owner joins later"}]
+    }}));
+    let rows = normalize(&end, &facts, &mut restored.pending);
+    assert_eq!(rows[0].row.turn_origin.as_deref(), Some("external"));
+    let mut journal = temp.journal();
+    journal.commit(&rows, &[]).unwrap();
+    // Replayed normalization cannot rewrite an already-journaled origin.
+    let mut replay = rows.clone();
+    replay[0].row.turn_origin = Some("owner".into());
+    assert!(journal.commit(&replay, &[]).unwrap().is_empty());
+}
+
+#[test]
+fn origin_owner_start_does_not_change_for_passive_results() {
+    let facts = FakeFacts::new();
+    let mut pending = Pending::default();
+    normalize(&submitted_start("other", "started", "t"), &facts, &mut pending);
+    let note = json!({"type":"functionCallOutput","name":"external_event",
+        "output":"{\"source\":{\"kind\":\"service\",\"id\":\"cutex-job\"},\"type\":\"RESULT\"}",
+        "externalInputView":{"data":{"deliveryMode":"passive"}}});
+    normalize(&native("cutex.a", AT, "item/completed", json!({"threadId":"root-a","turnId":"t","item":note})), &facts, &mut pending);
+    let end = native("cutex.a", AT, "turn/completed", json!({"threadId":"root-a","turn":{"id":"t","status":"completed","items":[note]}}));
+    assert_eq!(normalize(&end, &facts, &mut pending)[0].row.turn_origin.as_deref(), Some("owner"));
+}
+
+#[test]
+fn origin_unknown_does_not_guess_from_completion_items_or_host() {
+    let facts = FakeFacts::new();
+    for source in [Value::Null, json!({"kind":"future","id":"local-controller"}), json!({"kind":"user","id":"unknown-controller"})] {
+        let mut pending = Pending::default();
+        normalize(&origin_turn("turn/started", "t", source), &facts, &mut pending);
+        let end = native("cutex.a", AT, "turn/completed", json!({"threadId":"root-a","turn":{"id":"t","status":"completed","items":[
+            {"type":"userMessage","text":"later owner steer"},
+            {"type":"functionCallOutput","name":"external_event","output":"{\"source\":{\"kind\":\"service\"}}"}
+        ]}}));
+        let rows = normalize(&end, &facts, &mut pending);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row.turn_origin, None);
+        assert!(serde_json::to_value(&rows[0].row).unwrap().get("turnOrigin").is_none());
+    }
+    for disposition in ["steered", "queued", "unknown"] {
+        let mut pending = Pending::default();
+        normalize(&submitted_start("other", disposition, "t"), &facts, &mut pending);
+        assert!(pending.turn_origins.is_empty());
+    }
+    let mut unaccepted = submitted_start("other", "started", "t");
+    unaccepted.cutex.as_mut().unwrap().params["appServerAccepted"] = json!(false);
+    let mut pending = Pending::default();
+    normalize(&unaccepted, &facts, &mut pending);
+    assert!(pending.turn_origins.is_empty());
+}
+
+#[test]
+fn origin_is_scoped_to_stream_session_thread_and_turn() {
+    let mut facts = FakeFacts::new();
+    facts.threads.clear();
+    let mut pending = Pending::default();
+    normalize(&submitted_start("other", "started", "t"), &facts, &mut pending);
+    for field in ["session", "thread", "turn", "stream"] {
+        let mut end = origin_turn("turn/completed", "t", Value::Null);
+        match field {
+            "session" => end.cutex_session_id = "cutex.b".into(),
+            "thread" => end.native.as_mut().unwrap().message["params"]["threadId"] = json!("another-thread"),
+            "turn" => end.native.as_mut().unwrap().message["params"]["turn"]["id"] = json!("another-turn"),
+            _ => end.stream_id = "another-stream".into(),
+        }
+        assert_eq!(normalize(&end, &facts, &mut pending)[0].row.turn_origin, None, "{field}");
+    }
+    assert_eq!(normalize(&origin_turn("turn/completed", "t", Value::Null), &facts, &mut pending)[0].row.turn_origin.as_deref(), Some("owner"));
+    // A missing thread never borrows today's own_thread from Facts.
+    let mut event = submitted_start("other", "started", "missing-thread");
+    event.correlation.thread_id = None;
+    normalize(&event, &facts, &mut pending);
+    assert!(pending.turn_origins.is_empty());
+}
+
+#[test]
+fn origin_pending_and_rows_are_backwards_compatible_and_bounded() {
+    let mut pending: Pending = serde_json::from_value(json!({"turnStarts":{"cutex.a|old":AT}})).unwrap();
+    assert!(pending.turn_origins.is_empty());
+    let facts = FakeFacts::new();
+    let rows = normalize(&origin_turn("turn/completed", "old", Value::Null), &facts, &mut pending);
+    assert_eq!(rows[0].row.turn_origin, None);
+    for value in [Value::Null, json!("future"), json!("owner"), json!("external")] {
+        let mut row = serde_json::to_value(&rows[0].row).unwrap();
+        row["turnOrigin"] = value.clone();
+        let decoded: ProjectEvent = serde_json::from_value(row).unwrap();
+        let expected = value.as_str().filter(|s| matches!(*s, "owner" | "external"));
+        assert_eq!(decoded.turn_origin.as_deref(), expected);
+    }
+    for n in 0..MAX_TURN_STARTS + 20 {
+        normalize(&submitted_start("other", "started", &format!("t{n}")), &facts, &mut pending);
+    }
+    assert_eq!(pending.turn_origins.len(), MAX_TURN_STARTS);
+    let restored: Pending = serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
+    assert_eq!(restored, pending);
+}
+
+#[test]
+fn origin_native_start_items_ignore_passive_notes_and_use_only_starter() {
+    let passive = json!({"type":"functionCallOutput","name":"external_event",
+        "output":"{\"source\":{\"kind\":\"service\",\"id\":\"job\"}}",
+        "externalInputView":{"data":{"deliveryMode":"passive"}}});
+    let external = json!({"type":"functionCallOutput","name":"external_event",
+        "output":"{\"source\":{\"kind\":\"agent\",\"id\":\"remote\"}}",
+        "externalInputView":{"data":{"deliveryMode":"after_turn"}}});
+    assert_eq!(native_start_origin(&json!({"items":[passive, external, {"type":"userMessage"}]})), Some("external"));
+    assert_eq!(native_start_origin(&json!({"items":[passive, {"type":"userMessage"}, external]})), None);
+    assert_eq!(native_start_origin(&json!({"items":[passive,
+        {"type":"userMessage","source":{"kind":"user","id":"local-controller"}}, external]})), Some("owner"));
+    assert_eq!(native_start_origin(&json!({"items":[passive]})), None);
+    assert_eq!(native_start_origin(&json!({"items":[{"type":"userMessage","source":{"kind":"future"}}]})), None);
+    let mut parts = external.clone();
+    parts["output"] = json!([{"type":"input_text","text":external["output"]}]);
+    assert_eq!(native_start_origin(&json!({"items":[parts]})), Some("external"));
+}
+
+#[test]
+fn origin_source_gap_drops_pending_evidence_and_keeps_unknown_row() {
+    let facts = FakeFacts::new();
+    let mut persisted = Persisted::default();
+    normalize(&submitted_start("other", "started", "t"), &facts, &mut persisted.pending);
+    persisted.initialized = true;
+    persisted.checkpoint = Some(("s".into(), "c2:expired".into()));
+    let mut calls = 0;
+    let pass = project_pass(|position| {
+        calls += 1;
+        Ok(if position.is_some() { None } else {
+            Some(page_of(vec![origin_turn("turn/completed", "t", Value::Null)], false))
+        })
+    }, &mut persisted, &facts).unwrap();
+    assert_eq!(calls, 2);
+    assert!(pass.gap);
+    assert_eq!(pass.rows.len(), 1);
+    assert_eq!(pass.rows[0].row.turn_origin, None);
+}
+
 #[test]
 fn codex_and_claude_turns_become_one_row_each_and_sub_agent_turns_do_not() {
     let facts = FakeFacts::new();

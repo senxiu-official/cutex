@@ -6,6 +6,7 @@
 
 pub mod activity_bridge;
 pub mod bus_bridge;
+pub mod background_work;
 pub mod client;
 pub mod commands;
 pub mod external_input;
@@ -20,6 +21,7 @@ pub mod protocol;
 mod delta_coalesce;
 pub mod single_writer;
 pub mod runtime;
+pub mod turn_stall;
 
 /// One private diagnostic: static phase labels only, never payloads/credentials.
 #[cfg(feature = "stock-launch-test-hook")]

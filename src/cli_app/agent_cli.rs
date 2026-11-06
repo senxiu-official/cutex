@@ -411,6 +411,7 @@ fn cmd_agent_send(
         from,
         external_message_id,
     )?;
+    if let Some(detail)=response.detail.as_deref() {eprintln!("{detail}");}
     let delivered_to = response.to_name.as_deref().unwrap_or(response.to.as_str());
     let delivered_from = response.from.as_deref().unwrap_or("cutex");
     let delivery_mode = response

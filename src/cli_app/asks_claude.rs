@@ -64,15 +64,24 @@ fn supports_exclusive(session: &str, generation: u64) -> bool {
 }
 
 /// The adapter's `claude/capabilities` result, cached per runtime generation.
+/// None means the lookup failed, not that a capability was explicitly refused.
 pub(crate) fn adapter_capabilities(session: &str, generation: u64) -> Option<Value> {
+    adapter_capabilities_with(session, generation, || {
+        Ok(handle(session, generation)?.request("claude/capabilities", json!({}))?)
+    })
+}
+
+fn adapter_capabilities_with(
+    session: &str,
+    generation: u64,
+    load: impl FnOnce() -> anyhow::Result<Value>,
+) -> Option<Value> {
     if let Some((known, value)) = capability_cache().lock().ok().and_then(|cache| cache.get(session).cloned()) {
         if known == generation {
             return Some(value);
         }
     }
-    let capabilities = handle(session, generation)
-        .and_then(|handle| Ok(handle.request("claude/capabilities", json!({}))?))
-        .ok()?;
+    let capabilities = load().ok()?;
     cutex::runtime::claude::note_live_capabilities(session, generation, &capabilities);
     if let Ok(mut cache) = capability_cache().lock() {
         cache.insert(session.to_string(), (generation, capabilities.clone()));
@@ -458,6 +467,19 @@ fn interrupt_exact_bound(session: &str, thread: &str, generation: u64, turn_id: 
     Ok(())
 }
 
+/// r276 agent pause: set the adapter's tool gate (claude-r37). An adapter
+/// without the `toolGate` capability pauses at the end of the turn.
+pub(crate) fn set_tool_gate(session: &str, held: bool) -> anyhow::Result<super::tool_gate::Push> {
+    let (thread_id, generation, handle) = thread_and_handle(session)?;
+    let capabilities = adapter_capabilities(session, generation)
+        .ok_or_else(|| anyhow::anyhow!("Claude adapter capabilities unavailable"))?;
+    if capabilities.get("toolGate").and_then(Value::as_str) != Some(super::tool_gate::CLAUDE_SET) {
+        return Ok(super::tool_gate::Push::Unsupported);
+    }
+    handle.request(super::tool_gate::CLAUDE_SET, json!({"threadId": thread_id, "held": held}))?;
+    Ok(super::tool_gate::Push::Set)
+}
+
 /// Legacy owner/control compatibility path. StopAttempt uses interrupt_exact.
 pub(crate) fn interrupt(session: &str, turn_id: &str) -> anyhow::Result<()> {
     let (thread_id, generation, handle) = thread_and_handle(session)?;
@@ -488,6 +510,22 @@ pub(crate) fn resume(session: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use cutex::app_server::protocol::RpcError;
+
+    #[test]
+    fn capability_lookup_failure_is_unknown_and_recovery_is_cached_per_generation() {
+        let session = format!("caps-{}", uuid::Uuid::new_v4());
+        assert!(adapter_capabilities_with(&session, 7, || anyhow::bail!("transient RPC failure")).is_none());
+        assert!(!capability_cache().lock().unwrap().contains_key(&session));
+        let caps = json!({"input": {"sameTurnSteering": true}});
+        assert_eq!(adapter_capabilities_with(&session, 7, || Ok(caps.clone())), Some(caps.clone()));
+        assert_eq!(adapter_capabilities_with(&session, 7, || panic!("cached lookup must not send another RPC")), Some(caps));
+        // A restarted adapter cannot inherit the old generation's support.
+        assert!(adapter_capabilities_with(&session, 8, || anyhow::bail!("new adapter not ready")).is_none());
+        let unsupported = json!({"input": {"sameTurnSteering": false}});
+        assert_eq!(adapter_capabilities_with(&session, 8, || Ok(unsupported.clone())), Some(unsupported.clone()));
+        assert_eq!(adapter_capabilities_with(&session, 8, || panic!("explicit false is cached too")), Some(unsupported));
+        capability_cache().lock().unwrap().remove(&session);
+    }
 
     fn bound_control_capabilities() -> Value {
         json!({"externalInputVersion":1,"externalInputVersions":[1,2],

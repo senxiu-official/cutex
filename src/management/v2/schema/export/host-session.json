@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:host-session",
+  "title": "Exact host session catalog row",
+  "$ref": "#/$defs/hostSessionExact",
+  "$defs": {
+    "hostSession": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "hostId",
+        "cwd",
+        "state",
+        "generation"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "hostId": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projectId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projectName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "nativeId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtimeVersion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtimeVersionLatest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtimeVersionRecordedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "provider": {
+          "type": [
+            "object",
+            "string",
+            "null"
+          ]
+        },
+        "profileStyle": {
+          "type": [
+            "object",
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "hostSessionExact": {
+      "type": "object",
+      "required": [
+        "schema",
+        "hostId",
+        "data",
+        "nextCursor"
+      ],
+      "properties": {
+        "schema": {
+          "const": "cutex/host-sessions/v1"
+        },
+        "hostId": {
+          "type": "string"
+        },
+        "data": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/hostSession"
+          }
+        },
+        "nextCursor": {
+          "type": "null"
+        }
+      }
+    }
+  }
+}

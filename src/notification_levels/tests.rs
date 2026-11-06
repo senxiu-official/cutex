@@ -397,6 +397,7 @@ fn recommended_event_preset_matches_section_2_1() {
         ("system.quarantine", Level::Record),
         ("system.deliveryFailed", Level::Record),
         ("system.idleDelegation", Level::Record),
+        ("system.turnAuthFailed", Level::Inform),
         ("delegation.deliveryFailed", Level::Record),
         ("agentBus.messageFailed", Level::Record),
         ("job.completed.agent", Level::Record),

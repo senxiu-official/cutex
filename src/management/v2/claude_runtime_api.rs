@@ -277,6 +277,7 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
             Err(refusal) => write_refusal(stream, refusal),
         },
         (Some(Route::Repin(id)), "POST") => {
+            let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
             let body: RepinRequest = if request.body.iter().all(u8::is_ascii_whitespace) {
                 RepinRequest::default()
             } else {

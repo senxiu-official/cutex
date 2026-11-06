@@ -5,8 +5,9 @@ managed installs (`cutex service install`) only. Since cutex 0.1.1. Current comp
 
 | Name | What it is | Platforms |
 |---|---|---|
-| `claude-runtime` | Claude agent runtime; bundles Python and, in claude-r30 release archives, the unmodified SDK-matched Claude Code CLI, needs a login ([README](claude-runtime/README.md)) | linux-x64, windows-x64, darwin-arm64 (source install only: releases package linux-x64 and windows-x64) |
-| `dsh-runtime` | On-demand DeepSeek Harness runtime; pinned DSH/catalog and ws payload, system or bundled stable Node >=24.9.0 ([README](dsh-runtime/README.md)) | linux-x64 (glibc), windows-x64 |
+| `claude-runtime` | Claude agent runtime; bundles Python and, in claude-r40 release archives, the unmodified SDK-matched Claude Code CLI, needs a login ([README](claude-runtime/README.md)) | linux-x64, windows-x64, darwin-arm64 (source install only: releases package linux-x64 and windows-x64) |
+| `dsh-runtime` | DeepSeek Harness source adapter dsh-r3; separately installed upstream CLI and Node >=24.9.0 ([README](dsh-runtime/README.md)) | linux-x64 (glibc), windows-x64 |
+| `kimi-runtime` | Kimi source adapter kimi-r3; separately installed upstream CLI and Node >=24.9.0 ([README](kimi-runtime/README.md)) | linux-x64, windows-x64 |
 | `job-service` | Job Service: long-running agent jobs, the desktop's Jobs page ([README](job-service/README.md)) | linux-x64 |
 
 The user-facing install steps are in the install guide
@@ -59,7 +60,7 @@ component. Management API (owner token only, capability `components`):
 2. **Running jobs are never killed.** A service restarts only when its version or configuration
    changed and nothing would be interrupted; otherwise the new version is selected and the status
    shows `restartPending` until the restart is harmless.
-3. **Capabilities normally describe the build; DSH is install-dependent since r262.**
+3. **Capabilities normally describe the build; DSH capabilities depend on installation.**
    `dsh-runtime` / `features.dshRuntime` is omitted when its component is absent or removed.
    Installed components needing repair expose their component status (`needsUser` /
    `degraded`); a capability is not a Node health assertion. The generic `components` API remains
@@ -105,7 +106,4 @@ installed components with the cutex release and selects them during the swap; a 
 the previous versions again. Releases without a `components` section leave installed components as
 they are. `--from-source` (CLI only) builds from a checkout instead (`origin: source`).
 
-Starting with r262, standard host kits do not bundle or select DSH, and do not probe Node just
-to update cutex. DSH remains a separate manifest-addressed optional component. See
-[the r262 kit contract](../docs/development/r262-dsh-optional.md). Existing r260/r261 DSH
-deployments and session pins are preserved across an update; no automatic uninstall occurs.
+DSH and Kimi are optional source adapters. A backend update does not install their upstream CLIs or probe Node merely to update cutex. Follow the [DSH](dsh-runtime/README.md) and [Kimi](kimi-runtime/README.md) setup guides. Existing deployments and runtime pins remain unchanged until explicitly upgraded; there is no automatic uninstall.

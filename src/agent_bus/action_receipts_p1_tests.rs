@@ -1,12 +1,12 @@
 use super::*;
 use crate::asks::store::{AskStore, tests::{new_ask, REQUESTER}};
 use std::{path::PathBuf,sync::{mpsc,atomic::{AtomicUsize,Ordering}},time::{Duration,Instant}};
-fn isolated()->SharedCache {Arc::new(Mutex::new(Cache::default()))}
+fn isolated()->SharedCache {Default::default()}
 fn q(id:&str)->Query {Query {tool:"agent_delegate".into(),action_id:id.into()}}
 fn temp()->PathBuf {let p=std::env::temp_dir().join(format!("receipts-p1-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(&p).unwrap();p}
 fn until(mut condition:impl FnMut()->bool) {let end=Instant::now()+Duration::from_secs(20);while !condition(){assert!(Instant::now()<end,"test coordination timed out");std::thread::sleep(Duration::from_millis(5));}}
 fn ended(cache:&SharedCache,caller:&str,q:&Query){until(||cache.lock().unwrap().rows.get(&key(caller,q)).is_some_and(|r|r.result.is_some()));}
-fn unknown(cache:&SharedCache,caller:&str,q:&Query){assert_eq!(start_in(cache.clone(),caller,q.clone(),"digest".into(),||Ok(json!({"ok":false,"status":"response_uncertain","code":"outcome_unknown"})))["status"],"running");ended(cache,caller,q);}
+fn unknown(cache:&SharedCache,caller:&str,q:&Query){assert_eq!(start_in(cache.clone(),Duration::ZERO,caller,q.clone(),"digest".into(),||Ok(json!({"ok":false,"status":"response_uncertain","code":"outcome_unknown"})))["status"],"running");ended(cache,caller,q);}
 fn reserve(store:&AskStore,id:&str){store.with_state(|s|s.begin_action(REQUESTER,id,"agent_delegate","digest",chrono::Utc::now())).unwrap();}
 fn commit_without_reply(store:&AskStore,id:&str){store.with_state(|s|s.create_ask(new_ask(id,"private fixture"),chrono::Utc::now())).unwrap().unwrap();}
 
@@ -15,7 +15,7 @@ fn independent_caches_reconcile_commit_after_unknown_without_replay(){
  let root=temp();let a=AskStore::at(root.join("asks"));let b=AskStore::at(root.join("asks"));let qa=q("two-caches");
  let cache_a=isolated();let cache_b=isolated();let (entered,ready)=mpsc::channel();let (release,wait)=mpsc::channel();
  let action=qa.action_id.clone();
- start_in(cache_a.clone(),REQUESTER,qa.clone(),"digest".into(),move||{reserve(&a,&action);entered.send(()).unwrap();wait.recv().unwrap();commit_without_reply(&a,&action);anyhow::bail!("business committed; reply persistence failed")});
+ start_in(cache_a.clone(),Duration::ZERO,REQUESTER,qa.clone(),"digest".into(),move||{reserve(&a,&action);entered.send(()).unwrap();wait.recv().unwrap();commit_without_reply(&a,&action);anyhow::bail!("business committed; reply persistence failed")});
  ready.recv_timeout(Duration::from_secs(10)).unwrap();unknown(&cache_b,REQUESTER,&qa);
  assert_eq!(query_in(&cache_b,REQUESTER,&qa,||delegation_query(&b,REQUESTER,&qa))["status"],"unknown");
  let before=b.snapshot().unwrap();assert_eq!(before.asks.len(),0);release.send(()).unwrap();ended(&cache_a,REQUESTER,&qa);
@@ -50,10 +50,10 @@ fn second_process_commit_overrides_cached_unknown(){
 #[test]
 fn panic_before_reservation_is_unknown_until_explicit_original_id_retry(){
  let cache=isolated();let query=q("before-reservation");let root=temp();let store=AskStore::at(root.join("asks"));
- start_in(cache.clone(),REQUESTER,query.clone(),"digest".into(),||panic!("before reservation"));ended(&cache,REQUESTER,&query);
+ start_in(cache.clone(),Duration::ZERO,REQUESTER,query.clone(),"digest".into(),||panic!("before reservation"));ended(&cache,REQUESTER,&query);
  assert_eq!(query_in(&cache,REQUESTER,&query,||delegation_query(&store,REQUESTER,&query))["status"],"unknown");
  assert!(store.snapshot().unwrap().asks.is_empty());let action=query.action_id.clone();
- start_in(cache.clone(),REQUESTER,query.clone(),"digest".into(),move||{reserve(&store,&action);commit_without_reply(&store,&action);Ok(json!({"ok":true}))});
+ start_in(cache.clone(),Duration::ZERO,REQUESTER,query.clone(),"digest".into(),move||{reserve(&store,&action);commit_without_reply(&store,&action);Ok(json!({"ok":true}))});
  ended(&cache,REQUESTER,&query);assert_eq!(query_in(&cache,REQUESTER,&query,||panic!("already known"))["status"],"completed");
 }
 #[test]
@@ -62,7 +62,7 @@ fn stale_read_does_not_overwrite_a_concurrent_explicit_retry(){
  let read_cache=cache.clone();let read_query=query.clone();let (entered,ready)=mpsc::channel();let (release,wait)=mpsc::channel();
  let reader=std::thread::spawn(move||query_in(&read_cache,"caller",&read_query,||{entered.send(()).unwrap();wait.recv().unwrap();Ok(envelope(&read_query,"unknown",true,None))}));
  ready.recv_timeout(Duration::from_secs(10)).unwrap();
- start_in(cache.clone(),"caller",query.clone(),"digest".into(),||Ok(json!({"ok":true,"committed":true})));ended(&cache,"caller",&query);
+ start_in(cache.clone(),Duration::ZERO,"caller",query.clone(),"digest".into(),||Ok(json!({"ok":true,"committed":true})));ended(&cache,"caller",&query);
  release.send(()).unwrap();reader.join().unwrap();
  assert_eq!(query_in(&cache,"caller",&query,||panic!("must retain newer result"))["status"],"completed");
 }
@@ -73,16 +73,16 @@ fn blocked_workers_are_bounded_before_spawn_and_capacity_recovers(){
  for i in 0..MAX_WORKERS {
   let caller=format!("caller-{}",i/MAX_CALLER_WORKERS);let query=q(&format!("blocked-{i}"));let count=runs.clone();
   let (tx,rx)=mpsc::channel();let (entered,ready)=mpsc::channel();
-  assert_eq!(start_in(cache.clone(),&caller,query.clone(),"digest".into(),move||{count.fetch_add(1,Ordering::SeqCst);entered.send(()).unwrap();rx.recv().unwrap();Ok(json!({"ok":true}))})["status"],"running");
+  assert_eq!(start_in(cache.clone(),Duration::ZERO,&caller,query.clone(),"digest".into(),move||{count.fetch_add(1,Ordering::SeqCst);entered.send(()).unwrap();rx.recv().unwrap();Ok(json!({"ok":true}))})["status"],"running");
   ready.recv_timeout(Duration::from_secs(10)).unwrap();releases.push(tx);queries.push((caller,query));
-  if i==1 {assert_eq!(start_in(cache.clone(),"caller-0",q("caller-excess"),"digest".into(),||panic!("over caller budget"))["retryAdmission"]["code"],"action_caller_capacity");}
+  if i==1 {assert_eq!(start_in(cache.clone(),Duration::ZERO,"caller-0",q("caller-excess"),"digest".into(),||panic!("over caller budget"))["retryAdmission"]["code"],"action_caller_capacity");}
  }
  // All workers remain genuinely blocked during the excess admissions and query.
- for i in 0..100 {assert_eq!(start_in(cache.clone(),"other",q(&format!("excess-{i}")),"digest".into(),||panic!("over global budget"))["retryAdmission"]["code"],"action_worker_capacity");}
+ for i in 0..100 {assert_eq!(start_in(cache.clone(),Duration::ZERO,"other",q(&format!("excess-{i}")),"digest".into(),||panic!("over global budget"))["retryAdmission"]["code"],"action_worker_capacity");}
  assert_eq!(runs.load(Ordering::SeqCst),MAX_WORKERS);assert_eq!(cache.lock().unwrap().rows.len(),MAX_WORKERS);
  assert_eq!(query_in(&cache,"reader",&q("unrelated"),||Ok(envelope(&q("unrelated"),"notFound",true,None)))["status"],"notFound");
  for release in releases {release.send(()).unwrap();}for (caller,query) in queries {ended(&cache,&caller,&query);}
- let query=q("after-budget");assert_eq!(start_in(cache.clone(),"other",query.clone(),"digest".into(),||Ok(json!({"ok":true})))["status"],"running");ended(&cache,"other",&query);
+ let query=q("after-budget");assert_eq!(start_in(cache.clone(),Duration::ZERO,"other",query.clone(),"digest".into(),||Ok(json!({"ok":true})))["status"],"running");ended(&cache,"other",&query);
 }
 
 #[test]
@@ -90,14 +90,14 @@ fn ended_unknown_projection_capacity_is_reusable_without_replay(){
  let cache=isolated();let old=q("evicted-unknown");
  {let mut state=cache.lock().unwrap();for i in 0..MAX_CACHED_RESULTS {let query=if i==0 {old.clone()} else {q(&format!("unknown-{i}"))};state.rows.insert(key(REQUESTER,&query),Running {digest:"digest".into(),generation:i as u64,result:Some(envelope(&query,"unknown",true,None))});}state.generation=MAX_CACHED_RESULTS as u64;}
  let root=temp();let store=AskStore::at(root.join("asks"));reserve(&store,&old.action_id);commit_without_reply(&store,&old.action_id);
- let (release,wait)=mpsc::channel();let new=q("new-key");start_in(cache.clone(),REQUESTER,new.clone(),"digest".into(),move||{wait.recv().unwrap();Ok(json!({"ok":true}))});
+ let (release,wait)=mpsc::channel();let new=q("new-key");start_in(cache.clone(),Duration::ZERO,REQUESTER,new.clone(),"digest".into(),move||{wait.recv().unwrap();Ok(json!({"ok":true}))});
  assert_eq!(cache.lock().unwrap().rows.len(),MAX_CACHED_RESULTS);assert!(!cache.lock().unwrap().rows.contains_key(&key(REQUESTER,&old)));
  assert_eq!(query_in(&cache,REQUESTER,&old,||delegation_query(&store,REQUESTER,&old))["status"],"completed");assert_eq!(store.snapshot().unwrap().asks.len(),1);
  // Queries/eviction neither release the reserved action nor enqueue anything.
  assert!(store.snapshot().unwrap().actions.values().all(|a|a.result.is_none()));
  // Only an explicit original-ID retry invokes the original reservation layer.
  let retry_store=AskStore::at(root.join("asks"));let id=old.action_id.clone();
- start_in(cache.clone(),REQUESTER,old.clone(),"digest".into(),move||{
+ start_in(cache.clone(),Duration::ZERO,REQUESTER,old.clone(),"digest".into(),move||{
   let lookup=retry_store.with_state(|s|s.begin_action(REQUESTER,&id,"agent_delegate","digest",chrono::Utc::now()))?;
   assert!(matches!(lookup,crate::asks::store::ActionLookup::InFlight));
   Ok(json!({"ok":false,"status":"response_uncertain","code":"outcome_unknown"}))
@@ -129,7 +129,7 @@ fn concurrent_child_inflight_is_unknown_then_parent_read_converges(){
  assert!(!child["note"].as_str().unwrap().contains("never got"));assert!(!child["note"].as_str().unwrap().contains("agent_delegate(target"));
  let query=Query {tool:"agent_create".into(),action_id:create_id.into()};assert_eq!(completed(&query,response.clone())["status"],"unknown");
  persist_creation_reply_in(&management,REQUESTER,create_id,Some(&"0".repeat(64)),response.clone()).unwrap();
- let cache=isolated();start_in(cache.clone(),REQUESTER,query.clone(),"parent-digest".into(),move||Ok(response));ended(&cache,REQUESTER,&query);
+ let cache=isolated();start_in(cache.clone(),Duration::ZERO,REQUESTER,query.clone(),"parent-digest".into(),move||Ok(response));ended(&cache,REQUESTER,&query);
  let read=||management_query_with(&management.snapshot().unwrap(),REQUESTER,&query,|child|delegation_query(&asks,REQUESTER,child));
  assert_eq!(query_in(&cache,REQUESTER,&query,read)["status"],"unknown");
  release.send(()).unwrap();worker.join().unwrap();
@@ -228,7 +228,7 @@ fn created_business_survives_full_receipt_storage_error_and_read_reconciles(){
  reserve(&asks,&child_id);commit_without_reply(&asks,&child_id);
  let cache=isolated();let query=Query{tool:"agent_create".into(),action_id:action_id.into()};let worker_store=management.clone();
  let (entered,ready)=mpsc::channel();let (release,wait)=mpsc::channel();
- start_in(cache.clone(),REQUESTER,query.clone(),"digest".into(),move||{entered.send(()).unwrap();wait.recv().unwrap();persist_creation_reply_in(&worker_store,REQUESTER,action_id,Some(&"0".repeat(64)),response)});
+ start_in(cache.clone(),Duration::ZERO,REQUESTER,query.clone(),"digest".into(),move||{entered.send(()).unwrap();wait.recv().unwrap();persist_creation_reply_in(&worker_store,REQUESTER,action_id,Some(&"0".repeat(64)),response)});
  ready.recv_timeout(Duration::from_secs(10)).unwrap();assert_eq!(query_in(&cache,REQUESTER,&query,||panic!("running"))["status"],"running");release.send(()).unwrap();ended(&cache,REQUESTER,&query);
  assert_eq!(cache.lock().unwrap().rows[&key(REQUESTER,&query)].result.as_ref().unwrap()["status"],"unknown");
  let before=serde_json::to_value(management.snapshot().unwrap()).unwrap();
@@ -242,11 +242,11 @@ fn missing_cache_old_action_and_full_budget_do_not_claim_original_no_write(){
  let cache=isolated();let mut releases=vec![];let mut pending=vec![];
  for i in 0..MAX_WORKERS {
   let caller=if i<MAX_CALLER_WORKERS {REQUESTER.to_owned()} else {format!("budget-{}",i/MAX_CALLER_WORKERS)};let query=q(&format!("held-{i}"));let (release,wait)=mpsc::channel();let (entered,ready)=mpsc::channel();
-  start_in(cache.clone(),&caller,query.clone(),"digest".into(),move||{entered.send(()).unwrap();wait.recv().unwrap();Ok(json!({"ok":true}))});
+  start_in(cache.clone(),Duration::ZERO,&caller,query.clone(),"digest".into(),move||{entered.send(()).unwrap();wait.recv().unwrap();Ok(json!({"ok":true}))});
   ready.recv_timeout(Duration::from_secs(10)).unwrap();releases.push(release);pending.push((caller,query));
   if i==MAX_CALLER_WORKERS-1 {
    for old in [&committed,&uncertain] {
-    let denied=start_in(cache.clone(),REQUESTER,old.clone(),"digest".into(),||panic!("caller budget"));
+    let denied=start_in(cache.clone(),Duration::ZERO,REQUESTER,old.clone(),"digest".into(),||panic!("caller budget"));
     assert_eq!(denied["status"],"unknown");assert_eq!(denied["outcomeUnknown"],true);assert_eq!(denied["retryAdmission"]["code"],"action_caller_capacity");
    }
   }
@@ -255,7 +255,7 @@ fn missing_cache_old_action_and_full_budget_do_not_claim_original_no_write(){
  // Old outcomes are absent from this process, as after restart or eviction.
  for query in [&committed,&uncertain] {
   assert!(!cache.lock().unwrap().rows.contains_key(&key(REQUESTER,query)));
-  let denied=start_in(cache.clone(),REQUESTER,query.clone(),"digest".into(),||panic!("budget must reject before spawning"));
+  let denied=start_in(cache.clone(),Duration::ZERO,REQUESTER,query.clone(),"digest".into(),||panic!("budget must reject before spawning"));
   assert_eq!(denied["status"],"unknown");assert_eq!(denied["outcomeUnknown"],true);
   assert_eq!(denied["retryAdmission"]["status"],"no_write");assert_eq!(denied["retryAdmission"]["code"],"action_worker_capacity");
   assert!(denied.get("result").is_none());assert!(valid_response(&denied,&query.tool,&query.action_id));

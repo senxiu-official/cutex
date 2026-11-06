@@ -92,7 +92,7 @@ pub fn stamp(ask: &AskRecord, caller: &str, scope: &str) -> Result<(), AskError>
             "Only the authenticated requester can stamp a delegation",
         ));
     }
-    let snapshot = crate::memory::load_agent_management_snapshot().map_err(store::unavailable)?;
+    let snapshot = crate::memory::load_agent_management_directory().map_err(store::unavailable)?;
     let projects = crate::asks::directory::Directory::director_projects(&snapshot, caller);
     if projects.len() != 1 {
         return Err(AskError::new(

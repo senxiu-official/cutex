@@ -453,6 +453,8 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
         item["allowSessionSwitch"].as_bool().unwrap_or(false),
     );
     item["autoPick"] = json!(account.auto_pick);
+    // Design 059. Outside json!: its recursion limit.
+    item["browserToolSurface"] = json!(account.browser_tool_surface.as_str());
     item["appearanceRevisions"] = appearance_revisions(account);
     // profile-relay-runtimes: one row per provider interface with its
     // address and whether that is the provider's official one (cutex
@@ -546,6 +548,7 @@ pub fn profile_item(account: &StoredAccount, config: &CodezConfig, detail: bool)
         // recursion limit).
         item["detail"]["editable"]["searchTool"] = json!(search_tool_supported(account));
         item["detail"]["editable"]["privateChatgptAuthFile"] = json!(codex);
+        item["detail"]["editable"]["browserToolSurface"] = json!(true);
         // profile-avatar.
         item["detail"]["editable"]["avatarThemes"] = json!(true);
         item["detail"]["editable"]["avatarStyle"] = json!(true);
@@ -631,6 +634,8 @@ pub struct ProfileApiPatch {
     /// `Clear` restores the per-runtime default.
     pub delegation_wait: ConfigValueUpdate<bool>,
     pub browser_tools: Option<bool>,
+    /// Design 059 browser tool surface.
+    pub browser_tool_surface: Option<crate::profiles::model::BrowserToolSurface>,
     /// `profile-proxy`: partial `{mode: inherit|none|manual, url?, noProxy?}`; new runtimes only.
     pub proxy: Option<crate::config::proxy::ProxyUpdate>,
     /// Codex API-key profiles only (`search_tool_supported`).
@@ -745,9 +750,7 @@ fn api_key_auth_payload(current: Option<&Value>, key: &str) -> Value {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let unchanged = next.get("OPENAI_API_KEY").and_then(Value::as_str) == Some(key)
-        || (next.get("OPENAI_API_KEY").is_none()
-            && next.get("openai_api_key").and_then(Value::as_str) == Some(key));
+    let unchanged = current.and_then(super::api_key::from_auth) == Some(key);
     if unchanged {
         return Value::Object(next);
     }
@@ -850,6 +853,9 @@ fn apply_store_options(account: &mut StoredAccount, patch: &ProfileApiPatch) -> 
     }
     if let Some(required) = patch.agent_use_requires_approval {
         account.options.agent_use_requires_approval = required;
+    }
+    if let Some(surface) = patch.browser_tool_surface {
+        account.browser_tool_surface = surface;
     }
     if let Some(enabled) = patch.browser_tools {
         account.browser_tools = enabled;
@@ -985,6 +991,7 @@ fn store_fields_changed(account: &StoredAccount, original: &StoredAccount) -> bo
         || account.model_display_names != original.model_display_names
         || account.interface_base_urls != original.interface_base_urls
         || account.browser_tools != original.browser_tools
+        || account.browser_tool_surface != original.browser_tool_surface
         || account.proxy != original.proxy
         || account.search_tool != original.search_tool
         || account.private_chatgpt_auth_file != original.private_chatgpt_auth_file
@@ -1226,7 +1233,7 @@ pub(crate) fn update_profile_locked(
     if let Some(next_auth) = next_auth.as_ref().filter(|_| auth_changed) {
         // The key being replaced stays known for redaction (DSH variants of
         // this profile project logs written while it was current).
-        if let Some(old) = current_auth.as_ref().and_then(|auth| auth.get("OPENAI_API_KEY")).and_then(Value::as_str) {
+        if let Some(old) = current_auth.as_ref().and_then(super::api_key::from_auth) {
             crate::profiles::stored_keys::retire(&account.id, old, original.variants.credential_version)?;
         }
         crate::profiles::materialize::ensure_materialized_account_dir(&files)?;
@@ -1406,6 +1413,7 @@ mod tests {
         StoredAccount {
             options: Default::default(),
             browser_tools: false,
+            browser_tool_surface: Default::default(),
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,
@@ -1899,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_tools_default_off_and_editable_on_both_runtimes() {
+    fn browser_tools_explicit_off_and_editable_on_both_runtimes() {
         for kind in [CliKind::Codex, CliKind::Claude] {
             let mut profile = account(kind, "api-key");
             assert!(!browser_tools(&profile));
@@ -1934,10 +1942,7 @@ mod tests {
             )
             .unwrap();
             assert!(!browser_tools(&profile));
-            assert!(serde_json::to_value(&profile)
-                .unwrap()
-                .get("browser_tools")
-                .is_none());
+            assert_eq!(serde_json::to_value(&profile).unwrap()["browser_tools"], false);
         }
     }
 
@@ -2255,6 +2260,168 @@ mod tests {
             api_key_auth_payload(Some(&chatgpt_mode), "k")["auth_mode"],
             "apikey"
         );
+    }
+
+    #[test]
+    fn api_key_patch_round_trip_preserves_auth_metadata_and_same_key_is_noop() {
+        use crate::management::v2::profiles_api::parse_patch;
+        use crate::profiles::lifecycle::{create_profile, NewProfile, NewProfileKind};
+
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        for (index, (key_field, upper_shadow)) in [
+            ("OPENAI_API_KEY", None),
+            ("openai_api_key", None),
+            ("openai_api_key", Some(Value::Null)),
+            ("openai_api_key", Some(json!(""))),
+            ("openai_api_key", Some(json!(" \t "))),
+        ].into_iter().enumerate() {
+            let key = format!("test-only-{}", uuid::Uuid::new_v4().simple());
+            let created = create_profile(&NewProfile {
+                name: format!("auth-patch-regression-{index}"),
+                kind: NewProfileKind::ApiKey,
+                preset: crate::profiles::providers::find_preset("deepseek"),
+                base_url: None,
+                model: None,
+                api_key: Some(ApiKey(key.clone())),
+            })
+            .expect("create isolated API-key profile");
+            let files = materialized_account_files(&created).unwrap();
+            let mut original = json!({
+                "auth_mode": "apikey",
+                "last_refresh": "2026-10-06T00:00:00Z",
+                "tokens": null,
+                "test_metadata": {"preserve": true},
+            });
+            original[key_field] = json!(key);
+            if let Some(upper) = upper_shadow {
+                original["OPENAI_API_KEY"] = upper;
+            }
+            // Noncanonical whitespace makes an otherwise equivalent rewrite
+            // observable. Never print auth bytes or keys, even on assertion failure.
+            let mut original_bytes = b"\n".to_vec();
+            original_bytes.extend(serde_json::to_vec_pretty(&original).unwrap());
+            original_bytes.extend_from_slice(b"\n\n");
+            write_private_bytes_atomic(&files.auth_path, &original_bytes).unwrap();
+            let config_before = std::fs::read(&files.config_path).unwrap();
+            let accounts_path = crate::config::paths::accounts_path().unwrap();
+            let store_before = std::fs::read(&accounts_path).unwrap();
+            let version_before = created.variants.credential_version;
+
+            // Use the HTTP PATCH parser and the same settings writer called by
+            // the handler, without opening a management listener.
+            let body = serde_json::to_vec(&json!({"apiKey": key})).unwrap();
+            let patch = parse_patch(&body).unwrap();
+            let (unchanged, changed) = update_profile(&created.id, &patch).unwrap();
+            assert!(!changed, "PATCH of the same key must be a no-op");
+            assert_eq!(unchanged.variants.credential_version, version_before);
+            assert!(std::fs::read(&files.auth_path).unwrap() == original_bytes,
+                "same-key PATCH must preserve auth bytes");
+            assert!(std::fs::read(&files.config_path).unwrap() == config_before,
+                "same-key PATCH must not rewrite config");
+            assert!(std::fs::read(&accounts_path).unwrap() == store_before,
+                "same-key PATCH must not rewrite the store");
+            assert!(crate::profiles::stored_keys::retired_values(&created.id).is_empty(),
+                "same-key PATCH must not retire a credential");
+
+            // The editor can submit the unchanged key alongside both config
+            // and store changes. Neither materialization nor save may drop
+            // auth_mode, last_refresh or unknown auth metadata.
+            let body = serde_json::to_vec(&json!({
+                "apiKey": key,
+                "model": "offline-regression-model",
+                "color": "#123456",
+            })).unwrap();
+            let (updated, changed) = update_profile(&created.id, &parse_patch(&body).unwrap()).unwrap();
+            assert!(changed);
+            assert_eq!(updated.variants.credential_version, version_before);
+            assert!(std::fs::read(&files.auth_path).unwrap() == original_bytes,
+                "unrelated profile changes must preserve unchanged auth bytes");
+
+            // Also prove the full API path preserves metadata on a real dummy
+            // rotation, folds the legacy lowercase field, and increments once.
+            let replacement = format!("test-only-{}", uuid::Uuid::new_v4().simple());
+            let body = serde_json::to_vec(&json!({"apiKey": replacement})).unwrap();
+            let patch = parse_patch(&body).unwrap();
+            let (rotated, changed) = update_profile(&created.id, &patch).unwrap();
+            assert!(changed);
+            assert_eq!(rotated.variants.credential_version, version_before + 1);
+            assert!(crate::profiles::stored_keys::retired_values(&created.id)
+                .iter().any(|retired| retired == &key),
+                "rotation must retain the previous credential for redaction");
+            let rotated_bytes = std::fs::read(&files.auth_path).unwrap();
+            let rotated_auth: Value = serde_json::from_slice(&rotated_bytes).unwrap();
+            assert!(rotated_auth["OPENAI_API_KEY"].as_str() == Some(replacement.as_str()),
+                "rotation must store the replacement key");
+            assert!(rotated_auth.get("openai_api_key").is_none());
+            for field in ["auth_mode", "last_refresh", "tokens", "test_metadata"] {
+                assert!(rotated_auth.get(field) == original.get(field),
+                    "rotation must preserve unrelated auth metadata");
+            }
+            let (unchanged, changed) = update_profile(&created.id, &patch).unwrap();
+            assert!(!changed);
+            assert_eq!(unchanged.variants.credential_version, version_before + 1);
+            assert!(std::fs::read(&files.auth_path).unwrap() == rotated_bytes,
+                "repeated replacement key must not rewrite auth");
+        }
+    }
+
+    #[test]
+    fn provider_env_key_patch_matches_api_key_and_custom_provider_contract() {
+        use crate::management::v2::profiles_api::parse_patch;
+        use crate::profiles::lifecycle::{create_profile, NewProfile, NewProfileKind};
+
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        let config = CodezConfig::default();
+        let api_key_profile = create_profile(&NewProfile {
+            name: "fixed-env-profile".into(),
+            kind: NewProfileKind::ApiKey,
+            preset: crate::profiles::providers::find_preset("deepseek"),
+            base_url: None,
+            model: None,
+            api_key: None,
+        }).unwrap();
+        let item = profile_item(&api_key_profile, &config, true);
+        assert_eq!(item["detail"]["editable"]["providerEnvKey"], false);
+        assert_eq!(item["detail"]["config"]["providerEnvKey"], "OPENAI_API_KEY");
+        for value in [json!("CUTEX_TEST_PROVIDER_AUTH"), Value::Null] {
+            let body = serde_json::to_vec(&json!({"providerEnvKey": value})).unwrap();
+            let (updated, _) = update_profile(&api_key_profile.id, &parse_patch(&body).unwrap()).unwrap();
+            let item = profile_item(&updated, &config, true);
+            assert_eq!(item["detail"]["editable"]["providerEnvKey"], false);
+            assert_eq!(item["detail"]["config"]["providerEnvKey"], "OPENAI_API_KEY");
+        }
+
+        let non_api_key = create_profile(&NewProfile {
+            name: "custom-env-profile".into(),
+            kind: NewProfileKind::Chatgpt,
+            preset: None,
+            base_url: None,
+            model: None,
+            api_key: None,
+        }).unwrap();
+        assert_eq!(profile_item(&non_api_key, &config, true)["detail"]["editable"]["providerEnvKey"], false);
+        let rejected = parse_patch(&serde_json::to_vec(&json!({
+            "providerEnvKey": "CUTEX_TEST_PROVIDER_AUTH",
+        })).unwrap()).unwrap();
+        assert!(update_profile(&non_api_key.id, &rejected).is_err(),
+            "built-in provider must not accept provider options");
+        let custom = parse_patch(&serde_json::to_vec(&json!({
+            "modelProvider": "offline-relay",
+            "providerBaseUrl": "https://provider.invalid/v1",
+            "providerEnvKey": "CUTEX_TEST_PROVIDER_AUTH",
+        })).unwrap()).unwrap();
+        let (updated, changed) = update_profile(&non_api_key.id, &custom).unwrap();
+        assert!(changed);
+        let item = profile_item(&updated, &config, true);
+        assert_eq!(item["detail"]["editable"]["providerEnvKey"], true);
+        assert_eq!(item["detail"]["config"]["providerEnvKey"], "CUTEX_TEST_PROVIDER_AUTH");
+        let clear = parse_patch(br#"{"providerEnvKey":null}"#).unwrap();
+        let (cleared, changed) = update_profile(&non_api_key.id, &clear).unwrap();
+        assert!(changed);
+        let item = profile_item(&cleared, &config, true);
+        assert_eq!(item["detail"]["editable"]["providerEnvKey"], true);
+        assert_eq!(item["detail"]["config"]["providerEnvKey"], Value::Null);
+        assert!(!update_profile(&non_api_key.id, &clear).unwrap().1);
     }
 
     #[test]

@@ -1,12 +1,9 @@
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use anyhow::Context;
 use chrono::Utc;
@@ -15,12 +12,22 @@ use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::config::atomic::write_private_pretty_json_atomic;
 use crate::config::paths::runtime_dir;
 use crate::management::v2::model::MAX_SAFE_SEQUENCE;
 use crate::management::v2::native_requests::canonical_request_sha256;
 
 pub mod image_steering;
+mod sql;
+
+/// Input ledger writers for the owner's runtime paths (block C2, 054 §2.9),
+/// re-exported for the app-server side; no-ops while the switch is off.
+pub mod ledger {
+    pub use super::super::input_ledger_owner::{
+        already_in_context, held_expired, is_owner_user_item, lease_reason, materialize, native_accepted,
+        native_failed, native_refused, native_sending, native_unknown, note_host_busy, note_wait_reason, observe_user_item,
+        refusal_reason, with_offline_start,
+    };
+}
 
 const USER_INPUT_STATE_FILE: &str = "user-input-state.json";
 const USER_INPUT_LOCK_FILE: &str = "user-input-state.lock";
@@ -145,6 +152,43 @@ pub enum UserInputDisposition {
     Steered,
     Queued,
     Deduplicated,
+    /// Waiting for the host authority fence in the owner admission worker
+    /// (`owner-admission-held-v1`; only for clients that sent `allowHeld`).
+    Held,
+}
+
+/// Whether an idle owner input may start a turn now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerStart {
+    Ready,
+    /// A lease, pause, ride-along or earlier owner item goes first.
+    Blocked,
+    /// The host authority fence was busy: nothing decided, retry scheduled.
+    Deferred,
+}
+
+/// Why `owner_may_flush` refused, as an input ledger waiting reason (054
+/// §2.4). An ask queued ahead (no lease yet) is reported as
+/// `delegationLease`: it takes the lease next and §2.4 has no closer code.
+fn owner_block_reason(state: &crate::asks::store::AskState, session: &str, admission: &super::admission::AdmissionSnapshot) -> &'static str {
+    use crate::asks::model::LeaseHolder;
+    if crate::asks::agent_pause::is_paused(state, session) {
+        return "paused";
+    }
+    if let Some(lease) = state.leases.get(session) {
+        return match lease.holder {
+            LeaseHolder::Ask { .. } => "delegationLease",
+            LeaseHolder::Event { .. } => "eventLease",
+            LeaseHolder::Owner => "turnRunning",
+        };
+    }
+    if admission.next_step.iter().any(|item| item.eligible) {
+        return "rideAlongAhead";
+    }
+    match admission.items.iter().find(|item| item.state == "waiting") {
+        Some(item) if item.kind == "owner" => "ownerQueueAhead",
+        _ => "delegationLease",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +205,9 @@ pub struct UserInputSubmitExecution {
     pub queue_paused: bool,
     /// Refused explicit join retained as ordinary queued owner input.
     pub join_refusal: Option<String>,
+    /// Why a `queued` submit waits (`queue_order::QUEUED_REASONS`); result
+    /// field `queuedReason` (`owner-admission-busy-v1`). Not persisted.
+    pub queued_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -241,7 +288,7 @@ pub enum ClientIdentityDecision {
     Conflict,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct StoredQueueItem {
     management_request_id: String,
@@ -251,7 +298,7 @@ struct StoredQueueItem {
 
 pub const IDENTITY_RETENTION_DAYS: i64 = 30;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct ClientInputIdentity {
     canonical_sha256: String,
@@ -315,7 +362,7 @@ impl std::fmt::Display for QueueInputAlreadySubmitted {
 
 impl std::error::Error for QueueInputAlreadySubmitted {}
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct SessionInputState {
     queue_revision: u64,
@@ -327,7 +374,18 @@ struct SessionInputState {
     identities: BTreeMap<String, ClientInputIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pause: Option<UserInputQueuePause>,
+    /// AskState `revision` the persisted admission was last derived from by
+    /// a writer that may run ahead of a lock-free reader: the AskStore owner
+    /// sync (`sync_asks`, the revision it is about to commit) and the queue
+    /// listing. A listing computed from an older AskState snapshot must not
+    /// replace it (r274: `list_admission` no longer holds the ask lock).
+    /// 0 = unknown (older file). Kept outside the admission so it never makes
+    /// a projection look changed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    admission_asks_revision: u64,
 }
+
+fn is_zero(value: &u64) -> bool { *value == 0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -350,7 +408,20 @@ pub struct UserInputRepository {
     root: PathBuf,
     asks_dir: PathBuf,
     host_queue: bool,
-    process_lock: Mutex<()>,
+    db: std::sync::Arc<crate::store::StoreDb>,
+}
+
+/// Lock-free `list_admission` attempts before the locked fallback.
+const LIST_ADMISSION_ATTEMPTS: usize = 3;
+
+/// A queue listing computed outside every store lock; see
+/// [`UserInputRepository::list_admission`].
+pub(crate) struct PreparedAdmission {
+    before: Option<SessionInputState>,
+    revision: u64,
+    asks_revision: u64,
+    /// `None`: the stored admission is newer than the AskState snapshot.
+    projection: Option<(SessionInputState, super::admission::AdmissionSnapshot)>,
 }
 
 pub fn user_input_repository() -> anyhow::Result<&'static UserInputRepository> {
@@ -500,10 +571,23 @@ impl UserInputRepository {
         fs::create_dir_all(&root)?;
         secure_directory(&root)?;
         Ok(Self {
+            db: sql::open(&root)?,
             root,
             asks_dir,
             host_queue,
-            process_lock: Mutex::new(()),
+        })
+    }
+
+    /// Offline kit summary after `open` committed the complete import. Never
+    /// materializes business rows or performs admission/runtime work.
+    pub fn migration_report(&self) -> anyhow::Result<Value> {
+        self.db.read(|tx| {
+            let mut report = sql::migration_report(tx.sql())?;
+            let head = tx.head(crate::store::spec("user-input"))?;
+            report["path"] = serde_json::json!(self.db.path().display().to_string());
+            report["epoch"] = serde_json::json!(head.epoch.0.to_string());
+            report["revision"] = serde_json::json!(head.seq);
+            Ok(report)
         })
     }
 
@@ -513,7 +597,7 @@ impl UserInputRepository {
         params: &UserInputSubmitParams,
     ) -> anyhow::Result<ClientIdentityDecision> {
         let identity_sha256 = input_identity_sha256(params)?;
-        self.mutate(|store| {
+        self.mutate_session(cutex_session_id, &[params.client_user_message_id.as_str()], false, |store| {
             let state = store
                 .sessions
                 .entry(cutex_session_id.to_string())
@@ -546,7 +630,7 @@ impl UserInputRepository {
         params: &UserInputSubmitParams,
     ) -> anyhow::Result<QueueEnqueueDecision> {
         let identity_sha256 = input_identity_sha256(params)?;
-        self.ask_store().inspect(|asks| self.mutate(|store| {
+        self.ask_store().inspect(|asks| self.mutate_session(cutex_session_id, &[params.client_user_message_id.as_str()], true, |store| {
             let state = store
                 .sessions
                 .entry(cutex_session_id.to_string())
@@ -607,13 +691,7 @@ impl UserInputRepository {
         cutex_session_id: &str,
         client_user_message_id: &str,
     ) -> anyhow::Result<Option<InputDelivery>> {
-        self.read(|store| {
-            Ok(store
-                .sessions
-                .get(cutex_session_id)
-                .and_then(|state| state.identities.get(client_user_message_id))
-                .and_then(|identity| identity.delivery.clone()))
-        })
+        self.db.read(|tx| Ok(sql::identity(tx.sql(), cutex_session_id, client_user_message_id)?.and_then(|identity| identity.delivery)))
     }
 
     /// Compare-and-set of the native delivery in one locked read-modify-write:
@@ -629,7 +707,7 @@ impl UserInputRepository {
         expected: Option<&InputDelivery>,
         new: Option<InputDelivery>,
     ) -> anyhow::Result<bool> {
-        self.mutate(|store| {
+        self.mutate_session(cutex_session_id, &[client_user_message_id], false, |store| {
             let identity = store
                 .sessions
                 .get_mut(cutex_session_id)
@@ -644,7 +722,7 @@ impl UserInputRepository {
     }
 
     pub fn list(&self, cutex_session_id: &str) -> anyhow::Result<(u64, Vec<UserInputQueueItem>)> {
-        self.read(|store| {
+        self.read_session(cutex_session_id, &[], true, |store| {
             let Some(state) = store.sessions.get(cutex_session_id) else {
                 return Ok((0, Vec::new()));
             };
@@ -661,54 +739,185 @@ impl UserInputRepository {
     pub fn needs_admission_poll(&self) -> anyhow::Result<bool> {
         self.ask_store().inspect(|asks| {
             if asks.presence.values().any(|presence| presence.online) { return Ok(true); }
-            self.read(|store| Ok(store.sessions.values().any(|session| !session.items.is_empty())))
+            self.db.read(|tx| sql::has_queue(tx.sql()))
         })?
     }
 
+    /// Sessions with at least one queued owner input (cached store read).
+    pub fn sessions_with_queued_items(&self) -> anyhow::Result<Vec<String>> {
+        self.db.read(|tx| sql::queued_sessions(tx.sql()))
+    }
+
     pub fn owner_may_start(&self, session: &str, queue_id: Option<&str>) -> anyhow::Result<bool> {
-        crate::asks::pause_admission::with_state_or(&self.ask_store(), Ok(false), |state, _| {
-            let mut admission = self.admission_with_state(session, state)?;
-            if super::admission::owner_priority(session) {
+        Ok(self.owner_start(session, queue_id)? == OwnerStart::Ready)
+    }
+
+    /// Like `owner_may_start`, but tells a busy authority fence (`Deferred`:
+    /// nothing decided, a retry is scheduled) apart from a real block (lease,
+    /// pause, ride-alongs or an owner item ahead).
+    pub fn owner_start(&self, session: &str, queue_id: Option<&str>) -> anyhow::Result<OwnerStart> {
+        Ok(self.owner_start_with_reason(session, queue_id)?.0)
+    }
+
+    /// [`Self::owner_start`] plus, for `Blocked`, the input ledger's waiting
+    /// reason (054 §2.4: `rideAlongAhead` / `eventLease` / … apart from a
+    /// real Ask `delegationLease`; ledger only, the wire keeps
+    /// `queuedReason: delegationLease`).
+    pub fn owner_start_with_reason(&self, session: &str, queue_id: Option<&str>) -> anyhow::Result<(OwnerStart, &'static str)> {
+        let mut reason = "delegationLease";
+        Ok(match self.owner_may_start_admission(session, queue_id, &mut reason)? {
+            crate::asks::pause_admission::Admission::Ready(true) => (OwnerStart::Ready, reason),
+            crate::asks::pause_admission::Admission::Ready(false) => (OwnerStart::Blocked, reason),
+            crate::asks::pause_admission::Admission::Deferred => {
+                super::admission::retry_later(session);
+                (OwnerStart::Deferred, reason)
+            }
+        })
+    }
+
+    fn owner_may_start_admission(&self, session: &str, queue_id: Option<&str>, reason: &mut &'static str) -> anyhow::Result<crate::asks::pause_admission::Admission<bool>> {
+        // Owner decision 1 (input ledger switch): the idle agent takes the
+        // owner's message before ride-alongs that are already eligible.
+        // Read before the fence (the switch may read config.json).
+        let owner_first = super::admission::owner_first(session);
+        // r274 decision 1 (051): the admission projection (bus reads, config)
+        // is computed before the fence; under it only the pause
+        // reconciliation and the start predicate run.
+        let admission = self.admission(session)?;
+        match crate::asks::pause_admission::try_with_state(&self.ask_store(), move |state, _| {
+            let mut admission = admission;
+            if super::admission::owner_priority(session) || owner_first {
                 admission.next_step.clear();
             } else {
                 let waiting = !state.leases.contains_key(session)
                     && admission.next_step.iter().any(|item| item.eligible);
                 if super::admission_wait::waiting(session, waiting) { admission.next_step.clear(); }
             }
-            Ok(crate::asks::scheduler::owner_may_flush(state, session, &admission, queue_id))
-        })?
-    }
-
-    pub fn list_admission(&self, session: &str) -> anyhow::Result<(u64, Vec<UserInputQueueItem>, Option<UserInputQueuePause>, super::admission::AdmissionSnapshot)> {
-        match crate::asks::pause_admission::try_with_authority(|_| self.ask_store().inspect(|asks| self.list_admission_in(session,asks))?)? {
-            crate::asks::pause_admission::Admission::Ready(result)=>Ok(result),
-            crate::asks::pause_admission::Admission::Deferred=>Err(crate::asks::pause_admission::Deferred.into()),
+            let may = crate::asks::scheduler::owner_may_flush(state, session, &admission, queue_id);
+            if !may {
+                *reason = owner_block_reason(state, session, &admission);
+            }
+            anyhow::Ok(may)
+        })? {
+            crate::asks::pause_admission::Admission::Ready(result) => result.map(crate::asks::pause_admission::Admission::Ready),
+            crate::asks::pause_admission::Admission::Deferred => Ok(crate::asks::pause_admission::Admission::Deferred),
         }
     }
 
+    /// `cutex/userInput/queue/list`: the fresh projection when the host
+    /// authority fence is free, else the last committed projection (`false`
+    /// = not fresh). A busy fence never fails a read (`owner-admission-busy-v1`);
+    /// the fresh projection follows as soon as the admission worker syncs it.
+    pub fn list_admission_or_committed(&self, session: &str) -> anyhow::Result<(u64, Vec<UserInputQueueItem>, Option<UserInputQueuePause>, super::admission::AdmissionSnapshot, bool)> {
+        match self.list_admission(session) {
+            Ok((revision, items, pause, admission)) => Ok((revision, items, pause, admission, true)),
+            Err(error) if crate::asks::pause_admission::is_deferred(&error) => {
+                super::admission::retry_later(session);
+                let (revision, items, pause, admission) = self.list_admission_committed(session)?;
+                Ok((revision, items, pause, admission, false))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The last committed queue and admission projection of `session`, read
+    /// under the user-input store lock only: no authority fence, no AskStore.
+    pub fn list_admission_committed(&self, session: &str) -> anyhow::Result<(u64, Vec<UserInputQueueItem>, Option<UserInputQueuePause>, super::admission::AdmissionSnapshot)> {
+        self.read_session(session, &[], true, |store| {
+            let prior = store.sessions.get(session);
+            let projection = admission_projection(prior);
+            Ok((projection.queue_revision, prior.map(positioned_items).unwrap_or_default(), projection.pause, projection.admission.snapshot))
+        })
+    }
+
+    /// The admission projection (queue, numbered items, ride-alongs) of
+    /// `session`, synchronized into the user-input store.
+    ///
+    /// r274 decision 1 (051: nothing slow under the host authority fence):
+    /// computed WITHOUT the fence. It is a read model over one consistent
+    /// AskState read (`inspect`) and the user-input store lock; nothing in it
+    /// reads the roster or decides a delivery. Every decision that needs the
+    /// roster-consistent pause state takes the fence itself (`owner_start`,
+    /// the C-010 `sending` reservation). It used to run under a try of the
+    /// fence (11-22 ms per recompute on the `cutex-admission` thread), which
+    /// made the owner route's one-shot try fail (`hostBusy`).
+    ///
+    /// 051 (r274 fix): not under the ask lock either. One consistent AskState
+    /// snapshot (`AskStore::shared`, a short shared lock) is taken first; the
+    /// projection (bus reads, config) is computed with no store lock held;
+    /// only the compare-and-write of this session's admission takes the
+    /// user-input store lock. The write is refused, and the listing retried
+    /// from a fresh snapshot, when the session's queue state changed meanwhile
+    /// or the stored admission was derived from a newer AskState
+    /// (`admission_asks_revision`), so a stale snapshot never replaces a newer
+    /// projection. After [`LIST_ADMISSION_ATTEMPTS`] refusals the listing runs
+    /// in the established ask -> user-input lock order as before.
+    pub fn list_admission(&self, session: &str) -> anyhow::Result<(u64, Vec<UserInputQueueItem>, Option<UserInputQueuePause>, super::admission::AdmissionSnapshot)> {
+        for _ in 0..LIST_ADMISSION_ATTEMPTS {
+            let asks = self.ask_store().peek_shared()?.unwrap_or_default();
+            let prepared = self.prepare_list_admission(session, &asks)?;
+            if let Some(listed) = self.commit_list_admission(session, prepared)? { return Ok(listed); }
+        }
+        self.ask_store().inspect(|asks| self.list_admission_in(session, asks))?
+    }
+
+    /// Lock-free part of [`Self::list_admission`]: the committed session
+    /// state (a short user-input store read) and the projection over `asks`.
+    pub(crate) fn prepare_list_admission(&self, session: &str, asks: &crate::asks::store::AskState) -> anyhow::Result<PreparedAdmission> {
+        let (before, revision) = self.db.read(|tx| sql::selected(tx.sql(), session, &[], true))?;
+        let prior = before.as_ref();
+        if prior.is_some_and(|prior| prior.admission_asks_revision > asks.revision) {
+            return Ok(PreparedAdmission { before, revision, asks_revision: asks.revision, projection: None });
+        }
+        let mut projection = admission_projection(prior);
+        let admission = self.sync_admission(session, &mut projection, asks)?;
+        Ok(PreparedAdmission { before, revision, asks_revision: asks.revision, projection: Some((projection, admission)) })
+    }
+
+    /// Compare-and-write part of [`Self::list_admission`]: `None` (nothing
+    /// written) when the prepared projection is stale.
+    pub(crate) fn commit_list_admission(&self, session: &str, prepared: PreparedAdmission) -> anyhow::Result<Option<(u64, Vec<UserInputQueueItem>, Option<UserInputQueuePause>, super::admission::AdmissionSnapshot)>> {
+        let PreparedAdmission { before, revision, asks_revision, projection } = prepared;
+        let Some((projection, admission)) = projection else { return Ok(None) };
+        let prior = before.as_ref();
+        let changed = prior.is_none_or(|prior| !prior.admission.persisted_eq(&projection.admission));
+        if !changed {
+            return Ok(Some((projection.queue_revision, prior.map(positioned_items).unwrap_or_default(), projection.pause, admission)));
+        }
+        let committed = self.db.write(|tx| {
+            if sql::revision(tx.sql(), session)? != revision { return Ok(false); }
+            let mut state = before.clone().unwrap_or_default();
+            if state.admission_asks_revision > asks_revision { return Ok(false); }
+            state.admission = projection.admission.clone();
+            state.admission_asks_revision = state.admission_asks_revision.max(asks_revision);
+            sql::apply(tx, session, revision, prior, Some(&state))?;
+            Ok(true)
+        })?;
+        if !committed { return Ok(None); }
+        super::admission::changed(session);
+        Ok(Some((projection.queue_revision, prior.map(positioned_items).unwrap_or_default(), projection.pause, admission)))
+    }
+
+    /// The listing in the ask -> user-input lock order (the ask shared lock
+    /// held throughout): the fallback when lock-free attempts keep racing.
     fn list_admission_in(&self, session:&str, asks:&crate::asks::store::AskState)->anyhow::Result<(u64,Vec<UserInputQueueItem>,Option<UserInputQueuePause>,super::admission::AdmissionSnapshot)> {
-        self.with_lock(|path| {
-            let before = cached_store(path)?;
-            let prior = before.sessions.get(session);
-            // Admission synchronization never reads identities. In the usual
-            // unchanged case, only copy this session's live queue/admission,
-            // not every session's entire retained C-010 identity history.
+        let (listed, changed) = self.db.write(|tx| {
+            let (before, revision) = sql::selected(tx.sql(), session, &[], true)?;
+            let prior = before.as_ref();
             let mut projection = admission_projection(prior);
             let admission = self.sync_admission(session, &mut projection, asks)?;
-            let changed = match prior {
-                Some(prior) => serde_json::to_vec(&prior.admission)? != serde_json::to_vec(&projection.admission)?,
-                None => true,
-            };
-            // Keep serialized comparison: next_step.eligible is deliberately
-            // transient and must not cause a write or admission notification.
-            if changed {
-                let mut store = (*before).clone();
-                store.sessions.entry(session.to_string()).or_default().admission = projection.admission;
-                write_private_pretty_json_atomic(path, &store, "management v2 user-input state")?;
-                super::admission::changed(session);
+            let changed = prior.is_none_or(|prior| !prior.admission.persisted_eq(&projection.admission));
+            let restamp = prior.is_some_and(|prior| prior.admission_asks_revision > asks.revision);
+            if changed || restamp {
+                let mut state = before.clone().unwrap_or_default();
+                state.admission = projection.admission;
+                state.admission_asks_revision = asks.revision;
+                sql::apply(tx, session, revision, prior, Some(&state))?;
             }
-            Ok((projection.queue_revision, prior.map(positioned_items).unwrap_or_default(), projection.pause, admission))
-        })
+            Ok(((projection.queue_revision, prior.map(positioned_items).unwrap_or_default(), projection.pause, admission), changed))
+        })?;
+        if changed { super::admission::changed(session); }
+        Ok(listed)
     }
 
     pub fn admission(&self, session: &str) -> anyhow::Result<super::admission::AdmissionSnapshot> {
@@ -716,7 +925,7 @@ impl UserInputRepository {
     }
 
     pub fn admission_with_state(&self, session: &str, asks: &crate::asks::store::AskState) -> anyhow::Result<super::admission::AdmissionSnapshot> {
-        self.read(|store| {
+        self.read_session(session, &[], true, |store| {
             let mut state = admission_projection(store.sessions.get(session));
             self.sync_admission(session, &mut state, asks)
         })
@@ -725,7 +934,7 @@ impl UserInputRepository {
     /// Offline scheduling needs numbered order and holds, but cannot consume
     /// ridealongs. Avoid bus/config reads used only by the full presentation.
     pub(crate) fn numbered_admission_with_state(&self, session: &str, asks: &crate::asks::store::AskState) -> anyhow::Result<super::admission::AdmissionSnapshot> {
-        self.read(|store| {
+        self.read_session(session, &[], true, |store| {
             let mut state = admission_projection(store.sessions.get(session));
             let mut admission = self.sync_numbered(session, &mut state, asks)?;
             admission.next_step.clear();
@@ -738,6 +947,7 @@ impl UserInputRepository {
     /// AskStore calls this while holding its write lock. Every other path takes
     /// the ask lock before the owner lock, so registration and moves serialize.
     pub(crate) fn sync_asks(&self, before: &crate::asks::store::AskState, asks: &crate::asks::store::AskState) -> anyhow::Result<()> {
+        let prior_revision = before.revision;
         let mut sessions = std::collections::BTreeSet::new();
         for (id, ask) in asks.asks.iter().chain(before.asks.iter()) {
             if before.asks.get(id) != asks.asks.get(id) { sessions.insert(ask.target_cutex_session_id.clone()); }
@@ -753,20 +963,18 @@ impl UserInputRepository {
             ask.execution == crate::asks::model::ExecutionState::Queued
                 && before.asks.get(*id).is_some_and(|prior| prior.execution == crate::asks::model::ExecutionState::PendingReview)
         ).map(|(id, _)| id.clone()).collect();
-        self.with_lock(|path| {
-            let mut store = (*cached_store(path)?).clone();
-            let mut changed = false;
+        self.db.write(|tx| {
             for session in &sessions {
-                // Only affected rows are inspected. The shared JSON file is
-                // replaced once, without per-session scans or bus reads.
-                let state = store.sessions.entry(session.clone()).or_default();
-                let before = serde_json::to_vec(&state.admission)?;
-                let items = self.numbered_items(session, state, asks);
+                let (before, revision) = sql::selected(tx.sql(), session, &[], true)?;
+                let mut state = before.clone().unwrap_or_default();
+                let items = self.numbered_items(session, &state, asks);
                 state.admission.priority_asks = asks.asks.values().filter(|ask| ask.target_cutex_session_id == *session && ask.resume_pending()).map(|ask| ask.ask_id.clone()).collect();
                 state.admission.sync_approved(items, &approved)?;
-                changed |= before != serde_json::to_vec(&state.admission)?;
+                if before.as_ref().is_none_or(|prior| !prior.admission.persisted_eq(&state.admission)) {
+                    state.admission_asks_revision = state.admission_asks_revision.max(asks.revision.max(prior_revision).saturating_add(1));
+                    sql::apply(tx, session, revision, before.as_ref(), Some(&state))?;
+                }
             }
-            if changed { write_private_pretty_json_atomic(path, &store, "management v2 user-input state")?; }
             Ok(())
         })?;
         for session in sessions { super::admission::changed(&session); }
@@ -832,11 +1040,16 @@ impl UserInputRepository {
             .then(|| crate::asks::control::HELD_OWNER_STOP.to_string());
         // The one-shot owner yield lives in this daemon's memory only.
         let owner_yielded = self.host_queue && super::admission::owner_yielded(session);
+        let auto_retry = self.host_queue.then(||
+            super::model_overload_retry::auto_retry_default(session, asks.leases.get(session))).flatten()
+            .filter(|retry| retry.holds_admission);
+        super::admission::project_auto_retry(&mut next_step, auto_retry.as_ref());
         let snapshot = &mut state.admission.snapshot;
         if serde_json::to_value(&snapshot.next_step)? != serde_json::to_value(&next_step)?
             || snapshot.current_turn != current_turn
             || snapshot.ridealongs_held != ridealongs_held
             || snapshot.owner_yielded != owner_yielded
+            || snapshot.auto_retry != auto_retry
         {
             snapshot.revision = next_revision(snapshot.revision)?;
         }
@@ -844,6 +1057,7 @@ impl UserInputRepository {
         snapshot.current_turn = current_turn;
         snapshot.ridealongs_held = ridealongs_held;
         snapshot.owner_yielded = owner_yielded;
+        snapshot.auto_retry = auto_retry;
         Ok(snapshot.clone())
     }
 
@@ -852,7 +1066,7 @@ impl UserInputRepository {
     pub fn move_admission_item(&self, session: &str, queue_id: &str, expected: u64,
         before: Option<&super::admission::AdmissionRef>, may_pass: bool,
     ) -> anyhow::Result<(super::admission::AdmissionSnapshot, u64, Vec<UserInputQueueItem>, bool)> {
-        self.ask_store().inspect(|asks| self.mutate(|store| {
+        self.ask_store().inspect(|asks| self.mutate_session(session, &[], true, |store| {
             let state = store.sessions.entry(session.to_string()).or_default();
             self.sync_admission(session, state, asks)?;
             if state.admission.snapshot.order_revision != expected {
@@ -879,7 +1093,7 @@ impl UserInputRepository {
 
     /// The queue's pause, if one is recorded.
     pub fn pause_state(&self, cutex_session_id: &str) -> anyhow::Result<Option<UserInputQueuePause>> {
-        self.read(|store| {
+        self.read_session(cutex_session_id, &[], false, |store| {
             Ok(store
                 .sessions
                 .get(cutex_session_id)
@@ -896,7 +1110,7 @@ impl UserInputRepository {
         reason: &str,
         turn_id: Option<String>,
     ) -> anyhow::Result<QueuePauseDecision> {
-        self.mutate(|store| {
+        self.mutate_session(cutex_session_id, &[], true, |store| {
             let Some(state) = store.sessions.get_mut(cutex_session_id) else {
                 return Ok(QueuePauseDecision::Empty { revision: 0 });
             };
@@ -931,7 +1145,7 @@ impl UserInputRepository {
         &self,
         cutex_session_id: &str,
     ) -> anyhow::Result<Option<(UserInputQueuePause, u64)>> {
-        self.mutate(|store| {
+        self.mutate_session(cutex_session_id, &[], true, |store| {
             let Some(state) = store.sessions.get_mut(cutex_session_id) else {
                 return Ok(None);
             };
@@ -945,7 +1159,7 @@ impl UserInputRepository {
 
     /// Let one queued item through a pause (`UserInputQueueItem::bypass_pause`).
     pub fn mark_bypass_pause(&self, cutex_session_id: &str, queue_id: &str) -> anyhow::Result<bool> {
-        self.mutate(|store| {
+        self.mutate_session(cutex_session_id, &[], true, |store| {
             let Some(stored) = store.sessions.get_mut(cutex_session_id).and_then(|state| {
                 state
                     .items
@@ -967,7 +1181,7 @@ impl UserInputRepository {
         cutex_session_id: &str,
         ignore_pause: bool,
     ) -> anyhow::Result<Option<(String, String, UserInputQueueItem)>> {
-        self.read(|store| {
+        self.read_session(cutex_session_id, &[], true, |store| {
             let Some(state) = store.sessions.get(cutex_session_id) else {
                 return Ok(None);
             };
@@ -990,7 +1204,7 @@ impl UserInputRepository {
         &self,
         cutex_session_id: &str,
     ) -> anyhow::Result<Option<(String, String, UserInputQueueItem)>> {
-        self.read(|store| {
+        self.read_session(cutex_session_id, &[], true, |store| {
             Ok(store
                 .sessions
                 .get(cutex_session_id)
@@ -1015,7 +1229,7 @@ impl UserInputRepository {
         for item in &input {
             validate_user_input(item).map_err(anyhow::Error::msg)?;
         }
-        self.mutate(|store| {
+        self.mutate_session(cutex_session_id, &[], true, |store| {
             let Some(state) = store.sessions.get_mut(cutex_session_id) else {
                 return Ok(None);
             };
@@ -1057,13 +1271,87 @@ impl UserInputRepository {
         })
     }
 
+    /// Atomic merge of queued owner inputs (054 C2, owner queue merge): the
+    /// first item keeps its queueId / clientUserMessageId / position and takes
+    /// `input` (default: every item's input in the given order); the others
+    /// are removed. One store write; every item must match its expected
+    /// revision and none may be in native yet. Returns (merged, removed).
+    pub fn merge(
+        &self,
+        cutex_session_id: &str,
+        items: &[(String, u64)],
+        input: Option<Vec<Value>>,
+    ) -> anyhow::Result<Option<(UserInputQueueItem, Vec<UserInputQueueItem>)>> {
+        if let Some(input) = &input {
+            for item in input {
+                validate_user_input(item).map_err(anyhow::Error::msg)?;
+            }
+        }
+        self.mutate_session(cutex_session_id, &[], true, |store| {
+            let Some(state) = store.sessions.get_mut(cutex_session_id) else {
+                return Ok(None);
+            };
+            let mut indexes = Vec::new();
+            for (queue_id, expected) in items {
+                let Some(index) = state.items.iter().position(|stored| &stored.item.queue_id == queue_id) else {
+                    return Ok(None);
+                };
+                let stored = &state.items[index].item;
+                if stored.revision != *expected {
+                    return Err(QueueRevisionConflict { expected: *expected, current: stored.revision }.into());
+                }
+                if state.identities.get(&stored.client_user_message_id).is_some_and(|identity| identity.delivery.is_some()) {
+                    return Err(QueueInputAlreadySubmitted.into());
+                }
+                indexes.push(index);
+            }
+            let merged_input = match input {
+                Some(input) => input,
+                None => indexes.iter().flat_map(|index| state.items[*index].item.input.clone()).collect(),
+            };
+            let now = Utc::now().to_rfc3339();
+            let first = indexes[0];
+            {
+                let stored = &mut state.items[first].item;
+                stored.revision = next_revision(stored.revision)?;
+                stored.input = merged_input;
+                stored.updated_at = now.clone();
+            }
+            let identity_sha256 = canonical_request_sha256(&serde_json::json!({
+                "origin": state.items[first].item.origin,
+                "input": state.items[first].item.input,
+            }))?;
+            let survivor_id = state.items[first].item.client_user_message_id.clone();
+            if let Some(identity) = state.identities.get_mut(&survivor_id) {
+                identity.canonical_sha256 = identity_sha256;
+            }
+            let survivor_queue_id = state.items[first].item.queue_id.clone();
+            let mut removed = Vec::new();
+            let mut rest: Vec<usize> = indexes[1..].to_vec();
+            rest.sort_unstable_by(|a, b| b.cmp(a));
+            for index in rest {
+                let mut item = state.items.remove(index).item;
+                state.admission.remove_owner(&item.queue_id)?;
+                item.revision = next_revision(item.revision)?;
+                item.updated_at = now.clone();
+                removed.push(item);
+            }
+            removed.reverse();
+            let position = state.items.iter().position(|stored| stored.item.queue_id == survivor_queue_id).unwrap_or(0);
+            let mut merged = state.items[position].item.clone();
+            merged.position = position as u64;
+            state.queue_revision = next_revision(state.queue_revision)?;
+            Ok(Some((merged, removed)))
+        })
+    }
+
     pub fn remove(
         &self,
         cutex_session_id: &str,
         queue_id: &str,
         expected_revision: u64,
     ) -> anyhow::Result<Option<UserInputQueueItem>> {
-        self.mutate(|store| {
+        self.mutate_session(cutex_session_id, &[], true, |store| {
             let Some(state) = store.sessions.get_mut(cutex_session_id) else {
                 return Ok(None);
             };
@@ -1100,72 +1388,63 @@ impl UserInputRepository {
     }
 
     pub fn clear_session(&self, cutex_session_id: &str) -> anyhow::Result<()> {
-        self.mutate(|store| {
+        self.mutate_session(cutex_session_id, &[], false, |store| {
             store.sessions.remove(cutex_session_id);
             Ok(())
         })
     }
 
-    fn mutate<T>(
-        &self,
-        action: impl FnOnce(&mut UserInputStateStore) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        self.with_lock(|path| {
-            let mut store = (*cached_store(path)?).clone();
-            let before = serde_json::to_vec(&store)?;
-            let previous: BTreeMap<_, _> = store.sessions.iter().map(|(id, state)| (id.clone(), serde_json::to_vec(state).unwrap_or_default())).collect();
-            prune_identities(&mut store, Utc::now());
-            let result = action(&mut store)?;
-            if serde_json::to_vec(&store)? != before {
-                write_private_pretty_json_atomic(path, &store, "management v2 user-input state")?;
-                {
-                    for (session, state) in &store.sessions {
-                        if previous.get(session) != Some(&serde_json::to_vec(state)?) { super::admission::changed(session); }
-                    }
-                    for session in previous.keys().filter(|id| !store.sessions.contains_key(*id)) { super::admission::changed(session); }
-                }
+    fn mutate_session<T>(&self, session: &str, identities: &[&str], queue: bool,
+        action: impl FnOnce(&mut UserInputStateStore) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let (result, changed, pruned) = self.db.write(|tx| {
+            let pruned = sql::prune(tx, Utc::now())?;
+            let (before, revision) = sql::selected(tx.sql(), session, identities, queue)?;
+            let mut scoped = UserInputStateStore::default();
+            if let Some(state) = &before { scoped.sessions.insert(session.into(), state.clone()); }
+            let result = action(&mut scoped)?;
+            let changed = sql::apply(tx, session, revision, before.as_ref(), scoped.sessions.get(session))?;
+            Ok((result, changed, pruned))
+        })?;
+        for id in pruned { super::admission::changed(&id); }
+        if changed { super::admission::changed(session); }
+        Ok(result)
+    }
+
+    fn read_session<T>(&self, session: &str, identities: &[&str], queue: bool,
+        action: impl FnOnce(&UserInputStateStore) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.db.read(|tx| {
+            let (state, _) = sql::selected(tx.sql(), session, identities, queue)?;
+            let mut scoped = UserInputStateStore::default();
+            if let Some(state) = state { scoped.sessions.insert(session.into(), state); }
+            action(&scoped)
+        })
+    }
+}
+
+#[cfg(test)]
+impl UserInputRepository {
+    fn read<T>(&self, action: impl FnOnce(&UserInputStateStore) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.db.read(|tx| action(&sql::test_dump(tx.sql())?))
+    }
+    fn mutate<T>(&self, action: impl FnOnce(&mut UserInputStateStore) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.db.write(|tx| {
+            let before = sql::test_dump(tx.sql())?;
+            let mut after = before.clone();
+            let result = action(&mut after)?;
+            let keys: std::collections::BTreeSet<_> = before.sessions.keys().chain(after.sessions.keys()).collect();
+            for key in keys {
+                let rev = sql::revision(tx.sql(), key)?;
+                sql::apply(tx,key,rev,before.sessions.get(key),after.sessions.get(key))?;
             }
             Ok(result)
         })
     }
-
-    fn read<T>(
-        &self,
-        action: impl FnOnce(&UserInputStateStore) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        self.with_lock(|path| action(cached_store(path)?.as_ref()))
-    }
-
-    fn with_lock<T>(&self, action: impl FnOnce(&Path) -> anyhow::Result<T>) -> anyhow::Result<T> {
-        let _process_guard = self
-            .process_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("management v2 user-input lock was poisoned"))?;
-        let lock_file = open_private_lock(&self.root.join(USER_INPUT_LOCK_FILE))?;
-        lock_file.lock()?;
-        let result = action(&self.root.join(USER_INPUT_STATE_FILE));
-        let unlock = lock_file.unlock();
-        if result.is_ok() {
-            unlock?;
-        }
-        result
-    }
-}
-
-fn cached_store(path: &Path) -> anyhow::Result<std::sync::Arc<UserInputStateStore>> {
-    use crate::platform::file_stamp::FileStamp;
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, (Option<FileStamp>, std::sync::Arc<UserInputStateStore>)>>> = std::sync::OnceLock::new();
-    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let stamp = FileStamp::of(path);
-    if let Some((prior, store)) = cache.get(path) { if prior == &stamp { return Ok(store.clone()); } }
-    let store = std::sync::Arc::new(load_store(path)?);
-    if cache.len() > 32 { cache.clear(); }
-    cache.insert(path.into(), (stamp, store.clone()));
-    Ok(store)
+    fn dump(&self) -> UserInputStateStore { self.db.read(|tx| sql::test_dump(tx.sql())).unwrap() }
 }
 
 /// Only expired bookkeeping is discarded. Queued inputs and unresolved native
 /// sends keep their identities until delivery is settled.
+#[cfg(test)]
 fn prune_identities(store: &mut UserInputStateStore, now: chrono::DateTime<Utc>) {
     let cutoff = now - chrono::Duration::days(IDENTITY_RETENTION_DAYS);
     for state in store.sessions.values_mut() {
@@ -1194,6 +1473,7 @@ fn admission_projection(state: Option<&SessionInputState>) -> SessionInputState 
             items: state.items.clone(),
             identities: BTreeMap::new(),
             pause: state.pause.clone(),
+            admission_asks_revision: state.admission_asks_revision,
         },
         None => SessionInputState::default(),
     }
@@ -1235,29 +1515,6 @@ pub(crate) fn next_revision(current: u64) -> anyhow::Result<u64> {
     Ok(current + 1)
 }
 
-fn load_store(path: &Path) -> anyhow::Result<UserInputStateStore> {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let store: UserInputStateStore = serde_json::from_slice(&bytes).with_context(|| {
-                format!(
-                    "failed to parse management v2 user-input state: {}",
-                    path.display()
-                )
-            })?;
-            if store.version != 1 {
-                anyhow::bail!("unsupported management v2 user-input state version");
-            }
-            Ok(store)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(UserInputStateStore::default()),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "failed to read management v2 user-input state: {}",
-                path.display()
-            )
-        }),
-    }
-}
 
 fn open_private_lock(path: &Path) -> anyhow::Result<File> {
     let mut options = OpenOptions::new();
@@ -1351,6 +1608,40 @@ mod tests {
     }
 
     #[test]
+    fn idle_owner_admission_retries_queued_image_after_real_authority_fence_contention() {
+        let root = std::env::temp_dir().join(format!("cutex-idle-image-retry-{}", Uuid::new_v4()));
+        let session = format!("cutex.idle-image-retry-{}", Uuid::new_v4());
+        let repository = UserInputRepository::open(&root).unwrap();
+        let mut input = params("");
+        input.input = vec![json!({"type":"localImage","path":"/fixture/owner.png"})];
+        let QueueEnqueueDecision::Queued(item) = repository.enqueue(&session, "thread", "request", &input).unwrap() else { panic!("new image") };
+        let roster = crate::agent_management::AgentManagementStore::open_default().unwrap();
+        // r274 decision 1 (051): the admission projection is computed without
+        // the host fence, so a held fence no longer defers it (it used to be
+        // `Deferred` here and retried with backoff).
+        {
+            let _fence = roster.lock_mutations().unwrap();
+            let (_, items, _, _) = repository.list_admission(&session).unwrap();
+            assert_eq!(items.len(), 1);
+        }
+        for _ in 0..2 {
+            let _ = super::super::admission::take_change(&session);
+            let fence = roster.lock_mutations().unwrap();
+            // The start decision still needs the fence: deferred, with a wake.
+            assert!(!repository.owner_may_start(&session, Some(&item.queue_id)).unwrap());
+            assert!(!super::super::admission::take_change(&session), "held fence must not cause a busy retry loop");
+            drop(fence);
+            // No new input, runtime event, manual flush or queue/list refresh supplies a wake.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            assert!(super::super::admission::take_change(&session), "deferred idle image lost its only admission wake");
+            assert!(repository.owner_may_start(&session, Some(&item.queue_id)).unwrap());
+            assert_eq!(repository.list(&session).unwrap().1.len(), 1, "reservation never duplicates or drops input");
+        }
+drop(repository);
+                let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn queue_list_noop_preserves_receipts_and_skipped_eligibility_without_rewriting() {
         let root = std::env::temp_dir().join(format!("cutex-v2-list-noop-{}", Uuid::new_v4()));
         let session = format!("list-noop-{}", Uuid::new_v4());
@@ -1368,10 +1659,10 @@ mod tests {
         let first = repository.list_admission(&session).unwrap();
         assert_eq!(first.1[0].delivery.as_deref(), Some("sending"));
         assert!(first.3.next_step[0].eligible);
-        let path = root.join(USER_INPUT_STATE_FILE);
-        let stamp = crate::platform::file_stamp::FileStamp::of(&path);
+        let path = root.join("owner-input.sqlite3");
+        let stamp = repository.db.read(|tx| tx.head(crate::store::spec("user-input"))).unwrap();
         let bytes = fs::read(&path).unwrap();
-        let stored = load_store(&path).unwrap();
+        let stored = repository.dump();
         assert!(!stored.sessions[&session].admission.snapshot.next_step[0].eligible, "eligibility is intentionally not persisted");
         let cache_competitor = crate::asks::store::AskStore::at(root.join("cache-competitor"));
         cache_competitor.with_state(|state| { state.wait_cancel.insert("fixture".into(), 1); }).unwrap();
@@ -1383,12 +1674,14 @@ mod tests {
             cache_competitor.snapshot().unwrap();
             assert_eq!(repository.list_admission(&session).unwrap(), first);
         }
-        assert_eq!(crate::platform::file_stamp::FileStamp::of(&path), stamp);
+        assert_eq!(repository.db.read(|tx| tx.head(crate::store::spec("user-input"))).unwrap(), stamp);
         assert_eq!(fs::read(&path).unwrap(), bytes);
         let reopened = UserInputRepository::open(&root).unwrap();
         assert_eq!(reopened.register_identity(&session, &input).unwrap(), ClientIdentityDecision::Existing);
         assert_eq!(reopened.delivery(&session, &input.client_user_message_id).unwrap(), Some(sending));
         assert!(!reopened.set_delivery(&session, &input.client_user_message_id, None, None).unwrap(), "queue reads preserve the C-010 reservation");
+        drop(repository);
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1403,12 +1696,12 @@ mod tests {
         // file lock. Its freshly stored receipt must survive admission sync.
         let other = UserInputRepository::open(&root).unwrap();
         other.register_identity("unrelated-session", &params("other")).unwrap();
-        let path = root.join(USER_INPUT_STATE_FILE);
-        let other_before = serde_json::to_vec(&load_store(&path).unwrap().sessions["unrelated-session"]).unwrap();
+        let path = root.join("owner-input.sqlite3");
+        let other_before = serde_json::to_vec(&repository.dump().sessions["unrelated-session"]).unwrap();
         repository.ask_store().with_state(|state| {
             crate::asks::control::owner_stop(state, &session, Utc::now());
         }).unwrap();
-        let before = load_store(&path).unwrap().sessions[&session].admission.snapshot.clone();
+        let before = repository.dump().sessions[&session].admission.snapshot.clone();
         assert!(before.ridealongs_held.is_none(), "ask sync persists numbered order, not full presentation");
         let _ = super::super::admission::take_change(&session);
         let changed = repository.list_admission(&session).unwrap();
@@ -1417,51 +1710,16 @@ mod tests {
         assert!(changed.3.revision > before.revision);
         assert_eq!(changed.3.ridealongs_held.as_deref(), Some("ownerStop"));
         assert!(super::super::admission::take_change(&session));
-        let persisted = load_store(&path).unwrap();
+        let persisted = repository.dump();
         assert_eq!(persisted.sessions[&session].admission.snapshot, changed.3);
         assert_eq!(serde_json::to_vec(&persisted.sessions["unrelated-session"]).unwrap(), other_before);
-        let stamp = crate::platform::file_stamp::FileStamp::of(&path);
+        let stamp = repository.db.read(|tx| tx.head(crate::store::spec("user-input"))).unwrap();
         assert_eq!(other.list_admission(&session).unwrap(), changed);
         // A cache reload may publish an advisory admission invalidation;
         // persistent state/revision must nevertheless remain unchanged.
-        assert_eq!(crate::platform::file_stamp::FileStamp::of(&path), stamp);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[ignore = "synthetic queue/list performance comparison; no live state"]
-    fn benchmark_queue_list_unchanged_large_identity_history() {
-        let root = std::env::temp_dir().join(format!("cutex-v2-list-bench-{}", Uuid::new_v4()));
-        let repository = UserInputRepository::open(&root).unwrap();
-        repository.mutate(|store| {
-            for session in 0..100 {
-                let state = store.sessions.entry(format!("session-{session}")).or_default();
-                for id in 0..100 {
-                    state.identities.insert(format!("client-{id}"), ClientInputIdentity {
-                        canonical_sha256: "a".repeat(64), first_seen_at: "2026-10-13T00:00:00Z".into(), delivery: None,
-                    });
-                }
-            }
-            Ok(())
-        }).unwrap();
-        repository.list_admission("session-0").unwrap();
-        let bytes = fs::read(root.join(USER_INPUT_STATE_FILE)).unwrap();
-        let start = std::time::Instant::now();
-        for _ in 0..20 {
-            // Exact former implementation, retained only in this opt-in test.
-            repository.ask_store().inspect(|asks| repository.mutate(|store| {
-                let state = store.sessions.entry("session-0".into()).or_default();
-                let admission = repository.sync_admission("session-0", state, asks)?;
-                Ok((state.queue_revision, positioned_items(state), state.pause.clone(), admission))
-            })).unwrap().unwrap();
-        }
-        let baseline = start.elapsed();
-        let start = std::time::Instant::now();
-        for _ in 0..20 { repository.list_admission("session-0").unwrap(); }
-        let optimized = start.elapsed();
-        assert_eq!(fs::read(root.join(USER_INPUT_STATE_FILE)).unwrap(), bytes);
-        eprintln!("queue_list_noop bytes={} identities=10000 iterations=20 baseline_ms={:.3} optimized_ms={:.3}",
-            bytes.len(), baseline.as_secs_f64() * 1000.0, optimized.as_secs_f64() * 1000.0);
+        assert_eq!(repository.db.read(|tx| tx.head(crate::store::spec("user-input"))).unwrap(), stamp);
+        drop(repository);
+        drop(other);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1479,7 +1737,7 @@ mod tests {
         }).unwrap();
         let initial = repository.list_admission(session).unwrap().3;
         assert_eq!(initial.items.len(), 2);
-        let path = root.join(USER_INPUT_STATE_FILE);
+        let path = root.join("owner-input.sqlite3");
         // Pin an old mtime so even a fast redundant atomic rewrite is visible.
         let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
         fs::OpenOptions::new().write(true).open(&path).unwrap()
@@ -1492,6 +1750,7 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), bytes);
             assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
         }
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1527,7 +1786,7 @@ mod tests {
         assert_eq!(full.items[0].id, resumed);
         assert_eq!(full.items.len(), 3);
         assert_eq!(full.next_step.len(), 1);
-        let path = root.join(USER_INPUT_STATE_FILE);
+        let path = root.join("owner-input.sqlite3");
         let bytes = fs::read(&path).unwrap();
         let snapshot = asks.snapshot().unwrap();
         let numbered = repository.numbered_admission_with_state(session, &snapshot).unwrap();
@@ -1536,6 +1795,7 @@ mod tests {
         assert!(numbered.next_step.is_empty());
         assert!(numbered.current_turn.is_none());
         assert_eq!(fs::read(&path).unwrap(), bytes);
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1577,6 +1837,7 @@ mod tests {
         }).unwrap();
         let sent_rows = repository.list_admission(&session).unwrap().3;
         assert_eq!((sent_rows.next_step[0].timing.as_str(), sent_rows.next_step[0].next_step_at.as_deref()), ("nextStep", Some(sent.as_str())));
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1622,6 +1883,7 @@ mod tests {
         let error = repository.move_admission_item(&session, &owner.queue_id,
             initial.order_revision, None, true).unwrap_err();
         assert!(error.downcast_ref::<QueueRevisionConflict>().is_some());
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1641,6 +1903,7 @@ mod tests {
         assert!(repository.needs_admission_poll().unwrap());
         asks.with_state(|state| { state.presence.get_mut(&session).unwrap().online = false; }).unwrap();
         assert!(!repository.needs_admission_poll().unwrap());
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1684,8 +1947,7 @@ mod tests {
         }).unwrap();
         let before = repository.list_admission(active).unwrap().3;
         let stable = repository.list_admission(untouched).unwrap().3;
-        let path = root.join(USER_INPUT_STATE_FILE);
-        let read_store = || serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap();
+        let read_store = || serde_json::to_value(repository.dump()).unwrap();
         let untouched_before = read_store()["sessions"][untouched].clone();
         assert_eq!(read_store()["sessions"][active]["admission"]["keys"].as_object().unwrap().len(), 2);
         crate::management::v2::admission::take_change(untouched);
@@ -1706,6 +1968,7 @@ mod tests {
         repository.remove(active, &owner.queue_id, owner.revision).unwrap();
         assert_eq!(read_store()["sessions"][active]["admission"]["keys"].as_object().unwrap().len(), 0);
         assert_eq!(read_store()["sessions"][untouched], untouched_before);
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1763,6 +2026,7 @@ mod tests {
             .expect("removed item");
         assert_eq!(removed.revision, 3);
         assert_eq!(repository.list("session-1").expect("empty list").0, 3);
+        drop(repository);
         fs::remove_dir_all(root).expect("remove repository");
     }
 
@@ -1846,6 +2110,134 @@ mod tests {
         assert!(reopened.pause_state("session-1").expect("still paused").is_some());
         reopened.remove("session-1", &second.queue_id, 1).expect("remove second");
         assert!(reopened.pause_state("session-1").expect("emptied").is_none());
+        drop(repository);
+        drop(reopened);
         fs::remove_dir_all(root).expect("remove repository");
+    }
+
+    fn ask_lock_is_free(dir: &Path) -> bool {
+        let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(dir.join("asks-v1.lock")).unwrap();
+        let free = fs2::FileExt::try_lock_exclusive(&lock).is_ok();
+        if free { fs2::FileExt::unlock(&lock).unwrap(); }
+        free
+    }
+
+    /// r274 fix (051): `list_admission` used to wait for the
+    /// user-input store lock inside `AskStore::inspect`, holding the ask
+    /// SHARED lock the whole time, so a queued ask writer blocked every later
+    /// reader behind it. The listing now waits without any ask lock; the
+    /// locked fallback (the former path) is shown holding it for contrast.
+    #[test]
+    fn list_admission_waits_for_the_user_input_lock_without_the_ask_lock() {
+        use crate::asks::store::tests::{new_ask, temp_store, TARGET};
+        use std::time::Duration;
+        let (asks, dir) = temp_store("list-no-ask-hold");
+        asks.with_state(|s| { s.create_ask(new_ask("first", "first"), Utc::now()).unwrap(); }).unwrap();
+        let holder = asks.queue_repository().unwrap();
+        holder.clear_session(TARGET).unwrap(); // the listing must write
+        let lister = asks.queue_repository().unwrap();
+        for locked_fallback in [false, true] {
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let (holder, lister) = (&holder, &lister);
+                scope.spawn(move || holder.db.write(|_| {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Ok(())
+                }).unwrap());
+                held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                scope.spawn(move || done_tx.send(if locked_fallback {
+                    lister.ask_store().inspect(|state| lister.list_admission_in(TARGET, state)).unwrap()
+                } else { lister.list_admission(TARGET) }).unwrap());
+                let waited = done_rx.recv_timeout(Duration::from_millis(300)).is_err();
+                let free = ask_lock_is_free(&dir);
+                release_tx.send(()).unwrap();
+                assert!(waited, "the listing must wait for the held user-input lock");
+                if locked_fallback {
+                    assert!(!free, "the locked fallback keeps the ask -> user-input order");
+                } else {
+                    assert!(free, "list_admission held the ask lock while waiting for the user-input lock");
+                }
+                let (_, _, _, admission) = done_rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+                assert!(admission.items.iter().any(|item| item.kind == "ask"));
+            });
+            holder.clear_session(TARGET).unwrap();
+        }
+    }
+
+    /// Ordering: a projection computed from an AskState snapshot older than
+    /// the one an owner sync (`sync_asks`) already wrote is never committed.
+    #[test]
+    fn stale_ask_snapshot_never_replaces_a_newer_admission() {
+        use crate::asks::store::tests::{new_ask, temp_store, TARGET};
+        let (asks, _) = temp_store("list-stale-snapshot");
+        let queue = asks.queue_repository().unwrap();
+        asks.with_state(|s| { s.create_ask(new_ask("first", "first"), Utc::now()).unwrap(); }).unwrap();
+        queue.list_admission(TARGET).unwrap();
+        let stale = asks.shared().unwrap();
+        let ids = |admission: &super::super::admission::AdmissionSnapshot| admission.items.iter()
+            .map(|item| item.id.clone()).collect::<Vec<_>>();
+
+        // Prepared while the state is current, committed after a newer one.
+        queue.clear_session(TARGET).unwrap(); // make the stale listing a write
+        let early = queue.prepare_list_admission(TARGET, &stale).unwrap();
+        let second = asks.with_state(|s| s.create_ask(new_ask("second", "second"), Utc::now()).unwrap().0.ask_id).unwrap();
+        let synced = queue.read(|store| Ok(store.sessions[TARGET].admission_asks_revision)).unwrap();
+        assert_eq!(synced, stale.revision + 1, "the owner sync stamps the revision it commits");
+        assert!(queue.commit_list_admission(TARGET, early).unwrap().is_none());
+        // Prepared from the old snapshot after the newer admission was written.
+        let late = queue.prepare_list_admission(TARGET, &stale).unwrap();
+        assert!(queue.commit_list_admission(TARGET, late).unwrap().is_none());
+        let committed = queue.list_admission_committed(TARGET).unwrap().3;
+        assert!(ids(&committed).contains(&second), "the newer admission survives");
+
+        // The fresh listing commits and keeps both asks in order.
+        let fresh = queue.list_admission(TARGET).unwrap().3;
+        assert_eq!(ids(&fresh).iter().filter(|id| **id == second).count(), 1);
+        assert_eq!(fresh.items.len(), 2);
+        let stamped = queue.read(|store| Ok(store.sessions[TARGET].admission_asks_revision)).unwrap();
+        assert!(stamped >= synced);
+    }
+
+    /// A concurrent queue change to the session between the lock-free
+    /// projection and its write refuses the write; the retry sees it.
+    #[test]
+    fn list_admission_refuses_a_projection_over_a_changed_queue() {
+        use crate::asks::store::tests::{new_ask, temp_store, TARGET};
+        let (asks, _) = temp_store("list-changed-queue");
+        let queue = asks.queue_repository().unwrap();
+        asks.with_state(|s| { s.create_ask(new_ask("first", "first"), Utc::now()).unwrap(); }).unwrap();
+        queue.clear_session(TARGET).unwrap();
+        let snapshot = asks.shared().unwrap();
+        let prepared = queue.prepare_list_admission(TARGET, &snapshot).unwrap();
+        let owner = match queue.enqueue(TARGET, "thread", "request", &params("owner")).unwrap() {
+            QueueEnqueueDecision::Queued(item) => item,
+            _ => panic!("queued"),
+        };
+        assert!(queue.commit_list_admission(TARGET, prepared).unwrap().is_none());
+        let (_, items, _, admission) = queue.list_admission(TARGET).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(admission.items.iter().any(|item| item.kind == "owner" && item.id == owner.queue_id));
+        assert!(admission.items.iter().any(|item| item.kind == "ask"));
+    }
+
+    /// An owner sync whose commit failed leaves a stamp ahead of the committed
+    /// AskState; the locked fallback lowers it, so listings stay fresh.
+    #[test]
+    fn list_admission_recovers_from_a_stamp_ahead_of_the_committed_asks() {
+        use crate::asks::store::tests::{new_ask, temp_store, TARGET};
+        let (asks, _) = temp_store("list-stamp-ahead");
+        let queue = asks.queue_repository().unwrap();
+        asks.with_state(|s| { s.create_ask(new_ask("first", "first"), Utc::now()).unwrap(); }).unwrap();
+        queue.mutate(|store| { store.sessions.get_mut(TARGET).unwrap().admission_asks_revision = 1_000; Ok(()) }).unwrap();
+        let admission = queue.list_admission(TARGET).unwrap().3;
+        assert!(admission.items.iter().any(|item| item.kind == "ask"));
+        let revision = asks.shared().unwrap().revision;
+        assert_eq!(queue.read(|store| Ok(store.sessions[TARGET].admission_asks_revision)).unwrap(), revision);
+        // Back on the lock-free path: an unchanged listing is a pure read.
+        assert!(queue.commit_list_admission(TARGET, queue.prepare_list_admission(TARGET, &asks.shared().unwrap()).unwrap()).unwrap().is_some());
     }
 }

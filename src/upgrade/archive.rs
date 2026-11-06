@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, ensure, Context};
 
 const BLOCK: usize = 512;
-pub const MAX_ENTRIES: usize = 20_000;
+// Accommodate dependency-rich component payloads while keeping a finite entry budget.
+pub const MAX_ENTRIES: usize = 100_000;
 pub const MAX_TOTAL_BYTES: u64 = 4 << 30;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -340,6 +341,62 @@ mod tests {
 
     fn temp() -> PathBuf {
         std::env::temp_dir().join(format!("cutex-archive-{}", uuid::Uuid::new_v4().simple()))
+    }
+
+    fn check_entry_budget(count: usize, allowed: bool) {
+        // Directories count against the parser budget but are absent from Vec<Entry>.
+        // Reuse one directory to avoid creating 100k filesystem objects; a final file
+        // proves we reached the last header, or rejected it before writing anything.
+        let mut items: Vec<_> = (0..count - 1).map(|_| Item::Dir("packages")).collect();
+        items.push(Item::File { path: "last-entry", data: b"", mode: 0o644 });
+        let bytes = tar_gz(&items);
+        let dest = temp();
+        let result = unpack_tar_gz(&bytes[..], &dest);
+        if allowed {
+            let entries = result.expect("archive within the entry budget");
+            assert_eq!(entries, vec![Entry { path: "last-entry".into(), size: 0, executable: false }]);
+            assert!(dest.join("packages").is_dir());
+            assert_eq!(std::fs::read(dest.join("last-entry")).unwrap(), b"");
+            assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 2);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("too many entries"));
+            assert!(!dest.join("last-entry").exists(), "over-budget header must not be written");
+            assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+        }
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn accepts_component_archive_with_63710_entries() {
+        check_entry_budget(63_710, true);
+    }
+
+    #[test]
+    fn accepts_exactly_100000_entries() {
+        assert_eq!(MAX_ENTRIES, 100_000);
+        check_entry_budget(100_000, true);
+    }
+
+    #[test]
+    fn refuses_100001_entries_before_writing_the_last_entry() {
+        check_entry_budget(100_001, false);
+    }
+
+    #[test]
+    fn expanded_size_limit_remains_four_gib() {
+        assert_eq!(MAX_TOTAL_BYTES, 4 << 30);
+        // A valid header claiming >4 GiB is rejected before opening a file or
+        // reading its payload, so this regression test needs no large allocation.
+        let mut bytes = super::writer::tar(&[Item::File { path: "too-big", data: b"", mode: 0o644 }]);
+        bytes[124..135].copy_from_slice(format!("{:011o}", MAX_TOTAL_BYTES + 1).as_bytes());
+        bytes[148..156].fill(b' ');
+        let checksum: u64 = bytes[..BLOCK].iter().map(|b| *b as u64).sum();
+        bytes[148..155].copy_from_slice(format!("{checksum:06o}\0").as_bytes());
+        let dest = temp();
+        let error = unpack_tar(&bytes[..], &dest).unwrap_err();
+        assert!(error.to_string().contains("archive expands beyond the size limit"), "{error:#}");
+        assert!(!dest.join("too-big").exists());
+        std::fs::remove_dir_all(dest).unwrap();
     }
 
     #[test]

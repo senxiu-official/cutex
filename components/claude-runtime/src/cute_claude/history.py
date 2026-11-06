@@ -3,6 +3,7 @@ import base64
 import json
 
 from . import __version__
+from . import history_order
 from .errors import RpcError, require
 from .store import dump
 from .transport import MAX_RESPONSE
@@ -55,6 +56,8 @@ def thread_wire(store, history, tid, *, include_turns=False, effort=None, status
 class History:
     def __init__(self, store, *, read_only=False):
         self.store = store
+        # Detect once; read-only readers never create tables, indexes or leases.
+        self.item_order = history_order.available(store.db)
         if read_only:
             return
         # Keyset queries seek by stable order; no repeated full-history parsing.
@@ -79,13 +82,22 @@ class History:
         order = 'ASC' if direction == 'asc' else 'DESC'
         args = [tid]
         if items:
-            sql = 'SELECT i.seq,i.turn_id,i.payload FROM items i JOIN turns t ON t.id=i.turn_id WHERE t.thread_id=? AND ' + self.store.visible_turns_filter('t.')
+            projected = self.item_order and turn_id is None
+            if projected:
+                # CROSS JOIN fixes the visible range as the outer loop. A
+                # reverted prefix must not cause a canonical-item scan/sort.
+                sql = ('SELECT i.seq,i.turn_id,i.payload FROM history_item_order p '
+                       'CROSS JOIN items i ON i.seq=p.seq WHERE p.thread_id=?')
+            else:
+                # Explicit old/offline DB compatibility; per-turn seeks stay
+                # on their existing (turn_id,seq) index and visibility check.
+                sql = 'SELECT i.seq,i.turn_id,i.payload FROM items i JOIN turns t ON t.id=i.turn_id WHERE t.thread_id=? AND ' + self.store.visible_turns_filter('t.')
             if turn_id is not None:
                 sql += ' AND i.turn_id=?'; args.append(turn_id)
             if key is not None:
                 require(type(key) is int and key > 0, 'invalid item cursor')
-                sql += f' AND i.seq {op} ?'; args.append(key)
-            sql += f' ORDER BY i.seq {order} LIMIT ?'
+                sql += f' AND {"p" if projected else "i"}.seq {op} ?'; args.append(key)
+            sql += f' ORDER BY {"p" if projected else "i"}.seq {order} LIMIT ?'
         else:
             sql = 'SELECT id,started FROM turns WHERE thread_id=? AND ' + self.store.visible_turns_filter()
             if key is not None:

@@ -4,7 +4,7 @@ The open adapter owns RPC, FIFO inbox and host tool execution. The unmodified
 selected official runtime owns inference/authentication/native context. Local history
 is an audit projection, never replayed as a native Claude transcript.
 
-Public SDK API target: claude-agent-sdk 0.2.166. No credentials are extracted.
+Public SDK API target: claude-agent-sdk 0.2.175. No credentials are extracted.
 """
 from __future__ import annotations
 
@@ -24,10 +24,11 @@ from .engine import Engine
 from .errors import RpcError
 from .provider import ProviderError
 from .store import COMPACT_EVENT, Store, dump, identifier
+from . import usage_totals
 from .tools import ToolContext, ToolRegistry, ToolResult
 from .browser_content import BROWSER_TOOLS, journal_result
 from .subscription_auth import ApiAccount, resolve_config_dir
-from .sdk_runtime import RuntimeOwner, TurnInterrupted, OutcomeUncertain, system_prompt_option
+from .sdk_runtime import RuntimeOwner, TurnInterrupted, OutcomeUncertain, system_prompt_option, file_backed_system_prompt
 from .inputs import sdk_user_message
 from .side_chats import BOUNDARY_BLOCKS as SIDE_BOUNDARY_BLOCKS
 from .model_config import ModelConfig
@@ -42,11 +43,12 @@ from .native_tools import (COMMAND_TOOLS, EDIT_TOOLS, OWNER_DECLINED, OWNER_STOP
 from .safety_grants import BLOCKED_EVENT, UPDATED_EVENT
 from . import permission_rules
 from .approvals import is_allowed
+from .tool_gate import ENDED as GATE_ENDED, EXPIRED as GATE_EXPIRED, HOOK_TIMEOUT
 
 # Largest single message read from Claude Code (SDK `max_buffer_size`; its default is 1 MiB).
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
-SDK_TARGET = '0.2.166'
+SDK_TARGET = '0.2.175'
 SERVER_NAME = 'cutex'
 CALL_FIELD = '_cutex_invocation'
 # Tools a subagent may use in plan mode (besides MCP tools).
@@ -448,18 +450,21 @@ class OfficialSdkDriver:
             if not notes:
                 return result
             if busy:
-                engine.busy_delivery.offered(tid, binding[0])
+                engine.busy_delivery.offered(tid, binding[0], call_id=call_id, context=notes,
+                    bridge=bridge, hook_name=f"PostToolUse:{data.get('tool_name', '')}")
             return {'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': notes}}
         thread = engine.store.thread(tid)
         connectors = engine.settings.claude_ai_connectors and self.api_account is None
         system_prompt, bridge.prompt_digest = system_prompt_option(
             engine.store, tid, engine.settings.preset_append(thread['instructions'], permission_mode(engine, tid)), resume)
+        system_prompt, prompt_args = file_backed_system_prompt(
+            system_prompt, engine.settings.state_dir / 'system-prompts', tid)
         options = self.sdk.ClaudeAgentOptions(
             cli_path=str(self.cli), cwd=str(engine.settings.workspace), model=thread['model'],
             effort=engine.thread_effort(tid), thinking=ModelConfig(engine.settings).thinking(),
             tools={'type':'preset','preset':'claude_code'}, disallowed_tools=exclusions(engine.settings), allowed_tools=[f'mcp__{SERVER_NAME}__{tool.name}' for tool in engine.tools.tools.values() if tool.read_only],
             permission_mode=engine.permissions.effective_mode(tid),
-            extra_args={'allow-dangerously-skip-permissions': None, 'replay-user-messages': None},
+            extra_args={'allow-dangerously-skip-permissions': None, 'replay-user-messages': None, **prompt_args},
             # One NDJSON message can carry a whole tool result: a screenshot or a large file read is easily
             # over the SDK's 1 MiB default, which ended the turn with CLIJSONDecodeError (2026-10-19).
             max_buffer_size=MAX_MESSAGE_BYTES,
@@ -471,7 +476,8 @@ class OfficialSdkDriver:
             # calls it for AskUserQuestion and for its safety checks (NativeTools.approve declines those).
             # Settings sources are the profile's opt-in (project / user = the account home); plugins stay off.
             setting_sources=list(engine.settings.setting_sources), plugins=[], can_use_tool=permission_request,
-            hooks={'PreToolUse': [self.sdk.HookMatcher(hooks=[bridge.pre_tool])],
+            # A paused agent holds its next tool call in this hook (tool_gate.py): a long timeout, not the CLI's 600 s.
+            hooks={'PreToolUse': [self.sdk.HookMatcher(hooks=[bridge.pre_tool], timeout=HOOK_TIMEOUT)],
                    'PostToolUse': [self.sdk.HookMatcher(hooks=[post_tool])],
                    'PostToolUseFailure': [self.sdk.HookMatcher(hooks=[bridge.native.post])],
                    'SubagentStart': [self.sdk.HookMatcher(hooks=[bridge.subagent_start])],
@@ -632,12 +638,26 @@ class SdkToolBridge:
             return self.denied('Tool is not enabled by this runtime configuration')
         if external and not external_mcp_allowed(self.engine.settings, *external):
             return self.denied('This MCP tool is turned off for this agent')
+        held = await self.hold_at_gate(call_id, name, agent_id, None)
+        if held is not None:
+            return held
         while len(self.background_calls) >= 4096:
             self.background_calls.pop(next(iter(self.background_calls)))
         self.background_calls[call_id] = agent_id
         if getattr(self.engine, 'subagents', None) is not None:
             await self.engine.subagents.child_tool(agent_id, call_id)
         return {}
+
+    async def hold_at_gate(self, call_id: str, name: str, agent_id: str | None, binding) -> dict | None:
+        """Agent pause at the tool boundary (tool_gate.py); None lets the call go on."""
+        gate = getattr(self.engine, 'tool_gate', None)
+        if gate is None or not gate.closed(self.tid):
+            return None
+        if not await gate.wait(self.tid, call_id, name, agent_id, binding[0] if binding else None):
+            return self.denied(GATE_EXPIRED)
+        if binding is not None and (not self.accepting or self.binding != binding):
+            return self.denied(GATE_ENDED)
+        return None
 
     def permission_context_valid(self, call_id, agent_id) -> bool:
         if not self.accepting or call_id not in self.call_agents:
@@ -710,6 +730,10 @@ class SdkToolBridge:
         if agent_id and self.engine.permissions.planning(self.tid) and full_name not in PLAN_SUBAGENT_TOOLS \
                 and not full_name.startswith('mcp__'):
             return self.denied('Plan mode allows read-only subagent tools')
+        # Identity checked, nothing started yet: a paused agent waits here (no item, no grant).
+        held = await self.hold_at_gate(call_id, full_name, agent_id, binding)
+        if held is not None:
+            return held
         if full_name == 'AskUserQuestion':
             args = data.get('tool_input', {})
             call_id = tool_use_id or data.get('tool_use_id')
@@ -918,7 +942,7 @@ class SubscriptionEngine(Engine):
         row = self.store.db.execute('SELECT usage FROM turns WHERE id=?', (turn_id,)).fetchone()
         record = json.loads(row[0]) if row and row[0] else {}
         calls = list(record.get('modelRequests') or []) + entries
-        self.store.db.execute('UPDATE turns SET usage=? WHERE id=?', (dump({**record, 'modelRequests': calls}), turn_id))
+        usage_totals.write_turn_usage(self.store, turn_id, {**record, 'modelRequests': calls})
         await self._emit_usage(tid, turn_id, calls, keep_last=True)
 
     def ensure_launch_thread(self, tid: str, model: str, cwd: str, instructions: str) -> bool:
@@ -1403,8 +1427,18 @@ class SubscriptionEngine(Engine):
                     self.store.put_item(turn_id, last_item)
                     await self.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': last_item})
                 await self.busy_delivery.acknowledge(tid, turn_id)
+                # Passive notes used to inherit a broad turn-wide ACK. Keep
+                # their successful-terminal proof explicit now that each ACK
+                # confirms only the named input, including early hook receipts.
+                for note in self.store.db.execute("""SELECT message_id,payload FROM notes WHERE thread_id=? AND turn_id=? AND state='injected'
+                    AND NOT EXISTS(SELECT 1 FROM external_inputs e WHERE e.thread_id=notes.thread_id
+                        AND e.message_id=notes.message_id AND e.receipt IS NOT NULL)""", (tid, turn_id)).fetchall():
+                    await self.emit(tid, 'claude/input/contextPersisted', {
+                        'threadId': tid, 'turnId': turn_id, 'messageId': note['message_id'],
+                        'clientId': json.loads(note['payload']).get('clientId')})
                 await self.emit(tid, 'claude/input/contextPersisted', {
-                    'threadId': tid, 'turnId': turn_id, 'messageId': record['message_id']})
+                    'threadId': tid, 'turnId': turn_id, 'messageId': record['message_id'],
+                    'clientId': json.loads(record['payload']).get('clientId')})
 
         try:
             await self.emit(tid, 'turn/started', {'threadId': tid, 'turn': self.store.turn(turn_id, include_items=False)})
@@ -1464,7 +1498,6 @@ class SubscriptionEngine(Engine):
                     f'Official Claude could not refresh its login token: another Claude Code process using this account '
                     f'kept the refresh lock. The input was sent again {attempt} time(s) without success; send it again '
                     f'later or check the login (cutex human claude account status).',)
-            await self.metrics.refresh_context(tid)
             if terminal_failure:
                 raise terminal_failure if isinstance(terminal_failure, SdkResponseError) else ProviderError(terminal_failure)
             if not got_result:
@@ -1495,6 +1528,14 @@ class SubscriptionEngine(Engine):
             await self.emit(tid, 'turn/completed', {'threadId': tid, 'turn': self.store.turn(turn_id)})
             await self.emit(tid, 'thread/status/changed', {'threadId': tid, 'status': {'type': 'idle'}})
             await self.emit(tid, 'claude/input/statusChanged', self.store.input_status(tid, record['message_id']))
+
+        # Observational reads must not delay terminal events or change the saved
+        # outcome. Keep this serialized with the worker rather than introducing
+        # an untracked background read overlapping its next query.
+        try:
+            await self.metrics.refresh_context(tid, expected_turn_id=turn_id)
+        except Exception:
+            pass
 
 
 def usage_counts(usage: dict) -> dict:

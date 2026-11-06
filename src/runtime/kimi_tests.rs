@@ -34,7 +34,7 @@ fn record(cwd: &Path, session: DshSession) -> CutexSessionRecord {
 }
 
 fn env_options(name: &str) -> KimiOptions {
-    KimiOptions { credential: KimiCredentialSource::Env { env_name: name.into(), base_url: "https://api.kimi.com/coding/v1".into() }, models: Vec::new() }
+    KimiOptions { rg: None, credential: KimiCredentialSource::Env { env_name: name.into(), base_url: "https://api.kimi.com/coding/v1".into() }, models: Vec::new() }
 }
 
 #[test]
@@ -53,7 +53,7 @@ fn dsh_records_stay_byte_identical_and_kimi_bindings_round_trip() {
     assert_eq!(wire["flavor"], "kimi");
     assert_eq!(wire["kimi"]["credential"], json!({"source": "env", "env_name": "KIMI_TEST_KEY", "base_url": "https://api.kimi.com/coding/v1"}));
     assert_eq!(serde_json::from_value::<DshSession>(wire).unwrap(), kimi);
-    let profile = KimiOptions { credential: KimiCredentialSource::Profile, models: Vec::new() };
+    let profile = KimiOptions { rg: None, credential: KimiCredentialSource::Profile, models: Vec::new() };
     assert_eq!(serde_json::to_value(&profile).unwrap(), json!({"credential": {"source": "profile"}}));
     // The record's runtime backend serializes as "kimi" and parses back.
     let record = record(&state, kimi);
@@ -216,7 +216,7 @@ fn a_profile_api_key_launch_uses_the_profile_resolver_and_the_stored_key() {
     let state = temp("profile");
     let cwd = temp("profile-cwd");
     std::fs::create_dir_all(cwd.join(".git")).unwrap();
-    let mut record = record(&cwd, binding(&state, KimiOptions { credential: KimiCredentialSource::Profile, models: Vec::new() }));
+    let mut record = record(&cwd, binding(&state, KimiOptions { rg: None, credential: KimiCredentialSource::Profile, models: Vec::new() }));
     record.profile_binding = Some(bound);
     let parts = write_home(&record).unwrap();
     assert_eq!(parts.secret_env, Some((KIMI_KEY_ENV.to_string(), "sk-fake-r266-kimi-a".to_string())));
@@ -295,9 +295,9 @@ fn launch_options_are_validated() {
     validate_options(&env_options("KIMI_API_KEY")).unwrap();
     assert!(validate_options(&env_options("lower")).is_err());
     assert!(validate_options(&env_options(KIMI_KEY_ENV)).is_err(), "the child's carrier name is reserved");
-    let plain = KimiOptions { credential: KimiCredentialSource::Env { env_name: "K".into(), base_url: "http://example.com".into() }, models: Vec::new() };
+    let plain = KimiOptions { rg: None, credential: KimiCredentialSource::Env { env_name: "K".into(), base_url: "http://example.com".into() }, models: Vec::new() };
     assert!(validate_options(&plain).is_err());
-    let loopback = KimiOptions { credential: KimiCredentialSource::Env { env_name: "K".into(), base_url: "http://127.0.0.1:9/v1".into() }, models: Vec::new() };
+    let loopback = KimiOptions { rg: None, credential: KimiCredentialSource::Env { env_name: "K".into(), base_url: "http://127.0.0.1:9/v1".into() }, models: Vec::new() };
     assert_eq!(validate_options(&loopback).is_ok(), cfg!(debug_assertions));
 }
 
@@ -340,4 +340,85 @@ fn a_cutex_scratch_workspace_is_pinned_as_kimis_project_but_owner_folders_are_no
         assert!(check_project_root(dir).is_err());
     }
     std::fs::remove_dir_all(base).unwrap();
+}
+
+
+#[test]
+fn legacy_kimi_deployment_and_options_omit_absent_rg() {
+    let wire = json!({
+        "node": "/fixture/node", "adapter": "/fixture/adapter/src/server.mjs",
+        "kimi_cli": "/fixture/install/node_modules/@moonshot-ai/kimi-code/dist/main.mjs",
+        "install_root": "/fixture/install", "version": PINNED_KIMI_VERSION,
+    });
+    let deployment: KimiDeployment = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(deployment.rg, None);
+    assert_eq!(serde_json::to_value(&deployment).unwrap(), wire);
+    let wire = json!({"credential": {"source": "profile"}});
+    let options: KimiOptions = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(options.rg, None);
+    assert_eq!(serde_json::to_value(&options).unwrap(), wire);
+}
+
+#[test]
+fn session_rg_survives_serialization_and_precedes_current_path() {
+    let root = temp("pinned-rg-path");
+    let pinned_rg = root.join("old rg tools").join(if cfg!(windows) { "rg.exe" } else { "rg" });
+    let replacement = root.join("new global tools");
+    let system = root.join("system bin");
+    let mut options = env_options("KIMI_TEST_KEY");
+    options.rg = Some(pinned_rg.clone());
+    let original = binding(&root, options);
+    let wire = serde_json::to_value(&original).unwrap();
+    assert_eq!(wire["kimi"]["rg"], json!(pinned_rg));
+    assert!(wire.get("rg").is_none(), "rg belongs to Kimi options, not the shared DshSession schema");
+    let session: DshSession = serde_json::from_value(wire).unwrap();
+    let inherited = std::env::join_paths([&replacement, &system]).unwrap().into_string().unwrap();
+    let mut env = std::collections::BTreeMap::from([
+        ("Path".to_string(), inherited),
+        ("KIMI_INSTALL_ROOT".to_string(), "/session-pinned/install".to_string()),
+    ]);
+    crate::runtime::dsh::prepend_kimi_rg_path(&session, &mut env).unwrap();
+    assert!(!env.contains_key("Path"));
+    assert_eq!(std::env::split_paths(&env["PATH"]).collect::<Vec<_>>(),
+               vec![pinned_rg.parent().unwrap().to_path_buf(), replacement, system]);
+    assert_eq!(env["KIMI_INSTALL_ROOT"], "/session-pinned/install");
+}
+
+#[test]
+fn legacy_kimi_without_rg_preserves_path_exactly() {
+    let root = temp("legacy-rg-path");
+    let session = binding(&root, env_options("KIMI_TEST_KEY"));
+    let before = std::collections::BTreeMap::from([
+        ("PATH".to_string(), "unchanged PATH".to_string()),
+        ("Path".to_string(), "unchanged Path".to_string()),
+    ]);
+    let mut env = before.clone();
+    crate::runtime::dsh::prepend_kimi_rg_path(&session, &mut env).unwrap();
+    assert_eq!(env, before);
+    let mut dsh = session.clone();
+    dsh.flavor = AcpFlavor::Dsh;
+    dsh.kimi.as_mut().unwrap().rg = Some(root.join("rg"));
+    crate::runtime::dsh::prepend_kimi_rg_path(&dsh, &mut env).unwrap();
+    assert_eq!(env, before, "DSH does not inherit the Kimi-only PATH binding");
+}
+
+#[test]
+fn kimi_rg_path_prefers_canonical_path_and_refuses_relative_pin() {
+    let root = temp("rg-path-key");
+    let mut session = binding(&root, env_options("KIMI_TEST_KEY"));
+    let pinned = root.join("pinned tools/rg");
+    session.kimi.as_mut().unwrap().rg = Some(pinned.clone());
+    let canonical = root.join("canonical inherited");
+    let other = root.join("other inherited");
+    let mut env = std::collections::BTreeMap::from([
+        ("PATH".to_string(), canonical.to_string_lossy().into_owned()),
+        ("Path".to_string(), other.to_string_lossy().into_owned()),
+    ]);
+    crate::runtime::dsh::prepend_kimi_rg_path(&session, &mut env).unwrap();
+    assert_eq!(std::env::split_paths(&env["PATH"]).collect::<Vec<_>>(),
+               vec![pinned.parent().unwrap().to_path_buf(), canonical]);
+    session.kimi.as_mut().unwrap().rg = Some("relative/rg".into());
+    let before = env.clone();
+    assert!(crate::runtime::dsh::prepend_kimi_rg_path(&session, &mut env).is_err());
+    assert_eq!(env, before, "an invalid pin does not partially change launch PATH");
 }

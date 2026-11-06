@@ -65,9 +65,11 @@ impl Server {
                 }
                 seen.lock().unwrap().push(req.clone());
                 let result = match m {
-                    "initialize" => json!({}),
+                    "initialize" => if mode == "legacy" { json!({}) } else { json!({"externalInputVersions":[1,2]}) },
                     "thread/externalInput/resume" => json!({}),
                     "thread/externalInput/submit" => {
+                        assert_eq!(req["params"]["version"], e.version);
+                        assert_eq!(req["params"]["view"], serde_json::to_value(&e.view).unwrap());
                         assert_eq!(req["params"]["message"]["text"], "Continue.");
                         assert_eq!(req["params"]["admission"], "exclusive_turn");
                         assert_eq!(req["params"]["message"]["id"], e.message.id);
@@ -146,6 +148,44 @@ fn fixture() -> (Store, AskStore, String, Plan) {
 }
 fn due(p: &Plan) -> chrono::DateTime<Utc> {
     p.at.parse().unwrap()
+}
+
+#[test]
+fn continuation_has_digest_bound_typed_view_of_failed_turn_at_send() {
+    let (_, _, session, plan) = fixture();
+    let frozen = envelope(&session, &plan);
+    frozen.validate().unwrap();
+    assert_eq!(frozen.version, 2);
+    assert_eq!(frozen.message.source.kind, SourceKind::Service);
+    assert_eq!(frozen.message.source.id, "cutex-model-overload-retry");
+    assert_eq!(frozen.message.event_type, "model_overload_continue");
+    let view = frozen.view.as_ref().unwrap();
+    assert_eq!(view.schema, "cutex.model-overload-retry.v1");
+    assert_eq!(view.data, json!({"failedTurnId":"original","attempt":1,"maxAttempts":3,"planId":plan.plan_id}));
+    let mut running = plan.clone(); running.turn_id = "continued".into(); running.phase = Phase::Running;
+    assert_eq!(retry::retry_evidence(&running, Some("continued"))["failedTurnId"], "original");
+    assert_eq!(view.data["failedTurnId"], "original");
+    let mut altered = frozen.clone(); altered.view.as_mut().unwrap().data["attempt"] = json!(2);
+    assert_ne!(altered.digest(), frozen.semantic_sha256);
+    assert!(altered.validate().is_err());
+    let mut legacy = plan; legacy.envelope_version = 1;
+    let old = envelope(&session, &legacy);
+    old.validate().unwrap();
+    assert!(old.view.is_none());
+}
+
+#[test]
+fn old_pinned_runtime_keeps_retry_without_structured_view_and_freezes_v1_identity() {
+    let (store, asks, session, plan) = fixture();
+    let mut legacy = plan.clone(); legacy.envelope_version = 1;
+    let server = Server::start("legacy", envelope(&session, &legacy));
+    fire(&store, &asks, &session, &plan, due(&plan), |_| Ok(server.client.handle())).unwrap();
+    assert_eq!(server.count("thread/externalInput/submit"), 1);
+    let running = store.snapshot().unwrap().sessions[&session].plan.clone().unwrap();
+    assert_eq!(running.phase, Phase::Running);
+    assert_eq!(running.envelope_version, 1);
+    assert_eq!(running.message_id, plan.message_id);
+    server.finish();
 }
 
 #[test]

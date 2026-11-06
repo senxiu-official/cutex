@@ -643,6 +643,10 @@ pub(crate) fn cmd_management_serve(
         eprintln!("shared journal watcher warning: {error:#}");
     }
     cutex::management::v2::health::start_scan();
+    // r271: owner inputs held behind a busy host authority fence.
+    if let Err(error) = super::owner_admission::spawn() {
+        eprintln!("owner admission worker warning: {error:#}");
+    }
     // Asks (委托): admission scheduler and Management v2 ask events.
     if let Err(error) = super::asks_runtime::spawn_scheduler() {
         eprintln!("asks scheduler warning: {error:#}");
@@ -684,6 +688,7 @@ pub(crate) fn cmd_management_serve(
     }
     cutex::management::v2::profile_quota_native::start_refresher();
     cutex::management::v2::usage::catalog::start_refresher();
+    cutex::management::v2::usage::start_index_catch_up();
     cutex::management::v2::usage::external::start_scanner();
     cutex::management::v2::owner_rotation_api::start_driver(management_context::management_request_context());
     // Workflow runs (approvals, Agent Bus submissions, drivers, retention).

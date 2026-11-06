@@ -9,6 +9,31 @@
 
 use std::sync::{Condvar, Mutex, MutexGuard};
 
+thread_local! {
+    /// Live reservations owned by this thread (any lane, nesting counted).
+    static LANES_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The dedicated owner admission worker may only TRY a lane (r271 lock
+    /// protocol): waiting on a lane while it may hold the host authority
+    /// fence would invert lifecycle's fence -> lane order.
+    static TRY_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread owns any session lane reservation. The host authority
+/// fence must never be awaited while this is true (debug guard in
+/// `AgentManagementStore::lock_mutations`).
+pub fn thread_holds_lane() -> bool {
+    LANES_HELD.with(|held| held.get() > 0)
+}
+
+/// Mark the current thread as lane try-only (the owner admission worker).
+pub fn set_thread_lane_try_only(try_only: bool) {
+    TRY_ONLY.with(|flag| flag.set(try_only));
+}
+
+fn note_lane_acquired() {
+    LANES_HELD.with(|held| held.set(held.get().saturating_add(1)));
+}
+
 /// The single process-local lane registry shared by HTTP, input, lifecycle and
 /// registration fences. Resolve aliases to durable session IDs before calling.
 pub fn session_lane(session: &str) -> anyhow::Result<std::sync::Arc<OperationLane>> {
@@ -89,6 +114,7 @@ impl OperationLane {
     /// FIFO admission. Condvar::wait releases the metadata mutex while queued.
     /// The returned reservation contains no MutexGuard; callers may do IO.
     pub fn reserve(&self) -> Result<OperationReservation<'_>, ReservationError> {
+        super::input_ledger::assert_ledger_lock_not_held("a session lane");
         let mut state = self.state()?;
         if state.poisoned {
             return Err(ReservationError::Poisoned);
@@ -98,11 +124,19 @@ impl OperationLane {
                 .depth
                 .checked_add(1)
                 .ok_or(ReservationError::Exhausted)?;
+            note_lane_acquired();
             return Ok(OperationReservation {
                 lane: self,
                 token: state.active.expect("owner has token"),
                 _thread_bound: std::marker::PhantomData,
             });
+        }
+        if cfg!(debug_assertions)
+            && TRY_ONLY.with(|flag| flag.get())
+            && (state.active.is_some() || state.next != state.serving)
+        {
+            drop(state); // never poison the lane metadata
+            panic!("r271 lock protocol: the owner admission worker may only try a session lane");
         }
         let token = state.next;
         state.next = state
@@ -121,11 +155,17 @@ impl OperationLane {
         state.active = Some(token);
         state.owner = Some(std::thread::current().id());
         state.depth = 1;
+        note_lane_acquired();
         Ok(OperationReservation {
             lane: self,
             token,
             _thread_bound: std::marker::PhantomData,
         })
+    }
+
+    /// Whether the calling thread owns this lane (a `reserve` would nest).
+    pub fn held_by_current_thread(&self) -> bool {
+        self.state().is_ok_and(|state| state.owner == Some(std::thread::current().id()) && state.depth > 0)
     }
 
     /// Compatibility entrypoint for callers migrating from session_input_lock.
@@ -134,6 +174,7 @@ impl OperationLane {
     }
 
     pub fn try_lock(&self) -> Result<OperationReservation<'_>, ReservationError> {
+        super::input_ledger::assert_ledger_lock_not_held("a session lane");
         let mut state = self.state()?;
         if state.poisoned {
             return Err(ReservationError::Poisoned);
@@ -149,6 +190,7 @@ impl OperationLane {
         state.active = Some(token);
         state.owner = Some(std::thread::current().id());
         state.depth = 1;
+        note_lane_acquired();
         Ok(OperationReservation {
             lane: self,
             token,
@@ -190,6 +232,7 @@ impl OperationReservation<'_> {
 
 impl Drop for OperationReservation<'_> {
     fn drop(&mut self) {
+        LANES_HELD.with(|held| held.set(held.get().saturating_sub(1)));
         // Poison is fail-closed as with the previous mutex: unwinding through
         // native/store IO cannot authorize the next mutation as a safe retry.
         let mut state = self
@@ -249,6 +292,38 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    /// r271 guard (b): the owner admission worker only tries lanes.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn try_only_thread_panics_instead_of_waiting_for_a_lane() {
+        let lane = session_lane(&uuid::Uuid::new_v4().to_string()).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let lane = lane.clone();
+            std::thread::spawn(move || {
+                let _held = lane.reserve().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+        };
+        held_rx.recv().unwrap();
+        let waited = std::thread::spawn({
+            let lane = lane.clone();
+            move || {
+                set_thread_lane_try_only(true);
+                assert_eq!(lane.try_lock().unwrap_err(), ReservationError::WouldBlock);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.reserve().map(|_| ()))).is_err()
+            }
+        }).join().unwrap();
+        assert!(waited, "a try-only thread must not block on a lane");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // The panic inside reserve left the lane usable.
+        assert!(lane.try_lock().is_ok());
+        assert!(!thread_holds_lane());
     }
 
     #[test]

@@ -18,8 +18,13 @@
 
 pub mod claude_runtime;
 pub mod dsh_runtime;
-pub mod kimi_runtime;
+pub mod external_runtime;
+pub mod index;
+pub mod index_kit;
+pub mod index_model;
 pub mod job_service;
+pub mod kimi_runtime;
+pub mod kit_layout;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -43,6 +48,26 @@ pub const CAPABILITY: &str = "components";
 pub const UPDATED_EVENT: &str = "cutex/components/updated";
 pub const ORIGIN_SIGNED: &str = "signed";
 pub const ORIGIN_SOURCE: &str = "source";
+
+/// Runtime prerequisite probes have a bounded process/output budget. Service
+/// components retain their existing service-control executor.
+pub struct ComponentExec {
+    bounded: bool,
+}
+pub fn real_exec(name: &str) -> ComponentExec {
+    ComponentExec {
+        bounded: matches!(name, "dsh-runtime" | "kimi-runtime"),
+    }
+}
+impl Exec for ComponentExec {
+    fn run(&self, program: &str, args: &[String]) -> anyhow::Result<String> {
+        if self.bounded {
+            external_runtime::RealExec.run(program, args)
+        } else {
+            crate::upgrade::service::RealExec.run(program, args)
+        }
+    }
+}
 
 /// `component.json`: identity only (card text is desktop i18n keyed by name).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -98,6 +123,10 @@ pub trait Handler: Send + Sync {
     /// Files the unpacked archive must contain (the executables checked
     /// against `receipt.json` before any start).
     fn required_files(&self) -> &'static [&'static str];
+    /// Payload-aware validation after extraction; legacy handlers keep their list.
+    fn required_files_for(&self, _dir: &Path) -> &'static [&'static str] {
+        self.required_files()
+    }
     /// CLI-only source installs: build or take the files from a checkout into `dest`.
     fn from_source(&self, source: &Path, dest: &Path) -> anyhow::Result<()>;
     /// Whether a service cutex did not install occupies this component's place.
@@ -130,8 +159,12 @@ pub trait Handler: Send + Sync {
 /// Every component this cutex knows.
 pub fn handlers() -> Vec<Box<dyn Handler>> {
     #[allow(unused_mut)]
-    let mut list: Vec<Box<dyn Handler>> =
-        vec![Box::new(job_service::JobService::default()), Box::new(claude_runtime::ClaudeRuntime::default()), Box::new(dsh_runtime::DshRuntime::default()), Box::new(kimi_runtime::KimiRuntime::default())];
+    let mut list: Vec<Box<dyn Handler>> = vec![
+        Box::new(job_service::JobService::default()),
+        Box::new(claude_runtime::ClaudeRuntime::default()),
+        Box::new(dsh_runtime::DshRuntime::default()),
+        Box::new(kimi_runtime::KimiRuntime::default()),
+    ];
     #[cfg(test)]
     TEST_HANDLER.with(|extra| list.extend(extra.borrow().map(|make| make())));
     list
@@ -147,7 +180,14 @@ pub fn handler(name: &str) -> anyhow::Result<Box<dyn Handler>> {
     handlers()
         .into_iter()
         .find(|h| h.metadata().name == name)
-        .ok_or_else(|| UpgradeError::boxed(404, "component_unknown", format!("no component named `{name}`"), json!({ "name": name })))
+        .ok_or_else(|| {
+            UpgradeError::boxed(
+                404,
+                "component_unknown",
+                format!("no component named `{name}`"),
+                json!({ "name": name }),
+            )
+        })
 }
 
 // ------------------------------------------------------------------ state
@@ -180,14 +220,25 @@ fn state_path(layout: &Layout) -> PathBuf {
 }
 
 pub fn load_state(layout: &Layout) -> State {
-    std::fs::read(state_path(layout)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+    std::fs::read(state_path(layout))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 pub fn save_state(layout: &Layout, state: &State) -> anyhow::Result<()> {
-    crate::config::atomic::write_private_pretty_json_atomic(&state_path(layout), state, "components state")
+    crate::config::atomic::write_private_pretty_json_atomic(
+        &state_path(layout),
+        state,
+        "components state",
+    )
 }
 
-fn update_entry(layout: &Layout, name: &str, change: impl FnOnce(&mut Option<Entry>)) -> anyhow::Result<()> {
+fn update_entry(
+    layout: &Layout,
+    name: &str,
+    change: impl FnOnce(&mut Option<Entry>),
+) -> anyhow::Result<()> {
     let mut state = load_state(layout);
     let mut entry = state.remove(name);
     change(&mut entry);
@@ -211,13 +262,17 @@ pub struct Receipt {
     pub origin: String,
     #[serde(default)]
     pub archive_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_source: Option<Value>,
     /// Relative path -> sha256 of every file.
     pub files: BTreeMap<String, String>,
     pub unpacked_at: String,
 }
 
 pub fn read_receipt(dir: &Path) -> Option<Receipt> {
-    serde_json::from_slice::<Receipt>(&std::fs::read(dir.join(RECEIPT_FILE)).ok()?).ok().filter(|r| r.schema == RECEIPT_SCHEMA)
+    serde_json::from_slice::<Receipt>(&std::fs::read(dir.join(RECEIPT_FILE)).ok()?)
+        .ok()
+        .filter(|r| r.schema == RECEIPT_SCHEMA)
 }
 
 /// Before any start: `file` in `dir` must still have the receipt's sha256.
@@ -226,7 +281,11 @@ pub fn verify_file(dir: &Path, file: &str) -> anyhow::Result<PathBuf> {
     let path = dir.join(file);
     let actual = crate::upgrade::manifest::file_sha256_hex(&path)?;
     if receipt.files.get(file) != Some(&actual) {
-        return Err(upgrade_error(409, "component_unverified", format!("{} does not match its receipt", path.display())));
+        return Err(upgrade_error(
+            409,
+            "component_unverified",
+            format!("{} does not match its receipt", path.display()),
+        ));
     }
     Ok(path)
 }
@@ -242,9 +301,16 @@ fn file_hashes(dir: &Path) -> anyhow::Result<BTreeMap<String, String>> {
             if kind.is_dir() {
                 stack.push(entry.path());
             } else {
-                let rel = entry.path().strip_prefix(dir)?.to_string_lossy().replace('\\', "/");
+                let rel = entry
+                    .path()
+                    .strip_prefix(dir)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 if rel != RECEIPT_FILE {
-                    files.insert(rel, crate::upgrade::manifest::file_sha256_hex(&entry.path())?);
+                    files.insert(
+                        rel,
+                        crate::upgrade::manifest::file_sha256_hex(&entry.path())?,
+                    );
                 }
             }
         }
@@ -290,19 +356,27 @@ pub enum Lock {
     Held,
 }
 
-fn acquire(layout: &Layout, lock: &Lock) -> anyhow::Result<Option<crate::upgrade::state::OperationLock>> {
+fn acquire(
+    layout: &Layout,
+    lock: &Lock,
+) -> anyhow::Result<Option<crate::upgrade::state::OperationLock>> {
     match lock {
         Lock::Held => Ok(None),
         Lock::Acquire => crate::upgrade::state::OperationLock::try_acquire(layout)?
             .map(Some)
-            .ok_or_else(|| crate::upgrade::stage::blocked("run_in_progress", "a backend upgrade or another component operation is running")),
+            .ok_or_else(|| {
+                crate::upgrade::stage::blocked(
+                    "run_in_progress",
+                    "a backend upgrade or another component operation is running",
+                )
+            }),
     }
 }
 
-fn managed(layout: Option<&Layout>) -> anyhow::Result<&Layout> {
+fn managed<'a>(layout: Option<&'a Layout>, keys: &[PublicKey]) -> anyhow::Result<&'a Layout> {
     layout
-        .filter(|l| l.is_managed())
-        .ok_or_else(|| upgrade_error(409, "unmanaged_install", "not a managed cutex install (no install.json); components are set up by hand on this host"))
+        .filter(|l| kit_layout::managed(l,keys))
+        .ok_or_else(|| upgrade_error(409, "unmanaged_install", "components require a managed install or an explicitly imported trusted component kit"))
 }
 
 fn supported(handler: &dyn Handler) -> anyhow::Result<()> {
@@ -310,7 +384,11 @@ fn supported(handler: &dyn Handler) -> anyhow::Result<()> {
         return Err(UpgradeError::boxed(
             409,
             "component_unsupported_platform",
-            format!("{} runs on {} only", handler.metadata().name, handler.metadata().platforms.join(", ")),
+            format!(
+                "{} runs on {} only",
+                handler.metadata().name,
+                handler.metadata().platforms.join(", ")
+            ),
             json!({ "name": handler.metadata().name }),
         ));
     }
@@ -328,24 +406,53 @@ pub(crate) fn now() -> String {
 /// install` from an archive), fetched once by [`fetch_release_manifest`].
 /// Kept outside the release dir, whose file record must not change.
 fn cached_manifest_path(layout: &Layout, release: &str) -> PathBuf {
-    components_dir(layout).join("manifests").join(format!("{release}.json"))
+    components_dir(layout)
+        .join("manifests")
+        .join(format!("{release}.json"))
 }
 
 /// The running release's verified manifest (its release dir, else the
 /// cached copy); `None` without one.
-pub fn release_manifest(layout: &Layout, keys: &[PublicKey]) -> anyhow::Result<Option<ReleaseManifest>> {
+pub fn release_manifest(
+    layout: &Layout,
+    keys: &[PublicKey],
+) -> anyhow::Result<Option<ReleaseManifest>> {
+    // Signed kit adoption grants component operations, not backend release
+    // ownership. A manually deployed base has no legacy release manifest path.
+    if !layout.is_managed() {
+        return Ok(None);
+    }
     let release = layout.active_release()?;
-    let unverified = |e: anyhow::Error| upgrade_error(409, "release_unverified", format!("the manifest of release {release} does not verify: {e:#}"));
-    if layout.release_dir(&release).join(crate::upgrade::stage::MANIFEST_FILE).is_file() {
-        return crate::upgrade::stage::staged_manifest(layout, keys, &release).map(Some).map_err(unverified);
+    let unverified = |e: anyhow::Error| {
+        upgrade_error(
+            409,
+            "release_unverified",
+            format!("the manifest of release {release} does not verify: {e:#}"),
+        )
+    };
+    if layout
+        .release_dir(&release)
+        .join(crate::upgrade::stage::MANIFEST_FILE)
+        .is_file()
+    {
+        return crate::upgrade::stage::staged_manifest(layout, keys, &release)
+            .map(Some)
+            .map_err(unverified);
     }
     let cached = cached_manifest_path(layout, &release);
-    let (Ok(bytes), Ok(signature)) = (std::fs::read(&cached), std::fs::read_to_string(cached.with_extension("json.minisig"))) else {
+    let (Ok(bytes), Ok(signature)) = (
+        std::fs::read(&cached),
+        std::fs::read_to_string(cached.with_extension("json.minisig")),
+    ) else {
         return Ok(None);
     };
     crate::upgrade::minisign::verify_text(keys, &bytes, &signature).map_err(unverified)?;
     let manifest = ReleaseManifest::parse(&bytes).map_err(unverified)?;
-    ensure!(manifest.cutex.release == release, "cached manifest names release {}", manifest.cutex.release);
+    ensure!(
+        manifest.cutex.release == release,
+        "cached manifest names release {}",
+        manifest.cutex.release
+    );
     Ok(Some(manifest))
 }
 
@@ -357,7 +464,13 @@ fn dev_build(release: &str) -> bool {
 /// [`release_manifest`], else (a signed build installed without its
 /// manifest) the manifest of the same release fetched from the configured
 /// source, verified, checked against this build's commit and cached.
-pub fn fetch_release_manifest(layout: &Layout, keys: &[PublicKey]) -> anyhow::Result<Option<ReleaseManifest>> {
+pub fn fetch_release_manifest(
+    layout: &Layout,
+    keys: &[PublicKey],
+) -> anyhow::Result<Option<ReleaseManifest>> {
+    if !layout.is_managed() {
+        return Ok(None);
+    }
     if let Some(manifest) = release_manifest(layout, keys)? {
         return Ok(Some(manifest));
     }
@@ -368,15 +481,29 @@ pub fn fetch_release_manifest(layout: &Layout, keys: &[PublicKey]) -> anyhow::Re
     let settings = crate::upgrade::state::Settings::load(layout);
     let channel = settings.channel(layout);
     let tag = crate::upgrade::manifest::release_tag(&release);
-    let (manifest, bytes, signature) = crate::upgrade::stage::fetch_manifest(&settings.source()?, keys, channel, &tag, None)
-        .map_err(|e| upgrade_error(409, "release_unverified", format!("could not get the signed manifest of release {release}: {e:#}")))?;
+    let (manifest, bytes, signature) =
+        crate::upgrade::stage::fetch_manifest(&settings.source()?, keys, channel, &tag, None)
+            .map_err(|e| {
+                upgrade_error(
+                    409,
+                    "release_unverified",
+                    format!("could not get the signed manifest of release {release}: {e:#}"),
+                )
+            })?;
     if let Some(commit) = crate::build_info::COMMIT {
         let n = commit.len().min(manifest.cutex.commit.len());
-        ensure!(n >= 7 && commit[..n] == manifest.cutex.commit[..n], "the manifest of {release} names commit {}, this build is {commit}", manifest.cutex.commit);
+        ensure!(
+            n >= 7 && commit[..n] == manifest.cutex.commit[..n],
+            "the manifest of {release} names commit {}, this build is {commit}",
+            manifest.cutex.commit
+        );
     }
     let cached = cached_manifest_path(layout, &release);
     std::fs::create_dir_all(cached.parent().context("manifest cache dir")?)?;
-    crate::config::atomic::write_bytes_atomic(&cached.with_extension("json.minisig"), signature.as_bytes())?;
+    crate::config::atomic::write_bytes_atomic(
+        &cached.with_extension("json.minisig"),
+        signature.as_bytes(),
+    )?;
     crate::config::atomic::write_bytes_atomic(&cached, &bytes)?;
     Ok(Some(manifest))
 }
@@ -390,20 +517,35 @@ pub struct Offer {
 }
 
 pub fn offer(manifest: &ReleaseManifest, name: &str) -> Option<Offer> {
-    manifest.component_artifact(name).map(|(component, artifact)| Offer {
-        version: component.version.clone(),
-        tag: artifact.tag.clone().unwrap_or_else(|| format!("component-{name}-{}", component.version)),
-        artifact: artifact.clone(),
-    })
+    manifest
+        .component_artifact(name)
+        .map(|(component, artifact)| Offer {
+            version: component.version.clone(),
+            tag: artifact
+                .tag
+                .clone()
+                .unwrap_or_else(|| format!("component-{name}-{}", component.version)),
+            artifact: artifact.clone(),
+        })
 }
 
 fn staging_dir(layout: &Layout, name: &str) -> PathBuf {
-    layout.staging_dir().join(format!("component-{name}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]))
+    layout.staging_dir().join(format!(
+        "component-{name}-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ))
 }
 
-fn place(handler: &dyn Handler, files: &Path, target: &Path, origin: &str, version: &str, archive_sha256: Option<String>) -> anyhow::Result<()> {
+fn place(
+    handler: &dyn Handler,
+    files: &Path,
+    target: &Path,
+    origin: &str,
+    version: &str,
+    archive_sha256: Option<String>,
+) -> anyhow::Result<()> {
     let name = &handler.metadata().name;
-    for file in handler.required_files() {
+    for file in handler.required_files_for(files) {
         ensure!(files.join(file).is_file(), "component {name} lacks {file}");
     }
     let receipt = Receipt {
@@ -412,14 +554,19 @@ fn place(handler: &dyn Handler, files: &Path, target: &Path, origin: &str, versi
         version: version.into(),
         origin: origin.into(),
         archive_sha256,
+        selection_source: None,
         files: file_hashes(files)?,
         unpacked_at: now(),
     };
-    std::fs::write(files.join(RECEIPT_FILE), serde_json::to_vec_pretty(&receipt)?)?;
+    std::fs::write(
+        files.join(RECEIPT_FILE),
+        serde_json::to_vec_pretty(&receipt)?,
+    )?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::rename(files, target).with_context(|| format!("move {} to {}", files.display(), target.display()))
+    std::fs::rename(files, target)
+        .with_context(|| format!("move {} to {}", files.display(), target.display()))
 }
 
 /// A version dir moved aside by [`repair_incomplete`] is renamed to
@@ -436,10 +583,13 @@ pub fn incomplete_reason(handler: &dyn Handler, dir: &Path) -> Option<String> {
         return None;
     }
     let Some(receipt) = read_receipt(dir) else {
-        return Some(format!("{} has no {RECEIPT_FILE} (it was never completely unpacked)", dir.display()));
+        return Some(format!(
+            "{} has no {RECEIPT_FILE} (it was never completely unpacked)",
+            dir.display()
+        ));
     };
     let missing = handler
-        .required_files()
+        .required_files_for(dir)
         .iter()
         .map(|file| file.to_string())
         .chain(receipt.files.keys().cloned())
@@ -450,7 +600,12 @@ pub fn incomplete_reason(handler: &dyn Handler, dir: &Path) -> Option<String> {
 /// Where [`repair_incomplete`] moves `dir`: a dated sibling that is not taken yet.
 fn incomplete_path(dir: &Path) -> PathBuf {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let base = format!("{}{INCOMPLETE_MARK}{stamp}", dir.file_name().and_then(|n| n.to_str()).unwrap_or("version"));
+    let base = format!(
+        "{}{INCOMPLETE_MARK}{stamp}",
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("version")
+    );
     let mut path = dir.with_file_name(&base);
     let mut n = 2;
     while path.exists() {
@@ -464,14 +619,28 @@ fn incomplete_path(dir: &Path) -> PathBuf {
 /// `<version>.incomplete-<ts>` (kept for inspection, never deleted) so that the
 /// version can be downloaded and unpacked again. Returns `{movedAside, reason}`
 /// when it moved one; `dry_run` only reports where it would go.
-pub fn repair_incomplete(handler: &dyn Handler, dir: &Path, dry_run: bool) -> anyhow::Result<Option<Value>> {
-    let Some(reason) = incomplete_reason(handler, dir) else { return Ok(None) };
+pub fn repair_incomplete(
+    handler: &dyn Handler,
+    dir: &Path,
+    dry_run: bool,
+) -> anyhow::Result<Option<Value>> {
+    let Some(reason) = incomplete_reason(handler, dir) else {
+        return Ok(None);
+    };
     let aside = incomplete_path(dir);
     if !dry_run {
         progress("repair");
-        std::fs::rename(dir, &aside).with_context(|| format!("move the incomplete {} aside to {} ({reason})", dir.display(), aside.display()))?;
+        std::fs::rename(dir, &aside).with_context(|| {
+            format!(
+                "move the incomplete {} aside to {} ({reason})",
+                dir.display(),
+                aside.display()
+            )
+        })?;
     }
-    Ok(Some(json!({ "movedAside": aside, "reason": reason, "dryRun": dry_run })))
+    Ok(Some(
+        json!({ "movedAside": aside, "reason": reason, "dryRun": dry_run }),
+    ))
 }
 
 /// `<base>/components/<name>/<version>/` for a signed offer: present (same
@@ -483,14 +652,24 @@ pub fn fetch(layout: &Layout, handler: &dyn Handler, offer: &Offer) -> anyhow::R
 }
 
 /// [`fetch`] from `source` (default: the configured release source).
-pub fn fetch_with(layout: &Layout, handler: &dyn Handler, offer: &Offer, source: Option<&crate::upgrade::source::Source>) -> anyhow::Result<PathBuf> {
+pub fn fetch_with(
+    layout: &Layout,
+    handler: &dyn Handler,
+    offer: &Offer,
+    source: Option<&crate::upgrade::source::Source>,
+) -> anyhow::Result<PathBuf> {
     let name = &handler.metadata().name;
+    {
+        let _commit = index::CommitLock::acquire(layout)?;
+        index::check_legacy(layout, name, offer)?;
+    }
     let target = version_dir(layout, name, &offer.version);
     repair_incomplete(handler, &target, false)?;
     if target.exists() {
         let receipt = read_receipt(&target);
         ensure!(
-            receipt.as_ref().and_then(|r| r.archive_sha256.as_deref()) == Some(offer.artifact.sha256.as_str()),
+            receipt.as_ref().and_then(|r| r.archive_sha256.as_deref())
+                == Some(offer.artifact.sha256.as_str()),
             "{} exists but was not unpacked from the manifest's archive; move it away",
             target.display()
         );
@@ -509,18 +688,35 @@ pub fn fetch_with(layout: &Layout, handler: &dyn Handler, offer: &Offer, source:
                 &configured
             }
         };
-        source.download(&offer.tag, &offer.artifact.name, &archive, offer.artifact.size, &offer.artifact.sha256)?;
+        source.download(
+            &offer.tag,
+            &offer.artifact.name,
+            &archive,
+            offer.artifact.size,
+            &offer.artifact.sha256,
+        )?;
         let files = staging.join("files");
         progress("unpack");
         crate::upgrade::archive::unpack_tar_gz_file(&archive, &files)?;
-        place(handler, &files, &target, ORIGIN_SIGNED, &offer.version, Some(offer.artifact.sha256.clone()))
+        place(
+            handler,
+            &files,
+            &target,
+            ORIGIN_SIGNED,
+            &offer.version,
+            Some(offer.artifact.sha256.clone()),
+        )
     })();
     let _ = std::fs::remove_dir_all(&staging);
     result?;
     Ok(target)
 }
 
-fn fetch_source(layout: &Layout, handler: &dyn Handler, checkout: &Path) -> anyhow::Result<(String, PathBuf)> {
+fn fetch_source(
+    layout: &Layout,
+    handler: &dyn Handler,
+    checkout: &Path,
+) -> anyhow::Result<(String, PathBuf)> {
     let name = handler.metadata().name.clone();
     let staging = staging_dir(layout, &name);
     std::fs::create_dir_all(&staging)?;
@@ -532,7 +728,11 @@ fn fetch_source(layout: &Layout, handler: &dyn Handler, checkout: &Path) -> anyh
         for (file, sha) in file_hashes(&files)? {
             digest.push_str(&format!("{file}\0{sha}\n"));
         }
-        let version = format!("{}-source-{}", handler.metadata().version, &crate::upgrade::manifest::sha256_hex(digest.as_bytes())[..12]);
+        let version = format!(
+            "{}-source-{}",
+            handler.metadata().version,
+            &crate::upgrade::manifest::sha256_hex(digest.as_bytes())[..12]
+        );
         let target = version_dir(layout, &name, &version);
         repair_incomplete(handler, &target, false)?;
         if !target.exists() {
@@ -550,12 +750,55 @@ fn fetch_source(layout: &Layout, handler: &dyn Handler, checkout: &Path) -> anyh
 pub struct InstallRequest {
     /// CLI only: a checkout to build / take the files from (`origin: source`).
     pub from_source: Option<PathBuf>,
+    /// Explicit version from the current verified component offer source.
+    pub version: Option<String>,
     pub dry_run: bool,
+}
+
+/// Legacy DSH/Kimi select repeats its Node version check. Replay this operation's
+/// successful preparation result rather than starting Node inside index.lock.
+struct SelectionExec<'a> {
+    inner: &'a dyn Exec,
+    selecting: std::cell::Cell<bool>,
+    versions: std::cell::RefCell<BTreeMap<(String, Vec<String>), Result<String, String>>>,
+}
+impl Exec for SelectionExec<'_> {
+    fn run(&self, program: &str, args: &[String]) -> anyhow::Result<String> {
+        if args == ["--version"] {
+            let key = (program.into(), args.to_vec());
+            if self.selecting.get() {
+                return self
+                    .versions
+                    .borrow()
+                    .get(&key)
+                    .context("version probe was not completed during preparation")?
+                    .clone()
+                    .map_err(anyhow::Error::msg);
+            }
+            let result = self.inner.run(program, args);
+            self.versions.borrow_mut().insert(
+                key,
+                result
+                    .as_ref()
+                    .map(Clone::clone)
+                    .map_err(|e| format!("{e:#}")),
+            );
+            return result;
+        }
+        self.inner.run(program, args)
+    }
 }
 
 /// Install / update `name` to the version the running release names (or a
 /// source build). Idempotent. Returns `{component, result}`.
-pub fn install(layout: Option<&Layout>, keys: &[PublicKey], name: &str, request: &InstallRequest, exec: &dyn Exec, lock: Lock) -> anyhow::Result<Value> {
+pub fn install(
+    layout: Option<&Layout>,
+    keys: &[PublicKey],
+    name: &str,
+    request: &InstallRequest,
+    exec: &dyn Exec,
+    lock: Lock,
+) -> anyhow::Result<Value> {
     let handler = handler(name)?;
     install_with(layout, keys, handler.as_ref(), request, exec, lock)
 }
@@ -569,19 +812,31 @@ pub fn install_with(
     lock: Lock,
 ) -> anyhow::Result<Value> {
     supported(handler)?;
-    let layout = managed(layout)?;
+    let layout = managed(layout, keys)?;
     let name = handler.metadata().name.clone();
-    let _lock = if request.dry_run { None } else { acquire(layout, &lock)? };
+    ensure!(
+        request.from_source.is_none() || request.version.is_none(),
+        "--version and --from-source cannot be combined"
+    );
+    if let Some(version) = &request.version {
+        ensure!(valid_label(version), "invalid component version");
+    }
+    let _lock = if request.dry_run {
+        None
+    } else {
+        acquire(layout, &lock)?
+    };
     let previous = installed(layout, &name);
+    let previous_source = previous
+        .as_ref()
+        .and_then(|e| read_receipt(&version_dir(layout, &name, &e.selected)))
+        .and_then(|r| r.selection_source);
     if previous.is_none() && handler.external(layout) {
-        return Err(UpgradeError::boxed(
-            409,
-            "component_external",
-            format!("a {name} that cutex did not install is already running on this host; it is left alone"),
-            json!({ "name": name }),
-        ));
+        return Err(UpgradeError::boxed(409, "component_external",
+            format!("a {name} that cutex did not install is already running on this host; it is left alone"), json!({ "name": name })));
     }
     let mut repaired = None;
+    let mut resolved = None;
     let (version, dir, origin) = match &request.from_source {
         Some(checkout) => {
             ensure!(!request.dry_run, "--from-source has no dry run (it builds)");
@@ -589,52 +844,193 @@ pub fn install_with(
             (version, dir, ORIGIN_SOURCE)
         }
         None => {
-            let manifest = fetch_release_manifest(layout, keys)?.ok_or_else(|| {
-                UpgradeError::boxed(409, "component_source_only", format!(
-                    "this cutex release has no signed manifest (source install): use `cutex component install {name} --from-source <checkout>`"
-                ), json!({ "name": name }))
-            })?;
-            let offer = offer(&manifest, &name).ok_or_else(|| not_offered(&manifest, &name))?;
-            // Before the fetch, so the result says what was moved aside (fetch repairs too).
-            repaired = repair_incomplete(handler, &version_dir(layout, &name, &offer.version), request.dry_run)?;
-            let dir = if request.dry_run { version_dir(layout, &name, &offer.version) } else { fetch(layout, handler, &offer)? };
-            (offer.version, dir, ORIGIN_SIGNED)
+            let offer = if let Some(version) = &request.version {
+                index::resolve(layout, keys, &name, Some(version))?
+            } else {
+                fetch_release_manifest(layout, keys)?.ok_or_else(|| {
+                    let candidate = index::resolve(layout, keys, &name, None).ok();
+                    match candidate {
+                        Some(candidate) => UpgradeError::boxed(409, "component_source_only",
+                            format!("this source build has no release manifest; choose verified component version {} explicitly", candidate.offer.version),
+                            json!({"name":name,"offeredVersion":candidate.offer.version,
+                                "suggestedRequest":{"version":candidate.offer.version}})),
+                        None => UpgradeError::boxed(409, "component_source_only",
+                            format!("this cutex release has no signed manifest (source install): use `cutex component install {name} --from-source <checkout>`"), json!({"name":name})),
+                    }
+                })?;
+                let offer = index::legacy_resolve(layout, keys, &name)?;
+                if let Some(previous) = &previous {
+                    let provenance = read_receipt(&version_dir(layout, &name, &previous.selected))
+                        .and_then(|r| r.selection_source);
+                    if provenance
+                        .as_ref()
+                        .and_then(|v| v["kind"].as_str())
+                        .is_some_and(|kind| kind != "releaseManifest")
+                        && previous.selected != offer.offer.version
+                    {
+                        return Err(upgrade_error(
+                            409,
+                            "component_version_required",
+                            "use an explicit offered version to change an index or kit selection",
+                        ));
+                    }
+                }
+                offer
+            };
+            if !request.dry_run {
+                let _commit = index::CommitLock::acquire(layout)?;
+                index::record_offer(layout, &name, &offer)?;
+            }
+            repaired = repair_incomplete(
+                handler,
+                &version_dir(layout, &name, &offer.offer.version),
+                request.dry_run,
+            )?;
+            let dir = if request.dry_run {
+                version_dir(layout, &name, &offer.offer.version)
+            } else {
+                index::fetch_resolved(layout, keys, handler, &offer)?
+            };
+            let version = offer.offer.version.clone();
+            resolved = Some(offer);
+            (version, dir, ORIGIN_SIGNED)
         }
     };
-    let ctx = Context { layout, dir, version: version.clone(), exec, previous: previous.clone(), dry_run: request.dry_run };
+    let selection_exec = SelectionExec {
+        inner: exec,
+        selecting: std::cell::Cell::new(false),
+        versions: Default::default(),
+    };
+    let ctx = Context {
+        layout,
+        dir,
+        version: version.clone(),
+        exec: if matches!(name.as_str(), "dsh-runtime" | "kimi-runtime") {
+            &selection_exec
+        } else {
+            exec
+        },
+        previous: previous.clone(),
+        dry_run: request.dry_run,
+    };
     let result = (|| -> anyhow::Result<Value> {
+        if !request.dry_run && resolved.is_some() && ctx.dir.join("external-runtime.json").is_file()
+        {
+            verified_external_contract(&ctx.dir, &name, Some(&version))?;
+        }
         if !request.dry_run {
             progress("prepare");
         }
         let prepared = handler.prepare(&ctx)?;
+        // Handler preparation may stage a verified adapter awaiting user prerequisites.
+        // It must not select it, replace a working bundled default or alter session pins.
+        if prepared["state"] == states::NEEDS_USER
+            || (prepared["prepared"] == false && prepared.get("needsUser").is_some())
+        {
+            return Ok(
+                json!({"version":version,"origin":origin,"prepare":prepared,"outcome":"needsUser","selected":false}),
+            );
+        }
+        selection_exec.selecting.set(true);
         if !request.dry_run {
             progress("select");
         }
+        // Acceptance and selection share one commit fence. No network/probe is
+        // performed here; prepare above must complete before this short section.
+        let _commit = if request.dry_run {
+            None
+        } else {
+            Some(index::CommitLock::acquire(layout)?)
+        };
+        let current = if let Some(initial) = &resolved {
+            let current = if request.version.is_some() {
+                index::resolve(layout, keys, &name, Some(&version))?
+            } else {
+                index::legacy_resolve(layout, keys, &name)?
+            };
+            if current.offer != initial.offer
+                || current.source != initial.source
+                || current.provenance["kind"] != initial.provenance["kind"]
+            {
+                return Err(upgrade_error(
+                    409,
+                    "component_offer_changed",
+                    "component offer/source changed during installation",
+                ));
+            }
+            if !request.dry_run {
+                index::record_offer(layout, &name, &current)?;
+            }
+            Some(current)
+        } else {
+            None
+        };
         let selected = handler.select(&ctx)?;
-        let mut out = json!({ "version": version, "origin": origin, "prepare": prepared, "select": selected });
+        if !request.dry_run && selected["selected"] == false {
+            return Ok(
+                json!({"version":version,"origin":origin,"prepare":prepared,"select":selected,"outcome":"needsUser","selected":false}),
+            );
+        }
+        if !request.dry_run {
+            if let Some(current) = current {
+                let mut receipt = read_receipt(&ctx.dir)
+                    .context("component receipt missing before selection commit")?;
+                let archive_key = receipt
+                    .selection_source
+                    .as_ref()
+                    .and_then(|v| v.get("archiveKeyId"))
+                    .cloned();
+                let preserve_source = request.version.is_none()
+                    && previous.as_ref().is_some_and(|e| e.selected == version)
+                    && previous_source
+                        .as_ref()
+                        .and_then(|s| s["kind"].as_str())
+                        .is_some_and(|s| s != "releaseManifest");
+                let mut provenance = if preserve_source {
+                    previous_source.clone().expect("checked source")
+                } else {
+                    current.provenance
+                };
+                if let Some(key) = archive_key {
+                    provenance["archiveKeyId"] = key;
+                }
+                receipt.selection_source = Some(provenance);
+                crate::config::atomic::write_private_pretty_json_atomic(
+                    &ctx.dir.join(RECEIPT_FILE),
+                    &receipt,
+                    "component selection provenance",
+                )?;
+            }
+            update_entry(layout, &name, |entry| {
+                *entry = Some(Entry {
+                    selected: version.clone(),
+                    origin: origin.into(),
+                    installed_at: now(),
+                    last_error: None,
+                })
+            })?;
+        }
+        let mut out = json!({"version":version,"origin":origin,"prepare":prepared,"select":selected,"outcome":"selected","selected":!request.dry_run});
         if let Some(repaired) = &repaired {
             out["repaired"] = repaired.clone();
         }
         Ok(out)
     })();
     if !request.dry_run {
-        match &result {
-            Ok(_) => update_entry(layout, &name, |entry| {
-                *entry = Some(Entry { selected: version.clone(), origin: origin.into(), installed_at: now(), last_error: None });
-            })?,
-            Err(error) => {
-                let message = format!("{error:#}");
-                update_entry(layout, &name, |entry| {
-                    if let Some(entry) = entry {
-                        entry.last_error = Some(message);
-                    }
-                })?;
-            }
+        if let Err(error) = &result {
+            let message = format!("{error:#}");
+            update_entry(layout, &name, |entry| {
+                if let Some(entry) = entry {
+                    entry.last_error = Some(message);
+                }
+            })?;
+        }
+        if result.as_ref().is_ok_and(|out| out["selected"] == true) {
+            let _ = refresh_health(layout, handler);
         }
         publish_state(layout, keys, handler);
     }
-    let result = result?;
-    Ok(json!({ "component": status_of(Some(layout), keys, handler, None), "result": result }))
+    Ok(json!({"component":status_of(Some(layout),keys,handler,None),"result":result?}))
 }
 
 /// Why the release manifest offers no `name` archive for this platform:
@@ -671,7 +1067,15 @@ fn not_offered(manifest: &ReleaseManifest, name: &str) -> anyhow::Error {
 
 /// Remove `name`: deselect (stop, unregister, unselect for new agents).
 /// Version dirs and data stay (`cutex component prune`).
-pub fn remove(layout: Option<&Layout>, keys: &[PublicKey], name: &str, force: bool, dry_run: bool, exec: &dyn Exec, lock: Lock) -> anyhow::Result<Value> {
+pub fn remove(
+    layout: Option<&Layout>,
+    keys: &[PublicKey],
+    name: &str,
+    force: bool,
+    dry_run: bool,
+    exec: &dyn Exec,
+    lock: Lock,
+) -> anyhow::Result<Value> {
     let handler = handler(name)?;
     remove_with(layout, keys, handler.as_ref(), force, dry_run, exec, lock)
 }
@@ -686,11 +1090,21 @@ pub fn remove_with(
     lock: Lock,
 ) -> anyhow::Result<Value> {
     supported(handler)?;
-    let layout = managed(layout)?;
+    let layout = managed(layout, keys)?;
     let name = handler.metadata().name.clone();
-    let _lock = if dry_run { None } else { acquire(layout, &lock)? };
-    let entry = installed(layout, &name)
-        .ok_or_else(|| UpgradeError::boxed(409, "component_not_installed", format!("{name} is not installed by cutex"), json!({ "name": name })))?;
+    let _lock = if dry_run {
+        None
+    } else {
+        acquire(layout, &lock)?
+    };
+    let entry = installed(layout, &name).ok_or_else(|| {
+        UpgradeError::boxed(
+            409,
+            "component_not_installed",
+            format!("{name} is not installed by cutex"),
+            json!({ "name": name }),
+        )
+    })?;
     let ctx = Context {
         layout,
         dir: version_dir(layout, &name, &entry.selected),
@@ -712,15 +1126,30 @@ pub fn remove_with(
 
 /// Delete version dirs nothing needs: not selected, not pinned, not named by
 /// the running or the previous release's manifest.
-pub fn prune(layout: Option<&Layout>, keys: &[PublicKey], name: &str, dry_run: bool) -> anyhow::Result<Vec<String>> {
+pub fn prune(
+    layout: Option<&Layout>,
+    keys: &[PublicKey],
+    name: &str,
+    dry_run: bool,
+) -> anyhow::Result<Vec<String>> {
     let handler = handler(name)?;
-    let layout = managed(layout)?;
-    let _lock = if dry_run { None } else { acquire(layout, &Lock::Acquire)? };
+    let layout = managed(layout, keys)?;
+    let _lock = if dry_run {
+        None
+    } else {
+        acquire(layout, &Lock::Acquire)?
+    };
     let selected = installed(layout, name).map(|e| e.selected);
     let pins = handler.pins_checked(layout)?;
     let mut named = std::collections::BTreeSet::new();
     let record = layout.read_install().ok();
-    for release in [layout.active_release().ok(), record.and_then(|r| r.previous_release)].into_iter().flatten() {
+    for release in [
+        layout.active_release().ok(),
+        record.and_then(|r| r.previous_release),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if let Ok(manifest) = crate::upgrade::stage::staged_manifest(layout, keys, &release) {
             if let Some(offer) = offer(&manifest, name) {
                 named.insert(offer.version);
@@ -729,7 +1158,10 @@ pub fn prune(layout: Option<&Layout>, keys: &[PublicKey], name: &str, dry_run: b
     }
     let mut removed = Vec::new();
     for version in installed_versions(layout, name) {
-        if Some(&version) == selected.as_ref() || pins.get(&version).copied().unwrap_or(0) > 0 || named.contains(&version) {
+        if Some(&version) == selected.as_ref()
+            || pins.get(&version).copied().unwrap_or(0) > 0
+            || named.contains(&version)
+        {
             continue;
         }
         let dir = version_dir(layout, name, &version);
@@ -743,22 +1175,31 @@ pub fn prune(layout: Option<&Layout>, keys: &[PublicKey], name: &str, dry_run: b
 
 /// Where installs come from on this host.
 pub fn install_from(layout: Option<&Layout>, keys: &[PublicKey]) -> &'static str {
-    match layout.filter(|l| l.is_managed()) {
+    match layout.filter(|l| kit_layout::managed(l, keys)) {
         None => "none",
         Some(layout) => match release_manifest(layout, keys) {
             Ok(Some(_)) => "release",
             // A signed build without its manifest fetches it on install.
-            _ if !layout.active_release().is_ok_and(|r| dev_build(&r)) && !keys.is_empty() => "release",
+            _ if layout.is_managed()
+                && layout.active_release().is_ok_and(|r| !dev_build(&r))
+                && !keys.is_empty() => {
+                "release"
+            }
             _ => "source-only",
         },
     }
 }
 
 /// One component's view in `GET /v2/components`.
-pub fn status_of(layout: Option<&Layout>, keys: &[PublicKey], handler: &dyn Handler, operation: Option<&Value>) -> Value {
+pub fn status_of(
+    layout: Option<&Layout>,
+    keys: &[PublicKey],
+    handler: &dyn Handler,
+    operation: Option<&Value>,
+) -> Value {
     let meta = handler.metadata();
     let supported = meta.supported_here();
-    let layout = layout.filter(|l| l.is_managed());
+    let layout = layout.filter(|l| kit_layout::managed(l, keys));
     let entry = layout.and_then(|l| installed(l, &meta.name));
     let manifest = layout.map(|l| release_manifest(l, keys));
     let available = match &manifest {
@@ -767,16 +1208,21 @@ pub fn status_of(layout: Option<&Layout>, keys: &[PublicKey], handler: &dyn Hand
     };
     let in_manifest = matches!(&manifest, Some(Ok(Some(m))) if offer(m, &meta.name).is_some());
     let probe = match (layout, &entry) {
-        (Some(l), Some(e)) if supported => handler.probe(l, e),
+        (Some(l), Some(e)) if supported => cached_health(l, handler, e),
         _ => Value::Null,
     };
-    let running = operation.is_some_and(|op| op["name"] == meta.name.as_str() && op["state"] == "running");
+    let running =
+        operation.is_some_and(|op| op["name"] == meta.name.as_str() && op["state"] == "running");
     let state = if running {
         states::INSTALLING
     } else if !supported {
         states::MISSING
     } else if layout.is_none() {
-        if handler.configured_by_hand() { states::EXTERNAL } else { states::MISSING }
+        if handler.configured_by_hand() {
+            states::EXTERNAL
+        } else {
+            states::MISSING
+        }
     } else if let Some(entry) = &entry {
         match probe["state"].as_str() {
             Some(state) => state,
@@ -813,10 +1259,16 @@ pub fn status_of(layout: Option<&Layout>, keys: &[PublicKey], handler: &dyn Hand
         "error": entry.as_ref().and_then(|e| e.last_error.clone()),
     });
     if meta.name == dsh_runtime::NAME {
-        view["dsh"] = view.pointer("/detail/dsh").cloned().unwrap_or_else(dsh_runtime::status_requirements);
+        view["dsh"] = view
+            .pointer("/detail/dsh")
+            .cloned()
+            .unwrap_or_else(dsh_runtime::requirements);
     }
     if meta.name == kimi_runtime::NAME {
-        view["kimi"] = view.pointer("/detail/kimi").cloned().unwrap_or_else(kimi_runtime::requirements);
+        view["kimi"] = view
+            .pointer("/detail/kimi")
+            .cloned()
+            .unwrap_or_else(kimi_runtime::requirements);
     }
     if state == states::NEEDS_USER {
         view["steps"] = probe.get("steps").cloned().unwrap_or_else(|| json!([]));
@@ -826,13 +1278,192 @@ pub fn status_of(layout: Option<&Layout>, keys: &[PublicKey], handler: &dyn Hand
             .get("claudeCli")
             .map_or(Value::Null, claude_runtime::cli_choice_wire);
     }
+    if let Some(layout) = layout {
+        view["index"] = index::view(
+            layout,
+            keys,
+            &meta.name,
+            entry.as_ref().map(|e| e.selected.as_str()),
+        );
+        view["selectionSource"] = entry
+            .as_ref()
+            .and_then(|e| read_receipt(&version_dir(layout, &meta.name, &e.selected)))
+            .and_then(|r| r.selection_source)
+            .unwrap_or(Value::Null);
+        if let Ok(contract) = external_contract(layout, keys, &meta.name) {
+            view["external"] = match external_runtime::view(layout, &meta.name, &contract) {
+                Ok(status) => status,
+                Err(error) => json!({"version":contract.version,"root":null,"node":null,"rg":null,
+                    "packages":contract.external_root.packages.iter().map(|(p,v)|format!("{p}@{v}")).collect::<Vec<_>>(),
+                    "nodeRange":contract.node.range,"nodeRecommended":contract.node.recommended,"checkedAt":null,
+                    "issues":[{"code":"external_state_invalid","expected":"readable external runtime state","actual":format!("{error:#}"),"path":null,
+                        "steps":["Inspect the saved component external configuration on this host before retrying."]}]}),
+            };
+            view["external"] = external_runtime::diagnostics_view(view["external"].take());
+            if entry.is_none()
+                && supported
+                && !running
+                && view["external"]["issues"]
+                    .as_array()
+                    .is_some_and(|issues| !issues.is_empty())
+            {
+                view["state"] = json!(states::NEEDS_USER);
+            }
+        }
+    }
     view
+}
+
+/// Preferred verified adapter candidate, else the selected adapter. This also
+/// supports configuring dependencies before downloading the adapter archive.
+pub fn external_contract(
+    layout: &Layout,
+    keys: &[PublicKey],
+    name: &str,
+) -> anyhow::Result<external_runtime::ExternalRuntime> {
+    ensure!(
+        matches!(name, "dsh-runtime" | "kimi-runtime"),
+        "component has no external runtime"
+    );
+    if let Ok(resolved) = index::resolve(layout, keys, name, None) {
+        if let Some(value) = resolved
+            .release
+            .as_ref()
+            .and_then(|r| r.external_runtime.clone())
+        {
+            let contract: external_runtime::ExternalRuntime = serde_json::from_value(value)?;
+            contract.validate(name, &contract.version)?;
+            return Ok(contract);
+        }
+        // A manifest fallback carries the contract inside its archive. A
+        // dependency-blocked first install is staged but deliberately has no
+        // selected Entry, so configure/GET must also discover this verified offer.
+        let dir = version_dir(layout, name, &resolved.offer.version);
+        if read_receipt(&dir).is_some_and(|r| {
+            r.name == name
+                && r.version == resolved.offer.version
+                && r.origin == ORIGIN_SIGNED
+                && r.archive_sha256.as_deref() == Some(resolved.offer.artifact.sha256.as_str())
+        }) {
+            if let Ok(contract) =
+                verified_external_contract(&dir, name, Some(&resolved.offer.version))
+            {
+                return Ok(contract);
+            }
+        }
+    }
+    let candidate_error = match external_runtime::current_contract(layout, name) {
+        Ok(Some(contract)) => return Ok(contract),
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    let entry = installed(layout, name).ok_or_else(|| {
+        candidate_error.unwrap_or_else(|| anyhow::anyhow!("no selected or offered adapter runtime"))
+    })?;
+    let dir = version_dir(layout, name, &entry.selected);
+    verified_external_contract(
+        &dir,
+        name,
+        if entry.origin == ORIGIN_SOURCE {
+            None
+        } else {
+            Some(&entry.selected)
+        },
+    )
+}
+
+fn verified_external_contract(
+    dir: &Path,
+    name: &str,
+    version: Option<&str>,
+) -> anyhow::Result<external_runtime::ExternalRuntime> {
+    verify_file(&dir, "external-runtime.json")?;
+    let metadata: Metadata =
+        serde_json::from_slice(&std::fs::read(verify_file(&dir, "component.json")?)?)?;
+    ensure!(
+        metadata.schema == COMPONENT_SCHEMA
+            && metadata.name == name
+            && version.is_none_or(|v| v == metadata.version),
+        "adapter metadata does not match the offered/selected identity"
+    );
+    external_runtime::load_contract(&dir, name, &metadata.version)
+}
+
+pub fn check_external(
+    layout: Option<&Layout>,
+    keys: &[PublicKey],
+    name: &str,
+    request: Option<external_runtime::ConfigureRequest>,
+    exec: &dyn Exec,
+    lock: Lock,
+) -> anyhow::Result<Value> {
+    let handler = handler(name)?;
+    supported(handler.as_ref())?;
+    let layout = managed(layout, keys)?;
+    let _lock = acquire(layout, &lock)?;
+    let contract = external_contract(layout, keys, name)
+        .map_err(|e| upgrade_error(409, "component_external_unavailable", format!("{e:#}")))?;
+    match request {
+        Some(request) => external_runtime::configure(layout, name, &contract, request, exec)?,
+        None => external_runtime::check(layout, name, &contract, exec)?,
+    };
+    let external = external_runtime::view(layout, name, &contract)?;
+    let ready = external["checkedAt"].is_string()
+        && external["issues"].as_array().is_some_and(Vec::is_empty);
+    let result = json!({"outcome":if ready{"ready"}else{"needsUser"},"version":contract.version,"selected":false,"external":external});
+    publish_state(layout, keys, handler.as_ref());
+    Ok(json!({"component":status_of(Some(layout),keys,handler.as_ref(),None),"result":result}))
+}
+
+fn legacy_adapter(layout: &Layout, handler: &dyn Handler, entry: &Entry) -> bool {
+    matches!(
+        handler.metadata().name.as_str(),
+        "dsh-runtime" | "kimi-runtime"
+    ) && !version_dir(layout, &handler.metadata().name, &entry.selected)
+        .join("external-runtime.json")
+        .is_file()
+}
+fn health_path(layout: &Layout, name: &str) -> PathBuf {
+    components_dir(layout)
+        .join("probes")
+        .join(format!("{name}.json"))
+}
+/// Called at management startup or after an explicit mutation, never by GET.
+pub fn refresh_health(layout: &Layout, handler: &dyn Handler) -> anyhow::Result<Value> {
+    let entry = installed(layout, &handler.metadata().name).context("component is not selected")?;
+    let probe = handler.probe(layout, &entry);
+    if legacy_adapter(layout, handler, &entry) {
+        crate::config::atomic::write_private_pretty_json_atomic(
+            &health_path(layout, &handler.metadata().name),
+            &json!({"version":entry.selected,"checkedAt":now(),"probe":probe}),
+            "cached bundled component health",
+        )?;
+    }
+    Ok(probe)
+}
+fn cached_health(layout: &Layout, handler: &dyn Handler, entry: &Entry) -> Value {
+    if !legacy_adapter(layout, handler, entry) {
+        return handler.probe(layout, entry);
+    }
+    let dir = version_dir(layout, &handler.metadata().name, &entry.selected);
+    if let Some(reason) = incomplete_reason(handler, &dir) {
+        return json!({"state":states::DEGRADED,"problem":reason});
+    }
+    let cache = std::fs::read(health_path(layout, &handler.metadata().name))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    if let Some(cache) = cache.filter(|v| v["version"] == entry.selected) {
+        return cache["probe"].clone();
+    }
+    // Old installs have no persisted health cache yet. Startup/check primes it;
+    // absence is unverified, not proof that a working selected runtime is broken.
+    json!({"state":if entry.last_error.is_some(){states::DEGRADED}else{states::READY},"checkedAt":null,"health":"unchecked"})
 }
 
 /// `GET /v2/components`.
 pub fn list(layout: Option<&Layout>, keys: &[PublicKey], operation: Option<&Value>) -> Value {
     json!({
-        "managed": layout.is_some_and(|l| l.is_managed()),
+        "managed": layout.is_some_and(|l| kit_layout::managed(l,keys)),
         "installFrom": install_from(layout, keys),
         "components": handlers().iter().map(|h| status_of(layout, keys, h.as_ref(), operation)).collect::<Vec<_>>(),
         "operation": operation,
@@ -841,17 +1472,38 @@ pub fn list(layout: Option<&Layout>, keys: &[PublicKey], operation: Option<&Valu
 
 // --------------------------------------------------------- backend updates
 
+fn independent_selection(layout: &Layout, name: &str, entry: &Entry) -> bool {
+    if index::Policy::load(layout).map_or(true, |p| p.policy != "releaseManifest") {
+        return true;
+    }
+    read_receipt(&version_dir(layout, name, &entry.selected))
+        .and_then(|r| r.selection_source)
+        .and_then(|v| v["kind"].as_str().map(str::to_owned))
+        .is_some_and(|kind| matches!(kind.as_str(), "componentIndex" | "privateKit"))
+}
+
 /// `cutex upgrade stage`: download + verify (+ prepare later) the new
 /// versions of installed signed components. Never fetches components that
 /// are not installed. Best effort: failures are returned as notes.
-pub fn stage_installed(layout: &Layout, manifest: &ReleaseManifest, source: Option<&crate::upgrade::source::Source>) -> Vec<String> {
+pub fn stage_installed(
+    layout: &Layout,
+    manifest: &ReleaseManifest,
+    source: Option<&crate::upgrade::source::Source>,
+) -> Vec<String> {
     let mut notes = Vec::new();
     for (name, entry) in load_state(layout) {
-        let Ok(handler) = handler(&name) else { continue };
-        if entry.origin != ORIGIN_SIGNED || !handler.metadata().supported_here() {
+        let Ok(handler) = handler(&name) else {
+            continue;
+        };
+        if entry.origin != ORIGIN_SIGNED
+            || !handler.metadata().supported_here()
+            || independent_selection(layout, &name, &entry)
+        {
             continue;
         }
-        let Some(offer) = offer(manifest, &name) else { continue };
+        let Some(offer) = offer(manifest, &name) else {
+            continue;
+        };
         if offer.version == entry.selected {
             continue;
         }
@@ -866,8 +1518,12 @@ pub fn stage_installed(layout: &Layout, manifest: &ReleaseManifest, source: Opti
 pub fn stage_bytes(layout: &Layout, manifest: &ReleaseManifest) -> u64 {
     load_state(layout)
         .iter()
-        .filter(|(_, e)| e.origin == ORIGIN_SIGNED)
-        .filter_map(|(name, e)| offer(manifest, name).filter(|o| o.version != e.selected).map(|o| o.artifact.size))
+        .filter(|(name, e)| e.origin == ORIGIN_SIGNED && !independent_selection(layout, name, e))
+        .filter_map(|(name, e)| {
+            offer(manifest, name)
+                .filter(|o| o.version != e.selected)
+                .map(|o| o.artifact.size)
+        })
         .sum()
 }
 
@@ -875,7 +1531,12 @@ pub fn stage_bytes(layout: &Layout, manifest: &ReleaseManifest) -> u64 {
 /// new release names for installed signed components. Writes the previous
 /// state to `snapshot` for [`restore_after_rollback`]. Never fails the run:
 /// a failure leaves the previous version selected (`lastError`, degraded).
-pub fn select_for_release(layout: &Layout, keys: &[PublicKey], exec: &dyn Exec, snapshot: &Path) -> Vec<String> {
+pub fn select_for_release(
+    layout: &Layout,
+    keys: &[PublicKey],
+    exec: &dyn Exec,
+    snapshot: &Path,
+) -> Vec<String> {
     let state = load_state(layout);
     if state.is_empty() {
         return Vec::new();
@@ -883,18 +1544,29 @@ pub fn select_for_release(layout: &Layout, keys: &[PublicKey], exec: &dyn Exec, 
     if let Some(parent) = snapshot.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(snapshot, serde_json::to_vec_pretty(&state).unwrap_or_default());
+    let _ = std::fs::write(
+        snapshot,
+        serde_json::to_vec_pretty(&state).unwrap_or_default(),
+    );
     let manifest = release_manifest(layout, keys);
     let mut notes = Vec::new();
     for (name, entry) in state {
         let target = match &manifest {
-            Ok(Some(m)) if entry.origin == ORIGIN_SIGNED => match offer(m, &name) {
-                Some(o) => Some(o.version),
-                None => {
-                    notes.push(format!("{name} stays on {} (notInManifest)", entry.selected));
-                    None
+            Ok(Some(m))
+                if entry.origin == ORIGIN_SIGNED
+                    && !independent_selection(layout, &name, &entry) =>
+            {
+                match offer(m, &name) {
+                    Some(o) => Some(o.version),
+                    None => {
+                        notes.push(format!(
+                            "{name} stays on {} (notInManifest)",
+                            entry.selected
+                        ));
+                        None
+                    }
                 }
-            },
+            }
             Err(error) if entry.origin == ORIGIN_SIGNED => {
                 notes.push(format!("{name} stays on {}: {error:#}", entry.selected));
                 None
@@ -903,16 +1575,26 @@ pub fn select_for_release(layout: &Layout, keys: &[PublicKey], exec: &dyn Exec, 
         };
         let outcome = match &target {
             // A new version: fetch (normally staged already), prepare, select.
-            Some(version) if *version != entry.selected => {
-                install(Some(layout), keys, &name, &InstallRequest::default(), exec, Lock::Held).map(|out| out["result"]["select"].clone())
-            }
+            Some(version) if *version != entry.selected => install(
+                Some(layout),
+                keys,
+                &name,
+                &InstallRequest::default(),
+                exec,
+                Lock::Held,
+            )
+            .map(|out| out["result"]["select"].clone()),
             // Same version: select again (the native / launcher set may have changed).
             _ => reselect(layout, &name, &entry, exec),
         };
         let shown = target.unwrap_or_else(|| entry.selected.clone());
         match outcome {
-            Ok(select) if select["restartPending"] == true => notes.push(format!("{name} {shown} selected; restarts when no job is running")),
-            Ok(select) if select["restarted"] == true => notes.push(format!("{name} {shown} restarted")),
+            Ok(select) if select["restartPending"] == true => notes.push(format!(
+                "{name} {shown} selected; restarts when no job is running"
+            )),
+            Ok(select) if select["restarted"] == true => {
+                notes.push(format!("{name} {shown} restarted"))
+            }
             Ok(_) => {}
             Err(error) => {
                 let message = format!("{error:#}");
@@ -944,15 +1626,21 @@ fn reselect(layout: &Layout, name: &str, entry: &Entry, exec: &dyn Exec) -> anyh
 
 /// After a rolled-back run: reselect the versions selected before the swap.
 pub fn restore_after_rollback(layout: &Layout, exec: &dyn Exec, snapshot: &Path) -> Vec<String> {
-    let Ok(bytes) = std::fs::read(snapshot) else { return Vec::new() };
-    let Ok(before) = serde_json::from_slice::<State>(&bytes) else { return Vec::new() };
+    let Ok(bytes) = std::fs::read(snapshot) else {
+        return Vec::new();
+    };
+    let Ok(before) = serde_json::from_slice::<State>(&bytes) else {
+        return Vec::new();
+    };
     let now_state = load_state(layout);
     let mut notes = Vec::new();
     for (name, old) in before {
         if now_state.get(&name).map(|e| &e.selected) == Some(&old.selected) {
             continue;
         }
-        let Ok(handler) = handler(&name) else { continue };
+        let Ok(handler) = handler(&name) else {
+            continue;
+        };
         let ctx = Context {
             layout,
             dir: version_dir(layout, &name, &old.selected),
@@ -963,10 +1651,18 @@ pub fn restore_after_rollback(layout: &Layout, exec: &dyn Exec, snapshot: &Path)
         };
         match handler.prepare(&ctx).and_then(|_| handler.select(&ctx)) {
             Ok(_) => {
-                let _ = update_entry(layout, &name, |e| *e = Some(Entry { last_error: None, ..old.clone() }));
+                let _ = update_entry(layout, &name, |e| {
+                    *e = Some(Entry {
+                        last_error: None,
+                        ..old.clone()
+                    })
+                });
                 notes.push(format!("{name} back on {}", old.selected));
             }
-            Err(error) => notes.push(format!("{name} not restored to {}: {error:#}", old.selected)),
+            Err(error) => notes.push(format!(
+                "{name} not restored to {}: {error:#}",
+                old.selected
+            )),
         }
     }
     notes
@@ -975,19 +1671,36 @@ pub fn restore_after_rollback(layout: &Layout, exec: &dyn Exec, snapshot: &Path)
 /// Management's watcher: apply a pending restart once its gate opens.
 pub fn settle_pending(layout: &Layout, exec: &dyn Exec) {
     for (name, entry) in load_state(layout) {
-        let Ok(handler) = handler(&name) else { continue };
-        if handler.probe(layout, &entry)["state"] != states::RESTART_PENDING || handler.restart_gate(layout).is_err() {
+        let Ok(handler) = handler(&name) else {
+            continue;
+        };
+        if handler.probe(layout, &entry)["state"] != states::RESTART_PENDING
+            || handler.restart_gate(layout).is_err()
+        {
             continue;
         }
-        let Ok(Some(_lock)) = crate::upgrade::state::OperationLock::try_acquire(layout) else { continue };
-        let ctx = Context { layout, dir: version_dir(layout, &name, &entry.selected), version: entry.selected.clone(), exec, previous: Some(entry), dry_run: false };
+        let Ok(Some(_lock)) = crate::upgrade::state::OperationLock::try_acquire(layout) else {
+            continue;
+        };
+        let ctx = Context {
+            layout,
+            dir: version_dir(layout, &name, &entry.selected),
+            version: entry.selected.clone(),
+            exec,
+            previous: Some(entry),
+            dry_run: false,
+        };
         let result = handler.select(&ctx);
         let _ = update_entry(layout, &name, |e| {
             if let Some(e) = e {
                 e.last_error = result.as_ref().err().map(|error| format!("{error:#}"));
             }
         });
-        publish_state(layout, &crate::upgrade::keys::trusted_keys(), handler.as_ref());
+        publish_state(
+            layout,
+            &crate::upgrade::keys::trusted_keys(),
+            handler.as_ref(),
+        );
     }
 }
 
@@ -1002,7 +1715,12 @@ fn publish_state(layout: &Layout, keys: &[PublicKey], handler: &dyn Handler) {
         return;
     }
     let status = status_of(Some(layout), keys, handler, None);
-    publish(event_params(&handler.metadata().name, "state", &status["state"], None));
+    publish(event_params(
+        &handler.metadata().name,
+        "state",
+        &status["state"],
+        None,
+    ));
 }
 
 /// Publish one event (no-op in unit tests).
@@ -1034,4 +1752,14 @@ fn progress(step: &str) {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+mod external_acceptance;
+#[cfg(test)]
+mod external_contract_tests;
+#[cfg(test)]
+mod external_view_tests;
+#[cfg(test)]
+mod health_cache_tests;
+#[cfg(test)]
+mod selection_tests;
+#[cfg(test)]
 mod tests;

@@ -16,7 +16,7 @@ exactly once, after the recipient's current turn.
   A fixed SHA-256 vector guards this projection.
 - Claude receives source `{kind: "service", id: "Cutex Alarm"}`, event type
   `alarm`, and `after-turn` delivery. `claude_ingress::envelope` accepts this
-  typed system projection. Native envelopes remain frozen and r7 known-ID
+  typed system projection. Native envelopes remain frozen and legacy known-ID
   status probing remains in place. Local inbox acceptance is not context
   persistence. Native timeline items are not used as context receipts; native
   receipt recovery remains authoritative. Legacy v2 alarm items retain their

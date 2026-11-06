@@ -51,7 +51,60 @@ const INTER_AGENT_STATUS_SCHEMA: &str = "cutex/inter-agent-delivery-status/v1";
 
 #[path = "bus_bridge_external.rs"]
 mod external;
+#[path = "bus_bridge_frozen_recipient.rs"]
+mod frozen_recipient;
+pub use frozen_recipient::durable_inter_agent_params;
 pub(crate) use external::publish_director_changed_review;
+pub use external::owner_carry_envelope;
+
+/// Job Service notices for a runtime without the Codex bridge (the Claude
+/// observer, C3 S10): which of the polled notices wait for their batch to
+/// settle (`hold`) and which ride along `passive` (`passive`), exactly as
+/// the Codex delivery plans them (token audit 2026-10-22).
+pub fn job_notice_plan_for(
+    messages: &[AgentBusMessage],
+    session: &str,
+) -> (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>) {
+    let plan = external::job_notice_plan(
+        messages,
+        crate::platform::now_epoch_secs(),
+        external::awaiting_delegations(session),
+    );
+    (plan.hold, plan.passive)
+}
+
+/// A job completion a delegation awaits goes passive (notes it on the
+/// delegation, as the Codex delivery does).
+pub fn job_notice_awaited(message: &AgentBusMessage, session: &str) -> bool {
+    external::awaited_job_completion(message, session)
+}
+
+/// The native ExternalInput envelope of a Job Service notice, built and
+/// provenance-checked exactly as for a Codex runtime (service source
+/// `cutex-job-service`, event `job_completion`, the frozen v2 view), with
+/// the Codex routing: `passive` when awaited or batched, `soon` when read
+/// at a busy recipient's next step.
+pub fn job_notice_envelope(
+    message: &AgentBusMessage,
+    owner: &str,
+    thread: &str,
+    generation: u64,
+    passive: bool,
+    next_step: bool,
+) -> anyhow::Result<crate::app_server::external_input::Envelope> {
+    anyhow::ensure!(message.sender_kind.is_job_service_system(), "not a Job Service notice");
+    let binding = crate::launch::stock::ExternalInputBinding {
+        version: 1,
+        owner_id: owner.to_string(),
+        thread_id: thread.to_string(),
+        runtime_generation: generation,
+        canonical_byte_limit: Default::default(),
+    };
+    let mut envelope = external::envelope(message, &binding)?;
+    external::route_job_completion(&mut envelope, passive)?;
+    external::wake_at_next_step(&mut envelope, next_step)?;
+    Ok(envelope)
+}
 
 #[cfg(test)]
 pub(crate) fn projected_external_envelope(
@@ -119,6 +172,13 @@ pub fn quarantine_terminal_external_input(
     error: &anyhow::Error,
 ) -> anyhow::Result<bool> {
     external::quarantine_terminal(owner, message, error)
+}
+
+/// A runtime's pure envelope decoder rejected an unfrozen projection before
+/// any native IO. Keep its failure/owner notice and let unrelated input proceed.
+/// Never use this for transport, storage or uncertain submission failures.
+pub fn quarantine_invalid_external_projection(owner:&str,message:&AgentBusMessage,detail:&str)->anyhow::Result<bool> {
+    external::quarantine_projection(owner,message,detail)
 }
 
 /// r219: finishes the durable record of a polled legacy Task Service message
@@ -251,6 +311,36 @@ mod job_service_completion_projection_tests {
         message.from_cutex_session_id = Some("cutex.forged".to_string());
         assert!(inter_agent_params("thread-current", target, target, &message).is_err());
     }
+
+    /// 054 S10 (Claude): a Job Service notice becomes the same native
+    /// envelope a Codex runtime gets, with the Codex routing.
+    #[test]
+    fn job_notice_envelope_for_a_claude_runtime_is_the_codex_one() {
+        use crate::app_server::external_input::{Delivery, SourceKind};
+        let target = "cutex.11111111-1111-4111-8111-111111111111";
+        let message = completion_message();
+        let envelope = job_notice_envelope(&message, target, "thread-current", 7, false, false).unwrap();
+        assert_eq!((envelope.owner_id.as_str(), envelope.thread_id.as_str(), envelope.runtime_generation), (target, "thread-current", 7));
+        assert_eq!((envelope.message.source.kind.clone(), envelope.message.source.id.as_str()), (SourceKind::Service, "cutex-job-service"));
+        assert_eq!((envelope.message.event_type.as_str(), envelope.message.delivery.clone()), ("job_completion", Delivery::AfterTurn));
+        envelope.validate().unwrap();
+        let passive = job_notice_envelope(&message, target, "thread-current", 7, true, false).unwrap();
+        assert_eq!(passive.message.delivery, Delivery::Passive);
+        assert_ne!(passive.semantic_sha256, envelope.semantic_sha256);
+        let soon = job_notice_envelope(&message, target, "thread-current", 7, false, true).unwrap();
+        assert_eq!(soon.message.delivery, Delivery::Soon);
+        // Same checks as on Codex: a forged sender is refused, an agent
+        // message is not a job notice.
+        let mut forged = completion_message();
+        forged.from_cutex_session_id = Some("cutex.forged".to_string());
+        assert!(job_notice_envelope(&forged, target, "thread-current", 7, false, false).is_err());
+        let mut agent = completion_message();
+        agent.sender_kind = AgentMessageKind::Agent;
+        assert!(job_notice_envelope(&agent, target, "thread-current", 7, false, false).is_err());
+        // One notice alone is neither held nor batched.
+        let (hold, batch) = job_notice_plan_for(std::slice::from_ref(&message), target);
+        assert!(hold.is_empty() && batch.is_empty());
+    }
 }
 
 #[derive(Debug, Default)]
@@ -276,6 +366,49 @@ impl PendingPollBackoff {
         let delay = self.next_delay.unwrap_or(initial_delay).min(cap);
         self.next_delay = Some(delay.saturating_mul(2).min(cap));
         Some(delay)
+    }
+}
+
+/// Pauses between registration tries while the bus is unavailable.
+const REGISTER_RETRY_DELAYS: [Duration; 3] =
+    [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
+/// No new try starts after this long, so a read timeout (120 s, a wedged bus)
+/// is not waited for twice: quick failures (refused connect, 503) get every
+/// retry, and the create's worker slot is back in about 150 s at worst.
+const REGISTER_RETRY_BUDGET: Duration = Duration::from_secs(30);
+
+/// Registers the runtime, trying again (1, 2, 4 s) while the bus is
+/// unreachable or overloaded (`agent_bus_unavailable`: 10060 timeouts, the
+/// in-flight limit's 503). Registration is idempotent for the same runtime
+/// endpoint. Any other failure returns at once.
+pub(crate) fn register_with_retry(
+    bus: &dyn RuntimeAgentBus,
+    registration: &AgentBusRegisterRequest,
+) -> anyhow::Result<()> {
+    register_with_retry_using(bus, registration, &REGISTER_RETRY_DELAYS, REGISTER_RETRY_BUDGET, thread::sleep)
+}
+
+fn register_with_retry_using(
+    bus: &dyn RuntimeAgentBus,
+    registration: &AgentBusRegisterRequest,
+    delays: &[Duration],
+    budget: Duration,
+    sleep: impl Fn(Duration),
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let mut delays = delays.iter();
+    loop {
+        match bus.register(registration) {
+            Ok(()) => return Ok(()),
+            Err(error) if crate::agent_bus::client::agent_bus_unavailable(&error) => {
+                let Some(delay) = delays.next().filter(|_| started.elapsed() < budget) else {
+                    return Err(error);
+                };
+                eprintln!("\x1b[33mwarning:\x1b[0m agent bus unavailable while registering runtime {}; retrying in {delay:?}: {error:#}", registration.id);
+                sleep(*delay);
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -437,6 +570,38 @@ pub struct AppServerAgentBusBridgeStatus {
     pub last_error: Option<String>,
 }
 
+/// Republishes a running bridge's frozen identity after Agent Bus recovery.
+pub struct RegistrationRefresh {
+    bus: Arc<dyn RuntimeAgentBus>,
+    registration: AgentBusRegisterRequest,
+    status: Arc<Mutex<AppServerAgentBusBridgeStatus>>,
+}
+
+impl RegistrationRefresh {
+    /// Registration is idempotent for the same runtime endpoint and does not
+    /// create a child or alter the native thread/generation. A blocking bus
+    /// call: hold no runtime-manager or host lock across it.
+    pub fn run(self) -> anyhow::Result<AppServerAgentBusBridgeStatus> {
+        match register_with_retry(self.bus.as_ref(), &self.registration) {
+            Ok(()) => {
+                mark_registration(&self.status, true);
+                self.status
+                    .lock()
+                    .map(|status| status.clone())
+                    .map_err(|_| anyhow::anyhow!("agent-bus bridge status lock was poisoned"))
+            }
+            Err(error) => {
+                mark_registration(&self.status, false);
+                mark_error(
+                    &self.status,
+                    format!("agent-bus registration refresh failed: {error:#}"),
+                );
+                Err(error)
+            }
+        }
+    }
+}
+
 pub struct AppServerAgentBusBridge {
     stop_tx: mpsc::SyncSender<()>,
     worker: Option<JoinHandle<()>>,
@@ -467,7 +632,7 @@ impl AppServerAgentBusBridge {
         if !runtime_alive.load(Ordering::Acquire) {
             anyhow::bail!("app-server runtime disconnected before agent-bus bridge startup");
         }
-        bus.register(&options.registration)
+        register_with_retry(bus.as_ref(), &options.registration)
             .context("failed to register app-server runtime on the agent bus")?;
         let runtime_agent_id = options.registration.id.clone();
         let registration = options.registration.clone();
@@ -534,23 +699,17 @@ impl AppServerAgentBusBridge {
             .map_err(|_| anyhow::anyhow!("agent-bus bridge status lock was poisoned"))
     }
 
-    /// Synchronously republishes the bridge's frozen identity after Agent Bus
-    /// recovery. Registration is idempotent for the same runtime endpoint and
-    /// does not create a child or alter the native thread/generation.
     pub fn refresh_registration(&self) -> anyhow::Result<AppServerAgentBusBridgeStatus> {
-        match self.shutdown_bus.register(&self.registration) {
-            Ok(()) => {
-                mark_registration(&self.status, true);
-                self.status()
-            }
-            Err(error) => {
-                mark_registration(&self.status, false);
-                mark_error(
-                    &self.status,
-                    format!("agent-bus registration refresh failed: {error:#}"),
-                );
-                Err(error)
-            }
+        self.registration_refresh().run()
+    }
+
+    /// What [`RegistrationRefresh::run`] needs, so its owner can make the bus
+    /// call after dropping its own locks.
+    pub fn registration_refresh(&self) -> RegistrationRefresh {
+        RegistrationRefresh {
+            bus: self.shutdown_bus.clone(),
+            registration: self.registration.clone(),
+            status: self.status.clone(),
         }
     }
 
@@ -653,6 +812,7 @@ fn run_bridge_worker(
     .to_string();
     let mut pending_poll_backoff = PendingPollBackoff::default();
     let mut external_client = None;
+    let mut presentation_schedule = Default::default();
     loop {
         if !runtime_alive.load(Ordering::Acquire) {
             mark_error(&status, "app-server runtime disconnected".to_string());
@@ -694,6 +854,8 @@ fn run_bridge_worker(
                         &status,
                         &mut external_client,
                     )
+                } else if cfg!(debug_assertions) && test_fake_external_input() {
+                    test_fake_deliver(bus.as_ref(), &options, messages, &status)
                 } else {
                     deliver_polled_messages_with(
                         bus.as_ref(),
@@ -709,9 +871,14 @@ fn run_bridge_worker(
                     )
                 };
                 // Input delivery and ACK have already run. Display failures do
-                // not alter their result; recovery also runs on an empty poll.
+                // not alter their result; recovery also runs on an empty poll,
+                // where it searches only after a store change or a due attempt.
                 if let Some(generation) = options.external_input_generation {
-                    if let Err(error) = external::deliver_presentations(&options, generation) {
+                    if let Err(error) = external::deliver_presentations(
+                        &options,
+                        generation,
+                        &mut presentation_schedule,
+                    ) {
                         mark_error(&status, format!("presentation recovery: {error}"));
                     }
                 }
@@ -756,6 +923,36 @@ fn run_bridge_worker(
     }
     if let Err(error) = bus.unregister(&options.registration.id) {
         mark_error(&status, format!("agent-bus unregister failed: {error:#}"));
+    }
+}
+
+/// 054 S12 test hook (debug builds, private test homes only; see
+/// `external::deliver_test_fake`).
+fn test_fake_external_input() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        external::test_fake_external_input()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+fn test_fake_deliver(
+    bus: &dyn RuntimeAgentBus,
+    options: &AppServerAgentBusBridgeOptions,
+    messages: Vec<AgentBusMessage>,
+    status: &Arc<Mutex<AppServerAgentBusBridgeStatus>>,
+) -> anyhow::Result<DeliverySweepOutcome> {
+    #[cfg(debug_assertions)]
+    {
+        external::deliver_test_fake(bus, options, messages, status)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (bus, options, messages, status);
+        anyhow::bail!("the external-input test hook exists only in debug builds")
     }
 }
 
@@ -839,7 +1036,7 @@ fn deliver_polled_messages_with(
             outcome.made_progress = true;
             continue;
         }
-        match inter_agent_params(thread_id, recipient_label, cutex_session_id, &message) {
+        match durable_inter_agent_params(agent_bus_message_repository()?,thread_id, recipient_label, cutex_session_id, &message) {
             Ok(params) => {
                 let computed = inter_agent_semantic_sha256(&params);
                 let digest = agent_bus_message_repository()?
@@ -939,6 +1136,10 @@ fn deliver_polled_messages_with(
                 outcome.retained_pending = true;
                 continue;
             }
+            if agent_bus_message_repository()?.owner_delivery_blocked(cutex_session_id, &message.id)? {
+                outcome.retained_pending = true;
+                continue;
+            }
             let starts_turn = params.delivery_mode.trigger_turn() && !submitter.thread_busy(thread_id)?;
             if params.delivery_mode.trigger_turn() {
                 let busy = !starts_turn;
@@ -949,6 +1150,8 @@ fn deliver_polled_messages_with(
                 }
             }
             let prepared_turn = starts_turn.then(|| crate::management::v2::admission::prepare_turn(cutex_session_id, "delivery", None));
+            // 054 §2.9: native IO starts now (A2 submission next).
+            agent_bus_message_repository()?.input_ledger_sending(cutex_session_id, &message.id);
             match submitter.submit_inter_agent_message(params) {
                 Ok(submission_id) => {
                     if let Some(prepared) = prepared_turn { prepared.submitted(); }
@@ -1214,6 +1417,16 @@ pub fn inter_agent_params(
         Some(RegistryParticipantMetadataResolver.resolve(recipient_cutex_session_id));
     if message.sender_kind.is_alarm_system() {
         return alarm_inter_agent_params(thread_id, recipient_cutex_session_id, message);
+    }
+    if crate::agent_bus::rename_notice::is_notice(message) {
+        let content=crate::agent_bus::rename_notice::model_text(message)?;
+        return Ok(ThreadInterAgentMessageParams {
+            thread_id:thread_id.into(),message_id:model_visible_message_id(&message.id),
+            author:agent_path_for_bus_label(crate::agent_bus::rename_notice::SOURCE_ID),
+            author_metadata:Some(system_participant(crate::agent_bus::rename_notice::SOURCE_ID)),
+            recipient:"/root".into(),recipient_metadata,other_recipients:Vec::new(),content,
+            delivery_mode:message.delivery_mode.clone(),
+        });
     }
     if message.kind == AgentBusEnvelopeKind::Message
         && (message.from == AGENT_MANAGEMENT_SYSTEM_SENDER
@@ -2819,7 +3032,9 @@ mod tests {
         assert_eq!(quarantined["state"], "quarantined");
         assert_eq!(
             quarantined["error"]["code"],
-            "canonical_semantic_digest_mismatch"
+            // This legacy fixture has no frozen recipient label. Tampered
+            // content cannot prove a historical label against its stored SHA.
+            "canonical_envelope_invalid"
         );
     }
 
@@ -3854,5 +4069,71 @@ mod tests {
         options.registration.session_id = Some("thread-1".to_string());
         options.registration.pid = 0;
         assert!(options.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod register_retry_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct FlakyBus(Mutex<VecDeque<anyhow::Result<()>>>, Mutex<usize>);
+    impl RuntimeAgentBus for FlakyBus {
+        fn register(&self, _: &AgentBusRegisterRequest) -> anyhow::Result<()> {
+            *self.1.lock().unwrap() += 1;
+            self.0.lock().unwrap().pop_front().unwrap_or(Ok(()))
+        }
+        fn unregister(&self, _: &str) -> anyhow::Result<bool> { Ok(true) }
+        fn poll(&self, _: &str) -> anyhow::Result<Vec<AgentBusMessage>> { Ok(Vec::new()) }
+        fn ack(&self, _: &str, _: &[String]) -> anyhow::Result<usize> { Ok(0) }
+    }
+    fn timeout() -> anyhow::Error {
+        anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut)).context("Failed to read agent bus response")
+    }
+    fn registration() -> AgentBusRegisterRequest {
+        serde_json::from_value(serde_json::json!({"id": "codex.retry", "name": "retry", "profile": "p", "cwd": "."}))
+            .expect("minimal registration")
+    }
+    fn run(results: Vec<anyhow::Result<()>>, budget: Duration) -> (anyhow::Result<()>, usize, Vec<Duration>) {
+        let bus = FlakyBus(Mutex::new(results.into()), Mutex::new(0));
+        let slept = Mutex::new(Vec::new());
+        let result = register_with_retry_using(&bus, &registration(), &REGISTER_RETRY_DELAYS, budget, |d| slept.lock().unwrap().push(d));
+        let tries = *bus.1.lock().unwrap();
+        (result, tries, slept.into_inner().unwrap())
+    }
+
+    /// 2026-11-04 EVA: four agent_create calls lost their start to one 10060
+    /// timeout of this registration while the bus was overloaded.
+    #[test]
+    fn a_bus_timeout_is_retried_until_the_bus_answers() {
+        let (result, tries, slept) = run(vec![Err(timeout()), Err(timeout())], REGISTER_RETRY_BUDGET);
+        assert!(result.is_ok());
+        assert_eq!(tries, 3);
+        assert_eq!(slept, [Duration::from_secs(1), Duration::from_secs(2)]);
+    }
+
+    #[test]
+    fn retries_stop_after_three_and_never_for_a_refusal_or_an_exhausted_budget() {
+        let (result, tries, slept) = run((0..5).map(|_| Err(timeout())).collect(), REGISTER_RETRY_BUDGET);
+        assert!(crate::agent_bus::client::agent_bus_unavailable(&result.unwrap_err()));
+        assert_eq!((tries, slept.len()), (4, 3));
+        let (result, tries, _) = run(vec![Err(anyhow::anyhow!("registration refused: bad artifact"))], REGISTER_RETRY_BUDGET);
+        assert!(result.is_err());
+        assert_eq!(tries, 1, "a refusal is not retried");
+        let (result, tries, _) = run(vec![Err(timeout())], Duration::ZERO);
+        assert!(result.is_err());
+        assert_eq!(tries, 1, "no new try after the budget");
+    }
+
+    #[test]
+    fn only_bus_transport_failures_count_as_unavailable() {
+        use crate::agent_bus::client::{agent_bus_unavailable, agent_bus_unavailable_text};
+        assert!(agent_bus_unavailable(&timeout()));
+        assert!(agent_bus_unavailable(&timeout().context("failed to register app-server runtime on the agent bus")));
+        assert!(agent_bus_unavailable(&anyhow::anyhow!("refused").context("Failed to connect cutex agent bus")));
+        assert!(!agent_bus_unavailable(&anyhow::anyhow!("Failed to parse agent bus JSON response")));
+        assert!(!agent_bus_unavailable(&anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))));
+        assert!(agent_bus_unavailable_text("readiness failed: failed to register app-server runtime on the agent bus: Failed to read agent bus response: (os error 10060)"));
+        assert!(!agent_bus_unavailable_text("readiness failed: app-server request failed"));
     }
 }

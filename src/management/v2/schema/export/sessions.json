@@ -5,6 +5,23 @@
   "description": "GET /v2/sessions (and GET /v2/sessions/{id} → one session). Fields not listed may be added in later versions.",
   "anyOf": [{ "$ref": "#/$defs/sessionList" }, { "$ref": "#/$defs/session" }],
   "$defs": {
+    "autoRetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempt", "maxAttempts", "scheduledAt", "at", "turnId", "planId", "phase", "holdsAdmission"],
+      "properties": {
+        "attempt": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "maxAttempts": { "const": 3 },
+        "scheduledAt": { "type": "string" },
+        "at": { "type": "string" },
+        "turnId": { "type": "string", "minLength": 1 },
+        "planId": { "type": "string", "minLength": 1 },
+        "phase": { "enum": ["pending", "firing", "binding", "uncertain"] },
+        "holdsAdmission": { "type": "boolean" },
+        "threadId": { "type": "string" },
+        "runtimeGeneration": { "type": "integer", "minimum": 0 }
+      }
+    },
     "sessionList": {
       "type": "object",
       "required": ["contractVersion", "hostId", "sessions"],
@@ -46,6 +63,8 @@
         "runtimeGeneration": { "type": "integer", "minimum": 0 },
         "runtimeAgentId": { "type": ["string", "null"] },
         "activeTurnId": { "type": ["string", "null"] },
+        "backgroundWork": { "anyOf": [{ "$ref": "#/$defs/backgroundWork" }, { "type": "null" }], "description": "session-background-work: process-local own background work, including Codex descendant terminals. Null when disconnected or unsupported; independent of turn activity." },
+        "turnState": { "enum": ["unknown", "running", "idle"], "description": "Disconnected observation is unknown; reconnect derives turn state from the runtime resume snapshot." },
         "activeTurnObservedAt": { "type": ["string", "null"] },
         "threadStatus": {},
         "threadSettings": { "type": ["object", "null"] },
@@ -74,6 +93,17 @@
             "pendingRelease": { "type": ["string", "null"], "description": "A deferred repin's release (applies at the next fresh runtime start); null when none." }
           }
         }
+      }
+    },
+    "backgroundWork": {
+      "type": "object", "additionalProperties": false,
+      "required": ["running", "subagents", "shells", "terminals", "complete"],
+      "properties": {
+        "running": { "type": "boolean" },
+        "subagents": { "type": "integer", "minimum": 0 },
+        "shells": { "type": "integer", "minimum": 0 },
+        "terminals": { "type": "integer", "minimum": 0 },
+        "complete": { "type": "boolean", "description": "All supported runtime inventories read successfully. Claude completeInventory=false stays false; running=false with complete=false is not proof of idle." }
       }
     },
     "badge": {
@@ -107,6 +137,7 @@
       "required": ["contractVersion", "cutexSessionId", "revision", "lifecycle", "hostId", "displayName", "runtime"],
       "properties": {
         "contractVersion": { "const": 2 },
+        "autoRetry": { "anyOf": [{ "$ref": "#/$defs/autoRetry" }, { "type": "null" }] },
         "cutexSessionId": { "type": "string" },
         "revision": { "type": "integer" },
         "lifecycle": { "enum": ["active", "retired"] },

@@ -1797,6 +1797,7 @@ mod tests {
                 "thread/read" => {
                     json!({"thread":{"id":child,"forkedFromId":parent,"ephemeral":true}})
                 }
+                "thread/backgroundTerminals/list" | "thread/loaded/list" => json!({"data":[],"nextCursor":null}),
                 _ => panic!("unexpected fake native method: {method}"),
             };
             socket

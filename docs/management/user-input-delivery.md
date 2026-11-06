@@ -253,7 +253,7 @@ only affects future admission. Idle result coalescing is independent of numbered
 `fit_returns` retains prefix deferral: once one result is deferred for size, all subsequent
 results are deferred as well, avoiding overtaking within the result batch.
 
-**Rollback to r228:** no conversion is required. r228's serde readers ignore additive owner
+**Earlier input-format readers:** the readers described here ignore additive owner
 `admission`, bus `queuedAt`/`admissionStartedIdle` and config `queue` fields; an old-version save drops them. The
 owner-only queue vector survives, but old timestamp comparison and independent bus admission
 resume, losing the shared ordering and passing policy. Re-upgrading lazily reconstructs
@@ -264,7 +264,7 @@ longer held, and the old binary's own stops never create one. Before `admission-
 an unknown method and `ownerYielded` is ignored by readers and dropped from a stored snapshot on save
 (it is recomputed from memory anyway, so nothing is lost).
 
-**Rollback to before `nextStepLeases`** (r230 and earlier): the field is additive and absent when
+**Readers without `nextStepLeases`:** the field is additive and absent when
 empty; an older binary ignores it and drops it on its first ask-store save. A results event still
 in flight beside a running turn's lease at that moment stays in `events` unacknowledged with its
 deliveries `queuedAsEvent`: the older binary neither re-sends nor acknowledges it, and

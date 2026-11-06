@@ -54,7 +54,15 @@
     "cutex/ownerNotify/dismiss",
     "cutex/ownerNotify/delete",
     "cutex/safetyCheck/grant",
-    "cutex/safetyCheck/dismiss"
+    "cutex/safetyCheck/dismiss",
+    "cutex/input/get",
+    "cutex/input/list",
+    "cutex/input/dismiss",
+    "cutex/input/lease/release",
+    "cutex/userInput/queue/merge",
+    "cutex/input/retry",
+    "cutex/input/interruptSend",
+    "cutex/input/hold"
   ],
   "queries": [
     {

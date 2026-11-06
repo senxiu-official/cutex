@@ -248,6 +248,7 @@ mod tests {
                 ..
             }
         ));
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -335,6 +336,7 @@ mod tests {
             panic!("claim required")
         };
         assert_eq!(first, second);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

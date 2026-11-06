@@ -210,6 +210,10 @@ fn commit_pin(
 
 /// Move one local Claude session to `target` (see the module docs).
 pub fn repin(id: &str, target: &ClaudeDeployment, dry_run: bool) -> anyhow::Result<RepinReport> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+    // A caller may have read the target before obtaining its permit. Never
+    // publish that target if a concurrent prune removed its dependencies.
+    target.validate()?;
     let initial = super::claude::record(id)?;
     let session = initial.claude_session.clone().unwrap();
     let next = match plan_pin(&session.deployment, &for_session(&session.deployment, target)) {
@@ -279,6 +283,7 @@ pub fn repin(id: &str, target: &ClaudeDeployment, dry_run: bool) -> anyhow::Resu
 /// Every local Claude session (archived ones included: they are offline and
 /// keep their pin through Restore), in id order.
 pub fn repin_all(target: &ClaudeDeployment, dry_run: bool) -> anyhow::Result<Vec<RepinReport>> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     let store = crate::session::store::load_cutex_session_store()?;
     let host = crate::platform::host::current_host_name();
     let mut reports = Vec::new();

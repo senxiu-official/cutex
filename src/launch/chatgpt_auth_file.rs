@@ -118,8 +118,26 @@ pub(super) fn account_identity(bytes: &[u8]) -> anyhow::Result<crate::role_revis
         tokens.keys().all(|k| matches!(
             k.as_str(),
             "id_token" | "access_token" | "refresh_token" | "account_id"
+                | "oauth_provenance" | "login_owner_id"
         )),
         "unsupported native token fields"
+    );
+    // Native login::TokenData writes these optional metadata fields on login
+    // and preserves them across refresh. They do not change the reviewed
+    // account identity, and must never be removed from native-owned storage.
+    // Match native's Option/string structure without interpreting its issuer
+    // or choosing an OAuth authority here; native owns that decision.
+    if let Some(provenance) = tokens.get("oauth_provenance").filter(|v| !v.is_null()) {
+        ensure!(
+            provenance.is_object()
+                && ["issuer", "client_id"].iter().all(|field|
+                    provenance.get(field).is_some_and(|v| v.is_string())),
+            "invalid native OAuth provenance metadata"
+        );
+    }
+    ensure!(
+        tokens.get("login_owner_id").is_none_or(|v| v.is_null() || v.is_string()),
+        "invalid native login owner metadata"
     );
     for field in ["id_token", "access_token", "refresh_token"] {
         ensure!(
@@ -177,6 +195,10 @@ pub(super) fn account_identity(bytes: &[u8]) -> anyhow::Result<crate::role_revis
 pub fn review(_: PathBuf) -> anyhow::Result<ReviewedChatgptAuth> {
     anyhow::bail!("reviewed private ChatGPT auth file currently supports Linux only")
 }
+
+#[cfg(test)]
+#[path = "chatgpt_auth_file_tests.rs"]
+pub(crate) mod metadata_tests;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {

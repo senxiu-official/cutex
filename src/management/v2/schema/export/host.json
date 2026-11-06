@@ -82,7 +82,8 @@
           "type": "object",
           "required": ["selected", "latest", "inUse"],
           "properties": {
-            "selected": { "$ref": "#/$defs/nullableString" },
+            "selected": { "$ref": "#/$defs/nullableString", "description": "Version of the selected native SHA when registered; null for unregistered bytes or no selected deployment. Never inferred from latest." },
+            "selectedSha256Prefix": { "$ref": "#/$defs/nullableString", "description": "First 12 SHA-256 characters of the selected native executable; null without a selected deployment. Display identity when its version is unknown." },
             "latest": { "$ref": "#/$defs/nullableString" },
             "inUse": { "type": "array", "items": { "$ref": "#/$defs/runtimeUse" }, "description": "Selected entry plus every entry with agents, newest first." }
           }

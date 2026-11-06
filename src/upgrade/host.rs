@@ -397,6 +397,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn synthetic_failed_future_upgrade_rolls_back_through_production_store_preparation() {
+        use super::super::runner::{self, fake::FakeHost, Plan};
+        use super::super::manifest::Mode;
+        use super::super::state::{PackageRun, Phase, RunKind};
+        let root = std::env::temp_dir().join(format!("same-format-rollback-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let asks = crate::asks::store::AskStore::at_runtime(home.join("runtime"));
+        asks.with_state(|state| { state.wait_cancel.insert("cutex.retained".into(), 7); }).unwrap();
+        let database = home.join("runtime/management-v2").join(crate::management::v2::hot_store::DATABASE_FILE);
+        let before = std::fs::read(&database).unwrap();
+        let real = RealHost { layout: Layout::at(root.join("base")), home: home.clone(),
+            base_url: "http://127.0.0.1:1".into(), token: String::new(), service_manager: "unused".into(),
+            names: ServiceNames::default(), unit_dir: None, cancel_marker: root.join("cancel") };
+        let mut host = FakeHost::new("0.2.0");
+        host.fail_once.borrow_mut().insert("wait_ready");
+        // Only service/API observations are simulated. The rollback preparation
+        // is the production RealHost -> older_stores path over actual SQLite.
+        host.prepare_stores = Some(Box::new(move |displaced, target| {
+            assert_eq!(target, "0.2.0");
+            real.prepare_older_stores(displaced, target)
+        }));
+        let plan = Plan { to_release: "999.0.0".into(), to_commit: None, mode: Mode::Full,
+            class: MigrationClass::RollbackSafe, migrations: Vec::new(),
+            capabilities_added: Vec::new(), capabilities_removed: Vec::new(),
+            package_run: PackageRun::After, max_wait: Duration::from_secs(1), ready_timeout: Duration::from_secs(1),
+            run_dir: root.join("run"), selection_backup: None };
+        let mut run = runner::new_run(RunKind::Apply, "0.2.0", &plan);
+        runner::apply(&mut run, &plan, &host);
+        assert_eq!(run.phase, Phase::RolledBack, "{:?}", run.needs_owner);
+        assert_eq!(run.error.as_ref().unwrap().code, "not_ready");
+        assert_eq!(*host.running.borrow(), "0.2.0");
+        assert!(host.phases().contains(&Phase::RollingBack));
+        let steps = host.steps();
+        assert_eq!(steps.iter().filter(|s| *s == "wait_ready").count(), 2, "new daemon fails once; old daemon becomes ready");
+        let prepare = steps.iter().position(|s| s == "prepare_older_stores").unwrap();
+        assert!(steps[..prepare].iter().any(|s| s == "stop"));
+        assert!(steps[prepare + 1..].iter().any(|s| s == "activate_old"));
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        assert!(!home.join("runtime/asks/asks-v1.json").exists(), "no legacy export");
+        assert!(!plan.run_dir.join("displaced").exists());
+        assert_eq!(asks.snapshot().unwrap().wait_cancel["cutex.retained"], 7);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn busy_rule_matches_runtime_packages() {
         let idle = json!({"cutexSessionId": "cutex.a", "runtime": {"status": "online", "threadStatus": {"type": "idle"}}});
         assert!(session_busy(&idle).is_none());

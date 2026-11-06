@@ -53,12 +53,16 @@ enum Operation {
     },
     Online {
         cutex_session_id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_unlisted: bool,
     },
     Offline {
         cutex_session_id: String,
     },
     Restart {
         cutex_session_id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_unlisted: bool,
     },
     Close {
         cutex_session_id: String,
@@ -127,7 +131,8 @@ fn parse_input(arguments: &str) -> Result<ToolInput, ()> {
     let operation = object.get("operation").and_then(Value::as_str).ok_or(())?;
     let operation_fields: &[&str] = match operation {
         "create" => &["spec", "start_mode", "frozen_message", "bootstrap_intent"],
-        "online" | "offline" | "restart" | "close" => &["cutex_session_id"],
+        "online" | "restart" => &["cutex_session_id", "allow_unlisted"],
+        "offline" | "close" => &["cutex_session_id"],
         "replace" => &[
             "bootstrap_intent",
             "predecessor_cutex_session_id",
@@ -452,6 +457,8 @@ const AGENT_FIELDS: &[&str] = &[
     "pin",
     // r265: runtime variant of the profile (e.g. "dsh").
     "variant",
+    // r274.1: let a model the profile's list does not show through.
+    "allow_unlisted",
 ];
 
 /// Legacy full-spec fields that the sparse arguments dropped, with what to
@@ -720,13 +727,14 @@ fn agent_fields(name: &str) -> serde_json::Map<String, Value> {
     let mut fields = serde_json::Map::new();
     fields.insert("name".into(), string(name));
     fields.insert("profile".into(), string("Profile (name or id) it runs on, or \"auto:<provider>\" (e.g. auto:anthropic) to pick the opted-in profile of that provider with the most quota left. Default: yours."));
-    fields.insert("model".into(), string("Model. Default: the profile's default model."));
+    fields.insert("model".into(), string("Model. Default: the profile's default model. A model the profile's model list does not show is refused (invalid_model) with the allowed models; a unique short form of a listed model (e.g. \"astra\" for gpt-6-astra) is used and reported as model_resolved, and a name that is also a profile or model here gets a name_warning."));
     fields.insert("reasoning".into(), string("Reasoning effort. Default: the profile's default. An effort the model does not support is refused with the allowed list."));
     fields.insert("sandbox".into(), json!({"type":"string","enum":["read-only","workspace-write","danger-full-access"],"description":"Default: yours; never more than yours."}));
     fields.insert("approval_policy".into(), json!({"type":"string","enum":["untrusted","on-request","never"],"description":"Default: yours; never less strict than yours."}));
     fields.insert("cwd".into(), string("Absolute working directory. Default: the project's workspace root (else yours); agents may share it."));
     fields.insert("pin".into(), json!({"type":"boolean","description":"Pin it in the owner's agent list. Default false."}));
     fields.insert("variant".into(), string("Runtime variant of the profile (e.g. \"dsh\" for DSH on a DeepSeek profile). Default: the profile's default variant; the runtime is fixed at creation."));
+    fields.insert("allow_unlisted".into(), json!({"type":"boolean","description":"Allow a model the profile's model list does not show (a brand-new server model). Default false."}));
     fields
 }
 
@@ -745,7 +753,7 @@ pub(super) fn tools() -> Vec<Value> {
     const AUTHORITY: &str = "Your authority comes from your runtime, never from arguments. After response_uncertain, repeat the identical call (pass the action_id from the reply in a later turn).";
     const LIMITS: &str = "A new agent never gets more than you have: a sandbox, approval policy, network access or writable roots beyond yours answers permission_exceeds_creator with the offending fields. A profile the owner marked as needing approval waits up to 2 minutes for the owner's decision; if none came it answers approval_required (approval_id): repeat the same call with the same action_id after the owner approves; do not poll.";
     const DEFAULTS: &str = "Leave the other fields empty unless needed: profile, model, reasoning, sandbox and approval policy default to yours, cwd to the project's workspace.";
-    let create_limits = LIMITS.replace("waits up to 2 minutes for the owner's decision; if none came it answers", "answers");
+    let create_limits = LIMITS.replace("waits up to 2 minutes for the owner's decision; if none came it answers approval_required (approval_id)", "answers approval_required at once (receipt status awaitingApproval with approval_id)");
     let create_authority = "Your authority comes from your runtime, never from arguments. After response_uncertain, query action_status first; any explicit retry must keep the identical action_id and payload.";
     let mut create = agent_fields(name);
     create.insert("task".into(), task.clone());
@@ -757,14 +765,15 @@ pub(super) fn tools() -> Vec<Value> {
         "required":["name"],"additionalProperties":false,
         "description":"The new agent: name, plus any field to change from your defaults (as in agent_create)."});
     vec![
-        tool(AGENT_CREATE, format!("Example: {{\"name\":\"quokka\",\"task\":\"Review src/parser and report bugs\"}}. {DEFAULTS} (Director or operator) Create and start a persistent cutex agent in your project. A running receipt means this call is still being handled: read action_status with tool=agent_create and the returned action_id; never submit a replacement action. It has its own conversation the owner can use. The profile, model and reasoning fields select its runtime configuration; omitted fields use the documented defaults. {create_limits} {create_authority}"),
+        tool(AGENT_CREATE, format!("Example: {{\"name\":\"quokka\",\"task\":\"Review src/parser and report bugs\"}}. {DEFAULTS} (Director or operator) Create and start a persistent cutex agent in your project. The call waits up to 20 seconds and returns the finished result (the new agent and, with task, its delegation); a running receipt means it is still being handled: read action_status with tool=agent_create and the returned action_id; never submit a replacement action. It has its own conversation the owner can use. The profile, model and reasoning fields select its runtime configuration; omitted fields use the documented defaults. {create_limits} {create_authority}"),
             Value::Object(create),
             &["name"]),
         tool(AGENT_ARCHIVE, format!("(Director or operator) Soft archive a member of your project; agent_restore restores the same session and native thread offline. {AUTHORITY}"),
             json!({"action_id":action_id,"project_id":project_id,"cutex_session_id":target("archive")}),
             &["cutex_session_id"]),
         tool(MEMBER_RUNTIME, format!("(Director or operator) Bring a member of your project online, take it offline, or restart it; cutex resolves its launch contract (profile, model, permissions). {AUTHORITY}"),
-            json!({"action_id":action_id,"project_id":project_id,"cutex_session_id":target("change"),"change":{"type":"string","enum":["online","offline","restart"]}}),
+            json!({"action_id":action_id,"project_id":project_id,"cutex_session_id":target("change"),"change":{"type":"string","enum":["online","offline","restart"]},
+                "allow_unlisted":{"type":"boolean","description":"online / restart: start it even when its model is not on the profile's model list (a brand-new server model). Default false."}}),
             &["cutex_session_id","change"]),
         tool(MEMBER_REPLACE, format!("Example: {{\"predecessor_cutex_session_id\":\"quokka\",\"policy\":\"close_after_ready\",\"successor\":{{\"name\":\"quokka-2\"}},\"task\":\"Continue the parser review\"}}. {DEFAULTS} (Director or operator) Replace a member of your project with a new agent (successor). policy: close_before_create, close_after_ready (the old one is archived once the new one is ready) or keep_old. {LIMITS} {AUTHORITY}"),
             json!({"action_id":action_id,"project_id":project_id,"predecessor_cutex_session_id":target("replace"),
@@ -877,6 +886,38 @@ mod tests {
         );
         assert_eq!(transported, 1, "{result}");
         assert_ne!(result["outcome"]["code"], "invalid_arguments", "{result}");
+    }
+
+    /// r274.1: allow_unlisted is an agent_create / member_replace field and a
+    /// member_runtime argument; false stays off the wire (digests unchanged).
+    #[test]
+    fn allow_unlisted_reaches_the_bus() {
+        let mut sent = Value::Null;
+        call(AGENT_CREATE, json!({"action_id":"a","name":"sol-review","model":"gpt-7","allow_unlisted":true}), |body| {
+            sent = body.clone();
+            anyhow::bail!("stop")
+        });
+        assert_eq!(sent["agent"]["allow_unlisted"], true, "{sent}");
+        for (change, allow) in [("online", true), ("restart", true), ("restart", false)] {
+            let mut args = json!({"action_id":"b","cutex_session_id":"cutex.t","change":change});
+            if allow {
+                args["allow_unlisted"] = json!(true);
+            }
+            let mut sent = Value::Null;
+            let result = call(MEMBER_RUNTIME, args, |body| {
+                sent = body.clone();
+                anyhow::bail!("stop")
+            });
+            assert!(!sent.is_null(), "{result}");
+            let typed: crate::agent_management::AgentManagementRequest = serde_json::from_value(sent.clone()).unwrap();
+            assert_eq!(typed.operation.allow_unlisted(), allow, "{sent}");
+            assert_eq!(sent.get("allow_unlisted").is_some(), allow, "{sent}");
+        }
+        let schema = tools();
+        let create = schema.iter().find(|tool| tool["name"] == AGENT_CREATE).unwrap();
+        assert_eq!(create["inputSchema"]["properties"]["allow_unlisted"]["type"], "boolean");
+        let runtime = schema.iter().find(|tool| tool["name"] == MEMBER_RUNTIME).unwrap();
+        assert_eq!(runtime["inputSchema"]["properties"]["allow_unlisted"]["type"], "boolean");
     }
 
     #[test]
@@ -1068,7 +1109,8 @@ mod tests {
         assert!(description.starts_with("Example: {\"name\":\"quokka\",\"task\":"), "{description}");
         assert!(description.contains("Leave the other fields empty unless needed"), "{description}");
         // Prompt revision A2: what it creates, not which work it is for.
-        assert!(description.contains("Create and start a persistent cutex agent in your project. A running receipt means this call is still being handled: read action_status with tool=agent_create and the returned action_id; never submit a replacement action. It has its own conversation the owner can use."), "{description}");
+        assert!(description.contains("Create and start a persistent cutex agent in your project. The call waits up to 20 seconds and returns the finished result (the new agent and, with task, its delegation); a running receipt means it is still being handled: read action_status with tool=agent_create and the returned action_id; never submit a replacement action. It has its own conversation the owner can use."), "{description}");
+        assert!(description.contains("answers approval_required at once (receipt status awaitingApproval with approval_id): repeat the same call with the same action_id after the owner approves"), "{description}");
         for preference in ["long-lived work", "prefer your native", "short parallel subtasks"] {
             assert!(!description.contains(preference), "{preference}");
         }

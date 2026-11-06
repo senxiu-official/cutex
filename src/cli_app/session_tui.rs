@@ -27,7 +27,7 @@ use cutex::config::global_settings::apply_global_config_patch;
 use cutex::config::store::load_codez_config;
 use cutex::config::store::load_codez_config_checked;
 use cutex::config::store::save_codez_config;
-use cutex::management::v2::activity::load_session_activity_states;
+use cutex::management::v2::activity::session_activity;
 use cutex::management::v2::activity::SessionActivityState;
 use cutex::observability::{SafeToolCallClass, SafeToolCallStatus};
 use cutex::profiles::model::CodezConfig;
@@ -502,7 +502,7 @@ struct ProfileMutationReceipt {
 
 #[derive(Debug, Clone)]
 struct ProfileProjectionSnapshot {
-    records: HashMap<String, CutexSessionRecord>,
+    records: cutex::session::shared_rows::SharedHashRows<CutexSessionRecord>,
     config: CodezConfig,
     profile_names: Vec<String>,
 }
@@ -5011,7 +5011,7 @@ fn initial_selector_model(refreshing: bool) -> anyhow::Result<SelectorModel> {
     let store = load_reconciled_session_store()?;
     let config = load_codez_config();
     let (profile_names, profile_warning) = profile_names_with_warning();
-    let (activity_states, activity_warning) = activity_states_with_warning();
+    let (activity_states, activity_warning) = activity_states_with_warning(store.sessions.values().map(|record| record.cutex_session_id.as_str()));
     let (project_contexts, project_warning) = project_contexts_with_warning();
     let (compaction_counts, compaction_warning) = compaction_counts_with_warning();
     let initial_warning = combine_warnings(
@@ -5119,7 +5119,7 @@ fn load_live_snapshot() -> anyhow::Result<SelectorSnapshot> {
         ),
     };
     let (profile_names, profile_warning) = profile_names_with_warning();
-    let (activity_states, activity_warning) = activity_states_with_warning();
+    let (activity_states, activity_warning) = activity_states_with_warning(store.sessions.values().map(|record| record.cutex_session_id.as_str()));
     let (project_contexts, project_warning) = project_contexts_with_warning();
     let (compaction_counts, compaction_warning) = compaction_counts_with_warning();
     let config = load_codez_config();
@@ -5334,8 +5334,13 @@ fn profile_names_with_warning() -> (Vec<String>, Option<String>) {
     }
 }
 
-fn activity_states_with_warning() -> (HashMap<String, SessionActivityState>, Option<String>) {
-    match load_session_activity_states() {
+fn activity_states_with_warning<'a>(ids: impl IntoIterator<Item=&'a str>) -> (HashMap<String, SessionActivityState>, Option<String>) {
+    let selected = || -> anyhow::Result<HashMap<String, SessionActivityState>> {
+        let mut rows=HashMap::new();
+        for id in ids {if let Some(row)=session_activity(id)? {rows.insert(id.to_owned(),row);}}
+        Ok(rows)
+    };
+    match selected() {
         Ok(states) => (states, None),
         Err(error) => (
             HashMap::new(),
@@ -6884,9 +6889,8 @@ fn run_event_loop(
     loop {
         let now = Instant::now();
         if now >= next_activity_refresh {
-            if let Ok(Some(activity_states)) = cutex::management::v2::activity::try_load_session_activity_states() {
-                model.refresh_activity_states(&activity_states);
-            }
+            let (activity_states, warning) = activity_states_with_warning(model.rows.iter().filter_map(|row|row.activity_session_id.as_deref()));
+            if warning.is_none() {model.refresh_activity_states(&activity_states);}
             next_activity_refresh = now + ACTIVITY_REFRESH_INTERVAL;
         }
         receive_refresh(model, refresh);
@@ -7294,6 +7298,7 @@ fn apply_session_settings(
 fn apply_session_management(
     request: &SessionManagementRequest,
 ) -> anyhow::Result<SessionManagementResult> {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
     if request.command == SessionSettingsCommand::Adopt
         && cutex::launch::local_deployment::LocalDeployment::selected()?.is_some()
     {
@@ -11433,37 +11438,39 @@ mod tests {
             retired_at: None,
         };
         AgentManagementSnapshot {
-            bootstrap_intents: BTreeMap::new(),
-            agent_archive_actions: BTreeMap::new(),
-            agent_archive_audit: BTreeMap::new(),
-            reversible_archive_projection: BTreeMap::new(),
+            legacy_close_projection: None,
+            bootstrap_intents: Default::default(),
+            agent_archive_actions: Default::default(),
+            agent_archive_audit: Default::default(),
+            reversible_archive_projection: Default::default(),
             schema: AgentManagementStoreSchema::V1,
             store_revision: 1,
-            durable_import_actions: BTreeMap::new(),
-            durable_import_audit: BTreeMap::new(),
-            projects: BTreeMap::new(),
-            operator_grants: BTreeMap::new(),
-            operator_grant_revisions: BTreeMap::new(),
-            operator_audit_events: BTreeMap::new(),
-            human_management_operator_actions: BTreeMap::new(),
-            human_management_project_mutations: BTreeMap::new(),
-            current_project_memberships: BTreeMap::new(),
-            project_states: BTreeMap::new(),
-            project_tombstones: BTreeMap::new(),
-            project_audit_events: BTreeMap::new(),
+            durable_import_actions: Default::default(),
+            durable_import_audit: Default::default(),
+            projects: Default::default(),
+            operator_grants: Default::default(),
+            operator_grant_revisions: Default::default(),
+            operator_audit_events: Default::default(),
+            human_management_operator_actions: Default::default(),
+            human_management_project_mutations: Default::default(),
+            current_project_memberships: Default::default(),
+            project_states: Default::default(),
+            project_tombstones: Default::default(),
+            project_audit_events: Default::default(),
             project_presentations: presentation
-                .map(|presentation| BTreeMap::from([(project_id, presentation)]))
+                .map(|presentation| [(project_id, presentation)].into_iter().collect())
                 .unwrap_or_default(),
-            agents: BTreeMap::from([(cutex_session_id, agent)]),
-            actions: BTreeMap::new(),
-            phase_events: BTreeMap::new(),
-            authority_receipts: BTreeMap::new(),
-            legacy_director_ownership_import_receipts: BTreeMap::new(),
-            reservation_reconciliation_receipts: BTreeMap::new(),
-            reservation_reconciliation_events: BTreeMap::new(),
-            failure_events: BTreeMap::new(),
-            sparse_requests: BTreeMap::new(),
-            extra: BTreeMap::new(),
+            agents: [(cutex_session_id, agent)].into_iter().collect(),
+            actions: Default::default(),
+            phase_events: Default::default(),
+            authority_receipts: Default::default(),
+            legacy_director_ownership_import_receipts: Default::default(),
+            reservation_reconciliation_receipts: Default::default(),
+            reservation_reconciliation_events: Default::default(),
+            failure_events: Default::default(),
+            sparse_requests: Default::default(),
+            extra: Default::default(),
+            tool_action_receipts: Default::default(),
         }
     }
 
@@ -11958,7 +11965,7 @@ mod tests {
         durable.cutex_session_id = "cutex.one".into();
         durable.archive_state = cutex::session::model::CutexSessionArchiveState::Retired;
         let store = CutexSessionStore {
-            sessions: HashMap::from([("cutex.one".into(), durable)]),
+            sessions: cutex::session::shared_rows::SharedHashRows::from([("cutex.one".into(), durable)]),
             ..Default::default()
         };
         let before = serde_json::to_value(&store).unwrap();
@@ -12056,7 +12063,7 @@ mod tests {
         decoy.cwd = "/tmp/Nova Operations/project-alpha".to_string();
         decoy.managed_cwd = Some("/tmp/Nova Operations/project-alpha".to_string());
         let store = CutexSessionStore {
-            sessions: HashMap::from([
+            sessions: cutex::session::shared_rows::SharedHashRows::from([
                 ("store-exact".to_string(), exact),
                 ("store-decoy".to_string(), decoy),
             ]),
@@ -14813,7 +14820,7 @@ mod tests {
         let mut gamma = profile_catalog_entry("gamma", true);
         gamma.id = "id-alpha".to_string();
         let projection = ProfileProjectionSnapshot {
-            records: HashMap::from([(updated_record.cutex_session_id.clone(), updated_record)]),
+            records: cutex::session::shared_rows::SharedHashRows::from([(updated_record.cutex_session_id.clone(), updated_record)]),
             config: updated_config,
             profile_names: vec!["gamma".to_string(), "beta".to_string()],
         };

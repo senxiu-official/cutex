@@ -1,7 +1,8 @@
 //! Read-only receipts for slow tools. Business authority/idempotency remains
 //! in AgentManagementProvider and AskStore. A query never resumes an action.
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -28,7 +29,7 @@ impl Query {
 }
 
 pub fn definition() -> Value {
-    json!({"name":TOOL,"description":"Read the outcome of your agent_create or agent_delegate by its exact action_id. Read-only: never starts, retries or resumes work. Unknown/notFound is not proof that nothing happened. running means the daemon is still handling this call; completed means the tool operation finished (not that delegated work finished).",
+    json!({"name":TOOL,"description":"Read the outcome of your agent_create or agent_delegate by its exact action_id. Read-only: never starts, retries or resumes work. Unknown/notFound is not proof that nothing happened. running means the daemon is still handling this call; completed means the tool operation finished (not that delegated work finished); awaitingApproval (approval_id) means the owner must approve: result.approval.state says whether the owner has decided (approved: repeat the identical call now with the same action_id; denied or expired answer failed), and a delegation under owner review shows its current state once reviewed.",
         "annotations":{"readOnlyHint":true},
         "inputSchema":{"type":"object","additionalProperties":false,"required":["action_id","tool"],
             "properties":{"action_id":{"type":"string","minLength":1,"maxLength":128},"tool":{"type":"string","enum":["agent_create","agent_delegate"]}}}})
@@ -56,7 +57,13 @@ fn envelope(q: &Query, status: &str, unknown: bool, result: Option<Value>) -> Va
 fn completed(q: &Query, mut result: Value) -> Value {
     crate::asks::create_task::normalize_uncertain_attachment(&mut result, &q.action_id);
     if !result.is_object() { return envelope(q,"unknown",true,None); }
-    let status = if result["outcome"]["status"] == "approval_required" || result["status"] == "approval_required"
+    // The launch policy answers a pending owner approval as a no_write whose
+    // code is approval_required; it must stay retryable, not a final failure.
+    let approval = result["outcome"]["status"] == "no_write" && result["outcome"]["code"] == "approval_required";
+    if approval && result["approval_id"].is_null() {
+        if let Some(id) = approval_id(result["outcome"]["detail"].as_str().unwrap_or("")) { result["approval_id"] = json!(id); }
+    }
+    let status = if approval || result["outcome"]["status"] == "approval_required" || result["status"] == "approval_required"
         || result["state"] == "pendingReview" { "awaitingApproval" }
     else if result["outcome"]["status"] == "response_uncertain" || result["status"] == "response_uncertain"
         || result["outcome"]["status"] == "owner_action_required" || result["outcomeUnknown"] == true
@@ -68,6 +75,13 @@ fn completed(q: &Query, mut result: Value) -> Value {
     envelope(q, status, status == "unknown", Some(result))
 }
 
+/// The policy refusal carries the id only inside its detail text, as
+/// "... (approval_id <id>)".
+fn approval_id(detail: &str) -> Option<&str> {
+    let id = detail.rsplit_once("(approval_id ")?.1.strip_suffix(')')?;
+    (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
+}
+
 fn refused(q: &Query, code: &str) -> Value {
     completed(q,json!({"ok":false,"action_id":q.action_id,"status":"no_write","code":code}))
 }
@@ -77,6 +91,12 @@ fn refused(q: &Query, code: &str) -> Value {
 const MAX_WORKERS: usize = 8;
 const MAX_CALLER_WORKERS: usize = 2;
 const MAX_CACHED_RESULTS: usize = 256;
+/// How long an explicit start (or same-digest retry) waits for its worker
+/// before answering running. Below every façade's client timeout (the oldest
+/// adapters default to 30 s). The wait holds no business lock and no cache
+/// mutex; at most MAX_WAITERS callers wait at once, the rest answer running.
+pub const START_WAIT: Duration = Duration::from_secs(20);
+const MAX_WAITERS: usize = 32;
 /// Admission says only that THIS invocation did not obtain a worker. A missing
 /// process cache (restart/eviction/another process) is not evidence that the
 /// original action has no effects. Keep its outcome unknown, separately report
@@ -95,8 +115,14 @@ struct Running {
 }
 type Key = (String, String, String);
 #[derive(Default)]
-struct Cache { rows: BTreeMap<Key, Running>, generation: u64 }
-type SharedCache = Arc<Mutex<Cache>>;
+struct Cache { rows: BTreeMap<Key, Running>, generation: u64, waiters: usize }
+/// The projection plus a signal raised whenever a worker ends.
+#[derive(Default)]
+struct Shared { state: Mutex<Cache>, ended: Condvar }
+impl Shared {
+    fn lock(&self) -> LockResult<MutexGuard<'_, Cache>> { self.state.lock() }
+}
+type SharedCache = Arc<Shared>;
 static RUNNING: OnceLock<SharedCache> = OnceLock::new();
 fn calls() -> &'static SharedCache { RUNNING.get_or_init(Default::default) }
 fn key(caller: &str, q: &Query) -> Key { (caller.into(), q.tool.clone(), q.action_id.clone()) }
@@ -109,10 +135,41 @@ fn key(caller: &str, q: &Query) -> Key { (caller.into(), q.tool.clone(), q.actio
 /// durable idempotency layer, never through an unfenced direct business closure.
 pub fn start(caller: &str, q: Query, digest: String,
     run: impl FnOnce() -> anyhow::Result<Value> + Send + 'static) -> Value {
-    start_in(Arc::clone(calls()),caller,q,digest,run)
+    start_in(Arc::clone(calls()),START_WAIT,caller,q,digest,run)
 }
 
-fn start_in(cache: SharedCache, caller: &str, q: Query, digest: String,
+/// Ends a worker's row even if the worker unwinds past catch_unwind, then
+/// wakes every waiter. A missing value is recorded as unknown, never failed.
+struct WorkerEnd { cache: SharedCache, key: Key, generation: u64, query: Query, value: Option<Value> }
+impl Drop for WorkerEnd {
+    fn drop(&mut self) {
+        let value=self.value.take().unwrap_or_else(||envelope(&self.query,"unknown",true,None));
+        let mut state=self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(row)=state.rows.get_mut(&self.key) {
+            if row.generation==self.generation && row.result.is_none() {row.result=Some(value);}
+        }
+        drop(state);
+        self.cache.ended.notify_all();
+    }
+}
+
+/// Waits (cache mutex released) until this generation ends or `wait` passes.
+/// Anything else (timeout, eviction, a newer generation) answers running.
+fn await_end(cache: &Shared, mut state: MutexGuard<'_, Cache>, k: &Key, generation: u64, wait: Duration, q: &Query) -> Value {
+    let pending=|s: &mut Cache| s.rows.get(k).is_some_and(|r| r.generation==generation && r.result.is_none());
+    if !wait.is_zero() && pending(&mut state) && state.waiters<MAX_WAITERS {
+        state.waiters+=1;
+        state=match cache.ended.wait_timeout_while(state,wait,pending) {
+            Ok((state,_))=>state,
+            Err(poisoned)=>poisoned.into_inner().0,
+        };
+        state.waiters-=1;
+    }
+    state.rows.get(k).filter(|r| r.generation==generation).and_then(|r| r.result.clone())
+        .unwrap_or_else(|| envelope(q,"running",false,None))
+}
+
+fn start_in(cache: SharedCache, wait: Duration, caller: &str, q: Query, digest: String,
     run: impl FnOnce() -> anyhow::Result<Value> + Send + 'static) -> Value {
     if !q.valid() { return refused(&q,"invalid_arguments"); }
     let k = key(caller, &q);
@@ -122,7 +179,9 @@ fn start_in(cache: SharedCache, caller: &str, q: Query, digest: String,
         if row.digest != digest { return refused(&q,"idempotency_conflict"); }
         if row.result.as_ref().is_none_or(|r| !matches!(r["status"].as_str(),Some("unknown"|"awaitingApproval"))
             && r["result"]["outcome"]["receipt"]["result"]["delegation"]["ok"] != false) {
-            return row.result.clone().unwrap_or_else(|| envelope(&q,"running",false,None));
+            // Same-digest retry: replay a final result, or wait on the running worker.
+            if let Some(result)=&row.result {return result.clone();}
+            return await_end(&cache,state,&k,row.generation,wait,&q);
         }
     }
     let active=state.rows.iter().filter(|(_,r)|r.result.is_none()).count();
@@ -143,21 +202,19 @@ fn start_in(cache: SharedCache, caller: &str, q: Query, digest: String,
     }
     state.generation+=1;let generation=state.generation;
     state.rows.insert(k.clone(),Running {digest,generation,result:None});
+    // The guard is built inside the thread: a closure dropped by a failed
+    // spawn must not re-lock the cache this function still holds.
     let query=q.clone();let worker_key=k.clone();let worker_cache=Arc::clone(&cache);
     let spawned=std::thread::Builder::new().name("tool-action-receipt".into()).spawn(move || {
+        let mut end=WorkerEnd {cache:worker_cache,key:worker_key,generation,query,value:None};
         let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
-        let value=match result {Ok(Ok(result))=>completed(&query,result),_=>envelope(&query,"unknown",true,None)};
-        if let Ok(mut state)=worker_cache.lock() {
-            if let Some(row)=state.rows.get_mut(&worker_key) {
-                if row.generation==generation {row.result=Some(value);}
-            }
-        }
+        end.value=Some(match result {Ok(Ok(result))=>completed(&end.query,result),_=>envelope(&end.query,"unknown",true,None)});
     });
     if spawned.is_err() {
         if let Some(previous)=previous {let response=previous.result.clone();state.rows.insert(k,previous);return not_admitted(&q,"action_worker_unavailable",response);}
         state.rows.remove(&k);return not_admitted(&q,"action_worker_unavailable",None);
     }
-    envelope(&q,"running",false,None)
+    await_end(&cache,state,&k,generation,wait,&q)
 }
 
 pub fn query(caller: &str, args: Value) -> Value {
@@ -165,22 +222,53 @@ pub fn query(caller: &str, args: Value) -> Value {
         Ok(q) if Query::valid(&q)=>q,
         _=>return json!({"ok":false,"status":"no_write","code":"invalid_arguments"}),
     };
-    query_in(calls(),caller,&q,||durable_query(caller,&q))
+    query_with(calls(),caller,&q,||durable_query(caller,&q),live_approval)
 }
 
+#[cfg(test)]
 fn query_in(cache: &SharedCache, caller: &str, q: &Query,
     durable: impl FnOnce()->anyhow::Result<Value>) -> Value {
+    query_with(cache,caller,q,durable,|_| None)
+}
+
+/// approval-live-state: awaitingApproval is not final. A delegation under the
+/// owner's review answers its live state (the durable read); an agent_create
+/// refused for the owner's approval says what the owner decided (`approval`
+/// looks the record up by its id). Neither retries anything.
+fn query_with(cache: &SharedCache, caller: &str, q: &Query,
+    durable: impl FnOnce()->anyhow::Result<Value>,
+    approval: impl Fn(&str)->Option<crate::approvals::ApprovalRecord>) -> Value {
     let k=key(caller,q);
     let cached=cache.lock().ok().and_then(|s|s.rows.get(&k).cloned());
+    let mut waiting=None;
     if let Some(row)=&cached {
         if row.result.is_none() {return envelope(q,"running",false,None);}
         // Legacy nested uncertainty is normalized before considering finality.
         let value=row.result.as_ref().unwrap();
         let value=value.get("result").cloned().map(|r|completed(q,r)).unwrap_or_else(||value.clone());
-        if !matches!(value["status"].as_str(),Some("unknown"|"failed")) {return value;}
+        match value["status"].as_str() {
+            Some("awaitingApproval") => waiting=Some(value),
+            Some("unknown"|"failed") => {}
+            _ => return value,
+        }
     }
     // No mutex across disk IO and NO business execution from this path.
     let authoritative=durable().unwrap_or_else(|_|envelope(q,"unknown",true,None));
+    if let Some(waiting)=waiting {
+        // The live delegation / the created agent wins once it exists; else
+        // the call still waits for (or was refused by) the owner.
+        let live=!matches!(authoritative["status"].as_str(),Some("notFound"|"unknown"));
+        let value=if live {authoritative} else {waiting};
+        if live && value["status"]!="awaitingApproval" {
+            if let Ok(mut state)=cache.lock() {
+                if let Some(row)=state.rows.get_mut(&k) {
+                    let old=cached.as_ref().map(|r|r.generation);
+                    if Some(row.generation)==old && row.result.is_some() {row.result=Some(value.clone());}
+                }
+            }
+        }
+        return with_approval(value,&approval);
+    }
     let value=if authoritative["status"]=="notFound" && cached.is_some() {
         let old=cached.as_ref().and_then(|r|r.result.as_ref()).unwrap();
         let old=old.get("result").cloned().map(|r|completed(q,r)).unwrap_or_else(||old.clone());
@@ -194,7 +282,71 @@ fn query_in(cache: &SharedCache, caller: &str, q: &Query,
             }
         }
     }
+    with_approval(value,&approval)
+}
+
+/// An awaitingApproval agent_create receipt with the owner's decision so far
+/// (`result.approval`). Approved stays awaitingApproval: only the identical
+/// retry creates the agent. Denied and expired are failed. Not cached: a
+/// retry still runs and asks the launch policy again.
+fn with_approval(value: Value, approval: &dyn Fn(&str)->Option<crate::approvals::ApprovalRecord>) -> Value {
+    if value["tool"]!="agent_create" || value["status"]!="awaitingApproval" {return value;}
+    let record=value["result"]["approval_id"].as_str().and_then(approval);
+    approval_view(value,record.as_ref())
+}
+
+fn approval_view(mut value: Value, record: Option<&crate::approvals::ApprovalRecord>) -> Value {
+    use crate::approvals::ApprovalState;
+    let Some(record)=record else {return value;};
+    let (state,status,next)=match record.state {
+        ApprovalState::Pending=>("pending","awaitingApproval","The owner has not decided yet; you are told when they do. Do not poll."),
+        ApprovalState::Approved=>("approved","awaitingApproval","The owner approved: repeat the identical agent_create call now with the same action_id; it proceeds once (the approval lapses after 24 h)."),
+        ApprovalState::Consumed=>("consumed","unknown","The approval was used by a retry of this call; query again for that retry's outcome."),
+        ApprovalState::Denied=>("denied","failed","The owner denied this launch; do not retry the same call."),
+        ApprovalState::Expired=>("expired","failed","The approval lapsed before it was used; an identical call asks the owner again."),
+    };
+    value["status"]=json!(status);
+    value["outcomeUnknown"]=json!(status=="unknown");
+    let mut approval=json!({"approval_id":record.approval_id,"state":state,"next":next});
+    if let (ApprovalState::Denied,Some(note))=(record.state,record.note.as_deref()) {
+        approval["note"]=json!(note.chars().take(500).collect::<String>());
+    }
+    value["result"]["approval"]=approval;
     value
+}
+
+/// After a restart the refusal is gone: an agent_create whose resolution was
+/// recorded but that never reached the provider is found by the approval of
+/// its launch request (requester + digest, newest first).
+fn restart_approval(snapshot: &crate::agent_management::AgentManagementSnapshot, caller: &str, q: &Query,
+    find: impl FnOnce(&str)->Option<crate::approvals::ApprovalRecord>) -> Option<Value> {
+    if q.tool!="agent_create" {return None;}
+    let id=crate::agent_management::AgentActionId::new(&q.action_id).ok()?;
+    if snapshot.actions.contains_key(&id) {return None;}
+    let sparse=snapshot.sparse_requests.get(&id).filter(|s|s.caller_cutex_session.as_str()==caller)?;
+    let record=find(&crate::agent_bus::server::agent_profile_approval_digest(&sparse.request))?;
+    let result=json!({"outcome":{"status":"no_write","code":"approval_required"},"approval_id":record.approval_id});
+    Some(approval_view(envelope(q,"awaitingApproval",false,Some(result)),Some(&record)))
+}
+
+fn live_approval(id: &str) -> Option<crate::approvals::ApprovalRecord> {
+    crate::approvals::ApprovalStore::open_default().ok()?.get(id,chrono::Utc::now()).ok().flatten()
+}
+
+const RETRY_CREATE_HINT: &str = "The agent exists, but its runtime did not start and its task (if any) is not delivered yet. \
+Retry the same agent_create (same action_id and arguments), or start it with member_runtime online: either finishes the create and delivers the task.";
+
+/// The allowlisted reason of an `owner_action_required` failure detail
+/// (`[owner_action_required: ]<code>: …`) and whether an exact retry of the
+/// action is the way on.
+fn failure_reason(detail: &str) -> Option<(&'static str, bool)> {
+    let detail = detail.strip_prefix("owner_action_required: ").unwrap_or(detail);
+    [("agent_bus_observation_failed", "agent_bus_observation_failed", false),
+     ("agent_bus_unavailable", "agent_bus_unavailable", true),
+     ("session_online_failed", "runtime_start_failed", true)]
+        .into_iter()
+        .find(|(code, _, _)| detail.strip_prefix(code).is_some_and(|rest| rest.starts_with(": ")))
+        .map(|(_, reason, retry)| (reason, retry))
 }
 
 fn durable_query(caller: &str, q: &Query) -> anyhow::Result<Value> {
@@ -204,7 +356,13 @@ fn durable_query(caller: &str, q: &Query) -> anyhow::Result<Value> {
     }
     let store = crate::agent_management::AgentManagementStore::open_default()?;
     let snapshot = store.snapshot()?;
-    management_query(&snapshot,caller,q)
+    let value = management_query(&snapshot,caller,q)?;
+    if value["status"]!="notFound" {return Ok(value);}
+    Ok(restart_approval(&snapshot,caller,q,|digest| {
+        let store=crate::approvals::ApprovalStore::open_default().ok()?;
+        store.list(true,chrono::Utc::now()).ok()?.into_iter()
+            .find(|record| record.requester_cutex_session_id==caller && record.request_sha256==digest)
+    }).unwrap_or(value))
 }
 
 fn management_query(snapshot: &crate::agent_management::AgentManagementSnapshot, caller: &str, q: &Query) -> anyhow::Result<Value> {
@@ -218,7 +376,7 @@ fn management_query_with(snapshot: &crate::agent_management::AgentManagementSnap
     let action=snapshot.actions.values().find(|a|a.action_id.as_str()==q.action_id
         && a.caller_cutex_session.as_str()==caller && a.operation==crate::agent_management::AgentOperationKind::Create);
     let Some(action)=action else {return Ok(envelope(q,"notFound",true,None));};
-    let stored=snapshot.extra.get(RECEIPTS_EXTENSION).and_then(|v|v.get(&q.action_id));
+    let stored=snapshot.tool_action_receipt(&q.action_id);
     let mut result=if let Some(receipt)=stored {
         anyhow::ensure!(receipt["caller"]==caller && receipt["request_sha256"]==action.request_sha256.as_str(),"tool receipt does not match its original action");
         let result=receipt.get("result").filter(|v|v.is_object()).ok_or_else(||anyhow::anyhow!("invalid stored tool receipt"))?.clone();
@@ -245,18 +403,30 @@ fn management_query_with(snapshot: &crate::agent_management::AgentManagementSnap
                         "createdAt":failure.created_at});
                     // lifecycle_error writes this exact code prefix. Expose
                     // only the allowlisted constant, never its diagnostic tail.
-                    if failure.code == "owner_action_required"
-                        && failure.detail.starts_with("agent_bus_observation_failed: ") {
-                        reference["reasonCode"] = json!("agent_bus_observation_failed");
+                    if failure.code == "owner_action_required" {
+                        if let Some((reason, retry)) = failure_reason(&failure.detail) {
+                            reference["reasonCode"] = json!(reason);
+                            if retry { reference["retry"] = json!("exact"); }
+                        }
                     }
                     reference
                 }).collect();
-            return Ok(envelope(q,"unknown",true,Some(json!({"durableContext":{
+            let mut context = json!({
                 "phase":action.phase,"phaseSequence":action.phase_sequence,
                 "knownSuccessorCutexSession":action.known_successor_cutex_session,
                 "knownNativeSessionId":action.known_native_session_id,
                 "failureCount":failure_count,"failures":failures
-            }}))));
+            });
+            // The agent exists but its runtime did not start (r276): say how
+            // to finish the create instead of leaving an offline agent.
+            let latest = context["failures"].as_array()
+                .and_then(|failures| failures.iter().max_by_key(|f| f["createdAt"].as_str().unwrap_or_default().to_string()));
+            if action.operation == crate::agent_management::AgentOperationKind::Create
+                && latest.is_some_and(|failure| failure["retry"] == "exact") {
+                context["retry"] = json!("exact");
+                context["hint"] = json!(RETRY_CREATE_HINT);
+            }
+            return Ok(envelope(q,"unknown",true,Some(json!({"durableContext":context}))));
         };
         serde_json::to_value(response)?
     };
@@ -311,9 +481,11 @@ fn persist_creation_reply_in(store: &crate::agent_management::AgentManagementSto
         if expected_digest != Some(digest.as_str()) {
             return Err(crate::agent_management::AgentManagementError::InvalidStore);
         }
-        let receipts=state.extra.entry(RECEIPTS_EXTENSION.into()).or_insert_with(||json!({}));
-        let map=receipts.as_object_mut().ok_or(crate::agent_management::AgentManagementError::InvalidStore)?;
-        if let Some(previous)=map.get(action_id) {
+        // One row per receipt (058 S4); a non-object legacy value is damage.
+        if state.extra.get(RECEIPTS_EXTENSION).is_some_and(|receipts|!receipts.is_object()) {
+            return Err(crate::agent_management::AgentManagementError::InvalidStore);
+        }
+        if let Some(previous)=state.tool_action_receipt(action_id) {
             if previous["caller"] != caller || previous["request_sha256"] != digest {
                 return Err(crate::agent_management::AgentManagementError::InvalidStore);
             }
@@ -327,7 +499,7 @@ fn persist_creation_reply_in(store: &crate::agent_management::AgentManagementSto
                 return Ok((state,previous,false));
             }
         }
-        map.insert(action_id.into(),json!({"caller":caller,"request_sha256":digest,"result":result}));
+        state.tool_action_receipts.insert(action_id.into(),json!({"caller":caller,"request_sha256":digest,"result":result}));
         Ok((state,result,true))
     })?)
 }
@@ -335,20 +507,23 @@ fn persist_creation_reply_in(store: &crate::agent_management::AgentManagementSto
 fn delegation_query(store: &crate::asks::store::AskStore, caller: &str, q: &Query) -> anyhow::Result<Value> {
     let state = store.peek()?.unwrap_or_default();
     let action = state.actions.get(&format!("{caller}\u{1f}{}",q.action_id)).filter(|a| a.tool == q.tool);
+    let mut waiting=None;
     if let Some(result) = action.and_then(|a| a.result.as_ref()) {
         let receipt=completed(q,result.clone());
-        if receipt["status"]!="unknown" {return Ok(receipt);}
+        // A reply that waited for the owner's review is not final: the
+        // delegation's live state answers.
+        match receipt["status"].as_str() {
+            Some("unknown") => {}
+            Some("awaitingApproval") => waiting=Some(receipt),
+            _ => return Ok(receipt),
+        }
     }
-    let requester = crate::asks::model::Requester::Agent { cutex_session_id:caller.into(), name:None };
-    let ask = state.find_by_action(&requester,&q.action_id).cloned()
-        .or(store.archived_by_action(&requester,&q.action_id)?);
-    if let Some(ask) = ask {
-        let historical = store.lookup_snapshot(&[&ask.ask_id])?;
-        let mut result = crate::asks::view::requester_view(&historical,&ask);
+    if let Some(mut result) = crate::asks::tools::live_delegation_view(store,caller,&q.action_id)? {
         result["ok"] = json!(true);
         result["created"] = json!(false);
         return Ok(completed(q, crate::asks::tools::delegation_terms(result)));
     }
+    if let Some(waiting)=waiting {return Ok(waiting);}
     Ok(envelope(q,if action.is_some() {"unknown"} else {"notFound"},true,None))
 }
 
@@ -358,14 +533,15 @@ mod tests {
     #[test]
     fn pending_worker_is_fast_scoped_and_never_replayed() {
         let q = Query {tool:"agent_create".into(),action_id:format!("test-{}",uuid::Uuid::new_v4())};
+        let cache: SharedCache = Default::default();
         let (release, wait) = std::sync::mpsc::channel();
-        let result = start("caller",q.clone(),"digest".into(),move || {
+        let result = start_in(cache.clone(),Duration::ZERO,"caller",q.clone(),"digest".into(),move || {
             wait.recv().unwrap(); Ok(json!({"outcome":{"status":"complete"}}))
         });
         assert_eq!(result["status"],"running");
-        assert_eq!(start("caller",q.clone(),"digest".into(),|| panic!("replayed"))["status"],"running");
-        assert_eq!(start("caller",q.clone(),"different".into(),|| panic!("changed payload"))["result"]["code"],"idempotency_conflict");
-        assert!(!calls().lock().unwrap().rows.contains_key(&key("stranger",&q)));
+        assert_eq!(start_in(cache.clone(),Duration::ZERO,"caller",q.clone(),"digest".into(),|| panic!("replayed"))["status"],"running");
+        assert_eq!(start_in(cache.clone(),Duration::ZERO,"caller",q.clone(),"different".into(),|| panic!("changed payload"))["result"]["code"],"idempotency_conflict");
+        assert!(!cache.lock().unwrap().rows.contains_key(&key("stranger",&q)));
         release.send(()).unwrap();
     }
     #[test]
@@ -471,3 +647,11 @@ mod p1_tests;
 #[cfg(test)]
 #[path = "action_receipts_context_tests.rs"]
 mod context_tests;
+
+#[cfg(test)]
+#[path = "action_receipts_wait_tests.rs"]
+mod wait_tests;
+
+#[cfg(test)]
+#[path = "action_receipts_live_tests.rs"]
+mod live_tests;

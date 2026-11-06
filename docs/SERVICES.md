@@ -181,6 +181,40 @@ automatic retry. Explicit owner `/start` or `/open` resets the budget. Persisten
 services retain the existing exponential backoff. The exhausted state and
 restart count are persisted with runtime state.
 
+### Persistent managed idle stop (capability `service-idle-presets-v1`)
+
+`idleStopPreset` on register/update is `1h`, `24h`, `7d` or `forever`.
+Agent tools spell it `idle_stop_preset`. Only `runtime: managed` with
+`lifetime: persistent` accepts a preset. New eligible registrations default to
+`24h`; records written before this capability retain `forever`. Ephemeral
+reclamation, external processes and static registrations are unchanged.
+
+Idle stop kills only the owned process tree, retaining registration and its
+reserved port. Views show `health: stoppedIdle`, `stoppedIdleAt`, `idleStopAt`
+and `lastTrafficAt`. The durable idle marker is separate from `stopped` (the
+owner's manual stop), and sleepers remain asleep after daemon restart and
+prior-run process cleanup. Idle sleep/wake does not consume crash restarts.
+Management calculates deadlines from its live lifecycle facts. Agent Bus lists
+read the supervisor's persisted `idleStopAt` projection, on the existing
+last-traffic persistence cadence (up to one minute), rather than using the Bus
+process's own startup time or lease memory.
+
+Authenticated proxy traffic, active proxy connections and viewing leases count
+as use. Health probes and tile reads neither renew idle time nor start a service.
+Direct port traffic is outside the proxy: it neither counts as use nor wakes a
+stopped process. Choose `forever` for direct-port-only services or always-needed
+backends. The deadline uses the latest creation, daemon/process start, proxy traffic or
+final lease release; live connections and leases suspend it.
+
+The first admitted proxy request or view-ticket open wakes an idle service and
+waits up to 15 seconds for readiness. Concurrent requests share one startup.
+Failure returns a clear 503 `service_wake_failed` (gate wait expiry:
+`service_start_timeout`); the failed marker persists, so traffic and daemon
+restart do not retry indefinitely. Owner Start/Wake or `service_restart` permits
+one fresh attempt. An owner's manual stop always requires explicit owner Start:
+proxy requests and view-ticket opens return `service_manually_stopped` and never
+start it. Ephemeral open behavior stays unchanged.
+
 ### Agent restart (`service_restart`, capability `services-agent-restart`)
 
 `service_restart {slug}` lets the owning agent restart its managed service after
@@ -190,7 +224,7 @@ otherwise; project services also permit their current Director). It needs no app
 `managed_service` grant that let the command run covers its restarts. It
 refuses external and static services with 409 `not_managed` (cutex runs no
 process for them) and a service the owner stopped with 409 `service_stopped`:
-only the owner's `/start` or `/open` brings that back (the owner-start path also
+only the owner's `/start` brings a persistent service back (the owner-start path also
 clears `stopped`, which an agent must not override).
 
 The Agent Bus serves agent tools and the supervisor runs in Management serve,
@@ -445,7 +479,7 @@ Rollback: stop the daemon, restore `registry.json.pre-services-proxy` as
 `registry.json`, then switch to the old binary. Registrations made after the
 backup will be absent. Do not run old and new daemons against one home.
 
-The r258 previous-build preflight refuses rollback while the registry contains
+An older target build can refuse rollback in its preflight while the registry contains
 new retention intent (`ephemeralIdleMinutes: 0`, per-service TTL/pin) or any
 persistent purpose / owner organisation state. The normal upgrade backup also
 includes the complete `services/` directory; the preflight never strips fields.
@@ -464,7 +498,7 @@ binary, and optional Management/Bus ports (defaults 26170/26160). The lifecycle
 entry point runs the same combined smoke. The owner-approved daemon environment uses `HOME` pointing to marked
 `~/.cutex-gpt-svcproxy-dev`, `CUTEX_HOME` pointing to its `.cutex` directory,
 and `CUTEX_TEST_FORBID_REAL_HOME=1`. Only daemon/instance child processes omit
-`CUTEX_TEST_PRIVATE_HOME`: r223 forbids combining it with `CUTEX_HOME`, while
+`CUTEX_TEST_PRIVATE_HOME`: the debug test-home guard forbids combining it with `CUTEX_HOME`, while
 its default instance rejects the allocated 26170/26160 ports. Rust tests retain
 both `HOME` and `CUTEX_TEST_PRIVATE_HOME` in the marked test home. The pool is 26180–26199, child processes are
 hidden, and only owned PIDs are stopped. The script refuses protected ports

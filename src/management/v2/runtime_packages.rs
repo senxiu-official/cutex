@@ -772,7 +772,7 @@ pub fn reverted_agents(source: &Run, runs: &[Run]) -> HashSet<String> {
 
 /// A finished upgrade run, at most [`KEEP_REVERTABLE_DAYS`] old, with moved
 /// items no revert run has moved back yet (`runs`: every record).
-fn revertable(run: &Run, runs: &[Run], now: chrono::DateTime<chrono::Utc>) -> bool {
+pub(crate) fn revertable(run: &Run, runs: &[Run], now: chrono::DateTime<chrono::Utc>) -> bool {
     run.kind == RunKind::Upgrade
         && run.state != RunState::Running
         && !revert_items(run, &reverted_agents(run, runs), &Selection::All).items.is_empty()
@@ -1642,6 +1642,21 @@ fn spawn(
         .name(format!("cutex-runtime-packages-{}", run.run_id))
         .spawn(move || {
             let ops = DaemonOps { context, coordinator: thread_coordinator.clone() };
+            // Retain old-package references until the run's revert contracts
+            // are persisted, including the gap after backend apply returns.
+            let _runtime_reference = match crate::runtime::reference_guard::acquire_shared() {
+                Ok(permit) => permit,
+                Err(error) => {
+                    for item in &mut thread_run.items {
+                        item.state = ItemState::Failed;
+                        item.code = Some("runtime_reference_unavailable".into());
+                        item.reason = Some(clip(error.to_string()));
+                    }
+                    finish_run(&mut thread_run, &ops);
+                    thread_coordinator.finish(&thread_run);
+                    return;
+                }
+            };
             job(&mut thread_run, &ops);
             thread_coordinator.finish(&thread_run);
         });

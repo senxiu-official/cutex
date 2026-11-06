@@ -20,20 +20,25 @@ fn layout() -> anyhow::Result<Layout> {
     })
 }
 
-fn print(value: &serde_json::Value) -> anyhow::Result<()> {
+fn print(value: &impl serde::Serialize) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 
 fn explain(error: anyhow::Error) -> anyhow::Error {
     match error.downcast_ref::<UpgradeError>() {
-        Some(e) if !e.details.as_object().is_none_or(|d| d.is_empty()) => anyhow::anyhow!("{} ({})", e, e.details),
+        Some(e) if !e.details.as_object().is_none_or(|d| d.is_empty()) => {
+            anyhow::anyhow!("{} ({})", e, e.details)
+        }
         _ => error,
     }
 }
 
 fn package_run(text: Option<String>) -> anyhow::Result<Option<PackageRun>> {
-    text.map(|t| PackageRun::parse(&t).with_context(|| format!("--package-run {t}: after, during or none"))).transpose()
+    text.map(|t| {
+        PackageRun::parse(&t).with_context(|| format!("--package-run {t}: after, during or none"))
+    })
+    .transpose()
 }
 
 /// Print phase changes until the run is terminal.
@@ -42,7 +47,16 @@ fn follow(layout: &Layout, run_id: &str) -> anyhow::Result<()> {
     loop {
         if let Some(run) = state::read_run(layout, run_id) {
             for entry in run.timeline.iter().skip(seen) {
-                println!("{}  {}{}", entry.at, entry.phase.as_str(), entry.detail.as_deref().map(|d| format!("  {d}")).unwrap_or_default());
+                println!(
+                    "{}  {}{}",
+                    entry.at,
+                    entry.phase.as_str(),
+                    entry
+                        .detail
+                        .as_deref()
+                        .map(|d| format!("  {d}"))
+                        .unwrap_or_default()
+                );
             }
             seen = run.timeline.len();
             if run.phase.terminal() {
@@ -61,7 +75,9 @@ fn follow(layout: &Layout, run_id: &str) -> anyhow::Result<()> {
                 bail!("run {run_id} ended {}", run.phase.as_str());
             }
         }
-        if control::reconcile_lost_run(layout).is_some_and(|r| r.run_id == run_id && r.phase.terminal()) {
+        if control::reconcile_lost_run(layout)
+            .is_some_and(|r| r.run_id == run_id && r.phase.terminal())
+        {
             continue;
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -85,7 +101,9 @@ pub(super) fn run_upgrade(command: UpgradeCommand) -> anyhow::Result<()> {
         }
         UpgradeCommand::Status { json } => {
             // Unmanaged: never a stand-in base (see `upgrade_api::layout`).
-            let view = Layout::detect().map_or_else(control::unmanaged_status_view, |layout| control::status_view(&layout));
+            let view = Layout::detect().map_or_else(control::unmanaged_status_view, |layout| {
+                control::status_view(&layout)
+            });
             if json {
                 return print(&view);
             }
@@ -93,23 +111,50 @@ pub(super) fn run_upgrade(command: UpgradeCommand) -> anyhow::Result<()> {
                 println!("unmanaged: this cutex was deployed by hand; `cutex upgrade` does not change it");
                 return Ok(());
             }
-            println!("installed  {}", view["installed"]["release"].as_str().unwrap_or("?"));
-            println!("previous   {}", view["previousRelease"].as_str().unwrap_or("-"));
-            println!("available  {}", view["available"]["release"].as_str().unwrap_or("-"));
-            println!("staged     {}", view["staged"]["release"].as_str().unwrap_or("-"));
+            println!(
+                "installed  {}",
+                view["installed"]["release"].as_str().unwrap_or("?")
+            );
+            println!(
+                "previous   {}",
+                view["previousRelease"].as_str().unwrap_or("-")
+            );
+            println!(
+                "available  {}",
+                view["available"]["release"].as_str().unwrap_or("-")
+            );
+            println!(
+                "staged     {}",
+                view["staged"]["release"].as_str().unwrap_or("-")
+            );
             if let Some(run) = view["run"].as_object() {
-                println!("run        {} {} {} → {} ({})", run["runId"].as_str().unwrap_or(""), run["kind"].as_str().unwrap_or(""),
-                    run["fromRelease"].as_str().unwrap_or(""), run["toRelease"].as_str().unwrap_or(""), run["phase"].as_str().unwrap_or(""));
+                println!(
+                    "run        {} {} {} → {} ({})",
+                    run["runId"].as_str().unwrap_or(""),
+                    run["kind"].as_str().unwrap_or(""),
+                    run["fromRelease"].as_str().unwrap_or(""),
+                    run["toRelease"].as_str().unwrap_or(""),
+                    run["phase"].as_str().unwrap_or("")
+                );
             }
             if view["trustedKeys"].as_array().is_some_and(Vec::is_empty) {
-                println!("note: this build trusts no release signing key; check / stage are unavailable");
+                println!(
+                    "note: this build trusts no release signing key; check / stage are unavailable"
+                );
             }
             Ok(())
         }
         UpgradeCommand::Check => {
             let layout = layout()?;
             let settings = Settings::load(&layout);
-            let available = stage::check(&layout, &settings.source()?, &keys, settings.channel(&layout), &LocalRuntimes::read()).map_err(explain)?;
+            let available = stage::check(
+                &layout,
+                &settings.source()?,
+                &keys,
+                settings.channel(&layout),
+                &LocalRuntimes::read(),
+            )
+            .map_err(explain)?;
             match available {
                 Some(available) => print(&serde_json::to_value(available)?),
                 None => {
@@ -123,17 +168,32 @@ pub(super) fn run_upgrade(command: UpgradeCommand) -> anyhow::Result<()> {
             let release = release
                 .or_else(|| State::load(&layout).available.map(|a| a.release))
                 .context("no release given and none available (run `cutex upgrade check`)")?;
-            let _lock = OperationLock::try_acquire(&layout)?.context("another upgrade operation is running")?;
+            let _lock = OperationLock::try_acquire(&layout)?
+                .context("another upgrade operation is running")?;
             let settings = Settings::load(&layout);
-            let staged = stage::stage(&layout, &settings.source()?, &keys, settings.channel(&layout), &release, &LocalRuntimes::read())
-                .map_err(explain)?;
+            let staged = stage::stage(
+                &layout,
+                &settings.source()?,
+                &keys,
+                settings.channel(&layout),
+                &release,
+                &LocalRuntimes::read(),
+            )
+            .map_err(explain)?;
             print(&serde_json::to_value(&staged)?)?;
             if !staged.preflight_ok {
                 bail!("preflight failed");
             }
             Ok(())
         }
-        UpgradeCommand::Apply { release, mode, max_wait_secs, confirm_one_way, package_run: package, no_follow } => {
+        UpgradeCommand::Apply {
+            release,
+            mode,
+            max_wait_secs,
+            confirm_one_way,
+            package_run: package,
+            no_follow,
+        } => {
             let layout = layout()?;
             let mode = match mode.as_deref() {
                 None => None,
@@ -167,17 +227,34 @@ pub(super) fn run_upgrade(command: UpgradeCommand) -> anyhow::Result<()> {
         UpgradeCommand::Cancel => {
             let layout = layout()?;
             let run = control::cancel(&layout).map_err(explain)?;
-            println!("cancel requested for {} ({})", run.run_id, run.phase.as_str());
+            println!(
+                "cancel requested for {} ({})",
+                run.run_id,
+                run.phase.as_str()
+            );
             Ok(())
         }
-        UpgradeCommand::Rollback { to, dry_run, max_wait_secs, no_follow } => {
+        UpgradeCommand::Rollback {
+            to,
+            dry_run,
+            max_wait_secs,
+            no_follow,
+        } => {
             let layout = layout()?;
-            let request = RollbackRequest { to, max_wait_secs, dry_run, requested_by: Some("cli".into()) };
+            let request = RollbackRequest {
+                to,
+                max_wait_secs,
+                dry_run,
+                requested_by: Some("cli".into()),
+            };
             let (run, preview) = control::prepare_rollback(&layout, &request).map_err(explain)?;
             print(&preview)?;
             let Some(run) = run else { return Ok(()) };
             let run = control::start(&layout, &keys, run)?;
-            println!("run {} {} → {}", run.run_id, run.from_release, run.to_release);
+            println!(
+                "run {} {} → {}",
+                run.run_id, run.from_release, run.to_release
+            );
             if no_follow {
                 return Ok(());
             }
@@ -197,10 +274,15 @@ pub(super) fn run_upgrade(command: UpgradeCommand) -> anyhow::Result<()> {
                     run.from_release,
                     run.to_release,
                     run.phase.as_str(),
-                    run.error.as_ref().map(|e| format!("  ({})", e.code)).unwrap_or_default(),
+                    run.error
+                        .as_ref()
+                        .map(|e| format!("  ({})", e.code))
+                        .unwrap_or_default(),
                     match (run.runtime_change, &run.native_version) {
-                        (Some(state::RuntimeChange::Native), Some(native)) => format!("  [native {native}]"),
-                        (Some(state::RuntimeChange::Package), _) => "  [runtime package]".to_string(),
+                        (Some(state::RuntimeChange::Native), Some(native)) =>
+                            format!("  [native {native}]"),
+                        (Some(state::RuntimeChange::Package), _) =>
+                            "  [runtime package]".to_string(),
                         _ => String::new(),
                     }
                 );
@@ -222,7 +304,9 @@ pub(super) fn run_upgrade(command: UpgradeCommand) -> anyhow::Result<()> {
             let mut settings = Settings::load(&layout);
             let mut changed = false;
             if let Some(channel) = channel {
-                settings.channel = cutex::build_info::normalize_channel(&channel).with_context(|| format!("channel {channel}: release or main"))?.into();
+                settings.channel = cutex::build_info::normalize_channel(&channel)
+                    .with_context(|| format!("channel {channel}: release or main"))?
+                    .into();
                 changed = true;
             }
             if let Some(source) = source {
@@ -256,7 +340,11 @@ pub(super) fn run_upgrade(command: UpgradeCommand) -> anyhow::Result<()> {
                 changed = true;
             }
             if let Some(wait) = max_wait_secs {
-                anyhow::ensure!(wait <= state::MAX_MAX_WAIT_SECS, "--max-wait must be at most {}", state::MAX_MAX_WAIT_SECS);
+                anyhow::ensure!(
+                    wait <= state::MAX_MAX_WAIT_SECS,
+                    "--max-wait must be at most {}",
+                    state::MAX_MAX_WAIT_SECS
+                );
                 settings.max_wait_secs = wait;
                 changed = true;
             }
@@ -268,7 +356,11 @@ pub(super) fn run_upgrade(command: UpgradeCommand) -> anyhow::Result<()> {
         UpgradeCommand::Run { run_id } => {
             let layout = layout()?;
             let run = control::execute(&layout, &run_id)?;
-            eprintln!("cutex upgrade: {} finished {}", run.run_id, run.phase.as_str());
+            eprintln!(
+                "cutex upgrade: {} finished {}",
+                run.run_id,
+                run.phase.as_str()
+            );
             Ok(())
         }
     }
@@ -276,10 +368,18 @@ pub(super) fn run_upgrade(command: UpgradeCommand) -> anyhow::Result<()> {
 
 pub(super) fn run_service(command: ServiceCommand) -> anyhow::Result<()> {
     match command {
-        ServiceCommand::Install { base, unit_dir, channel, no_start, dry_run, force } => {
+        ServiceCommand::Install {
+            base,
+            unit_dir,
+            channel,
+            no_start,
+            dry_run,
+            force,
+        } => {
             let base = match base {
                 Some(base) => base,
-                None => cutex::upgrade::layout::default_base().context("cannot determine the install base; pass --base")?,
+                None => cutex::upgrade::layout::default_base()
+                    .context("cannot determine the install base; pass --base")?,
             };
             let exe = std::env::current_exe()?;
             let options = InstallOptions {
@@ -289,7 +389,10 @@ pub(super) fn run_service(command: ServiceCommand) -> anyhow::Result<()> {
                 no_start,
                 dry_run,
                 force,
-                source_dir: exe.parent().context("executable has no directory")?.to_path_buf(),
+                source_dir: exe
+                    .parent()
+                    .context("executable has no directory")?
+                    .to_path_buf(),
                 release: service::build_release_label(),
                 names: service::ServiceNames::for_install()?,
             };
@@ -324,9 +427,127 @@ pub(super) fn run_service(command: ServiceCommand) -> anyhow::Result<()> {
 pub(super) fn run_component(command: ComponentCommand) -> anyhow::Result<()> {
     use cutex::components::{self, InstallRequest, Lock};
     let keys = cutex::upgrade::keys::trusted_keys();
-    let layout = Layout::detect();
+    let layout = components::kit_layout::detect();
     let layout = layout.as_ref();
     match command {
+        ComponentCommand::Check { name } => print(
+            &components::check_external(
+                layout,
+                &keys,
+                &name,
+                None,
+                &components::external_runtime::RealExec,
+                Lock::Acquire,
+            )
+            .map_err(explain)?,
+        ),
+        ComponentCommand::Configure {
+            name,
+            external_root,
+            clear_external_root,
+            node,
+            clear_node,
+            rg,
+            clear_rg,
+        } => {
+            let mut body = serde_json::Map::new();
+            for (field, path, clear) in [
+                ("externalRoot", external_root, clear_external_root),
+                ("node", node, clear_node),
+                ("rg", rg, clear_rg),
+            ] {
+                if clear {
+                    body.insert(field.into(), serde_json::Value::Null);
+                } else if let Some(path) = path {
+                    body.insert(field.into(), serde_json::json!(path));
+                }
+            }
+            let request = serde_json::from_value(serde_json::Value::Object(body))?;
+            print(
+                &components::check_external(
+                    layout,
+                    &keys,
+                    &name,
+                    Some(request),
+                    &components::external_runtime::RealExec,
+                    Lock::Acquire,
+                )
+                .map_err(explain)?,
+            )
+        }
+
+        ComponentCommand::Index { command } => {
+            use cutex::cli::args::ComponentIndexCommand;
+            match &command {
+                ComponentIndexCommand::VerifyKit { root } => {
+                    return print(&components::index_kit::verify(root, &keys).map_err(explain)?);
+                }
+                ComponentIndexCommand::ImportKit { root } => {
+                    let candidate = components::kit_layout::candidate().context(
+                        "component kit import requires an explicit absolute install base",
+                    )?;
+                    return print(
+                        &components::index::import_kit(&candidate, &keys, root).map_err(explain)?,
+                    );
+                }
+                _ => {}
+            }
+            let layout = layout.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "component index requires a managed install or imported trusted component kit"
+                )
+            })?;
+            match command {
+                ComponentIndexCommand::Status => print(&components::index::Policy::load(layout)?),
+                ComponentIndexCommand::Check => {
+                    print(&components::index::refresh(layout, &keys).map_err(explain)?)
+                }
+                ComponentIndexCommand::Config {
+                    policy,
+                    channel,
+                    source,
+                } => {
+                    let settings = components::index::Policy {
+                        policy,
+                        channel,
+                        source,
+                        ..Default::default()
+                    };
+                    settings.save(layout)?;
+                    print(&settings)
+                }
+                ComponentIndexCommand::FreezeKit {
+                    destination,
+                    assets,
+                } => {
+                    let mut selections = Vec::new();
+                    for asset in assets {
+                        let (name, tail) = asset.split_once('@').ok_or_else(|| {
+                            anyhow::anyhow!("asset must be NAME@VERSION:PLATFORM")
+                        })?;
+                        let (version, platform) = tail.split_once(':').ok_or_else(|| {
+                            anyhow::anyhow!("asset must be NAME@VERSION:PLATFORM")
+                        })?;
+                        selections.push((
+                            name.to_string(),
+                            version.to_string(),
+                            platform.to_string(),
+                        ));
+                    }
+                    print(
+                        &components::index::freeze_kit(layout, &keys, &destination, &selections)
+                            .map_err(explain)?,
+                    )
+                }
+                ComponentIndexCommand::VerifyKit { root } => {
+                    print(&components::index_kit::verify(&root, &keys).map_err(explain)?)
+                }
+                ComponentIndexCommand::ImportKit { root } => {
+                    print(&components::index::import_kit(layout, &keys, &root).map_err(explain)?)
+                }
+            }
+        }
+
         ComponentCommand::List { json } => {
             let view = components::list(layout, &keys, None);
             if json {
@@ -337,7 +558,13 @@ pub(super) fn run_component(command: ComponentCommand) -> anyhow::Result<()> {
             }
             for c in view["components"].as_array().into_iter().flatten() {
                 let text = |key: &str| c[key].as_str().unwrap_or("-").to_string();
-                println!("{:<16} {:<15} selected {:<14} available {}", text("name"), text("state"), text("selected"), text("available"));
+                println!(
+                    "{:<16} {:<15} selected {:<14} available {}",
+                    text("name"),
+                    text("state"),
+                    text("selected"),
+                    text("available")
+                );
                 if let Some(error) = c["error"].as_str() {
                     println!("{:<16} last error: {error}", "");
                 }
@@ -350,18 +577,53 @@ pub(super) fn run_component(command: ComponentCommand) -> anyhow::Result<()> {
                 None => print(&view),
                 Some(name) => {
                     components::handler(&name).map_err(explain)?;
-                    let one = view["components"].as_array().into_iter().flatten().find(|c| c["name"] == name.as_str()).cloned();
+                    let one = view["components"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|c| c["name"] == name.as_str())
+                        .cloned();
                     print(&one.unwrap_or_default())
                 }
             }
         }
-        ComponentCommand::Install { name, from_source, dry_run } => {
-            let request = InstallRequest { from_source, dry_run };
-            let out = components::install(layout, &keys, &name, &request, &RealExec, Lock::Acquire).map_err(explain)?;
+        ComponentCommand::Install {
+            name,
+            from_source,
+            version,
+            dry_run,
+        } => {
+            let request = InstallRequest {
+                from_source,
+                version,
+                dry_run,
+            };
+            let out = components::install(
+                layout,
+                &keys,
+                &name,
+                &request,
+                &components::real_exec(&name),
+                Lock::Acquire,
+            )
+            .map_err(explain)?;
             print(&out)
         }
-        ComponentCommand::Remove { name, force, dry_run } => {
-            let out = components::remove(layout, &keys, &name, force, dry_run, &RealExec, Lock::Acquire).map_err(explain)?;
+        ComponentCommand::Remove {
+            name,
+            force,
+            dry_run,
+        } => {
+            let out = components::remove(
+                layout,
+                &keys,
+                &name,
+                force,
+                dry_run,
+                &RealExec,
+                Lock::Acquire,
+            )
+            .map_err(explain)?;
             print(&out)
         }
         ComponentCommand::Prune { name, dry_run } => {

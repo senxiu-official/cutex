@@ -26,6 +26,8 @@ pub(crate) fn load_management_v2_registry() -> anyhow::Result<ImRegistry> {
 }
 
 pub(crate) fn management_request_context() -> ManagementRequestContext {
+    // r274 cutex/input/interruptSend: the runtime half.
+    cutex::management::v2::input_interrupt_send::install(super::app_server_user_input::interrupt_send_v2);
     ManagementRequestContext {
         explicit_launch_action,
         adopt_saved_native,
@@ -71,6 +73,39 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
 /// stopped first). A live launch keeps its claim and surfaces
 /// `launch_in_progress`.
 pub(super) fn auto_clear_dead_launch_claim(key: &str) -> anyhow::Result<()> {
+    let result = clear_dead_launch_claim_once(key);
+    // r271: a lane holder only tried the host fence. The lane-free sweep
+    // clears a dead claim once the fence is free; the caller reports hostBusy.
+    if let Err(error) = &result {
+        if cutex::asks::pause_admission::is_deferred(error) {
+            super::owner_admission::sweep_launch_claim(key);
+        }
+    }
+    result
+}
+
+/// ReviewRuntime's launch-claim check (r271.1, 051 §2). A claim on the record
+/// is checked now: under a request lane that only tries the fence, so a busy
+/// host is hostBusy and the sweep follows. Dead start intents that never wrote
+/// a record claim (`Prepared`) cannot make the review wrong (it refuses an
+/// unresolved claim under its own locks), so the review answers and the
+/// lane-free sweep abandons them afterwards (they would hold deliveries back).
+pub(super) fn review_runtime_claim_check(key: &str) -> anyhow::Result<()> {
+    let Some(record) = cutex::session::store::shared_session_row(key)? else { return Ok(()); };
+    if record.app_server_launch_claim_id.is_some() {
+        return auto_clear_dead_launch_claim(key);
+    }
+    let stale_intent =
+        cutex::session::store::has_prepared_launch_at(
+        & cutex::session::store::cutex_sessions_path()?, key,)?;
+    if stale_intent {
+        super::owner_admission::sweep_launch_claim(key);
+    }
+    Ok(())
+}
+
+/// One check, blocking on the fence only when this thread holds no lane.
+pub(super) fn clear_dead_launch_claim_once(key: &str) -> anyhow::Result<()> {
     let id = cutex::role_revision::CutexSessionId::new(key.to_string())
         .map_err(|_| anyhow::anyhow!("invalid durable Agent ID"))?;
     let cleared = management_agent_provider()?.clear_dead_launch_claim(
@@ -222,28 +257,24 @@ fn explicit_launch_action(
                 }),
         }
     };
-    let subject = match request {
+    // r271.1 lock order (051 §2): no session lane is held while an entry
+    // waits for the host fence. Changing entries go fence-first: the provider
+    // takes the execution mutex and the fence holding nothing, then only tries
+    // the subject's lane (`cutex::agent_management::with_fence_first`).
+    // Reviews and lookups only read and hold no lane; ReconcileExitedRuntime
+    // takes its own lane and only tries the fence.
+    let fence_first_subject = match request {
         Launch::RecoverRuntime { cutex_session_id, .. }
-        | Launch::ReviewRuntime { cutex_session_id, .. }
-        | Launch::ReviewRuntimePackageUpgrade { cutex_session_id }
-        | Launch::RevertRuntimePackageUpgrade { cutex_session_id, .. }
-        | Launch::ReconcileExitedRuntime { cutex_session_id }
-        | Launch::Review { cutex_session_id, .. } => Some(cutex_session_id.as_str()),
-        Launch::Run { review, .. } => Some(review.subject.cutex_session_id.as_str()),
-        Launch::Activate { review, .. } => Some(review.subject.cutex_session_id.as_str()),
-        Launch::ApplyRuntimePackageUpgrade { review, .. } => Some(review.subject.cutex_session_id.as_str()),
+        | Launch::RevertRuntimePackageUpgrade { cutex_session_id, .. } => Some(Some(cutex_session_id.as_str())),
+        Launch::Run { review, .. } => Some(Some(review.subject.cutex_session_id.as_str())),
+        Launch::Activate { review, .. } => Some(Some(review.subject.cutex_session_id.as_str())),
+        Launch::ApplyRuntimePackageUpgrade { review, .. } => Some(Some(review.subject.cutex_session_id.as_str())),
         #[cfg(target_os = "linux")]
-        Launch::MaintenanceReview { request } => Some(request.cutex_session_id.as_str()),
+        Launch::MaintenanceApply { review } => Some(Some(review.subject.cutex_session_id.as_str())),
         #[cfg(target_os = "linux")]
-        Launch::MaintenanceApply { review } => Some(review.subject.cutex_session_id.as_str()),
-        #[cfg(target_os = "linux")]
-        Launch::MaintenanceStart { .. } | Launch::MaintenanceRecoveryStart { .. } => maintenance_subject.as_deref(),
-        _ => None, // Read-only/action lookup or creation of a new identity.
+        Launch::MaintenanceStart { .. } | Launch::MaintenanceRecoveryStart { .. } => Some(maintenance_subject.as_deref()),
+        _ => None, // Reviews, lookups, ReconcileExitedRuntime, new identities.
     };
-    let lane = subject.map(cutex::management::v2::user_input::session_input_lock).transpose()
-        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
-    let _reservation = lane.as_ref().map(|lane| lane.reserve()).transpose()
-        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
     let operation = || -> anyhow::Result<_> {
         if let cutex::agent_management::ExplicitLaunchRequest::RuntimeStatus { action_id } = request
         {
@@ -283,7 +314,7 @@ fn explicit_launch_action(
             ..
         } = request
         {
-            auto_clear_dead_launch_claim(cutex_session_id.as_str())?;
+            review_runtime_claim_check(cutex_session_id.as_str())?;
         }
         #[cfg(target_os = "linux")]
         if let cutex::agent_management::ExplicitLaunchRequest::MaintenanceStart { action_id } =
@@ -332,7 +363,23 @@ fn explicit_launch_action(
             request,
         )
     };
-    operation().map_err(|e| {
+    let result = match fence_first_subject {
+        // The owner online route already opted in (with its mutation lane).
+        Some(subject) if !cutex::agent_management::fence_first_active() =>
+            cutex::agent_management::with_fence_first(subject, None, operation),
+        _ => operation(),
+    };
+    result.map_err(|e| {
+        if let Some(cutex::agent_management::AgentManagementError::HostBusy(message)) =
+            e.downcast_ref::<cutex::agent_management::AgentManagementError>()
+        {
+            // Fence-first entry: the subject's lane stayed busy for the budget.
+            return cutex::agent_management::AgentManagementError::HostBusy(message.clone());
+        }
+        if cutex::asks::pause_admission::is_deferred(&e) {
+            // Before any runtime IO; never a start over an uncleared claim.
+            return cutex::agent_management::AgentManagementError::HostBusy(format!("{e:#}"));
+        }
         cutex::agent_management::AgentManagementError::OwnerActionRequired(format!("{e:#}"))
     })
 }
@@ -412,6 +459,7 @@ fn adopt_native(
     created_by: Option<&cutex::session::model::SessionCreatedBy>,
 ) -> Result<cutex::agent_management::HumanAdoptResult, cutex::agent_management::AgentManagementError>
 {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared().map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
     let operation = || -> anyhow::Result<_> {
         let mut timing = super::light_new::CreateTiming::new("adopt_saved_native");
         let path = cutex::session::store::cutex_sessions_path()?;
@@ -505,14 +553,13 @@ pub(super) fn execute_managed_agent_archive(
     invocation: &cutex::agent_management::AgentManagementInvocation,
     request: &cutex::agent_management::ManagedAgentArchiveRequest,
 ) -> Result<cutex::agent_management::AgentArchiveReceipt, cutex::agent_management::AgentManagementError> {
-    let lane = cutex::management::v2::user_input::session_input_lock(request.cutex_session_id.as_str())
-        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
-    let _operation = lane.reserve().map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
     let path = cutex::session::store::cutex_sessions_path()
         .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
-    management_agent_provider()?.execute_managed_archive(
+    let provider = management_agent_provider()?;
+    // r271 (051 §2): host fence first, then only try the session lane.
+    cutex::agent_management::with_archive_fence_first(None, || provider.execute_managed_archive(
         invocation, request, &path, &mut super::management_archive::StoppingArchiveRuntime,
-    )
+    ))
 }
 
 fn execute_agent_archive(
@@ -522,33 +569,42 @@ fn execute_agent_archive(
     cutex::agent_management::AgentArchiveReceipt,
     cutex::agent_management::AgentManagementError,
 > {
-    let lane = cutex::management::v2::user_input::session_input_lock(request.review.cutex_session_id.as_str())
-        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
-    let _operation = lane.reserve()
-        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
     let path = cutex::session::store::cutex_sessions_path()
         .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
-    let _guard = MANAGEMENT_V2_SESSION_MUTATION_LOCK
-        .get_or_init(OperationLane::new)
-        .lock()
-        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
+    let mutation_lane: &'static OperationLane = MANAGEMENT_V2_SESSION_MUTATION_LOCK.get_or_init(OperationLane::new);
     let provider = management_agent_provider()?;
     if request.review.operation == cutex::agent_management::AgentArchiveOperation::Archive {
+        // Pre-stop under the lanes as before (no fence wait in here).
+        let lane = cutex::management::v2::user_input::session_input_lock(request.review.cutex_session_id.as_str())
+            .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
+        let _operation = lane.reserve()
+            .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
+        let _guard = mutation_lane
+            .lock()
+            .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
         let blockers = provider.agent_archive_blockers(&request.review.cutex_session_id)?;
         if !blockers.director_projects.is_empty() {
             return Err(cutex::agent_management::AgentManagementError::Conflict(
                 "archive_requires_explicit_director_rotation",
             ));
         }
-        stop_runtime_before_archive(request.review.cutex_session_id.as_str())
-            .map_err(|error| cutex::agent_management::AgentManagementError::OwnerActionRequired(error.message))?;
+        stop_runtime_before_archive(request.review.cutex_session_id.as_str()).map_err(|error| {
+            // r271: the launch claim check met a busy host fence (typed hostBusy).
+            if error.code == cutex::asks::pause_admission::ADMISSION_BUSY_CODE {
+                cutex::agent_management::AgentManagementError::HostBusy(error.message)
+            } else {
+                cutex::agent_management::AgentManagementError::OwnerActionRequired(error.message)
+            }
+        })?;
     }
-    provider.execute_agent_archive(
+    // r271 (051 §2): no lane held here; the archive takes the host fence
+    // first and then only tries the session lane and the mutation lane.
+    cutex::agent_management::with_archive_fence_first(Some(mutation_lane), || provider.execute_agent_archive(
         principal,
         &path,
         request,
         &mut super::management_archive::OfflineArchiveRuntime,
-    )
+    ))
 }
 
 fn durable_agent_candidates(
@@ -815,11 +871,32 @@ fn create_human_agent(
     principal: &cutex::management::control_plane::HumanManagementPrincipal,
     request: &cutex::management::v2::human_agents::HumanCreateAgentRequest,
 ) -> Result<String, cutex::management::v2::user_input::UserInputExecutionError> {
+    let _name_scope = cutex::agent_names::mutation_scope::enter(
+        cutex::agent_names::NameScope::for_project(request.project_id.as_deref()),
+    );
+    cutex::session::creation_identity::with_action(
+        &format!("human-agent:{}", request.request_id),
+        || create_human_agent_bound(principal, request),
+    )
+}
+
+fn create_human_agent_bound(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::management::v2::human_agents::HumanCreateAgentRequest,
+) -> Result<String, cutex::management::v2::user_input::UserInputExecutionError> {
     use cutex::management::control_plane::{
         HumanManagementProjectMutationKind, HumanManagementProjectMutationRequest,
         HumanManagementProjectMutationSchema,
     };
     request.validate()?;
+    let name_path = cutex::session::store::cutex_sessions_path()
+        .map_err(|error|human_agent_validation("persistence_unavailable",format!("{error:#}")))?;
+    cutex::session::store::assert_formal_name_available_at(
+        &name_path,&cutex::agent_names::mutation_scope::current(),&request.name,None,
+    ).map_err(|error| {
+        let code = error.downcast_ref::<cutex::agent_names::NameError>().map(|error|error.code).unwrap_or("persistence_unavailable");
+        human_agent_validation(code,format!("{error:#}"))
+    })?;
     // Design 041: "auto:<provider>" picks an opted-in profile of that
     // provider now; everything below sees the picked profile's name.
     let picked = match request.profile.as_deref() {
@@ -1535,6 +1612,7 @@ fn mutate_management_v2_session_using(
     params: serde_json::Value,
     mut persist: impl FnMut(&cutex::session::model::CutexSessionStore, &str) -> anyhow::Result<()>,
 ) -> Result<serde_json::Value, cutex::management::v2::user_input::UserInputExecutionError> {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared().map_err(runtime_mutation_error)?;
     // Take the session capability before the whole-store lifecycle barrier.
     // Nested HTTP/profile/offline-start calls retain the same execution token.
     let lane = cutex::management::v2::user_input::session_input_lock(cutex_session_id)
@@ -1553,7 +1631,9 @@ fn mutate_management_v2_session_using(
         return result;
     }
     if matches!(method, "cutex/session/retire" | "cutex/session/restore") {
-        return archive_management_v2_session(cutex_session_id, method, &params);
+        // The archive itself runs fence-first after the pre-stop releases the
+        // lanes (r271, 051 §2).
+        return archive_management_v2_session(cutex_session_id, method, &params, (_operation, _guard));
     }
     let mut attempt = 1;
     loop {
@@ -1999,7 +2079,9 @@ fn archive_management_v2_session(
     cutex_session_id: &str,
     method: &str,
     params: &serde_json::Value,
+    lanes: impl Sized,
 ) -> Result<serde_json::Value, cutex::management::v2::user_input::UserInputExecutionError> {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared().map_err(runtime_mutation_error)?;
     use cutex::agent_management::{AgentArchiveOperation, AgentArchiveStage};
     use cutex::management::v2::user_input::UserInputExecutionError;
     let restoring = method == "cutex/session/restore";
@@ -2100,14 +2182,18 @@ fn archive_management_v2_session(
     } else {
         AgentArchiveOperation::Archive
     };
-    let receipt = provider
+    // r271 (051 §2): release the session and mutation lanes; the archive takes
+    // the host fence first and then only tries them.
+    drop(lanes);
+    let mutation_lane: &'static OperationLane = MANAGEMENT_V2_SESSION_MUTATION_LOCK.get_or_init(OperationLane::new);
+    let receipt = cutex::agent_management::with_archive_fence_first(Some(mutation_lane), || provider
         .archive_agent(
             &path,
             &id,
             operation,
             reason,
             &mut super::management_archive::OfflineArchiveRuntime,
-        )
+        ))
         .map_err(|error| match error {
             cutex::agent_management::AgentManagementError::Conflict(
                 "archive_requires_explicit_director_rotation",
@@ -2153,6 +2239,9 @@ pub(super) fn stop_runtime_before_archive(
     key: &str,
 ) -> Result<(), cutex::management::v2::user_input::UserInputExecutionError> {
     if let Err(error) = auto_clear_dead_launch_claim(key) {
+        if cutex::asks::pause_admission::is_deferred(&error) {
+            return Err(cutex::management::v2::server::admission_busy_user_input_error("runtime", error));
+        }
         eprintln!("archive: launch claim check failed for {key}: {error:#}");
     }
     let store = load_cutex_session_store().map_err(session_mutation_persistence_error)?;
@@ -2233,6 +2322,16 @@ fn archive_provider_error(
     error: cutex::agent_management::AgentManagementError,
 ) -> cutex::management::v2::user_input::UserInputExecutionError {
     use cutex::agent_management::AgentManagementError;
+    if let AgentManagementError::NameConflict(error) = &error {
+        return cutex::management::v2::user_input::UserInputExecutionError {
+            stage: "route".into(), code: error.code.into(), message: error.message.clone(),
+            retryable: false, details: error.details.clone(), outcome_unknown: false,
+        };
+    }
+    // r271: busy host fence / busy agent lane: nothing was archived; retry.
+    if matches!(error, AgentManagementError::HostBusy(_)) {
+        return cutex::management::v2::server::admission_busy_user_input_error("runtime", anyhow::anyhow!("{error}"));
+    }
     let (stage, code, retryable) = match &error {
         AgentManagementError::Conflict("archive_runtime_launch_in_progress") => {
             ("runtime", "launch_in_progress", true)
@@ -2327,6 +2426,7 @@ fn automatic_online_management_v2_session_using(
     id:&str,
     start:impl FnOnce(&str,&serde_json::Value)->Result<serde_json::Value,cutex::management::v2::user_input::UserInputExecutionError>,
 ) -> Result<serde_json::Value,cutex::management::v2::user_input::UserInputExecutionError> {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared().map_err(runtime_mutation_error)?;
     let store=load_cutex_session_store().map_err(session_mutation_persistence_error)?;
     let key=cutex::session::service::cutex_session_key_for_user_id(&store,id)
         .ok_or_else(||session_mutation_invalid("cutex session not found"))?;
@@ -2371,6 +2471,7 @@ fn online_management_v2_session_inner(
     id: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, cutex::management::v2::user_input::UserInputExecutionError> {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared().map_err(runtime_mutation_error)?;
     use cutex::agent_management::{ExplicitLaunchRequest, StockRuntimeReview};
     let store = load_cutex_session_store().map_err(session_mutation_persistence_error)?;
     let key = cutex::session::service::cutex_session_key_for_user_id(&store, id)
@@ -2479,9 +2580,9 @@ fn start_explicit_runtime(
     let key = key.to_string();
     let lane = cutex::management::v2::user_input::session_input_lock(&key)
         .map_err(session_mutation_invalid_error)?;
-    let _operation = lane.reserve().map_err(|error| session_mutation_invalid_error(error.into()))?;
-    let _guard = MANAGEMENT_V2_SESSION_MUTATION_LOCK
-        .get_or_init(OperationLane::new)
+    let mutation_lane: &'static OperationLane = MANAGEMENT_V2_SESSION_MUTATION_LOCK.get_or_init(OperationLane::new);
+    let operation_reservation = lane.reserve().map_err(|error| session_mutation_invalid_error(error.into()))?;
+    let mutation_guard = mutation_lane
         .lock()
         .map_err(|_| session_mutation_invalid("management v2 session mutation lock poisoned"))?;
     let current = load_cutex_session_store().map_err(session_mutation_persistence_error)?;
@@ -2503,7 +2604,9 @@ fn start_explicit_runtime(
             details: serde_json::json!({"currentRuntimeGeneration": generation, "expectedRuntimeGeneration": params.get("expectedRuntimeGeneration"), "resyncRequired": true}),
         });
     }
-    let operation = || -> anyhow::Result<StockRuntimeReceipt> {
+    // Under the lanes: claim cleanup (try-only fence), exited binding stop and
+    // reconnect of a live one. `None` = a launch is needed.
+    let prepare = || -> anyhow::Result<Option<StockRuntimeReceipt>> {
         let store = load_cutex_session_store()?;
         let record = store
             .sessions
@@ -2542,12 +2645,26 @@ fn start_explicit_runtime(
             } else {
                 super::stock_lifecycle::verify_stock_process(record, binding)?;
                 super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
-                return super::stock_lifecycle::reconnect_ready_runtime(record, &store);
+                return super::stock_lifecycle::reconnect_ready_runtime(record, &store).map(Some);
             }
         }
-        launch(&key)
+        Ok(None)
     };
-    let receipt = operation().map_err(runtime_mutation_error)?;
+    let prepared = prepare();
+    // r271.1 (051 §2): the launch waits for the host fence, so it holds no
+    // lane: the provider takes the fence first and then only tries this
+    // session's lane and the mutation lane. It re-checks the record under
+    // its locks (a concurrent start meets "no duplicate launch").
+    drop(mutation_guard);
+    drop(operation_reservation);
+    let receipt = match prepared {
+        Ok(Some(receipt)) => Ok(receipt),
+        // Under an HTTP request lane (or an asks relaunch) the provider only
+        // tries the execution mutex and the fence (`fence_first` module).
+        Ok(None) => cutex::agent_management::with_fence_first(Some(&key), Some(mutation_lane), || launch(&key)),
+        Err(error) => Err(error),
+    }
+    .map_err(runtime_mutation_error)?;
     if receipt.stage != StockRuntimeStage::Ready || receipt.error.is_some() {
         if receipt.stage == StockRuntimeStage::Abandoned {
             // Readiness failed; the spawned runtime was stopped and its claim
@@ -3176,6 +3293,14 @@ fn launch_profile_not_applied(
 fn runtime_mutation_error(
     error: anyhow::Error,
 ) -> cutex::management::v2::user_input::UserInputExecutionError {
+    // r271: the launch claim check met a busy host fence under the lane;
+    // r271.1: a fence-first start/review stayed busy for its budget.
+    if cutex::asks::pause_admission::is_deferred(&error)
+        || error.chain().any(|cause| matches!(cause.downcast_ref::<cutex::agent_management::AgentManagementError>(),
+            Some(cutex::agent_management::AgentManagementError::HostBusy(_))))
+    {
+        return cutex::management::v2::server::admission_busy_user_input_error("runtime", error);
+    }
     // Saved ACP runtimes resolve their current profile address at every
     // start. Preserve these stable configuration refusals through anyhow
     // context, just as the creation path does; unrelated runtime failures
@@ -3604,6 +3729,83 @@ pub(crate) fn load_app_server_runtime_status(
 
 #[cfg(test)]
 mod tests {
+    /// r271.1: a dead start intent the record does not carry as a claim
+    /// (`Prepared`, crashed before claiming) never makes ReviewRuntime wait or
+    /// fail under fence contention: the claim check answers at once, the
+    /// review answers once the fence frees (only trying it under the request
+    /// lane), and the lane-free launch-claim sweep abandons the intent.
+    #[test]
+    fn review_runtime_skips_an_unclaimed_dead_intent_and_the_sweep_abandons_it() {
+        let _test = crate::cli_app::test_home::IsolatedTestHome::new("review-unclaimed-intent").unwrap();
+        let mut record = cutex::session::model::CutexSessionRecord::new(
+            format!("cutex.{}", uuid::Uuid::new_v4()), Some(uuid::Uuid::new_v4().to_string()),
+            "private".into(), "/private".into(), None).unwrap();
+        let key = record.cutex_session_id.clone();
+        let intent: cutex::agent_management::StockRuntimeReceipt = serde_json::from_value(serde_json::json!({
+            "action_id":"crashed-prepare", "stage":"prepared", "claim_id":"claim-never-written", "runtime_agent_id":"runtime-never", "expected_generation":1,
+            "binding":null,"publication":null,"error":null,"updated_at":"2026-10-31T00:00:00Z",
+            "review":{
+                "subject":{"cutex_session_id":key,"formal_name":"Review test","durable_sha256":"a".repeat(64),"authority_sha256":"b".repeat(64),"current_project_id":null,"revision":0,"runtime_generation":0},
+                "contract":{"version":2,"native_id":record.codex_session_id,"native_home":"/private","bundle_manifest":"/private/manifest","bundle_sha256":"c".repeat(64)},
+                "configuration":{"profile_name":"alpha","profile_id":"private-profile","inherited":false,"profile_sha256":"c".repeat(64),"account_sha256":"d".repeat(64),"model":"private-model","reasoning":null,"model_provider":"private","provider":{"name":"private","base_url":"http://127.0.0.1:1/v1","wire_api":"responses","requires_openai_auth":false,"supports_websockets":false},"sandbox":"read-only","approval":"on-request"},"restart":false
+            }
+        })).unwrap();
+        record.explicit_launch = Some(intent.review.contract.clone());
+        let mut store = cutex::session::model::CutexSessionStore::default();
+        store.sessions.insert(key.clone(), record);
+        store.explicit_launch_receipts.insert("crashed-prepare".into(),
+            cutex::agent_management::ExplicitLaunchActionReceipt::Runtime(intent));
+        cutex::session::store::save_cutex_session_store(&store).unwrap();
+        let pending = || {
+            let store = cutex::session::store::load_cutex_session_store().unwrap();
+            cutex::agent_management::native_runtime_transition_pending(&store, &store.sessions[&key])
+        };
+        assert!(pending(), "the dead intent holds deliveries back");
+
+        // Fence contention, and this thread holds the session lane (the
+        // cutex/requests request guard).
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            cutex::asks::pause_admission::acquire_worker_fence().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            cutex::asks::pause_admission::release_worker_fence();
+        });
+        held_rx.recv().unwrap();
+        let lane = cutex::management::v2::user_input::session_input_lock(&key).unwrap();
+        let request = lane.reserve().unwrap();
+        let started = std::time::Instant::now();
+        super::review_runtime_claim_check(&key).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "no fence wait: {:?}", started.elapsed());
+        assert!(super::super::owner_admission::launch_claim_sweep_pending(&key), "the sweep follows");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            release_tx.send(()).unwrap();
+        });
+        let id = cutex::role_revision::CutexSessionId::new(key.clone()).unwrap();
+        let review = super::management_agent_provider().unwrap()
+            .review_stock_runtime(&cutex::session::store::cutex_sessions_path().unwrap(), &id, false);
+        // It answered after the fence freed: the fixture has no bundle, so the
+        // answer is that refusal, never hostBusy.
+        let error = review.unwrap_err();
+        assert!(!format!("{error:#}").contains("hostBusy"), "{error:#}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        drop(request);
+        releaser.join().unwrap();
+        holder.join().unwrap();
+        assert!(pending(), "nothing was cleared under the lane");
+
+        super::super::owner_admission::sweep_launch_claims_once();
+        assert!(!super::super::owner_admission::launch_claim_sweep_pending(&key));
+        assert!(!pending(), "the sweep abandoned the dead intent");
+        let store = cutex::session::store::load_cutex_session_store().unwrap();
+        let cutex::agent_management::ExplicitLaunchActionReceipt::Runtime(intent) =
+            &store.explicit_launch_receipts["crashed-prepare"] else { panic!("runtime receipt") };
+        assert_eq!(intent.stage, cutex::agent_management::StockRuntimeStage::Abandoned);
+        assert!(store.sessions[&key].app_server_launch_claim_id.is_none());
+    }
+
     #[test]
     fn saved_runtime_relay_refusals_preserve_client_error_codes() {
         for code in ["variant_base_url_missing", "relay_runtime_unavailable"] {
@@ -3744,6 +3946,13 @@ mod tests {
         assert_eq!(starting.code, "launch_in_progress");
         assert!(starting.retryable);
         assert!(starting.message.contains("Wait for startup"));
+        for code in ["agent_name_taken","agent_name_reserved"] {
+            let mut detail=cutex::agent_names::NameError::new(code,"rename this archived agent before restoring it");
+            detail.details=serde_json::json!({"holderSessionIds":["cutex.other"],"scope":{"kind":"unassigned"},"renameRequired":true});
+            let refusal=super::archive_provider_error(AgentManagementError::NameConflict(detail.clone()));
+            assert_eq!(refusal.code,code);assert_eq!(refusal.details,detail.details);
+            assert!(!refusal.outcome_unknown);assert!(!refusal.retryable);
+        }
     }
 
     #[test]
@@ -4179,6 +4388,7 @@ mod tests {
         StoredAccount {
             options: Default::default(),
             browser_tools: false,
+            browser_tool_surface: Default::default(),
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,

@@ -23,6 +23,13 @@ pub fn load_agent_management_snapshot() -> anyhow::Result<AgentManagementSnapsho
         .map_err(anyhow::Error::new)
 }
 
+/// Read-only authority/directory projection; action and event history stays in SQL.
+pub fn load_agent_management_directory() -> anyhow::Result<AgentManagementSnapshot> {
+    AgentManagementStore::open_default()?
+        .directory_snapshot()
+        .map_err(anyhow::Error::new)
+}
+
 /// The project a session currently belongs to (member or Director seat).
 pub fn project_for_session(
     snapshot: &AgentManagementSnapshot,

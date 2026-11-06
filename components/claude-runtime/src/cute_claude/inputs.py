@@ -138,6 +138,10 @@ def sdk_user_message(prompt: str, attachments: list[dict], *, verbatim: bool, pr
     slash commands); `preceding` blocks are passed on as they are."""
     message = {'type': 'user', 'message': {'role': 'user', 'content': content_blocks(prompt, attachments, preceding)},
                'parent_tool_use_id': None}
-    if verbatim:
+    # With image-only owner input there is no owner text block. Claude Code
+    # would otherwise treat the last external note as typed text and expand
+    # its @paths. Mark the message composed instead of inventing owner text
+    # or relying on an empty text block surviving native normalization.
+    if verbatim or (not prompt and preceding):
         message['client_composed'] = True
     return message

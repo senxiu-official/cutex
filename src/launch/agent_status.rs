@@ -8,7 +8,7 @@ pub fn for_record(record: &CutexSessionRecord) -> String {
 }
 fn project(record: &CutexSessionRecord, snapshot: Option<&crate::agent_management::AgentManagementSnapshot>) -> serde_json::Value {
     if !record.agent_enabled { return serde_json::json!({}); }
-    let agent = snapshot.and_then(|s| s.agents.values().find(|a| a.cutex_session_id.as_str() == record.cutex_session_id));
+    let agent = snapshot.and_then(|s| s.agent_by_session(&record.cutex_session_id));
     let name = record.formal_agent_name.as_deref().filter(|n| !n.is_empty())
         .or_else(|| agent.map(|a| a.spec.name.as_str()));
     let Some(name) = name else { return serde_json::json!({}); };

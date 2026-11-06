@@ -18,6 +18,7 @@ const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
 
 pub struct EventBlobStore {
     dir: PathBuf,
+    attachments: Option<PathBuf>,
 }
 
 fn sha(bytes: &[u8]) -> String {
@@ -55,10 +56,17 @@ impl EventBlobStore {
     pub fn open_default() -> anyhow::Result<Self> {
         Ok(Self::at(
             crate::config::paths::runtime_dir()?.join("management-v2/event-blobs"),
-        ))
+        )
+        .with_attachments(super::attachments::attachments_root()?))
     }
     pub fn at(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self { dir: dir.into(), attachments: None }
+    }
+
+    /// Adds `width` / `height` to `localImage` items that are this session's stored attachments.
+    pub fn with_attachments(mut self, root: impl Into<PathBuf>) -> Self {
+        self.attachments = Some(root.into());
+        self
     }
 
     fn grant_path(&self, session: &str, id: &str) -> PathBuf {
@@ -263,6 +271,20 @@ impl EventBlobStore {
         }
         match value {
             Value::Object(map) => {
+                // Desktop uploads pasted images, so the owner's image arrives as an attachment path.
+                if map.get("type").and_then(Value::as_str) == Some("localImage") {
+                    if let (Some(root), Some(path), false) = (
+                        self.attachments.as_deref(),
+                        map.get("path").and_then(Value::as_str),
+                        map.contains_key("width") || map.contains_key("height"),
+                    ) {
+                        if let Some((width, height)) = super::attachments::stored_dimensions(root, session, path) {
+                            map.insert("width".into(), width.into());
+                            map.insert("height".into(), height.into());
+                        }
+                    }
+                    return Ok(());
+                }
                 if map.get("type").and_then(Value::as_str) == Some("cutexBlob") {
                     let valid = map
                         .get("blobId")
@@ -543,6 +565,41 @@ mod tests {
 
     fn png() -> Vec<u8> {
         base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg==").unwrap()
+    }
+
+    #[test]
+    fn local_image_attachments_get_their_stored_dimensions() {
+        let base = std::env::temp_dir().join(format!("eb-dims-{}", uuid::Uuid::new_v4()));
+        let root = base.join("attachments");
+        let settings = crate::config::attachments::AttachmentSettings { max_bytes: 1 << 20, retention_days: 30 };
+        let (_, own) = super::super::attachments::store_upload(&root, "cutex.a", Some("image/png"), &png(), settings).unwrap();
+        let (_, other) = super::super::attachments::store_upload(&root, "cutex.b", Some("image/png"), &png(), settings).unwrap();
+        let own = own["path"].as_str().unwrap().to_owned();
+        let other = other["path"].as_str().unwrap().to_owned();
+        let outside = base.join("elsewhere.png");
+        fs::write(&outside, png()).unwrap();
+        let store = EventBlobStore::at(base.join("blobs")).with_attachments(&root);
+        let mut event = json!({"method":"item/completed","params":{"item":{"type":"userMessage","id":"u1","content":[
+            {"type":"text","text":"see"},
+            {"type":"localImage","path":own},
+            {"type":"localImage","path":other},
+            {"type":"localImage","path":outside.to_string_lossy()},
+            {"type":"localImage","path":own,"width":7,"height":9},
+        ]}}});
+        store.externalize_media("cutex.a", &mut event).unwrap();
+        let content = &event["params"]["item"]["content"];
+        assert_eq!((content[1]["width"].as_u64(), content[1]["height"].as_u64()), (Some(1), Some(1)));
+        assert_eq!(content[1]["path"], own.as_str());
+        assert!(content[2].get("width").is_none(), "another session's attachment");
+        assert!(content[3].get("width").is_none(), "a path outside the attachments root");
+        assert_eq!((content[4]["width"].as_u64(), content[4]["height"].as_u64()), (Some(7), Some(9)), "given sizes stay");
+        let mut page = json!({"data":[{"turns":[{"items":[{"type":"userMessage","content":[{"type":"localImage","path":own}]}]}]}]});
+        store.normalize("cutex.a", &mut page).unwrap();
+        assert_eq!(page["data"][0]["turns"][0]["items"][0]["content"][0]["width"], 1);
+        let mut plain = json!({"type":"localImage","path":own});
+        EventBlobStore::at(base.join("blobs")).externalize_media("cutex.a", &mut plain).unwrap();
+        assert!(plain.get("width").is_none());
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

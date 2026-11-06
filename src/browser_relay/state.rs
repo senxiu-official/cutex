@@ -50,12 +50,19 @@ pub(crate) struct Lease {
     pub refs: std::collections::HashSet<String>,
     /// The browser_claim approval this owner selection consumed.
     pub claim: Option<String>,
+    /// Last admission of the agent's own command (not turn-end shots):
+    /// a turn-end release keeps a lease the next turn already used.
+    pub agent_used: Instant,
+    /// browser-popup-grant: the opener lease whose agent click opened this tab.
+    pub opener: Option<String>,
+    pub granted: Instant,
 }
 /// Leases a desktop restart / reconnect dropped, kept briefly so the agent's
 /// next call on that tab says why instead of a generic `lease_revoked`.
 pub const ENDED_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const MAX_ENDED_LEASES: usize = 256;
 pub const LEASE_ENDED_DESKTOP_RESTARTED: &str = "lease_ended_desktop_restarted";
+pub const LEASE_ENDED_TURN_END: &str = "lease_ended_turn_end";
 #[derive(Default)]
 pub(crate) struct State {
     pub devices: HashMap<String, Device>,
@@ -64,6 +71,8 @@ pub(crate) struct State {
     pub turn_shots: super::shots::Tracking,
     /// (cutex session, guest id) → when its lease ended with its desktop connection.
     pub ended: HashMap<(String, String), Instant>,
+    /// (cutex session, guest id) → when the trusted turn-end release ended it.
+    pub turn_released: HashMap<(String, String), Instant>,
 }
 impl State {
     fn remember_ended(&mut self, device: &str, now: Instant) {
@@ -87,8 +96,11 @@ impl State {
     /// The refusal for an agent call on a tab it holds no active lease for.
     pub(crate) fn missing_lease(&self, session: &str, guest: Option<&str>) -> RelayError {
         let recent = guest.and_then(|guest| self.ended.get(&(session.to_owned(), guest.to_owned())));
+        let released = guest.and_then(|guest| self.turn_released.get(&(session.to_owned(), guest.to_owned())));
         if recent.is_some_and(|at| at.elapsed() < ENDED_LEASE_TTL) {
             RelayError::new(LEASE_ENDED_DESKTOP_RESTARTED)
+        } else if released.is_some_and(|at| at.elapsed() < ENDED_LEASE_TTL) {
+            RelayError::new(LEASE_ENDED_TURN_END)
         } else {
             RelayError::new("lease_revoked")
         }
@@ -416,6 +428,10 @@ impl Relay {
         {
             return Err(RelayError::new("lease_limit"));
         }
+        let opener = match &request.source {
+            GrantSource::Popup { opener_lease_id } => Some(opener_lease_id.clone()),
+            _ => None,
+        };
         let claim = match &request.source {
             GrantSource::Claim { approval_id } => Some(approval_id.clone()),
             _ => None,
@@ -462,6 +478,7 @@ impl Relay {
         };
         if let Some(guest) = &view.target.guest_id {
             state.ended.remove(&(view.cutex_session_id.clone(), guest.clone()));
+            state.turn_released.remove(&(view.cutex_session_id.clone(), guest.clone()));
         }
         state.leases.insert(
             view.lease_id.clone(),
@@ -473,6 +490,9 @@ impl Relay {
                 page_generation: None,
                 refs: Default::default(),
                 claim,
+                agent_used: Instant::now(),
+                opener,
+                granted: Instant::now(),
             },
         );
         self.changed.notify_all();
@@ -515,6 +535,24 @@ impl Relay {
                     && l.view.cutex_session_id == session
                     && l.view.state == "active"
             }) {
+                return Some(lease.view.clone());
+            }
+            let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())?;
+            state = self.changed.wait_timeout(state, left).ok()?.0;
+        }
+    }
+    /// Wait (bounded) for the tab a click in `opener` opened (browser-page-links-v1
+    /// newTab): the newest active popup lease of that opener granted since `since`.
+    pub fn await_popup(&self, opener: &str, since: Instant, wait: Duration) -> Option<LeaseView> {
+        let deadline = Instant::now() + wait;
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if let Some(lease) = state
+                .leases
+                .values()
+                .filter(|l| l.opener.as_deref() == Some(opener) && l.granted >= since && l.view.state == "active")
+                .max_by_key(|l| l.granted)
+            {
                 return Some(lease.view.clone());
             }
             let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())?;
@@ -575,6 +613,29 @@ pub(crate) fn event(device: &Device, kind: &str, fields: Value) -> Value {
         event.as_object_mut().unwrap().extend(fields.clone());
     }
     event
+}
+/// Trusted turn end (design 059, owner decision): the session's active leases
+/// not used since `ended_at` end; pages stay open. Returns how many ended.
+pub(crate) fn release_after_turn(state: &mut State, session: &str, ended_at: Instant) -> usize {
+    let now = Instant::now();
+    state.turn_released.retain(|_, at| now.saturating_duration_since(*at) < ENDED_LEASE_TTL);
+    let ids: Vec<(String, Option<String>)> = state
+        .leases
+        .iter()
+        .filter(|(_, lease)| {
+            lease.view.cutex_session_id == session && lease.view.state == "active" && lease.agent_used <= ended_at
+        })
+        .map(|(id, lease)| (id.clone(), lease.view.target.guest_id.clone()))
+        .collect();
+    for (id, guest) in &ids {
+        if let Some(guest) = guest {
+            if state.turn_released.len() < MAX_ENDED_LEASES {
+                state.turn_released.insert((session.to_owned(), guest.clone()), now);
+            }
+        }
+        revoke_lease(state, id, "lease_revoked");
+    }
+    ids.len()
 }
 pub(crate) fn revoke_lease(state: &mut State, id: &str, reason: &str) {
     super::commands::abort_matching(
@@ -860,10 +921,20 @@ mod tests {
         assert_eq!(r.grant_checked(&b, popup("g2", "cutex.other", &opener.lease_id), "Other".into()).unwrap_err().code, "permission_denied");
         assert_eq!(r.grant_checked(&b, popup("g2", "cutex.s", "bl-missing"), "Agent".into()).unwrap_err().code, "permission_denied");
         assert!(r.grant_checked(&b, popup("g1", "cutex.s", &opener.lease_id), "Agent".into()).is_err());
+        let before = Instant::now();
         let child = r.grant_checked(&b, popup("g2", "cutex.s", &opener.lease_id), "Agent".into()).unwrap();
         assert_eq!(child.origin, "agent");
         assert_eq!(child.state, "pending");
         assert_eq!(child.cutex_session_id, "cutex.s");
+        // The opener's click result names this tab once it is active (not while pending,
+        // and never a popup granted before that click).
+        assert!(r.await_popup(&opener.lease_id, before, Duration::from_millis(10)).is_none(), "pending");
+        let waiter = { let r = Arc::clone(&r); let opener = opener.lease_id.clone(); std::thread::spawn(move || r.await_popup(&opener, before, Duration::from_secs(5))) };
+        std::thread::sleep(Duration::from_millis(50));
+        r.activate(&b, &child.lease_id).unwrap();
+        assert_eq!(waiter.join().unwrap().unwrap().lease_id, child.lease_id);
+        assert!(r.await_popup(&opener.lease_id, Instant::now(), Duration::from_millis(10)).is_none(), "an earlier popup is not this click's");
+        assert!(r.await_popup("bl-other", before, Duration::from_millis(10)).is_none());
         // Wire shape: kebab-case kind with camelCase opener id, unknown fields refused.
         assert!(parse::<GrantSource>(br#"{"kind":"popup","openerLeaseId":"bl-1"}"#).is_ok());
         assert!(parse::<GrantSource>(br#"{"kind":"popup","openerLeaseId":"bl-1","owner":true}"#).is_err());
@@ -980,11 +1051,46 @@ mod tests {
                 page_generation: None,
                 refs: Default::default(),
                 claim: None,
+                agent_used: now,
+                opener: None,
+                granted: now,
             },
         );
         state.remember_ended("d", now);
         assert_eq!(state.ended.len(), MAX_ENDED_LEASES);
         assert!(state.ended.contains_key(&("cutex.s".into(), "g".into())));
+    }
+    #[test]
+    fn turn_end_releases_unused_leases_keeps_pages_and_says_why() {
+        let r = Arc::new(Relay::new());
+        let i = identity();
+        let v = r.register(i.clone(), reg("d"), 10000, 30000).unwrap();
+        let b = binding(&i, &v);
+        let s = r.attach(&b, None).unwrap();
+        s.receiver.recv().unwrap();
+        let grant = |guest: &str| {
+            let lease = r.grant_checked(&b, GrantRequest { device_id: "d".into(), guest_id: guest.into(), cutex_session_id: "cutex.s".into(),
+                title: "page".into(), url: "http://localhost/".into(), source: GrantSource::Owner {} }, "Agent".into()).unwrap();
+            r.activate(&b, &lease.lease_id).unwrap();
+            lease.lease_id
+        };
+        let (old, reused) = (grant("g-old"), grant("g-new"));
+        let other = r.grant_checked(&b, GrantRequest { device_id: "d".into(), guest_id: "g-other".into(), cutex_session_id: "cutex.t".into(),
+            title: "page".into(), url: "http://localhost/".into(), source: GrantSource::Owner {} }, "Agent".into()).unwrap();
+        r.activate(&b, &other.lease_id).unwrap();
+        let ended_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        // The next turn already used one tab: it stays.
+        r.state.lock().unwrap().leases.get_mut(&reused).unwrap().agent_used = Instant::now();
+        let mut state = r.state.lock().unwrap();
+        assert_eq!(release_after_turn(&mut state, "cutex.s", ended_at), 1);
+        assert!(!state.leases.contains_key(&old) && state.leases.contains_key(&reused));
+        assert!(state.leases.contains_key(&other.lease_id), "another agent's lease is not touched");
+        assert_eq!(state.missing_lease("cutex.s", Some("g-old")).code, LEASE_ENDED_TURN_END);
+        assert_eq!(state.missing_lease("cutex.s", Some("g-elsewhere")).code, "lease_revoked");
+        drop(state);
+        let revoked = std::iter::from_fn(|| s.receiver.try_recv().ok()).find(|e| e["kind"] == "lease-revoked").expect("desktop told");
+        assert_eq!(revoked["leaseId"], old.as_str());
     }
     #[test]
     fn a_claim_waits_briefly_for_the_desktops_own_grant() {

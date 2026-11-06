@@ -343,7 +343,7 @@ fn resolve_director_alarm_in(alarm:&Alarm,store:&crate::director_address::Store,
 }
 fn validate_director_alarm_creator(owner:&str,project:&str,sessions:&crate::session::model::CutexSessionStore,roster:&crate::agent_management::AgentManagementSnapshot)->anyhow::Result<()>{
     ensure!(sessions.sessions.values().any(|r|r.cutex_session_id==owner && !r.is_retired() && r.retired_at.is_none()),"Director alarm creator is retired or missing");
-    ensure!(!roster.agents.values().any(|a|a.cutex_session_id.as_str()==owner && a.retired_at.is_some()),"Director alarm creator was retired by management");
+    ensure!(!roster.agent_by_session(owner).is_some_and(|a|a.retired_at.is_some()),"Director alarm creator was retired by management");
     ensure!(crate::asks::directory::Directory::director_projects(roster,owner)==vec![project.to_owned()],"Director alarm creator no longer belongs to its original project");Ok(())
 }
 /// A cutex system notice to one agent through the alarm scheduler (durable,

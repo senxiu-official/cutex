@@ -17,6 +17,16 @@ pub mod archive_mcp;
 pub const THREAD_HEADER: &str = "x-cutex-mcp-thread-id";
 pub const GENERATION_HEADER: &str = "x-cutex-mcp-generation";
 
+/// Notes are separate MCP text, never extra fields in a strict business
+/// receipt. Its JSON text stays byte-for-byte the ordinary serialization.
+fn result_with_name_notes(result: Value, failed: bool, notes: &[crate::agent_names::RenameNote]) -> Value {
+    let mut content=vec![json!({"type":"text","text":result.to_string()})];
+    if !notes.is_empty() {
+        content.push(json!({"type":"text","text":notes.iter().map(|note|note.text()).collect::<Vec<_>>().join("\n")}));
+    }
+    json!({"isError":failed,"content":content})
+}
+
 #[derive(Clone, Debug)]
 pub struct CallerFence {
     pub thread_id: String,
@@ -152,7 +162,7 @@ fn listed_tools(port: u16, token: &str, runtime: &RuntimeAgentId) -> Value {
         }
     }
     // Fail closed for opt-in tools when the Bus cannot say.
-    super::mcp_browser::filter_listing(&mut list, false);
+    super::mcp_browser::filter_listing(&mut list, None);
     crate::agent_bus::tool_policy::retain_tools_except(&mut list, &[super::web_search::TOOL]);
     list
 }
@@ -177,7 +187,16 @@ pub fn tools() -> Value {
     tools.extend(crate::workflows::tools::definitions());
     // Search-only provider request (profile `searchTool`).
     tools.push(super::web_search::definition());
+    add_name_scope_fields(&mut tools);
     json!({ "tools": tools })
+}
+
+fn add_name_scope_fields(tools:&mut [Value]) {
+    for tool in tools {
+        if matches!(tool["name"].as_str(),Some("agent_delegate"|"agent_tell"|"agent_pause"|"agent_resume"|"alarm_set"|"agent_archive"|"agent_restore"|"member_runtime"|"member_replace")) {
+            tool["inputSchema"]["properties"]["targetScope"]=crate::agent_names::scope_schema();
+        }
+    }
 }
 
 /// [`tools`] with the delegation tools worded for `runtime`; `wait` lists
@@ -190,6 +209,7 @@ pub fn tools_for(runtime: crate::asks::tools::ToolRuntime, wait: bool) -> Value 
         });
         tools.extend(crate::asks::tools::definitions_for(runtime, wait));
         tools.extend(crate::artifacts::tools::definitions(runtime));
+        add_name_scope_fields(tools);
     }
     list
 }
@@ -440,6 +460,7 @@ pub fn run() -> anyhow::Result<()> {
             trace.stage(crate::management::v2::control_timing::Stage::Validation);
             trace
         });
+        let mut resolution_notes:Vec<crate::agent_names::RenameNote>=Vec::new();
         let result = match message["method"].as_str() {
             Some("initialize") => Ok(
                 json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"cutex-outbound-prototype","version":"1"}}),
@@ -458,7 +479,8 @@ pub fn run() -> anyhow::Result<()> {
                     generation,
                 };
                 let (name, mut args) = legacy_call(name, args).map_err(anyhow::Error::msg)?;
-                if matches!(name, "agent_create" | "agent_delegate") && args.get("action_id").is_none_or(Value::is_null) {
+                if (matches!(name, "agent_create" | "agent_delegate" | "agent_tell" | "agent_pause" | "agent_resume")
+                    || management::is_tool(name) || archive_mcp::is_tool(name)) && args.get("action_id").is_none_or(Value::is_null) {
                     let key = receipt_action_id(&message["params"], &rpc_call_key(&process, id),
                         &runtime, generation, &fence.thread_id, name);
                     // Explicit key prevents the Bus from re-keying it with Claude's
@@ -484,6 +506,9 @@ pub fn run() -> anyhow::Result<()> {
                         return Ok(preflight_rejection(resolved));
                     }
                     args = resolved["arguments"].clone();
+                    if let Some(notes)=resolved.get("resolutionNotes") {
+                        resolution_notes=serde_json::from_value(notes.clone()).context("invalid name-resolution notes")?;
+                    }
                 }
                 if let Some(trace) = timing.as_mut() { trace.stage(crate::management::v2::control_timing::Stage::Dispatch); }
                 let mut result = if crate::asks::tools::is_tool(name) || name == crate::owner_notify::tool::OWNER_NOTIFY || crate::workflows::tools::is_tool(name) {
@@ -605,7 +630,7 @@ pub fn run() -> anyhow::Result<()> {
                         Some("no_write" | "conflict" | "response_uncertain" | "approval_required" | "failed" | "unknown")
                     )
                     || result["ok"] == false;
-                json!({"isError":failed,"content":[{"type":"text","text":result.to_string()}]})
+                result_with_name_notes(result,failed,&resolution_notes)
             }),
             _ => Err(anyhow::Error::new(UnsupportedMethod)),
         };
@@ -649,6 +674,24 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_notes_leave_strict_business_receipt_json_unchanged() {
+        let receipt=serde_json::to_value(crate::agent_management::AgentManagementResponse {
+            schema:crate::agent_management::AgentManagementSchema::V1,
+            action_id:crate::agent_management::AgentActionId::new("test-action").unwrap(),
+            outcome:crate::agent_management::AgentManagementOutcome::NoWrite {code:"busy".into(),detail:"not sent".into()},
+        }).unwrap();
+        let notes=[crate::agent_names::RenameNote {requested_name:"Old".into(),current_name:"New".into(),
+            cutex_session_id:"cutex.target".into(),scope:crate::agent_names::NameScope::Unassigned}];
+        let wrapped=result_with_name_notes(receipt.clone(),true,&notes);
+        assert_eq!(wrapped["content"][0]["text"],receipt.to_string());
+        assert_eq!(wrapped["content"].as_array().unwrap().len(),2);
+        assert!(wrapped["content"][1]["text"].as_str().unwrap().contains("Old was renamed by the owner to New"));
+        assert_eq!(wrapped["isError"],true);
+        assert_eq!(serde_json::from_str::<Value>(wrapped["content"][0]["text"].as_str().unwrap()).unwrap(),receipt);
+        serde_json::from_str::<crate::agent_management::AgentManagementResponse>(wrapped["content"][0]["text"].as_str().unwrap()).unwrap();
+    }
 
     #[test]
     fn resource_and_prompt_listings_are_empty() {

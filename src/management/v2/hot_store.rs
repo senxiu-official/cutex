@@ -4,6 +4,9 @@
 //! SQLite generation CAS and an immediate transaction, so independent store
 //! locks may safely share one WAL database.
 
+#[path = "bus_changes.rs"]
+pub(crate) mod bus_changes;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -21,6 +24,7 @@ static CACHED_READ_CONNECTION: OnceLock<Mutex<Option<(PathBuf, Connection)>>> = 
 thread_local! {
     // Thread-local and consumed once: only the test's selected read can pause.
     pub(crate) static READ_SNAPSHOT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static PRESENTATION_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub type RowKey = (String, String);
@@ -89,7 +93,96 @@ fn connection(path: &Path) -> anyhow::Result<Connection> {
            FOREIGN KEY (store) REFERENCES hot_store_meta(store) ON DELETE CASCADE
          ) WITHOUT ROWID;",
     )?;
+    // The expression is maintained by SQLite in the same transaction as each
+    // message write, including writes by older binaries. No second projection
+    // or invalidation protocol can fall behind the authoritative row.
+    db.execute_batch(
+        "CREATE INDEX IF NOT EXISTS agent_bus_message_state ON hot_store_rows
+         (json_extract(CAST(value_json AS TEXT), '$.snapshot.state'), row_key)
+         WHERE store = 'agent_bus' AND collection = 'message';",
+    )?;
+    // Open presentation obligations by recipient and next attempt (058 C1).
+    // Independent of the message state: an ACKed input keeps its display work.
+    db.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS agent_bus_presentation_due ON hot_store_rows
+         ({PRESENTATION_RECIPIENT}, {PRESENTATION_NEXT_ATTEMPT}, row_key)
+         WHERE {PRESENTATION_OPEN};"
+    ))?;
+    db.execute_batch(&format!("CREATE INDEX IF NOT EXISTS agent_bus_admission_candidates
+        ON hot_store_rows(row_key) WHERE {ADMISSION_CANDIDATE};"))?;
+    db.execute_batch("CREATE INDEX IF NOT EXISTS agent_bus_owner_carry ON hot_store_rows
+        (json_extract(CAST(value_json AS TEXT),'$.snapshot.toCutexSessionId'),
+         json_extract(CAST(value_json AS TEXT),'$.ownerCarry'),row_key)
+        WHERE store='agent_bus' AND collection='message' AND json_extract(CAST(value_json AS TEXT),'$.ownerCarry') IS NOT NULL;")?;
+    db.execute_batch("CREATE INDEX IF NOT EXISTS agent_bus_close_request ON hot_store_rows
+        (json_extract(CAST(value_json AS TEXT), '$.settlement.request.requestId'), row_key)
+        WHERE store='agent_bus' AND collection='message';")?;
+    db.execute_batch(&format!("CREATE INDEX IF NOT EXISTS agent_bus_management_starts ON hot_store_rows
+        (json_extract(CAST(value_json AS TEXT),'$.canonicalEnvelope.controlType'), json_extract(CAST(value_json AS TEXT),'$.canonicalEnvelope.from'),row_key) WHERE {MANAGEMENT_START_ROWS};
+        CREATE INDEX IF NOT EXISTS agent_bus_settlement_outbox ON hot_store_rows(row_key) WHERE {SETTLEMENT_OUTBOX_ROWS};
+        CREATE INDEX IF NOT EXISTS agent_bus_finished_time ON hot_store_rows({FINISHED_TIME},row_key) WHERE {FINISHED_ROWS};"))?;
     Ok(db)
+}
+
+/// Selected owner's frozen IDs, including settled carries, without retaining history.
+pub(crate) fn owner_carry_keys(db: &Connection, session: &str, owner: &str) -> anyhow::Result<Vec<String>> {
+    let mut statement=db.prepare("SELECT row_key FROM hot_store_rows WHERE store='agent_bus' AND collection='message'
+        AND json_extract(CAST(value_json AS TEXT),'$.ownerCarry') IS NOT NULL
+        AND json_extract(CAST(value_json AS TEXT),'$.snapshot.toCutexSessionId')=?1
+        AND json_extract(CAST(value_json AS TEXT),'$.ownerCarry')=?2 ORDER BY row_key")?;
+    let ids=statement.query_map([session,owner],|row|row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    crate::store::metrics::note("bus-messages",crate::store::OpCounts {sql_statements:1,rows_visited:ids.len() as u64,..Default::default()});
+    Ok(ids)
+}
+
+pub(crate) fn close_request_keys(db: &Connection, request: &str) -> anyhow::Result<Vec<String>> {
+    let mut statement = db.prepare("SELECT row_key FROM hot_store_rows WHERE store='agent_bus' AND collection='message' AND json_extract(CAST(value_json AS TEXT), '$.settlement.request.requestId')=?1 ORDER BY row_key")?;
+    let keys = statement
+        .query_map([request], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(keys)
+}
+
+const PRESENTATION_RECIPIENT: &str =
+    "json_extract(CAST(value_json AS TEXT), '$.snapshot.toCutexSessionId')";
+// `nextAttemptAt` is serde-defaulted to 0 when absent.
+const PRESENTATION_NEXT_ATTEMPT: &str =
+    "IFNULL(json_extract(CAST(value_json AS TEXT), '$.snapshot.presentation.nextAttemptAt'), 0)";
+const PRESENTATION_OPEN: &str = "store = 'agent_bus' AND collection = 'message'
+         AND json_extract(CAST(value_json AS TEXT), '$.snapshot.presentation.version') IS NOT NULL
+         AND json_extract(CAST(value_json AS TEXT), '$.snapshot.presentation.receipt') IS NULL";
+
+/// The recipient's first `limit` open presentation obligations as
+/// `(message id, next attempt)`, earliest first. Rows are not decoded.
+pub(crate) fn presentation_due_rows(
+    db: &Connection,
+    recipient: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<(String, i64)>> {
+    #[cfg(test)]
+    PRESENTATION_SEARCHES.with(|n| n.set(n.get() + 1));
+    let indexed: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='agent_bus_presentation_due')",
+        [], |row| row.get(0),
+    )?;
+    // As for bus_state_query: pin the index once a writer installed it; a
+    // home no writer has opened since upgrade stays readable by a scan.
+    let index = if indexed {
+        " INDEXED BY agent_bus_presentation_due"
+    } else {
+        ""
+    };
+    let mut query = db.prepare(&format!(
+        "SELECT row_key, {PRESENTATION_NEXT_ATTEMPT} FROM hot_store_rows{index}
+         WHERE {PRESENTATION_OPEN} AND {PRESENTATION_RECIPIENT} = ?1
+         ORDER BY {PRESENTATION_NEXT_ATTEMPT}, row_key LIMIT ?2"
+    ))?;
+    let rows = query
+        .query_map(params![recipient, i64::try_from(limit)?], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 fn meta(connection: &Connection, store: &str) -> anyhow::Result<Option<(u64, bool)>> {
@@ -125,15 +218,77 @@ fn meta(connection: &Connection, store: &str) -> anyhow::Result<Option<(u64, boo
         .transpose()
 }
 
+pub(crate) fn prepare(path: &Path) -> anyhow::Result<()> { drop(connection(path)?); Ok(()) }
+
+pub(crate) const ADMISSION_CANDIDATE: &str = "store='agent_bus' AND collection='message'
+    AND (json_extract(CAST(value_json AS TEXT),'$.snapshot.state') IN ('pending','inbox_accepted','stale_held')
+         OR json_extract(CAST(value_json AS TEXT),'$.admissionStartedIdle')=1)
+    AND json_extract(CAST(value_json AS TEXT),'$.settlement.closure') IS NULL";
+
+/// Keyset page over scheduling candidates. At most the budget plus one
+/// probe is visited; no completed-history payload is decoded or retained.
+pub(crate) fn admission_page(
+    db: &Connection,
+    after: Option<&str>,
+    budget: crate::store::PageBudget,
+) -> anyhow::Result<(Rows, Option<String>)> {
+    let mut stmt = db.prepare(&format!("SELECT collection,row_key,value_json FROM hot_store_rows INDEXED BY agent_bus_admission_candidates WHERE {ADMISSION_CANDIDATE} {} ORDER BY row_key LIMIT ?2",
+        if after.is_some() { "AND row_key > ?1" } else { "AND (?1 IS NULL)" }))?;
+    let mut query = stmt.query(params![
+        after,
+        budget.max_rows.max(1).saturating_add(1) as i64
+    ])?;
+    let mut rows = Rows::new();
+    let mut bytes = 0;
+    let mut more = false;
+    while let Some(row) = query.next()? {
+        let collection: String = row.get(0)?;
+        let key: String = row.get(1)?;
+        let value: Vec<u8> = row.get(2)?;
+        crate::store::metrics::note(
+            "bus-messages",
+            crate::store::OpCounts {
+                rows_visited: 1,
+                bytes_read: value.len() as u64,
+                ..Default::default()
+            },
+        );
+        if !budget.admits(rows.len(), bytes, value.len()) {
+            more = true;
+            break;
+        }
+        bytes += value.len();
+        rows.insert((collection, key), value);
+    }
+    let next = more.then(|| rows.keys().last().expect("page makes progress").1.clone());
+    Ok((rows, next))
+}
+
 fn rows(connection: &Connection, store: &str) -> anyhow::Result<Rows> {
-    let mut statement = connection.prepare(
-        "SELECT collection, row_key, value_json FROM hot_store_rows WHERE store = ?1 ORDER BY collection, row_key",
-    )?;
-    let values =
-        statement.query_map([store], |row| Ok(((row.get(0)?, row.get(1)?), row.get(2)?)))?;
-    values
-        .collect::<rusqlite::Result<Rows>>()
-        .map_err(Into::into)
+    let mut statement = connection.prepare("SELECT collection,row_key,value_json FROM hot_store_rows WHERE store=?1 ORDER BY collection,row_key")?;
+    let rows = statement
+        .query_map([store], |row| Ok(((row.get(0)?, row.get(1)?), row.get(2)?)))?
+        .collect::<rusqlite::Result<Rows>>()?;
+    note_bus_rows(store, rows.len(), rows.values().map(Vec::len).sum());
+    Ok(rows)
+}
+
+fn note_bus_rows(logical: &str, rows: usize, bytes: usize) {
+    let id = match logical {
+        "agent_bus" => "bus-messages",
+        "agent_bus_settlement_evidence" => "bus-settlement-evidence",
+        _ => return,
+    };
+    crate::store::metrics::note(
+        id,
+        crate::store::OpCounts {
+            bytes_read: bytes as u64,
+            rows_visited: rows as u64,
+            rows_materialized: rows as u64,
+            sql_statements: 1,
+            ..Default::default()
+        },
+    );
 }
 
 pub fn generation(path: &Path, store: &str) -> anyhow::Result<Option<u64>> {
@@ -171,6 +326,39 @@ pub fn cached_generation(path: &Path, store: &str) -> anyhow::Result<Option<u64>
     Ok(meta(connection, store)?
         .filter(|(_, verified)| *verified)
         .map(|(generation, _)| generation))
+}
+
+/// [`verified_snapshot`] on the cached read-only connection, for probes that
+/// run on every idle poll. Never creates, migrates or repairs data.
+pub(crate) fn cached_snapshot<T>(
+    path: &Path,
+    store: &str,
+    read: impl FnOnce(&Connection, u64) -> anyhow::Result<T>,
+) -> anyhow::Result<Option<T>> {
+    let mut cached = CACHED_READ_CONNECTION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("hot-store read connection lock was poisoned"))?;
+    if cached
+        .as_ref()
+        .is_none_or(|(cached_path, _)| cached_path != path)
+    {
+        if !path.exists() {
+            return Ok(None);
+        }
+        *cached = Some((path.to_path_buf(), read_connection(path)?));
+    }
+    let db = &mut cached.as_mut().expect("connection installed above").1;
+    if !table_exists(db, "hot_store_meta")? {
+        return Ok(None);
+    }
+    let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let Some((generation, true)) = meta(&tx, store)? else {
+        return Ok(None);
+    };
+    let result = read(&tx, generation)?;
+    tx.commit()?;
+    Ok(Some(result))
 }
 
 #[cfg(test)]
@@ -236,6 +424,7 @@ pub fn load_or_migrate(
     // leave both the database and the legacy backup untouched.
     let decoded = decode(&legacy)?;
     let digest = format!("{:x}", Sha256::digest(&legacy));
+    bus_changes::invalidate(path, store)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some((generation, true)) = meta(&tx, store)? {
         let loaded = rows(&tx, store)?;
@@ -280,19 +469,22 @@ pub fn load_or_migrate(
     })
 }
 
-/// Commit only the supplied changed rows and advance the store generation.
-pub fn commit(
-    path: &Path,
-    store: &str,
-    expected_generation: u64,
-    changes: Vec<RowChange>,
-) -> anyhow::Result<u64> {
-    if changes.is_empty() {
-        return Ok(expected_generation);
+/// Commit changed rows and their transport tombstones atomically.
+pub fn commit(path: &Path, store: &str, expected_generation: u64, changes: Vec<RowChange>) -> anyhow::Result<u64> {
+    if changes.is_empty() { return Ok(expected_generation); }
+    if bus_changes::spec(store).is_some() {
+        drop(connection(path)?);
+        return bus_changes::commit(path, store, expected_generation, changes);
     }
     let mut db = connection(path)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current = meta(&tx, store)?;
+    let next = commit_rows(&tx, store, expected_generation, &changes)?;
+    tx.commit()?;
+    Ok(next)
+}
+
+pub(super) fn commit_rows(tx: &Connection, store: &str, expected_generation: u64, changes: &[RowChange]) -> anyhow::Result<u64> {
+    let current = meta(tx, store)?;
     match current {
         Some((generation, true)) => anyhow::ensure!(
             generation == expected_generation,
@@ -339,7 +531,6 @@ pub fn commit(
             i64::try_from(next).context("hot-store generation overflow")?
         ],
     )?;
-    tx.commit()?;
     Ok(next)
 }
 
@@ -366,26 +557,98 @@ pub fn handoff_to_legacy(path: &Path, store: &str, expected_generation: u64) -> 
 }
 
 pub fn verified_rows(path: &Path, store: &str) -> anyhow::Result<Option<LoadedRows>> {
+    verified_snapshot(path, store, |db, generation| {
+        Ok(LoadedRows {
+            generation,
+            rows: rows(db, store)?,
+            exists: true,
+        })
+    })
+}
+
+/// A coherent read-only WAL snapshot. Never creates, migrates or repairs data.
+pub(crate) fn verified_snapshot<T>(
+    path: &Path,
+    store: &str,
+    read: impl FnOnce(&Connection, u64) -> anyhow::Result<T>,
+) -> anyhow::Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
     }
-    let db = read_connection(path)?;
+    let mut db = read_connection(path)?;
     if !table_exists(&db, "hot_store_meta")? {
         return Ok(None);
     }
-    let Some((generation, true)) = meta(&db, store)? else {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let Some((generation, true)) = meta(&tx, store)? else {
         return Ok(None);
     };
-    Ok(Some(LoadedRows {
-        generation,
-        rows: rows(&db, store)?,
-        exists: true,
-    }))
+    let result = read(&tx, generation)?;
+    tx.commit()?;
+    Ok(Some(result))
+}
+
+pub(crate) fn verified_row(
+    db: &Connection,
+    store: &str,
+    collection: &str,
+    key: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if !meta(db, store)?.is_some_and(|(_, verified)| verified) {
+        return Ok(None);
+    }
+    let value: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT value_json FROM hot_store_rows WHERE store=?1 AND collection=?2 AND row_key=?3",
+            params![store, collection, key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    note_bus_rows(store,usize::from(value.is_some()),value.as_ref().map_or(0,Vec::len));
+    Ok(value)
+}
+
+pub(crate) fn bus_state_query(db: &Connection) -> anyhow::Result<String> {
+    let indexed: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='agent_bus_message_state')",
+        [], |row| row.get(0),
+    )?;
+    // Without ANALYZE, SQLite can prefer the (store,collection) primary-key
+    // prefix and scan every retained payload. Pin the state index once the
+    // normal writer has installed it; old read-only homes remain readable.
+    let index = if indexed {
+        " INDEXED BY agent_bus_message_state"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "SELECT collection,row_key,value_json FROM hot_store_rows{index}
+         WHERE store='agent_bus' AND collection='message'
+         AND json_extract(CAST(value_json AS TEXT),'$.snapshot.state')
+             IN ('pending','inbox_accepted','stale_held')"
+    ))
+}
+
+pub(crate) fn bus_state_rows(db: &Connection) -> anyhow::Result<Rows> {
+    let mut query = db.prepare(&bus_state_query(db)?)?;
+    let rows = query
+        .query_map([], |row| Ok(((row.get(0)?, row.get(1)?), row.get(2)?)))?
+        .collect::<rusqlite::Result<Rows>>()?;
+    Ok(rows)
+}
+
+/// Indexed reader-fence probe; never creates or migrates a store.
+pub(crate) fn has_row(path:&Path,store:&str,collection:&str,key:&str)->anyhow::Result<bool>{
+    if !path.exists(){return Ok(false);}
+    let db=read_connection(path)?;
+    if !table_exists(&db,"hot_store_rows")?{return Ok(false);}
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM hot_store_rows WHERE store=?1 AND collection=?2 AND row_key=?3)",
+        params![store,collection,key],|row|row.get(0))?)
 }
 
 /// Whether this store has any migration metadata, including an unverified
-/// legacy handoff. Callers use this to distinguish a pre-SQLite JSON store
-/// from JSON that must be re-imported before another offline conversion.
+/// legacy handoff. Callers distinguish pre-SQLite JSON from an offline
+/// conversion that requires re-import.
 pub fn has_store(path: &Path, store: &str) -> anyhow::Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -400,6 +663,37 @@ pub fn has_store(path: &Path, store: &str) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_rows_and_generation_share_one_wal_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("cutex-selected-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(DATABASE_FILE);
+        let put = |value: &[u8]| RowChange::Put {
+            collection: "row".into(),
+            key: "key".into(),
+            value: value.to_vec(),
+        };
+        commit(&path, "fixture", 0, vec![put(b"old")]).unwrap();
+        let observed = verified_snapshot(&path, "fixture", |db, generation| {
+            commit(&path, "fixture", 1, vec![put(b"new")])?;
+            Ok((generation, verified_row(db, "fixture", "row", "key")?))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(observed, (1, Some(b"old".to_vec())));
+        assert_eq!(generation(&path, "fixture").unwrap(), Some(2));
+        assert_eq!(
+            verified_snapshot(&path, "fixture", |db, _| verified_row(
+                db, "fixture", "row", "key"
+            ))
+            .unwrap()
+            .unwrap(),
+            Some(b"new".to_vec())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn corrupt_legacy_and_unverified_partial_rows_are_never_accepted() {
@@ -505,4 +799,47 @@ mod tests {
         clear_cached_generation();
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+const MANAGEMENT_START_ROWS: &str = "store='agent_bus' AND collection='message' AND json_extract(CAST(value_json AS TEXT),'$.canonicalEnvelope.controlType') IS NOT NULL";
+const SETTLEMENT_OUTBOX_ROWS: &str = "store='agent_bus' AND collection='message' AND json_array_length(CAST(value_json AS TEXT),'$.settlement.pendingSessions')>0 AND json_extract(CAST(value_json AS TEXT),'$.settlement.closure') IS NOT NULL";
+
+fn existing_index(db: &Connection, name: &str) -> anyhow::Result<bool> {
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",[name],|row|row.get(0))?)
+}
+
+pub(crate) fn management_start_rows(db: &Connection, sender: &str, control: &str) -> anyhow::Result<Rows> {
+    let index = if existing_index(db,"agent_bus_management_starts")? {" INDEXED BY agent_bus_management_starts"} else {""};
+    let sql = format!("SELECT collection,row_key,value_json FROM hot_store_rows{index} WHERE {MANAGEMENT_START_ROWS}
+        AND json_extract(CAST(value_json AS TEXT),'$.canonicalEnvelope.controlType')=?1
+        AND json_extract(CAST(value_json AS TEXT),'$.canonicalEnvelope.from')=?2 ORDER BY row_key");
+    let mut query = db.prepare(&sql)?;
+    let rows = query.query_map(params![control,sender],|row|Ok(((row.get(0)?,row.get(1)?),row.get(2)?)))?.collect::<rusqlite::Result<Rows>>()?;
+    note_bus_rows("agent_bus",rows.len(),rows.values().map(Vec::len).sum());
+    Ok(rows)
+}
+
+pub(crate) fn settlement_outbox_rows(db: &Connection) -> anyhow::Result<Rows> {
+    let index = if existing_index(db,"agent_bus_settlement_outbox")? {" INDEXED BY agent_bus_settlement_outbox"} else {""};
+    let sql = format!("SELECT collection,row_key,value_json FROM hot_store_rows{index} WHERE {SETTLEMENT_OUTBOX_ROWS} ORDER BY row_key");
+    let mut query = db.prepare(&sql)?;
+    let rows = query.query_map([],|row|Ok(((row.get(0)?,row.get(1)?),row.get(2)?)))?.collect::<rusqlite::Result<Rows>>()?;
+    note_bus_rows("agent_bus",rows.len(),rows.values().map(Vec::len).sum());
+    Ok(rows)
+}
+
+// julianday is only a conservative prefilter. Equal millisecond buckets and
+// unsupported/invalid RFC3339 forms are retained for the exact Rust predicate.
+// The shape guard also prevents SQLite dynamic words (now/subsec) from making
+// an expression index reject legacy timestamps that Rust previously skipped.
+const FINISHED_TIME: &str = "IFNULL(CASE WHEN json_extract(CAST(value_json AS TEXT),'$.updatedAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.updatedAt')) ELSE NULL END,-1.0e100)";
+const FINISHED_ROWS: &str = "store='agent_bus' AND collection='message' AND json_extract(CAST(value_json AS TEXT),'$.snapshot.state') IN ('delivered','inbox_accepted','quarantined','discarded','failed') AND json_extract(CAST(value_json AS TEXT),'$.settlement') IS NULL AND (json_extract(CAST(value_json AS TEXT),'$.snapshot.presentation') IS NULL OR json_extract(CAST(value_json AS TEXT),'$.snapshot.presentation.receipt') IS NOT NULL)";
+
+pub(crate) fn finished_message_rows(db: &Connection, cutoff: chrono::DateTime<chrono::Utc>) -> anyhow::Result<Rows> {
+    let index = if existing_index(db,"agent_bus_finished_time")? {" INDEXED BY agent_bus_finished_time"} else {""};
+    let sql = format!("SELECT collection,row_key,value_json FROM hot_store_rows{index} WHERE {FINISHED_ROWS} AND {FINISHED_TIME}<=IFNULL(julianday(?1),1.0e100) ORDER BY row_key");
+    let mut query = db.prepare(&sql)?;
+    let rows = query.query_map([cutoff.to_rfc3339()],|row|Ok(((row.get(0)?,row.get(1)?),row.get(2)?)))?.collect::<rusqlite::Result<Rows>>()?;
+    note_bus_rows("agent_bus",rows.len(),rows.values().map(Vec::len).sum());
+    Ok(rows)
 }

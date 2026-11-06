@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:session-deltas",
+  "title": "Session catalog pages and deltas",
+  "description": "Owner-only session-deltas-v1. See docs/management-v2-session-deltas.md for bootstrap ordering, byte budgets and recovery.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/sessionPage"
+    },
+    {
+      "$ref": "#/$defs/sessionChangePage"
+    },
+    {
+      "$ref": "#/$defs/sessionResync"
+    }
+  ],
+  "$defs": {
+    "sessionKey": {
+      "type": "object",
+      "required": [
+        "cutexSessionId",
+        "revision"
+      ],
+      "properties": {
+        "cutexSessionId": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "sessionChange": {
+      "type": "object",
+      "required": [
+        "seq",
+        "key",
+        "deleted",
+        "revision"
+      ],
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "key": {
+          "type": "string"
+        },
+        "deleted": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "sessionPage": {
+      "type": "object",
+      "required": [
+        "sessions",
+        "nextCursor",
+        "changeCursor",
+        "oversizeFirst",
+        "hostId",
+        "claudeRuntime"
+      ],
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": {
+            "$ref": "#/$defs/sessionKey"
+          }
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "changeCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "oversizeFirst": {
+          "type": "boolean"
+        },
+        "hostId": {
+          "type": "string"
+        },
+        "claudeRuntime": {
+          "$ref": "#/$defs/claudeRuntimeHost"
+        }
+      }
+    },
+    "sessionChangePage": {
+      "type": "object",
+      "required": [
+        "changes",
+        "nextCursor",
+        "watermark",
+        "more",
+        "oversizeFirst",
+        "resyncRequired",
+        "hostId",
+        "claudeRuntime"
+      ],
+      "properties": {
+        "resyncRequired": {
+          "const": false
+        },
+        "nextCursor": {
+          "type": "string"
+        },
+        "watermark": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "more": {
+          "type": "boolean"
+        },
+        "oversizeFirst": {
+          "type": "boolean"
+        },
+        "changes": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": {
+            "$ref": "#/$defs/sessionChange"
+          }
+        },
+        "hostId": {
+          "type": "string"
+        },
+        "claudeRuntime": {
+          "$ref": "#/$defs/claudeRuntimeHost"
+        }
+      }
+    },
+    "sessionResync": {
+      "type": "object",
+      "required": [
+        "resyncRequired",
+        "reason",
+        "hostId",
+        "claudeRuntime"
+      ],
+      "properties": {
+        "resyncRequired": {
+          "const": true
+        },
+        "reason": {
+          "enum": [
+            "EpochChanged",
+            "BelowRetention",
+            "WrongInstance",
+            "ScopeMismatch",
+            "FilterMismatch",
+            "StoreMismatch",
+            "StoreAbsent"
+          ]
+        },
+        "watermark": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hostId": {
+          "type": "string"
+        },
+        "claudeRuntime": {
+          "$ref": "#/$defs/claudeRuntimeHost"
+        }
+      }
+    },
+    "claudeRuntimeHost": {
+      "type": "object",
+      "required": [
+        "selectedRelease"
+      ],
+      "properties": {
+        "selectedRelease": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

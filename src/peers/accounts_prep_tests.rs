@@ -160,7 +160,7 @@ fn exported_directory_never_reexports_remote_cache_or_mirror_targets() {
     ).unwrap();
     let (mut state, mut mirror, _) = super::tests::remote_record();
     mirror.target_cutex_session_id = remote.into();
-    state.asks.insert(mirror.ask_id.clone(), mirror);
+    state.asks.insert(mirror.ask_id.clone(), mirror.into());
     crate::asks::store::AskStore::open_default()
         .unwrap()
         .with_state(|current| *current = state)

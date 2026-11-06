@@ -591,6 +591,7 @@ pub(crate) mod fake {
     pub struct FakeHost {
         pub log: RefCell<Vec<String>>,
         pub fail: RefCell<BTreeSet<&'static str>>,
+        pub fail_once: RefCell<BTreeSet<&'static str>>,
         pub busy_script: RefCell<Vec<Vec<Busy>>>,
         pub running: RefCell<String>,
         pub commit: RefCell<String>,
@@ -607,6 +608,8 @@ pub(crate) mod fake {
         pub online_late: RefCell<Option<(Duration, String)>>,
         /// Features that disappear when the new release is activated.
         pub drop_on_swap: RefCell<Vec<String>>,
+        /// Exercise production store preparation without controlling real services.
+        pub prepare_stores: Option<Box<dyn Fn(&Path, &str) -> anyhow::Result<Vec<String>>>>,
     }
 
     impl FakeHost {
@@ -614,6 +617,7 @@ pub(crate) mod fake {
             Self {
                 log: RefCell::new(Vec::new()),
                 fail: RefCell::new(BTreeSet::new()),
+                fail_once: RefCell::new(BTreeSet::new()),
                 busy_script: RefCell::new(Vec::new()),
                 running: RefCell::new(running.into()),
                 commit: RefCell::new("1111111aaaa".into()),
@@ -628,11 +632,12 @@ pub(crate) mod fake {
                 new_release_commit: "5f30a7cad4dcd8435e797592a380349df509e35d".into(),
                 online_late: RefCell::new(None),
                 drop_on_swap: RefCell::new(Vec::new()),
+                prepare_stores: None,
             }
         }
         fn step(&self, name: &'static str) -> anyhow::Result<()> {
             self.log.borrow_mut().push(name.to_string());
-            if self.fail.borrow().contains(name) {
+            if self.fail.borrow().contains(name) || self.fail_once.borrow_mut().remove(name) {
                 anyhow::bail!("{name} failed (fake)");
             }
             Ok(())
@@ -730,8 +735,9 @@ pub(crate) mod fake {
             self.step("move_aside")?;
             Ok(true)
         }
-        fn prepare_older_stores(&self, _displaced: &Path, _target: &str) -> anyhow::Result<Vec<String>> {
+        fn prepare_older_stores(&self, displaced: &Path, target: &str) -> anyhow::Result<Vec<String>> {
             self.step("prepare_older_stores")?;
+            if let Some(prepare) = &self.prepare_stores { return prepare(displaced, target); }
             Ok(vec!["legacy views exported".into()])
         }
         fn rollback_prep(&self, _migrations: &[Migration]) -> anyhow::Result<Vec<String>> {

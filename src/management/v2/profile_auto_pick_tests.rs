@@ -23,7 +23,7 @@ fn opus_high() -> Spend {
 
 #[test]
 fn requested_profile_values() {
-    assert_eq!(requested("GammaProfile"), Requested::Profile);
+    assert_eq!(requested("ExampleProfile"), Requested::Profile);
     assert_eq!(requested("automatic"), Requested::Profile);
     assert_eq!(requested("auto"), Requested::Bare);
     assert_eq!(requested(" AUTO "), Requested::Bare);
@@ -49,12 +49,12 @@ fn spend_table_and_window_lengths() {
 }
 
 /// Design 041 §2 worked example: AlphaProfile wins on its weekly window although
-/// GammaProfile and Ceobe look better on 5h remaining alone.
+/// ExampleProfile and Ceobe look better on 5h remaining alone.
 #[test]
 fn worked_example_picks_the_latest_wall() {
     let spend = opus_high();
     let candidates = vec![
-        candidate("GammaProfile", vec![window("5h", 62.0, 3.0, 10.0), window("7d", 40.0, 96.0, 0.8)], 2),
+        candidate("ExampleProfile", vec![window("5h", 62.0, 3.0, 10.0), window("7d", 40.0, 96.0, 0.8)], 2),
         candidate("AlphaProfile", vec![window("5h", 85.0, 4.5, 5.0), window("7d", 12.0, 48.0, 0.5)], 1),
         candidate("Ceobe", vec![window("5h", 20.0, 0.5, 25.0), window("7d", 70.0, 120.0, 1.5)], 3),
     ];
@@ -68,7 +68,7 @@ fn worked_example_picks_the_latest_wall() {
     assert_eq!(pick.picked, "AlphaProfile");
     assert_eq!(pick.picked_id, "id-AlphaProfile");
     assert_eq!(pick.rule, "latest_wall");
-    assert_eq!(pick.candidates.iter().map(|c| c.profile.as_str()).collect::<Vec<_>>(), ["AlphaProfile", "Ceobe", "GammaProfile"]);
+    assert_eq!(pick.candidates.iter().map(|c| c.profile.as_str()).collect::<Vec<_>>(), ["AlphaProfile", "Ceobe", "ExampleProfile"]);
     assert!(pick.reason.starts_with("AlphaProfile: 7d window 12% left, about 8.0 h"), "{}", pick.reason);
     let value = serde_json::to_value(&pick).unwrap();
     assert_eq!(value["candidates"][0]["bindingWindow"], "7d");
@@ -114,10 +114,10 @@ fn burn_falls_back_to_open_agents_and_scores_cap_at_a_day() {
 
 #[test]
 fn no_candidate_is_refused_with_the_reasons() {
-    let excluded = vec![Excluded { profile: "ZetaProfile".into(), reason: "not_opted_in".into() }];
+    let excluded = vec![Excluded { profile: "ProviderC".into(), reason: "not_opted_in".into() }];
     let refused = pick_from("auto:zhipu", "zhipu", &Spend::default(), &[], excluded, NOW).unwrap_err();
     assert_eq!(refused.code, "no_auto_pick_candidate");
-    assert!(refused.detail.contains("ZetaProfile: not_opted_in"), "{}", refused.detail);
+    assert!(refused.detail.contains("ProviderC: not_opted_in"), "{}", refused.detail);
 }
 
 #[test]

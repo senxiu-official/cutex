@@ -16,6 +16,7 @@ from cute_claude.config import Settings
 from cute_claude.subscription import OfficialSdkDriver
 from cute_claude.subscription_auth import ApiAccount, CONFLICTING_ENV
 from test_subscription import SubHarness
+from prompt_fixture import large_append, LAST_LINE, AGENTS_MARKER
 
 pytestmark = pytest.mark.skipif(os.environ.get('CUTEX_SIDE_FORK_NATIVE_SMOKE') != '1', reason='opt-in local SDK/CLI probe')
 
@@ -75,7 +76,7 @@ async def test_real_cli_side_chat_and_busy_fork(tmp_path, monkeypatch):
     config = tmp_path / 'native-config'
     driver = OfficialSdkDriver(cli, config, api_account=account)
     h = SubHarness(Settings(work, tmp_path / 'adapter', model='claude-sonnet-4-6', backend='subscription', mock=False,
-                            thinking='disabled'), driver)
+                            thinking='disabled', system_append=large_append()), driver)
 
     def transcript(sid):
         return next(config.glob(f'projects/*/{sid}.jsonl')).read_text(encoding='utf-8')
@@ -116,6 +117,7 @@ async def test_real_cli_side_chat_and_busy_fork(tmp_path, monkeypatch):
         assert 'SIDE_QUESTION_23' in transcript(side_sid)
         await h.call('claude/side/close', {'threadId': tid, 'chatId': chat['id']})
         assert not list(config.glob(f'projects/*/{side_sid}.jsonl'))  # Discarded with the chat.
+        assert not (h.engine.settings.state_dir / 'system-prompts' / f"{chat['threadId']}.md").exists()
 
         # Busy fork: the running turn is left out, the parent keeps running.
         running = await h.turn(tid, 'HOLD_PARENT now.')
@@ -133,6 +135,9 @@ async def test_real_cli_side_chat_and_busy_fork(tmp_path, monkeypatch):
         assert h.store.turn(question, include_items=False)['status'] == 'completed'
         fork_request = next(r for r in reversed(requests) if 'FORK_QUESTION_31' in conversation(r))
         assert 'PARENT_MARKER_11' in conversation(fork_request) and 'HOLD_PARENT' not in conversation(fork_request)
+        for request in requests:
+            system=json.dumps(request.get('system'),ensure_ascii=False)
+            assert LAST_LINE in system and AGENTS_MARKER in system
         print(json.dumps({'probe': 'real-sdk-cli-loopback', 'kind': 'side-and-busy-fork', 'modelRequests': len(requests),
                           'sideSawParent': True, 'parentUntouched': True, 'busyForkLeftRunningTurnOut': True}))
     finally:

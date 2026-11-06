@@ -996,6 +996,7 @@ mod tests {
 }
 
 /// Restrict a runtime process or job object to the account across elevation/session changes.
+#[expect(clippy::not_unsafe_ptr_arg_deref, reason = "HANDLE is an opaque kernel object identifier, not caller memory")]
 pub fn secure_runtime_object(handle: HANDLE) -> Result<(), PrivateFsError> {
     let sid = current_user_sid()?;
     let acl = private_acl(sid.as_ptr() as PSID, false)?;

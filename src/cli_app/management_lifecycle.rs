@@ -261,6 +261,26 @@ fn start_cutex_session_online_with_profile_inner(
     launch_profile: Option<&ResolvedLaunchProfile>,
     validate_occurrence: Option<&RuntimeOccurrenceValidator<'_>>,
 ) -> anyhow::Result<SessionOnlineStartOutcome> {
+    // r273 (051 §2/step 3): a lifecycle entry that registered the host fence
+    // (Director create/online) never reserves this session lane under it.
+    // The whole start runs holding only the lane; its own launch claim and
+    // finalization compare are the intent and the version check.
+    if cutex::agent_management::host_fence_registered()
+        && !cutex::management::v2::session_coordination::thread_holds_lane()
+    {
+        return cutex::agent_management::outside_host_fence("session online start", || {
+            start_cutex_session_online_under_lane(config, entry, launch_profile, validate_occurrence)
+        })?;
+    }
+    start_cutex_session_online_under_lane(config, entry, launch_profile, validate_occurrence)
+}
+
+fn start_cutex_session_online_under_lane(
+    config: &CodezConfig,
+    entry: &CodingSessionRegistration,
+    launch_profile: Option<&ResolvedLaunchProfile>,
+    validate_occurrence: Option<&RuntimeOccurrenceValidator<'_>>,
+) -> anyhow::Result<SessionOnlineStartOutcome> {
     // Resolve the durable identity before any lifecycle/store barrier, then
     // revalidate it after admission. A direct TUI start must not cross an
     // owner/asks send already authorized for that session.
@@ -439,7 +459,10 @@ fn start_cutex_session_online_with_profile_inner(
     let mut alden_session_name = None;
     let mut alden_pid = None;
 
-    let start_result = (|| -> anyhow::Result<AgentBusAgent> {
+    // r273 (051 step 3): the claim is committed and the child spawned; the
+    // endpoint/registration wait runs outside a registered host fence. The
+    // finalization below compares the claim, binding and runtime agent.
+    let start_result = cutex::agent_management::outside_host_fence("session online readiness", || -> anyhow::Result<AgentBusAgent> {
         // Bus registration is a callback of this lane-owning start. Publish
         // the exact pending occurrence before connecting/registering so Bus
         // can admit only that occurrence without waiting for our reservation.
@@ -478,7 +501,8 @@ fn start_cutex_session_online_with_profile_inner(
                 session_online_log_tail(&log_path)
             )
         })
-    })();
+    })
+    .unwrap_or_else(|error| Err(anyhow::Error::new(error)));
     let final_live_agent = match start_result {
         Ok(agent) => agent,
         Err(error) => {
@@ -2010,6 +2034,7 @@ mod profile_tests {
         StoredAccount {
             options: Default::default(),
             browser_tools: false,
+            browser_tool_surface: Default::default(),
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,

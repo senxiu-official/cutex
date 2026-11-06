@@ -136,6 +136,13 @@ stores![
         "directory"
     ),
     (
+        "usage-index",
+        "usage",
+        "runtime/management-v2/usage-index.sqlite3",
+        "internal",
+        "sqlite"
+    ),
+    (
         "quota-history",
         "usage",
         "runtime/management-v2/usage-quota-history",
@@ -246,11 +253,25 @@ stores![
         "json"
     ),
     (
+        "user-input-rows",
+        "management",
+        "runtime/management-v2/owner-input.sqlite3",
+        "internal",
+        "sqlite"
+    ),
+    (
         "activity-projector",
         "management",
         "runtime/management-v2/activity-projector-state.json",
         "internal",
         "json"
+    ),
+    (
+        "activity-projector-rows",
+        "management",
+        "runtime/management-v2/activity-projector-state.sqlite3",
+        "internal",
+        "sqlite"
     ),
     (
         "session-projection",
@@ -1247,6 +1268,9 @@ mod tests {
             ("runtime/artifacts/blobs/a", "artifacts"),
             ("runtime/documents/documents-v1.sqlite3", "documents"),
             ("runtime/management-v2/user-input-state.json", "user-input"),
+            ("runtime/management-v2/owner-input.sqlite3", "user-input-rows"),
+            ("runtime/management-v2/owner-input.sqlite3-wal", "user-input-rows"),
+            ("runtime/management-v2/owner-input.sqlite3-shm", "user-input-rows"),
             (
                 "runtime/management-v2/integration-event-dedupe-seen-v1.json",
                 "integration-dedupe",

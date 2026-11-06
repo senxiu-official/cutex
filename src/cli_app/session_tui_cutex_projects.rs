@@ -3290,7 +3290,11 @@ mod tests {
         impl Drop for ServerGuard {
             fn drop(&mut self) {
                 self.0.store(true, Ordering::SeqCst);
-                self.1.take().unwrap().join().unwrap();
+                let joined = self.1.take().unwrap().join();
+                // Keep the initiating failure if a disconnected client also
+                // makes the fixture server fail while unwinding. Otherwise
+                // a second panic aborts the complete bin suite on Windows.
+                if !std::thread::panicking() { joined.unwrap(); }
             }
         }
         let _server = ServerGuard(stop, Some(server));
@@ -3682,7 +3686,9 @@ mod tests {
                 .unwrap(),
         };
         // Archive stops the recorded running runtime as part of the call.
+        let archive_started = std::time::Instant::now();
         let receipt = client.execute_agent_archive(&unsupported).unwrap();
+        eprintln!("private archive runtime stop and HTTP receipt elapsed={:?}", archive_started.elapsed());
         assert_eq!(
             receipt.stage,
             cutex::agent_management::AgentArchiveStage::Committed

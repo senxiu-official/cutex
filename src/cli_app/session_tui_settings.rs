@@ -3249,12 +3249,15 @@ mod tests {
         assert_eq!(draft.dirty_count(), 0);
     }
 
+    // The bin links the non-test lib: its default-port lift exists in debug only.
+    #[cfg(debug_assertions)]
     #[test]
     fn global_agent_bus_draft_validates_port_and_masks_token() {
         // Default-instance port rules (59995 invalid, 24261 valid).
         cutex::config::instance::with_default_ports_for_test(global_agent_bus_draft_validates_port_and_masks_token_inner);
     }
 
+    #[cfg(debug_assertions)]
     fn global_agent_bus_draft_validates_port_and_masks_token_inner() {
         let mut config = CodezConfig::default();
         config.agent_bus_enabled = false;

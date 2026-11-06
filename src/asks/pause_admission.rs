@@ -19,12 +19,56 @@ impl std::fmt::Display for Deferred {
 }
 impl std::error::Error for Deferred {}
 
+/// Whether an error is (or wraps) a deferred admission: the host authority
+/// fence was busy, nothing was decided and nothing was sent. Owner-facing
+/// routes report it as the retryable `admission_busy` code (reason
+/// `hostBusy`), never as a pause, persistence failure or runtime refusal.
+pub fn is_deferred(error:&anyhow::Error)->bool {
+    error.chain().any(|cause|cause.is::<Deferred>())
+}
+
+/// Wire contract of a deferred owner admission (`owner-admission-busy-v1`).
+pub const ADMISSION_BUSY_CODE:&str="admission_busy";
+pub const HOST_BUSY_REASON:&str="hostBusy";
+pub const ADMISSION_BUSY_RETRY_AFTER_MS:u64=1000;
+
+thread_local! {
+    /// The host authority fence held by the owner admission worker on this
+    /// thread (r271). While set, admission on this thread runs under it
+    /// instead of trying the fence again; it is dropped before native IO.
+    static WORKER_FENCE: std::cell::RefCell<Option<crate::platform::lock_accounting::FileGuard>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Owner admission worker only: wait (FIFO with every other blocking waiter)
+/// for the host authority fence and keep it on this thread. The caller must
+/// hold no session lane (debug-checked by `lock_mutations`).
+/// Accounted (step-0 lock accounting, `Lock::Authority`, blocking) at the
+/// worker's call site; the whole hold is one record.
+#[track_caller]
+pub fn acquire_worker_fence()->anyhow::Result<()> {
+    if worker_fence_held() {return Ok(());}
+    let fence=AgentManagementStore::open_default()?.lock_mutations()?;
+    WORKER_FENCE.with(|held|*held.borrow_mut()=Some(fence));
+    Ok(())
+}
+
+/// Drop this thread's worker fence (no-op elsewhere). Called right after the
+/// owner input's re-check and durable reservation, before any native call.
+pub fn release_worker_fence()->bool {
+    WORKER_FENCE.with(|held|held.borrow_mut().take().is_some())
+}
+
+pub fn worker_fence_held()->bool {
+    WORKER_FENCE.with(|held|held.borrow().is_some())
+}
+
 /// Hot admission never waits behind lifecycle: lifecycle may be joining this
 /// very bridge worker. No role-action maintenance/pruning belongs on this path.
 pub fn try_with_authority<T>(run:impl FnOnce(&AgentManagementSnapshot)->anyhow::Result<T>)->anyhow::Result<Admission<T>> {
     let roster=AgentManagementStore::open_default()?;
+    // Under the owner admission worker's fence this succeeds (store.rs).
     let Some(_fence)=roster.try_lock_delivery_mutations()? else {return Ok(Admission::Deferred)};
-    let snapshot=roster.snapshot()?;
+    let snapshot=roster.directory_snapshot_shared()?;
     crate::director_address::with_authority_snapshot(&snapshot,||run(&snapshot)).map(Admission::Ready)
 }
 
@@ -85,6 +129,25 @@ pub fn gate(store:&AskStore,session:&str)->anyhow::Result<Gate> {
 pub fn is_paused_in(state:&AskState,roster:&AgentManagementSnapshot,session:&str)->bool {
     state.presence.get(session).is_some_and(|p|p.agent_pause.is_some())
         || super::project_control::is_paused_with_roster(state,session,roster)
+}
+
+/// [`gate`] that rides out a brief authority-fence hold: retries the
+/// non-blocking try for at most ~0.5 s (never blocks on the fence, so a
+/// lifecycle action holding it still defers). A pause or error is final at
+/// once. Used by every one-shot submit/resume check (ACP r266 B3, extended
+/// to native/Claude next-step and resume in r273 stab).
+pub fn gate_bounded(store:&AskStore,session:&str)->anyhow::Result<Gate> {
+    const TRIES: u32 = 25;
+    const STEP: std::time::Duration = std::time::Duration::from_millis(20);
+    for attempt in 1..=TRIES {
+        let gate = gate(store, session)?;
+        if attempt < TRIES && gate == Gate::Deferred {
+            std::thread::sleep(STEP);
+            continue;
+        }
+        return Ok(gate);
+    }
+    unreachable!("the last attempt returns")
 }
 
 /// A transient deferred admission is a hold, not a persisted project pause.

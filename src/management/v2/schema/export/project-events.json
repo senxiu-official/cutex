@@ -57,6 +57,7 @@
         },
         "durationMs": { "type": "integer", "minimum": 0 },
         "toolCalls": { "type": "integer", "minimum": 0 },
+        "turnOrigin": { "enum": ["owner", "external"], "description": "Positive evidence of who started this turn, not later steering or passive notes. Optional: absent on older hosts/journal rows or when unknown; consumers must keep unknown rows visible." },
         "backfilled": { "const": true, "description": "Written by the first-start replay of the retained event log (project = membership at replay time)" }
       }
     },

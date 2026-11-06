@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "calibration": "host-a 2026-11-03 read-all audits, metadata only",
+  "stores": [
+    {
+      "id": "agent_bus",
+      "owner": "management/v2/agent_bus_state",
+      "scope": "recipient + message ID",
+      "stress_bytes": 36700160,
+      "audited_current_json_bytes": 14739440,
+      "rows": 1846,
+      "expected_access": "indexed outstanding IDs / bounded recipient page; no completed payload for queue/list or health",
+      "held_sentinel_rows": 1,
+      "assertion": "one health finding + stuck ID + durable completed content + available private live queue"
+    },
+    {
+      "id": "usage",
+      "owner": "management/v2/usage",
+      "scope": "time range + source + profile",
+      "month_bytes": 167772160,
+      "native_mib": 70,
+      "external_mib": 90,
+      "expected_access": "indexed range aggregate; one selected day/sample while unrelated month rows grow",
+      "assertion": "combined 6 tokens, native/external 3 each, API quota account ca-scale / 30-day 6 tokens"
+    },
+    {
+      "id": "sessions",
+      "owner": "session/store",
+      "scope": "session ID + lifecycle",
+      "active_rows": 166,
+      "expected_access": "shared active list / point lookup / indexed host page; grow only retired rows for --histories",
+      "required_flags": {
+        "agent_enabled": true,
+        "registration_class": "persistent",
+        "exposed_to_backend": true
+      },
+      "assertion": "exact 166 visible IDs + one offline host Agent with scale-project"
+    },
+    {
+      "id": "asks",
+      "owner": "asks/store",
+      "scope": "requester / target / status / revision",
+      "closed_rows": 1000,
+      "open_rows": 4,
+      "approx_hot_json_bytes": 18587425,
+      "expected_access": "ten selected closed rows + answer preview, targeted refresh; immutable answer artifact stays outside hot projection"
+    },
+    {
+      "id": "user_input",
+      "owner": "management/v2/user_input",
+      "scope": "session + client identity",
+      "approx_json_bytes": 1464218,
+      "synthetic_identities_per_session": 60,
+      "expected_access": "one session queue, no unrelated identity parsing",
+      "paused_queue_sentinel_rows": 1
+    },
+    {
+      "id": "roster",
+      "owner": "agent_management/store",
+      "scope": "project / session / action ID",
+      "approx_json_bytes": 4173656,
+      "synthetic_historical_actions": 11500,
+      "expected_access": "shared current roster and keyed receipts",
+      "required_files": [
+        "agent-management-v1.json",
+        "agent-management-v1.lock"
+      ],
+      "timestamp_format": "canonical UTC RFC3339 Z",
+      "managed_agents": 166
+    },
+    {
+      "id": "owner_notify",
+      "owner": "owner_notify/store",
+      "scope": "agent + state + time",
+      "approx_json_bytes": 75671,
+      "synthetic_final_rows": 56,
+      "expected_access": "indexed pending page, no final notification bodies",
+      "pending_sentinel_rows": 1,
+      "assertion": "exact open needsReply sentinel"
+    }
+  ],
+  "small_document_exceptions": [
+    {
+      "id": "synthetic-config",
+      "max_bytes": 4096,
+      "trigger": "configuration/startup only"
+    },
+    {
+      "id": "synthetic-profile-and-account-config",
+      "max_bytes": 16384,
+      "trigger": "profile/quota configuration; no provider credential or network request"
+    }
+  ],
+  "note": "Counts marked synthetic are size calibration choices, not live record counts. SQLite physical file sizes are not decoded heap targets. This manifest documents the gate; it is not a new business repository contract.",
+  "fixture_version": 2
+}

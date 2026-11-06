@@ -398,6 +398,10 @@ pub trait AskRuntime {
     fn relaunch_reviewed(&self, session: &str, requester: &str, ask_id: &str) -> anyhow::Result<()> {
         anyhow::bail!("reviewed relaunch of {session} for {ask_id} is not available (requested by {requester})")
     }
+
+    fn managed_online(&self, _context: crate::agent_management::AutomaticManagedOnline) -> anyhow::Result<()> {
+        anyhow::bail!("automatic managed online is unsupported")
+    }
     /// Reconnect to the live runtime of `session` (never launches; r208).
     /// Implementations rate-limit and run it in the background.
     fn reconnect(&self, session: &str) -> anyhow::Result<()> {
@@ -811,7 +815,7 @@ fn review_pending(world: &dyn SchedulerWorld, store: &AskStore, report: &mut Tic
         .asks
         .values()
         .filter(|ask| ask.remote.is_none() && ask.execution == ExecutionState::PendingReview)
-        .cloned()
+        .map(|ask| (**ask).clone())
         .collect();
     for ask in pending {
         // A handover under review / reconcile (044) decides nothing: it stays
@@ -838,7 +842,7 @@ fn review_pending(world: &dyn SchedulerWorld, store: &AskStore, report: &mut Tic
             continue;
         }
         let reviewed=with_admission_state(world, store, |state, authority, controllers, host| {
-            if routing_pass_in(state, authority, controllers, host, &ask.ask_id, routing_required, false, now) {
+            if routing_admission_in(state, authority, controllers, host, &ask.ask_id, routing_required, false, now) == RoutingAdmission::Pass {
                 apply_review_verdict(state, &ask.ask_id, verdict, now);
                 true
             } else {
@@ -1064,6 +1068,9 @@ pub(crate) fn reconcile_bound(
     report: &mut TickReport,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    if lease.turn_id.is_some() && !matches!(lease.holder, LeaseHolder::Ask { .. }) {
+        return reconcile_bound_input(runtime, store, lease, now);
+    }
     let (Some(turn_id), LeaseHolder::Ask { ask_id, attempt }) = (&lease.turn_id, &lease.holder) else {
         return Ok(());
     };
@@ -1080,15 +1087,20 @@ pub(crate) fn reconcile_bound(
     }
     let status = runtime.target_status(&lease.cutex_session_id);
     if !status.online {
+        // 054 §2.12 (c): offline past the grace makes the lease stale.
+        super::lease_reconcile::offline(store.dir(), lease, now);
         return Ok(());
     }
+    super::lease_reconcile::online(store.dir(), lease);
     let restarted = status.runtime_generation != lease.runtime_generation;
     if !restarted && status.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+        super::lease_reconcile::active_turn(store.dir(), lease);
         return Ok(());
     }
     // Give a just-reserved turn time to show up as active.
     let settled = super::parse_time(&lease.since).is_none_or(|since| now - since > chrono::Duration::seconds(BOUND_SETTLE_SECS));
     if !restarted && !settled {
+        super::lease_reconcile::waiting_turn(store.dir(), lease, "settling");
         return Ok(());
     }
     let state = store.snapshot()?;
@@ -1103,12 +1115,18 @@ pub(crate) fn reconcile_bound(
         store.with_state(|state| { if state.leases.get(&lease.cutex_session_id) == Some(lease) { state.leases.remove(&lease.cutex_session_id); } })?;
         return Ok(());
     }
+    // 054 §2.12 (a): one read of one turn per due check, with backoff.
+    if !super::lease_reconcile::due(store.dir(), lease, now) {
+        return Ok(());
+    }
     match runtime.read_turn(&lease.cutex_session_id, turn_id) {
         Some(turn) if turn.get("status").and_then(Value::as_str) != Some("inProgress") => {
             super::observe::finalize_fenced(store, &lease.cutex_session_id, ask_id, *attempt, &turn, Some(InterruptReason::RuntimeRestart), now, lease)?;
+            super::lease_reconcile::forget(store.dir(), &lease.cutex_session_id);
             report.interrupted.push(ask_id.clone());
         }
-        Some(_) if !restarted => {} // still running per history
+        // Still running per history: check again after the backoff.
+        Some(_) if !restarted => super::lease_reconcile::unproven(store.dir(), lease, now, "turnRunning"),
         _ => {
             // Not in history (never started, or unreadable after restart).
             if !restarted {
@@ -1119,6 +1137,7 @@ pub(crate) fn reconcile_bound(
                         // The bound turn ended before the item reached
                         // context: native dropped it; admitting again is safe.
                         store.with_state(|state| { if state.leases.get(&lease.cutex_session_id) == Some(lease) { refuse_attempt(state, &lease.cutex_session_id, ask_id, *attempt, None, now); } })?;
+                        super::lease_reconcile::forget(store.dir(), &lease.cutex_session_id);
                         report.requeued.push(ask_id.clone());
                         return Ok(());
                     }
@@ -1134,8 +1153,69 @@ pub(crate) fn reconcile_bound(
                 now,
                 lease,
             )?;
+            super::lease_reconcile::forget(store.dir(), &lease.cutex_session_id);
             report.interrupted.push(ask_id.clone());
         }
+    }
+    Ok(())
+}
+
+/// Events and owner inputs have no ask attempt to finalize. Once native
+/// history proves their bound turn ended, retain delivery acknowledgements
+/// and free admission; never put an accepted event back into the outbox.
+fn reconcile_bound_input(
+    runtime: &dyn AskRuntime,
+    store: &AskStore,
+    lease: &AdmissionLease,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let Some(turn_id) = lease.turn_id.as_deref() else { return Ok(()); };
+    if crate::management::v2::model_overload_retry::holds_default(&lease.cutex_session_id, Some(turn_id)) {
+        return Ok(());
+    }
+    let status = runtime.target_status(&lease.cutex_session_id);
+    if !status.online {
+        // 054 §2.12: offline used to mean "never checked" (11-01 bug 2);
+        // past the grace the lease is stale and the owner may release it.
+        super::lease_reconcile::offline(store.dir(), lease, now);
+        return Ok(());
+    }
+    super::lease_reconcile::online(store.dir(), lease);
+    let restarted = status.runtime_generation != lease.runtime_generation;
+    if !restarted && status.active_turn_id.as_deref() == Some(turn_id) {
+        super::lease_reconcile::active_turn(store.dir(), lease);
+        return Ok(());
+    }
+    if super::parse_time(&lease.since).is_some_and(|since|
+        now - since <= chrono::Duration::seconds(BOUND_SETTLE_SECS)) {
+        super::lease_reconcile::waiting_turn(store.dir(), lease, "settling");
+        return Ok(());
+    }
+    if !store.project_snapshot(|state| state.leases.get(&lease.cutex_session_id) == Some(lease))? {
+        return Ok(());
+    }
+    // Runtime IO happens outside AskStore's write lock. The subsequent write
+    // compares the full lease, including generation, message id and turn id.
+    // 054 §2.12 (a): one read of one turn per due check, with backoff.
+    if !super::lease_reconcile::due(store.dir(), lease, now) {
+        return Ok(());
+    }
+    let turn = runtime.read_turn(&lease.cutex_session_id, turn_id);
+    let (ended, result) = match &turn {
+        Some(turn) if turn.get("id").and_then(Value::as_str) != Some(turn_id) => (false, "turnMismatch"),
+        Some(turn) => match turn.get("status").and_then(Value::as_str) {
+            Some("completed" | "failed" | "interrupted") => (true, "turnEnded"),
+            Some("inProgress") => (false, "turnRunning"),
+            _ => (false, "turnMalformed"),
+        },
+        None if restarted => (true, "runtimeRestarted"),
+        None => (false, "turnUnreadable"),
+    };
+    if ended {
+        super::observe::release_bound_input(store, lease, now)?;
+        super::lease_reconcile::forget(store.dir(), &lease.cutex_session_id);
+    } else {
+        super::lease_reconcile::unproven(store.dir(), lease, now, result);
     }
     Ok(())
 }
@@ -1356,22 +1436,49 @@ fn with_admission_state<T: Default>(
         }).map(|result|result.unwrap_or_default()).map_err(|error| anyhow::anyhow!("{error}"))
 }
 
-fn routing_pass_in(
+#[derive(Debug, PartialEq, Eq)]
+enum RoutingAdmission {
+    Pass,
+    Waiting,
+    Ended,
+}
+
+#[cfg(test)]
+#[path = "scheduler_admission_failure_tests.rs"]
+mod admission_failure_tests;
+
+fn routing_admission_in(
     state: &mut AskState, snapshot: &crate::agent_management::AgentManagementSnapshot,
     controllers: &super::routing_policy::integration::ControllerView<'_>,
     host: &str,
     ask_id: &str, required: bool, consume: bool, now: DateTime<Utc>,
-) -> bool {
-    if super::lineage::check_admission(state,host,ask_id).is_err(){return false;}
-    let Some(ask) = state.asks.get(ask_id) else { return false };
-    if snapshot.agents.values().any(|a|a.cutex_session_id.as_str()==ask.target_cutex_session_id
-        &&a.retired_at.is_some()) {return false;}
+) -> RoutingAdmission {
+    if super::lineage::check_admission(state,host,ask_id).is_err(){return RoutingAdmission::Waiting;}
+    let Some(ask) = state.asks.get(ask_id) else { return RoutingAdmission::Waiting };
+    if snapshot.agent_by_session(&ask.target_cutex_session_id).is_some_and(|a|a.retired_at.is_some()) {return RoutingAdmission::Waiting;}
     // Production requires this for historical project asks too. Their missing
     // lineage remains unknown; it never manufactures reviewer-grant evidence.
-    if !required && !has_routing(ask) { return true; }
-    matches!(super::routing_policy::integration::check_admission(state, snapshot, ask_id,
-        host, consume, now,controllers),
-        Ok(super::routing_policy::RouteVerdict::Pass(_)))
+    if !required && !has_routing(ask) { return RoutingAdmission::Pass; }
+    match super::routing_policy::integration::check_admission(state, snapshot, ask_id,
+        host, consume, now,controllers) {
+        Ok(super::routing_policy::RouteVerdict::Pass(_)) => RoutingAdmission::Pass,
+        Ok(super::routing_policy::RouteVerdict::ApprovalRequired) => RoutingAdmission::Waiting,
+        Err(error) => {
+            if super::admission_failure::end(state, ask_id, &error, now) {
+                RoutingAdmission::Ended
+            } else {
+                // Approval denial already has its existing rejected result;
+                // unknown handover/lineage and temporary authority waits must
+                // not be converted into failures of work that may still run.
+                if state.asks.get(ask_id).is_some_and(|ask| !ask.is_open()) {
+                    RoutingAdmission::Ended
+                } else {
+                    eprintln!("asks: routing admission of {ask_id} deferred: {}", error.code);
+                    RoutingAdmission::Waiting
+                }
+            }
+        }
+    }
 }
 
 /// These replies prove nothing was accepted, but root idle status does not
@@ -1411,7 +1518,7 @@ pub fn continuations_of(state: &AskState, target: &str) -> Vec<AskRecord> {
         .asks
         .values()
         .filter(|ask| (ask.remote.is_none() && ask.target_cutex_session_id == target) && ask.resume_pending())
-        .cloned()
+        .map(|ask| (**ask).clone())
         .collect();
     asks.sort_by(|a, b| {
         let key = |ask: &AskRecord| ask.resume.as_ref().map(|resume| resume.since.clone()).unwrap_or_default();
@@ -1425,7 +1532,7 @@ fn target_plan(state: &AskState, target: &str, status: &TargetStatus) -> Option<
     let queued: Vec<AskRecord> = status.admission.as_ref()?.items.iter()
         .filter(|item| item.kind == "ask")
         .filter_map(|item| state.asks.get(&item.id))
-        .cloned()
+        .map(|ask| (**ask).clone())
         .collect();
     // Recompute runtime holds without changing records until the final reason
     // is known, so an unchanged tick does not create transient revisions.
@@ -1437,7 +1544,7 @@ fn target_plan(state: &AskState, target: &str, status: &TargetStatus) -> Option<
     let selected = continuation.map(|ask| ask.ask_id).or_else(|| {
         status.admission.as_ref()?.items.iter().find(|item| match item.kind.as_str() {
             "owner" => item.state == "waiting",
-            "ask" => state.asks.get(&item.id).is_some_and(&eligible),
+            "ask" => state.asks.get(&item.id).is_some_and(|ask| eligible(ask)),
             _ => false,
         }).filter(|item| item.kind == "ask").map(|item| item.id.clone())
     });
@@ -1445,7 +1552,7 @@ fn target_plan(state: &AskState, target: &str, status: &TargetStatus) -> Option<
 }
 
 fn ridealongs_first(state: &AskState, target: &str, status: &TargetStatus, ask_id: &str) -> bool {
-    !state.asks.get(ask_id).is_some_and(AskRecord::resume_pending)
+    !state.asks.get(ask_id).is_some_and(|ask| ask.resume_pending())
         && !crate::management::v2::admission::owner_priority(target)
         && status.admission.as_ref().is_some_and(|order| order.next_step.iter().any(|item| item.eligible))
 }
@@ -1645,7 +1752,7 @@ fn admit(
         }
         if state.asks.get(ask_id).is_none_or(|current|current.revision!=ask.revision
             || controllers.controller(current).ok()!=Some(controller.clone())) {return false;}
-        if !routing_pass_in(state, authority, controllers, host, ask_id, routing_required, true, now) { return false; }
+        if routing_admission_in(state, authority, controllers, host, ask_id, routing_required, true, now) != RoutingAdmission::Pass { return false; }
         state.leases.insert(
             target.to_string(),
             AdmissionLease {
@@ -1659,6 +1766,7 @@ fn admit(
         );
         state.update_ask(ask_id, now, |ask| {
             ask.gate = Some(gate.clone());
+            ask.admission_failure = None;
             let mut record = AttemptRecord::submitting(attempt_n, message_id.clone(), status.runtime_generation, now_rfc3339(now));
             record.event_artifact = Some(event_artifact.clone());
             record.view = Some(ask_view.clone());
@@ -1854,7 +1962,7 @@ fn admit_continuation(
         }
         if !continuation_permitted || state.asks.get(ask_id).is_none_or(|current|current.revision!=ask.revision
             || controllers.controller(current).ok()!=continuation_controller) {return false;}
-        if !routing_pass_in(state, authority, controllers, host, ask_id, routing_required, false, now) { return false; }
+        if routing_admission_in(state, authority, controllers, host, ask_id, routing_required, false, now) != RoutingAdmission::Pass { return false; }
         if let Some(wake_id) = &continuation.bounded_wake_id {
             let Some(current) = state.asks.get(ask_id) else { return false };
             // Rendering and the queue snapshot may have raced a declaration,
@@ -1872,7 +1980,7 @@ fn admit_continuation(
         }
         // Spend only after every continuation gate/CAS passed, immediately
         // before the actual attempt/lease commit. No recursive authority fence.
-        if !routing_pass_in(state, authority, controllers, host, ask_id, routing_required, true, now) {
+        if routing_admission_in(state, authority, controllers, host, ask_id, routing_required, true, now) != RoutingAdmission::Pass {
             if let Some(wake_id) = &continuation.bounded_wake_id {
                 state.update_ask(ask_id, now, |ask| {
                     let _ = ask.bounded_continuation.admission_definitely_refused(wake_id, &message_id);
@@ -2107,7 +2215,7 @@ pub fn event_compaction_reminder_text(state: &AskState, event: &EventOutboxRecor
                 && ask.review == Some(ReviewState::AwaitingAcceptance)
                 && ask.controlled_by(&event.cutex_session_id).unwrap_or(false)
         })
-        .collect();
+        .map(|ask| &**ask).collect();
     awaiting.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.ask_id.cmp(&b.ask_id)));
     if !awaiting.is_empty() {
         text.push_str("Your delegations awaiting your acceptance (review, then delegation_close outcome=accepted, or send a follow-up):\n");
@@ -2449,6 +2557,8 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
         reconcile_submitting(runtime, store, lease, &mut report, now)?;
         reconcile_bound(runtime, store, lease, &mut report, now)?;
     }
+    // 054 §2.12: reconcile states of leases that are gone (memory only).
+    super::lease_reconcile::retain(store.dir(), |session| state.leases.contains_key(session));
     settle_unreachable_stops(world, runtime, store, &mut report, now)?;
     send_compaction_reminders(runtime, store, world.documents().margin_percent, now)?;
     // Await timeouts (and waits met while the turn still ran).
@@ -2500,12 +2610,13 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
         timing.stage(ControlStage::StoreWrite);
         store.with_state(|state| {
             for target in &unblocked {
-                super::wake::clear_owner_action(state, target);
+                super::wake::clear_owner_action(state, target, now);
             }
         })?;
     }
     timing.stage(ControlStage::ContextRead);
     let directory = if targets.is_empty() { None } else { world.directory().ok() };
+    let admission_host = super::routing_policy::integration::local_host_id();
     let mut provenance = None;
     if let Some(last) = scan_cursor(store, None) {
         let start = targets.partition_point(|target| target <= &last);
@@ -2547,6 +2658,30 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
             })?;
             report.failed.extend(ids);
             continue;
+        }
+        // An upgrade intentionally leaves runtimes owner-stopped/offline.
+        // A known closed root cannot become startable by waiting for runtime
+        // readiness. Reuse the normal, fresh routing check before pause/wake
+        // gates, without launching anything or rewriting an unrelated input.
+        // Healthy queues take no extra authority/store transaction here.
+        let closed_roots: Vec<_> = by_target[&target].iter().filter(|id| {
+            state.asks.get(*id).and_then(|ask| ask.routing_request.as_ref())
+                .and_then(|request| request.root.as_ref())
+                .is_some_and(|root| root.host_id() == admission_host
+                    && state.asks.get(root.id()).is_some_and(|ask| !ask.is_open()))
+        }).cloned().collect();
+        if !closed_roots.is_empty() {
+            let ended = with_admission_state(world, store, |state, authority, controllers, host| {
+                closed_roots.iter().filter(|id| {
+                    routing_admission_in(state, authority, controllers, host, id, true, false, now)
+                        == RoutingAdmission::Ended
+                }).cloned().collect::<Vec<_>>()
+            })?;
+            report.failed.extend(ended);
+            let pending = store.project_snapshot(|state| by_target[&target].iter().any(|id|
+                state.asks.get(id).is_some_and(|ask| ask.is_open()
+                    && (ask.execution == ExecutionState::Queued || ask.resume_pending()))))?;
+            if !pending { continue; } // No runtime probe/reconnect solely for work just ended.
         }
         if paused_target(store, &state, &target, &by_target[&target], now)? {
             report.paused_targets_skipped += 1;
@@ -2603,7 +2738,7 @@ pub fn tick(world: &dyn SchedulerWorld, runtime: &dyn AskRuntime, store: &AskSto
             }
             if status.online && state.owner_action.contains_key(&target) {
                 timing.stage(ControlStage::StoreWrite);
-                store.with_state(|state| super::wake::clear_owner_action(state, &target))?;
+                store.with_state(|state| super::wake::clear_owner_action(state, &target, now))?;
             }
             if !status.online && status.reconnectable {
                 timing.stage(ControlStage::Dispatch);
@@ -2639,16 +2774,18 @@ fn reserve_auto_wake(
         if current.revision!=head.revision || current.target_cutex_session_id!=target
             || !(current.execution==ExecutionState::Queued||current.resume_pending())
             || controllers.controller(current).ok()!=expected_controller
-            || authority.agents.values().any(|a|a.cutex_session_id.as_str()==target&&a.retired_at.is_some())
+            || authority.agent_by_session(target).is_some_and(|a|a.retired_at.is_some())
             || state.pauses.contains_key(target)||super::agent_pause::is_paused(state,target)
             || state.leases.contains_key(target)||super::wake::recently_woken(state,target,now)
             || (matches!(expected_controller,Some(Some(_)))&&state.owner_offline.contains(target)) {
             return false;
         }
-        let running=state.woken.iter().filter(|(session,(woken_domain,_))|woken_domain==domain
-            &&state.presence.get(*session).is_some_and(|p|p.online)).count();
+        let running=super::wake::runtime_budget_used(state,domain,&|session|
+            state.presence.get(session).is_some_and(|p|p.online))
+            - usize::from(state.woken.get(target).is_some_and(|(d,_)|d==domain)
+                && super::wake::pending_wake(state,target).is_some());
         if running>=online_budget {return false;}
-        if !routing_pass_in(state,authority,controllers,host,&head.ask_id,routing_required,false,now) {return false;}
+        if routing_admission_in(state,authority,controllers,host,&head.ask_id,routing_required,false,now) != RoutingAdmission::Pass {return false;}
         super::wake::record_wake(state,target,domain,now);
         state.update_ask(&head.ask_id,now,|ask|ask.hold=Some(Hold::Blocked{by:BlockedReason::RuntimeDown}));
         true
@@ -2687,7 +2824,7 @@ fn maybe_wake(
                 .filter_map(|item| state.asks.get(&item.id))
                 .filter(|ask| ask.execution == ExecutionState::Queued || ask.resume_pending())
                 .filter(|ask| matches!(ask.hold, Some(Hold::Blocked { by: BlockedReason::RuntimeDown | BlockedReason::Budget })))
-                .cloned()
+                .map(|ask| (**ask).clone())
                 .collect()
         })
         .unwrap_or_default();
@@ -2719,6 +2856,7 @@ fn maybe_wake(
             if !reserve_auto_wake(world,store,target,&head,&domain,limits.agent_started_online_per_domain,now)? {return Ok(());}
             report.waits.insert(target.into(), "runtimeStarting".into());
             if let Err(error) = runtime.wake(target) {
+                store.with_state(|state| super::wake::finish_wake(state,target,&super::now_rfc3339(now)))?;
                 eprintln!("asks: auto-wake of {target} failed: {error:#}");
             }
         }
@@ -2726,7 +2864,20 @@ fn maybe_wake(
             if !reserve_auto_wake(world,store,target,&head,&domain,limits.agent_started_online_per_domain,now)? {return Ok(());}
             report.waits.insert(target.into(), "reviewedRelaunch".into());
             if let Err(error) = runtime.relaunch_reviewed(target, &requester, &head.ask_id) {
+                store.with_state(|state| super::wake::finish_wake(state,target,&super::now_rfc3339(now)))?;
                 eprintln!("asks: reviewed relaunch of {target} for {requester} failed: {error:#}");
+            }
+        }
+        super::wake::WakeDecision::ManagedOnline { domain, requester } => {
+            if !reserve_auto_wake(world,store,target,&head,&domain,limits.agent_started_online_per_domain,now)? {return Ok(());}
+            report.waits.insert(target.into(), "managedOnline".into());
+            let context = crate::agent_management::AutomaticManagedOnline {
+                ask_id: head.ask_id.clone(), target: target.into(), controller: requester,
+                reserved_at: super::now_rfc3339(now),
+            };
+            if let Err(error) = runtime.managed_online(context.clone()) {
+                store.with_state(|state| super::wake::finish_wake(state,target,&context.reserved_at))?;
+                eprintln!("asks: automatic managed online of {target} failed: {error:#}");
             }
         }
         super::wake::WakeDecision::OverBudget { domain } => {
@@ -2736,7 +2887,8 @@ fn maybe_wake(
         super::wake::WakeDecision::Never(reason) => {
             report.waits.insert(target.into(), reason.into());
             // The owner paused it (and is told by the pause) or archived it
-            // (the tick fails those asks); otherwise only the owner can help.
+            // (the tick fails those asks); other real refusals explain the
+            // explicit owner/authorized-manager start options.
             let known = state.owner_action.get(target);
             let all_known = state
                 .waiting_for_target(target)
@@ -2858,7 +3010,7 @@ pub(crate) mod tests {
                     state.leases.insert(lease.cutex_session_id.clone(), lease.clone());
                     leases.push(lease);
                 }
-                state.asks.insert(ask.ask_id.clone(), ask);
+                state.asks.insert(ask.ask_id.clone(), ask.into());
             }
             leases
         }).unwrap();
@@ -3016,6 +3168,7 @@ pub(crate) mod tests {
 
     #[derive(Default)]
     pub struct FakeRuntime {
+        pub managed_wakes: RefCell<Vec<crate::agent_management::AutomaticManagedOnline>>,
         pub result_context: RefCell<BTreeMap<String, crate::asks::result_coalescing::Context>>,
         pub status: RefCell<BTreeMap<String, TargetStatus>>,
         pub target_probes: RefCell<Vec<String>>,
@@ -3128,6 +3281,10 @@ pub(crate) mod tests {
         fn relaunch_reviewed(&self, session: &str, requester: &str, ask_id: &str) -> anyhow::Result<()> {
             self.relaunches.borrow_mut().push((session.to_string(), requester.to_string()));
             self.relaunch_asks.borrow_mut().push(ask_id.to_string());
+            Ok(())
+        }
+        fn managed_online(&self, context: crate::agent_management::AutomaticManagedOnline) -> anyhow::Result<()> {
+            self.managed_wakes.borrow_mut().push(context);
             Ok(())
         }
         fn reconnect(&self, session: &str) -> anyhow::Result<()> {
@@ -4245,6 +4402,162 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(store_dir);
     }
 
+    #[test]
+    fn missed_event_completion_releases_lease_without_redelivery() {
+        for restarted in [false, true] {
+            let (world, dir) = world("missed-event-end");
+            let (store, store_dir) = temp_store("missed-event-end");
+            let runtime = FakeRuntime::idle(&[TARGET]);
+            let now = Utc::now();
+            let delivery = queued_answer(&store, "missed-answer", now);
+            tick(&world, &runtime, &store, now).unwrap();
+            let lease = store.snapshot().unwrap().leases[TARGET].clone();
+            let LeaseHolder::Event { event_id } = &lease.holder else { panic!("event lease expected") };
+            let owner = queued_owner(&store, "waiting-owner");
+            let queue = store.queue_repository().unwrap();
+            assert!(!owner_may_flush(&store.snapshot().unwrap(), TARGET, &queue.admission(TARGET).unwrap(), Some(&owner.queue_id)));
+            runtime.set(TARGET, |status| {
+                status.active_turn_id = None;
+                if restarted { status.runtime_generation += 1; }
+            });
+            if !restarted {
+                runtime.turns.borrow_mut().insert(lease.turn_id.clone().unwrap(),
+                    json!({"id":lease.turn_id,"status":"completed","items":[]}));
+            }
+            tick(&world, &runtime, &store, now + chrono::Duration::seconds(BOUND_SETTLE_SECS + 1)).unwrap();
+            let state = store.snapshot().unwrap();
+            assert!(!state.leases.contains_key(TARGET), "missed completion must release the event lease");
+            assert!(state.events[event_id].acknowledged);
+            assert_eq!(state.deliveries[&delivery].state, DeliveryState::Acknowledged);
+            assert!(owner_may_flush(&state, TARGET, &queue.admission(TARGET).unwrap(), Some(&owner.queue_id)));
+            // The owner admission is now permitted, and later scheduler passes
+            // must never submit the old, already delivered results a second time.
+            tick(&world, &runtime, &store, now + chrono::Duration::minutes(2)).unwrap();
+            assert_eq!(runtime.submitted.borrow().len(), 1);
+            for path in [dir, store_dir] { let _ = std::fs::remove_dir_all(path); }
+        }
+    }
+
+    #[test]
+    fn missed_owner_completion_releases_bound_lease() {
+        for restarted in [false, true] {
+        let (world, dir) = world("missed-owner-end");
+        let (store, store_dir) = temp_store("missed-owner-end");
+        let runtime = FakeRuntime::idle(&[TARGET]);
+        let now = Utc::now();
+        store.with_state(|state| {
+            state.leases.insert(TARGET.into(), AdmissionLease {
+                cutex_session_id: TARGET.into(), holder: LeaseHolder::Owner,
+                native_message_id: "owner-old".into(), runtime_generation: 1,
+                turn_id: Some("owner-turn".into()), since: now_rfc3339(now),
+            });
+        }).unwrap();
+        if restarted {
+            runtime.set(TARGET, |status| status.runtime_generation += 1);
+        } else {
+            runtime.turns.borrow_mut().insert("owner-turn".into(), json!({"id":"owner-turn","status":"completed"}));
+        }
+        tick(&world, &runtime, &store, now + chrono::Duration::seconds(BOUND_SETTLE_SECS + 1)).unwrap();
+        assert!(store.snapshot().unwrap().leases.is_empty());
+        for path in [dir, store_dir] { let _ = std::fs::remove_dir_all(path); }
+        }
+    }
+
+    /// r273 stab, 054 §2.12: a bound lease whose history still shows the
+    /// turn running is re-examined every pass, but its turn is read only
+    /// when due: backoff 5 s → 10 → 20 → 60 s, stale after 10 checks.
+    #[test]
+    fn running_bound_history_is_not_reread_every_pass() {
+        for holder in [LeaseHolder::Owner, LeaseHolder::Event { event_id: "event".into() }] {
+            let (store, dir) = temp_store("bound-read-throttle");
+            let runtime = FakeRuntime::idle(&[TARGET]);
+            let now = Utc::now();
+            let lease = AdmissionLease {
+                cutex_session_id: TARGET.into(), holder: holder.clone(), native_message_id: "throttled-input".into(),
+                runtime_generation: 1, turn_id: Some("still-running".into()), since: now_rfc3339(now),
+            };
+            store.with_state(|state| { state.leases.insert(TARGET.into(), lease.clone()); }).unwrap();
+            runtime.turns.borrow_mut().insert("still-running".into(), json!({"id":"still-running","status":"inProgress"}));
+            let read_at = |at: DateTime<Utc>| {
+                let flag = std::rc::Rc::new(std::cell::Cell::new(false));
+                let seen = flag.clone();
+                *runtime.read_turn_hook.borrow_mut() = Some(Box::new(move || seen.set(true)));
+                reconcile_bound(&runtime, &store, &lease, &mut TickReport::default(), at).unwrap();
+                runtime.read_turn_hook.borrow_mut().take();
+                flag.get()
+            };
+            let first = now + chrono::Duration::seconds(BOUND_SETTLE_SECS + 1);
+            // Switch off: r273.1's fixed 15 s spacing, unchanged.
+            let legacy: Vec<i64> = crate::asks::lease_reconcile::with_contract(false, || {
+                (0..61).filter(|offset| read_at(first + chrono::Duration::seconds(*offset))).collect()
+            });
+            assert_eq!(legacy, [0, 15, 30, 45, 60]);
+            crate::asks::lease_reconcile::forget(store.dir(), TARGET);
+            let first = first + chrono::Duration::seconds(100);
+            // 054: pass every second for 10 minutes; record when history was read.
+            let reads: Vec<i64> = crate::asks::lease_reconcile::with_contract(true, || {
+                (0..600).filter(|offset| read_at(first + chrono::Duration::seconds(*offset))).collect()
+            });
+            assert_eq!(&reads[..6], &[0, 5, 15, 35, 95, 155], "backoff 5 → 10 → 20 → 60 s");
+            assert!(reads.windows(2).all(|pair| pair[1] - pair[0] <= 60));
+            assert!(reads.len() <= 15, "{} reads in 10 minutes", reads.len());
+            let reconcile = crate::asks::lease_reconcile::view(store.dir(), &lease).expect("reconcile state");
+            assert_eq!(reconcile.state.as_str(), "stale", "10 unproven checks");
+            assert_eq!(reconcile.last_result.as_deref(), Some("turnRunning"));
+            assert_eq!(store.snapshot().unwrap().leases.get(TARGET), Some(&lease), "running history keeps the lease");
+            // Offline: never read, stale once past the grace.
+            runtime.set(TARGET, |status| status.online = false);
+            let offline = first + chrono::Duration::seconds(700);
+            assert!(!read_at(offline));
+            assert!(!read_at(offline + chrono::Duration::seconds(crate::asks::lease_reconcile::LEASE_OFFLINE_GRACE_SECS)));
+            assert!(crate::asks::lease_reconcile::is_stale(store.dir(), &lease));
+            runtime.set(TARGET, |status| status.online = true);
+            crate::asks::lease_reconcile::forget(store.dir(), TARGET);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn bound_input_reconciliation_keeps_live_uncertain_and_replaced_leases() {
+        for holder in [LeaseHolder::Owner, LeaseHolder::Event { event_id: "event".into() }] {
+            for case in ["active", "offline", "settling", "restart-settling", "unknown", "running-history", "wrong-turn", "malformed", "replaced"] {
+                let (store, dir) = temp_store("bound-input-keep");
+                let runtime = FakeRuntime::idle(&[TARGET]);
+                let now = Utc::now();
+                let lease = AdmissionLease {
+                    cutex_session_id: TARGET.into(), holder: holder.clone(), native_message_id: "old-input".into(),
+                    runtime_generation: 1, turn_id: Some("old-turn".into()), since: now_rfc3339(now),
+                };
+                store.with_state(|state| { state.leases.insert(TARGET.into(), lease.clone()); }).unwrap();
+                runtime.turns.borrow_mut().insert("old-turn".into(), json!({"id":"old-turn","status":"completed"}));
+                let later = now + chrono::Duration::seconds(BOUND_SETTLE_SECS + 1);
+                match case {
+                    "active" => runtime.set(TARGET, |s| s.active_turn_id = Some("old-turn".into())),
+                    "offline" => runtime.set(TARGET, |s| s.online = false),
+                    "restart-settling" => runtime.set(TARGET, |s| s.runtime_generation += 1),
+                    "unknown" => { runtime.turns.borrow_mut().clear(); },
+                    "running-history" => {
+                        runtime.set(TARGET, |s| s.runtime_generation += 1);
+                        runtime.turns.borrow_mut().insert("old-turn".into(), json!({"id":"old-turn","status":"inProgress"}));
+                    },
+                    "wrong-turn" => { runtime.turns.borrow_mut().insert("old-turn".into(), json!({"id":"other","status":"completed"})); },
+                    "malformed" => { runtime.turns.borrow_mut().insert("old-turn".into(), json!({"id":"old-turn"})); },
+                    "replaced" => {
+                        let concurrent_store = store.clone();
+                        *runtime.read_turn_hook.borrow_mut() = Some(Box::new(move || {
+                            concurrent_store.with_state(|state| state.leases.get_mut(TARGET).unwrap().native_message_id = "replacement".into()).unwrap();
+                        }));
+                    },
+                    _ => {},
+                }
+                reconcile_bound(&runtime, &store, &lease, &mut TickReport::default(), if case.ends_with("settling") { now } else { later }).unwrap();
+                let current = store.snapshot().unwrap().leases[TARGET].clone();
+                assert_eq!(current.native_message_id, if case == "replaced" { "replacement" } else { "old-input" }, "{case}");
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
     /// Acceptance §12.3 item 4 (crash windows, fake runtime): after a
     /// runtime restart a completed turn is captured from history, a missing
     /// one ends interrupted(runtimeRestart); a held item ends
@@ -4354,6 +4667,48 @@ pub(crate) mod tests {
         assert_eq!(runtime.wakes.borrow().len(), 1, "owner-stopped targets are never woken");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[test]
+    fn automatic_managed_upgrade_wakes_reserve_budget_before_presence_and_emit_no_question() {
+        let (mut world, dir) = world("managed-upgrade-batch");
+        let targets: Vec<String> = (0..10).map(|i|format!("cutex.upgraded-{i}")).collect();
+        let mut rows = vec![(REQUESTER,"Eva",Some("alpha"))];
+        rows.extend(targets.iter().map(|id|(id.as_str(),id.as_str(),Some("alpha"))));
+        world.directory = directory(&rows);
+        world.facts = vec![crate::asks::children::AgentFacts {
+            cutex_session_id: REQUESTER.into(), project: Some("alpha".into()), director:true,
+            ..Default::default()
+        }];
+        world.facts.extend(targets.iter().map(|target|crate::asks::children::AgentFacts {
+            cutex_session_id: target.clone(), project: Some("alpha".into()),
+            created_by:Some(REQUESTER.into()), explicit_launch:true, reviewed_relaunch:false,
+            managed_online_by:vec![REQUESTER.into()], ..Default::default()
+        }));
+        let (store, store_dir) = temp_store("managed-upgrade-batch");
+        let runtime = FakeRuntime::default();
+        let now = Utc::now();
+        store.with_state(|state|for (i,target) in targets.iter().enumerate() {
+            let mut ask = new_ask(&format!("upgrade-{i}"),"work");
+            ask.target_cutex_session_id = target.clone();
+            state.create_ask(ask,now).unwrap();
+        }).unwrap();
+        tick(&world,&runtime,&store,now).unwrap();
+        assert_eq!(runtime.managed_wakes.borrow().len(),6,"pending starts occupy the six runtime slots");
+        tick(&world,&runtime,&store,now).unwrap();
+        assert_eq!(runtime.managed_wakes.borrow().len(),6);
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.presence.values().filter(|p|p.wake_pending.is_some()).count(),6);
+        assert!(state.questions.is_empty());
+        assert!(state.owner_action.is_empty());
+        assert!(!state.notices.iter().any(|n|n.method==crate::asks::wake::OWNER_ACTION_EVENT));
+        // A slow/lost transport retains its slot beyond the retry interval.
+        // Each target may retry its own reservation, never allocate a seventh.
+        tick(&world,&runtime,&store,now+chrono::Duration::minutes(3)).unwrap();
+        assert_eq!(runtime.managed_wakes.borrow().len(),12);
+        assert_eq!(store.snapshot().unwrap().presence.values().filter(|p|p.wake_pending.is_some()).count(),6);
+        let _=std::fs::remove_dir_all(dir);
+        let _=std::fs::remove_dir_all(store_dir);
     }
 
     /// Owner approval 2026-10-14: the Director's delegation starts its
@@ -4570,7 +4925,8 @@ pub(crate) mod tests {
         let submitted = runtime.submitted.borrow();
         let (session, event) = submitted.last().unwrap();
         assert_eq!(session, REQUESTER);
-        assert!(event.text.contains("blockedOwnerAction") && event.text.contains("only the owner"), "{}", event.text);
+        assert!(event.text.contains("blockedOwnerAction") && event.text.contains("authorized project manager")
+            && event.text.contains("member_runtime"), "{}", event.text);
         drop(submitted);
         // Later ticks: no second item, no second notice.
         let turn = store.snapshot().unwrap().leases[REQUESTER].turn_id.clone().unwrap();
@@ -4616,7 +4972,7 @@ pub(crate) mod tests {
         let submitted = runtime.submitted.borrow();
         let (session, event) = submitted.last().unwrap();
         assert_eq!(session, REQUESTER);
-        assert!(event.text.contains("is now ownerStopped") && event.text.contains("The owner stopped the turn"), "{}", event.text);
+        assert!(event.text.contains("is now ownerStopped") && event.text.contains("stopped by the owner or a host upgrade"), "{}", event.text);
         drop(submitted);
         // A requester stop is not an owner stop.
         let (store2, dir2) = temp_store("owner-stop2");

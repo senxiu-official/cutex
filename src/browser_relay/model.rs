@@ -25,8 +25,9 @@ impl RelayError {
                 "request_conflict"
                 | "stale_connection"
                 | "lease_conflict"
-                | "request_result_not_retained" => 409,
-                "busy" | "browser_unavailable" | "idempotency_capacity_exceeded" => 503,
+                | "request_result_not_retained"
+                | "script_running" => 409,
+                "busy" | "browser_unavailable" | "idempotency_capacity_exceeded" | "script_runtime_unavailable" => 503,
                 "message_too_large" => 413,
                 _ => 400,
             },
@@ -48,6 +49,7 @@ impl RelayError {
             "target_closed" => "target_closed",
             "lease_revoked" => "lease_revoked",
             "lease_ended_desktop_restarted" => "lease_ended_desktop_restarted",
+            "lease_ended_turn_end" => "lease_ended_turn_end",
             "target_hidden" => "target_hidden",
             "scope_unsupported" => "scope_unsupported",
             "scope_invalid" => "scope_invalid",
@@ -217,10 +219,64 @@ pub fn safe_url(raw: &str) -> String {
         String::new()
     }
 }
+/// A page's link target / image source for the model (browser-page-links-v1):
+/// http(s) only, no credentials or fragment, and no query parameter whose
+/// name looks secret (the desktop's display rule); other parameters stay,
+/// since a product link without its `id` leads nowhere.
+pub fn link_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return String::new();
+    };
+    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+        return String::new();
+    }
+    url.set_fragment(None);
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(name, _)| !secret_query_name(name))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if kept.is_empty() {
+        url.set_query(None);
+    } else {
+        url.query_pairs_mut().clear().extend_pairs(kept);
+    }
+    let value = url.to_string();
+    if value.len() <= 4096 {
+        value
+    } else {
+        String::new()
+    }
+}
+/// The desktop's `browserDisplayUrl` secret-key rule: camelCase split to
+/// snake, then any token-like word as a whole `-`/`_` separated part.
+fn secret_query_name(name: &str) -> bool {
+    let mut snake = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            snake.push('_');
+        }
+        snake.push(c.to_ascii_lowercase());
+    }
+    let parts: Vec<&str> = snake.split(['-', '_']).collect();
+    const WORDS: [&str; 20] = ["token", "auth", "authorization", "password", "passwd", "secret", "signature", "sig", "jwt", "bearer",
+        "otp", "credential", "key", "code", "ticket", "session", "sessionid", "apikey", "accesstoken", "refreshtoken"];
+    parts.iter().any(|p| WORDS.contains(p))
+        || parts.windows(2).any(|w| matches!((w[0], w[1]), ("access" | "refresh" | "id", "token") | ("api", "key")))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn link_urls_keep_ordinary_parameters_only() {
+        assert_eq!(link_url("https://item.example.com/item.htm?id=7&spm=a.b#x"), "https://item.example.com/item.htm?id=7&spm=a.b");
+        assert_eq!(link_url("https://e.com/p?accessToken=1&x_sig=2&apiKey=3&session_id=4&q=ok"), "https://e.com/p?q=ok");
+        assert_eq!(link_url("https://e.com/p?token=1"), "https://e.com/p");
+        for bad in ["javascript:alert(1)", "https://u:p@e.com/", "file:///c:/x", "data:image/png;base64,AA"] {
+            assert_eq!(link_url(bad), "", "{bad}");
+        }
+    }
     #[test]
     fn strict_wire_and_display() {
         assert!(parse::<Empty>(br#"{"key":"secret"}"#).is_err());

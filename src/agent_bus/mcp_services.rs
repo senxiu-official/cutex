@@ -41,7 +41,7 @@ fn command_schema() -> Value {
 
 pub(super) fn tools() -> Vec<Value> {
     vec![
-        json!({"name":REGISTER,"description":"Register a web server or static HTML report (dev server, preview, API, docs) so the owner can find, open and monitor it. Do this instead of picking a random port: omit `port` and cutex allocates a free one and returns it, then start your server on that port, bound to 127.0.0.1 (managed commands get PORT and HOST=127.0.0.1). With runtime `external` (default) you run the process and cutex only health-checks it; with `managed` cutex runs `command`, restarts it on crashes, and starts it again when the owner opens it after a stop. To show the owner a single page, chart or picture, publish it with artifact_publish show: true instead (it opens beside your conversation); services are for real servers and multi-file sites. A static service serves an absolute root (directory or .html file, no port/command/env): a root inside your cwd or project workspace needs nothing; any other existing root outside the cutex home needs the owner's approval (approval_required, one approval together with a persistent lifetime); the cutex home (except your own cutex-made scratch cwd), filesystem roots and the user home itself are always refused. The request is fully validated before any approval is asked, so fix static_root_forbidden / invalid errors first. Vite commands must use --port {port} --strictPort. New services default to ephemeral and are reclaimed after idle/TTL or owner archive; `idle_ttl_minutes` may request a longer idle window up to the host's maximum. Persistent may need owner approval and may suggest `purpose` foreground/background; the owner can reorganize it later. Link the returned cutex:service/ link. reveal requests an owner notification. Re-registering your own slug updates it while preserving owner organization. Unregister it when the service is gone for good. `tile` / `tile_path` give it a tile. A `managed` command runs outside your sandbox, so unless you already run with full access and approval `never` it needs the owner's approval: the call waits up to 2 minutes for the owner's decision and then proceeds (or answers approval_denied); if the owner has not decided by then it answers `approval_required` with an approval_id: retry the same call after the owner approves (end your turn or set an alarm instead of polling).","inputSchema":{"type":"object","properties":{
+        json!({"name":REGISTER,"description":"Register a web server or static HTML report (dev server, preview, API, docs) so the owner can find, open and monitor it. Do this instead of picking a random port: omit `port` and cutex allocates a free one and returns it, then start your server on that port, bound to 127.0.0.1 (managed commands get PORT and HOST=127.0.0.1). With runtime `external` (default) you run the process and cutex only health-checks it; with `managed` cutex runs `command`, restarts it on crashes, and starts it again when the owner opens it after a stop. To show the owner a single page, chart or picture, publish it with artifact_publish show: true instead (it opens beside your conversation); services are for real servers and multi-file sites. A static service serves an absolute root (directory or .html file, no port/command/env): a root inside your cwd or project workspace needs nothing; any other existing root outside the cutex home needs the owner's approval (approval_required, one approval together with a persistent lifetime); the cutex home (except your own cutex-made scratch cwd), filesystem roots and the user home itself are always refused. The request is fully validated before any approval is asked, so fix static_root_forbidden / invalid errors first. Vite commands must use --port {port} --strictPort. New services default to ephemeral and are reclaimed after idle/TTL or owner archive; persistent managed services may set idle_stop_preset (1h/24h/7d/forever, new default 24h), preserving registration and port when idle. Proxy traffic and viewing leases count as use; health/tile probes and direct-port traffic do not. Only proxy visits wake an idle stop: use forever for direct-port-only services or always-needed backends. `idle_ttl_minutes` may request a longer idle window up to the host's maximum. Persistent may need owner approval and may suggest `purpose` foreground/background; the owner can reorganize it later. Link the returned cutex:service/ link. reveal requests an owner notification. Re-registering your own slug updates it while preserving owner organization. Unregister it when the service is gone for good. `tile` / `tile_path` give it a tile. A `managed` command runs outside your sandbox, so unless you already run with full access and approval `never` it needs the owner's approval: the call waits up to 2 minutes for the owner's decision and then proceeds (or answers approval_denied); if the owner has not decided by then it answers `approval_required` with an approval_id: retry the same call after the owner approves (end your turn or set an alarm instead of polling).","inputSchema":{"type":"object","properties":{
             "slug":{"type":"string","description":"Stable id, unique on this host: a-z, 0-9 and '-', e.g. `myapp-web`."},
             "display_name":{"type":"string","description":"Human name; defaults to the slug."},
             "reveal":{"type":"boolean","description":"Request that the owner see this page (rate limited)."},
@@ -51,6 +51,7 @@ pub(super) fn tools() -> Vec<Value> {
             "root":{"type":"string","description":"Absolute static directory or .html file. Inside your cwd or project workspace: no approval; elsewhere (outside the cutex home, not a filesystem root or the user home): owner approval."},
             "lifetime":{"type":"string","enum":["ephemeral","persistent"]},
             "purpose":{"type":"string","enum":["foreground","background"],"description":"Optional hint for a persistent service only. Foreground is something the owner opens or uses; background is infrastructure."},
+            "idle_stop_preset":{"type":"string","enum":["1h","24h","7d","forever"],"description":"Persistent managed only. New services default to 24h; idle stops the process but preserves registration and port. Proxy visits wake it. Direct port traffic cannot wake or renew it; use forever for direct-port-only services or always-needed backends."},
             "idle_ttl_minutes":{"type":"integer","minimum":5,"description":"Ephemeral idle TTL to request, in minutes. The host refuses values above its configured maximum."},
             "command":command_schema(),
             "cwd":{"type":"string","description":"Absolute working directory for managed."},
@@ -67,6 +68,7 @@ pub(super) fn tools() -> Vec<Value> {
             "runtime":{"type":"string","enum":["external","managed","static"]},
             "root":{"type":"string","description":"Absolute static directory or .html file. Inside your cwd or project workspace: no approval; elsewhere (outside the cutex home, not a filesystem root or the user home): owner approval."},
             "lifetime":{"type":"string","enum":["ephemeral","persistent"]},
+            "idle_stop_preset":{"type":"string","enum":["1h","24h","7d","forever"],"description":"Persistent managed only. New services default to 24h; idle stops the process but preserves registration and port. Proxy visits wake it. Direct port traffic cannot wake or renew it; use forever for direct-port-only services or always-needed backends."},
             "idle_ttl_minutes":{"type":"integer","minimum":5,"description":"Ephemeral idle TTL to request, in minutes. The host refuses values above its configured maximum."},
             "command":command_schema(),
             "cwd":{"type":["string","null"]},
@@ -75,15 +77,17 @@ pub(super) fn tools() -> Vec<Value> {
             "tile_path":tile_path_schema(true),
             "scope":scope_schema(true)
         },"required":["slug"],"additionalProperties":false}}),
-        json!({"name":RESTART,"description":"Restart a managed service you registered (e.g. after editing its code) with its unchanged command, cwd and env. No owner approval: the approval that let the command run covers its restarts. The call returns once the restart is requested; cutex stops the running process and starts it again about a second later (check service_list for health and process.startedAt). Refused for external and static services (not_managed: restart your own process) and for a service the owner stopped (service_stopped: only the owner starts it again). To change what it runs, use service_update instead (it restarts the service itself). Only services you manage (service_list youMayManage).","inputSchema":{"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"],"additionalProperties":false}}),
+        json!({"name":RESTART,"description":"Restart a managed service you registered (e.g. after editing its code), or wake it from idle sleep, with its unchanged command, cwd and env. No owner approval: the approval that let the command run covers its restarts. The call returns once the restart is requested; cutex stops the running process and starts it again about a second later (check service_list for health and process.startedAt). Refused for external and static services (not_managed: restart your own process) and for a service the owner stopped (service_stopped: only the owner starts it again). To change what it runs, use service_update instead (it restarts the service itself). Only services you manage (service_list youMayManage).","inputSchema":{"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"],"additionalProperties":false}}),
         json!({"name":UNREGISTER,"description":"Remove a service you manage (managed ones are stopped): your own, or a project service you manage (service_list youMayManage). Removing a persistent project service another agent registered needs the owner's confirmation (waits like other approvals, else approval_required).","inputSchema":{"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"],"additionalProperties":false}}),
-        json!({"name":LIST,"description":"List web services you may use, with lifetime, cutex:service/ link, port, URL and health (reachable/unreachable/starting/stopped): your own, your project's (outside a project: those of the cutex agents you created and the ones they created; native subagents are not cutex agents) and the owner's shared ones. Each has ownerScope (session: managed by its registrant; project: also by the project's current Director) and youMayManage (whether you may update, restart or unregister it). Command, cwd and env keys are shown only for services you may manage. Check it before starting a server to reuse an existing one.","inputSchema":{"type":"object","properties":{"mine":{"type":"boolean","description":"Only services you registered."}},"required":[],"additionalProperties":false}}),
+        json!({"name":LIST,"description":"List web services you may use, with lifetime, cutex:service/ link, port, URL and health (reachable/unreachable/starting/stopped/stoppedIdle): your own, your project's (outside a project: those of the cutex agents you created and the ones they created; native subagents are not cutex agents) and the owner's shared ones. Each has ownerScope (session: managed by its registrant; project: also by the project's current Director) and youMayManage (whether you may update, restart or unregister it). Command, cwd and env keys are shown only for services you may manage. Persistent managed views include idleStopPreset, lastTrafficAt, idleStopAt and stoppedIdleAt. Idle sleep keeps the registration and port; proxy traffic wakes it, but direct port access cannot wake it or count as use. Use forever for direct-port-only services. Check it before starting a server to reuse an existing one.","inputSchema":{"type":"object","properties":{"mine":{"type":"boolean","description":"Only services you registered."}},"required":[],"additionalProperties":false}}),
     ]
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolArgs {
+    #[serde(default)]
+    idle_stop_preset: Option<String>,
     #[serde(default)]
     slug: Option<String>,
     #[serde(default)]
@@ -151,7 +155,7 @@ pub(super) fn request_body(name: &str, args: Value) -> anyhow::Result<Value> {
                 && parsed.root.is_none()
                 && parsed.lifetime.is_none()
                 && parsed.purpose.is_none()
-                && parsed.idle_ttl_minutes.is_none()
+                && parsed.idle_ttl_minutes.is_none() && parsed.idle_stop_preset.is_none()
                 && parsed.reveal.is_none()
                 && parsed.tile.is_none()
                 && parsed.tile_path.is_none()
@@ -181,7 +185,7 @@ pub(super) fn request_body(name: &str, args: Value) -> anyhow::Result<Value> {
                 && parsed.root.is_none()
                 && parsed.lifetime.is_none()
                 && parsed.purpose.is_none()
-                && parsed.idle_ttl_minutes.is_none()
+                && parsed.idle_ttl_minutes.is_none() && parsed.idle_stop_preset.is_none()
                 && parsed.reveal.is_none()
                 && parsed.tile.is_none()
                 && parsed.tile_path.is_none()
@@ -208,6 +212,10 @@ pub(super) fn request_body(name: &str, args: Value) -> anyhow::Result<Value> {
     }
     if let Some(value) = parsed.idle_ttl_minutes {
         out.insert("idleTtlMinutes".into(), json!(value));
+    }
+    if let Some(value) = parsed.idle_stop_preset {
+        crate::services::idle::IdleStopPreset::parse(&value).map_err(|e| anyhow::anyhow!(e))?;
+        out.insert("idleStopPreset".into(), json!(value));
     }
     if let Some(value) = parsed.reveal {
         anyhow::ensure!(op == "register", "reveal is only for register");
@@ -263,6 +271,26 @@ mod tests {
                 assert!(tool["inputSchema"]["properties"].get(key).is_none());
             }
             assert!(is_tool(tool["name"].as_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn idle_presets_are_validated_and_mapped_only_for_mutations() {
+        for preset in ["1h", "24h", "7d", "forever"] {
+            for tool in [REGISTER, UPDATE] {
+                let body = request_body(tool, json!({"slug":"web", "idle_stop_preset":preset})).unwrap();
+                assert_eq!(body["args"]["idleStopPreset"], preset);
+                assert!(body["args"].get("idle_stop_preset").is_none());
+            }
+            for tool in [LIST, RESTART, UNREGISTER] {
+                assert!(request_body(tool, json!({"slug":"web", "idle_stop_preset":preset})).is_err());
+            }
+        }
+        for value in [json!("2h"), json!(1), json!(true)] {
+            assert!(request_body(REGISTER, json!({"slug":"web", "idle_stop_preset":value})).is_err());
+        }
+        for tool in tools().into_iter().filter(|tool| [REGISTER, UPDATE].contains(&tool["name"].as_str().unwrap())) {
+            assert_eq!(tool["inputSchema"]["properties"]["idle_stop_preset"]["enum"], json!(["1h", "24h", "7d", "forever"]));
         }
     }
 

@@ -397,6 +397,55 @@ fn summary_failure_remains_durable_and_retry_repairs_once() {
     );
     assert_eq!(calls.get(), 1);
 }
+
+#[test]
+fn waste_guard_summary_batch_writes_once_and_rechecks_controller_revision() {
+    let f = Fixture::new();
+    f.stamp();
+    f.plan(true, true);
+    f.store
+        .update(|state| {
+            let seed = state.asks[&f.ask.ask_id].clone();
+            for n in 0..16 {
+                let mut item = seed.clone();
+                item.ask_id = format!("summary-{n}");
+                state.asks.insert(item.ask_id.clone(), item);
+            }
+            Ok(())
+        })
+        .unwrap();
+    let revision = f.store.snapshot().unwrap().revision;
+    let repaired = f
+        .store
+        .repair_summaries_with(|item| {
+            if item.ask_id == "summary-0" {
+                f.store.update(|state| {
+                    let row = state.asks.get_mut(&item.ask_id).unwrap();
+                    row.controller_revision += 1;
+                    row.controller = "raced-controller".into();
+                    Ok(())
+                })?;
+            }
+            Ok(true)
+        })
+        .unwrap();
+    assert_eq!(repaired, 17);
+    let after = f.store.snapshot().unwrap();
+    assert_eq!(
+        after.revision,
+        revision + 2,
+        "one simulated competing write plus one summary batch"
+    );
+    assert!(after.asks["summary-0"].summary_pending);
+    assert_eq!(
+        after
+            .asks
+            .values()
+            .filter(|item| item.summary_pending)
+            .count(),
+        1
+    );
+}
 #[test]
 fn newer_ownership_version_is_not_read_as_legacy_or_rewritten() {
     let f = Fixture::new();
@@ -501,7 +550,7 @@ fn changed_request_digest_fails_closed() {
     let mut f = Fixture::new();
     f.stamp();
     f.ask.request_sha256 = "forged".into();
-    f.asks.asks.insert(f.ask.ask_id.clone(), f.ask.clone());
+    f.asks.asks.insert(f.ask.ask_id.clone(), f.ask.clone().into());
     assert_eq!(
         f.store
             .plan_handover(&f.asks, "alpha", REQUESTER, "new", true, "c", |_| true)

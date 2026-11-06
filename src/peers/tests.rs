@@ -217,7 +217,7 @@ pub(super) fn remote_record() -> (AskState, AskRecord, store::Peer) {
             accepted: false,
         },
     });
-    s.asks.insert(a.ask_id.clone(), a.clone());
+    s.asks.insert(a.ask_id.clone(), a.clone().into());
     (s, a, p)
 }
 #[test]
@@ -351,7 +351,7 @@ fn incoming_state_change_and_outbox_are_one_store_write() {
         next_attempt_at: None,
         failures: 0,
     });
-    s.asks.insert(a.ask_id.clone(), a.clone());
+    s.asks.insert(a.ask_id.clone(), a.clone().into());
     let store =
         AskStore::at(std::env::temp_dir().join(format!("xhost-outbox-{}", uuid::Uuid::new_v4())));
     store.with_state(|v| *v = s).unwrap();
@@ -393,7 +393,7 @@ fn operation_receipt_and_stop_are_atomic_and_replayable() {
         next_attempt_at: None,
         failures: 0,
     });
-    s.asks.insert(a.ask_id.clone(), a.clone());
+    s.asks.insert(a.ask_id.clone(), a.clone().into());
     let store =
         AskStore::at(std::env::temp_dir().join(format!("xhost-op-{}", uuid::Uuid::new_v4())));
     store.with_state(|v| *v = s).unwrap();
@@ -568,7 +568,7 @@ fn outbox_expiry_and_unknown_outcome_are_durable_without_repeat_delivery() {
         };
         p.last_seen_at = Some(now());
         p.urls = vec!["http://127.0.0.1:0".into()];
-        s.asks.insert(a.ask_id.clone(), a.clone());
+        s.asks.insert(a.ask_id.clone(), a.clone().into());
         let dir = std::env::temp_dir().join(format!("xhost-expire-{}", uuid::Uuid::new_v4()));
         let peers = store::Store::at(dir.join("runtime/peers"));
         peers.insert(p.clone(), &token::generate()).unwrap();
@@ -606,7 +606,7 @@ fn removal_interrupts_mirrors_and_clears_their_outbox() {
         op: "create".into(),
         outcome: None,
     });
-    s.asks.insert(a.ask_id.clone(), a.clone());
+    s.asks.insert(a.ask_id.clone(), a.clone().into());
     let store =
         AskStore::at(std::env::temp_dir().join(format!("xhost-remove-{}", uuid::Uuid::new_v4())));
     store.with_state(|v| *v = s).unwrap();

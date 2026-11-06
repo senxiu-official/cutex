@@ -156,7 +156,7 @@ impl AgentServicePolicy {
             )
         });
         let (director_default_project, project_ambiguous) =
-            crate::memory::load_agent_management_snapshot()
+            crate::memory::load_agent_management_directory()
                 .map(|snapshot| {
                     let projects = crate::asks::directory::Directory::director_projects(
                         &snapshot,
@@ -610,7 +610,7 @@ fn with_notes(mut result: Value, notes: Vec<Value>) -> Value {
 
 /// The caller's current project (member or Director seat), if any.
 pub fn caller_project(cutex_session_id: &str) -> Option<String> {
-    let snapshot = crate::memory::load_agent_management_snapshot().ok()?;
+    let snapshot = crate::memory::load_agent_management_directory().ok()?;
     let projects = crate::asks::directory::Directory::director_projects(&snapshot, cutex_session_id);
     (projects.len() == 1).then(|| projects[0].clone())
 }
@@ -1257,6 +1257,10 @@ mod tests {
         );
 
         // The owner sees how its service runs; a project peer does not.
+        store.update("web", UpdateRequest { lifetime: Some("persistent".into()), ..Default::default() }, &Caller::Owner).unwrap();
+        let started = chrono::Utc::now() + chrono::Duration::hours(1);
+        let state: RuntimeSnapshot = serde_json::from_value(json!({"health":"reachable", "startedAt":started.to_rfc3339(), "idleStopAt":(started + chrono::Duration::hours(24)).to_rfc3339()})).unwrap();
+        store.save_state(&[("web".to_string(), state)].into()).unwrap();
         let own = call(&s1, list.clone(), &isolated);
         let own_web = &own["services"][1];
         assert_eq!(own_web["command"], "serve --token secret {port}");
@@ -1273,6 +1277,8 @@ mod tests {
             assert!(peer_web.get(field).is_none(), "{field} leaked: {peer_web}");
         }
         assert_eq!(peer_web["port"], own_web["port"]);
+        assert_eq!(peer_web["idleStopAt"], own_web["idleStopAt"]);
+        assert_eq!(super::super::lifecycle::parse_time(own_web["idleStopAt"].as_str().unwrap()), Some(started + chrono::Duration::hours(24)));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1413,6 +1419,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(call(update)["ok"], true);
+        drop(policy);
+        drop(approvals);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1670,6 +1678,8 @@ mod tests {
         let defaulted = call(json!({"op":"register","args":{"slug":"ext2"}}));
         assert_eq!(defaulted["status"], "approval_required", "{defaulted}");
         assert!(store.load().unwrap().services.get("ext2").is_none());
+        drop(policy);
+        drop(approvals);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1749,6 +1759,8 @@ mod tests {
             &unrestricted,
         );
         assert_eq!(own["ok"], true, "{own}");
+        drop(policy);
+        drop(approvals);
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// A roster whose project `proj` is directed by `director` (installed as
@@ -1970,6 +1982,10 @@ mod tests {
             assert_eq!(call(replacement)["ok"], true);
             assert!(approvals.list(false, chrono::Utc::now()).unwrap().is_empty());
         });
+        // Close SQLite approval handles before removing the test home on Windows.
+        drop(policy);
+        drop(approvals);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2018,6 +2034,7 @@ mod tests {
             assert_eq!(own["ok"], true, "{own}");
             assert!(approvals.list(false, chrono::Utc::now()).unwrap().is_empty());
         });
+        drop(approvals);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2061,6 +2078,8 @@ mod tests {
             assert_eq!(retried["status"], "approval_required", "{retried}");
             assert_eq!(approvals.list(false, chrono::Utc::now()).unwrap().len(), 1);
         });
+        drop(policy);
+        drop(approvals);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2148,7 +2167,11 @@ mod tests {
         assert_eq!(refused["code"], "static_root_forbidden", "{refused}");
         let detail = refused["detail"].as_str().unwrap();
         assert!(detail.contains("profiles") && detail.contains("cutex home"), "{detail}");
-        assert!(detail.contains(&*workspace.canonicalize().unwrap().to_string_lossy()), "{detail}");
+        // Human-facing paths omit Windows' verbatim prefix; canonicalize adds it.
+        let canonical_workspace = workspace.canonicalize().unwrap();
+        let displayed_workspace = canonical_workspace.to_string_lossy();
+        let displayed_workspace = displayed_workspace.strip_prefix(r"\\?\").unwrap_or(&displayed_workspace);
+        assert!(detail.contains(displayed_workspace), "{detail}");
         // Other invalid requests never reach the owner either.
         assert_eq!(
             call(&agent(S1), json!({"op":"register","args":{"slug":"Bad Slug","lifetime":"persistent"}}))["code"],
@@ -2240,6 +2263,9 @@ mod tests {
         assert!(store.get("direct").is_err(), "validate-only writes nothing");
         // The approval flag is not part of the wire format.
         assert!(serde_json::from_value::<RegisterRequest>(json!({"slug":"a","staticRootApproved":true})).is_err());
+        drop(approvals);
+        drop(store);
+        drop(policy);
         drop(_reset);
         std::fs::remove_dir_all(base).unwrap();
     }

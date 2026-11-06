@@ -30,6 +30,8 @@ use super::scheduler::{AskRuntime, NativeMessageStatus, SchedulerWorld, Submissi
 use super::store::{AskState, AskStore};
 use super::{new_id, now_rfc3339};
 
+pub use super::owner_carries::{reserve_owner_results, release_owner_results, set_owner_hold, OwnerResultBundle};
+
 fn answer_text(store: &AskStore, answer: &AnswerRecord) -> Option<String> {
     let artifact = answer.artifact_id.as_deref()?;
     store
@@ -80,6 +82,7 @@ pub fn return_item(store: &AskStore, state: &AskState, delivery: &DeliveryRecord
                 answer_bytes,
                 review: ask.review == Some(ReviewState::AwaitingAcceptance),
                 flags: flags(ask, answer),
+                error: answer.metadata.last_error.clone(),
             }
         }
         DeliveryKind::Question => {
@@ -104,7 +107,7 @@ pub fn return_item(store: &AskStore, state: &AskState, delivery: &DeliveryRecord
 /// JSON of a return item for tool results.
 pub fn item_json(item: &ReturnItem) -> Value {
     match item {
-        ReturnItem::Answer { ask_id, title, target, status, answer_id, revision, inline, review, flags, .. } => json!({
+        ReturnItem::Answer { ask_id, title, target, status, answer_id, revision, inline, review, flags, error, .. } => json!({
             "kind": "answer",
             "ask_id": ask_id,
             "title": title,
@@ -115,6 +118,7 @@ pub fn item_json(item: &ReturnItem) -> Value {
             "answer": inline,
             "awaiting_acceptance": review,
             "flags": flags,
+            "error": error,
         }),
         ReturnItem::Question { ask_id, title, target, question_id, questions } => json!({
             "kind": "question",
@@ -320,7 +324,7 @@ fn held_by_event(lease: &AdmissionLease, event_id: &str) -> bool {
 
 /// Remove what `event_id` holds for `session`: its admission lease, or its
 /// next-step record beside the running turn's lease (never that lease).
-fn remove_event_lease(state: &mut AskState, session: &str, event_id: &str) {
+pub(super) fn remove_event_lease(state: &mut AskState, session: &str, event_id: &str) {
     if state.leases.get(session).is_some_and(|lease| held_by_event(lease, event_id)) {
         state.leases.remove(session);
     }
@@ -383,7 +387,7 @@ pub fn waiting(state: &AskState, session: &str) -> bool {
 }
 
 /// The asks an event carries (in delivery order, once each).
-fn event_asks(state: &AskState, event: &EventOutboxRecord) -> Vec<String> {
+pub(super) fn event_asks(state: &AskState, event: &EventOutboxRecord) -> Vec<String> {
     let mut asks = Vec::new();
     for delivery in event.delivery_ids.iter().filter_map(|id| state.deliveries.get(id)) {
         if !asks.contains(&delivery.ask_id) {
@@ -393,6 +397,21 @@ fn event_asks(state: &AskState, event: &EventOutboxRecord) -> Vec<String> {
     asks
 }
 
+
+/// Rebuild an event's native identity from its frozen payload. Only new
+/// owner carries have an explicit type; legacy events keep their old rule.
+pub(super) fn event_submission(state: &AskState, event: &EventOutboxRecord, text: String) -> Submission {
+    let event_type = match event.view.as_ref().and_then(|view| view["data"]["ownerCarryEventType"].as_str()) {
+        Some(render::ANSWER_EVENT) => render::ANSWER_EVENT,
+        Some(render::QUESTION_EVENT) => render::QUESTION_EVENT,
+        _ if text.contains("## Answer") => render::ANSWER_EVENT,
+        _ => render::QUESTION_EVENT,
+    };
+    Submission {
+        message_id: event.native_message_id.clone(), source_agent: None,
+        event_type, text, asks: event_asks(state, event), attempt: None, view: event.view.clone(),
+    }
+}
 
 /// The ask a return item belongs to.
 fn return_ask_id(item: &ReturnItem) -> &str {
@@ -491,13 +510,18 @@ fn settle_unreconcilable_event(
         "{}: the delivery of these results to {session} could not be confirmed ({error}); they are not re-sent and stay readable with delegation_wait / agent_list",
         super::RESULTS_OUTCOME_UNKNOWN
     );
-    store.with_state(|state| {
+    let settled = store.with_state(|state| {
         if state.events.remove(event_id).is_none() {
-            return;
+            return false;
         }
         remove_event_lease(state, session, event_id);
         make_passive_with(state, session, delivery_ids, asks, super::RESULTS_OUTCOME_UNKNOWN, detail, now);
+        true
     })?;
+    if settled {
+        // 054 decision 3: sent, delivery unprovable → uncertain.
+        super::ledger::results_unknown(&*store.shared()?, session, delivery_ids);
+    }
     Ok(())
 }
 
@@ -566,6 +590,7 @@ fn detach_from_event(state: &mut AskState, event_id: &str, delivery_ids: &[Strin
     }
 }
 
+/// Legacy path for runtimes lacking `ownerInputCarries: 1`.
 /// Stage the idle owner's results as one passive native input. The caller holds
 /// the session input lane through staging and owner turn/start. Reserving the
 /// original deliveries before sending prevents the scheduler racing a second
@@ -624,8 +649,12 @@ pub fn stage_owner_results(
           return Ok(false);
       }
     // Even an indeterminate RPC retains this exact identity, never replays.
-    submit(&Submission { message_id, source_agent: None, event_type: fitted.event_type,
-        text: fitted.text, asks, attempt: None, view: Some(view) })?;
+    let submitted = submit(&Submission { message_id: message_id.clone(), source_agent: None, event_type: fitted.event_type,
+        text: fitted.text, asks, attempt: None, view: Some(view) });
+    // Native IO was attempted either way: `sending` until the receipt.
+    let ids: Vec<String> = pairs.iter().map(|(id, _)| id.clone()).collect();
+    super::ledger::results_submitted(&state, session, &ids, &event_id, &message_id, None, false);
+    submitted?;
     Ok(true)
 }
 
@@ -717,6 +746,8 @@ pub fn admit_events(
                     reconcile_generation = target.runtime_generation;
                 } else {
                     let (session, event_id) = (lease.cutex_session_id.clone(), event_id.clone());
+                    // Taken by the lost runtime: not proven read (054 §2.12).
+                    super::ledger::results_returned(&state, &session, &event.delivery_ids);
                     let freed = store.with_state(|state| {
                         // Unknown at native: never resent to a new controller (044).
                         super::delivery::release_event_unknown(state, &event_id, now);
@@ -739,18 +770,16 @@ pub fn admit_events(
         else {
             continue;
         };
-        let submission = Submission {
-            message_id: event.native_message_id.clone(),
-            source_agent: None,
-            event_type: if text.contains("## Answer") { render::ANSWER_EVENT } else { render::QUESTION_EVENT },
-            text,
-            asks: event_asks(&state, event),
-            attempt: None,
-            view: event.view.clone(),
-        };
+        let submission = event_submission(&state, event, text);
         let session = lease.cutex_session_id.clone();
         let event_id = event_id.clone();
+        let owner_carry = event.delivery_ids.iter().any(|id|
+            state.deliveries.get(id).is_some_and(|d| d.owner_input_id.is_some()));
         match runtime.message_status(&session, reconcile_generation, &submission) {
+            // The atomic request can still be in flight when a status query
+            // says absent. Only its submitting lane can prove it unsent.
+            NativeMessageStatus::Absent | NativeMessageStatus::Unavailable(_)
+                | NativeMessageStatus::Held { turn_id: None, .. } if owner_carry => {},
             NativeMessageStatus::Persisted { turn_id } | NativeMessageStatus::Held { turn_id: Some(turn_id), .. } => {
                 let rows = result_rows(&state, &event.delivery_ids, now);
                 let freed = store.with_state(|state| {
@@ -772,6 +801,9 @@ pub fn admit_events(
                 }
             }
             NativeMessageStatus::Absent => {
+                // Native IO was made and native says it has nothing:
+                // `waiting{returned}`, resent automatically (decision 3).
+                super::ledger::results_returned(&state, &session, &event.delivery_ids);
                 let freed = store.with_state(|state| {
                     super::delivery::release_event(state, &event_id, now);
                     remove_event_lease(state, &session, &event_id);
@@ -881,6 +913,18 @@ pub fn admit_events(
                 report.result_waits.insert(requester.clone(), "resultCoalescing".into());
                 continue;
             }
+            // Owner decision 1 (switch on): an idle agent takes the owner's
+            // waiting message before results, like ride-alongs (admission.rs
+            // delivery_may_start_first).
+            if crate::management::v2::admission::owner_first(&requester)
+                && !crate::management::v2::admission::owner_priority(&requester)
+            {
+                let admission = store.queue_repository()?.admission_with_state(&requester, &state)?;
+                if admission.items.iter().find(|item| item.state == "waiting").is_some_and(|item| item.kind == "owner") {
+                    report.result_waits.insert(requester.clone(), "ownerPriority".into());
+                    continue;
+                }
+            }
             if crate::management::v2::admission::owner_priority(&requester) {
                 let admission = store.queue_repository()?.admission_with_state(&requester, &state)?;
                 if admission.items.iter().any(|item| item.kind == "owner" && item.state == "waiting") {
@@ -986,6 +1030,18 @@ pub fn admit_events(
         };
         if matches!(outcome, SubmitOutcome::Started { .. } | SubmitOutcome::Uncertain(_)) {
             if let Some(prepared) = prepared_turn { prepared.submitted(); }
+        }
+        // 054 §2.9 / invariant 7: `sending` only once native IO was made
+        // (started or outcome unknown); a refusal before it (authority busy,
+        // paused, gate closed, unsupported) leaves the items `waiting`.
+        match &outcome {
+            SubmitOutcome::Started { turn_id } => {
+                super::ledger::results_submitted(&state, &requester, &event.delivery_ids, &event_id, &submission.message_id, Some(turn_id), !next_step);
+            }
+            SubmitOutcome::Uncertain(_) => {
+                super::ledger::results_submitted(&state, &requester, &event.delivery_ids, &event_id, &submission.message_id, None, !next_step)
+            }
+            _ => {}
         }
         let text_bytes = submission.text.len();
         let rows = result_rows(&state, &event.delivery_ids, now);
@@ -1152,6 +1208,7 @@ mod tests {
             inline: Some(text),
             review: false,
             flags: vec![],
+            error: None,
         };
         let long = || "a \"quoted\" line\n".repeat(400);
         let items: Vec<ReturnItem> = (0..20).map(|n| answer(n, long())).collect();
@@ -1552,7 +1609,7 @@ mod tests {
                 ask.closed = Some(CloseOutcome::Completed);
                 ask.closed_at = Some(now_rfc3339(now));
             });
-            let ask = state.asks[&ask.ask_id].clone();
+            let ask = (*state.asks[&ask.ask_id]).clone();
             super::super::delivery::record_state_delivery(state, &ask, "rejected", now);
             ask.ask_id
         }).unwrap();
@@ -1834,7 +1891,9 @@ mod tests {
         assert_eq!(runtime.steered.borrow().last().unwrap().1.message_id, second);
         let _ = std::fs::remove_dir_all(store_dir);
         // A volatile runtime restarted (the store, read back from disk, still
-        // has the record): back to pending, the old lease untouched.
+        // has the record): next-step input goes back to pending, while the
+        // scheduler also settles the old bound event lease (r271.2). The
+        // pending input can then start a fresh event; the old event is not resent.
         let (store, store_dir, lease, _) = setup("returns-leased-restart");
         let reread = AskStore::at(&store_dir).snapshot().unwrap();
         assert!(reread.next_step_leases.contains_key(REQUESTER));
@@ -1843,17 +1902,24 @@ mod tests {
             status.active_turn_id = None;
         });
         let steered = runtime.steered.borrow().len();
-        crate::asks::scheduler::tick(&world, &runtime, &store, at(122)).unwrap();
+        let report = crate::asks::scheduler::tick(&world, &runtime, &store, at(122)).unwrap();
         let state = store.snapshot().unwrap();
-        assert_eq!(state.leases[REQUESTER], lease);
+        assert_ne!(state.leases.get(REQUESTER), Some(&lease));
+        let LeaseHolder::Event { event_id } = &lease.holder else { panic!("event lease") };
+        assert!(state.events[event_id].acknowledged);
+        assert_eq!(report.events.len(), 1, "only the previously unread next-step input starts a new event");
         assert!(state.next_step_leases.is_empty());
-        assert!(state.deliveries.values().any(|d| d.state == DeliveryState::Pending && !d.passive));
+        assert!(state.deliveries.values().all(|d| d.state == DeliveryState::Acknowledged));
         assert_eq!(runtime.steered.borrow().len(), steered, "not beside a turn the new runtime does not run");
         let _ = std::fs::remove_dir_all(store_dir);
         // A durable inbox keeps the key across the restart and reads it.
         runtime.durable_next_step.set(true);
         let (store, store_dir, lease, message_id) = setup("returns-leased-durable");
         runtime.set(REQUESTER, |status| status.runtime_generation = 2);
+        // This bound turn is restored and still running in the new runtime;
+        // its history protects the lease independently of the next-step key.
+        runtime.turns.borrow_mut().insert(lease.turn_id.clone().unwrap(),
+            json!({"id":lease.turn_id,"status":"inProgress"}));
         runtime.native.borrow_mut().insert(message_id.clone(), NativeMessageStatus::Persisted { turn_id: "turn-later".into() });
         crate::asks::scheduler::tick(&world, &runtime, &store, at(122)).unwrap();
         let state = store.snapshot().unwrap();

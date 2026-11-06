@@ -4,6 +4,38 @@ use crate::asks::store::tests::{new_ask, temp_store, TARGET};
 use crate::asks::{awaits, observe, scheduler};
 
 #[test]
+#[ignore = "EVA-sized continuation no-change scale probe"]
+fn waste_scale_a06_continuation_not_due() {
+    let f=Fixture::new("scale-continuation");f.declare(1);f.finish(1,f.now,"completed");
+    let fixture=crate::test_support::waste_scale::asks();
+    let bytes=serde_json::to_vec(&fixture).unwrap().len();
+    f.store.with_state(|state|{
+        state.asks.extend(fixture.asks);
+        let ask=state.asks[&f.ask].clone();
+        for n in 0..15 {let mut copy=ask.clone();copy.ask_id=format!("continuation-{n}");state.asks.insert(copy.ask_id.clone(),copy);}
+    }).unwrap();
+    let mut samples=Vec::new();let before=crate::asks::store::whole_state_copies_on_this_thread();
+    for _ in 0..6 {let t=std::time::Instant::now();tick_due(&f.world,&f.runtime,&f.store,f.now+Duration::seconds(1)).unwrap();samples.push(t.elapsed());}
+    let copies=crate::asks::store::whole_state_copies_on_this_thread()-before;
+    crate::test_support::waste_scale::emit("a06_continuation_not_due",&samples,copies,json!({"asks_bytes":bytes,"continuations":16}));
+}
+
+#[test]
+fn waste_guard_continuation_waiting_has_zero_store_drafts_but_stop_and_limit_commit(){
+    let f=Fixture::new("guard-continuation");f.declare(1);f.finish(1,f.now,"completed");
+    f.store.with_state(|state|state.asks.extend(crate::test_support::waste_scale::asks().asks)).unwrap();
+    let before=crate::asks::store::whole_state_copies_on_this_thread();
+    for _ in 0..4 {tick_due(&f.world,&f.runtime,&f.store,f.now+Duration::seconds(1)).unwrap();}
+    assert_eq!(crate::asks::store::whole_state_copies_on_this_thread()-before,0,"not-due continuations must not draft the whole store");
+    tick_due(&f.world,&f.runtime,&f.store,f.now+Duration::seconds(i64::from(MAX_ELAPSED_SECONDS)+1)).unwrap();
+    assert_eq!(f.store.shared().unwrap().asks[&f.ask].bounded_continuation.current.as_ref().unwrap().state,Phase::Limited);
+    let stopped=Fixture::new("guard-continuation-stop");stopped.declare(1);stopped.finish(1,stopped.now,"completed");
+    stopped.store.with_state(|state|{state.asks.get_mut(&stopped.ask).unwrap().closed=Some(model::CloseOutcome::Stopped);}).unwrap();
+    tick_due(&stopped.world,&stopped.runtime,&stopped.store,stopped.now+Duration::seconds(1)).unwrap();
+    assert_eq!(stopped.store.shared().unwrap().asks[&stopped.ask].bounded_continuation.current.as_ref().unwrap().state,Phase::Cancelled);
+}
+
+#[test]
 fn verified_delegation_child_finished_before_declaration_wakes_once(){
     let f=Fixture::new("bounded-child-before");
     let child=f.store.with_state(|state|{

@@ -269,12 +269,7 @@ fn archive_owner_replies(
     now: DateTime<Utc>,
     report: &mut SweepReport,
 ) -> anyhow::Result<()> {
-    let due = owner_notify.snapshot()?.replied_final_before(cutoff);
-    if due.is_empty() {
-        return Ok(());
-    }
-    let mut archived = Vec::new();
-    for record in &due {
+    owner_notify.visit_replied_final_before(cutoff, |record| {
         let result = (|| -> anyhow::Result<()> {
         let title = crate::app_server::external_input::size::preview(record.text.lines().next().unwrap_or_default(), 120).to_string();
         archive.append(
@@ -289,14 +284,13 @@ fn archive_owner_replies(
             },
             now,
         )?;
-        archived.push(record.clone());
+        // Only a successfully archived, unchanged row leaves the SQL store.
+        report.archived_owner_replies += owner_notify.remove_archived(std::slice::from_ref(&record))?;
         Ok(())
         })();
         if let Err(error) = result { report.errors.push(format!("owner notification {}: {error:#}", record.notification_id)); }
-    }
-    // Only what is in the archive (and unchanged since) leaves the store.
-    report.archived_owner_replies = owner_notify.with_state(|state| state.remove_archived(&archived))?;
-    Ok(())
+        Ok(())
+    })
 }
 
 fn delete_orphaned_documents(stores: &SweepStores<'_>, settings: &DocumentSettings, now: DateTime<Utc>, report: &mut SweepReport) -> anyhow::Result<()> {
@@ -331,7 +325,7 @@ fn idle_reminders(asks: &AskStore, days: u32, now: DateTime<Utc>) -> anyhow::Res
         .values()
         .filter(|ask| ask.is_open() && ask.idle_reminded_at.is_none())
         .filter(|ask| parse_time(&ask.updated_at).is_some_and(|updated| updated < cutoff))
-        .cloned()
+        .map(|ask| (**ask).clone())
         .collect();
     for ask in &idle {
         let agent = ask.requester.session().unwrap_or(&ask.target_cutex_session_id);

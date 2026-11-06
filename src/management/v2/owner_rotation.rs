@@ -336,6 +336,18 @@ pub struct AgentFacts {
     pub project_id: Option<String>,
 }
 
+/// The successor's runtime after its first message (r271.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SuccessorStart {
+    Online,
+    /// A start runs; the queued first message goes out when it is up.
+    Starting,
+    /// The last start failed (a busy host was already retried inside it).
+    Failed(EffectError),
+    /// Offline, with no start running or recorded.
+    NotStarted,
+}
+
 pub trait RotationEffects: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
     fn project(&self, project_id: &str) -> Result<Option<ProjectFacts>, EffectError>;
@@ -351,10 +363,13 @@ pub trait RotationEffects: Send + Sync {
     ) -> Result<(), EffectError>;
     /// Whether the session runs a turn (offline: false).
     fn turn_active(&self, cutex_session_id: &str) -> Result<bool, EffectError>;
+    /// Where the successor's start stands (see [`SuccessorStart`]).
+    fn successor_start(&self, cutex_session_id: &str) -> Result<SuccessorStart, EffectError>;
     /// The handoff file exists and is not empty.
     fn handoff_ready(&self, path: &Path) -> bool;
-    /// An active agent named `name` created at or after `since`.
-    fn find_agent_by_name(&self, name: &str, since: &str) -> Result<Option<String>, EffectError>;
+    /// Recover only the session durably bound to this rotation's create action.
+    /// Legacy records without that evidence must not be inferred from names.
+    fn find_successor_by_creation(&self, rotation: &Rotation) -> Result<Option<String>, EffectError>;
     /// Create the successor in the Project without starting it.
     fn create_successor(&self, rotation: &Rotation) -> Result<String, EffectError>;
     /// `rotate_director` with the epoch fence; returns the new epoch.
@@ -1057,11 +1072,11 @@ impl<E: RotationEffects> Driver<E> {
 
     fn create_successor(&self, rotation: &Rotation) -> anyhow::Result<bool> {
         let (_, now_text) = self.now();
-        if let Some(started) = rotation.successor_create_started_at.clone() {
+        if rotation.successor_create_started_at.is_some() {
             // A creation that a previous process started and did not record.
             let found = self
                 .effects
-                .find_agent_by_name(&rotation.successor_spec.name, &started);
+                .find_successor_by_creation(rotation);
             let state = rotation.state;
             let changed = self.store.modify(&rotation.rotation_id, &now_text, |current| {
                 if current.state != state || current.successor_cutex_session_id.is_some() {
@@ -1081,8 +1096,8 @@ impl<E: RotationEffects> Driver<E> {
                         current.fail(
                             "successor_creation_interrupted",
                             format!(
-                                "the successor creation was interrupted and no agent named {} exists; \
-                                 the Director is unchanged, start a new rotation",
+                                "the successor creation was interrupted and no creation binding for {} exists; \
+                                 inspect existing agents before starting a new rotation; the Director is unchanged",
                                 current.successor_spec.name
                             ),
                             &now_text,
@@ -1237,33 +1252,78 @@ impl<E: RotationEffects> Driver<E> {
         let Some(successor) = rotation.successor_cutex_session_id.clone() else {
             return Ok(false);
         };
-        let exists = self.effects.handoff_ready(Path::new(&rotation.handoff.path));
-        let result = self.effects.send_message(
-            &successor,
-            &format!("owner-rotation-{}-successor", rotation.rotation_id),
-            &successor_text(rotation, exists),
-        );
+        // r271.1: Done only once the successor is online. While its start
+        // runs (a busy host is retried inside it) the rotation waits; a failed
+        // start is retried by sending the same (deduplicated) message again,
+        // which starts it again.
+        let before = self.effects.successor_start(&successor);
+        if matches!(before, Ok(SuccessorStart::Starting)) {
+            return Ok(false);
+        }
         let (_, now_text) = self.now();
+        if let Ok(SuccessorStart::Failed(error)) = &before {
+            // The previous start failed: that used one attempt.
+            let retry = self.store.modify(&rotation.rotation_id, &now_text, |current| {
+                if current.state != RotationState::PredecessorDisposed {
+                    return false;
+                }
+                if error.retryable && current.attempts + 1 < MAX_STEP_ATTEMPTS {
+                    current.attempts += 1;
+                    return true;
+                }
+                current.finish_successor_start_failed(error, &now_text);
+                false
+            })?;
+            if !retry.is_some_and(|(_, retry)| retry) {
+                return Ok(false);
+            }
+        }
+        let exists = self.effects.handoff_ready(Path::new(&rotation.handoff.path));
+        let result = self
+            .effects
+            .send_message(
+                &successor,
+                &format!("owner-rotation-{}-successor", rotation.rotation_id),
+                &successor_text(rotation, exists),
+            )
+            .and_then(|()| self.effects.successor_start(&successor))
+            .and_then(|start| match start {
+                SuccessorStart::NotStarted => Err(EffectError::new(
+                    "successor_not_started",
+                    "the first message is queued but no start of the successor is running",
+                    true,
+                )),
+                SuccessorStart::Failed(error) => Err(error),
+                start => Ok(start),
+            });
         self.store.modify(&rotation.rotation_id, &now_text, |current| {
             if current.state != RotationState::PredecessorDisposed {
                 return;
             }
             match &result {
-                Ok(()) => current.transition(RotationState::Done, &now_text, None),
+                Ok(SuccessorStart::Online) => current.transition(RotationState::Done, &now_text, None),
+                // Its start runs; the next tick looks again.
+                Ok(_) => {}
                 Err(error) if error.retryable && current.attempts + 1 < MAX_STEP_ATTEMPTS => {
                     current.attempts += 1;
                 }
-                Err(error) => {
-                    let warning = format!(
-                        "successor_start_failed: {}; send the successor its first message by hand",
-                        effect_text(error)
-                    );
-                    current.warnings.push(warning.clone());
-                    current.transition(RotationState::Done, &now_text, Some(warning));
-                }
+                Err(error) => current.finish_successor_start_failed(error, &now_text),
             }
         })?;
         Ok(false)
+    }
+}
+
+impl Rotation {
+    /// Done with the real start error as a visible warning: authority has
+    /// already moved and the successor keeps its queued first message.
+    fn finish_successor_start_failed(&mut self, error: &EffectError, now_text: &str) {
+        let warning = format!(
+            "successor_start_failed: {}; send the successor its first message by hand",
+            effect_text(error)
+        );
+        self.warnings.push(warning.clone());
+        self.transition(RotationState::Done, now_text, Some(warning));
     }
 }
 

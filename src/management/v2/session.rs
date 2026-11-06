@@ -1,13 +1,11 @@
+#[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
-use std::sync::OnceLock;
 
 use anyhow::Context;
 use chrono::Utc;
@@ -26,9 +24,8 @@ use crate::session::model::CutexSessionArchiveState;
 use crate::session::model::CutexSessionRecord;
 use crate::session::model::CutexSessionRuntimeBackend;
 use crate::session::model::LaunchProfileSource;
-use crate::session::store::load_cutex_session_store_shared;
 
-use super::activity::load_session_activity_states;
+use super::activity::session_activity;
 use super::activity::SessionActivityState;
 
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -96,6 +93,14 @@ pub const CUTEX_METHOD_REGISTRY_METHODS: &[&str] = &[
     "cutex/ownerNotify/delete",
     "cutex/safetyCheck/grant",
     "cutex/safetyCheck/dismiss",
+    "cutex/input/get",
+    "cutex/input/list",
+    "cutex/input/dismiss",
+    "cutex/input/lease/release",
+    "cutex/userInput/queue/merge",
+    "cutex/input/retry",
+    "cutex/input/interruptSend",
+    "cutex/input/hold",
 ];
 
 #[cfg(test)]
@@ -114,25 +119,7 @@ pub fn cutex_method_is_registered(method: &str) -> bool {
 }
 
 const SESSION_PROJECTION_FILE: &str = "session-projection-state.json";
-const SESSION_PROJECTION_LOCK_FILE: &str = "session-projection-state.lock";
 
-/// Process lock of the projection store; it also holds the last parsed
-/// version, keyed by file identity.
-static SESSION_PROJECTION_LOCK: OnceLock<Mutex<Option<CachedProjectionStore>>> = OnceLock::new();
-
-struct CachedProjectionStore {
-    path: std::path::PathBuf,
-    stamp: crate::platform::file_stamp::FileStamp,
-    bytes: (usize, u64),
-    store: SessionProjectionStore,
-}
-
-fn projection_digest(bytes: &[u8]) -> (usize, u64) {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    (bytes.len(), hasher.finish())
-}
 static ACTIVITY_LOAD_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
 pub type RuntimeStatusLoader = fn(&str) -> anyhow::Result<Option<AppServerManagedRuntimeStatus>>;
@@ -177,20 +164,6 @@ impl Default for SessionProjectionEntry {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionProjectionStore {
-    #[serde(default = "projection_store_version")]
-    version: u8,
-    /// Ordered, so an unchanged store serializes to the same bytes.
-    #[serde(default)]
-    sessions: std::collections::BTreeMap<String, SessionProjectionEntry>,
-}
-
-fn projection_store_version() -> u8 {
-    1
-}
-
 pub fn session_list_resource(
     registry: &ImRegistry,
     load_runtime_status: RuntimeStatusLoader,
@@ -209,10 +182,9 @@ pub fn session_list_resource_with_hidden(
     repository: &EventRepository,
     include_hidden: bool,
 ) -> anyhow::Result<Value> {
-    let store = load_cutex_session_store_shared()?;
+    let store = crate::session::store::session_catalog(false)?;
     let host_id = crate::platform::host::current_host_name();
     let management = management_identity(repository)?;
-    let activity_states = load_activity_states_best_effort();
     let mut seen = HashSet::new();
     let mut records = store
         .sessions
@@ -253,28 +225,16 @@ pub fn session_list_resource_with_hidden(
                     record,
                     visible,
                     runtime_status,
-                    activity_states.get(&record.cutex_session_id),
+                    load_activity_best_effort(&record.cutex_session_id).as_ref(),
                     &management,
                     &context,
                 )?,
             ))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let sessions = with_projection_store_tracking(|store| {
-        let mut changed = false;
-        let sessions = prepared
-            .into_iter()
-            .map(|(cutex_session_id, prepared)| {
-                let (value, entry_changed) =
-                    update_projection_entry(store, &cutex_session_id, |entry| {
-                        apply_session_projection(prepared, entry)
-                    })?;
-                changed |= entry_changed;
-                Ok(value)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok((sessions, changed))
-    })?;
+    let sessions = prepared.into_iter().map(|(id, prepared)| {
+        with_projection_entry(&id, |entry| apply_session_projection(prepared, entry))
+    }).collect::<anyhow::Result<Vec<_>>>()?;
     Ok(json!({
         "contractVersion": 2,
         "hostId": host_id,
@@ -294,12 +254,13 @@ pub fn read_route_resource(
     registry:&ImRegistry,
     require_visible:bool,
 ) -> anyhow::Result<Option<Value>> {
-    let store=load_cutex_session_store_shared()?;
-    let Some(record)=store.sessions.values().find(|r|r.cutex_session_id==cutex_session_id) else {return Ok(None)};
-    Ok(read_route_snapshot(record,session_is_visible(registry,record),require_visible,&crate::platform::host::current_host_name()))
+    let Some(shared_record) = crate::session::store::shared_session_row(cutex_session_id)? else {return Ok(None);
+    };
+    let record = &*shared_record;
+    Ok(read_route_snapshot(record,session_is_visible(registry,record),require_visible,&crate::platform::host::current_host_name(),))
 }
 
-fn read_route_snapshot(record:&CutexSessionRecord,visible:bool,require_visible:bool,host:&str)->Option<Value> {
+fn read_route_snapshot(record:&CutexSessionRecord,visible:bool,require_visible:bool,host:&str,)->Option<Value> {
     active_session_is_eligible(record,visible,require_visible,host)
         .then(||json!({"cutexSessionId":record.cutex_session_id}))
 }
@@ -314,34 +275,34 @@ pub fn online_submit_resource(
     load_runtime_status: RuntimeStatusLoader,
     require_visible: bool,
 ) -> anyhow::Result<Option<Value>> {
-    let store = load_cutex_session_store_shared()?;
-    let Some(record) = store.sessions.values()
-        .find(|record| record.cutex_session_id == cutex_session_id) else {
+    let Some(shared_record) = crate::session::store::shared_session_row(cutex_session_id)? else {
         return Ok(None);
     };
+    let record = &*shared_record;
     if !active_session_is_eligible(record, session_is_visible(registry, record),
-        require_visible, &crate::platform::host::current_host_name()) {
+        require_visible, &crate::platform::host::current_host_name(),) {
         return Ok(None);
     }
     let status = load_runtime_status(cutex_session_id)?;
     Ok(online_submit_snapshot(record, status.as_ref()))
 }
 
-fn active_session_is_eligible(record: &CutexSessionRecord, visible: bool, require_visible: bool, host: &str) -> bool {
+fn active_session_is_eligible(record: &CutexSessionRecord, visible: bool, require_visible: bool, host: &str,) -> bool {
     crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, host)
         && !record.is_retired()
         && is_durable_management_session(record)
         && (!require_visible || visible)
 }
 
-fn online_submit_snapshot(record: &CutexSessionRecord, status: Option<&AppServerManagedRuntimeStatus>) -> Option<Value> {
+fn online_submit_snapshot(record: &CutexSessionRecord, status: Option<&AppServerManagedRuntimeStatus>,) -> Option<Value> {
     let thread = record.app_server_thread_id().filter(|thread| !thread.trim().is_empty())?;
-    let status = status.filter(|status| status.connected
+    let status = status.filter(|status| { status.connected
         && status.cutex_session_id == record.cutex_session_id
         && status.thread_id == thread
         && record.runtime_generation > 0
         && record.runtime_generation <= super::model::MAX_SAFE_SEQUENCE
-        && status.runtime_generation == record.runtime_generation)?;
+        && status.runtime_generation == record.runtime_generation
+    })?;
     // offline_submit's connected branch reads appServerConnected/threadId and
     // delegates straight to dispatch_user_input_submit, which only uses threadId.
     // In particular this must never enter the offline StartPlan branch or a CAS mutation.
@@ -388,14 +349,11 @@ pub fn session_resource_including_archive(
     load_runtime_status: RuntimeStatusLoader,
     repository: &EventRepository,
 ) -> anyhow::Result<Option<Value>> {
-    let store = load_cutex_session_store_shared()?;
-    let Some(record) = store
-        .sessions
-        .values()
-        .find(|record| record.cutex_session_id == cutex_session_id)
+    let Some(shared_record) = crate::session::store::shared_session_row(cutex_session_id)?
     else {
         return Ok(None);
     };
+    let record = &*shared_record;
     if !crate::runtime::lifecycle::cutex_session_host_is_local(
         &record.host_id,
         &crate::platform::host::current_host_name(),
@@ -407,12 +365,11 @@ pub fn session_resource_including_archive(
         return retired_session_resource(cutex_session_id);
     }
     let visible = session_is_visible(registry, record);
-    let activity_states = load_activity_states_best_effort();
     Ok(Some(project_session(
         record,
         visible,
         load_runtime_status(&record.cutex_session_id)?,
-        activity_states.get(&record.cutex_session_id),
+        load_activity_best_effort(&record.cutex_session_id).as_ref(),
         &management_identity(repository)?,
     )?))
 }
@@ -424,24 +381,20 @@ fn session_resource_with_visibility(
     repository: &EventRepository,
     require_visible: bool,
 ) -> anyhow::Result<Option<Value>> {
-    let store = load_cutex_session_store_shared()?;
-    let Some(record) = store
-        .sessions
-        .values()
-        .find(|record| record.cutex_session_id == cutex_session_id)
+    let Some(shared_record) = crate::session::store::shared_session_row(cutex_session_id)?
     else {
         return Ok(None);
     };
+    let record = &*shared_record;
     let visible = session_is_visible(registry, record);
-    if !active_session_is_eligible(record, visible, require_visible, &crate::platform::host::current_host_name()) {
+    if !active_session_is_eligible(record, visible, require_visible, &crate::platform::host::current_host_name(),) {
         return Ok(None);
     }
-    let activity_states = load_activity_states_best_effort();
     Ok(Some(project_session(
         record,
         visible,
         load_runtime_status(&record.cutex_session_id)?,
-        activity_states.get(&record.cutex_session_id),
+        load_activity_best_effort(&record.cutex_session_id).as_ref(),
         &management_identity(repository)?,
     )?))
 }
@@ -483,7 +436,8 @@ pub fn management_identity(repository: &EventRepository) -> anyhow::Result<Value
                         "lastTurnStartedAt",
                         "lastConversationAt",
                         "lastOutput",
-                        "lastToolCall"
+                        "lastToolCall",
+                        "lastTurnError"
                     ],
                     "changesSessionRevision": false,
                 }
@@ -495,9 +449,8 @@ pub fn management_identity(repository: &EventRepository) -> anyhow::Result<Value
 
 pub fn retired_session_list_resource() -> anyhow::Result<Value> {
     // The shared snapshot is current as of this read (no whole-store copy).
-    let store = load_cutex_session_store_shared()?;
+    let store = crate::session::store::session_catalog(true)?;
     let host_id = crate::platform::host::current_host_name();
-    let activity_states = load_activity_states_best_effort();
     let projects = load_agent_management_snapshot_best_effort();
     let context = ProjectionContext::default();
     let mut sessions = store
@@ -511,10 +464,10 @@ pub fn retired_session_list_resource() -> anyhow::Result<Value> {
         .map(|record| {
             let mut value = retired_session_resource_value_with(
                 record,
-                activity_states.get(&record.cutex_session_id),
+                load_activity_best_effort(&record.cutex_session_id).as_ref(),
                 &context,
             );
-            annotate_retired_session_project(&mut value, record, projects.as_ref());
+            annotate_retired_session_project(&mut value, record, projects.as_deref());
             value
         })
         .collect::<Vec<_>>();
@@ -532,9 +485,8 @@ pub fn retired_session_list_resource() -> anyhow::Result<Value> {
 }
 
 pub fn retired_session_resource(cutex_session_id: &str) -> anyhow::Result<Option<Value>> {
-    let store = load_cutex_session_store_shared()?;
-    let activity_states = load_activity_states_best_effort();
-    let record = store.sessions.values().find(|record| {
+    let shared_record = crate::session::store::shared_session_row(cutex_session_id)?;
+    let record = shared_record.as_deref().filter(|record| {
         record.cutex_session_id == cutex_session_id
             && crate::runtime::lifecycle::cutex_session_host_is_local(
                 &record.host_id,
@@ -545,17 +497,17 @@ pub fn retired_session_resource(cutex_session_id: &str) -> anyhow::Result<Option
     });
     Ok(record.map(|record| {
         let mut value =
-            retired_session_resource_value(record, activity_states.get(&record.cutex_session_id));
+            retired_session_resource_value(record, load_activity_best_effort(&record.cutex_session_id).as_ref());
         let projects = load_agent_management_snapshot_best_effort();
-        annotate_retired_session_project(&mut value, record, projects.as_ref());
+        annotate_retired_session_project(&mut value, record, projects.as_deref());
         value
     }))
 }
 
 fn load_agent_management_snapshot_best_effort(
-) -> Option<crate::agent_management::AgentManagementSnapshot> {
+) -> Option<std::sync::Arc<crate::agent_management::AgentManagementSnapshot>> {
     crate::agent_management::AgentManagementStore::open_default()
-        .and_then(|store| store.snapshot().map_err(anyhow::Error::new))
+        .and_then(|store| store.snapshot_shared().map_err(anyhow::Error::new))
         .ok()
 }
 
@@ -571,11 +523,8 @@ fn annotate_retired_session_project(
     let Some(snapshot) = snapshot else {
         return;
     };
-    let project = snapshot
-        .agents
-        .iter()
-        .find(|(id, _)| id.as_str() == record.cutex_session_id)
-        .and_then(|(_, agent)| crate::agent_management::current_project_id(snapshot, agent));
+    let project = snapshot.agent_by_session(&record.cutex_session_id)
+        .and_then(|agent| crate::agent_management::current_project_id(snapshot, agent));
     match project {
         Some(id) => {
             let presentation = crate::agent_management::effective_presentation(
@@ -633,7 +582,7 @@ fn retired_session_resource_value_with(
     context: &ProjectionContext,
 ) -> Value {
     let mut value = retired_session_resource_fields(record, activity, context);
-    insert_claude_account(value.as_object_mut().expect("session resource object"), record);
+    insert_claude_account(value.as_object_mut().expect("session resource object"), record,);
     insert_claude_runtime(&mut value, record);
     value
 }
@@ -644,6 +593,7 @@ fn retired_session_resource_fields(
     context: &ProjectionContext,
 ) -> Value {
     let mut value = json!({
+        "autoRetry": null,
         "contractVersion": 2,
         "cutexSessionId": record.cutex_session_id,
         "revision": record.durable_revision(),
@@ -696,8 +646,8 @@ fn retired_session_resource_fields(
 
 fn annotate_continuation_capabilities(value:&mut Value){
     if let Some(runtime)=value.get_mut("runtime").and_then(Value::as_object_mut) {
-        runtime.insert("continuationWakeKinds".into(),json!(crate::asks::continuation::runtime::WAKE_KINDS));
-        runtime.insert("continuationChildKinds".into(),json!(crate::asks::continuation::runtime::CHILD_KINDS));
+        runtime.insert("continuationWakeKinds".into(),json!(crate::asks::continuation::runtime::WAKE_KINDS),);
+        runtime.insert("continuationChildKinds".into(),json!(crate::asks::continuation::runtime::CHILD_KINDS),);
     }
 }
 
@@ -755,6 +705,8 @@ fn activity_resource(activity: Option<&SessionActivityState>) -> Value {
         "lastFileChangeAt": activity.last_file_change_at,
         "lastTurnStartedAt": activity.last_turn_started_at,
         "lastConversationAt": activity.conversation_at(),
+        // turn-error-surface: the last failed turn until a later one completes.
+        "lastTurnError": activity.last_turn_error.as_ref().map(super::activity::LastTurnError::resource),
     });
     let object = resource
         .as_object_mut()
@@ -811,8 +763,8 @@ fn insert_task_association(
     }
 }
 
-fn load_activity_states_best_effort() -> HashMap<String, SessionActivityState> {
-    match load_session_activity_states() {
+fn load_activity_best_effort(id: &str) -> Option<SessionActivityState> {
+    match session_activity(id) {
         Ok(states) => {
             ACTIVITY_LOAD_WARNING_EMITTED.store(false, Ordering::Relaxed);
             states
@@ -823,7 +775,7 @@ fn load_activity_states_best_effort() -> HashMap<String, SessionActivityState> {
                     "warning: session activity projection is unavailable; returning null activity: {error:#}"
                 );
             }
-            HashMap::new()
+            None
         }
     }
 }
@@ -863,7 +815,7 @@ pub fn set_focus(
     })
 }
 
-pub fn clear_focus(cutex_session_id: &str, expected_revision: Option<u64>) -> anyhow::Result<Value> {
+pub fn clear_focus(cutex_session_id: &str, expected_revision: Option<u64>,) -> anyhow::Result<Value> {
     set_focus(cutex_session_id, expected_revision, "none", false, None)
 }
 
@@ -912,6 +864,9 @@ pub(super) fn project_session_entry(
 /// so a config change is visible on the next request.
 #[derive(Default)]
 struct ProjectionContext {
+    overload_retry: std::cell::OnceCell<Option<(super::model_overload_retry::State,
+        std::collections::BTreeMap<String, crate::asks::model::AdmissionLease>,
+        )>,>,
     archive: super::archive::projection::Batch,
     global_default_profile: std::cell::OnceCell<Option<String>>,
     pending_server_requests:
@@ -920,9 +875,20 @@ struct ProjectionContext {
 }
 
 impl ProjectionContext {
+    fn auto_retry(&self, record: &CutexSessionRecord, active_turn: Option<&str>,) -> Option<super::model_overload_retry::AutoRetry> {
+        let (retry, leases) = self.overload_retry.get_or_init(|| { (|| -> anyhow::Result<_> {
+            let store = super::model_overload_retry::Store::open_default()?;
+            if store.is_disabled() { return Ok(None); }
+            let leases = crate::asks::store::AskStore::open_default()?.project_snapshot(|asks| asks.leases.clone())?;
+            Ok(Some((store.snapshot()?, leases)))
+        })().ok().flatten()
+            }).as_ref()?;
+        retry.auto_retry(&record.cutex_session_id, record.app_server_thread_id(), record.runtime_generation,
+            leases.get(&record.cutex_session_id), active_turn,)
+    }
     fn pause_view(&self,session:&str)->(Value,Value,bool){
         let views=self.pause_views.get_or_init(||( || -> anyhow::Result<_> {
-            let roster=crate::memory::load_agent_management_snapshot()?;
+            let roster=crate::memory::load_agent_management_directory()?;
             let store=crate::asks::store::AskStore::open_default()?;
             store.project_snapshot(|state|{
                 let projects=crate::asks::project_control::project_snapshot(state,&roster);
@@ -937,7 +903,7 @@ impl ProjectionContext {
                 }).collect()
             })
         })().ok());
-        match views{Some(views)=>{let (pause,reasons)=views.get(session).cloned().unwrap_or((Value::Null,json!([])));(pause,reasons,true)},None=>(Value::Null,json!([]),false)}
+        match views{Some(views)=>{let (pause,reasons)=views.get(session).cloned().unwrap_or((Value::Null,json!([])));(pause,reasons,true)}None=>(Value::Null,json!([]),false),}
     }
     fn global_default_profile(&self) -> Option<&str> {
         self.global_default_profile
@@ -1072,17 +1038,19 @@ fn prepare_session_projection(
     context: &ProjectionContext,
 ) -> anyhow::Result<PreparedSessionProjection> {
     // A late observer from an earlier runtime cannot change the current row.
-    let runtime_status = runtime_status.filter(|status| status.runtime_generation == record.runtime_generation);
+    let runtime_status = runtime_status.filter(|status| status.runtime_generation == record.runtime_generation)
+        .map(|mut status| { status.mask_disconnected_turn(); status });
     let backend = runtime_backend_name(record.runtime_backend);
     let app_server_connected = runtime_status
         .as_ref()
         .is_some_and(|status| status.connected);
-    let stop_state = (!app_server_connected).then(||
-        crate::session::runtime_stop::state(&record.cutex_session_id, record.runtime_generation)).flatten();
+    let stop_state = (!app_server_connected).then(|| {
+        crate::session::runtime_stop::state(&record.cutex_session_id, record.runtime_generation)
+        }).flatten();
     if stop_state == Some(crate::session::runtime_stop::StopState::Closing) {
         super::native_events::observe_stop_from_snapshot(&record.cutex_session_id,
             record.runtime_generation, backend,
-            runtime_status.as_ref().and_then(|status| status.last_error.as_deref()))?;
+            runtime_status.as_ref().and_then(|status| status.last_error.as_deref()),)?;
     }
     let expected_stop = matches!(stop_state, Some(crate::session::runtime_stop::StopState::Closing
         | crate::session::runtime_stop::StopState::Offline));
@@ -1143,12 +1111,14 @@ fn prepare_session_projection(
         let connected = runtime_status.as_ref().is_some_and(|status| status.connected);
         let can_steer = connected && record.dsh_session.is_none()
             && if record.claude_session.is_some() {
-                runtime_status.as_ref().and_then(|status|
+                runtime_status.as_ref().and_then(|status| {
                     crate::runtime::claude::live_same_turn_steering(
-                        &record.cutex_session_id, status.runtime_generation)) == Some(true)
+                        &record.cutex_session_id, status.runtime_generation,
+                    )
+                }) == Some(true)
             } else { features.get("turnSteer").and_then(Value::as_bool) == Some(true) };
         super::user_input::image_steering::project_capability(features,
-            record.claude_session.is_some(), can_steer);
+            record.claude_session.is_some(), can_steer,);
         // DSH / Kimi fork / revert run the pinned runtime's session-ops.mjs (r265);
         // a session pinned to an older DSH runtime cannot offer them.
         if let Some(dsh) = &record.dsh_session {
@@ -1225,6 +1195,9 @@ fn prepare_session_projection(
         "createdAt": record.created_at,
         "updatedAt": record.updated_at,
     });
+    value["runtime"]["backgroundWork"] = json!(runtime_status.as_ref().filter(|status| status.connected).and_then(|status| status.background_work.clone()));
+    value["runtime"]["turnState"] = json!(if !app_server_connected { "unknown" }
+        else if runtime_status.as_ref().is_some_and(|s| s.active_turn_id.is_some()) { "running" } else { "idle" });
     // Presentation metadata (Management `cutex/session/metadata/update`).
     // `displayName` above already prefers `displayNameOverride`.
     let presentation = value.as_object_mut().expect("session resource object");
@@ -1248,6 +1221,9 @@ fn prepare_session_projection(
     annotate_continuation_capabilities(&mut value);
     value["pauseReasons"]=pause_reasons;
     value["pauseReasonsAvailable"]=json!(pause_reasons_available);
+    value["autoRetry"] = serde_json::to_value(context.auto_retry(record,
+        runtime_status.as_ref().and_then(|s| s.active_turn_id.as_deref()),
+        ),)?;
     let fingerprint_base = session_fingerprint_base(&value)?;
     Ok(PreparedSessionProjection {
         value,
@@ -1337,199 +1313,27 @@ fn registration_class_value(record: &CutexSessionRecord) -> anyhow::Result<Value
     }
 }
 
-fn with_projection_entry<T>(
-    cutex_session_id: &str,
-    action: impl FnOnce(&mut SessionProjectionEntry) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    with_projection_store_tracking(|store| update_projection_entry(store, cutex_session_id, action))
+pub(super) fn projection_repository(root: &Path) -> anyhow::Result<super::session_row_store::Repository<SessionProjectionEntry>> {
+    super::session_row_store::Repository::open(root, "session-projection", SESSION_PROJECTION_FILE, |entry| {
+        anyhow::ensure!(entry.revision > 0 && entry.revision <= super::model::MAX_SAFE_SEQUENCE,
+            "invalid session projection revision");
+        anyhow::ensure!(entry.focus.revision > 0 && entry.focus.revision <= super::model::MAX_SAFE_SEQUENCE,
+            "invalid session focus revision");
+        Ok(())
+    })
 }
 
-fn update_projection_entry<T>(
-    store: &mut SessionProjectionStore,
-    cutex_session_id: &str,
-    action: impl FnOnce(&mut SessionProjectionEntry) -> anyhow::Result<T>,
-) -> anyhow::Result<(T, bool)> {
-    // Only this entry can change. Compare every persisted field, including
-    // focus/revision, and treat inserting even a default entry as a change.
-    let before = store.sessions.get(cutex_session_id).cloned();
-    let entry = store
-        .sessions
-        .entry(cutex_session_id.to_string())
-        .or_default();
-    let result = action(entry)?;
-    Ok((result, before.as_ref() != Some(entry)))
+fn with_projection_entry_at<T>(root: &Path, id: &str,
+    action: impl FnOnce(&mut SessionProjectionEntry) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    projection_repository(root)?.update(id, |deleted, row| {
+        anyhow::ensure!(!deleted,"deleted session projection");
+        action(row.get_or_insert_with(Default::default))
+    })
 }
 
-fn with_projection_store_tracking<T>(
-    action: impl FnOnce(&mut SessionProjectionStore) -> anyhow::Result<(T, bool)>,
-) -> anyhow::Result<T> {
-    with_projection_store_at(
-        &runtime_dir()?.join("management-v2"),
-        SESSION_PROJECTION_LOCK.get_or_init(|| Mutex::new(None)),
-        action,
-    )
-}
-
-fn with_projection_store_at<T>(
-    root: &Path,
-    cache: &Mutex<Option<CachedProjectionStore>>,
-    action: impl FnOnce(&mut SessionProjectionStore) -> anyhow::Result<(T, bool)>,
-) -> anyhow::Result<T> {
-    use crate::platform::file_stamp::FileStamp;
-    let mut cache = cache
-        .lock()
-        .map_err(|_| anyhow::anyhow!("management v2 session projection lock was poisoned"))?;
-    fs::create_dir_all(root)?;
-    secure_directory(root)?;
-    let lock_path = root.join(SESSION_PROJECTION_LOCK_FILE);
-    let lock_file = open_private_lock(&lock_path)?;
-    lock_file.lock()?;
-    let result = (|| {
-        let path = root.join(SESSION_PROJECTION_FILE);
-        // Every session read goes through here (2-3 per second from clients
-        // on the Linux host, 2026-10-09) and used to parse and rewrite the file each
-        // time. Reuse the parsed version while the file is unchanged and
-        // write only a changed serialization.
-        let stamp = FileStamp::of(&path);
-        let cached = cache
-            .take()
-            .filter(|entry| entry.path == path && stamp.as_ref() == Some(&entry.stamp));
-        let cache_hit = cached.is_some();
-        let (mut store, before) = match cached {
-            Some(entry) => (entry.store, Some(entry.bytes)),
-            None => match fs::read(&path) {
-                Ok(bytes) => (
-                    parse_projection_store(&path, &bytes)?,
-                    (FileStamp::of(&path) == stamp).then(|| projection_digest(&bytes)),
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    (empty_projection_store(), None)
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "Failed to read management v2 session projections: {}",
-                            path.display()
-                        )
-                    })
-                }
-            },
-        };
-        let (result, changed) = action(&mut store)?;
-        if cache_hit && !changed {
-            // A cold/external reload still takes the original serialization
-            // path (normalization/version checks). Only a validated cached
-            // no-op may preserve its canonical bytes without serializing.
-            *cache = Some(CachedProjectionStore {
-                path: path.clone(),
-                stamp: stamp.expect("cache hit has a stamp"),
-                bytes: before.expect("cache hit has a digest"),
-                store,
-            });
-            return Ok(result);
-        }
-        #[cfg(test)]
-        PROJECTION_SERIALIZATIONS.with(|count| count.set(count.get() + 1));
-        let data = serde_json::to_vec_pretty(&store)
-            .context("Failed to serialize management v2 session projections")?;
-        let after = projection_digest(&data);
-        if before == Some(after) {
-            if let Some(stamp) = stamp {
-                *cache = Some(CachedProjectionStore {
-                    path: path.clone(),
-                    stamp,
-                    bytes: after,
-                    store,
-                });
-            }
-            return Ok(result);
-        }
-        crate::config::atomic::write_private_bytes_atomic(&path, &data)
-            .context("Failed to write management v2 session projections")?;
-        if let Some(stamp) = FileStamp::of(&path) {
-            *cache = Some(CachedProjectionStore {
-                path: path.clone(),
-                stamp,
-                bytes: after,
-                store,
-            });
-        }
-        Ok(result)
-    })();
-    let unlock = lock_file.unlock();
-    if result.is_ok() {
-        unlock?;
-    }
-    result
-}
-
-fn parse_projection_store(path: &Path, bytes: &[u8]) -> anyhow::Result<SessionProjectionStore> {
-    let store: SessionProjectionStore = serde_json::from_slice(bytes).with_context(|| {
-        format!(
-            "Failed to parse management v2 session projections: {}",
-            path.display()
-        )
-    })?;
-    if store.version != 1 {
-        anyhow::bail!("unsupported management v2 session projection version");
-    }
-    Ok(store)
-}
-
-fn empty_projection_store() -> SessionProjectionStore {
-    SessionProjectionStore {
-        version: 1,
-        sessions: Default::default(),
-    }
-}
-
-fn open_private_lock(path: &Path) -> anyhow::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.mode(0o600);
-    }
-    let file = options.open(path)?;
-    secure_file(path)?;
-    Ok(file)
-}
-
-#[cfg(unix)]
-fn secure_directory(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn secure_directory(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn secure_file(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn secure_file(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-#[cfg(test)]
-thread_local! { static PROJECTION_SERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-
-/// Projection-file serializations on the calling thread (benchmarks).
-#[cfg(test)]
-pub(crate) fn projection_serializations_on_this_thread() -> usize {
-    PROJECTION_SERIALIZATIONS.with(|count| count.get())
+fn with_projection_entry<T>(id: &str,
+    action: impl FnOnce(&mut SessionProjectionEntry) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    with_projection_entry_at(&runtime_dir()?.join("management-v2"), id, action)
 }
 
 #[cfg(test)]
@@ -1548,6 +1352,7 @@ mod tests {
         record.host_id = "online-submit-host".into();
         record.registration_class = AgentRegistrationClass::LocalOnly;
         let status = AppServerManagedRuntimeStatus {
+            background_work: Default::default(),
             cutex_session_id: record.cutex_session_id.clone(), thread_id: "online-submit-thread".into(),
             runtime_generation: 7, connected: true, active_turn_id: Some("busy-turn".into()),
             active_turn_observed_at: None, thread_status: None, thread_status_observed_at: None,
@@ -1560,6 +1365,24 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_projection_reports_unknown_turn_even_with_stale_running_snapshot() {
+        let _home = crate::config::paths::test_home_env_lock();
+        let (mut record, mut status) = online_submit_fixture();
+        record.cutex_session_id = format!("cutex.disconnected-{}", Uuid::new_v4());
+        status.cutex_session_id = record.cutex_session_id.clone();
+        status.connected = false;
+        status.thread_status = Some(json!({"type":"active"}));
+        status.last_error = Some("transport lost".into());
+        let value = prepare_session_projection(&record, true, Some(status), None,
+            &json!({}), &ProjectionContext::default(),).unwrap().value;
+        assert_eq!(value["runtime"]["turnState"], "unknown");
+        assert!(value["runtime"]["activeTurnId"].is_null());
+        assert!(value["runtime"]["activeTurnObservedAt"].is_null());
+        assert_eq!(value["runtime"]["threadStatus"]["type"], "unknown");
+        assert_eq!(value["runtime"]["appServerConnected"], false);
+    }
+
+    #[test]
     fn stopped_runtime_snapshot_clears_only_the_matching_requested_error() {
         let _home = crate::config::paths::test_home_env_lock();
         use crate::session::runtime_stop::RequestedStop;
@@ -1568,8 +1391,9 @@ mod tests {
         status.cutex_session_id = record.cutex_session_id.clone();
         status.connected = false;
         status.last_error = Some("connection reset (os error 10054)".into());
-        let project = |status| prepare_session_projection(&record, true, Some(status), None,
-            &json!({}), &ProjectionContext::default()).unwrap().value;
+        let project = |status| { prepare_session_projection(&record, true, Some(status), None,
+            &json!({}), &ProjectionContext::default(),).unwrap().value
+        };
         assert_eq!(project(status.clone())["runtime"]["status"], "error");
         assert_eq!(project(status.clone())["runtime"]["continuationWakeKinds"], json!(["after", "children"]));
         assert_eq!(project(status.clone())["runtime"]["continuationChildKinds"], json!(["delegation"]));
@@ -1684,7 +1508,7 @@ mod tests {
                 "claude_home":"fixture","tui_binary":"fixture"},
             "thread_id":"claude-app-server-thread","state_dir":"fixture","model":"fixture",
             "native_session_id":"different-native-history-id"
-        })).unwrap());
+        })).unwrap(),);
         // A manager still reporting the Codex/history binding cannot use the fast path.
         assert!(online_submit_snapshot(&record, Some(&status)).is_none());
         status.thread_id = "claude-app-server-thread".into();
@@ -1693,315 +1517,6 @@ mod tests {
         assert_eq!(snapshot["runtime"]["runtimeGeneration"], record.runtime_generation);
     }
 
-
-    struct ProjectionFixture {
-        root: PathBuf,
-        cache: Mutex<Option<CachedProjectionStore>>,
-    }
-
-    impl ProjectionFixture {
-        fn new() -> Self {
-            let root =
-                std::env::temp_dir().join(format!("cutex-projection-private-{}", Uuid::new_v4()));
-            fs::create_dir(&root).unwrap();
-            secure_directory(&root).unwrap();
-            Self {
-                root,
-                cache: Mutex::new(None),
-            }
-        }
-
-        fn entry<T>(
-            &self,
-            id: &str,
-            action: impl FnOnce(&mut SessionProjectionEntry) -> anyhow::Result<T>,
-        ) -> anyhow::Result<T> {
-            with_projection_store_at(&self.root, &self.cache, |store| {
-                update_projection_entry(store, id, action)
-            })
-        }
-
-        fn read(&self) -> SessionProjectionStore {
-            serde_json::from_slice(&fs::read(self.root.join(SESSION_PROJECTION_FILE)).unwrap())
-                .unwrap()
-        }
-    }
-
-    impl Drop for ProjectionFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    #[test]
-    fn projection_cached_noop_skips_store_serialization_and_write() {
-        let fixture = ProjectionFixture::new();
-        fixture
-            .entry("target", |entry| {
-                entry.fingerprint = "original".into();
-                Ok(())
-            })
-            .unwrap();
-        let path = fixture.root.join(SESSION_PROJECTION_FILE);
-        let stamp = crate::platform::file_stamp::FileStamp::of(&path);
-        let before = fs::read(&path).unwrap();
-        PROJECTION_SERIALIZATIONS.with(|count| count.set(0));
-        for _ in 0..3 {
-            fixture.entry("target", |entry| Ok(entry.revision)).unwrap();
-        }
-        assert_eq!(PROJECTION_SERIALIZATIONS.with(|count| count.get()), 0);
-        assert_eq!(crate::platform::file_stamp::FileStamp::of(&path), stamp);
-        assert_eq!(fs::read(path).unwrap(), before);
-    }
-
-    #[test]
-    fn projection_entry_changes_and_default_insert_persist() {
-        let fixture = ProjectionFixture::new();
-        fixture.entry("target", |_| Ok(())).unwrap();
-        assert!(
-            fixture.read().sessions.contains_key("target"),
-            "default insertion is still a change"
-        );
-        fixture
-            .entry("other", |entry| {
-                entry.fingerprint = "keep".into();
-                Ok(())
-            })
-            .unwrap();
-        PROJECTION_SERIALIZATIONS.with(|count| count.set(0));
-        fixture
-            .entry("target", |entry| {
-                entry.revision = 9;
-                entry.fingerprint = "next".into();
-                entry.focus.mobile_muted = true;
-                entry.focus.updated_at = Some("fixture-time".into());
-                Ok(())
-            })
-            .unwrap();
-        let persisted = fixture.read();
-        assert_eq!(persisted.sessions["target"].revision, 9);
-        assert!(persisted.sessions["target"].focus.mobile_muted);
-        assert_eq!(
-            persisted.sessions["target"].focus.updated_at.as_deref(),
-            Some("fixture-time")
-        );
-        assert_eq!(persisted.sessions["other"].fingerprint, "keep");
-        assert_eq!(PROJECTION_SERIALIZATIONS.with(|count| count.get()), 1);
-        // A focus-only edit must not be mistaken for an unchanged fingerprint.
-        fixture
-            .entry("target", |entry| {
-                entry.focus.revision += 1;
-                entry.focus.owner = "desktop".into();
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(fixture.read().sessions["target"].focus.owner, "desktop");
-        assert_eq!(PROJECTION_SERIALIZATIONS.with(|count| count.get()), 2);
-    }
-
-    #[test]
-    fn projection_external_reload_and_failed_action_do_not_reuse_stale_cache() {
-        let fixture = ProjectionFixture::new();
-        fixture.entry("target", |_| Ok(())).unwrap();
-        let path = fixture.root.join(SESSION_PROJECTION_FILE);
-        let mut external = fixture.read();
-        external.sessions.get_mut("target").unwrap().fingerprint = "external".into();
-        // Simulate another process under the same file protocol; atomic replace
-        // invalidates the file-identity stamp even at identical mtime/length.
-        crate::config::atomic::write_private_pretty_json_atomic(&path, &external, "fixture")
-            .unwrap();
-        PROJECTION_SERIALIZATIONS.with(|count| count.set(0));
-        assert_eq!(
-            fixture
-                .entry("target", |entry| Ok(entry.fingerprint.clone()))
-                .unwrap(),
-            "external"
-        );
-        assert_eq!(
-            PROJECTION_SERIALIZATIONS.with(|count| count.get()),
-            1,
-            "cold reload preserves canonicalization"
-        );
-        let result: anyhow::Result<()> = fixture.entry("target", |entry| {
-            entry.fingerprint = "uncommitted".into();
-            anyhow::bail!("fixture failure")
-        });
-        assert!(result.is_err());
-        assert!(fixture.cache.lock().unwrap().is_none());
-        assert_eq!(
-            fixture
-                .entry("target", |entry| Ok(entry.fingerprint.clone()))
-                .unwrap(),
-            "external"
-        );
-        fs::write(&path, br#"{"version":99,"sessions":{}}"#).unwrap();
-        assert!(
-            fixture.entry("target", |_| Ok(())).is_err(),
-            "unknown schema is still refused"
-        );
-    }
-
-    #[test]
-    fn projection_other_session_events_preserve_bytes_stamp_and_revision() {
-        use super::super::model::{CutexMessage, EventCorrelation, EventSource, PendingEvent};
-        use crate::platform::file_stamp::FileStamp;
-        let fixture = ProjectionFixture::new();
-        let repository =
-            EventRepository::open(fixture.root.join("events"), "fixture-host").unwrap();
-        let record = |name: &str| {
-            CutexSessionRecord::new_at(
-                format!("cutex.{name}"),
-                Some(format!("thread-{name}")),
-                "fixture-host".into(),
-                fixture.root.to_string_lossy().into_owned(),
-                Some("fixture-profile".into()),
-                "2026-10-14T00:00:00Z".into(),
-            )
-            .unwrap()
-        };
-        let mut a = record("a");
-        let b = record("b");
-        let project = |record: &CutexSessionRecord, metadata: &Value| {
-            fixture
-                .entry(&record.cutex_session_id, |entry| {
-                    project_session_entry(record, true, None, None, metadata, entry)
-                })
-                .unwrap()
-        };
-        let initial_metadata = management_identity(&repository).unwrap();
-        let initial_a = project(&a, &initial_metadata);
-        project(&b, &initial_metadata);
-        let path = fixture.root.join(SESSION_PROJECTION_FILE);
-        let initial_bytes = fs::read(&path).unwrap();
-        let initial_stamp = FileStamp::of(&path);
-        let initial_revision = fixture.read().sessions[&a.cutex_session_id].revision;
-        let event = repository
-            .append(PendingEvent {
-                cutex_session_id: b.cutex_session_id.clone(),
-                host_id: "fixture-host".into(),
-                source: EventSource::Cutex,
-                schema: None,
-                correlation: EventCorrelation::default(),
-                native: None,
-                cutex: Some(CutexMessage {
-                    method: "cutex/test/event".into(),
-                    params: json!({}),
-                }),
-            })
-            .unwrap();
-        let latest_metadata = management_identity(&repository).unwrap();
-        assert_ne!(
-            latest_metadata["eventStream"],
-            initial_metadata["eventStream"]
-        );
-        let latest_a = project(&a, &latest_metadata);
-        project(&b, &latest_metadata);
-        assert_eq!(
-            latest_a.pointer("/management/eventStream/latest/sequence"),
-            Some(&json!(event.sequence))
-        );
-        assert_eq!(latest_a["revision"], initial_a["revision"]);
-        assert_eq!(
-            fixture.read().sessions[&a.cutex_session_id].revision,
-            initial_revision
-        );
-        assert_eq!(fs::read(&path).unwrap(), initial_bytes);
-        assert_eq!(FileStamp::of(&path), initial_stamp);
-        // The summary's bulk path also produces identical persisted bytes.
-        with_projection_store_at(&fixture.root, &fixture.cache, |store| {
-            for record in [&a, &b] {
-                project_session_entry(
-                    record,
-                    true,
-                    None,
-                    None,
-                    &latest_metadata,
-                    store.sessions.get_mut(&record.cutex_session_id).unwrap(),
-                )?;
-            }
-            Ok(((), true))
-        })
-        .unwrap();
-        assert_eq!(fs::read(&path).unwrap(), initial_bytes);
-        assert_eq!(FileStamp::of(&path), initial_stamp);
-
-        a.display_name_override = Some("changed fixture".into());
-        a.revision += 1;
-        let changed_a = project(&a, &latest_metadata);
-        assert_eq!(changed_a["revision"], json!(a.durable_revision()));
-        assert_eq!(
-            fixture.read().sessions[&a.cutex_session_id].revision,
-            initial_revision + 1
-        );
-        assert_ne!(fs::read(&path).unwrap(), initial_bytes);
-        assert_ne!(FileStamp::of(&path), initial_stamp);
-        let changed_stamp = FileStamp::of(&path);
-        fixture
-            .entry(&a.cutex_session_id, |entry| {
-                entry.focus.mobile_muted = true;
-                entry.focus.revision += 1;
-                project_session_entry(&a, true, None, None, &latest_metadata, entry)
-            })
-            .unwrap();
-        assert!(
-            fixture.read().sessions[&a.cutex_session_id]
-                .focus
-                .mobile_muted
-        );
-        assert_eq!(
-            fixture.read().sessions[&a.cutex_session_id].revision,
-            initial_revision + 2
-        );
-        assert_ne!(FileStamp::of(&path), changed_stamp);
-    }
-
-    #[test]
-    #[ignore = "private synthetic projection performance comparison"]
-    fn projection_noop_470_entries_benchmark() {
-        use std::time::Instant;
-        let fixture = ProjectionFixture::new();
-        with_projection_store_at(&fixture.root, &fixture.cache, |store| {
-            for index in 0..470 {
-                let mut entry = SessionProjectionEntry::default();
-                entry.fingerprint = format!("synthetic-{index:03}-{}", "x".repeat(3300));
-                entry.focus.updated_at = Some("2026-10-14T00:00:00Z".into());
-                store
-                    .sessions
-                    .insert(format!("cutex.fixture-{index:03}"), entry);
-            }
-            Ok(((), true))
-        })
-        .unwrap();
-        let bytes = fs::metadata(fixture.root.join(SESSION_PROJECTION_FILE))
-            .unwrap()
-            .len();
-        let started = Instant::now();
-        PROJECTION_SERIALIZATIONS.with(|count| count.set(0));
-        for _ in 0..50 {
-            with_projection_store_at(&fixture.root, &fixture.cache, |store| {
-                let (result, _) =
-                    update_projection_entry(
-                        store,
-                        "cutex.fixture-000",
-                        |entry| Ok(entry.revision),
-                    )?;
-                Ok((result, true)) // original unconditional serialize/digest path
-            })
-            .unwrap();
-        }
-        let baseline = started.elapsed();
-        assert_eq!(PROJECTION_SERIALIZATIONS.with(|count| count.get()), 50);
-        let started = Instant::now();
-        PROJECTION_SERIALIZATIONS.with(|count| count.set(0));
-        for _ in 0..50 {
-            fixture
-                .entry("cutex.fixture-000", |entry| Ok(entry.revision))
-                .unwrap();
-        }
-        let optimized = started.elapsed();
-        assert_eq!(PROJECTION_SERIALIZATIONS.with(|count| count.get()), 0);
-        eprintln!("projection-noop fixture_entries=470 fixture_bytes={bytes} calls=50 baseline_us={} optimized_us={}", baseline.as_micros(), optimized.as_micros());
-    }
 
     struct IsolatedTestHome {
         root: PathBuf,
@@ -2058,32 +1573,6 @@ mod tests {
         fs::create_dir(path)
     }
 
-    #[test]
-    fn unchanged_projection_reads_do_not_rewrite_and_see_other_writers() {
-        use crate::platform::file_stamp::FileStamp;
-        let home = IsolatedTestHome::new("cutex-projection-cache").unwrap();
-        let id = "cutex.projection-cache";
-        let first = focus_resource(id).unwrap();
-        let path = runtime_dir().unwrap().join("management-v2").join(SESSION_PROJECTION_FILE);
-        let stamp = FileStamp::of(&path).expect("first read creates the entry");
-        // Reads that change nothing neither rewrite nor alter the answer.
-        for _ in 0..3 {
-            assert_eq!(focus_resource(id).unwrap(), first);
-        }
-        assert_eq!(FileStamp::of(&path).unwrap(), stamp, "no-op reads must not rewrite");
-        // A real change is written and seen.
-        let focused = set_focus(id, None, "pc", false, None).unwrap();
-        assert_ne!(FileStamp::of(&path).unwrap(), stamp);
-        assert_eq!(focus_resource(id).unwrap(), focused);
-        // Another writer (atomic replace) is seen through the cache.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut store = parse_projection_store(&path, &fs::read(&path).unwrap()).unwrap();
-        store.sessions.get_mut(id).unwrap().focus.owner = "mobile".into();
-        crate::config::atomic::write_private_bytes_atomic(&path, &serde_json::to_vec_pretty(&store).unwrap())
-            .unwrap();
-        assert_eq!(focus_resource(id).unwrap()["owner"], "mobile");
-        drop(home);
-    }
 
     #[test]
     fn backend_names_match_frozen_contract() {
@@ -2154,6 +1643,7 @@ mod tests {
         record.cutex_session_id = "cutex-native-state".to_string();
         record.runtime_generation = 7;
         let runtime_status = AppServerManagedRuntimeStatus {
+            background_work: Default::default(),
             cutex_session_id: record.cutex_session_id.clone(),
             thread_id: "thread-native-state".to_string(),
             runtime_generation: 7,
@@ -2216,6 +1706,17 @@ mod tests {
                 display_text: "Command".to_string(),
                 updated_at: "2026-07-24T00:00:04Z".to_string(),
                 runtime_generation: 7,
+            }),
+            // The profile it ran on stays in the store, not the resource.
+            last_turn_error: Some(super::super::activity::LastTurnError {
+                turn_id: Some("turn-failed".to_string()),
+                message: "unexpected status 401 Unauthorized".to_string(),
+                code: "unauthorized".to_string(),
+                codex_error_info: json!({"httpConnectionFailed": {"httpStatusCode": 401}}),
+                at: "2026-07-24T00:00:06Z".to_string(),
+                consecutive: 2,
+                profile_id: Some("acct-1".to_string()),
+                profile_name: Some("work".to_string()),
             }),
             ..SessionActivityState::default()
         };
@@ -2300,6 +1801,14 @@ mod tests {
                 // Derived for a state written before session-conversation-activity.
                 "lastTurnStartedAt": null,
                 "lastConversationAt": "2026-07-24T00:00:06Z",
+                "lastTurnError": {
+                    "turnId": "turn-failed",
+                    "message": "unexpected status 401 Unauthorized",
+                    "code": "unauthorized",
+                    "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}},
+                    "at": "2026-07-24T00:00:06Z",
+                    "consecutive": 2
+                },
                 "lastOutput": {
                     "cutexSessionId": "cutex-test-session",
                     "assignmentId": "assignment-1",
@@ -2340,6 +1849,38 @@ mod tests {
             later_resource.pointer("/activity/lastOutputAt"),
             Some(&json!("2026-07-24T00:00:07Z"))
         );
+    }
+
+    #[test]
+    fn session_resource_and_list_projection_expose_live_retry_and_revision_changes() {
+        use super::super::model_overload_retry::{Phase,State};
+        let mut record = CutexSessionRecord::from_codex_session_id("retry-thread").unwrap();
+        record.cutex_session_id = "retry-session".into();
+        record.runtime_generation = 7;
+        let mut state = State::default();
+        state.terminal("retry-session", "retry-thread", 7,
+            &json!({"id":"failed","status":"failed","error":{"codexErrorInfo":"serverOverloaded"}}),
+            None, Utc::now(),);
+        let project = |state: State, entry: &mut SessionProjectionEntry| {
+            let context = ProjectionContext::default();
+            context.overload_retry.set(Some((state, Default::default()))).unwrap();
+            context.pause_views.set(Some(Default::default())).unwrap();
+            apply_session_projection(prepare_session_projection(&record, true, None, None, &json!({}), &context).unwrap(), entry,).unwrap()
+        };
+        let mut entry = SessionProjectionEntry::default();
+        let resource = project(state.clone(), &mut entry);
+        assert_eq!(resource["autoRetry"]["turnId"], "failed");
+        assert_eq!(resource["autoRetry"]["phase"], "pending");
+        assert_eq!(resource["autoRetry"]["holdsAdmission"], false);
+        let revision = entry.revision;
+        state.sessions.get_mut("retry-session").unwrap().plan.as_mut().unwrap().phase = Phase::Firing;
+        assert_eq!(project(state.clone(), &mut entry)["autoRetry"]["phase"], "firing");
+        assert!(entry.revision > revision, "retry transitions change the common session/list fingerprint");
+        state.sessions.get_mut("retry-session").unwrap().plan.as_mut().unwrap().phase = Phase::Running;
+        assert_eq!(project(state.clone(), &mut entry).get("autoRetry"), Some(&Value::Null));
+        let p = state.sessions.get_mut("retry-session").unwrap().plan.as_mut().unwrap();
+        p.phase = Phase::Pending; p.runtime_generation = 6;
+        assert_eq!(project(state, &mut entry).get("autoRetry"), Some(&Value::Null));
     }
 
     #[test]
@@ -2507,19 +2048,19 @@ mod tests {
         let isolated_home =
             IsolatedTestHome::new("cutex-hidden-root-test").expect("create isolated test HOME");
         let mut hidden = CutexSessionRecord::from_codex_session_id(
-            "018a0000-0000-7000-8000-00000000a001",
+            "018a0000-0000-7000-8000-00000000a001"
         )
         .expect("durable test session");
         hidden.registration_class = AgentRegistrationClass::Persistent;
         hidden.exposed_to_backend = false;
         let mut shown = CutexSessionRecord::from_codex_session_id(
-            "018a0000-0000-7000-8000-00000000a002",
+            "018a0000-0000-7000-8000-00000000a002"
         )
         .expect("durable test session");
         shown.registration_class = AgentRegistrationClass::Persistent;
         shown.exposed_to_backend = true;
         let mut local = CutexSessionRecord::from_codex_session_id(
-            "018a0000-0000-7000-8000-00000000a003",
+            "018a0000-0000-7000-8000-00000000a003"
         )
         .expect("local-only test session");
         local.registration_class = AgentRegistrationClass::LocalOnly;
@@ -2585,7 +2126,7 @@ mod tests {
             .expect("unexposed durable session resolves");
         assert_eq!(exact["visible"], true);
         let exact =
-            session_resource_including_hidden(&hidden_id, &registry, no_runtime_status, &repository)
+            session_resource_including_hidden(&hidden_id, &registry, no_runtime_status, &repository,)
                 .expect("root exact")
                 .expect("session resolves for root");
         assert_eq!(exact["visible"], true);
@@ -2597,7 +2138,6 @@ mod tests {
     /// change shows on the next listing.
     #[test]
     fn unchanged_listings_skip_projection_writes_and_see_config_changes() {
-        use crate::platform::file_stamp::FileStamp;
         let isolated_home =
             IsolatedTestHome::new("cutex-list-projection-test").expect("create isolated test HOME");
         let mut store = crate::session::store::load_cutex_session_store().expect("empty store");
@@ -2637,13 +2177,12 @@ mod tests {
         };
         let first = list();
         assert_eq!(launches(&first), vec![json!("first"); 3]);
-        let path = runtime_dir().unwrap().join("management-v2").join(SESSION_PROJECTION_FILE);
-        let stamp = FileStamp::of(&path).expect("first listing writes the entries");
+        let path = runtime_dir().unwrap().join("management-v2").join("session-projection.sqlite3");
         let projection_revision = |id: &str| {
-            parse_projection_store(&path, &fs::read(&path).unwrap()).unwrap().sessions[id].revision
+            projection_repository(path.parent().unwrap()).unwrap().get(id).unwrap().unwrap().revision
         };
         let revision = projection_revision(&ids[0]);
-        let serialized = projection_serializations_on_this_thread();
+        let encoded = crate::store::metrics::store_counters("session-projection").bytes_encoded;
         let stable_rows = |mut value:Value| {
             for row in value["sessions"].as_array_mut().unwrap() {
                 // Activity observation is request-time evidence, not a
@@ -2656,8 +2195,7 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(stable_rows(list()),stable_rows(first.clone()));
         }
-        assert_eq!(projection_serializations_on_this_thread(), serialized);
-        assert_eq!(FileStamp::of(&path).unwrap(), stamp, "unchanged listings must not rewrite");
+        assert_eq!(crate::store::metrics::store_counters("session-projection").bytes_encoded, encoded);
 
         // A config change is visible on the next request and counts as a change.
         set_default(Some("second"));
@@ -2733,11 +2271,15 @@ mod tests {
         record.runtime_generation = 4;
         record.current_runtime_agent_id = Some("stale-runtime".to_string());
         record.note = Some("reviewer".to_string());
+        record.formal_agent_name=Some("Archived formal name".into());
+        record.display_name_override=Some("Owner archive alias".into());
 
         let resource = retired_session_resource_value(&record, None);
 
         // Presentation fields stay (the desktop lists archived agents with them).
         assert_eq!(resource["note"], "reviewer");
+        assert_eq!(resource["formalAgentName"],"Archived formal name");
+        assert_eq!(resource["displayName"],"Owner archive alias");
         assert_eq!(resource["createdBy"],Value::Null,"legacy provenance is never inferred from an archived agent's name or ownership");
         record.created_by=Some(crate::session::model::SessionCreatedBy::Agent {
             cutex_session_id:crate::role_revision::CutexSessionId::new("cutex.original-director").unwrap(),
@@ -2745,7 +2287,7 @@ mod tests {
         });
         let with_creator=retired_session_resource_value(&record,None);
         assert_eq!(with_creator["createdBy"],json!({"kind":"agent","cutexSessionId":"cutex.original-director","role":"director"}));
-        for key in ["avatar", "avatarMode", "createdBy", "displayNameOverride", "formalAgentName", "effectiveNextLaunch"] {
+        for key in ["avatar", "avatarMode", "createdBy", "displayNameOverride", "formalAgentName", "effectiveNextLaunch",] {
             assert!(resource.get(key).is_some(), "{key}");
         }
         assert_eq!(resource["lifecycle"], "retired");
@@ -2765,7 +2307,8 @@ mod tests {
                 "lastTurnCompletedAt": null,
                 "lastFileChangeAt": null,
                 "lastTurnStartedAt": null,
-                "lastConversationAt": null
+                "lastConversationAt": null,
+                "lastTurnError": null
             }))
         );
     }

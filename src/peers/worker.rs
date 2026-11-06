@@ -1213,7 +1213,7 @@ mod source_routing_tests {
         remote.request.request_sha256 = remote.request.digest();
         remote.sync.pending_ops = vec![Op { op_id:"pop-fresh-pause".into(),op:"create".into(),outcome:None,reason:None }];
         let original_request = remote.request.clone();
-        state.asks.insert(ask.ask_id.clone(),ask.clone());
+        state.asks.insert(ask.ask_id.clone(),ask.clone().into());
         assert!(ask.routing_request.is_none(), "exercise a legacy queued create");
         test_support::configure(&mut state,&fixture,now).unwrap();
         let ctx = routing::trusted_context(&fixture.snapshot,"alpha",RoutingActor::Owner,&host).unwrap();
@@ -1267,7 +1267,7 @@ mod source_routing_tests {
             reason: None,
         }];
         let original_request = remote.request.clone();
-        state.asks.insert(ask.ask_id.clone(), ask.clone());
+        state.asks.insert(ask.ask_id.clone(), ask.clone().into());
         let original_action = ask.action_id.clone();
         let denied = prepare_create(
             &mut state,
@@ -1388,7 +1388,7 @@ mod source_routing_tests {
             outcome: None,
             reason: None,
         }];
-        state.asks.insert(ask.ask_id.clone(), ask.clone());
+        state.asks.insert(ask.ask_id.clone(), ask.clone().into());
         test_support::configure(&mut state, &fixture, Utc::now()).unwrap();
         assert_eq!(
             prepare_create(

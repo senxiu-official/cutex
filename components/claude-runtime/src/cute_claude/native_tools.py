@@ -4,7 +4,7 @@ Claude Code's built-in tools are projected onto the Codex v2 item types that
 app-server frontends already render. The mapping is presentation only; the
 official runtime still decides, runs and records every tool call:
 
-- ``Bash`` -> ``commandExecution``; ``Read``/``Grep``/``Glob``/``LS`` ->
+- ``Bash``/``PowerShell`` -> ``commandExecution``; ``Read``/``Grep``/``Glob``/``LS`` ->
   ``commandExecution`` whose ``commandActions`` say read / search / listFiles
 - ``Edit``/``MultiEdit``/``Write``/``NotebookEdit`` -> ``fileChange`` plus an
   aggregated per-turn ``turn/diff/updated``
@@ -42,7 +42,8 @@ UNSUPPORTED = ['EnterPlanMode', 'ExitPlanMode',
                'Monitor', 'Workflow', 'EnterWorktree', 'ExitWorktree',
                'SendMessage', 'ListAgents', 'SendFile']
 
-COMMAND_TOOLS = {'Bash', 'Read', 'Grep', 'Glob', 'LS'}
+SHELL_TOOLS = {'Bash', 'PowerShell'}
+COMMAND_TOOLS = SHELL_TOOLS | {'Read', 'Grep', 'Glob', 'LS'}
 EDIT_TOOLS = {'Edit', 'MultiEdit', 'Write', 'NotebookEdit'}
 TODO_TOOL = 'TodoWrite'
 TASK_TOOLS = {'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet'}
@@ -182,7 +183,7 @@ def text_of(value):
 
 def command_spec(name, arguments, workspace):
     """Display command and Codex commandActions for a command-like native tool."""
-    if name == 'Bash':
+    if name in SHELL_TOOLS:
         command = str(arguments.get('command', ''))
         return command, [{'type': 'unknown', 'command': command}]
     if name == 'Read':
@@ -201,7 +202,7 @@ def command_spec(name, arguments, workspace):
 
 def command_output(name, response):
     """aggregatedOutput for a successful command-like tool."""
-    if name == 'Bash' and isinstance(response, dict):
+    if name in SHELL_TOOLS and isinstance(response, dict):
         parts = [response.get('stdout') or '', response.get('stderr') or '']
         text = '\n'.join(p for p in parts if isinstance(p, str) and p)
         if response.get('backgroundTaskId'):
@@ -566,7 +567,7 @@ class NativeTools:
         duration = int((time.monotonic() - started) * 1000)
         if name in {'Agent', 'Task'} and getattr(b.engine, 'subagents', None) is not None:
             await b.engine.subagents.finished(call_id, success, declined=declined)
-        if name == 'Bash' and success and isinstance(result, dict):
+        if name in SHELL_TOOLS and success and isinstance(result, dict):
             task_id = result.get('backgroundTaskId') or result.get('task_id') or result.get('background_task_id')
             owner = getattr(b.engine.driver, 'owners', {}).get(b.tid)
             if task_id and owner:
@@ -582,13 +583,13 @@ class NativeTools:
         if kind == 'commandExecution':
             if success:
                 output, code = command_output(name, result), 0
-                if name == 'Bash' and isinstance(result, dict) and result.get('interrupted'):
+                if name in SHELL_TOOLS and isinstance(result, dict) and result.get('interrupted'):
                     code = None
             else:
                 output = text_of(result)
-                code = None if declined else (exit_code(output) if name == 'Bash' else 1)
+                code = None if declined else (exit_code(output) if name in SHELL_TOOLS else 1)
             # Reads and searches only need a preview; command output keeps more.
-            limit = OUTPUT_BYTES if name == 'Bash' else 16384
+            limit = OUTPUT_BYTES if name in SHELL_TOOLS else 16384
             item.update(status='completed' if success else ('declined' if declined else 'failed'),
                         aggregatedOutput=bounded(output, limit), exitCode=code, durationMs=duration)
         elif kind == 'fileChange':

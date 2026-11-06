@@ -231,11 +231,7 @@ pub fn materialized_claude_config_dir(account: &StoredAccount) -> PathBuf {
 pub(crate) fn codex_api_key_from_auth_file(path: &Path) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     let json: Value = serde_json::from_str(&raw).ok()?;
-    json.get("OPENAI_API_KEY")
-        .or_else(|| json.get("openai_api_key"))
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    crate::profiles::api_key::from_auth(&json)
         .map(ToOwned::to_owned)
 }
 

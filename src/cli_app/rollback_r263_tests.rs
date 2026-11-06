@@ -326,7 +326,7 @@ fn r263_native_archive_wal_receipts_and_unknown_maps() {
     let f = R263Fixture::new();
     let path = f.0.join("cutex-sessions.sqlite3");
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=1; CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO meta VALUES('store_revision','1'); CREATE TABLE sessions(key TEXT,rev INTEGER,record_json TEXT); CREATE TABLE receipts(map TEXT,key TEXT,rev INTEGER,json TEXT); PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+    db.execute_batch("PRAGMA user_version=1; CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO meta VALUES('store_revision','1'); CREATE TABLE sessions(key TEXT PRIMARY KEY,cutex_session_id TEXT NOT NULL,codex_session_id TEXT,formal_agent_name TEXT,archive_state TEXT NOT NULL,rev INTEGER NOT NULL,record_json TEXT NOT NULL); CREATE TABLE receipts(map TEXT,key TEXT,rev INTEGER,json TEXT); PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
     db.execute(
         "INSERT INTO receipts VALUES('agent_archive','fixture',1,?1)",
         [old_archive_receipt().to_string()],

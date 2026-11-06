@@ -7,10 +7,47 @@
 //! The v1 format and canonical receipts stay readable by r256; r252 ignores this
 //! Director sidecar as before. Pending and unverifiable rows are unbounded.
 use super::*;
+use crate::asks::store::AskStore;
 use std::collections::BTreeSet;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 
 const RESOLVED_ROLE_KEEP: usize = 512;
 const RESOLVED_ROLE_PRUNE_BATCH: usize = 128;
+const ACTIONS_PER_PASS: usize = 128;
+static REQUESTED: AtomicBool = AtomicBool::new(true);
+#[derive(Default)]
+struct Scan {
+    root: std::path::PathBuf,
+    last: Option<String>,
+    retained: Vec<String>,
+}
+static SCAN: Mutex<Option<Scan>> = Mutex::new(None);
+pub(super) fn request_maintenance() {
+    REQUESTED.store(true, Ordering::Relaxed);
+}
+pub(super) fn maintenance() {
+    if !REQUESTED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let result = (|| -> Result<(), AskError> {
+        let roster = crate::agent_management::AgentManagementStore::open_default()
+            .map_err(store::unavailable)?;
+        let Some(_fence) = roster
+            .try_lock_delivery_mutations()
+            .map_err(store::unavailable)?
+        else {
+            request_maintenance();
+            return Ok(());
+        };
+        Store::open_default()?.prune_redundant_role_bookkeeping()
+    })();
+    if result.is_err() {
+        request_maintenance();
+    }
+}
 
 fn queue_id(record: &RoleResolutionReceipt) -> Option<&str> {
     let business = record.business.as_ref()?;
@@ -20,13 +57,22 @@ fn queue_id(record: &RoleResolutionReceipt) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
+#[cfg(test)]
 fn redundant_keys(
     state: &OwnershipState,
     asks: &AskState,
     delivered: &BTreeSet<String>,
 ) -> BTreeSet<String> {
+    redundant_keys_in(state, asks, delivered, asks.actions.iter())
+}
+fn redundant_keys_in<'a>(
+    state: &OwnershipState,
+    asks: &AskState,
+    delivered: &BTreeSet<String>,
+    actions: impl Iterator<Item = (&'a String, &'a crate::asks::store::ActionRecord)>,
+) -> BTreeSet<String> {
     let mut eligible = BTreeSet::new();
-    for (action_key, action) in &asks.actions {
+    for (action_key, action) in actions {
         let Some((caller, action_id)) = action_key.split_once('\u{1f}') else {
             continue;
         };
@@ -121,40 +167,151 @@ impl Store {
     /// Caller holds the lifecycle mutation fence. Collect bus proof before any
     /// ask/Director write lock; a failed/absent bus read is never terminal proof.
     pub(super) fn prune_redundant_role_bookkeeping(&self) -> Result<(), AskError> {
+        let asks = crate::asks::store::AskStore::open_default().map_err(store::unavailable)?;
+        let repository = std::cell::OnceCell::new();
+        self.prune_redundant_in(&asks, |id| {
+            repository
+                .get_or_init(crate::management::v2::agent_bus_state::agent_bus_message_repository)
+                .as_ref()
+                .ok()
+                .and_then(|repository| repository.message_state(id).ok().flatten())
+                .is_some_and(|(state, _)| state == "delivered")
+        })
+    }
+    fn prune_redundant_in(
+        &self,
+        asks: &AskStore,
+        delivered_proof: impl Fn(&str) -> bool,
+    ) -> Result<(), AskError> {
         let snapshot = self.snapshot()?;
         if snapshot.role_resolutions.len() <= RESOLVED_ROLE_KEEP {
             return Ok(());
         }
-        let mut delivered = BTreeSet::new();
-        if let Ok(repository) =
-            crate::management::v2::agent_bus_state::agent_bus_message_repository()
-        {
-            for id in snapshot.role_resolutions.values().filter_map(queue_id) {
-                if repository
-                    .message_state(id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|(state, _)| state == "delivered")
-                {
-                    delivered.insert(id.to_owned());
+        let shared = asks.shared().map_err(store::unavailable)?;
+        // A moving cursor bounds fresh canonical action inspection. Carry at
+        // most KEEP previously proven candidates across passes so sparse
+        // terminal records can still reach the pruning threshold. Every one
+        // is re-proved below; the cursor/pool never authorizes a deletion.
+        let mut scan = {
+            let mut slot = SCAN.lock().unwrap_or_else(|e| e.into_inner());
+            slot.take()
+                .filter(|s| s.root == self.root())
+                .unwrap_or_else(|| Scan {
+                    root: self.root().into(),
+                    ..Default::default()
+                })
+        };
+        let fresh: Vec<String> = match &scan.last {
+            Some(last) => shared
+                .actions
+                .range((
+                    std::ops::Bound::Excluded(last.clone()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take(ACTIONS_PER_PASS)
+                .map(|(k, _)| k.clone())
+                .collect(),
+            None => shared
+                .actions
+                .keys()
+                .take(ACTIONS_PER_PASS)
+                .cloned()
+                .collect(),
+        };
+        scan.last = if fresh.len() < ACTIONS_PER_PASS {
+            None
+        } else {
+            fresh.last().cloned()
+        };
+        let candidates: Vec<String> = scan
+            .retained
+            .iter()
+            .chain(fresh.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut role_keys = BTreeSet::new();
+        for key in &candidates {
+            if let Some((caller, action_id)) = key.split_once('\u{1f}') {
+                if let Some(action) = shared.actions.get(key) {
+                    role_keys.insert(super::resolution::key(caller, action_id, &action.tool));
+                    if action.tool == "agent_delegate" {
+                        role_keys.insert(super::resolution::key(
+                            caller,
+                            action_id,
+                            "agent_delegate:origin",
+                        ));
+                    }
                 }
             }
         }
-        let asks = crate::asks::store::AskStore::open_default().map_err(store::unavailable)?;
+        let mut delivered = BTreeSet::new();
+        for id in role_keys
+            .iter()
+            .filter_map(|key| snapshot.role_resolutions.get(key))
+            .filter_map(queue_id)
+            .take(RESOLVED_ROLE_KEEP + ACTIONS_PER_PASS)
+        {
+            if delivered_proof(id) {
+                delivered.insert(id.to_owned());
+            }
+        }
         // Recheck terminal ask/action proof under its canonical lock. Store::update
         // acquires no other store locks: existing order is ask -> Director.
-        asks.with_state(|asks| {
-            self.prune_role_copies_at(
-                asks,
-                &delivered,
-                RESOLVED_ROLE_KEEP,
-                RESOLVED_ROLE_PRUNE_BATCH,
-            )
-        })
-        .map_err(store::unavailable)??;
+        let remaining = asks
+            .inspect(|asks| {
+                self.update_if(|state| {
+                    let eligible = redundant_keys_in(
+                        state,
+                        asks,
+                        &delivered,
+                        candidates
+                            .iter()
+                            .filter_map(|key| asks.actions.get_key_value(key)),
+                    );
+                    let count = eligible
+                        .len()
+                        .saturating_sub(RESOLVED_ROLE_KEEP)
+                        .min(RESOLVED_ROLE_PRUNE_BATCH);
+                    for key in eligible.iter().take(count) {
+                        state.role_resolutions.remove(key);
+                    }
+                    let remaining: Vec<String> = candidates
+                        .iter()
+                        .filter(|key| {
+                            let Some((caller, action_id)) = key.split_once('\u{1f}') else {
+                                return false;
+                            };
+                            let Some(action) = asks.actions.get(*key) else {
+                                return false;
+                            };
+                            [action.tool.as_str(), "agent_delegate:origin"]
+                                .iter()
+                                .any(|tool| {
+                                    let k = super::resolution::key(caller, action_id, tool);
+                                    eligible.contains(&k) && state.role_resolutions.contains_key(&k)
+                                })
+                        })
+                        .take(RESOLVED_ROLE_KEEP)
+                        .cloned()
+                        .collect();
+                    Ok((remaining, count > 0))
+                })
+            })
+            .map_err(store::unavailable)??;
+        scan.retained = remaining;
+        *SCAN.lock().unwrap_or_else(|e| e.into_inner()) = Some(scan);
+        // Continue a bounded sweep even without new role traffic. There is no
+        // age/expiry deletion; uncertain proofs keep the original rows.
+        request_maintenance();
         Ok(())
     }
 
+    #[cfg(test)]
     fn prune_role_copies_at(
         &self,
         asks: &AskState,
@@ -184,6 +341,144 @@ mod tests {
     use super::*;
     use crate::asks::store::{ActionLookup, ActionRecord};
     use serde_json::json;
+
+    #[test]
+    fn waste_guard_role_action_never_runs_optional_ask_store_maintenance() {
+        let store = Store::open_default().unwrap();
+        let prefix = format!("guard-role-{}-", uuid::Uuid::new_v4());
+        store
+            .update(|state| {
+                for n in 0..600 {
+                    state.role_resolutions.insert(
+                        format!("{prefix}{n}"),
+                        RoleResolutionReceipt {
+                            raw_digest: format!("synthetic-{n}"),
+                            resolution: RoleResolution {
+                                project_id: "synthetic".into(),
+                                target: "director".into(),
+                                epoch: 1,
+                            },
+                            business: None,
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        let before = crate::asks::store::whole_state_copies_on_this_thread();
+        for _ in 0..4 {
+            crate::director_address::with_role_action(|_, _| Ok(())).unwrap();
+        }
+        let copies = crate::asks::store::whole_state_copies_on_this_thread() - before;
+        store
+            .update_if(|state| {
+                let count = state.role_resolutions.len();
+                state
+                    .role_resolutions
+                    .retain(|key, _| !key.starts_with(&prefix));
+                Ok(((), count != state.role_resolutions.len()))
+            })
+            .unwrap();
+        assert_eq!(
+            copies, 0,
+            "role actions must only request background maintenance, never draft AskState for it"
+        );
+    }
+
+    #[test]
+    fn waste_guard_housekeeping_has_bounded_proofs_zero_ask_drafts_and_preserves_receipts() {
+        let (asks, ask_dir) = crate::asks::store::tests::temp_store("guard-role-maintenance");
+        let root = std::env::temp_dir().join(format!("guard-pruning-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(&root);
+        let mut ownership = OwnershipState::default();
+        let mut canonical = crate::test_support::waste_scale::asks();
+        for n in 0..600 {
+            tell(&mut ownership, &mut canonical, &format!("proof-{n:04}"));
+        }
+        asks.with_state(|state| *state = canonical).unwrap();
+        store
+            .update(|state| {
+                *state = ownership;
+                Ok(())
+            })
+            .unwrap();
+        let before = crate::asks::store::whole_state_copies_on_this_thread();
+        for _ in 0..8 {
+            let calls = std::cell::Cell::new(0usize);
+            store
+                .prune_redundant_in(&asks, |_| {
+                    calls.set(calls.get() + 1);
+                    true
+                })
+                .unwrap();
+            assert!(
+                calls.get() <= RESOLVED_ROLE_KEEP + ACTIONS_PER_PASS,
+                "proof IO exceeds bounded pass"
+            );
+        }
+        assert_eq!(
+            crate::asks::store::whole_state_copies_on_this_thread() - before,
+            0
+        );
+        assert_eq!(
+            store.snapshot().unwrap().role_resolutions.len(),
+            RESOLVED_ROLE_KEEP
+        );
+        assert_eq!(
+            asks.shared().unwrap().actions.len(),
+            600,
+            "canonical replay history is permanent"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(ask_dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "EVA-sized role housekeeping scale probe; runner marked private home only"]
+    fn waste_scale_a05_role_housekeeping() {
+        let home = std::env::var_os("CUTEX_TEST_PRIVATE_HOME").expect("scale runner private home");
+        assert!(std::path::Path::new(&home)
+            .join(".cutex-test-private-home")
+            .is_file());
+        let asks = crate::asks::store::AskStore::open_default().unwrap();
+        asks.with_state(|s| *s = crate::test_support::waste_scale::asks())
+            .unwrap();
+        let root = std::env::temp_dir().join(format!("scale-pruning-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(&root);
+        store
+            .update(|s| {
+                for n in 0..600 {
+                    s.role_resolutions.insert(
+                        format!("role-{n}"),
+                        RoleResolutionReceipt {
+                            raw_digest: format!("digest-{n}"),
+                            resolution: RoleResolution {
+                                project_id: "synthetic".into(),
+                                target: "director".into(),
+                                epoch: 1,
+                            },
+                            business: None,
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        let before = crate::asks::store::whole_state_copies_on_this_thread();
+        let mut samples = Vec::new();
+        for _ in 0..6 {
+            let t = std::time::Instant::now();
+            store.prune_redundant_role_bookkeeping().unwrap();
+            samples.push(t.elapsed());
+        }
+        crate::test_support::waste_scale::emit(
+            "a05_role_housekeeping",
+            &samples,
+            crate::asks::store::whole_state_copies_on_this_thread() - before,
+            json!({"roles":600,"asks_target_bytes":crate::test_support::waste_scale::ASK_BYTES}),
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn tell(state: &mut OwnershipState, asks: &mut AskState, id: &str) -> String {
         let result = json!({"ok":true,"to":"director","detail":id});

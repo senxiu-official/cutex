@@ -17,10 +17,11 @@ pub const FEATURES: [&str; 4] = [
 
 /// Advertised and negotiated like [`FEATURES`], but never required by
 /// [`validate_hello`]: older peers keep working without them.
-pub const OPTIONAL_FEATURES: [&str; 3] = [
+pub const OPTIONAL_FEATURES: [&str; 4] = [
     super::tells::FEATURE,
     super::tells::FEATURE_V2,
     super::profiles::FEATURE,
+    super::names::FEATURE,
 ];
 
 pub fn features() -> Vec<String> {

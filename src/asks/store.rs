@@ -59,6 +59,10 @@ pub struct Presence {
     /// additive field while still decoding the known `presence` row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_pause: Option<AgentPause>,
+    /// Automatic startup's durable budget slot, before online presence.
+    /// Additive within a known row so previous builds can still decode it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_pending: Option<String>,
 }
 
 /// Durable whole-agent admission gate. Unlike [`AdmissionPause`], this
@@ -81,6 +85,38 @@ pub struct AgentPause {
     pub by: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by_cutex_session_id: Option<String>,
+    /// r276: where the pause takes effect, once the live runtime was told:
+    /// `toolBoundary` (its next tool call waits) or `turnEnd` (no tool gate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<AgentPauseAt>,
+    /// r276: whether the live runtime offers the tool gate (absent: not known,
+    /// e.g. the agent is offline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_gate: Option<bool>,
+    /// r276: tool calls the runtime holds right now, oldest first (bounded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<HeldToolCall>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentPauseAt {
+    ToolBoundary,
+    TurnEnd,
+}
+
+/// One tool call a paused agent's runtime holds before it starts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeldToolCall {
+    pub call_id: String,
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// A subagent's call (its agent id); absent for the agent itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub since: String,
 }
 
 impl Presence {
@@ -178,7 +214,7 @@ pub struct AskState {
     #[serde(default)]
     pub project_control: super::project_control::ProjectControlState,
     #[serde(default)]
-    pub lineage: super::lineage::LineageState,
+    pub lineage: super::shared::Shared<super::lineage::LineageState>,
     /// Close may overtake an unacknowledged PUT. Keep its receipt under the same lock.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub peer_cancellations: BTreeMap<String, (String, crate::peers::model::Op)>,
@@ -187,15 +223,15 @@ pub struct AskState {
     #[serde(default)]
     pub next_seq: u64,
     #[serde(default)]
-    pub asks: BTreeMap<String, AskRecord>,
+    pub asks: super::shared::Shared<BTreeMap<String, super::shared::Shared<AskRecord>>>,
     #[serde(default)]
-    pub answers: BTreeMap<String, AnswerRecord>,
+    pub answers: super::shared::Shared<BTreeMap<String, AnswerRecord>>,
     #[serde(default)]
-    pub questions: BTreeMap<String, QuestionRecord>,
+    pub questions: super::shared::Shared<BTreeMap<String, QuestionRecord>>,
     #[serde(default)]
-    pub deliveries: BTreeMap<String, DeliveryRecord>,
+    pub deliveries: super::shared::Shared<BTreeMap<String, DeliveryRecord>>,
     #[serde(default)]
-    pub events: BTreeMap<String, EventOutboxRecord>,
+    pub events: super::shared::Shared<BTreeMap<String, EventOutboxRecord>>,
     /// Admission lease per target session.
     #[serde(default)]
     pub leases: BTreeMap<String, AdmissionLease>,
@@ -210,15 +246,15 @@ pub struct AskState {
     #[serde(default)]
     pub pauses: BTreeMap<String, AdmissionPause>,
     #[serde(default)]
-    pub artifacts: BTreeMap<String, ArtifactRecord>,
+    pub artifacts: super::shared::Shared<BTreeMap<String, ArtifactRecord>>,
     #[serde(default)]
-    pub waits: BTreeMap<String, WaitRecord>,
+    pub waits: super::shared::Shared<BTreeMap<String, WaitRecord>>,
     /// Session → wait cancel epoch (owner steer / interrupt / input).
     #[serde(default)]
     pub wait_cancel: BTreeMap<String, u64>,
     /// `<caller>\u{1f}<action_id>` → idempotency record.
     #[serde(default)]
-    pub actions: BTreeMap<String, ActionRecord>,
+    pub actions: super::shared::Shared<BTreeMap<String, ActionRecord>>,
     #[serde(default)]
     pub commands: Vec<QueuedCommand>,
     #[serde(default)]
@@ -229,7 +265,7 @@ pub struct AskState {
     /// Runtime presence of agents for `agent_list` (written by the
     /// management process, which holds the runtime connections).
     #[serde(default)]
-    pub presence: BTreeMap<String, Presence>,
+    pub presence: super::shared::Shared<BTreeMap<String, Presence>>,
     /// Agents the owner took offline on purpose (never auto-woken, §8.4).
     #[serde(default)]
     pub owner_offline: std::collections::BTreeSet<String>,
@@ -282,6 +318,10 @@ fn persisted_state_equal(before: &AskState, after: &AskState) -> anyhow::Result<
         || facades != &after.facades || asks.len() != after.asks.len()
     {
         return Ok(false);
+    }
+    // Copy-on-write: an untouched draft collection is the committed one.
+    if super::shared::Shared::ptr_eq(asks, &after.asks) {
+        return Ok(true);
     }
     for (id, previous) in asks {
         let Some(current) = after.asks.get(id) else { return Ok(false); };
@@ -547,6 +587,7 @@ impl AskState {
     pub fn find_by_action(&self, requester: &Requester, action_id: &str) -> Option<&AskRecord> {
         self.asks
             .values()
+            .map(|ask| &**ask)
             .find(|ask| crate::peers::asks::same_requester(&ask.requester,requester) && ask.action_id == action_id)
     }
 
@@ -555,6 +596,7 @@ impl AskState {
         let mut asks: Vec<&AskRecord> = self
             .asks
             .values()
+            .map(|ask| &**ask)
             .filter(|ask| {
                 (ask.remote.is_none() && ask.target_cutex_session_id == target)
                     && ask.remote.is_none()
@@ -604,6 +646,7 @@ impl AskState {
             parent_ask: new.parent_ask.clone(),
             seq: 0,
             execution: if gated { ExecutionState::PendingReview } else { ExecutionState::Queued },
+            admission_failure: None,
             hold: None,
             hold_since: None,
             review: None,
@@ -707,7 +750,7 @@ impl AskState {
                 }
             }
         }
-        self.asks.insert(ask.ask_id.clone(), ask.clone());
+        self.asks.insert(ask.ask_id.clone(), ask.clone().into());
         let sessions = Self::ask_sessions(&ask);
         self.notice("cutex/delegation/lineageChanged", sessions.clone(),
             json!({"projectId":ask.project_id,"resourceId":ask.ask_id,"revision":self.lineage.revision}));
@@ -793,6 +836,10 @@ impl AskState {
                 Self::ask_sessions(&snapshot),
                 json!({"askId": snapshot.ask_id, "outcome": snapshot.closed, "revision": snapshot.revision}),
             );
+        }
+        if (before.0 == ExecutionState::Queued && after.0 != ExecutionState::Queued)
+            || (before.3.is_none() && after.3.is_some()) {
+            super::delivery::supersede_blocked_owner_action(self, ask_id, now);
         }
         Some(result)
     }
@@ -933,6 +980,35 @@ pub(crate) fn ask_state_rows(state: &AskState) -> anyhow::Result<crate::manageme
     Ok(rows)
 }
 
+/// Add permanent cold rows to a copy of the decoded hot generation. Equal to
+/// decoding hot and cold rows together (an identity in both is refused, as
+/// before), but decodes only the cold rows; with copy-on-write collections
+/// only the collections that receive cold records are copied (r273 stab).
+fn merge_cold_rows(state: &mut AskState, rows: crate::management::v2::hot_store::Rows) -> anyhow::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    anyhow::ensure!(rows.keys().all(|(collection, _)| collection != "state"), "hot/archive identity conflict");
+    let cold = ask_state_from_owned_rows(rows)?;
+    macro_rules! merge {
+        ($($field:ident),+ $(,)?) => { $(
+            for (key, value) in cold.$field {
+                anyhow::ensure!(!state.$field.contains_key(&key), "hot/archive identity conflict");
+                state.$field.insert(key, value);
+            }
+        )+ };
+    }
+    merge!(
+        peer_cancellations, asks, answers, questions, deliveries, events, leases,
+        next_step_leases, pauses, artifacts, waits, wait_cancel, actions,
+        auto_turns, presence, woken, owner_action, owner_action_told, facades,
+    );
+    for key in cold.owner_offline {
+        anyhow::ensure!(state.owner_offline.insert(key), "hot/archive identity conflict");
+    }
+    Ok(())
+}
+
 pub(crate) fn ask_state_from_rows(source: &crate::management::v2::hot_store::Rows) -> anyhow::Result<AskState> {
     ask_state_from_owned_rows(source.clone())
 }
@@ -963,13 +1039,14 @@ pub(crate) fn ask_state_from_owned_rows(mut rows: crate::management::v2::hot_sto
     let notices = singleton(&mut rows, "notices")?;
     let routing = singleton(&mut rows, "routing")?;
     let project_control = singleton(&mut rows, "project_control")?;
-    let lineage = singleton(&mut rows, "lineage")?;
+    let lineage = singleton::<super::lineage::LineageState>(&mut rows, "lineage")?.into();
     anyhow::ensure!(rows.is_empty(), "unknown ask SQLite row collection");
     Ok(AskState {
         routing, project_control, lineage,
-        peer_cancellations, revision, next_seq, asks, answers, questions,
-        deliveries, events, leases, next_step_leases, pauses, artifacts, waits,
-        wait_cancel, actions, commands, notices, auto_turns, presence,
+        peer_cancellations, revision, next_seq, asks: asks.into(), answers: answers.into(),
+        questions: questions.into(), deliveries: deliveries.into(), events: events.into(),
+        leases, next_step_leases, pauses, artifacts: artifacts.into(), waits: waits.into(),
+        wait_cancel, actions: actions.into(), commands, notices, auto_turns, presence: presence.into(),
         owner_offline, woken, owner_action, owner_action_told, facades,
     })
 }
@@ -980,6 +1057,11 @@ fn diff_map<T: Serialize + PartialEq>(
     before: &BTreeMap<String, T>,
     after: &BTreeMap<String, T>,
 ) -> anyhow::Result<()> {
+    // A copy-on-write collection the write never touched is still the very
+    // same allocation as the committed one: nothing to diff.
+    if std::ptr::eq(before, after) {
+        return Ok(());
+    }
     let keys = before.keys().chain(after.keys()).collect::<std::collections::BTreeSet<_>>();
     for key in keys {
         match (before.get(key), after.get(key)) {
@@ -1047,14 +1129,53 @@ pub(crate) fn ask_state_changes(
     diff_singleton(&mut changes, "routing", &before.routing, &after.routing)?;
     diff_singleton(&mut changes, "project_control", &before.project_control, &after.project_control)?;
     diff_singleton(&mut changes, "lineage", &before.lineage, &after.lineage)?;
-    // Every r266 write installs a row unknown to old readers. This also guards
-    // continuation/lineage fields nested in otherwise familiar ask rows.
-    if !changes.is_empty() && before.routing == after.routing {
-        changes.push(crate::management::v2::hot_store::RowChange::Put {
-            collection: "state".into(), key: "routing".into(), value: encode_row(&after.routing)?,
-        });
-    }
     Ok(changes)
+}
+
+/// At most this many full-history decodes (hot + cold rows) run at once.
+/// Each materializes every retained ask; before r273 up to 256 management
+/// connection threads could do so concurrently (host-a, 2026-11-01).
+const HISTORY_DECODE_LIMIT: usize = 2;
+static HISTORY_DECODES: (std::sync::Mutex<usize>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// The last merged (hot + cold) history, keyed by the hot generation it was
+/// built from: every hot/cold move and every write commits a new hot
+/// generation, so an equal generation means equal history. One entry; its
+/// copy-on-write collections are shared with the snapshots handed out.
+type MergedHistory = Option<(PathBuf, u64, std::sync::Arc<AskState>)>;
+static MERGED_HISTORY: std::sync::Mutex<MergedHistory> = std::sync::Mutex::new(None);
+
+fn cached_merged_history(database: &Path, generation: u64) -> Option<AskState> {
+    let cache = MERGED_HISTORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.as_ref()
+        .filter(|(path, cached, _)| path == database && *cached == generation)
+        .map(|(_, _, state)| (**state).clone())
+}
+
+fn remember_merged_history(database: &Path, generation: u64, state: &AskState) {
+    let previous = MERGED_HISTORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace((database.to_path_buf(), generation, std::sync::Arc::new(state.clone())));
+    drop(previous); // reclaimed outside the cache mutex
+}
+
+struct HistoryDecodePermit;
+
+fn history_decode_permit() -> HistoryDecodePermit {
+    let (count, freed) = &HISTORY_DECODES;
+    let mut running = count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *running >= HISTORY_DECODE_LIMIT {
+        running = freed.wait(running).unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *running += 1;
+    HistoryDecodePermit
+}
+
+impl Drop for HistoryDecodePermit {
+    fn drop(&mut self) {
+        let (count, freed) = &HISTORY_DECODES;
+        *count.lock().unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+        freed.notify_one();
+    }
 }
 
 /// The store on disk.
@@ -1084,6 +1205,9 @@ mod row_reuse;
 #[cfg(test)]
 #[path = "store/read_perf_tests.rs"]
 mod read_perf_tests;
+#[cfg(test)]
+#[path = "store/cow_tests.rs"]
+mod cow_tests;
 // The cache mutex protects publication, not IO. Serialize cold refreshes
 // separately: otherwise every reader seeing a new generation decodes all
 // retained asks while holding a shared file lock, starving the next writer.
@@ -1131,6 +1255,20 @@ pub struct AskStore {
     queue_root: PathBuf,
     host_queue: bool,
     cache_generation: bool,
+}
+
+/// One [`AskStore::rolling_archive_pass`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollingArchiveReport {
+    pub moved: super::archive::MoveReport,
+    /// Movable delegations left for the next pass (batch bound).
+    pub deferred_asks: usize,
+    pub attempts: usize,
+    /// Plans discarded because a write landed before the move.
+    pub replans: usize,
+    /// Attempts skipped because the host authority fence was busy.
+    pub fence_busy: usize,
 }
 
 impl AskStore {
@@ -1188,11 +1326,90 @@ impl AskStore {
         std::fs::create_dir_all(&self.dir)?;
         let lock = self.lock_file()?;
         let _lock = diagnostics::LockGuard::acquire(lock, diagnostics::Operation::History, diagnostics::Mode::Shared).context("ask history lock")?;
-        let (hot, _) = self.read_state_shared()?;
-        if super::archive::persisted_cutoff(&self.database_path())?.is_none() {
-            return Ok((*hot).clone());
+        let (hot, generation) = self.read_state_shared()?;
+        let mut state = (*hot).clone(); // copy-on-write: no deep copy
+        let database = self.database_path();
+        if super::archive::persisted_cutoff(&database)?.is_none() {
+            return Ok(state);
         }
-        ask_state_from_rows(&super::archive::history_rows(&self.database_path())?)
+        // The shared file lock excludes hot/cold moves until we return.
+        if let Some(merged) = cached_merged_history(&database, generation) {
+            return Ok(merged);
+        }
+        let _decode = history_decode_permit();
+        if let Some(merged) = cached_merged_history(&database, generation) {
+            return Ok(merged);
+        }
+        merge_cold_rows(&mut state, super::archive::archived_rows(&database)?)?;
+        remember_merged_history(&database, generation, &state);
+        Ok(state)
+    }
+
+    /// Presentation-only history read. Never migrate/recover, create a lock or
+    /// directory, publish cache/admission changes, or drain notices. JSON files
+    /// are atomically replaced by writers; SQLite readers see committed rows.
+    /// Mutations must revalidate under their normal write guard.
+    pub fn readonly_history_snapshot(&self) -> anyhow::Result<AskState> {
+        let database = self.database_path();
+        if let Some(state) = self.readonly_cached_history(&database)? {
+            return Ok(state);
+        }
+        // Decodes every hot and cold row: bound how many of these
+        // whole-history copies exist at once.
+        let _decode = history_decode_permit();
+        let loaded = crate::management::v2::hot_store::verified_rows(&database, "asks")?;
+        anyhow::ensure!(
+            loaded.is_some() || !crate::management::v2::hot_store::has_store(&database, "asks")?,
+            "ask store migration is unverified; read-only listing cannot recover it"
+        );
+        if super::archive::persisted_cutoff(&database)?.is_some() {
+            return ask_state_from_rows(&super::archive::history_rows(&database)?);
+        }
+        if let Some(loaded) = loaded {
+            return ask_state_from_rows(&loaded.rows);
+        }
+        match std::fs::read(self.state_path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("ask store is corrupt"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AskState::default()),
+            Err(error) => Err(error).context("read ask store"),
+        }
+    }
+
+    /// r273 stab: the hot generation this process already decoded (only a
+    /// verified load or a committed write is ever cached) plus the cold rows,
+    /// without a lock, a migration or a cache publication. `None` when the
+    /// cache holds another generation or a hot/cold move raced the read;
+    /// the caller then decodes everything as before.
+    fn readonly_cached_history(&self, database: &Path) -> anyhow::Result<Option<AskState>> {
+        let Some(generation) = crate::management::v2::hot_store::generation(database, "asks")? else {
+            return Ok(None);
+        };
+        let cached = {
+            let cache = ASK_STATE_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match cache.as_ref() {
+                Some((path, cached_generation, state, _)) if path == database && *cached_generation == generation =>
+                    std::sync::Arc::clone(state),
+                _ => return Ok(None),
+            }
+        };
+        let mut state = (*cached).clone(); // copy-on-write: no deep copy
+        drop(cached);
+        if super::archive::persisted_cutoff(database)?.is_some() {
+            if let Some(merged) = cached_merged_history(database, generation) {
+                return Ok(Some(merged));
+            }
+            let _decode = history_decode_permit();
+            if let Some(merged) = cached_merged_history(database, generation) {
+                return Ok(Some(merged));
+            }
+            let merged = merge_cold_rows(&mut state, super::archive::archived_rows(database)?);
+            // Moves between hot and cold commit a new hot generation.
+            if merged.is_err() || crate::management::v2::hot_store::generation(database, "asks")? != Some(generation) {
+                return Ok(None);
+            }
+            remember_merged_history(database, generation, &state);
+        }
+        Ok(Some(state))
     }
 
     pub fn archived_identities(&self) -> anyhow::Result<Vec<crate::management::v2::hot_store::RowKey>> {
@@ -1226,13 +1443,13 @@ impl AskStore {
         let lock=self.lock_file()?;
         let _lock = diagnostics::LockGuard::acquire(lock, diagnostics::Operation::Lookup, diagnostics::Mode::Shared).context("ask record read lock")?;
         let (hot,_)=self.read_state_shared()?;
-        if let Some(ask)=hot.asks.get(id) {return Ok(Some(ask.clone()));}
+        if let Some(ask)=hot.asks.get(id) {return Ok(Some((**ask).clone()));}
         if !self.archive_configured()? {return Ok(None);}
         super::archive::record(&self.database_path(),"asks",id)
     }
 
     pub fn all_ask_ids(&self) -> anyhow::Result<std::collections::BTreeSet<String>> {
-        if !self.archive_configured()? {return Ok(self.snapshot()?.asks.into_keys().collect());}
+        if !self.archive_configured()? {return Ok(self.shared()?.asks.keys().cloned().collect());}
         let lock=self.lock_file()?;
         let _lock = diagnostics::LockGuard::acquire(lock, diagnostics::Operation::History, diagnostics::Mode::Shared).context("ask reference inventory lock")?;
         super::archive::all_ask_ids(&self.database_path())
@@ -1279,17 +1496,18 @@ impl AskStore {
             return Ok((*hot).clone());
         }
         if !self.archive_configured()? {return Ok((*hot).clone());}
-        let mut rows=ask_state_rows(&hot)?;
         let mut related=inputs.to_vec();
-        for (id,artifact) in &hot.artifacts {
+        for (id,artifact) in hot.artifacts.iter() {
             if inputs.iter().any(|input|super::archive::identity_matches(input,id)) {
                 related.extend(artifact.asks.iter().map(String::as_str));
             }
         }
-        for (key,value) in super::archive::matching_rows(&self.database_path(),&related)? {
-            anyhow::ensure!(rows.insert(key,value).is_none(),"hot/archive identity conflict");
-        }
-        ask_state_from_rows(&rows)
+        // Before r273 this re-encoded every hot row and decoded them all
+        // again for one detail lookup; now only the matching cold rows are
+        // decoded into a copy-on-write copy of the hot generation.
+        let mut state=(*hot).clone();
+        merge_cold_rows(&mut state,super::archive::matching_rows(&self.database_path(),&related)?)?;
+        Ok(state)
     }
 
     /// First startup and later incremental sweeps share one persisted cutoff.
@@ -1315,7 +1533,7 @@ impl AskStore {
 
     /// Guard-aware entry for a caller already holding the non-reentrant
     /// authority fence. Sidecar errors retain every record, never mean empty.
-    pub(crate) fn archive_before_guarded(&self,_authority:&std::fs::File,sidecar:&crate::director_address::Store,
+    pub(crate) fn archive_before_guarded(&self,_authority:&crate::platform::lock_accounting::FileGuard,sidecar:&crate::director_address::Store,
         requested:Option<chrono::DateTime<Utc>>,now:chrono::DateTime<Utc>) -> anyhow::Result<super::archive::MoveReport> {
         let ownership=sidecar.snapshot().map_err(|error|anyhow::anyhow!("{error}"))?;
         self.archive_before_inner(requested,now,&super::archive::sidecar_roots(&ownership))
@@ -1347,6 +1565,84 @@ impl AskStore {
         }
         let keys=super::archive::plan_with_protected_roots(&hot,cutoff,sidecar)?;
         super::archive::move_rows(&self.database_path(),generation,&keys,cutoff,now)
+    }
+
+    /// r273 rolling archive: one bounded pass moving closed delegations
+    /// whose `closedAt` is older than `max_age` (default 48 h, see
+    /// `asks_runtime::spawn_rolling_archive`) to the permanent cold rows.
+    ///
+    /// Off the hot path: planning (row encoding + reference graph) runs on a
+    /// copy-on-write snapshot under a SHARED ask lock, so writers continue.
+    /// The move then takes the exclusive ask lock (and, for the host store,
+    /// only TRIES the authority fence: a busy fence skips the attempt) and
+    /// commits only when the hot generation is still the planned one (the
+    /// SQL move re-checks it in its transaction). A concurrent write means a
+    /// re-plan; the last attempt plans under the exclusive lock. At most
+    /// `max_asks` delegations (whole reference components) move per pass.
+    /// The fixed cutoff policy row is never changed (r271.x compatible).
+    pub fn rolling_archive_pass(&self, max_age: chrono::Duration, max_asks: usize, now: chrono::DateTime<Utc>) -> anyhow::Result<RollingArchiveReport> {
+        const ATTEMPTS: usize = 3;
+        let mut report = RollingArchiveReport::default();
+        if !self.archive_configured()? {
+            // The startup pass creates the policy; nothing rolls before it.
+            return Ok(report);
+        }
+        let cutoff = now - max_age;
+        let (roster, sidecar) = if self.host_queue {
+            let runtime = self.dir.parent().context("asks runtime directory missing")?;
+            (Some(crate::agent_management::AgentManagementStore::open(runtime.join("agent-management/v1")).map_err(anyhow::Error::new)?),
+             Some(crate::director_address::Store::at(runtime.join("director-address"))))
+        } else { (None, None) };
+        let roots = |sidecar: &Option<crate::director_address::Store>| -> anyhow::Result<std::collections::BTreeSet<String>> {
+            match sidecar {
+                Some(sidecar) => Ok(super::archive::sidecar_roots(&*sidecar.snapshot().map_err(|error| anyhow::anyhow!("{error}"))?)),
+                None => Ok(Default::default()),
+            }
+        };
+        std::fs::create_dir_all(&self.dir)?;
+        for attempt in 0..ATTEMPTS {
+            report.attempts = attempt + 1;
+            let last = attempt + 1 == ATTEMPTS;
+            let planned = if last { None } else {
+                let lock = self.lock_file()?;
+                let _lock = diagnostics::LockGuard::acquire(lock, diagnostics::Operation::History, diagnostics::Mode::Shared).context("ask rolling archive plan lock")?;
+                let (hot, generation) = self.read_state_shared()?;
+                drop(_lock);
+                if generation == 0 { return Ok(report); }
+                let (keys, deferred) = super::archive::plan_rolling(&hot, cutoff, &roots(&sidecar)?, max_asks)?;
+                if keys.is_empty() { return Ok(report); }
+                Some((generation, keys, deferred))
+            };
+            // Authority fence (try only), then the exclusive ask lock: the
+            // same order as archive_before_with_authority, never waiting
+            // for the fence.
+            let _fence = match &roster {
+                Some(roster) => match roster.try_lock_delivery_mutations().map_err(anyhow::Error::new)? {
+                    Some(fence) => Some(fence),
+                    None => {
+                        report.fence_busy += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(200 + (uuid::Uuid::new_v4().as_u128() % 300) as u64));
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let lock = self.lock_file()?;
+            let _lock = diagnostics::LockGuard::acquire(lock, diagnostics::Operation::Archive, diagnostics::Mode::Exclusive).context("ask rolling archive lock")?;
+            let (hot, generation) = self.read_state_shared()?;
+            let sidecar_roots = roots(&sidecar)?;
+            let (keys, deferred) = match planned {
+                Some((planned_generation, keys, deferred)) if planned_generation == generation
+                    && keys.iter().all(|(kind, id)| kind != "asks" || !sidecar_roots.contains(id)) => (keys, deferred),
+                Some(_) => { report.replans += 1; continue; }
+                None => super::archive::plan_rolling(&hot, cutoff, &sidecar_roots, max_asks)?,
+            };
+            if keys.is_empty() { return Ok(report); }
+            report.moved = super::archive::move_rows_rolling(&self.database_path(), generation, &keys, now)?;
+            report.deferred_asks = deferred;
+            return Ok(report);
+        }
+        Ok(report)
     }
 
     pub fn archive_configured(&self) -> anyhow::Result<bool> {
@@ -1612,6 +1908,7 @@ impl AskStore {
     /// store or acquire another ask-store lock. Derived owner-queue writes are
     /// permitted only in the established ask -> owner lock order. An absent
     /// store stays absent. Use `project_snapshot` only for side-effect-free reads.
+    #[track_caller]
     pub fn inspect<T>(&self, read: impl FnOnce(&AskState) -> T) -> anyhow::Result<T> {
         use crate::management::v2::control_timing::{Path, Stage, Trace};
         let mut timing = Trace::new(Path::AsksStoreRead);
@@ -1690,28 +1987,34 @@ impl AskStore {
 
     /// Locked read-modify-write; saves (and bumps `revision`) only when the
     /// state changed.
+    #[track_caller]
     pub fn with_state<T>(&self, mutate: impl FnOnce(&mut AskState) -> T) -> anyhow::Result<T> {
         self.with_selection(&[],None,mutate)
     }
 
     /// Promotion and mutation share ONE file lock, so the incremental mover
     /// cannot cold-move a closed predecessor between lookup and update.
+    #[track_caller]
     pub fn with_records<T>(&self, records:&[&str],mutate:impl FnOnce(&mut AskState)->T) -> anyhow::Result<T> {
         self.with_selection(records,None,mutate)
     }
 
+    #[track_caller]
     pub fn with_new_ask_state<T>(&self,new:&NewAsk,mutate:impl FnOnce(&mut AskState)->T) -> anyhow::Result<T> {
         let records:Vec<&str>=new.follow_up_of.iter().chain(new.parent_ask.iter())
             .chain(new.body.attachments.iter()).chain(new.body.text_artifact.iter()).map(String::as_str).collect();
         self.with_selection(&records,Some((&new.requester,&new.action_id)),mutate)
     }
 
+    #[track_caller]
     fn with_selection<T>(&self,records:&[&str],action:Option<(&Requester,&str)>,mutate:impl FnOnce(&mut AskState)->T) -> anyhow::Result<T> {
         use crate::management::v2::control_timing::{Path, Stage, Trace};
         let mut timing = Trace::new(Path::AsksStoreWrite);
         timing.status(500);
         timing.stage(Stage::ContextRead);
         std::fs::create_dir_all(&self.dir)?;
+        // 054 §2.9: decided before the lock (the switch may read config).
+        let input_ledger = crate::management::v2::input_ledger::enabled();
         let mut reclaim = WriteReclaim::default();
         let lock = self.lock_file()?;
         timing.stage(Stage::LockWait);
@@ -1759,7 +2062,21 @@ impl AskStore {
             }
             state.revision += 1;
             let diff = diagnostics::stage(diagnostics::Stage::RowDiff);
-            let changes = ask_state_changes(before, state)?;
+            let mut changes = ask_state_changes(before, state)?;
+            // Input ledger (054 §2.9, block C4): the one hook for delegation
+            // requests and results. Pure mapping of the changed rows; queued
+            // after the commit, applied by the ledger writer thread.
+            let ledger_jobs = if input_ledger { super::ledger::store_jobs(before, state, &changes) } else { Vec::new() };
+            // The persisted routing row is also r266's old-reader fence.
+            // Install it once, including when upgrading a pre-r266 database;
+            // retaining that row is sufficient. Do not re-encode its entire
+            // unchanged policy/grant/approval history on unrelated writes.
+            if before.routing==state.routing && !crate::management::v2::hot_store::has_row(
+                &self.database_path(),"asks","state","routing")? {
+                changes.push(crate::management::v2::hot_store::RowChange::Put{
+                    collection:"state".into(),key:"routing".into(),value:encode_row(&state.routing)?,
+                });
+            }
             let prior_rows = {
                 let mut cache = ASK_STATE_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 cache.as_mut().filter(|(path, cached_generation, _, _)|
@@ -1778,6 +2095,8 @@ impl AskStore {
                 changes,
             )?;
             drop(commit);
+            // Committed: queue in commit order (still under the store lock).
+            super::ledger::enqueue(ledger_jobs);
             let _publication = diagnostics::stage(diagnostics::Stage::CachePublish);
             reclaim.replaced = ASK_STATE_CACHE
                 .lock()
@@ -1906,7 +2225,7 @@ impl AskStore {
         let needs_ask_acl=reader.is_some_and(|reader|!record.readers.iter().any(|allowed|allowed==reader));
         let mut related=Vec::new();
         if needs_ask_acl {
-            related.extend(record.asks.iter().filter_map(|id|state.asks.get(id).cloned()));
+            related.extend(record.asks.iter().filter_map(|id|state.asks.get(id).map(|ask|(**ask).clone())));
             if cold {
                 let missing:Vec<&str>=record.asks.iter().filter(|id|!state.asks.contains_key(*id)).map(String::as_str).collect();
                 related.extend(super::archive::records::<AskRecord>(&self.database_path(),"asks",&missing)?);
@@ -1952,6 +2271,80 @@ impl AskStore {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn readonly_history_does_not_create_absent_store_or_migrate_legacy_json() {
+        let (store, dir) = temp_store("readonly-history");
+        assert!(store.readonly_history_snapshot().unwrap().asks.is_empty());
+        assert!(!dir.exists());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = AskState::default();
+        state.create_ask(new_ask("readonly", "legacy"), Utc::now()).unwrap();
+        let bytes = serde_json::to_vec(&state).unwrap();
+        std::fs::write(store.state_path(), &bytes).unwrap();
+        for _ in 0..2 { assert_eq!(store.readonly_history_snapshot().unwrap(), state); }
+        assert_eq!(std::fs::read(store.state_path()).unwrap(), bytes);
+        assert!(!store.database_path().exists());
+        assert!(!dir.join("asks-v1.lock").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn readonly_history_keeps_sqlite_generation_notices_and_cold_rows() {
+        let (store, dir) = temp_store("readonly-history-sqlite");
+        let old = parse_time("2026-10-01T00:00:00Z").unwrap();
+        let cutoff = parse_time("2026-10-30T00:00:00Z").unwrap();
+        let id = store.with_state(|state| {
+            let (ask, _) = state.create_ask(new_ask("readonly-sqlite", "history"), old).unwrap();
+            state.update_ask(&ask.ask_id, old, |ask| {
+                ask.closed = Some(CloseOutcome::Abandoned);
+                ask.execution = ExecutionState::Cancelled;
+                ask.closed_at = Some(now_rfc3339(old));
+            });
+            state.notices.clear();
+            ask.ask_id
+        }).unwrap();
+        assert_eq!(store.archive_before(Some(cutoff), cutoff).unwrap().asks, 1);
+        let before = crate::management::v2::hot_store::verified_rows(&store.database_path(), "asks").unwrap().unwrap();
+        let first = store.readonly_history_snapshot().unwrap();
+        assert!(first.asks.contains_key(&id));
+        assert_eq!(store.readonly_history_snapshot().unwrap(), first);
+        let after = crate::management::v2::hot_store::verified_rows(&store.database_path(), "asks").unwrap().unwrap();
+        assert_eq!(before.generation, after.generation);
+        assert_eq!(before.rows, after.rows);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn readonly_history_corrupt_legacy_fails_without_repair() {
+        let (store, dir) = temp_store("readonly-history-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(store.state_path(), b"{broken").unwrap();
+        assert!(store.readonly_history_snapshot().is_err());
+        assert_eq!(std::fs::read(store.state_path()).unwrap(), b"{broken");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn readonly_history_refuses_unverified_sqlite_instead_of_reimporting_json() {
+        let (store, dir) = temp_store("readonly-history-unverified");
+        store.with_state(|state| { state.create_ask(new_ask("unverified", "ask"), Utc::now()).unwrap(); }).unwrap();
+        let database = store.database_path();
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute("UPDATE hot_store_meta SET verified=0 WHERE store='asks'", []).unwrap();
+        let legacy = serde_json::to_vec(&AskState::default()).unwrap();
+        std::fs::write(store.state_path(), &legacy).unwrap();
+        assert!(store.readonly_history_snapshot().is_err());
+        super::super::archive::configure_cutoff(&database, Utc::now()).unwrap();
+        assert!(store.readonly_history_snapshot().is_err(), "archive policy cannot bypass unverified hot rows");
+        let verified: i64 = db.query_row("SELECT verified FROM hot_store_meta WHERE store='asks'", [], |row| row.get(0)).unwrap();
+        assert_eq!(verified, 0);
+        assert_eq!(std::fs::read(store.state_path()).unwrap(), legacy);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn new_ask_lineage_notice_is_minimal_routed_and_not_repeated_on_replay() {
@@ -2028,7 +2421,7 @@ pub(crate) mod tests {
                 last_received_at: now_rfc3339(Utc::now()), failures: 0, accepted: false,
             },
         });
-        state.asks.insert(ask.ask_id.clone(), ask.clone());
+        state.asks.insert(ask.ask_id.clone(), ask.clone().into());
         ask.ask_id = "peer-inbound".into();
         ask.remote = None;
         ask.peer_inbound = Some(peer::Inbound {
@@ -2043,7 +2436,7 @@ pub(crate) mod tests {
                 },
             }], received_ops: vec![], next_attempt_at: None, failures: 0,
         });
-        state.asks.insert(ask.ask_id.clone(), ask);
+        state.asks.insert(ask.ask_id.clone(), ask.into());
         state.notices.clear();
         state
     }

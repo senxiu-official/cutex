@@ -736,6 +736,8 @@ impl UserStore {
             Ok(())
         })?;
         audit(&self.dir, "userDeleted", json!({ "userId": id, "actor": actor }));
+        // The users lock has been released before entering the layout store.
+        crate::management::user_layout::LayoutStore::at(&self.dir).remove(id)?;
         Ok(())
     }
 
@@ -936,7 +938,7 @@ impl Scope {
     /// snapshot: persistent (or IM-exposed), not retired, and in a granted project or listed
     /// as a standalone agent (an agent without a project).
     pub fn load(grant: &Grant) -> anyhow::Result<Self> {
-        let snapshot = crate::memory::load_agent_management_snapshot()?;
+        let snapshot = crate::memory::load_agent_management_directory()?;
         let boundary = crate::agent_bus::boundary::AgentBoundary::from_snapshot(
             &crate::config::agent_security::AgentSecurityConfig::default(),
             &snapshot,

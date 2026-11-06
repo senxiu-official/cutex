@@ -649,7 +649,7 @@ fn idle_paths_bench() {
         times[runs / 2]
     };
     let copies = crate::session::store::whole_store_copies_on_this_thread; // perf-counter
-    let serializations = crate::management::v2::session::projection_serializations_on_this_thread; // perf-counter
+    let serializations = || crate::store::metrics::store_counters("session-projection").bytes_encoded; // perf-counter
 
     let copy_ms = median(20, &mut || {
         assert_eq!(crate::session::store::load_cutex_session_store().unwrap().sessions.len(), sessions);

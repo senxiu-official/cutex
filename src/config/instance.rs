@@ -221,14 +221,16 @@ pub fn is_isolated() -> bool {
 // process on a `CUTEX_TEST_PRIVATE_HOME` uses instance port rules: a default
 // port is never resolved, accepted, connected to, bound or handed off.
 
-#[cfg(debug_assertions)]
+// `test` too: `cargo test --release --lib` has no debug assertions but runs
+// the default-port rule tests through `with_default_ports_for_test`.
+#[cfg(any(test, debug_assertions))]
 thread_local! {
     static DEFAULT_PORTS_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Tests of the default-instance port rules only: lift the test port guard
 /// on this thread while `f` runs (nothing in `f` may connect or bind).
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub fn with_default_ports_for_test<R>(f: impl FnOnce() -> R) -> R {
     struct Reset(bool);
@@ -244,11 +246,12 @@ pub fn with_default_ports_for_test<R>(f: impl FnOnce() -> R) -> R {
 /// True when this process must never use a default-instance port (see the
 /// test port guard above). Always false in a release `cutex`.
 pub fn default_ports_forbidden() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if DEFAULT_PORTS_ALLOWED.with(std::cell::Cell::get) {
+        return false;
+    }
     #[cfg(debug_assertions)]
     {
-        if DEFAULT_PORTS_ALLOWED.with(std::cell::Cell::get) {
-            return false;
-        }
         if std::env::var_os("CUTEX_TEST_PRIVATE_HOME").is_some_and(|value| !value.is_empty()) {
             return true;
         }

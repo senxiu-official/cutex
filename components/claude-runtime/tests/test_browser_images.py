@@ -30,10 +30,12 @@ def test_browser_image_conversions_and_budgets():
                 [{'type':'image','mimeType':'image/png','data':base64.b64encode(b'not png').decode()}]]:
         with pytest.raises(ValueError): ToolResult.from_mcp(bad)
 
-async def test_browser_mcp_bridge_preserves_image_and_trusted_call_meta(tmp_path, monkeypatch):
+# cutex design 059: browser_visit and the one-tool `browser` keep the browser path.
+@pytest.mark.parametrize('tool', ['browser_screenshot', 'browser', 'browser_visit', 'browser_script'])
+async def test_browser_mcp_bridge_preserves_image_and_trusted_call_meta(tmp_path, monkeypatch, tool):
     executable=tmp_path/'facade'; executable.touch()
     descriptor=tmp_path/'tools.json'
-    descriptor.write_text(json.dumps({'executable':str(executable),'tools':[{'name':'browser_screenshot','description':'shot','inputSchema':{'type':'object'}}]}))
+    descriptor.write_text(json.dumps({'executable':str(executable),'tools':[{'name':tool,'description':'shot','inputSchema':{'type':'object'}}]}))
     (tmp_path/'cutex-mcp-binding.json').write_text(json.dumps({'threadId':'thread','runtimeAgentId':'runtime','generation':1,'url':'http://fixture','token':'fixture-token'}))
     requests=[]
     class Input:
@@ -52,7 +54,7 @@ async def test_browser_mcp_bridge_preserves_image_and_trusted_call_meta(tmp_path
     async def spawn(*a,**kw): return Process()
     monkeypatch.setattr('cute_claude.cutex_tools.asyncio.create_subprocess_exec',spawn)
     registry=ToolRegistry(None,include_builtins=False); load(registry,descriptor)
-    result=await registry.tools['browser_screenshot'].handler({'title':'Shot','guestId':'g'},SimpleNamespace(thread_id='thread',call_id='native-call'))
+    result=await registry.tools[tool].handler({'title':'Shot','guestId':'g'},SimpleNamespace(thread_id='thread',call_id='native-call'))
     assert result.mcp_content()==BLOCKS
     assert requests[0]['params']['_meta']=={'threadId':'thread','callId':'native-call'}
     assert requests[0]['params']['arguments']=={'title':'Shot','guestId':'g'}

@@ -91,12 +91,31 @@ impl AgentManagementProvider {
     /// record was deleted. Refuses (without writing) when a provider-store
     /// reference appeared since the caller's check. Returns whether anything
     /// was removed.
+    ///
+    /// r271 lock protocol (051 §2, same rule as decision A): a caller holding a
+    /// session lane (session delete) only tries the execution lock and the host
+    /// fence; busy is `HostBusy` and nothing is written (a lane-free retry
+    /// finishes it).
     pub fn forget_deleted_session(&self, id: &CutexSessionId) -> Result<bool, AgentManagementError> {
-        let _execution = super::provider::provider_execution_lock()
-            .lock()
-            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
-        let _mutation = self.store().lock_mutations()?;
-        self.store().with_state(true, |mut state| {
+        let busy = || AgentManagementError::HostBusy("hostBusy: roster cleanup waits for the host authority fence".into());
+        let lane_held = crate::management::v2::session_coordination::thread_holds_lane();
+        let _execution = if lane_held {
+            match super::provider::provider_execution_lock().try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return Err(busy()),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(AgentManagementError::PersistenceUnavailable),
+            }
+        } else {
+            super::provider::provider_execution_lock()
+                .lock()
+                .map_err(|_| AgentManagementError::PersistenceUnavailable)?
+        };
+        let _mutation = if lane_held {
+            self.store().try_lock_delivery_mutations()?.ok_or_else(busy)?
+        } else {
+            self.store().lock_mutations()?
+        };
+        let removed = self.store().with_state(true, |mut state| {
             if store_references(&state, id).blocks_delete() {
                 return Err(AgentManagementError::Conflict("session_referenced"));
             }
@@ -104,7 +123,12 @@ impl AgentManagementProvider {
             let removed_membership = state.current_project_memberships.remove(id).is_some();
             let removed = removed_agent || removed_membership;
             Ok((state, removed, removed))
-        })
+        })?;
+        // The row is gone: readers no longer need the deletion marker.
+        if let Err(error) = super::pending_forget::clear(id.as_str()) {
+            eprintln!("session delete: pending-forget marker of {} kept: {error:#}", id.as_str());
+        }
+        Ok(removed)
     }
 }
 
@@ -114,6 +138,67 @@ mod tests {
 
     fn id(value: &str) -> CutexSessionId {
         CutexSessionId::new(value.to_string()).unwrap()
+    }
+
+    /// r271 (051 §2): session delete with the host fence busy leaves the
+    /// roster row for the lane-free sweep. Until it is gone the deleted id has
+    /// no routing authority and no project membership; afterwards the row and
+    /// the marker are gone.
+    #[test]
+    fn deleted_session_is_gone_for_authority_readers_before_the_sweep() {
+        use crate::asks::routing_policy::{integration, RoutingActor, RoutingError, RoutingRef};
+        let root = std::env::temp_dir().join(format!("cutex-delete-pending-{}", uuid::Uuid::new_v4()));
+        let provider = AgentManagementProvider::open(root.join("provider")).unwrap();
+        let deleted = id(&format!("cutex.deleted-{}", uuid::Uuid::new_v4()));
+        let project = "project-pending-forget";
+        provider.store().with_state(true, |mut state| {
+            let mut roster = crate::test_support::waste_scale::roster_with_agents();
+            let mut agent = roster.agents.pop_first().unwrap().1;
+            agent.cutex_session_id = deleted.clone();
+            state.agents.insert(deleted.clone(), agent);
+            state.project_states.insert(ProjectId::new(project.to_string()).unwrap(), serde_json::from_value(serde_json::json!({
+                "project_id": project, "lifecycle": "active", "revision": 1, "created_at": "2026-10-31T00:00:00Z",
+                "updated_at": "2026-10-31T00:00:00Z", "archived_at": null, "workspace_root": null, "last_director_epoch": null
+            })).unwrap());
+            state.current_project_memberships.insert(deleted.clone(), serde_json::from_value(serde_json::json!({
+                "cutex_session_id": deleted.as_str(), "project_id": project, "revision": 1, "updated_at": "2026-10-31T00:00:00Z"
+            })).unwrap());
+            Ok((state, (), true))
+        }).unwrap();
+        let host = integration::local_host_id();
+        let actor = || RoutingActor::Agent { reference: RoutingRef::new(&host, deleted.as_str()).unwrap(), name: None };
+        let snapshot = provider.store().snapshot().unwrap();
+        assert!(integration::trusted_context(&snapshot, project, actor(), &host).is_ok(), "a live member routes");
+        assert!(crate::management::v2::delegations::membership(&snapshot, project).members.contains(deleted.as_str()));
+        // Delete marked it and removed the durable record; the fence is busy.
+        super::super::pending_forget::mark(deleted.as_str()).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let fence_root = root.join("provider");
+        let holder = std::thread::spawn(move || {
+            let store = AgentManagementStore::open(&fence_root).unwrap();
+            let _fence = store.lock_mutations().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        let lane = crate::management::v2::session_coordination::session_lane(deleted.as_str()).unwrap();
+        {
+            let _lane = lane.reserve().unwrap();
+            assert!(matches!(provider.forget_deleted_session(&deleted), Err(AgentManagementError::HostBusy(_))));
+        }
+        let snapshot = provider.store().snapshot().unwrap();
+        assert!(snapshot.agents.contains_key(&deleted), "row still present before the sweep");
+        let refused = integration::trusted_context(&snapshot, project, actor(), &host).unwrap_err();
+        assert_eq!(refused.code, RoutingError::NotAuthorized.code());
+        assert!(!crate::management::v2::delegations::membership(&snapshot, project).members.contains(deleted.as_str()));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // The lane-free sweep path.
+        assert!(provider.forget_deleted_session(&deleted).unwrap());
+        assert!(!provider.store().snapshot().unwrap().agents.contains_key(&deleted), "row gone after the sweep");
+        assert!(!super::super::pending_forget::contains(deleted.as_str()), "marker cleared");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

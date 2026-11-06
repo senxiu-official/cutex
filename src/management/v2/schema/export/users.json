@@ -464,6 +464,198 @@
         "contentType": { "enum": ["image/png", "image/jpeg", "image/webp"] },
         "data": { "type": "string", "description": "Base64 of the image: at most 2097152 bytes, any aspect, each side 1..=4096 px." }
       }
-    }
+    },
+      "layoutSection": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "data",
+          "updatedAt",
+          "updatedBy"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "data": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "updatedAt": {
+            "type": "string"
+          },
+          "updatedBy": {
+            "type": "string"
+          }
+        }
+      },
+      "layoutPointer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "memoryHost",
+          "label",
+          "setAt"
+        ],
+        "properties": {
+          "memoryHost": {
+            "type": "string",
+            "pattern": "^ci-[a-f0-9]{32}$"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "setAt": {
+            "type": "string"
+          }
+        }
+      },
+      "layoutView": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "docKey",
+          "userId",
+          "displayName",
+          "ownerPersonConfirmed",
+          "pointer",
+          "sections"
+        ],
+        "properties": {
+          "docKey": {
+            "type": "string"
+          },
+          "userId": {
+            "type": "string"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "ownerPersonConfirmed": {
+            "type": "boolean"
+          },
+          "pointer": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/layoutPointer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sections": {
+            "type": "object",
+            "propertyNames": {
+              "pattern": "^[a-z][a-z0-9-]{0,31}$"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/layoutSection"
+            }
+          }
+        }
+      },
+      "layoutPut": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "data"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "data": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        }
+      },
+      "layoutDelete": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "layoutMutation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "updatedAt"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "updatedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "layoutPointerPut": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "memoryHost",
+          "label"
+        ],
+        "properties": {
+          "memoryHost": {
+            "type": "string",
+            "pattern": "^ci-[a-f0-9]{32}$"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        }
+      },
+      "layoutChanged": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "docKey",
+          "section",
+          "revision"
+        ],
+        "properties": {
+          "docKey": {
+            "type": "string"
+          },
+          "section": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pointer": {
+            "$ref": "#/$defs/layoutPointer"
+          }
+        }
+      }
   }
 }

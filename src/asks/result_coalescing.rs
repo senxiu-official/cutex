@@ -20,8 +20,8 @@ pub struct Context {
 pub fn context_for_session(session: &str) -> Option<Context> {
     let sessions = crate::session::store::load_cutex_session_store_shared().ok()?;
     let record = sessions.sessions.get(session)?;
-    let activity = crate::management::v2::activity::try_load_session_activity_states()
-        .ok().flatten().and_then(|states| states.get(session).cloned());
+    let activity = crate::management::v2::activity::session_activity(session)
+        .ok().flatten();
     let usage = record.claude_session.as_ref().and_then(|binding| {
         crate::management::v2::claude_token_usage::latest(session, &binding.thread_id).ok().flatten()
     });

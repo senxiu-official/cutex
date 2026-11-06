@@ -31,7 +31,7 @@ fn fixture(label: &str, bytes: usize) -> (AskStore, PathBuf) {
     record.body = tests::body(&"x".repeat(bytes / 256));
     for n in 0..256 {
         record.ask_id = format!("fixture-{n}");
-        state.asks.insert(record.ask_id.clone(), record.clone());
+        state.asks.insert(record.ask_id.clone(), record.clone().into());
     }
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(store.state_path(), serde_json::to_vec(&state).unwrap()).unwrap();

@@ -351,12 +351,7 @@ fn validate_account_auth_payload(
         return Ok(());
     }
 
-    let has_api_key = auth
-        .get("OPENAI_API_KEY")
-        .or_else(|| auth.get("openai_api_key"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .is_some_and(|key| !key.is_empty());
+    let has_api_key = super::api_key::from_auth(auth).is_some();
     if !has_api_key {
         anyhow::bail!(
             "Profile '{}' is configured for API-key authentication, but {} has no non-empty OPENAI_API_KEY. Re-import the profile or restore its API key.",
@@ -679,6 +674,7 @@ mod tests {
         StoredAccount {
             options: Default::default(),
             browser_tools: false,
+            browser_tool_surface: Default::default(),
             search_tool: false,
             quota_reader: None,
             private_chatgpt_auth_file: false,

@@ -477,6 +477,7 @@ pub fn prepare_venv(dir: &Path, options: &Options) -> anyhow::Result<Value> {
 
 /// `select` without the trait: `{selected, deployment?, needsUser?}`.
 pub fn select_dir(dir: &Path, options: &Options) -> anyhow::Result<Value> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     check_layout(dir)?;
     if !venv_ready(dir) {
         // prepare stopped at a user step (Python): nothing to select yet.
@@ -603,13 +604,13 @@ pub fn probe_dir(dir: &Path) -> Value {
     }
 }
 
-/// Version -> sessions (not retired) whose Claude deployment is that version
+/// Version -> all durable sessions (including retired) whose Claude deployment is that version
 /// dir under `root` (`<base>/components/claude-runtime`).
 pub fn pins_under(root: &Path) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
     let Ok(store) = crate::session::store::load_cutex_session_store() else { return out };
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    for record in store.sessions.values().filter(|record| !record.is_retired()) {
+    for record in store.sessions.values() {
         let Some(session) = &record.claude_session else { continue };
         let source = &session.deployment.adapter_source;
         let source = source.canonicalize().unwrap_or_else(|_| source.clone());
@@ -986,6 +987,7 @@ pub fn validate_cli_choice(layout: Option<&Layout>, choice: crate::config::claud
 
 /// Rewrites the deployment used by new sessions; pinned sessions are untouched.
 pub fn apply_cli_choice(layout: Option<&Layout>, choice: crate::config::claude::ClaudeCliChoice) -> anyhow::Result<()> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
     let Some(layout) = layout else { return Ok(()) };
     let Some(entry) = super::installed(layout, NAME) else { return Ok(()) };
     let dir = super::version_dir(layout, NAME, &entry.selected);

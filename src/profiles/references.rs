@@ -123,7 +123,7 @@ fn update_session_profile_references(
     }
     let timestamp = chrono::Utc::now().to_rfc3339();
     let mut keys = Vec::new();
-    for (key, record) in &mut sessions.sessions {
+    for (key, record) in sessions.sessions.iter_mut() {
         if record.profile.as_deref() == Some(old_name) {
             record.profile = new_name.map(str::to_string);
             record.bump_durable_revision()?;

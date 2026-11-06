@@ -139,6 +139,10 @@ pub struct ProjectEvent {
     /// Turn rows: tool items in the turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<u64>,
+    /// Positive evidence about the input that STARTED this turn. Missing is
+    /// unknown, including old journal rows; later steering/notes are irrelevant.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_turn_origin")]
+    pub turn_origin: Option<String>,
     /// Written by the first-start replay of the retained event log; the
     /// project is the membership at replay time.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -149,6 +153,11 @@ impl ProjectEvent {
     fn kind_prefix(&self) -> &str {
         self.kind.split('.').next().unwrap_or_default()
     }
+}
+
+fn deserialize_turn_origin<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_str().filter(|s| matches!(*s, "owner" | "external")).map(str::to_string))
 }
 
 /// A row before it is journaled; `dedupe` is unique in the journal (a
@@ -198,10 +207,15 @@ pub trait Facts {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pending {
-    /// `<session>|<turnId>` → `turn/started` time (Codex turns carry no
-    /// duration of their own).
+    /// Scoped turn key -> `turn/started` time (legacy checkpoints used
+    /// `<session>|<turnId>`; those keys remain readable for duration only).
     #[serde(default)]
     pub turn_starts: BTreeMap<String, String>,
+    /// JSON tuple (source stream, session, thread, turn) -> positive start
+    /// origin. Kept with the checkpoint: completion often carries no inputs.
+    /// Separate from legacy timing keys, which never proved an origin.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub turn_origins: BTreeMap<String, String>,
     /// askId → project, from `cutex/ask/created`, until the ask closes.
     #[serde(default)]
     pub ask_projects: BTreeMap<String, String>,
@@ -224,6 +238,7 @@ impl Pending {
             }
         }
         trim(&mut self.turn_starts, MAX_TURN_STARTS);
+        trim(&mut self.turn_origins, MAX_TURN_STARTS);
         trim(&mut self.ask_projects, MAX_ASK_PROJECTS);
         trim(&mut self.ask_titles, MAX_ASK_PROJECTS);
         while self.running_tasks.len() > MAX_RUNNING_TASKS {
@@ -234,6 +249,61 @@ impl Pending {
 }
 
 // ---------------------------------------------------------------- normalize
+
+fn origin_key(event: &EventEnvelope, thread: Option<&str>, turn: Option<&str>) -> Option<String> {
+    let thread = thread.filter(|s| !s.is_empty())?;
+    let turn = turn.filter(|s| !s.is_empty())?;
+    Some(json!([event.stream_id, event.cutex_session_id, thread, turn]).to_string())
+}
+
+fn source_origin(source: &Value) -> Option<&'static str> {
+    // Same source kinds as the trusted-controller input and ExternalInput
+    // adapters. Source identity is carried by the input, never today's host.
+    match source["kind"].as_str()? {
+        "user" if source["id"] == "local-controller" => Some("owner"),
+        "owner" => Some("owner"),
+        "agent" | "service" => Some("external"),
+        _ => None,
+    }
+}
+
+fn native_start_origin(turn: &Value) -> Option<&'static str> {
+    // Only inspected at turn/started. A userMessage in completed.items may
+    // instead be a mid-turn owner steer. An external_event may be passive.
+    if let Some(source) = turn.get("source") {
+        return source_origin(source);
+    }
+    for item in turn["items"].as_array().into_iter().flatten() {
+        if item["type"] == "userMessage" {
+            // Older runtimes also projected external input as userMessage.
+            // Item type alone is not positive owner provenance.
+            return item.get("source").and_then(source_origin);
+        }
+        if item["type"] == "functionCallOutput" && item["name"] == "external_event" {
+            // A passive note can precede either starter (Claude Store.claim).
+            // Without delivery metadata it cannot prove who started the turn.
+            match item.pointer("/externalInputView/data/deliveryMode").and_then(Value::as_str) {
+                Some("passive") => continue,
+                Some("after_turn") => {
+                    // Native FunctionCallOutputBody is a string or input_text
+                    // parts (the same representation used by the timeline).
+                    let output = match &item["output"] {
+                        Value::String(output) => output.clone(),
+                        Value::Array(parts) => parts.iter()
+                            .filter(|part| part["type"] == "input_text")
+                            .filter_map(|part| part["text"].as_str())
+                            .collect::<Vec<_>>().join(""),
+                        _ => return None,
+                    };
+                    let body: Value = serde_json::from_str(&output).ok()?;
+                    return source_origin(&body["source"]);
+                }
+                _ => return None,
+            }
+        }
+    }
+    None
+}
 
 struct Base<'a> {
     event: &'a EventEnvelope,
@@ -287,7 +357,15 @@ fn normalize_native(base: &Base<'_>, params: &Value, facts: &dyn Facts, pending:
         "turn/started" => {
             if let Some(turn) = text(&params["turn"]["id"]).or_else(|| event.correlation.turn_id.clone()) {
                 if own_thread() {
-                    pending.turn_starts.insert(format!("{session}|{turn}"), event.received_at.clone());
+                    if let Some(key) = origin_key(event, thread.as_deref(), Some(&turn)) {
+                        pending.turn_starts.entry(key).or_insert_with(|| event.received_at.clone());
+                    }
+                    if let (Some(key), Some(origin)) = (
+                        origin_key(event, thread.as_deref(), Some(&turn)),
+                        native_start_origin(&params["turn"]),
+                    ) {
+                        pending.turn_origins.entry(key).or_insert_with(|| origin.to_string());
+                    }
                 }
             }
             Vec::new()
@@ -299,14 +377,19 @@ fn normalize_native(base: &Base<'_>, params: &Value, facts: &dyn Facts, pending:
                 return Vec::new();
             };
             let turn_id = text(&turn["id"]).or_else(|| event.correlation.turn_id.clone());
-            let started = turn_id.as_ref().and_then(|t| pending.turn_starts.remove(&format!("{session}|{t}")));
             // Sub-agent threads report under the parent's session: their
             // turns are the sub-agent's rows, not the agent's.
             if !own_thread() {
                 return Vec::new();
             }
+            let key = origin_key(event, thread.as_deref(), turn_id.as_deref());
+            let started = key.as_ref().and_then(|key| pending.turn_starts.remove(key)).or_else(|| {
+                turn_id.as_ref().and_then(|t| pending.turn_starts.remove(&format!("{session}|{t}")))
+            });
+            let origin = key.and_then(|key| pending.turn_origins.remove(&key));
             let Some(project) = facts.project_of_session(session) else { return Vec::new() };
             let mut row = base.row(&format!("turn.{status}"), project, Some(session.to_string()), facts);
+            row.turn_origin = origin.filter(|origin| matches!(origin.as_str(), "owner" | "external"));
             row.status = Some(status.to_string());
             let items = turn["items"].as_array().map(Vec::as_slice).unwrap_or_default();
             row.title = items.iter().find(|item| item["type"] == "userMessage").and_then(user_message_text).and_then(|t| preview(&t));
@@ -400,6 +483,28 @@ fn normalize_cutex(base: &Base<'_>, params: &Value, facts: &dyn Facts, pending: 
     let member_project = |session: Option<&str>| session.and_then(|s| facts.project_of_session(s));
     let one = |dedupe: String, row: ProjectEvent| vec![Normalized { dedupe, row }];
     match base.method {
+        "cutex/userInput/submitted" => {
+            // Accepted start only: steered/queued/uncertain input must never
+            // relabel the turn. Origin is the transport's typed provenance,
+            // not a display name or client-id heuristic (desktop uses other).
+            if params["disposition"] == "started" && params["appServerAccepted"] == true {
+                let origin = match params["origin"]["kind"].as_str() {
+                    Some("android" | "backend" | "tui" | "other") => Some("owner"),
+                    Some("agent_bus" | "automation") => Some("external"),
+                    _ => None,
+                };
+                let thread = text(&params["threadId"]).or_else(|| event.correlation.thread_id.clone());
+                let turn = text(&params["turnId"]).or_else(|| event.correlation.turn_id.clone());
+                if session.is_some() {
+                    if let (Some(key), Some(origin)) = (origin_key(event, thread.as_deref(), turn.as_deref()), origin) {
+                        // The accepted managed START disposition is stronger
+                        // than an earlier native projection of the same turn.
+                        pending.turn_origins.insert(key, origin.to_string());
+                    }
+                }
+            }
+            Vec::new()
+        }
         "cutex/ask/created" => {
             let ask = &params["ask"];
             let Some(ask_id) = text(&ask["askId"]) else { return Vec::new() };
@@ -1030,7 +1135,7 @@ struct LiveFacts {
 
 impl LiveFacts {
     fn load() -> anyhow::Result<Self> {
-        let snapshot = crate::memory::load_agent_management_snapshot()?;
+        let snapshot = crate::memory::load_agent_management_directory()?;
         let mut ids: BTreeSet<String> =
             snapshot.agents.values().map(|agent| agent.cutex_session_id.as_str().to_string()).collect();
         ids.extend(snapshot.projects.values().map(|p| p.authorized_director_session.as_str().to_string()));
@@ -1061,7 +1166,7 @@ impl LiveFacts {
         });
         if !state.as_ref()?.asks.contains_key(ask_id) {
             let ask=crate::asks::store::AskStore::open_default().and_then(|store|store.lookup_ask(ask_id)).ok()??;
-            state.as_mut()?.asks.insert(ask_id.to_owned(),ask);
+            state.as_mut()?.asks.insert(ask_id.to_owned(),ask.into());
         }
         read(state.as_ref()?.asks.get(ask_id)?)
     }
@@ -1171,6 +1276,7 @@ pub(super) fn project_pass(
         let Some(page) = source(position.as_ref())? else {
             // The event log moved past the checkpoint: go on from its start.
             gap |= position.is_some() && persisted.initialized;
+            persisted.pending.turn_origins.clear();
             position = None;
             continue;
         };
@@ -1641,7 +1747,7 @@ fn background_resource(
     context: crate::management::server::ManagementRequestContext,
     project: &str,
 ) -> anyhow::Result<Option<Value>> {
-    let snapshot = crate::memory::load_agent_management_snapshot()?;
+    let snapshot = crate::memory::load_agent_management_directory()?;
     let Ok(project_id) = crate::agent_management::ProjectId::new(project.to_string()) else { return Ok(None) };
     if !crate::memory::project_is_known(&snapshot, &project_id) {
         return Ok(None);

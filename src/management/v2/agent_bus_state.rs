@@ -40,6 +40,17 @@ static AGENT_BUS_MESSAGE_REPOSITORY: super::process_repository::ProcessRepositor
     AgentBusMessageRepository,
 > = super::process_repository::ProcessRepository::new();
 
+/// Presentation attempts per bridge poll.
+const PRESENTATION_BATCH: usize = 4;
+
+/// What one recipient's bridge worker last learned about its presentation
+/// work: the store generation it searched and its earliest open attempt.
+#[derive(Debug, Default)]
+pub(crate) struct PresentationSchedule {
+    cursor: Option<u64>,
+    next_due: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentBusMessageSnapshot {
@@ -77,7 +88,16 @@ pub struct AgentBusMessageSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredAgentBusMessage {
+    /// Semantic bytes captured at queue time; never identity or authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frozen_recipient_label: Option<String>,
     owner_cutex_session_id: String,
+    /// No expiry: unknown owner submissions stay reserved until explicit recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_carry: Option<String>,
+    /// Explicit per-input choice, independent of session stopHold/resume.
+    #[serde(default, skip_serializing_if = "is_false")]
+    owner_hold: bool,
     from_runtime_agent_id: Option<String>,
     to_runtime_agent_id: Option<String>,
     #[serde(default)]
@@ -85,6 +105,9 @@ struct StoredAgentBusMessage {
     snapshot: AgentBusMessageSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     queued_at: Option<String>,
+    /// First durable local-inbox acceptance. Older rows fall back conservatively to updated_at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inbox_accepted_at: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     admission_started_idle: bool,
     updated_at: String,
@@ -173,6 +196,7 @@ struct AgentBusMessageStore {
 }
 
 pub struct AgentBusMessageRepository {
+    read_only: bool,
     root: PathBuf,
     process_lock: Mutex<()>,
     cache: Mutex<Option<CachedStore>>,
@@ -349,6 +373,149 @@ fn native_evidence(snapshot: &AgentBusMessageSnapshot) -> bool {
         || snapshot.external_input_receipt.is_some()
 }
 
+/// Candidates must not have crossed any native admission boundary.
+fn owner_carry_candidate(stored: &StoredAgentBusMessage, session: &str) -> bool {
+    !stored.owner_hold && owner_holdable(stored, session)
+}
+
+fn owner_holdable(stored: &StoredAgentBusMessage, session: &str) -> bool {
+    let snapshot = &stored.snapshot;
+    snapshot.to_cutex_session_id == session
+        && snapshot.state == "pending" && !settlement_closed(stored)
+        && stored.owner_carry.is_none()
+        && !snapshot.may_have_reached_runtime()
+        && snapshot.external_input_last_observed.is_none()
+        && stored.canonical_envelope.as_ref().is_some_and(|m| {
+            m.kind == crate::agent_bus::model::AgentBusEnvelopeKind::Message
+                && matches!(m.delivery_mode, crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn
+                    | crate::agent_bus::delivery::AgentDeliveryMode::Soon)
+                && !m.is_removed_task_service_message()
+                && !matches!(m.sender_kind, crate::agent_bus::model::AgentMessageKind::User
+                    | crate::agent_bus::model::AgentMessageKind::Owner)
+        })
+}
+
+#[cfg(test)]
+#[path = "agent_bus_owner_carry_tests.rs"]
+mod owner_carry_tests;
+
+impl AgentBusMessageRepository {
+    /// Prefetch the builder's sender/view sidecars by recipient, before reserve
+    /// acquires the non-reentrant source lock. No whole-host metadata walk.
+    pub fn owner_carry_metadata(&self, session: &str) -> anyhow::Result<BTreeMap<String, AgentBusMessageMeta>> {
+        self.read_admission(session, |rows| Ok(rows.filter(|row| owner_carry_candidate(row, session))
+            .filter_map(|row| row.meta.clone().map(|meta| (row.snapshot.message_id.clone(), meta))).collect()))
+    }
+
+    /// Build from canonical provenance and reserve atomically with independent freeze.
+    /// Builder failures (including oversized notices) skip that item, not the owner send.
+    /// Retrying the same owner input returns its existing immutable envelopes.
+    pub fn reserve_owner_carries(
+        &self, session: &str, owner_input_id: &str, limit: usize,
+        mut make: impl FnMut(&AgentBusMessage) -> anyhow::Result<crate::app_server::external_input::Envelope>,
+    ) -> anyhow::Result<Vec<crate::app_server::external_input::Envelope>> {
+        anyhow::ensure!(!owner_input_id.trim().is_empty(), "owner input id absent");
+        let mut ids = self.read_admission(session, |rows| {
+            let mut rows: Vec<_> = rows.filter(|row| owner_carry_candidate(row, session)).collect();
+            rows.sort_by(|a, b| (a.canonical_envelope.as_ref().map(|m| m.created_at_epoch_secs), &a.snapshot.message_id)
+                .cmp(&(b.canonical_envelope.as_ref().map(|m| m.created_at_epoch_secs), &b.snapshot.message_id)));
+            Ok(rows.into_iter().map(|row| row.snapshot.message_id.clone()).collect::<Vec<_>>())
+        })?;
+        for id in self.owner_carry_ids(session, owner_input_id)? {
+            if !ids.contains(&id) { ids.push(id); }
+        }
+        self.update_inner(DirtyRows::Messages(ids.clone()), false, |store| {
+            let existing: Vec<_> = ids.iter().filter_map(|id| store.messages.get(id)).filter(|row|
+                row.snapshot.to_cutex_session_id == session && row.owner_carry.as_deref() == Some(owner_input_id))
+                .filter_map(|row| row.snapshot.external_input.clone()).collect();
+            if !existing.is_empty() { return Ok((existing, false)); }
+            let mut envelopes = Vec::new();
+            for id in &ids {
+                if envelopes.len() >= limit { break; }
+                let Some(row) = store.messages.get_mut(id) else { continue };
+                if !owner_carry_candidate(row, session) { continue; }
+                let canonical = row.canonical_envelope.as_ref().expect("candidate canonical");
+                let Ok(envelope) = make(canonical) else { continue };
+                if envelope.validate().is_err() || envelope.owner_id != session
+                    || envelope.message.id != *id
+                    || envelope.message.delivery == crate::app_server::external_input::Delivery::Passive {
+                    continue;
+                }
+                row.snapshot.external_input = Some(envelope.clone());
+                row.owner_carry = Some(owner_input_id.to_string());
+                row.updated_at = Utc::now().to_rfc3339();
+                envelopes.push(envelope);
+            }
+            let changed = !envelopes.is_empty();
+            if changed { store.version = store.version.max(8); }
+            Ok((envelopes, changed))
+        })
+    }
+
+    pub fn owner_carry_ids(&self, session: &str, owner_input_id: &str) -> anyhow::Result<Vec<String>> {
+        let database = self.root.join(super::hot_store::DATABASE_FILE);
+        if let Some(ids) = super::hot_store::verified_snapshot(&database, "agent_bus", |db, _| {
+            super::hot_store::owner_carry_keys(db, session, owner_input_id)
+        })? { return Ok(ids); }
+        self.read(|store| Ok(store.messages.iter().filter(|(_, row)|
+            row.snapshot.to_cutex_session_id == session && row.owner_carry.as_deref() == Some(owner_input_id))
+            .map(|(id, _)| id.clone()).collect()))
+    }
+
+    /// Caller must prove the owner submission was refused/unsent. A timeout/unknown
+    /// never permits release. Recheck all known native acceptance before any change.
+    pub fn release_owner_carries(&self, session: &str, owner_input_id: &str) -> anyhow::Result<()> {
+        let ids = self.owner_carry_ids(session, owner_input_id)?;
+        self.update_inner(DirtyRows::Messages(ids.clone()), false, |store| {
+            for id in &ids {
+                let Some(row) = store.messages.get(id) else { continue };
+                if row.owner_carry.as_deref() != Some(owner_input_id) { continue; }
+                anyhow::ensure!(row.snapshot.to_cutex_session_id == session, "carry recipient changed");
+                let s = &row.snapshot;
+                anyhow::ensure!(s.state == "pending" && s.a2_submission_id.is_none()
+                    && s.a4_receipt.is_none() && s.local_inbox_receipt.is_none()
+                    && s.external_input_receipt.is_none()
+                    && s.external_input_last_observed.as_ref().is_none_or(|status|
+                        status.delivery_state == crate::app_server::external_input::DeliveryState::Unknown
+                        && status.processing.state == crate::app_server::external_input::ProcessingState::None),
+                    "carry has native evidence; cannot release");
+            }
+            let mut changed = false;
+            for id in &ids {
+                let Some(row) = store.messages.get_mut(id) else { continue };
+                if row.owner_carry.as_deref() != Some(owner_input_id) { continue; }
+                row.owner_carry = None;
+                row.snapshot.external_input = None;
+                row.snapshot.external_input_last_observed = None;
+                row.updated_at = Utc::now().to_rfc3339();
+                changed = true;
+            }
+            Ok(((), changed))
+        })
+    }
+
+    /// Explicit per-input hold. Session resume must not call this method.
+    pub fn set_owner_hold(&self, session: &str, input_id: &str, held: bool) -> anyhow::Result<bool> {
+        self.update_message(input_id, |store| {
+            let row = store.messages.get_mut(input_id).context("bus input absent")?;
+            anyhow::ensure!(row.snapshot.to_cutex_session_id == session, "bus input recipient mismatch");
+            anyhow::ensure!(owner_holdable(row, session),
+                "bus input is no longer safely unsent");
+            if row.owner_hold == held { return Ok((false, false)); }
+            row.owner_hold = held;
+            row.updated_at = Utc::now().to_rfc3339();
+            store.version = store.version.max(8);
+            Ok((true, true))
+        })
+    }
+
+    /// Fresh check for already queued sweeps; never blocks receipt/status recovery.
+    pub fn owner_delivery_blocked(&self, session: &str, input_id: &str) -> anyhow::Result<bool> {
+        Ok(self.get(input_id)?.is_some_and(|row| row.snapshot.to_cutex_session_id == session
+            && (row.owner_hold || row.owner_carry.is_some())))
+    }
+}
+
 fn stored_protected_control(stored: &StoredAgentBusMessage) -> bool {
     stored.canonical_envelope.as_ref().is_some_and(|message| {
         message.sender_kind.is_task_service_system()
@@ -462,7 +629,7 @@ pub fn receipt_read_inputs_default(
         return Ok(Default::default());
     }
     READER.get_or_open(|| Ok(root), |root| Ok(AgentBusMessageRepository {
-        root, process_lock: Mutex::new(()), cache: Mutex::new(None), admission_index: Mutex::new(None),
+        root, read_only: true, process_lock: Mutex::new(()), cache: Mutex::new(None), admission_index: Mutex::new(None),
     }))?.receipt_read_inputs(message_ids)
 }
 
@@ -492,6 +659,18 @@ fn validate_private_test_home(home: &str, private: &str) -> anyhow::Result<()> {
 }
 
 impl AgentBusMessageRepository {
+    /// Owner diagnostics must not initialize directories/locks, migrate legacy
+    /// rows, publish an outbox, or change permissions just to display state.
+    pub fn open_read_only(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(), read_only: true, process_lock: Mutex::new(()),
+            cache: Mutex::new(None), admission_index: Mutex::new(None),
+        }
+    }
+
+    pub(super) fn read_only_view(&self) -> Self {
+        Self::open_read_only(self.root.clone())
+    }
     /// Kit stdin helper: the normal current parsers over supplied bytes only.
     /// No repository instance, path, connection, lock, migration or runtime IO.
     pub(crate) fn validate_kit_input_rows(
@@ -531,6 +710,47 @@ impl AgentBusMessageRepository {
     /// Includes already ACKed input records. The canonical store has no pruning;
     /// do not derive this worklist from the transport's pending-message queue.
     pub(crate) fn due_presentations(&self, owner: &str, now: i64) -> anyhow::Result<Vec<String>> {
+        self.due_presentations_scheduled(owner, now, &mut PresentationSchedule::default())
+    }
+
+    /// [`Self::due_presentations`] for one recipient's bridge worker (058 C1).
+    /// While the store generation is the one last searched and no obligation
+    /// is due, an idle poll reads only that generation. Otherwise the
+    /// recipient's open obligations come from their index, never from the
+    /// message history. The persisted generation and next attempt, not an
+    /// in-memory signal, decide when to search again, across processes and
+    /// restarts alike.
+    pub(crate) fn due_presentations_scheduled(
+        &self,
+        owner: &str,
+        now: i64,
+        schedule: &mut PresentationSchedule,
+    ) -> anyhow::Result<Vec<String>> {
+        let database = self.root.join(super::hot_store::DATABASE_FILE);
+        let searched = super::hot_store::cached_snapshot(&database, "agent_bus", |db, generation| {
+            if schedule.cursor == Some(generation) && schedule.next_due.is_none_or(|due| due > now) {
+                return Ok(None);
+            }
+            let open = super::hot_store::presentation_due_rows(db, owner, PRESENTATION_BATCH)?;
+            Ok(Some((generation, open)))
+        })?;
+        match searched {
+            Some(None) => Ok(Vec::new()),
+            Some(Some((generation, open))) => {
+                // Unprocessed due work keeps next_due <= now: search again.
+                schedule.cursor = Some(generation);
+                schedule.next_due = open.first().map(|(_, at)| *at);
+                Ok(open.into_iter().filter(|(_, at)| *at <= now).map(|(id, _)| id).collect())
+            }
+            None => {
+                // Absent, legacy-only or unverified store: the previous reader.
+                *schedule = PresentationSchedule::default();
+                self.due_presentations_from_history(owner, now)
+            }
+        }
+    }
+
+    fn due_presentations_from_history(&self, owner: &str, now: i64) -> anyhow::Result<Vec<String>> {
         self.read(|s| {
             let mut due: Vec<_> = s
                 .messages
@@ -545,7 +765,7 @@ impl AgentBusMessageRepository {
                 })
                 .collect();
             due.sort();
-            Ok(due.into_iter().take(4).map(|(_, id)| id).collect())
+            Ok(due.into_iter().take(PRESENTATION_BATCH).map(|(_, id)| id).collect())
         })
     }
     pub(crate) fn begin_presentation_attempt(
@@ -703,6 +923,12 @@ impl AgentBusMessageRepository {
         &self,
         action: &str,
     ) -> anyhow::Result<Option<crate::app_server::external_recovery::RecoveryReceipt>> {
+        let database = self.root.join(super::hot_store::DATABASE_FILE);
+        if let Some(result) = super::hot_store::verified_snapshot(&database,"agent_bus",|db,_| {
+            let keys = vec![("state".into(),"version".into()),("recovery".into(),action.into())];
+            let rows = super::hot_store::bus_changes::keyed_rows(db,"agent_bus",keys)?;
+            Ok(bus_store_from_rows(&rows)?.external_recovery_actions.remove(action))
+        })? { return Ok(result); }
         self.read(|s| Ok(s.external_recovery_actions.get(action).cloned()))
     }
 
@@ -733,6 +959,7 @@ impl AgentBusMessageRepository {
         secure_directory(&root)?;
         Ok(Self {
             root,
+            read_only: false,
             process_lock: Mutex::new(()),
             cache: Mutex::new(None),
             admission_index: Mutex::new(None),
@@ -742,7 +969,7 @@ impl AgentBusMessageRepository {
     /// Returns `true` only for the first durable commit and `false` for an
     /// exact replay of the same message identity and semantic content.
     pub fn record_queued(&self, message: AgentBusQueuedMessage) -> anyhow::Result<bool> {
-        self.record_queued_internal(message, true, None, None)
+        self.record_queued_internal(message, true, None, None,None)
     }
 
     /// Like [`Self::record_queued`], with the sender's display facts.
@@ -751,7 +978,11 @@ impl AgentBusMessageRepository {
         message: AgentBusQueuedMessage,
         meta: AgentBusMessageMeta,
     ) -> anyhow::Result<bool> {
-        self.record_queued_internal(message, true, None, Some(meta))
+        self.record_queued_internal(message, true, None, Some(meta),None)
+    }
+
+    pub fn record_queued_with_meta_and_recipient_label(&self,message:AgentBusQueuedMessage,meta:AgentBusMessageMeta,label:String) -> anyhow::Result<bool> {
+        self.record_queued_internal(message,true,None,Some(meta),Some(label))
     }
 
     /// Only the authenticated Job handler calls this after its source checks.
@@ -765,12 +996,12 @@ impl AgentBusMessageRepository {
             Some(p) => p.obligation(&message.canonical_envelope, &message.semantic_sha256)?,
             _ => None,
         };
-        self.record_queued_internal(message, true, display, None)
+        self.record_queued_internal(message, true, display, None,None)
     }
 
     #[cfg(test)]
     pub(crate) fn record_queued_isolated(&self, message: AgentBusQueuedMessage) -> anyhow::Result<bool> {
-        self.record_queued_internal(message, false, None, None)
+        self.record_queued_internal(message, false, None, None,None)
     }
 
     fn record_queued_internal(
@@ -779,6 +1010,7 @@ impl AgentBusMessageRepository {
         record_management_event: bool,
         presentation: Option<crate::app_server::presentation::Obligation>,
         meta: Option<AgentBusMessageMeta>,
+        frozen_recipient_label: Option<String>,
     ) -> anyhow::Result<bool> {
         validate_session_identity(&message.owner_cutex_session_id)?;
         if let Some(from) = message.from_cutex_session_id.as_deref() {
@@ -863,7 +1095,10 @@ impl AgentBusMessageRepository {
             store.messages.insert(
                 message.message_id.clone(),
                 StoredAgentBusMessage {
+                    frozen_recipient_label,
                     owner_cutex_session_id: message.owner_cutex_session_id,
+                    owner_carry: None,
+                    owner_hold: false,
                     from_runtime_agent_id: message.from_runtime_agent_id,
                     to_runtime_agent_id: message.to_runtime_agent_id,
                     canonical_envelope: Some(message.canonical_envelope),
@@ -888,6 +1123,7 @@ impl AgentBusMessageRepository {
                     },
                     admission_started_idle: false,
                     queued_at: Some(message.queued_at.to_rfc3339()),
+                    inbox_accepted_at: None,
                     updated_at: message.queued_at.to_rfc3339(),
                     meta,
                     settlement: None,
@@ -922,12 +1158,13 @@ impl AgentBusMessageRepository {
                 stored.snapshot.to_cutex_session_id == owner,
                 "canonical recipient changed"
             );
+            anyhow::ensure!(!stored.owner_hold, "input held by owner");
             if let Some(envelope) = &stored.snapshot.external_input {
                 envelope.validate()?;
                 return Ok((envelope.clone(), false));
             }
             anyhow::ensure!(
-                stored.snapshot.state == "pending"
+                stored.owner_carry.is_none() && stored.snapshot.state == "pending"
                     && stored.snapshot.a2_submission_id.is_none()
                     && stored.snapshot.a4_receipt.is_none(),
                 "legacy native submission ambiguous; explicit review required"
@@ -1094,7 +1331,7 @@ impl AgentBusMessageRepository {
 
     /// Agent notes to `cutex_session_id` not yet read into its context.
     pub fn pending_note_count(&self, cutex_session_id: &str) -> anyhow::Result<usize> {
-        self.read(|store| {
+        self.read_selected(None, |store| {
             Ok(store
                 .messages
                 .values()
@@ -1119,6 +1356,30 @@ impl AgentBusMessageRepository {
     /// Display facts of a message (agent messaging v2), if recorded.
     pub fn message_meta(&self, message_id: &str) -> anyhow::Result<Option<AgentBusMessageMeta>> {
         Ok(self.get(message_id)?.and_then(|stored| stored.meta))
+    }
+
+    pub fn frozen_recipient_label(&self,message_id:&str)->anyhow::Result<Option<String>> {
+        Ok(self.get(message_id)?.and_then(|stored|stored.frozen_recipient_label))
+    }
+
+    /// Legacy capture is accepted only after the bridge proves these exact
+    /// label bytes reproduce the stored digest. No envelope/digest is changed.
+    pub fn remember_recipient_label(&self,message_id:&str,owner:&str,digest:&str,label:&str)->anyhow::Result<()> {
+        self.update_message(message_id,|store| {
+            let stored=store.messages.get_mut(message_id).context("queued message disappeared")?;
+            anyhow::ensure!(stored.snapshot.to_cutex_session_id==owner&&stored.snapshot.semantic_sha256.as_deref()==Some(digest),"queued message identity/digest changed");
+            if let Some(existing)=stored.frozen_recipient_label.as_deref() {
+                anyhow::ensure!(existing==label,"frozen recipient label changed");
+                return Ok(((),false));
+            }
+            stored.frozen_recipient_label=Some(label.into());
+            Ok(((),true))
+        })
+    }
+
+    /// Complete durable text; use a read-only repository for diagnostic routes.
+    pub fn message_content(&self, message_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.get(message_id)?.map(|stored| stored.snapshot.content))
     }
 
     /// Messages `cutex_session_id` sent (latest `limit`, oldest first).
@@ -1220,6 +1481,55 @@ impl AgentBusMessageRepository {
         })
     }
 
+    /// A failed automatic proof attempt is terminal for that observation,
+    /// never a receipt or proof of non-consumption. Keep the original message
+    /// and expose the failure to the owner instead of silently looping.
+    pub fn record_settlement_observation_failure(
+        &self, expected: &AgentBusMessageSnapshot, observing_generation: u64,
+    ) -> anyhow::Result<bool> {
+        self.observe_settlement(&expected.message_id, None, Utc::now())?;
+        self.update_inner(DirtyRows::Messages(vec![expected.message_id.clone()]), true, |store| {
+            let Some(stored) = store.messages.get_mut(&expected.message_id) else { return Ok((false, false)); };
+            if stored.snapshot != *expected || settlement_closed(stored)
+                || !matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted")
+                || stored.snapshot.external_input_receipt.is_some() || stored.snapshot.a4_receipt.is_some()
+                || Self::settlement_observation_failed(&stored.snapshot, observing_generation) {
+                return Ok((false, false));
+            }
+            stored.snapshot.error = Some(json!({
+                "code": "settlement_observation_unavailable", "retryable": false,
+                "message": "Automatic settlement observation ended without proof. Delivery remains unconfirmed; review this stuck message. A changed runtime binding or native status permits a fresh observation.",
+                "details": { "observationState": "failed", "observingGeneration": observing_generation,
+                    "envelopeSemanticSha256": expected.external_input.as_ref().map(|envelope| &envelope.semantic_sha256),
+                    "nativeStatus": expected.external_input_last_observed }
+            }));
+            stored.updated_at = Utc::now().to_rfc3339();
+            Ok((true, true))
+        })
+    }
+
+    pub fn settlement_observation_failed(snapshot: &AgentBusMessageSnapshot, generation: u64) -> bool {
+        snapshot.error.as_ref().is_some_and(|error| {
+            error["code"] == "settlement_observation_unavailable"
+                && error["details"]["observingGeneration"] == generation
+                && error["details"]["envelopeSemanticSha256"] == serde_json::to_value(snapshot.external_input.as_ref().map(|envelope| &envelope.semantic_sha256)).unwrap_or(Value::Null)
+                && error["details"]["nativeStatus"] == serde_json::to_value(&snapshot.external_input_last_observed).unwrap_or(Value::Null)
+        })
+    }
+
+    pub fn clear_settlement_observation_failure(&self, expected: &AgentBusMessageSnapshot) -> anyhow::Result<bool> {
+        self.update_inner(DirtyRows::Messages(vec![expected.message_id.clone()]), true, |store| {
+            let Some(stored) = store.messages.get_mut(&expected.message_id) else { return Ok((false, false)); };
+            if stored.snapshot != *expected || !stored.snapshot.error.as_ref()
+                .is_some_and(|error| error["code"] == "settlement_observation_unavailable") {
+                return Ok((false, false));
+            }
+            stored.snapshot.error = None;
+            stored.updated_at = Utc::now().to_rfc3339();
+            Ok((true, true))
+        })
+    }
+
     pub fn observe_external_input(
         &self,
         message_id: &str,
@@ -1295,7 +1605,7 @@ impl AgentBusMessageRepository {
         stable.as_object_mut().unwrap().remove("state");
         self.mutate_message(message, |store| {
             let stored = store.messages.get_mut(message).context("message not found")?;
-            anyhow::ensure!(stored.owner_cutex_session_id == owner, "message owner mismatch");
+            anyhow::ensure!(stored.snapshot.to_cutex_session_id == owner, "message owner mismatch");
             if let Some(previous) = &stored.snapshot.local_inbox_receipt {
                 anyhow::ensure!(previous == &stable, "local inbox receipt changed");
             } else {
@@ -1303,6 +1613,7 @@ impl AgentBusMessageRepository {
                 // submit response is recorded.
                 anyhow::ensure!(matches!(stored.snapshot.state.as_str(), "pending" | "delivered"), "message is no longer pending");
                 stored.snapshot.local_inbox_receipt = Some(stable);
+                stored.inbox_accepted_at = Some(Utc::now().to_rfc3339());
                 if stored.snapshot.state == "pending" {
                     stored.snapshot.state = "inbox_accepted".into();
                 }
@@ -1376,82 +1687,109 @@ impl AgentBusMessageRepository {
         self.read_admission(session, |messages| {
             let now = Utc::now();
             let wait = crate::agent_bus::delivery::wake_busy_wait();
-            let held = super::admission::ridealong_held(asks, session, false);
             let sessions = crate::session::store::load_cutex_session_store_shared().ok();
             let is_local_session = local_sender(sessions.as_deref());
-            Ok(messages.filter_map(|stored| {
-                let snapshot = &stored.snapshot;
-                let message = stored.canonical_envelope.as_ref()?;
-                if settlement_closed(stored) || snapshot.to_cutex_session_id != session
-                    || !matches!(snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held")
-                    || message.kind != crate::agent_bus::model::AgentBusEnvelopeKind::Message
-                    || !message.delivery_mode.trigger_turn()
-                    || message.is_removed_task_service_message()
-                    || snapshot.external_input.as_ref().is_some_and(|envelope|
-                        envelope.message.delivery == crate::app_server::external_input::Delivery::Passive)
-                {
-                    return None;
-                }
-                if snapshot.external_input.is_none() && message.sender_kind.is_job_service_system()
-                    && message.control_type.as_deref() == Some(crate::agent_bus::job_completion::SCHEMA_V2)
-                    && crate::agent_bus::job_completion::FrozenProjection::from_message(message).ok().is_some_and(|projection| {
-                        let job_id = &projection.request.job_id;
-                        asks.asks.values().any(|ask| ask.remote.is_none() && ask.target_cutex_session_id == session
-                            && ask.job(job_id).is_some_and(|job| job.cancel.is_some()
-                                || (ask.is_open() && ask.awaiting.as_ref().is_some_and(|wait| wait.jobs.contains(job_id)))))
-                    })
-                {
-                    return None;
-                }
-                let accepted = snapshot.a2_submission_id.is_some() || snapshot.local_inbox_receipt.is_some()
-                    || snapshot.external_input_last_observed.as_ref().is_some_and(|status|
-                        status.delivery_state != crate::app_server::external_input::DeliveryState::Unknown);
-                let detail = ridealong_detail(stored, message, asks, &is_local_session);
-                let (timing, next_step_at) = bus_admission_timing(message, snapshot.external_input.as_ref(), now, wait);
-                Some(super::admission::AdmissionNextStep {
-                    id: message.id.clone(),
-                    enqueued_at: stored.queued_at.clone().unwrap_or_else(|| DateTime::<Utc>::from_timestamp(
-                        message.created_at_epoch_secs.min(i64::MAX as u64) as i64, 0,
-                    ).unwrap_or(DateTime::<Utc>::UNIX_EPOCH).to_rfc3339()),
-                    eligible: !accepted && snapshot.state != "stale_held" && held.is_none(),
-                    wait_reason: accepted.then(|| "nativeReceipt".into()),
-                    timing, next_step_at, held: held.clone(), ask_id: detail.ask_id,
-                    delivery_kind: detail.kind.into(), label: Some(detail.label),
-                    from: detail.from, from_host: detail.from_host,
-                    from_cutex_session_id: detail.from_cutex_session_id, preview: detail.preview,
-                    settlement: settlement_view(stored, now),
-                })
-            }).collect())
+            Ok(messages.filter_map(|stored| Self::project_pending_admission(
+                stored, session, asks, now, wait, &is_local_session,
+            )).collect())
         })
     }
 
-    /// The admission worker only observes external replacements here. An unchanged
-    /// file needs neither the cross-process store lock nor an index traversal.
-    pub fn refresh_admission_if_changed(&self) -> anyhow::Result<bool> {
-        let generation = super::hot_store::generation(
-            &self.root.join(super::hot_store::DATABASE_FILE),
-            "agent_bus",
-        )?;
-        let observation_generation = super::hot_store::generation(
-            &self.root.join(super::hot_store::DATABASE_FILE), settlement_state::EVIDENCE_STORE,
-        );
+    /// Pure shared projection: no repository, session-store or runtime IO.
+    fn project_pending_admission(
+        stored: &StoredAgentBusMessage,
+        session: &str,
+        asks: &crate::asks::store::AskState,
+        now: DateTime<Utc>,
+        wait: Option<std::time::Duration>,
+        is_local_session: &dyn Fn(&str) -> bool,
+    ) -> Option<super::admission::AdmissionNextStep> {
+        let held = super::admission::ridealong_held(asks, session, false);
+        let snapshot = &stored.snapshot;
+        let message = stored.canonical_envelope.as_ref()?;
+        if settlement_closed(stored) || snapshot.to_cutex_session_id != session
+            || !matches!(snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held")
+            || message.kind != crate::agent_bus::model::AgentBusEnvelopeKind::Message
+            || !message.delivery_mode.trigger_turn()
+            || message.is_removed_task_service_message()
+            || snapshot.external_input.as_ref().is_some_and(|envelope|
+                envelope.message.delivery == crate::app_server::external_input::Delivery::Passive)
         {
-            let index = self.admission_index.lock().map_err(|_| anyhow::anyhow!("agent-bus admission index lock poisoned"))?;
-            if observation_generation.as_ref().is_ok_and(|observed|
-                index.as_ref().is_some_and(|index| !index.observation_unavailable && index.generation == generation && index.observation_generation == *observed)
-                || (generation.is_none() && observed.is_none() && index.is_none())) {
-                return Ok(false);
-            }
+            return None;
         }
+        if snapshot.external_input.is_none() && message.sender_kind.is_job_service_system()
+            && message.control_type.as_deref() == Some(crate::agent_bus::job_completion::SCHEMA_V2)
+            && crate::agent_bus::job_completion::FrozenProjection::from_message(message).ok().is_some_and(|projection| {
+                let job_id = &projection.request.job_id;
+                asks.asks.values().any(|ask| ask.remote.is_none() && ask.target_cutex_session_id == session
+                    && ask.job(job_id).is_some_and(|job| job.cancel.is_some()
+                        || (ask.is_open() && ask.awaiting.as_ref().is_some_and(|wait| wait.jobs.contains(job_id)))))
+            })
+        {
+            return None;
+        }
+        let accepted = snapshot.a2_submission_id.is_some() || snapshot.local_inbox_receipt.is_some()
+            || snapshot.external_input_last_observed.as_ref().is_some_and(|status|
+                status.delivery_state != crate::app_server::external_input::DeliveryState::Unknown);
+        let detail = ridealong_detail(stored, message, asks, &is_local_session);
+        let (timing, next_step_at) = bus_admission_timing(message, snapshot.external_input.as_ref(), now, wait);
+        Some(super::admission::AdmissionNextStep {
+            id: message.id.clone(),
+            enqueued_at: stored.queued_at.clone().unwrap_or_else(|| DateTime::<Utc>::from_timestamp(
+                message.created_at_epoch_secs.min(i64::MAX as u64) as i64, 0,
+            ).unwrap_or(DateTime::<Utc>::UNIX_EPOCH).to_rfc3339()),
+            eligible: !accepted && snapshot.state != "stale_held" && held.is_none()
+                && !stored.owner_hold && stored.owner_carry.is_none(),
+            wait_reason: if stored.owner_hold { Some("ownerPause".into()) }
+                else if stored.owner_carry.is_some() { Some("carriedByOwner".into()) }
+                else { accepted.then(|| "nativeReceipt".into()) },
+            timing, next_step_at, held: held.clone(), ask_id: detail.ask_id,
+            delivery_kind: detail.kind.into(), label: Some(detail.label),
+            from: detail.from, from_host: detail.from_host,
+            from_cutex_session_id: detail.from_cutex_session_id, preview: detail.preview,
+            settlement: settlement_view(stored, now),
+        })
+    }
+
+    /// Read retained recipients directly from durable bus rows, including
+    /// offline/archived agents. Never initialize a writer, refresh/notify the
+    /// admission index, load/repair session metadata, or recover native input.
+    pub(super) fn cleanup_next_steps(
+        &self,
+        asks: &crate::asks::store::AskState,
+    ) -> anyhow::Result<Vec<(String, super::admission::AdmissionNextStep)>> {
+        let reader = self.read_only_view();
+        reader.read(|store| {
+            let now = Utc::now();
+            let wait = crate::agent_bus::delivery::wake_busy_wait();
+            let mut rows: Vec<_> = store.messages.values().filter_map(|stored| {
+                let snapshot = &stored.snapshot;
+                if snapshot.a4_receipt.is_some() || snapshot.external_input_receipt.is_some()
+                    || snapshot.external_input_last_observed.as_ref().is_some_and(|status|
+                        status.receipt.is_some()
+                            || status.delivery_state == crate::app_server::external_input::DeliveryState::ContextPersisted)
+                {
+                    return None;
+                }
+                let session = &snapshot.to_cutex_session_id;
+                // Keep durable sender names/previews; omit the optional local
+                // avatar identity rather than invoke its repairing loader.
+                let row = Self::project_pending_admission(stored, session, asks, now, wait, &|_| false)?;
+                (row.wait_reason.as_deref() == Some("nativeReceipt"))
+                    .then(|| (session.clone(), row))
+            }).collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
+            Ok(rows)
+        })
+    }
+
+    /// Compare transport cursors under the shared bus lock. An unchanged cursor
+    /// needs no message decode or admission-index traversal.
+    pub fn refresh_admission_if_changed(&self) -> anyhow::Result<bool> {
         self.with_lock(|path| {
-            let mut cache = self.cache.lock().map_err(|_| anyhow::anyhow!("agent-bus cache lock poisoned"))?;
-            let (store, generation) = fresh_store(&mut cache, path)?;
+            self.prepare_keyed_store(path)?;
             let mut index = self.admission_index.lock().map_err(|_| anyhow::anyhow!("agent-bus admission index lock poisoned"))?;
-            if index.as_ref().is_some_and(|index| !store.observation_unavailable && !index.observation_unavailable && index.generation == generation && index.observation_generation == store.observation_generation) { return Ok(false); }
-            let refreshed = AdmissionIndex::new(&store, generation);
-            refreshed.notify_changes(index.as_ref());
-            *index = Some(refreshed);
-            Ok(true)
+            refresh_index(&bus_database_path(path), &mut index)
         })
     }
 
@@ -1495,7 +1833,7 @@ impl AgentBusMessageRepository {
     /// Restart classification requires both our idle-submit marker and the
     /// matching native context receipt. Old records cannot prove turn origin.
     pub fn admission_started_turn(&self, session: &str, turn: &str) -> anyhow::Result<bool> {
-        self.with_admission_index(|_, index| Ok(index.started_turns.get(session).is_some_and(|turns| turns.contains(turn))))
+        self.with_admission_index(|index| Ok(index.started_turns.get(session).is_some_and(|turns| turns.contains(turn))))
     }
 
     fn read_admission<T>(
@@ -1503,23 +1841,19 @@ impl AgentBusMessageRepository {
         session: &str,
         action: impl FnOnce(&mut dyn Iterator<Item = &StoredAgentBusMessage>) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        self.with_admission_index(|store, index| {
-            let ids = index.sessions.get(session);
-            action(&mut ids.into_iter().flatten().filter_map(|id| store.messages.get(id)))
+        self.with_admission_index(|index| {
+            let ids = index.sessions.get(session).into_iter().flatten().cloned().collect::<Vec<_>>();
+            let store = self.selected_store(Some(&ids))?.unwrap_or_default();
+            action(&mut ids.iter().filter_map(|id| store.messages.get(id)))
         })
     }
 
-    fn with_admission_index<T>(&self, action: impl FnOnce(&AgentBusMessageStore, &AdmissionIndex) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    fn with_admission_index<T>(&self, action: impl FnOnce(&AdmissionIndex) -> anyhow::Result<T>) -> anyhow::Result<T> {
         self.with_lock(|path| {
-            let mut cache = self.cache.lock().map_err(|_| anyhow::anyhow!("agent-bus cache lock poisoned"))?;
-            let (store, generation) = fresh_store(&mut cache, path)?;
+            self.prepare_keyed_store(path)?;
             let mut index = self.admission_index.lock().map_err(|_| anyhow::anyhow!("agent-bus admission index lock poisoned"))?;
-            if index.as_ref().is_none_or(|index| index.generation != generation || index.observation_generation != store.observation_generation || index.observation_unavailable != store.observation_unavailable) {
-                let refreshed = AdmissionIndex::new(&store, generation);
-                refreshed.notify_changes(index.as_ref());
-                *index = Some(refreshed);
-            }
-            action(&store, index.as_ref().unwrap())
+            refresh_index(&bus_database_path(path), &mut index)?;
+            action(index.as_ref().unwrap())
         })
     }
 
@@ -1590,7 +1924,7 @@ impl AgentBusMessageRepository {
     }
 
     pub fn pending_v2(&self) -> anyhow::Result<Vec<PendingAgentBusMessage>> {
-        self.read(|store| {
+        self.read_selected(None, |store| {
             store
                 .messages
                 .values()
@@ -1759,7 +2093,7 @@ impl AgentBusMessageRepository {
         min_age_secs: u64,
         now_epoch_secs: u64,
     ) -> anyhow::Result<Vec<StuckAgentBusMessage>> {
-        self.read(|store| {
+        self.read_selected(None, |store| {
             let mut records = store
                 .messages
                 .values()
@@ -2010,12 +2344,12 @@ impl AgentBusMessageRepository {
         owner_cutex_session_id: &str,
         message_id: &str,
     ) -> anyhow::Result<bool> {
-        self.read(|store| {
+        self.read_selected(Some(&[message_id.to_owned()]), |store| {
             let Some(stored) = store.messages.get(message_id) else {
                 return Ok(false);
             };
             anyhow::ensure!(
-                stored.owner_cutex_session_id == owner_cutex_session_id,
+                stored.snapshot.to_cutex_session_id == owner_cutex_session_id,
                 "agent-bus message owner session changed"
             );
             // The owner discarded it (`cutex human bus-messages discard`):
@@ -2055,7 +2389,7 @@ impl AgentBusMessageRepository {
     /// retention sweep.
     pub fn management_start_messages(&self) -> anyhow::Result<Vec<ManagementStartMessage>> {
         use crate::agent_management::{AGENT_MANAGEMENT_START_CONTROL_TYPE, AGENT_MANAGEMENT_SYSTEM_SENDER};
-        self.read(|store| {
+        self.read_matching(|db| super::hot_store::management_start_rows(db, AGENT_MANAGEMENT_SYSTEM_SENDER, AGENT_MANAGEMENT_START_CONTROL_TYPE), |store| {
             Ok(store
                 .messages
                 .iter()
@@ -2105,22 +2439,10 @@ impl AgentBusMessageRepository {
             Err(error) => return Err(error.into()),
         };
         lock.lock_shared()?;
-        let Some(generation) = super::hot_store::generation(&database, "agent_bus")? else {
+        let requested = ids.iter().map(|id| (*id).clone()).collect::<Vec<_>>();
+        let Some(store) = self.selected_store(Some(&requested))? else {
             return Ok(ReceiptReadContext::new());
         };
-        let mut cache = self.cache.lock().map_err(|_|anyhow::anyhow!("agent-bus cache lock poisoned"))?;
-        if cache.as_ref().is_none_or(|entry| entry.generation != generation) {
-            let Some(loaded) = super::hot_store::verified_rows(&database, "agent_bus")? else {
-                return Ok(ReceiptReadContext::new());
-            };
-            let store = bus_store_from_rows(&loaded.rows)?;
-            *cache = Some(CachedStore {generation: loaded.generation, store});
-        }
-        let entry = cache.as_mut().expect("verified read cache installed");
-        // verified_rows and observation refresh open SQLite read-only. Do not
-        // call fresh_store/load_or_migrate (writer opener/schema setup).
-        settlement_state::refresh_observations(entry, &database)?;
-        let store = &entry.store;
         Ok(ids.into_iter().filter_map(|id|store.messages.get(id).map(|stored| {
             let terminal = stored.settlement.as_ref().or(stored.observed_settlement.as_ref())
                 .filter(|record|validate_settlement_record(stored, record).is_ok())
@@ -2175,9 +2497,9 @@ impl AgentBusMessageRepository {
         &self,
         cutex_session_id: &str,
     ) -> anyhow::Result<Vec<crate::app_server::external_input::Envelope>> {
-        self.read(|store| {
+        self.read_selected(None, |store| {
             Ok(store.messages.values()
-                .filter(|stored| stored.owner_cutex_session_id == cutex_session_id
+                .filter(|stored| stored.snapshot.to_cutex_session_id == cutex_session_id
                     && matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted"))
                 .filter_map(|stored| stored.snapshot.external_input.clone())
                 .collect())
@@ -2224,10 +2546,9 @@ impl AgentBusMessageRepository {
     }
 
     pub fn migrate_legacy_v1(&self) -> anyhow::Result<()> {
-        // The first normal read performs the v1 quarantine while importing
-        // into SQLite. The legacy JSON remains untouched as the rollback
-        // backup, so this periodic compatibility hook is now only a warm-up.
-        self.read(|_| Ok(()))
+        // Import/quarantine once, without retaining a decoded copy of every
+        // historical message in either process merely to warm the repository.
+        self.with_lock(|path| self.prepare_keyed_store(path))
     }
 
     /// Offline rollback export for a release that still reads the JSON file.
@@ -2287,7 +2608,7 @@ impl AgentBusMessageRepository {
     /// failed) last changed before `cutoff`, without a presentation still
     /// due: the retention sweep archives, then [`Self::remove_finished`]s them.
     pub fn finished_before(&self, cutoff: chrono::DateTime<chrono::Utc>) -> anyhow::Result<Vec<FinishedAgentBusMessage>> {
-        self.read(|store| {
+        self.read_matching(|db| super::hot_store::finished_message_rows(db, cutoff), |store| {
             Ok(store
                 .messages
                 .values()
@@ -2311,8 +2632,176 @@ impl AgentBusMessageRepository {
         })
     }
 
+    // Version, selected rows and observations belong to one read-only snapshot.
+    fn selected_store(
+        &self,
+        ids: Option<&[String]>,
+    ) -> anyhow::Result<Option<AgentBusMessageStore>> {
+        self.matching_store(|db| {
+            let rows = match ids {
+                None => super::hot_store::bus_state_rows(db)?,
+                Some(ids) => {
+                    let mut rows = super::hot_store::Rows::new();
+                    for id in ids {
+                        if let Some(bytes) =
+                            super::hot_store::verified_row(db, "agent_bus", "message", id)?
+                        {
+                            rows.insert(("message".into(), id.clone()), bytes);
+                        }
+                    }
+                    rows
+                }
+            };
+            Ok(rows)
+        })
+    }
+
+    fn matching_store(&self, select: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<super::hot_store::Rows>) -> anyhow::Result<Option<AgentBusMessageStore>> {
+        let database = self.root.join(super::hot_store::DATABASE_FILE);
+        super::hot_store::verified_snapshot(&database, "agent_bus", |db, _| {
+            let mut rows = select(db)?;
+            if let Some(version) =
+                super::hot_store::verified_row(db, "agent_bus", "state", "version")?
+            {
+                rows.insert(("state".into(), "version".into()), version);
+            }
+            let mut store = bus_store_from_rows(&rows)?;
+            store.observation_unavailable = !settlement_state::observe_selected(db, &mut store.messages);
+            Ok(store)
+        })
+    }
+
+    fn read_matching<T>(&self, select: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<super::hot_store::Rows>, action: impl FnOnce(&AgentBusMessageStore) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        if let Some(store) = self.matching_store(select)? {return action(&store);}
+        // The original legacy/unverified path keeps its migration behavior.
+        self.read(action)
+    }
+
+    fn read_selected<T>(
+        &self,
+        ids: Option<&[String]>,
+        action: impl FnOnce(&AgentBusMessageStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        if let Some(store) = self.selected_store(ids)? {
+            return action(&store);
+        }
+        // Preserve legacy-only and unverified-store behavior; diagnostics
+        // cannot migrate or repair either store.
+        self.read(action)
+    }
+
     fn get(&self, message_id: &str) -> anyhow::Result<Option<StoredAgentBusMessage>> {
-        self.read(|store| Ok(store.messages.get(message_id).cloned()))
+        self.read_selected(Some(&[message_id.to_owned()]), |store| {
+            Ok(store.messages.get(message_id).cloned())
+        })
+    }
+
+    fn prepare_keyed_store(&self, path: &Path) -> anyhow::Result<()> {
+        let database = bus_database_path(path);
+        super::hot_store::prepare(&database)?;
+        if super::hot_store::generation(&database, "agent_bus")?.is_none()
+            && (path.exists() || super::hot_store::has_store(&database, "agent_bus")?)
+        {
+            super::hot_store::load_or_migrate(
+                &database,
+                "agent_bus",
+                path,
+                decode_legacy_bus_store,
+                |rows| bus_store_from_rows(rows).map(|_| ()),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn load_dirty_store(
+        &self,
+        path: &Path,
+        dirty: &DirtyRows,
+        request: Option<&str>,
+    ) -> anyhow::Result<(AgentBusMessageStore, u64)> {
+        use super::hot_store::bus_changes;
+        self.prepare_keyed_store(path)?;
+        let db = bus_changes::open(&bus_database_path(path))?;
+        db.read(|tx| {
+            let position = bus_changes::position(tx, &db, "agent_bus")?;
+            let mut keys = vec![("state".into(), "version".into())];
+            match dirty {
+                DirtyRows::Messages(ids) => {
+                    keys.extend(ids.iter().cloned().map(|id| ("message".into(), id)))
+                }
+                DirtyRows::Recovery(ids) => {
+                    keys.extend(ids.iter().cloned().map(|id| ("recovery".into(), id)))
+                }
+                DirtyRows::All => anyhow::bail!("whole-store action is not a keyed write"),
+            }
+            if let Some(request) = request {
+                keys.extend(
+                    super::hot_store::close_request_keys(tx.sql(), request)?
+                        .into_iter()
+                        .map(|id| ("message".into(), id)),
+                );
+            }
+            keys.sort();
+            keys.dedup();
+            let rows = bus_changes::keyed_rows(tx.sql(), "agent_bus", keys)?;
+            let mut store = bus_store_from_rows(&rows)?;
+            store.observation_unavailable =
+                !settlement_state::observe_selected(tx.sql(), &mut store.messages);
+            Ok((store, position.generation.unwrap_or(0)))
+        })
+    }
+
+    fn update_keyed<T>(
+        &self,
+        dirty: DirtyRows,
+        request: Option<&str>,
+        action: impl FnOnce(&mut AgentBusMessageStore) -> anyhow::Result<(T, bool)>,
+    ) -> anyhow::Result<T> {
+        let mut ledger_changes = Vec::new();
+        let result = self.with_lock(|path| {
+            let (mut store, generation) = self.load_dirty_store(path, &dirty, request)?;
+            let tracked = match &dirty {
+                DirtyRows::Messages(ids) if super::input_ledger_bus::active() => {
+                    Some(ledger_facts_of(&store, ids.clone()))
+                }
+                _ => None,
+            };
+            let old_projection = admission_projections(&store);
+            let before = dirty_rows(&store, &dirty)?;
+            let (result, changed) = action(&mut store)?;
+            if !changed {
+                return Ok(result);
+            }
+            let changes = bus_changes(&store, dirty, before)?;
+            if changes.is_empty() {
+                return Ok(result);
+            }
+            let database = bus_database_path(path);
+            // Resolve a poisoned index mutex before committing business rows.
+            let mut index = self
+                .admission_index
+                .lock()
+                .map_err(|_| anyhow::anyhow!("agent-bus admission index lock poisoned"))?;
+            super::hot_store::commit(&database, "agent_bus", generation, changes)?;
+            if let Some(before) = tracked {
+                ledger_changes = ledger_changes_of(&store, before);
+            }
+            if index.is_some() {
+                if let Err(error) = refresh_index(&database, &mut index) {
+                    *index = None;
+                    notify_projection_changes(&old_projection, &admission_projections(&store));
+                    eprintln!("committed bus write; admission projection will resync: {error:#}");
+                }
+            } else {
+                // A writer that never serves admission needs no history cache.
+                notify_projection_changes(&old_projection, &admission_projections(&store));
+            }
+            Ok(result)
+        });
+        if result.is_ok() && !ledger_changes.is_empty() {
+            super::input_ledger_bus::apply_changes(ledger_changes);
+        }
+        result
     }
 
     fn mutate<T>(
@@ -2391,16 +2880,24 @@ impl AgentBusMessageRepository {
         unchanged_on_error: bool,
         action: impl FnOnce(&mut AgentBusMessageStore) -> anyhow::Result<(T, bool)>,
     ) -> anyhow::Result<T> {
-        self.with_lock(|path| {
+        if !matches!(dirty, DirtyRows::All) { return self.update_keyed(dirty, None, action); }
+        // 054 §2.9: the ledger follows committed message writes, after the lock.
+        let tracked = match &dirty {
+            DirtyRows::Messages(ids) if super::input_ledger_bus::active() => Some(ids.clone()),
+            _ => None,
+        };
+        let mut ledger_changes = Vec::new();
+        let result = self.with_lock(|path| {
             let mut cache = self
                 .cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("management v2 agent-bus cache lock was poisoned"))?;
             let (mut store, generation, exists) = take_store(&mut cache, path)?;
+            let ledger_before = tracked.map(|ids| ledger_facts_of(&store, ids));
             let before = dirty_rows(&store, &dirty)?;
             let unchanged = |cache: &mut Option<CachedStore>, store: AgentBusMessageStore| {
                 if exists {
-                    *cache = Some(CachedStore { generation, store });
+                    *cache = Some(CachedStore { generation, store, position: None });
                 }
             };
             let (result, changed) = match action(&mut store) {
@@ -2423,19 +2920,57 @@ impl AgentBusMessageRepository {
                 return Ok(result);
             }
             let next = super::hot_store::commit(&database, "agent_bus", generation, changes)?;
+            if let Some(before) = ledger_before {
+                ledger_changes = ledger_changes_of(&store, before);
+            }
             let mut index = self.admission_index.lock().map_err(|_| anyhow::anyhow!("agent-bus admission index lock poisoned"))?;
-            let refreshed = AdmissionIndex::new(&store, Some(next));
+            let mut refreshed = AdmissionIndex::new(&store, Some(next));
+            let db = super::hot_store::bus_changes::open(&database)?;
+            db.read(|tx| {
+                refreshed.position = Some(super::hot_store::bus_changes::position(tx, &db, "agent_bus")?);
+                refreshed.observation_position = super::hot_store::bus_changes::position(tx, &db, settlement_state::EVIDENCE_STORE).ok();
+                Ok(())
+            })?;
+            refreshed.db = Some(db);
             refreshed.notify_changes(index.as_ref());
             *index = Some(refreshed);
-            *cache = Some(CachedStore { generation: next, store });
+            *cache = Some(CachedStore { generation: next, store, position: None });
             Ok(result)
-        })
+        });
+        if result.is_ok() && !ledger_changes.is_empty() {
+            super::input_ledger_bus::apply_changes(ledger_changes);
+        }
+        result
     }
 
     fn read<T>(
         &self,
         action: impl FnOnce(&AgentBusMessageStore) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        if self.read_only {
+            let _process = self.process_lock.lock()
+                .map_err(|_| anyhow::anyhow!("agent-bus read cache lock poisoned"))?;
+            // Open an existing lock only. An absent store is an empty view;
+            // neither it nor a legacy-only store needs a migration to be read.
+            let lock = match OpenOptions::new().read(true).open(self.root.join(AGENT_BUS_LOCK_FILE)) {
+                Ok(lock) => { lock.lock_shared()?; Some(lock) },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            let database = self.root.join(super::hot_store::DATABASE_FILE);
+            let mut cache = match super::hot_store::verified_rows(&database, "agent_bus")? {
+                Some(rows) => CachedStore { generation: rows.generation, store: bus_store_from_rows(&rows.rows)?, position: None },
+                None => {
+                    anyhow::ensure!(!super::hot_store::has_store(&database, "agent_bus")?,
+                        "agent-bus store is unverified; diagnostics will not repair it");
+                    CachedStore { generation: 0, store: load_store(&self.root.join(AGENT_BUS_STATE_FILE))?, position: None }
+                },
+            };
+            settlement_state::refresh_observations(&mut cache, &database)?;
+            let result = action(&cache.store);
+            if let Some(lock) = lock { lock.unlock()?; }
+            return result;
+        }
         self.with_lock(|path| {
             let mut cache = self
                 .cache
@@ -2447,14 +2982,17 @@ impl AgentBusMessageRepository {
     }
 
     fn with_lock<T>(&self, action: impl FnOnce(&Path) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        anyhow::ensure!(!self.read_only, "read-only agent-bus view cannot write");
         let _process_guard = self
             .process_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("management v2 agent-bus lock was poisoned"))?;
         let lock_file = open_private_lock(&self.root.join(AGENT_BUS_LOCK_FILE))?;
         lock_file.lock()?;
+        #[cfg(test)] let bus_lock_started = std::time::Instant::now();
         let result = action(&self.root.join(AGENT_BUS_STATE_FILE));
         let unlock = lock_file.unlock();
+        #[cfg(test)] write_tests::note_lock(bus_lock_started.elapsed());
         if result.is_ok() {
             unlock?;
         }
@@ -2797,6 +3335,315 @@ fn event_error(error: &Value) -> Value {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Input ledger (054 §2.9 bus rows; mapping in `input_ledger_bus`)
+
+pub use super::input_ledger_bus::{
+    active as input_ledger_active, apply_changes as input_ledger_apply, claude_input_stage, deferred as input_ledger_deferred,
+    tell_refused as input_ledger_tell_refused,
+};
+
+fn ledger_facts(stored: &StoredAgentBusMessage) -> super::input_ledger_bus::BusFacts {
+    let snapshot = &stored.snapshot;
+    super::input_ledger_bus::BusFacts {
+        state: snapshot.state.clone(),
+        timing: super::input_ledger_bus::timing_of(stored.canonical_envelope.as_ref(), &snapshot.message_id, &snapshot.delivery_mode),
+        frozen: snapshot.external_input.is_some(),
+        a2: snapshot.a2_submission_id.is_some(),
+        inbox: snapshot.local_inbox_receipt.is_some(),
+        a4: snapshot.a4_receipt.is_some(),
+        external_receipt: snapshot.external_input_receipt.is_some(),
+        observed: {
+            let native = snapshot.external_input_last_observed.as_ref().and_then(super::input_ledger_bus::NativeObserved::of);
+            let holdable = stored.owner_hold || owner_carry_candidate(stored, &stored.snapshot.to_cutex_session_id);
+            if holdable || stored.owner_carry.is_some() {
+                Some(super::input_ledger_bus::NativeObserved::OwnerPolicy {
+                    hold: holdable.then_some(stored.owner_hold),
+                    carried: stored.owner_carry.is_some(), native: native.map(Box::new),
+                })
+            } else { native }
+        },
+        turn: stored.meta.as_ref().and_then(|meta| meta.context_turn_id.clone()),
+        settlement_closed: settlement_closed(stored),
+        error_code: snapshot.error.as_ref().and_then(|error| error.get("code")).and_then(Value::as_str).map(str::to_string),
+        item: ledger_item(stored),
+    }
+}
+
+/// The native timeline item of a delivered message (054 §3.2): the item
+/// id its context receipt names (ExternalInput `responseItemId`, A4
+/// `response_item_id`); a Claude context injection has no receipt, its item
+/// is the `external_event` whose id is the message id
+/// (`record_context_injected`). `None` before delivery.
+fn ledger_item(stored: &StoredAgentBusMessage) -> Option<String> {
+    let snapshot = &stored.snapshot;
+    if snapshot.state != "delivered" {
+        return None;
+    }
+    snapshot.external_input_receipt.as_ref().map(|receipt| receipt.response_item_id.clone())
+        .or_else(|| snapshot.a4_receipt.as_ref().map(|receipt| receipt.response_item_id.clone()))
+        .or_else(|| Some(snapshot.message_id.clone()))
+        .filter(|item| !item.is_empty())
+}
+
+fn ledger_input(stored: &StoredAgentBusMessage) -> super::input_ledger::NewInput {
+    let snapshot = &stored.snapshot;
+    super::input_ledger_bus::new_input(
+        stored.canonical_envelope.as_ref(),
+        &snapshot.message_id,
+        snapshot.from_cutex_session_id.as_deref(),
+        &snapshot.delivery_mode,
+        &snapshot.content,
+        stored.meta.as_ref().and_then(|meta| meta.sender.as_ref()).and_then(|sender| sender.name.as_deref()),
+    )
+}
+
+/// See [`AgentBusMessageRepository::input_ledger_redeliverable`].
+fn redeliverable(stored: &StoredAgentBusMessage, owner: &str) -> Result<(), (&'static str, String)> {
+    let id = &stored.snapshot.message_id;
+    if stored.snapshot.to_cutex_session_id != owner {
+        return Err(("bus_message_not_found", format!("agent-bus message {id} is not for {owner}")));
+    }
+    if settlement_closed(stored) {
+        return Err(("bus_message_settled", format!("agent-bus message {id} was settled")));
+    }
+    if stored.canonical_envelope.is_none() {
+        return Err(("bus_message_not_redeliverable", format!("agent-bus message {id} has no durable envelope")));
+    }
+    match stored.snapshot.state.as_str() {
+        "pending" | "inbox_accepted" => Ok(()),
+        state => Err(("bus_message_not_redeliverable", format!("agent-bus message {id} is {state}"))),
+    }
+}
+
+fn ledger_facts_of(
+    store: &AgentBusMessageStore,
+    ids: Vec<String>,
+) -> Vec<(String, Option<super::input_ledger_bus::BusFacts>)> {
+    ids.into_iter().map(|id| {
+        let facts = store.messages.get(&id).map(ledger_facts);
+        (id, facts)
+    }).collect()
+}
+
+fn ledger_changes_of(
+    store: &AgentBusMessageStore,
+    before: Vec<(String, Option<super::input_ledger_bus::BusFacts>)>,
+) -> Vec<super::input_ledger_bus::BusChange> {
+    before.into_iter().filter_map(|(id, before)| {
+        let stored = store.messages.get(&id)?;
+        let after = ledger_facts(stored);
+        (before.as_ref() != Some(&after)).then(|| super::input_ledger_bus::BusChange {
+            session: stored.snapshot.to_cutex_session_id.clone(),
+            message_id: id,
+            before,
+            after,
+            input: ledger_input(stored),
+        })
+    }).collect()
+}
+
+impl AgentBusMessageRepository {
+    /// 054 §2.9 `sending`: the bridge is about to submit this message to the
+    /// native runtime (after the freeze, before the submit call).
+    pub fn input_ledger_sending(&self, owner: &str, message_id: &str) {
+        if !super::input_ledger_bus::active() {
+            return;
+        }
+        match self.get(message_id) {
+            Ok(Some(stored)) if stored.snapshot.to_cutex_session_id == owner => {
+                super::input_ledger_bus::sending(owner, message_id, &ledger_input(&stored));
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("cutex input ledger (bus): read {message_id}: {error:#}"),
+        }
+    }
+
+    /// The recipient has no runtime endpoint (startup redrive could not
+    /// queue it): `waiting{agentOffline}` while it still waits.
+    pub fn input_ledger_agent_offline(&self, message_id: &str) {
+        if !super::input_ledger_bus::active() {
+            return;
+        }
+        match self.get(message_id) {
+            Ok(Some(stored)) if matches!(stored.snapshot.state.as_str(), "pending") => {
+                let input = ledger_input(&stored);
+                if stored.owner_hold || stored.owner_carry.is_some() {
+                    super::input_ledger_bus::drive(&stored.snapshot.to_cutex_session_id, message_id,
+                        &input, &super::input_ledger_bus::target_of(&ledger_facts(&stored)));
+                    return;
+                }
+                if owner_holdable(&stored, &stored.snapshot.to_cutex_session_id) {
+                    super::input_ledger_bus::drive(&stored.snapshot.to_cutex_session_id, message_id, &input,
+                        &super::input_ledger_bus::Target::Waiting { reason: "agentOffline", details: Some(json!({"ownerHold": false})) });
+                    return;
+                }
+                super::input_ledger_bus::waiting_reason(&stored.snapshot.to_cutex_session_id, message_id, &input, "agentOffline");
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("cutex input ledger (bus): read {message_id}: {error:#}"),
+        }
+    }
+
+    /// The ledger view of one stored message (054 §2.12 drift, C5): its
+    /// recipient, the facts the ledger follows and its ledger identity.
+    pub fn input_ledger_view(
+        &self,
+        message_id: &str,
+    ) -> anyhow::Result<Option<(String, super::input_ledger_bus::BusFacts, super::input_ledger::NewInput)>> {
+        self.read_selected(Some(&[message_id.to_owned()]), |store| {
+            Ok(store.messages.get(message_id).map(|stored| {
+                (stored.snapshot.to_cutex_session_id.clone(), ledger_facts(stored), ledger_input(stored))
+            }))
+        })
+    }
+
+    /// The native timeline items of delivered messages, for the ledger's
+    /// timelineItemId backfill: `(message id, owner session, item)` for each
+    /// of `ids` the store knows (one read, no copy of the store).
+    pub fn input_ledger_items(&self, ids: &[String]) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+        self.read_selected(Some(ids), |store| {
+            Ok(ids.iter()
+                .filter_map(|id| store.messages.get(id).map(|stored| (id.clone(), stored.snapshot.to_cutex_session_id.clone(), ledger_item(stored))))
+                .collect())
+        })
+    }
+
+    /// r274.2 §9.1: the Claude adapter showed frozen r8 message `message_id`
+    /// of `owner` as its native item in `turn`. Ledger only
+    /// ([`super::input_ledger_bus::native_item`]: `accepted` on the
+    /// timeline); the bus row keeps waiting for the validated receipt.
+    pub fn input_ledger_native_item(&self, owner: &str, message_id: &str, turn: &str) -> anyhow::Result<()> {
+        if !super::input_ledger_bus::active() {
+            return Ok(());
+        }
+        let Some(stored) = self.get(message_id)? else { return Ok(()) };
+        if stored.snapshot.to_cutex_session_id != owner || !matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted") {
+            return Ok(());
+        }
+        super::input_ledger_bus::native_item_with_carry(owner, message_id, &ledger_input(&stored), turn, stored.owner_carry.is_some());
+        Ok(())
+    }
+
+    /// Whether `cutex/input/retry` can resend this message (054 §2.10 /
+    /// §2.14): it is still open on the bus (`pending` or taken into the
+    /// local inbox) for `owner`. `Err((code, message))` says why not.
+    pub fn input_ledger_redeliverable(&self, owner: &str, message_id: &str) -> anyhow::Result<Result<(), (&'static str, String)>> {
+        self.read_selected(Some(&[message_id.to_owned()]), |store| {
+            let Some(stored) = store.messages.get(message_id) else {
+                return Ok(Err(("bus_message_not_found", format!("no agent-bus message {message_id}"))));
+            };
+            Ok(redeliverable(stored, owner))
+        })
+    }
+
+    /// 054 §2.14 retry of a bus message: the same id goes out again. The
+    /// receipts of the earlier attempt (local inbox, A2 submission, last
+    /// native observation) are dropped so the bridge submits it once more;
+    /// the frozen native identity stays (a runtime that still holds it
+    /// answers for it, one that lost it takes it again). Authorised for the
+    /// startup redrive, which re-queues it on the bus. Returns `false` when
+    /// it is no longer redeliverable (settled meanwhile).
+    pub fn input_ledger_redeliver(&self, owner: &str, message_id: &str, at: DateTime<Utc>) -> anyhow::Result<bool> {
+        self.update_message(message_id, |store| {
+            let Some(stored) = store.messages.get_mut(message_id) else { return Ok((false, false)) };
+            if redeliverable(stored, owner).is_err() {
+                return Ok((false, false));
+            }
+            stored.snapshot.state = "pending".into();
+            stored.snapshot.local_inbox_receipt = None;
+            stored.snapshot.a2_submission_id = None;
+            stored.snapshot.external_input_last_observed = None;
+            stored.snapshot.stale_release_authorized = true;
+            stored.snapshot.error = None;
+            stored.inbox_accepted_at = None;
+            stored.admission_started_idle = false;
+            // Explicit retry authorizes this source input to leave an
+            // unresolved owner bundle. Automatic sweeps never clear it.
+            stored.owner_carry = None;
+            stored.updated_at = at.to_rfc3339();
+            Ok((true, true))
+        })
+    }
+
+    /// One backfill batch: up to `limit` open messages (pending, stale_held,
+    /// inbox_accepted, not closed) after `after` in id order, as small owned
+    /// views (no store clone), and the cursor for the next batch (`None`:
+    /// done).
+    pub fn input_ledger_backfill_items(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<super::input_ledger_bus::BackfillItem>, Option<String>)> {
+        use std::ops::Bound;
+        self.read_selected(None, |store| {
+            let start = match after {
+                Some(after) => Bound::Excluded(after.to_string()),
+                None => Bound::Unbounded,
+            };
+            let mut items = Vec::new();
+            let mut cursor = None;
+            for (id, stored) in store.messages.range::<String, _>((start, Bound::Unbounded)) {
+                cursor = Some(id.clone());
+                if settlement_closed(stored)
+                    || !matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held")
+                {
+                    continue;
+                }
+                items.push(super::input_ledger_bus::BackfillItem {
+                    session: stored.snapshot.to_cutex_session_id.clone(),
+                    message_id: id.clone(),
+                    facts: ledger_facts(stored),
+                    input: ledger_input(stored),
+                    updated_at: DateTime::parse_from_rfc3339(&stored.updated_at).ok().map(|at| at.with_timezone(&Utc)),
+                });
+                if items.len() >= limit {
+                    break;
+                }
+            }
+            let done = items.len() < limit;
+            Ok((items, if done { None } else { cursor }))
+        })
+    }
+
+    /// Decision 9 backfill: ledger records for every open bus message that
+    /// has none yet, in batches of [`super::input_ledger_bus::BACKFILL_BATCH`].
+    /// Idempotent (existing records are left to the drift reconcile).
+    pub fn input_ledger_backfill(&self) -> anyhow::Result<usize> {
+        let mut cursor: Option<String> = None;
+        let mut created = 0;
+        loop {
+            if !super::input_ledger_bus::active() {
+                return Ok(created);
+            }
+            let (items, next) = self.input_ledger_backfill_items(cursor.as_deref(), super::input_ledger_bus::BACKFILL_BATCH)?;
+            created += super::input_ledger_bus::backfill_batch(&items, Utc::now());
+            match next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(created),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+/// Run the decision 9 backfill once in the background (bus startup).
+pub fn spawn_input_ledger_backfill() {
+    if !super::input_ledger_bus::active() {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("cutex-input-ledger-bus-backfill".into()).spawn(|| {
+        match agent_bus_message_repository().and_then(|repository| repository.input_ledger_backfill()) {
+            Ok(0) => {}
+            Ok(created) => eprintln!("cutex input ledger: backfilled {created} open agent-bus message(s)"),
+            Err(error) => eprintln!("cutex input ledger: agent-bus backfill failed: {error:#}"),
+        }
+    });
+    if let Err(error) = spawned {
+        eprintln!("cutex input ledger: agent-bus backfill not started: {error}");
+    }
+}
+
 /// The recipient and (for agent senders) the sender stream.
 fn both_streams(stored: &StoredAgentBusMessage) -> Vec<String> {
     let mut sessions = vec![stored.owner_cutex_session_id.clone()];
@@ -2816,7 +3663,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn capture_events<T>(action: impl FnOnce() -> T) -> (T, Vec<(String, String, Value)>) {
+pub(super) fn capture_events<T>(action: impl FnOnce() -> T) -> (T, Vec<(String, String, Value)>) {
     CAPTURED_EVENTS.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
     let result = action();
     let events = CAPTURED_EVENTS.with(|cell| cell.borrow_mut().take().unwrap_or_default());
@@ -2889,6 +3736,9 @@ fn bus_store_from_rows(source: &super::hot_store::Rows) -> anyhow::Result<AgentB
     let mut store = AgentBusMessageStore::default();
     let mut seen_version = false;
     for ((collection, key), value) in source {
+        crate::store::metrics::note("bus-messages",crate::store::OpCounts {
+            bytes_decoded:value.len() as u64, rows_materialized:1, ..Default::default()
+        });
         match collection.as_str() {
             "state" if key == "version" => {
                 store.version = serde_json::from_slice(value)?;
@@ -3039,6 +3889,10 @@ fn dirty_rows(store: &AgentBusMessageStore, dirty: &DirtyRows) -> anyhow::Result
 #[serde(rename_all = "camelCase")]
 struct AdmissionMessageProjection {
     #[serde(default)]
+    owner_carry: Option<String>,
+    #[serde(default)]
+    owner_hold: bool,
+    #[serde(default)]
     settlement: Option<super::agent_bus_settlement_model::SettlementView>,
     canonical_envelope: Option<AdmissionCanonicalProjection>,
     snapshot: AdmissionSnapshotProjection,
@@ -3140,85 +3994,410 @@ impl From<&StoredAgentBusMessage> for AdmissionMessageProjection {
     fn from(stored: &StoredAgentBusMessage) -> Self {
         let snapshot = &stored.snapshot;
         Self {
+            owner_carry: stored.owner_carry.clone(), owner_hold: stored.owner_hold,
             settlement: settlement_view(stored, Utc::now()),
-            canonical_envelope: stored.canonical_envelope.as_ref().map(|message| AdmissionCanonicalProjection {
-                id: message.id.clone(), kind: message.kind.clone(), from: message.from.clone(), to: message.to.clone(),
-                from_cutex_session_id: message.from_cutex_session_id.clone(), to_cutex_session_id: message.to_cutex_session_id.clone(),
-                delivery_mode: message.delivery_mode.clone(), trigger_turn: message.trigger_turn,
-                created_at_epoch_secs: message.created_at_epoch_secs, sender_kind: message.sender_kind.clone(),
-                control_type: message.control_type.clone(),
-                control_payload: message.control_payload.as_ref().map(|payload| AdmissionPayloadFingerprint::deserialize(payload).expect("JSON value is a valid admission fingerprint")),
-                external_action_id: message.external_action_id.clone(), external_message_id: message.external_message_id.clone(),
+            canonical_envelope: stored.canonical_envelope.as_ref().map(|message| {
+                AdmissionCanonicalProjection {
+                    id: message.id.clone(),
+                    kind: message.kind.clone(),
+                    from: message.from.clone(),
+                    to: message.to.clone(),
+                    from_cutex_session_id: message.from_cutex_session_id.clone(),
+                    to_cutex_session_id: message.to_cutex_session_id.clone(),
+                    delivery_mode: message.delivery_mode.clone(),
+                    trigger_turn: message.trigger_turn,
+                    created_at_epoch_secs: message.created_at_epoch_secs,
+                    sender_kind: message.sender_kind.clone(),
+                    control_type: message.control_type.clone(),
+                    control_payload: message.control_payload.as_ref().map(|payload| {
+                        AdmissionPayloadFingerprint::deserialize(payload)
+                            .expect("JSON value is a valid admission fingerprint")
+                    }),
+                    external_action_id: message.external_action_id.clone(),
+                    external_message_id: message.external_message_id.clone(),
+                }
             }),
             snapshot: AdmissionSnapshotProjection {
-                to_cutex_session_id: snapshot.to_cutex_session_id.clone(), state: snapshot.state.clone(),
-                semantic_sha256: snapshot.semantic_sha256.clone(), a2_submission_id: snapshot.a2_submission_id.clone(),
-                a4_receipt: snapshot.a4_receipt.as_ref().map(|receipt| AdmissionTurnProjection { turn_id: receipt.turn_id.clone() }),
+                to_cutex_session_id: snapshot.to_cutex_session_id.clone(),
+                state: snapshot.state.clone(),
+                semantic_sha256: snapshot.semantic_sha256.clone(),
+                a2_submission_id: snapshot.a2_submission_id.clone(),
+                a4_receipt: snapshot
+                    .a4_receipt
+                    .as_ref()
+                    .map(|receipt| AdmissionTurnProjection {
+                        turn_id: receipt.turn_id.clone(),
+                    }),
                 local_inbox_receipt: snapshot.local_inbox_receipt.clone(),
-                external_input: snapshot.external_input.as_ref().map(|envelope| AdmissionEnvelopeProjection {
-                    message: AdmissionDeliveryProjection { delivery: envelope.message.delivery.clone() },
+                external_input: snapshot.external_input.as_ref().map(|envelope| {
+                    AdmissionEnvelopeProjection {
+                        message: AdmissionDeliveryProjection {
+                            delivery: envelope.message.delivery.clone(),
+                        },
+                    }
                 }),
-                external_input_receipt: snapshot.external_input_receipt.as_ref().map(|receipt| AdmissionTurnProjection { turn_id: receipt.turn_id.clone() }),
-                external_input_last_observed: snapshot.external_input_last_observed.as_ref().map(|status| AdmissionStatusProjection { delivery_state: status.delivery_state.clone() }),
+                external_input_receipt: snapshot.external_input_receipt.as_ref().map(|receipt| {
+                    AdmissionTurnProjection {
+                        turn_id: receipt.turn_id.clone(),
+                    }
+                }),
+                external_input_last_observed: snapshot.external_input_last_observed.as_ref().map(
+                    |status| AdmissionStatusProjection {
+                        delivery_state: status.delivery_state.clone(),
+                    },
+                ),
             },
-            queued_at: stored.queued_at.clone(), admission_started_idle: stored.admission_started_idle,
-            meta: stored.meta.as_ref().map(|meta| AdmissionMetaProjection { context_turn_id: meta.context_turn_id.clone() }),
+            queued_at: stored.queued_at.clone(),
+            admission_started_idle: stored.admission_started_idle,
+            meta: stored.meta.as_ref().map(|meta| AdmissionMetaProjection {
+                context_turn_id: meta.context_turn_id.clone(),
+            }),
         }
     }
+}
+
+type AdmissionProjectionMap = BTreeMap<String, AdmissionMessageProjection>;
+
+fn admission_candidate(stored: &StoredAgentBusMessage) -> bool {
+    !settlement_closed(stored)
+        && (stored.admission_started_idle
+            || matches!(
+                stored.snapshot.state.as_str(),
+                "pending" | "inbox_accepted" | "stale_held"
+            ))
+}
+
+fn admission_projections(store: &AgentBusMessageStore) -> AdmissionProjectionMap {
+    crate::store::metrics::note(
+        "bus-messages",
+        crate::store::OpCounts {
+            rows_visited: store.messages.len() as u64,
+            ..Default::default()
+        },
+    );
+    store
+        .messages
+        .iter()
+        .filter(|(_, stored)| admission_candidate(stored))
+        .map(|(id, stored)| (id.clone(), AdmissionMessageProjection::from(stored)))
+        .collect()
+}
+
+fn projection_pending(row: &AdmissionMessageProjection) -> bool {
+    matches!(
+        row.snapshot.state.as_str(),
+        "pending" | "inbox_accepted" | "stale_held"
+    )
+}
+
+fn projection_turn(row: &AdmissionMessageProjection) -> Option<String> {
+    if !row.admission_started_idle {
+        return None;
+    }
+    row.snapshot
+        .external_input_receipt
+        .as_ref()
+        .map(|r| r.turn_id.as_str())
+        .or_else(|| row.snapshot.a4_receipt.as_ref().map(|r| r.turn_id.as_str()))
+        .or_else(|| {
+            row.snapshot
+                .local_inbox_receipt
+                .as_ref()
+                .and_then(|r| r.get("turnId"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| row.meta.as_ref().and_then(|m| m.context_turn_id.as_deref()))
+        .filter(|turn| !turn.is_empty())
+        .map(str::to_owned)
 }
 
 struct AdmissionIndex {
     generation: Option<u64>,
     observation_generation: Option<u64>,
     observation_unavailable: bool,
-    sessions: BTreeMap<String, Vec<String>>,
-    fingerprints: BTreeMap<String, Vec<(String, AdmissionMessageProjection)>>,
+    sessions: BTreeMap<String, std::collections::BTreeSet<String>>,
+    fingerprints: BTreeMap<String, AdmissionProjectionMap>,
     started_turns: BTreeMap<String, std::collections::BTreeSet<String>>,
+    turn_counts: BTreeMap<(String, String), usize>,
+    messages: AdmissionProjectionMap,
+    position: Option<super::hot_store::bus_changes::Position>,
+    observation_position: Option<super::hot_store::bus_changes::Position>,
+    db: Option<std::sync::Arc<crate::store::StoreDb>>,
 }
 
 impl AdmissionIndex {
     fn new(store: &AgentBusMessageStore, generation: Option<u64>) -> Self {
-        let mut index = Self::from_projection(store.messages.iter().filter(|(_, stored)| !settlement_closed(stored) && (stored.admission_started_idle
-            || matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held")))
-            .map(|(id, stored)| (id.clone(), AdmissionMessageProjection::from(stored))).collect(), generation);
+        let mut index = Self::from_projection(admission_projections(store), generation);
         index.observation_generation = store.observation_generation;
         index.observation_unavailable = store.observation_unavailable;
         index
     }
 
-    fn from_projection(messages: BTreeMap<String, AdmissionMessageProjection>, generation: Option<u64>) -> Self {
-        let mut sessions: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut fingerprints: BTreeMap<String, Vec<(String, AdmissionMessageProjection)>> = BTreeMap::new();
-        let mut started_turns: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
-        for (id, stored) in messages {
-            let snapshot = &stored.snapshot;
-            if stored.admission_started_idle {
-                let turn = snapshot.external_input_receipt.as_ref().map(|receipt| receipt.turn_id.as_str())
-                    .or_else(|| snapshot.a4_receipt.as_ref().map(|receipt| receipt.turn_id.as_str()))
-                    .or_else(|| snapshot.local_inbox_receipt.as_ref().and_then(|receipt| receipt.get("turnId")).and_then(Value::as_str))
-                    .or_else(|| stored.meta.as_ref().and_then(|meta| meta.context_turn_id.as_deref()));
-                if let Some(turn) = turn.filter(|turn| !turn.is_empty()) {
-                    started_turns.entry(snapshot.to_cutex_session_id.clone()).or_default().insert(turn.into());
+    fn from_projection(messages: AdmissionProjectionMap, generation: Option<u64>) -> Self {
+        let mut index = Self {
+            generation,
+            observation_generation: None,
+            observation_unavailable: false,
+            sessions: BTreeMap::new(),
+            fingerprints: BTreeMap::new(),
+            started_turns: BTreeMap::new(),
+            turn_counts: BTreeMap::new(),
+            messages: BTreeMap::new(),
+            position: None,
+            observation_position: None,
+            db: None,
+        };
+        for (id, row) in messages {
+            index.replace(&id, Some(row));
+        }
+        index
+    }
+
+    fn replace(&mut self, id: &str, row: Option<AdmissionMessageProjection>) {
+        if let Some(old) = self.messages.remove(id) {
+            let session = &old.snapshot.to_cutex_session_id;
+            if projection_pending(&old) {
+                if let Some(ids) = self.sessions.get_mut(session) {
+                    ids.remove(id);
+                    if ids.is_empty() {
+                        self.sessions.remove(session);
+                    }
+                }
+                if let Some(rows) = self.fingerprints.get_mut(session) {
+                    rows.remove(id);
+                    if rows.is_empty() {
+                        self.fingerprints.remove(session);
+                    }
                 }
             }
-            if matches!(snapshot.state.as_str(), "pending" | "inbox_accepted" | "stale_held") {
-                sessions.entry(snapshot.to_cutex_session_id.clone()).or_default().push(id.clone());
-                fingerprints.entry(snapshot.to_cutex_session_id.clone()).or_default().push((id, stored));
+            if let Some(turn) = projection_turn(&old) {
+                let key = (session.clone(), turn.clone());
+                let count = self.turn_counts.get_mut(&key).expect("indexed turn count");
+                *count -= 1;
+                if *count == 0 {
+                    self.turn_counts.remove(&key);
+                    if let Some(turns) = self.started_turns.get_mut(session) {
+                        turns.remove(&turn);
+                        if turns.is_empty() {
+                            self.started_turns.remove(session);
+                        }
+                    }
+                }
             }
         }
-        Self { generation, observation_generation: None, observation_unavailable:false, sessions, fingerprints, started_turns }
+        if let Some(row) = row {
+            let session = &row.snapshot.to_cutex_session_id;
+            if projection_pending(&row) {
+                self.sessions
+                    .entry(session.clone())
+                    .or_default()
+                    .insert(id.into());
+                self.fingerprints
+                    .entry(session.clone())
+                    .or_default()
+                    .insert(id.into(), row.clone());
+            }
+            if let Some(turn) = projection_turn(&row) {
+                *self
+                    .turn_counts
+                    .entry((session.clone(), turn.clone()))
+                    .or_default() += 1;
+                self.started_turns
+                    .entry(session.clone())
+                    .or_default()
+                    .insert(turn);
+            }
+            self.messages.insert(id.into(), row);
+        }
+    }
+
+    fn apply(&mut self, changes: Vec<(String, Option<AdmissionMessageProjection>)>) {
+        let mut notify = std::collections::BTreeSet::new();
+        let mut old_turns = BTreeMap::new();
+        for (id, new) in &changes {
+            let old = self.messages.get(id);
+            let old_pending = old.filter(|row| projection_pending(row));
+            let new_pending = new.as_ref().filter(|row| projection_pending(row));
+            if old_pending != new_pending {
+                for row in old_pending.into_iter().chain(new_pending) {
+                    notify.insert(row.snapshot.to_cutex_session_id.clone());
+                }
+            }
+            for row in old.into_iter().chain(new.as_ref()) {
+                if let Some(turn) = projection_turn(row) {
+                    let key = (row.snapshot.to_cutex_session_id.clone(), turn);
+                    old_turns
+                        .entry(key.clone())
+                        .or_insert_with(|| self.turn_counts.contains_key(&key));
+                }
+            }
+        }
+        for (id, row) in changes {
+            self.replace(&id, row);
+        }
+        for ((session, turn), present) in old_turns {
+            if present != self.turn_counts.contains_key(&(session.clone(), turn)) {
+                notify.insert(session);
+            }
+        }
+        for session in notify {
+            super::admission::changed(&session);
+        }
     }
 
     fn notify_changes(&self, previous: Option<&Self>) {
-        let sessions = self.fingerprints.keys().chain(self.started_turns.keys()).chain(previous.into_iter()
-            .flat_map(|old| old.fingerprints.keys().chain(old.started_turns.keys()))).collect::<std::collections::BTreeSet<_>>();
+        let sessions = self
+            .fingerprints
+            .keys()
+            .chain(self.started_turns.keys())
+            .chain(
+                previous
+                    .into_iter()
+                    .flat_map(|old| old.fingerprints.keys().chain(old.started_turns.keys())),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
         for session in sessions {
-            if previous.and_then(|old| old.fingerprints.get(session)) != self.fingerprints.get(session)
-                || previous.and_then(|old| old.started_turns.get(session)) != self.started_turns.get(session) {
+            if previous.and_then(|old| old.fingerprints.get(session))
+                != self.fingerprints.get(session)
+                || previous.and_then(|old| old.started_turns.get(session))
+                    != self.started_turns.get(session)
+            {
                 super::admission::changed(session);
             }
         }
     }
+}
+
+fn notify_projection_changes(old: &AdmissionProjectionMap, new: &AdmissionProjectionMap) {
+    let before = AdmissionIndex::from_projection(old.clone(), None);
+    let after = AdmissionIndex::from_projection(new.clone(), None);
+    after.notify_changes(Some(&before));
+}
+
+/// Rebuild only scheduling candidates on cold start/explicit resync; ordinary
+/// catch-up uses the S0 cursor and tombstones, then point-loads dirty IDs.
+fn refresh_index(database: &Path, index: &mut Option<AdmissionIndex>) -> anyhow::Result<bool> {
+    use super::hot_store::{
+        self,
+        bus_changes::{self, Delta},
+    };
+    let db = index
+        .as_ref()
+        .and_then(|i| i.db.clone())
+        .map(Ok)
+        .unwrap_or_else(|| bus_changes::open(database))?;
+    db.read(|tx| {
+        let business = bus_changes::delta(
+            tx,
+            &db,
+            "agent_bus",
+            index.as_ref().and_then(|i| i.position.as_ref()),
+        )?;
+        let observations = bus_changes::delta(
+            tx,
+            &db,
+            settlement_state::EVIDENCE_STORE,
+            index.as_ref().and_then(|i| i.observation_position.as_ref()),
+        )
+        .ok();
+        let bus_position = match &business {
+            Delta::Rows { position, .. } | Delta::Resync(position) => position.clone(),
+        };
+        let observation_position = observations.as_ref().map(|delta| match delta {
+            Delta::Rows { position, .. } | Delta::Resync(position) => position.clone(),
+        });
+        let mut keys = std::collections::BTreeSet::new();
+        let resync = index.is_none()
+            || index.as_ref().is_some_and(|i| i.observation_unavailable)
+            || matches!(&business, Delta::Resync(_))
+            || !matches!(&observations, Some(Delta::Rows { .. }));
+        if let Delta::Rows { keys: dirty, .. } = &business {
+            keys.extend(
+                dirty
+                    .iter()
+                    .filter(|(c, _)| c == "message")
+                    .map(|(_, id)| id.clone()),
+            );
+        }
+        if let Some(Delta::Rows { keys: dirty, .. }) = &observations {
+            keys.extend(
+                dirty
+                    .iter()
+                    .filter(|(c, _)| c == "evidence")
+                    .map(|(_, id)| id.clone()),
+            );
+        }
+        let changed = resync
+            || index.as_ref().is_none_or(|i| {
+                i.position.as_ref() != Some(&bus_position)
+                    || i.observation_position != observation_position
+            });
+        if !changed {
+            return Ok(false);
+        }
+        let version = hot_store::verified_row(tx.sql(), "agent_bus", "state", "version")?;
+        let decode =
+            |mut rows: super::hot_store::Rows| -> anyhow::Result<(AgentBusMessageStore, bool)> {
+                if let Some(version) = &version {
+                    rows.insert(("state".into(), "version".into()), version.clone());
+                }
+                let mut store = bus_store_from_rows(&rows)?;
+                let available = settlement_state::observe_selected(tx.sql(), &mut store.messages);
+                Ok((store, available))
+            };
+        let mut unavailable = observations.is_none();
+        if resync {
+            let mut refreshed =
+                AdmissionIndex::from_projection(BTreeMap::new(), bus_position.generation);
+            let mut after = None;
+            while bus_position.generation.is_some() {
+                let (page, next) = hot_store::admission_page(
+                    tx.sql(),
+                    after.as_deref(),
+                    crate::store::PageBudget::LIST_DEFAULT,
+                )?;
+                let (store, available) = decode(page)?;
+                unavailable |= !available;
+                for (id, row) in admission_projections(&store) {
+                    refreshed.replace(&id, Some(row));
+                }
+                if next.is_none() {
+                    break;
+                }
+                after = next;
+            }
+            refreshed.notify_changes(index.as_ref());
+            *index = Some(refreshed);
+        } else {
+            let rows = bus_changes::keyed_rows(
+                tx.sql(),
+                "agent_bus",
+                keys.iter().cloned().map(|id| ("message".into(), id)),
+            )?;
+            let (store, available) = decode(rows)?;
+            unavailable |= !available;
+            let changes = keys
+                .into_iter()
+                .map(|id| {
+                    let row = store
+                        .messages
+                        .get(&id)
+                        .filter(|m| admission_candidate(m))
+                        .map(AdmissionMessageProjection::from);
+                    (id, row)
+                })
+                .collect();
+            index.as_mut().unwrap().apply(changes);
+        }
+        let index = index.as_mut().unwrap();
+        index.generation = bus_position.generation;
+        index.observation_generation = observation_position.as_ref().and_then(|p| p.generation);
+        index.observation_unavailable = unavailable;
+        index.position = Some(bus_position);
+        index.observation_position = observation_position;
+        index.db = Some(db.clone());
+        Ok(true)
+    })
 }
 
 fn bus_admission_timing(
@@ -3252,6 +4431,7 @@ fn bus_admission_timing(
 struct CachedStore {
     generation: u64,
     store: AgentBusMessageStore,
+    position: Option<super::hot_store::bus_changes::Position>,
 }
 
 /// Loads the state under the repository lock, reusing the cached parse while
@@ -3261,10 +4441,57 @@ fn fresh_store<'a>(
     cache: &'a mut Option<CachedStore>,
     path: &Path,
 ) -> anyhow::Result<(std::borrow::Cow<'a, AgentBusMessageStore>, Option<u64>)> {
+    use super::hot_store::bus_changes::{self, Delta};
     let database = bus_database_path(path);
-    let generation = super::hot_store::generation(&database, "agent_bus")?;
-    let hit = matches!((cache.as_ref(), generation), (Some(entry), Some(generation)) if entry.generation == generation);
-    if !hit {
+    super::hot_store::prepare(&database)?;
+    let db = bus_changes::open(&database)?;
+    let caught_up = if let Some(entry) = cache.as_mut() {
+        db.read(
+            |tx| match bus_changes::delta(tx, &db, "agent_bus", entry.position.as_ref())? {
+                Delta::Resync(_) => Ok(false),
+                Delta::Rows { position, mut keys } => {
+                    if !keys.is_empty() {
+                        let dirty_keys = keys.clone();
+                        keys.insert(("state".into(), "version".into()));
+                        let rows = bus_changes::keyed_rows(tx.sql(), "agent_bus", keys)?;
+                        let mut changed = bus_store_from_rows(&rows)?;
+                        if !settlement_state::observe_selected(tx.sql(), &mut changed.messages) {
+                            entry.store.observation_generation = None;
+                        }
+                        entry.store.version = changed.version;
+                        for (collection, key) in dirty_keys {
+                            match collection.as_str() {
+                                "message" => {
+                                    if let Some(row) = changed.messages.remove(&key) {
+                                        entry.store.messages.insert(key, row);
+                                    } else {
+                                        entry.store.messages.remove(&key);
+                                    }
+                                }
+                                "recovery" => {
+                                    if let Some(row) =
+                                        changed.external_recovery_actions.remove(&key)
+                                    {
+                                        entry.store.external_recovery_actions.insert(key, row);
+                                    } else {
+                                        entry.store.external_recovery_actions.remove(&key);
+                                    }
+                                }
+                                "state" if key == "version" => {}
+                                _ => anyhow::bail!("unknown bus change row {collection}/{key}"),
+                            }
+                        }
+                    }
+                    entry.generation = position.generation.unwrap_or(0);
+                    entry.position = Some(position);
+                    Ok(true)
+                }
+            },
+        )?
+    } else {
+        false
+    };
+    if !caught_up {
         *cache = None;
         let loaded = super::hot_store::load_or_migrate(
             &database,
@@ -3275,14 +4502,22 @@ fn fresh_store<'a>(
         )?;
         let store = bus_store_from_rows(&loaded.rows)?;
         if loaded.exists {
-            *cache = Some(CachedStore { generation: loaded.generation, store });
+            let position = db.read(|tx| bus_changes::position(tx, &db, "agent_bus"))?;
+            *cache = Some(CachedStore {
+                generation: loaded.generation,
+                store,
+                position: Some(position),
+            });
         } else {
             return Ok((std::borrow::Cow::Owned(store), None));
         }
     }
     let entry = cache.as_mut().expect("cache filled above");
     settlement_state::refresh_observations(entry, &database)?;
-    Ok((std::borrow::Cow::Borrowed(&entry.store), Some(entry.generation)))
+    Ok((
+        std::borrow::Cow::Borrowed(&entry.store),
+        Some(entry.generation),
+    ))
 }
 
 /// Like [`fresh_store`], but hands out the store itself and empties the
@@ -3315,7 +4550,7 @@ fn empty_store() -> AgentBusMessageStore {
 }
 
 fn validate_store(store: AgentBusMessageStore) -> anyhow::Result<AgentBusMessageStore> {
-    if !matches!(store.version, 2 | 3 | 4 | 5 | 6 | 7 | 8) {
+    if !matches!(store.version, 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9) {
         anyhow::bail!("unsupported management v2 agent-bus state version");
     }
     if store.version < 5
@@ -3327,6 +4562,14 @@ fn validate_store(store: AgentBusMessageStore) -> anyhow::Result<AgentBusMessage
         anyhow::bail!("presentation obligation requires Bus state v5");
     }
     for m in store.messages.values() {
+        if m.owner_carry.is_some() || m.owner_hold {
+            anyhow::ensure!(store.version >= 8, "owner bus policy requires Bus state v8");
+            anyhow::ensure!(!(m.owner_hold && m.owner_carry.is_some()), "held carry is invalid");
+        }
+        if let Some(owner_input) = &m.owner_carry {
+            anyhow::ensure!(!owner_input.trim().is_empty() && m.snapshot.external_input.is_some(),
+                "carry reservation requires its frozen identity");
+        }
         if let Some(settlement) = &m.settlement {
             anyhow::ensure!(store.version >= 8, "message settlement requires Bus state v8");
             validate_settlement_record(m, settlement)?;
@@ -3458,6 +4701,92 @@ fn secure_file(_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cleanup_retained_receipts_are_cold_read_only_and_exclude_context() {
+        let root = std::env::temp_dir().join(format!("cutex-cleanup-read-{}", uuid::Uuid::new_v4()));
+        let absent = root.join("absent");
+        let asks = crate::asks::store::AskState::default();
+        assert!(AgentBusMessageRepository::open_read_only(&absent).cleanup_next_steps(&asks).unwrap().is_empty());
+        assert!(!absent.exists());
+        let fixture = root.join("fixture");
+        let writer = AgentBusMessageRepository::open(&fixture).unwrap();
+        writer.record_queued_isolated(system_queued_message("retained body")).unwrap();
+        let mut store = persisted_store(&fixture);
+        let template = store.messages.values().next().unwrap().clone();
+        store.messages.clear();
+        for id in ["pending", "inbox_accepted", "stale_held", "unaccepted", "a4", "native-context", "passive", "removed", "delivered"] {
+            let mut stored = template.clone();
+            stored.snapshot.message_id = id.into();
+            stored.snapshot.to_cutex_session_id = format!("retained-{id}");
+            stored.snapshot.local_inbox_receipt = Some(json!({"durable":true}));
+            let message = stored.canonical_envelope.as_mut().unwrap();
+            message.id = id.into();
+            if matches!(id, "pending" | "inbox_accepted" | "stale_held" | "delivered") {
+                stored.snapshot.state = id.into();
+            }
+            if id == "unaccepted" { stored.snapshot.local_inbox_receipt = None; }
+            if id == "passive" { message.delivery_mode = crate::agent_bus::delivery::AgentDeliveryMode::Passive; }
+            if id == "removed" { message.sender_kind = crate::agent_bus::model::AgentMessageKind::TaskServiceSystem; }
+            if id == "a4" {
+                stored.snapshot.a4_receipt = Some(serde_json::from_value(json!({
+                    "receiptId":"receipt", "responseItemId":"item", "turnId":"turn", "rolloutOrdinal":1
+                })).unwrap());
+            }
+            if id == "native-context" {
+                stored.snapshot.external_input_last_observed = Some(serde_json::from_value(json!({
+                    "messageId":id, "semanticSha256":"a".repeat(64), "deliveryState":"context_persisted",
+                    "receipt":null, "processing":{"state":"none", "attemptId":null, "reason":null}
+                })).unwrap());
+            }
+            store.messages.insert(id.into(), stored);
+        }
+        let legacy = root.join("legacy");
+        fs::create_dir_all(&legacy).unwrap();
+        let path = legacy.join(AGENT_BUS_STATE_FILE);
+        let bytes = serde_json::to_vec(&store).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let reader = AgentBusMessageRepository::open_read_only(&legacy);
+        for _ in 0..2 {
+            let rows = reader.cleanup_next_steps(&asks).unwrap();
+            assert_eq!(rows.iter().map(|(_, row)| row.id.as_str()).collect::<Vec<_>>(), ["inbox_accepted", "pending", "stale_held"]);
+            assert!(rows.iter().all(|(session, row)| session == &format!("retained-{}", row.id)
+                && row.wait_reason.as_deref() == Some("nativeReceipt") && !row.eligible));
+        }
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert!(!legacy.join(AGENT_BUS_LOCK_FILE).exists());
+        assert!(!legacy.join(super::super::hot_store::DATABASE_FILE).exists());
+        assert!(reader.admission_index.lock().unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_shared_projection_excludes_closed_followup_without_admission() {
+        let root = std::env::temp_dir().join(format!("cutex-cleanup-closed-{}", uuid::Uuid::new_v4()));
+        let writer = AgentBusMessageRepository::open(&root).unwrap();
+        writer.record_queued_isolated(system_queued_message("body")).unwrap();
+        let mut stored = persisted_store(&root).messages.into_values().next().unwrap();
+        stored.snapshot.local_inbox_receipt = Some(json!({"durable":true}));
+        let asks = crate::asks::store::AskState::default();
+        let project = |stored: &StoredAgentBusMessage| AgentBusMessageRepository::project_pending_admission(
+            stored, &stored.snapshot.to_cutex_session_id, &asks, Utc::now(), None, &|_| false,
+        );
+        assert!(project(&stored).is_some());
+        // Exercise the exact closure guard of the shared pure projection.
+        stored.settlement = Some(serde_json::from_value(json!({
+            "evidenceToken":"token", "evidence":{
+                "schemaVersion":1,"runtime":"claude","recipientId":"recipient","runtimeGeneration":1,
+                "threadId":"thread","messageId":"message","semanticSha256":"a".repeat(64),
+                "localSemanticSha256":"b".repeat(64),"attemptId":uuid::Uuid::new_v4().to_string(),
+                "processingState":"held","actualTurnId":"turn","terminalStatus":"completed",
+                "observedAt":Utc::now(),"observationSha256":"c".repeat(64)
+            }, "closure":{"actor":"owner","closedAt":Utc::now(),"reason":"done","requestId":"request"}
+        })).unwrap());
+        assert!(project(&stored).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn sqlite_generation(root: &Path) -> u64 {
         super::super::hot_store::generation(
             &root.join(super::super::hot_store::DATABASE_FILE),
@@ -3502,6 +4831,7 @@ mod tests {
             let mut duplicate=existing.clone();duplicate.snapshot.message_id="duplicate".into();duplicate.canonical_envelope.as_mut().unwrap().id="duplicate".into();store.messages.insert("duplicate".into(),duplicate);Ok(())
         }).unwrap();
         assert!(repository.snapshot_by_external_message_id("event-1","adoption").is_err());
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3534,17 +4864,18 @@ mod tests {
             second.get(&id).unwrap().unwrap().snapshot.error.unwrap()["message"],
             "native pending 2"
         );
-        // Check-then-mutate actions that fail (a polled message without a
-        // durable record, a presentation not due) keep the cached parse, and
-        // the per-registration v1 migration check reads through it.
+        // Point reads and failed keyed actions do not hydrate canonical history.
+        // Migration stays lazy; an explicit compatibility read can still warm the cache.
         assert!(first.get(&id).unwrap().is_some());
-        assert!(first.cache.lock().unwrap().is_some());
+        assert!(first.cache.lock().unwrap().is_none());
         assert!(first.record_external_input_error("missing-message", "x").is_err());
         assert!(first.presentation_error("missing-message", "x").is_err());
         assert!(first.begin_presentation_attempt("owner", "missing-message", 0).is_err());
-        assert!(first.cache.lock().unwrap().is_some(), "a checked failure keeps the cache");
+        assert!(first.cache.lock().unwrap().is_none());
         let generation = sqlite_generation(&root);
         first.migrate_legacy_v1().unwrap();
+        assert!(first.cache.lock().unwrap().is_none());
+        first.read(|_| Ok(())).unwrap();
         assert!(first.cache.lock().unwrap().is_some());
         assert_eq!(sqlite_generation(&root), generation);
         // A failed update drops the possibly half-changed store: the next
@@ -3872,6 +5203,8 @@ mod tests {
         crate::asks::control::owner_stop(&mut asks, target, Utc::now());
         let stopped = reopened.pending_admission_messages(target, &asks).unwrap();
         assert!(stopped.iter().all(|item| !item.eligible && item.held.as_deref() == Some("ownerStop")));
+        drop(reopened);
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3993,6 +5326,7 @@ mod tests {
         assert!(value.get("preview").is_none() && value.get("fromCutexSessionId").is_none());
         let local_step = super::super::admission::AdmissionNextStep { from_cutex_session_id: Some("cutex.sender".into()), ..step };
         assert_eq!(serde_json::to_value(&local_step).unwrap()["fromCutexSessionId"], "cutex.sender");
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4031,6 +5365,8 @@ mod tests {
         assert!(!reopened.admission_started_turn(&target, "turn-old-record").unwrap());
         assert!(!reopened.admission_started_turn(&target, "another-turn").unwrap());
         assert!(!reopened.admission_started_turn("another-session", "turn-idle").unwrap());
+        drop(reopened);
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4058,6 +5394,7 @@ mod tests {
             Ok(())
         }).unwrap();
         assert!(repository.pending_admission_notes(&target).unwrap().is_empty());
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4105,6 +5442,8 @@ mod tests {
         assert!(!reader.refresh_admission_if_changed().unwrap());
         assert!(!writer.refresh_admission_if_changed().unwrap());
         assert!(reader.pending_admission_messages(&target, &asks).unwrap().is_empty());
+        drop(reader);
+        drop(writer);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4122,7 +5461,7 @@ mod tests {
         crate::management::v2::admission::take_change(&target);
         assert!(reader.refresh_admission_if_changed().unwrap());
         assert!(crate::management::v2::admission::take_change(&target));
-        assert!(reader.cache.lock().unwrap().is_some());
+        assert!(reader.cache.lock().unwrap().is_none());
         writer.mutate_message("jsc_stable", |store| {
             let message = store.messages.get_mut("jsc_stable").unwrap();
             message.snapshot.error = Some(json!({"retry": "new error"}));
@@ -4131,7 +5470,7 @@ mod tests {
         }).unwrap();
         assert!(reader.refresh_admission_if_changed().unwrap());
         assert!(!crate::management::v2::admission::take_change(&target));
-        assert!(reader.cache.lock().unwrap().is_some());
+        assert!(reader.cache.lock().unwrap().is_none());
         assert!(!reader.refresh_admission_if_changed().unwrap());
         let full = persisted_store(&root);
         let expected = AdmissionIndex::new(&full, None);
@@ -4140,7 +5479,9 @@ mod tests {
         assert_eq!(actual.as_ref().unwrap().started_turns, expected.started_turns);
         drop(actual);
         assert_eq!(reader.pending_admission_messages(&target, &crate::asks::store::AskState::default()).unwrap().len(), 1);
-        assert!(reader.cache.lock().unwrap().is_some());
+        assert!(reader.cache.lock().unwrap().is_none());
+        drop(reader);
+        drop(writer);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4188,7 +5529,7 @@ mod tests {
             assert!(reader.refresh_admission_if_changed().unwrap());
             assert!(crate::management::v2::admission::take_change(&target), "missed {pointer}");
             if pointer == "/snapshot/toCutexSessionId" { assert!(crate::management::v2::admission::take_change(&other)); }
-            assert!(reader.cache.lock().unwrap().is_some());
+            assert!(reader.cache.lock().unwrap().is_none());
         }
         // A terminal receipt changes currentTurn even when no pending item exists.
         let mut terminal = base;
@@ -4223,6 +5564,8 @@ mod tests {
         reader.refresh_admission_if_changed().unwrap();
         assert!(crate::management::v2::admission::take_change(&target));
         assert!(reader.admission_index.lock().unwrap().as_ref().unwrap().started_turns[&target].contains("claude-turn"));
+        drop(reader);
+        drop(repository);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4520,6 +5863,7 @@ mod tests {
             before
         );
         assert!(repo.due_presentations(&owner, i64::MAX).unwrap().is_empty());
+        super::super::hot_store::clear_cached_generation();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4700,6 +6044,7 @@ mod tests {
             persisted_store(&root).version,
             5
         );
+        super::super::hot_store::clear_cached_generation();
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -4734,6 +6079,84 @@ mod tests {
         assert!(!matches!(state.version, 2 | 3 | 4));
         state.version = 4;
         assert!(validate_store(state).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn presentation_idle_poll_searches_only_after_store_change_or_due_attempt() {
+        use crate::app_server::presentation::PrivateJobPolicy;
+        let root =
+            std::env::temp_dir().join(format!("presentation-idle-{}", uuid::Uuid::new_v4()));
+        let repo = AgentBusMessageRepository::open(&root).unwrap();
+        let owner = presentation_job().to_cutex_session_id;
+        let policy = PrivateJobPolicy {
+            version: 1,
+            recipients: vec![owner.clone()],
+            template: None,
+        };
+        let record = |repo: &AgentBusMessageRepository, id: &str, policy| {
+            let mut q = presentation_job();
+            q.message_id = id.into();
+            q.canonical_envelope.id = q.message_id.clone();
+            repo.record_queued_private_job(q, policy).unwrap();
+        };
+        for n in 0..40 {
+            record(&repo, &format!("hist-{n}"), None);
+        }
+        record(&repo, "job-0", Some(&policy));
+        record(&repo, "job-1", Some(&policy));
+        let searches = || super::super::hot_store::PRESENTATION_SEARCHES.with(|n| n.get());
+        let mut schedule = PresentationSchedule::default();
+        let mut due = |now| repo.due_presentations_scheduled(&owner, now, &mut schedule).unwrap();
+        assert_eq!(due(100), ["job-0", "job-1"]);
+        for id in ["job-0", "job-1"] {
+            repo.begin_presentation_attempt(&owner, id, 100).unwrap();
+            repo.presentation_error(id, "recipient offline").unwrap();
+        }
+        let before = searches();
+        assert!(due(100).is_empty());
+        assert_eq!(searches(), before + 1, "a store change is searched once");
+        for now in [100, 101, 129] {
+            assert!(due(now).is_empty());
+        }
+        assert_eq!(searches(), before + 1, "idle polls probe the generation only");
+        // The retry comes due with no store change and no signal.
+        assert_eq!(due(130), ["job-0", "job-1"]);
+        assert_eq!(searches(), before + 2);
+        // Unprocessed due work is searched again on the next poll.
+        assert_eq!(due(130), ["job-0", "job-1"]);
+        // Another writer (as another process) adds work: the cursor sees it.
+        let other = AgentBusMessageRepository::open(&root).unwrap();
+        record(&other, "job-2", Some(&policy));
+        assert_eq!(due(100), ["job-2"]);
+        drop(due);
+        // Restart: a new worker recovers from the persisted index alone.
+        let restarted = AgentBusMessageRepository::open(&root).unwrap();
+        assert_eq!(restarted.due_presentations(&owner, 100).unwrap(), ["job-2"]);
+        assert!(restarted.due_presentations("foreign", 200).unwrap().is_empty());
+
+        let db = rusqlite::Connection::open(root.join(super::super::hot_store::DATABASE_FILE)).unwrap();
+        let plan = db
+            .prepare(&format!("EXPLAIN QUERY PLAN SELECT row_key FROM hot_store_rows INDEXED BY agent_bus_presentation_due WHERE store='agent_bus' AND collection='message'
+                AND json_extract(CAST(value_json AS TEXT), '$.snapshot.presentation.version') IS NOT NULL
+                AND json_extract(CAST(value_json AS TEXT), '$.snapshot.presentation.receipt') IS NULL
+                AND json_extract(CAST(value_json AS TEXT), '$.snapshot.toCutexSessionId') = ?1"))
+            .is_ok();
+        assert!(plan, "presentation index usable");
+        // Rows are not decoded: an unrelated undecodable payload does not
+        // matter, and an obligation persisted without nextAttemptAt is due.
+        db.execute(r#"UPDATE hot_store_rows SET value_json=CAST(json_set(CAST(value_json AS TEXT),'$.ownerCutexSessionId',42) AS BLOB)
+            WHERE store='agent_bus' AND collection='message' AND row_key='hist-0'"#, []).unwrap();
+        db.execute(r#"UPDATE hot_store_rows SET value_json=CAST(json_remove(CAST(value_json AS TEXT),'$.snapshot.presentation.nextAttemptAt') AS BLOB)
+            WHERE store='agent_bus' AND collection='message' AND row_key='job-0'"#, []).unwrap();
+        drop(db);
+        assert_eq!(
+            restarted
+                .due_presentations_scheduled(&owner, 100, &mut PresentationSchedule::default())
+                .unwrap(),
+            ["job-0", "job-2"]
+        );
+        super::super::hot_store::clear_cached_generation();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4776,6 +6199,7 @@ mod tests {
             persisted_store(&root).messages.len(),
             6
         );
+        super::super::hot_store::clear_cached_generation();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4809,7 +6233,10 @@ mod tests {
                 store.messages.insert(
                     "message-1".to_string(),
                     StoredAgentBusMessage {
+                        frozen_recipient_label:None,
                         owner_cutex_session_id: "cutex.target".to_string(),
+                        owner_carry: None,
+                        owner_hold: false,
                         from_runtime_agent_id: Some("runtime-from".to_string()),
                         to_runtime_agent_id: Some("runtime-to".to_string()),
                         canonical_envelope: None,
@@ -4835,6 +6262,7 @@ mod tests {
                             error: None,
                         },
                         updated_at: Utc::now().to_rfc3339(),
+                        inbox_accepted_at: None,
                         meta: None,
                         settlement: None,
                         observed_settlement: None,
@@ -4848,6 +6276,7 @@ mod tests {
         assert_eq!(snapshot[0]["state"], "queued");
         // An agent message keeps its agent fields, no system-sender ones.
         assert!(snapshot[0].get("senderKind").is_none());
+        drop(repository);
         fs::remove_dir_all(root).expect("remove state repository");
     }
 
@@ -5440,6 +6869,34 @@ mod owner_discard_tests {
     const NOW: u64 = 1_000_000;
 
     #[test]
+    fn owner_content_read_preserves_full_unicode_and_durable_state() {
+        struct Live;
+        impl LiveBus for Live {
+            fn queued(&self) -> anyhow::Result<Vec<QueuedAgentBusMessage>> { panic!("content read must not list all queues") }
+            fn withdraw(&self, _: &[String], _: &str) -> anyhow::Result<Vec<(String, String)>> { panic!("read cannot withdraw") }
+            fn content(&self, id: &str) -> anyhow::Result<Option<String>> {
+                assert_ne!(id, "durable", "durable text does not need a live bus");
+                Ok((id == "live-only").then(|| "live full text 世界".repeat(100)))
+            }
+        }
+        let (repository, root) = repo("content-read");
+        let text = "complete durable text 世界 🦀\n".repeat(100);
+        repository.record_queued_isolated(message("durable", &text, 10,
+            crate::agent_bus::model::AgentMessageKind::Agent, None)).unwrap();
+        let before = repository.message_state("durable").unwrap();
+        let durable = agent_bus_stuck::content_view(&repository, &Live, "durable").unwrap().unwrap();
+        assert_eq!(durable["text"], text);
+        assert_eq!(durable["durable"], true);
+        let live = agent_bus_stuck::content_view(&repository, &Live, "live-only").unwrap().unwrap();
+        assert_eq!(live["text"], "live full text 世界".repeat(100));
+        assert_eq!(live["durable"], false);
+        assert!(agent_bus_stuck::content_view(&repository, &Live, "missing").unwrap().is_none());
+        assert_eq!(repository.message_state("durable").unwrap(), before);
+        drop(repository);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn accepted_native_control_can_be_explicitly_quarantined_without_faking_delivery() {
         let (repository, root) = repo("accepted-control");
         let control = message("accepted", "task ended", 10,
@@ -5564,6 +7021,67 @@ mod owner_discard_tests {
                 Ok(envelope)
             })
             .unwrap();
+    }
+
+    #[test]
+    fn indexed_reads_ignore_unselected_payloads_and_follow_external_state_changes() {
+        let (writer, root) = repo("indexed-reads");
+        writer
+            .record_queued_isolated(agent_message("wanted", 10))
+            .unwrap();
+        writer
+            .record_queued_isolated(agent_message("cold", 20))
+            .unwrap();
+        let database = root.join(super::super::hot_store::DATABASE_FILE);
+        let db = rusqlite::Connection::open(&database).unwrap();
+        // Valid JSON with an unsupported payload type: whole-store Rust
+        // deserialization would fail, while state/key readers never load it.
+        db.execute(r#"UPDATE hot_store_rows SET value_json=CAST('{"snapshot":{"state":"delivered"},"ownerCutexSessionId":42}' AS BLOB)
+            WHERE store='agent_bus' AND collection='message' AND row_key='cold'"#, []).unwrap();
+        let reader = AgentBusMessageRepository::open_read_only(&root);
+        assert_eq!(
+            reader
+                .snapshot_by_message_id("wanted")
+                .unwrap()
+                .unwrap()
+                .message_id,
+            "wanted"
+        );
+        assert_eq!(
+            reader
+                .stuck_messages(0, NOW)
+                .unwrap()
+                .iter()
+                .map(|m| m.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["wanted"]
+        );
+        assert_eq!(
+            reader
+                .receipt_read_inputs(&["wanted".into()])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(reader.snapshot_by_message_id("cold").is_err());
+        db.execute("UPDATE hot_store_rows SET value_json=CAST(json_set(CAST(value_json AS TEXT),'$.snapshot.state','delivered') AS BLOB)
+            WHERE store='agent_bus' AND collection='message' AND row_key='wanted'", []).unwrap();
+        assert!(reader.stuck_messages(0, NOW).unwrap().is_empty());
+        assert_eq!(
+            reader
+                .snapshot_by_message_id("wanted")
+                .unwrap()
+                .unwrap()
+                .state,
+            "delivered"
+        );
+        let query = super::super::hot_store::bus_state_query(&db).unwrap();
+        let plan: String = db
+            .query_row(&format!("EXPLAIN QUERY PLAN {query}"), [], |row| row.get(3))
+            .unwrap();
+        assert!(plan.contains("agent_bus_message_state"), "{plan}");
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5914,3 +7432,7 @@ mod owner_discard_tests {
         assert!(!agent_bus_stuck::is_path("/v2/agent-bus/stuck-messages/x"));
     }
 }
+
+#[cfg(test)]
+#[path = "bus_write_tests.rs"]
+mod write_tests;

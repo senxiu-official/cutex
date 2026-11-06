@@ -1034,6 +1034,8 @@ impl ManagementHook {
 }
 
 impl AuthorityTransitionHook for ManagementHook {
+    fn recovery_uses_directory(&self) -> bool {true}
+
     fn recover(&self, snapshot: &AgentManagementSnapshot) -> Result<(), AgentManagementError> {
         ManagementHook::recover(self, snapshot)
     }
@@ -2835,8 +2837,9 @@ fn source_start(source_message_id: &str, target: &CutexSessionId) -> anyhow::Res
 /// pending notices whose recipient is still a member (others superseded).
 pub fn pending_dispatches() -> anyhow::Result<Vec<DirectorDispatch>> {
     let store = default_store_or_file()?;
-    let roster = crate::agent_management::AgentManagementStore::open_default()?.snapshot()?;
     let ext = store.read()?;
+    let actions = ext.adoptions.values().filter(|r| may_submit(r)).map(|r|r.source_action_id.clone()).collect::<Vec<_>>();
+    let roster = crate::agent_management::AgentManagementStore::open_default()?.directory_for_actions(&actions)?;
     let mut out = Vec::new();
     let mut stale = Vec::new();
     let mut reconcile = Vec::new();
@@ -3013,10 +3016,11 @@ pub fn recover_now() -> anyhow::Result<()> {
     repair_summaries();
     // A start quarantined while no Director could review it (seat cleared, or
     // an unknown chain) gets its review once the authority moves.
-    let roster = provider.store().snapshot()?;
     let store = default_store_or_file()?;
     let mut seen = scanned_authorities().lock().unwrap_or_else(|e| e.into_inner());
-    rescan_if_authority_changed(&roster, &mut seen, store.as_ref(), quarantined_starts)?;
+    rescan_current_authority(provider.store(), &mut seen, store.as_ref())?;
+    drop(seen);
+    super::pruning::maintenance();
     Ok(())
 }
 
@@ -3094,9 +3098,17 @@ pub fn startup() -> anyhow::Result<usize> {
     provider.recover_authority_hook()?;
     repair_summaries();
     let store = default_store_or_file()?;
-    let roster = provider.store().snapshot()?;
     // Startup always scans once (`seen` starts empty), then only on change.
     let mut seen = scanned_authorities().lock().unwrap_or_else(|e| e.into_inner());
     *seen = None;
-    rescan_if_authority_changed(&roster, &mut seen, store.as_ref(), quarantined_starts)
+    rescan_current_authority(provider.store(), &mut seen, store.as_ref())
+}
+
+fn rescan_current_authority(roster_store: &crate::agent_management::AgentManagementStore, seen: &mut Option<String>, store: &dyn ExtensionStateStore) -> anyhow::Result<usize> {
+    let directory = roster_store.directory_snapshot_shared()?;
+    if seen.as_deref() == Some(authority_fingerprint(&directory).as_str()) {return Ok(0);}
+    let starts = quarantined_starts()?;
+    let ids = starts.iter().filter_map(|(_,message)|message.external_message_id.clone()).collect::<Vec<_>>();
+    let roster = roster_store.directory_for_starts(&ids)?;
+    rescan_if_authority_changed(&roster, seen, store, ||Ok(starts))
 }

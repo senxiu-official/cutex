@@ -6,7 +6,14 @@ use tungstenite::{Message, WebSocket};
 fn read_json(socket: &mut WebSocket<TcpStream>) -> Value {
     loop {
         if let Message::Text(text) = socket.read().unwrap() {
-            return serde_json::from_str(text.as_ref()).unwrap();
+            let request: Value = serde_json::from_str(text.as_ref()).unwrap();
+            let result = match request.get("method").and_then(Value::as_str) {
+                Some("claude/tasks/list") => Some(serde_json::json!({"tasks":[],"completeInventory":false})),
+                Some("thread/backgroundTerminals/list" | "thread/loaded/list") => Some(serde_json::json!({"data":[],"nextCursor":null})),
+                _ => None,
+            };
+            if let Some(result) = result { write_json(socket, serde_json::json!({"id":request["id"],"result":result})); continue; }
+            return request;
         }
     }
 }

@@ -16,7 +16,7 @@ One occurrence can match several events (e.g. an `info` owner_notify message tha
 
 **Both tables default to the `default` ("Recommended") preset** (capability `notification-presets-no-legacy`,
 owner decision 2026-10-15). The former `legacy` preset of both tables ("Old behaviour", which reproduced
-cutex r216 and derived the methods from `ownerNotify.delivery` / `bigAlertSound`) was removed: it is no longer
+the earlier notification policy and derived the methods from `ownerNotify.delivery` / `bigAlertSound`) was removed: it is no longer
 offered, a `PATCH` naming it is refused as an unknown preset, and a stored `legacy` (or no preset) reads as
 `default`. See [Migration from legacy](#migration-from-legacy-2026-10-15).
 
@@ -62,6 +62,7 @@ tables (after the desktop freeze). `requires`: what cutex still lacks to decide 
 | `ownerNotify.needsReply` (combined with the level event) | cutex | needsYou |
 | `ownerNotify.rateLimited` (replaces the level events) | cutex | record |
 | `system.quarantine` / `system.deliveryFailed` / `system.idleDelegation` / `system.other` | cutex | record |
+| `system.turnAuthFailed` (a turn failed `unauthorized` / `refresh_token_reused`; once per profile per rolling hour, capability `turn-error-surface`) | cutex | inform |
 | `system.safetyBlock` (a Claude Code safety check declined a command under full access; [SAFETY-GRANTS.md](SAFETY-GRANTS.md)) | cutex | needsYou |
 | `native.approval` (command / file / permissions) | cutex + client | needsYou |
 | `native.question` (requestUserInput / elicitation) | cutex + client | needsYou |
@@ -84,19 +85,19 @@ tables (after the desktop freeze). `requires`: what cutex still lacks to decide 
   `notificationLevel`, `notificationEvent`, `actions`, and for cutex notices `systemKind`. The agent-facing tool
   result is unchanged.
 - **cutex notices** (`documents::notify_owner(kind, …)`): `system.<kind>`. Record in every built-in preset
-  (same as r215 / r216); an owner who raises one gets channels / a need like any other event (still not
+  (as in the earlier policy); an owner who raises one gets channels / a need like any other event (still not
   replyable).
 - **record predicates**: `pending()` = agent needs-reply message open / acknowledged, else open and `actions`
   contains `needsYou`; `alerting()` = open agent message, or open cutex notice with a channel; `to_phone()` =
   channel phone (old cutex notices without `actions` never). Records without `actions` (written before this
-  capability) keep the r216 rules.
+  capability) keep the legacy rules.
 - **summary** (`/v2/summary`, management process, every tick): native requests, owner approvals, delegations
   and owner_notify records → `needs[]` only when the decision includes `needsYou`; each need gains `level`;
   `asksChanged.count` uses the same rule. `messageToOwner` follows `to_phone()`.
 - **webhook** (the notification worker: inside `management serve` on managed installs, else `cutex notify run`): `agent.message_to_owner` follows the record's channels as before; turn /
   attention / job webhook events keep the per-session level (`notify/session.rs`) for now. The levels
   `task.reviewReady` / `task.closed` / `system.preActivationSkipped` and the webhook events
-  `task.review_ready` / `task.closed` were removed in r219 (see [r219-removals.md](r219-removals.md));
+  `task.review_ready` / `task.closed` were removed with the legacy Task Service (see [r219-removals.md](r219-removals.md));
   saved owner settings and retired names in `~/.cutex/notifications/outbound.json` stay loadable (the
   retired webhook names are dropped on read).
 
@@ -195,14 +196,14 @@ To restore the old delivery-driven behaviour by hand, read the record: the old `
   binary.
 - After moving forward again, a `legacy` the older binary stored reads as `default` (the migration does not run a
   second time; the record exists).
-- Binaries older than `notification-levels` (r216 and before) ignore `config.json` `notification_levels`, drop
-  it on their next config save and run their r216 behaviour. `ownerNotify.delivery` / `bigAlertSound` were
+- Binaries older than `notification-levels`  ignore `config.json` `notification_levels`, drop
+  it on their next config save and run their legacy behaviour. `ownerNotify.delivery` / `bigAlertSound` were
   never changed by this feature.
-- owner-notify records: the new fields are ignored (and dropped when it rewrites the store). r216 then judges
+- owner-notify records: the new fields are ignored (and dropped when it rewrites the store). The legacy reader then judges
   every record by its own rule (open with a channel / needs-reply; cutex notices never); records created under
   the `default` tables can differ (e.g. a muted urgent message that still counted, or a cutex notice the owner
-  raised: r216 shows it in no need and sends no further push).
-- summary: `needs[].level` and kind `delegationFailed` disappear on the next tick of an r216 binary.
+  raised: the legacy reader shows it in no need and sends no further push).
+- summary: `needs[].level` and kind `delegationFailed` disappear on the next tick of a legacy binary.
 
 ## Not done here (follow-ups)
 

@@ -720,7 +720,7 @@ fn collect_meta_and_projects() -> (HashMap<String, AgentMeta>, BTreeMap<String, 
         }
     });
     if let Ok(snapshot) = crate::agent_management::AgentManagementStore::open_default()
-        .and_then(|store| store.snapshot().map_err(anyhow::Error::new))
+        .and_then(|store| store.directory_snapshot_shared().map_err(anyhow::Error::new))
     {
         for (session_id, agent) in &snapshot.agents {
             if let Some(project_id) = crate::agent_management::current_project_id(&snapshot, agent) {
@@ -807,7 +807,7 @@ fn collect_need_sources(sessions: &[Value], meta: &HashMap<String, AgentMeta>) -
         native,
         approvals,
         asks,
-        owner_notifications: super::owner_notify::all_records(),
+        owner_notifications: super::owner_notify::pending_records(),
         evaluator: crate::notification_levels::Evaluator::current(),
         agent_projects: meta
             .iter()

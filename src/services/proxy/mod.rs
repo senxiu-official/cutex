@@ -8,6 +8,7 @@ use head::{read_head, Head};
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -100,6 +101,18 @@ fn serve(
     info: &ConnectionInfo,
     store: &ServiceStore,
     slug: &str,
+) {
+    let supervisor = crate::services::supervisor::global();
+    serve_with_supervisor(stream, buffer, info, store, slug, supervisor.as_ref());
+}
+
+fn serve_with_supervisor(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    info: &ConnectionInfo,
+    store: &ServiceStore,
+    slug: &str,
+    supervisor: Option<&Arc<crate::services::supervisor::Supervisor>>,
 ) {
     let max = match store.load() {
         Ok(registry) => registry.settings.proxy_max_connections as usize,
@@ -208,7 +221,7 @@ fn serve(
         if traffic_guard.is_none() {
             traffic_guard = Some(super::traffic::begin(slug));
         }
-        let record = match store.get(slug) {
+        let mut record = match store.get(slug) {
             Ok(record) => record,
             Err(e) => {
                 let _ = error_with_detail(
@@ -229,10 +242,19 @@ fn serve(
             break;
         }
         if record.runtime == ServiceRuntime::Managed {
-            let snapshot = crate::services::supervisor::global()
+            if let Some(supervisor) = supervisor {
+                record = match supervisor.ready_for_proxy(slug) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        let _ = error_with_detail(stream, error.status, error.code, Some(&error.message));
+                        break;
+                    }
+                };
+            }
+            let snapshot = supervisor
                 .and_then(|s| s.snapshots().remove(slug))
                 .or_else(|| store.load_state().remove(slug));
-            if record.stopped
+            if record.stopped || record.stopped_idle_at.is_some()
                 || snapshot
                     .as_ref()
                     .is_none_or(|s| s.pid.is_none() || s.next_restart_at.is_some())
@@ -324,6 +346,7 @@ fn error_with_detail(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         410 => "Gone",
         417 => "Expectation Failed",
         421 => "Misdirected Request",

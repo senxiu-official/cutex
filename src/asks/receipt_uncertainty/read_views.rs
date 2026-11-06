@@ -81,6 +81,15 @@ fn terminal_bound(input: &ReceiptReadInput) -> Option<TerminalEvidence> {
     let snapshot = &input.snapshot;
     let envelope = snapshot.external_input.as_ref()?;
     let evidence = input.terminal.as_ref()?;
+    // A later-turn witness authorizes owner follow-up closure only. It did not validate the
+    // original external_event item, so it cannot be promoted to ExactTurnRead evidence here.
+    if evidence
+        .stale_ack
+        .as_ref()
+        .is_some_and(|proof| proof.later_completed_turn_id.is_some())
+    {
+        return None;
+    }
     let observer = observer_matches(input)?;
     envelope.validate().ok()?;
     evidence.validate_shape().ok()?;

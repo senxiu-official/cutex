@@ -91,7 +91,7 @@ fn seed(provider: &AgentManagementProvider, id: &str, name: &str, phase: AgentAc
 
 const NEWS: &str = "auto-5ae2f95202c9b1ab5a5087d0596eb256";
 const GLM: &str = "auto-87e029fcf075de20b1857380ff969c04";
-const SUCCESSOR: &str = "cutex.01815f87-7707-77b2-9087-1e59fc5fe83f";
+const SUCCESSOR: &str = "cutex.c0ae2db8-a376-5d79-aaa6-518a37bf69d0";
 
 fn holds_name(provider: &AgentManagementProvider, name: &str) -> bool {
     provider.store().snapshot().unwrap().actions.values().any(|a| {
@@ -102,7 +102,7 @@ fn holds_name(provider: &AgentManagementProvider, name: &str) -> bool {
 #[test]
 fn configured_create_with_a_session_is_abandoned_and_its_name_released() {
     let (provider, root) = provider();
-    seed(&provider, NEWS, "waveline-news", AgentActionPhase::Configured, Some(SUCCESSOR), "01815f87-7707-77b2-9087-1e59fc5fe83f", AgentOperationKind::Create);
+    seed(&provider, NEWS, "waveline-news", AgentActionPhase::Configured, Some(SUCCESSOR), "c0ae2db8-a376-5d79-aaa6-518a37bf69d0", AgentOperationKind::Create);
     let cleanup = fake(&[SUCCESSOR]);
     // Dry run: the plan, nothing changes.
     let plan = provider.abandon_create(NEWS, true, &cleanup).unwrap();
@@ -133,11 +133,11 @@ fn configured_create_with_a_session_is_abandoned_and_its_name_released() {
 #[test]
 fn a_captured_native_thread_without_a_session_is_moved_aside() {
     let (provider, root) = provider();
-    seed(&provider, GLM, "waveline-news-glm", AgentActionPhase::NativeSessionCaptured, None, "01815f98-6282-7b73-afbf-72fcf081cad2", AgentOperationKind::Create);
+    seed(&provider, GLM, "waveline-news-glm", AgentActionPhase::NativeSessionCaptured, None, "ddf2e5eb-1981-562b-8fdb-fe978d891764", AgentOperationKind::Create);
     let cleanup = fake(&[]);
     let receipt = provider.abandon_create(GLM, false, &cleanup).unwrap();
     assert_eq!(receipt.plan.durable_session, None);
-    assert_eq!(receipt.removed, ["moved native thread 01815f98-6282-7b73-afbf-72fcf081cad2 aside"]);
+    assert_eq!(receipt.removed, ["moved native thread ddf2e5eb-1981-562b-8fdb-fe978d891764 aside"]);
     assert!(!holds_name(&provider, "waveline-news-glm"));
     std::fs::remove_dir_all(root).ok();
 }
@@ -146,7 +146,7 @@ fn a_captured_native_thread_without_a_session_is_moved_aside() {
 fn a_missing_session_record_is_not_cleaned_as_a_session() {
     // host-a waveline-news: the action names a successor whose record is gone.
     let (provider, root) = provider();
-    seed(&provider, NEWS, "waveline-news", AgentActionPhase::Configured, Some(SUCCESSOR), "01815f87-7707-77b2-9087-1e59fc5fe83f", AgentOperationKind::Create);
+    seed(&provider, NEWS, "waveline-news", AgentActionPhase::Configured, Some(SUCCESSOR), "c0ae2db8-a376-5d79-aaa6-518a37bf69d0", AgentOperationKind::Create);
     let receipt = provider.abandon_create(NEWS, false, &fake(&[])).unwrap();
     assert_eq!(receipt.plan.durable_session, None);
     assert_eq!(receipt.plan.successor_session.as_deref(), Some(SUCCESSOR));

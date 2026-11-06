@@ -84,7 +84,7 @@ pub fn deadlock_check(state: &AskState, waiter: &str, asks: &[String], all: bool
         .iter()
         .filter_map(|id| state.asks.get(id))
         .filter(|ask| !ask.execution.is_terminal())
-        .collect();
+        .map(|ask| &**ask).collect();
     let cyclic: Vec<String> = open
         .iter()
         .filter(|ask| ask.remote.is_none() && reaches(&edges, &ask.target_cutex_session_id, waiter))

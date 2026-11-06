@@ -477,8 +477,7 @@ impl Config {
         ensure!(uuid::Uuid::parse_str(id).is_ok(), "invalid profile ID");
         let auth_value: serde_json::Value = serde_json::from_slice(&bounded_asset(&auth_path)?)
             .map_err(|_| anyhow::anyhow!("invalid selected credential file"))?;
-        let api_key = auth_value.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str)
-            .is_some_and(|key| !key.is_empty());
+        let api_key = crate::profiles::api_key::from_auth(&auth_value).is_some();
         let route = if api_key { Route::ApiKey } else { Route::ChatgptFile };
         let api = if api_key {
             let provider_id = self.model_provider.clone().unwrap_or_else(|| "openai".into());
@@ -847,6 +846,25 @@ pub fn validate_model(
     Ok(())
 }
 
+/// A new managed agent on a profile without a catalog (ChatGPT login /
+/// official, see `profiles::model_check`): `model` must be on the profile's
+/// native model list unless `allow_unlisted`; an unreadable list allows it
+/// (the create reply warns). A profile with a catalog was checked by
+/// [`validate_model`].
+pub fn validate_listed_model(
+    catalog: Option<&VerifiedFile>,
+    profile: &str,
+    model: &str,
+    check: &crate::profiles::model_check::Check,
+    allow_unlisted: bool,
+) -> anyhow::Result<()> {
+    if catalog.is_some() {
+        return Ok(());
+    }
+    crate::profiles::model_check::decide(profile, model, check, allow_unlisted)
+        .map_err(|refusal| crate::profiles::model_check::UnlistedModel(refusal).into())
+}
+
 pub(super) fn bounded_asset(path: &Path) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
@@ -1045,7 +1063,7 @@ fn read_api_key(path: &Path) -> anyhow::Result<ApiKey> {
     ensure!(
         v.as_object().is_some_and(|o| o.keys().all(|k| matches!(
             k.as_str(),
-            "OPENAI_API_KEY" | "auth_mode" | "tokens" | "last_refresh"
+            "OPENAI_API_KEY" | "openai_api_key" | "auth_mode" | "tokens" | "last_refresh"
         ))) && v
             .get("auth_mode")
             .is_none_or(|m| m.is_null() || m.as_str() == Some("apikey"))
@@ -1055,8 +1073,7 @@ fn read_api_key(path: &Path) -> anyhow::Result<ApiKey> {
                     .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())),
         "unsupported API credential fields"
     );
-    let key = v["OPENAI_API_KEY"]
-        .as_str()
+    let key = crate::profiles::api_key::from_auth(&v)
         .filter(|k| !k.is_empty() && !k.chars().any(char::is_control))
         .context("API credential missing")?;
     Ok(ApiKey(key.into()))
@@ -1469,8 +1486,46 @@ trust_level = "untrusted"
         .is_err());
     }
 
+    /// ChatGPT-login profiles without a catalog: a new agent's model must be
+    /// on the native list (listed and hidden rows pass); an unlisted one is
+    /// refused naming the allowed models, the list's source and
+    /// allow_unlisted, which lets it through; an unreadable list allows it.
     #[test]
-    fn selected_models_allow_new_names_and_native_efforts_without_fallback() {
+    fn new_agent_models_are_checked_against_the_native_list() {
+        use crate::profiles::model_check::{check_with, Check, ModelList, UnlistedModel};
+        let list = ModelList::from_rows(
+            &[serde_json::json!({"slug": "gpt-6.1-sol"}), serde_json::json!({"slug": "gpt-6-astra"}),
+              serde_json::json!({"slug": "gpt-5.5", "visibility": "hide"})],
+            &serde_json::json!({"kind": "nativeBundled", "native": {"version": "codex-cli 0.130.0"}}),
+        );
+        for model in ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.5"] {
+            validate_listed_model(None, "Ada", model, &check_with(Ok(list.clone()), model), false).unwrap();
+        }
+        for model in ["gpt-sol-6.1", "gpt-astra-6", "future-model/revision-2"] {
+            let check = check_with(Ok(list.clone()), model);
+            let error = validate_listed_model(None, "Ada", model, &check, false).unwrap_err();
+            let refusal = error.downcast_ref::<UnlistedModel>().expect("typed refusal").to_string();
+            assert!(refusal.contains(&format!("Model '{model}' is not on the model list of profile 'Ada'")), "{refusal}");
+            assert!(refusal.contains("Allowed models: gpt-6.1-sol, gpt-6-astra."), "{refusal}");
+            assert!(refusal.contains("the bundled model list of the deployed Codex CLI (codex-cli 0.130.0)"), "{refusal}");
+            assert!(refusal.contains("pass allow_unlisted: true"), "{refusal}");
+            validate_listed_model(None, "Ada", model, &check, true).unwrap();
+        }
+        let unreadable = check_with(Err("no local runtime deployment is selected".into()), "gpt-sol-6.1");
+        validate_listed_model(None, "Ada", "gpt-sol-6.1", &unreadable, false).unwrap();
+        // Profiles the list does not apply to, and catalog profiles, are not checked here.
+        validate_listed_model(None, "API", "manual-model", &Check::NotChecked, false).unwrap();
+        let path = std::env::temp_dir().join(format!("cutex-listed-model-catalog-{}.json", std::process::id()));
+        std::fs::write(&path, b"{}").unwrap();
+        let file = VerifiedFile { sha256: crate::agent_management::file_sha256(&path).unwrap(), path: path.clone() };
+        validate_listed_model(Some(&file), "Ada", "gpt-sol-6.1", &check_with(Ok(list), "gpt-sol-6.1"), false).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Without a native list in hand, `validate_model` checks the name's form
+    /// and the effort names only (the list check is `validate_listed_model`).
+    #[test]
+    fn selected_models_without_catalog_check_form_and_native_efforts() {
         for model in ["gpt-6-astra", "gpt-5.6-luna", "future-model/revision-2"] {
             assert!(validate_model(&Route::ChatgptFile, model, None, None).is_ok());
             for effort in [

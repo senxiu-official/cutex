@@ -19,6 +19,18 @@ pub const DSH_VERSION: &str = "0.2.1-rc.3";
 pub const NODE_MINIMUM: &str = "24.9.0";
 pub const NODE_ENV: &str = "CUTEX_DSH_NODE";
 
+/// Adapter payloads deliberately contain none of the owner's npm prefix.
+pub const ADAPTER_FILES: &[&str] = &[
+    "component.json", "external-runtime.json", "package.json", "LICENSE", "NOTICE",
+    "src/server.mjs", "src/history-reader.mjs", "src/runtime.mjs", "src/rpc.mjs",
+    "src/store.mjs", "src/reconcile.mjs", "src/nativeProjection.mjs",
+    "src/toolItems.mjs", "src/session-ops.mjs", "src/dsh-plugin.mjs", "src/delivery.mjs",
+];
+
+pub fn payload_files(dir: &Path) -> &'static [&'static str] {
+    if dir.join("external-runtime.json").exists() { ADAPTER_FILES } else { REQUIRED_FILES }
+}
+
 /// Presence, not health: capability polling must never execute Node or hash
 /// the npm tree. Registered, damaged installs keep their repair card.
 pub fn advertised() -> bool {
@@ -68,6 +80,8 @@ fn registered_identity(meta: &Metadata, entry: &Entry) -> bool {
 }
 
 fn manual_presence(deployment: &DshDeployment) -> bool {
+    if let Some(present) = external_presence(NAME, &deployment.node, &deployment.adapter,
+        &deployment.dsh_cli, &deployment.install_root, &deployment.version) { return present; }
     deployment.version == DSH_VERSION
         && deployment.node.is_absolute()
         && deployment.adapter.is_absolute()
@@ -78,6 +92,23 @@ fn manual_presence(deployment: &DshDeployment) -> bool {
         && deployment.install_root.is_dir()
         && same_path(&deployment.dsh_cli, &deployment.install_root.join("node_modules/@deepseek-ai/dsh/lib/bin.js"))
         && package(&deployment.install_root, "node_modules/@deepseek-ai/dsh/package.json", "@deepseek-ai/dsh", DSH_VERSION).is_ok()
+}
+
+/// Capability/list polling only inspects deployment identity and file presence.
+/// Health and the external package tree are checked by explicit actions/launch.
+pub(crate) fn external_presence(name: &str, node: &Path, adapter: &Path, cli: &Path,
+    root: &Path, vendor_version: &str) -> Option<bool> {
+    let dir = adapter.parent().and_then(Path::parent)?;
+    if !dir.join("external-runtime.json").exists() { return None; }
+    Some((|| -> anyhow::Result<bool> {
+        let contract = external_contract(dir, name)?;
+        let package = if name == NAME { "@deepseek-ai/dsh" } else { crate::runtime::kimi::KIMI_PACKAGE };
+        Ok(node.is_absolute() && adapter.is_absolute() && adapter.is_file()
+            && cli.is_absolute() && cli.is_file() && root.is_absolute() && root.is_dir()
+            && same_path(adapter, &dir.join("src/server.mjs"))
+            && same_path(cli, &root.join(&contract.external_root.cli_entry))
+            && contract.external_root.packages.get(package).is_some_and(|v| v == vendor_version))
+    })().unwrap_or(false))
 }
 
 pub fn requirements() -> Value {
@@ -216,7 +247,7 @@ pub(crate) fn same_component_version(adapter: &Path, expected: &Metadata) -> any
 
 pub fn check_layout(dir: &Path) -> anyhow::Result<()> {
     ensure!(dir.is_absolute(), "DSH component directory must be absolute");
-    for file in REQUIRED_FILES {
+    for file in payload_files(dir) {
         ensure!(dir.join(file).is_file(), "DSH component lacks {file}");
     }
     let meta: Metadata = serde_json::from_slice(&std::fs::read(dir.join("component.json"))?)?;
@@ -224,6 +255,10 @@ pub fn check_layout(dir: &Path) -> anyhow::Result<()> {
         meta.name == NAME && meta.schema == super::COMPONENT_SCHEMA,
         "invalid DSH component identity"
     );
+    if dir.join("external-runtime.json").exists() {
+        super::external_runtime::load_contract(dir, NAME, &meta.version)?;
+        return Ok(());
+    }
     package(
         dir,
         "runtime/node_modules/@deepseek-ai/dsh/package.json",
@@ -277,6 +312,10 @@ fn user_step() -> Value {
 fn selected_path() -> anyhow::Result<PathBuf> {
     Ok(crate::config::paths::runtime_dir()?.join("dsh/deployment.json"))
 }
+/// The Node this host's selected deployment runs (browser script kernels reuse it).
+pub fn selected_node() -> Option<PathBuf> {
+    selected_raw().and_then(|value| value["node"].as_str().map(PathBuf::from))
+}
 fn selected_raw() -> Option<Value> {
     serde_json::from_slice(&std::fs::read(selected_path().ok()?).ok()?).ok()
 }
@@ -284,6 +323,10 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a.canonicalize().unwrap_or_else(|_| a.to_path_buf()) == b.canonicalize().unwrap_or_else(|_| b.to_path_buf())
 }
 fn selected_is(dir: &Path) -> bool {
+    if selected_raw().and_then(|v| v["adapter"].as_str().map(PathBuf::from))
+        .is_some_and(|adapter| same_path(&adapter, &dir.join("src/server.mjs"))) {
+        return true;
+    }
     selected_raw()
         .and_then(|v| v["install_root"].as_str().map(PathBuf::from))
         .is_some_and(|root| same_path(&root, &dir.join("runtime")))
@@ -292,7 +335,7 @@ fn selected_is(dir: &Path) -> bool {
 fn verify_payload(dir: &Path) -> anyhow::Result<()> {
     check_layout(dir)?;
     let receipt = super::read_receipt(dir).context("DSH component has no receipt")?;
-    for file in REQUIRED_FILES {
+    for file in payload_files(dir) {
         ensure!(receipt.files.contains_key(*file), "DSH receipt lacks {file}");
     }
     // A full npm tree has tens of thousands of files. Read the receipt ONCE;
@@ -304,12 +347,132 @@ fn verify_payload(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn copy_adapter_source(source: &Path, dest: &Path, name: &str, files: &[&str]) -> anyhow::Result<()> {
+    let meta: Metadata = serde_json::from_slice(&std::fs::read(source.join("component.json"))?)?;
+    ensure!(meta.name == name && meta.schema == super::COMPONENT_SCHEMA, "invalid adapter identity");
+    super::external_runtime::load_contract(source, name, &meta.version)?;
+    ensure!(!dest.exists() || (dest.is_dir() && std::fs::read_dir(dest)?.next().is_none()), "source output must be empty");
+    ensure!(!dest.starts_with(source) && !source.starts_with(dest), "source output must be separate from input");
+    std::fs::create_dir_all(dest)?;
+    for file in files.iter().filter(|f| !f.starts_with("src/")) {
+        copy_file(&source.join(file), &dest.join(file))?;
+    }
+    copy_tree(&source.join("src"), &dest.join("src"))?;
+    for file in files { ensure!(dest.join(file).is_file(), "adapter lacks {file}"); }
+    Ok(())
+}
+
+fn external_contract(dir: &Path, name: &str) -> anyhow::Result<super::external_runtime::ExternalRuntime> {
+    let meta: Metadata = serde_json::from_slice(&std::fs::read(dir.join("component.json"))?)?;
+    super::external_runtime::load_contract(dir, name, &meta.version)
+}
+
+pub(crate) fn prepare_external(ctx: &Context, name: &str) -> anyhow::Result<Value> {
+    let contract = external_contract(&ctx.dir, name)?;
+    let external = super::external_runtime::check(ctx.layout, name, &contract, ctx.exec)?;
+    let ready = external.ready();
+    Ok(json!({"prepared": ready, "state": if ready { states::READY } else { states::NEEDS_USER }, "external": external,
+        "needsUser": if ready { Value::Null } else { json!({"issues": external.issues}) }}))
+}
+
+pub(crate) fn select_external_dsh(ctx: &Context) -> anyhow::Result<Value> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+    let contract = external_contract(&ctx.dir, NAME)?;
+    // Central install runs prepare before its acceptance/selection commit lock.
+    // Under that lock selection must not start Node or another external probe.
+    let external = super::external_runtime::cached(ctx.layout, NAME, &contract)?;
+    if !external.ready() {
+        return Ok(json!({"selected": false, "external": external, "needsUser": {"issues": external.issues}}));
+    }
+    let root = external.root.clone().context("external prefix missing")?;
+    let deployment = DshDeployment {
+        node: external.node.clone().context("Node missing")?, adapter: ctx.dir.join("src/server.mjs"),
+        dsh_cli: root.join(&contract.external_root.cli_entry), install_root: root,
+        version: contract.external_root.packages.get("@deepseek-ai/dsh").context("DSH package missing")?.clone(),
+    };
+    crate::config::atomic::write_private_pretty_json_atomic(&crate::runtime::dsh::deployment_path()?, &deployment, "DSH deployment")?;
+    Ok(json!({"selected": true, "deployment": deployment, "external": external}))
+}
+
+pub(crate) fn select_external_kimi(ctx: &Context) -> anyhow::Result<Value> {
+    let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
+    let name = super::kimi_runtime::NAME;
+    let contract = external_contract(&ctx.dir, name)?;
+    let external = super::external_runtime::cached(ctx.layout, name, &contract)?;
+    if !external.ready() {
+        return Ok(json!({"selected": false, "external": external, "needsUser": {"issues": external.issues}}));
+    }
+    let root = external.root.clone().context("external prefix missing")?;
+    let deployment = crate::runtime::kimi::KimiDeployment {
+        node: external.node.clone().context("Node missing")?, adapter: ctx.dir.join("src/server.mjs"),
+        kimi_cli: root.join(&contract.external_root.cli_entry), install_root: root,
+        version: contract.external_root.packages.get(crate::runtime::kimi::KIMI_PACKAGE).context("Kimi package missing")?.clone(),
+        rg: external.rg.clone(),
+    };
+    crate::config::atomic::write_private_pretty_json_atomic(&crate::runtime::kimi::deployment_path()?, &deployment, "Kimi deployment")?;
+    Ok(json!({"selected": true, "deployment": deployment, "external": external}))
+}
+
+/// GET reads cached readiness only. Explicit check/configure/selection performs
+/// probes; merely displaying a component card never starts a process.
+pub(crate) fn cached_external_probe(dir: &Path, name: &str, selected: bool) -> Value {
+    let result = (|| -> anyhow::Result<Value> {
+        match name { NAME => check_layout(dir)?, _ => super::kimi_runtime::check_layout(dir)? }
+        let contract = external_contract(dir, name)?;
+        let base = dir.parent().and_then(Path::parent).and_then(Path::parent).context("invalid component directory")?;
+        let external = super::external_runtime::view(&Layout { base: base.into() }, name, &contract)?;
+        let ready = external["checkedAt"].is_string()
+            && external["issues"].as_array().is_some_and(Vec::is_empty);
+        let state = if ready && selected { states::READY } else { states::NEEDS_USER };
+        let mut value = json!({"dir": dir, "state": state, "external": external});
+        // Supply the legacy detail key too: status_of otherwise falls back to
+        // status_requirements(), whose old Node-version cache can spawn Node.
+        let (key, package) = if name == NAME { ("dsh", "@deepseek-ai/dsh") }
+            else { ("kimi", crate::runtime::kimi::KIMI_PACKAGE) };
+        value[key] = json!({"version": contract.external_root.packages.get(package),
+            "node": {"minimum": NODE_MINIMUM, "range":contract.node.range,
+                "version": external.get("nodeVersion").cloned().unwrap_or(Value::Null),
+                "path": external["node"], "ready": ready}});
+        Ok(value)
+    })();
+    result.unwrap_or_else(|error| {
+        let mut value = json!({"dir": dir, "state": states::DEGRADED, "problem": format!("{error:#}")});
+        let key = if name == NAME { "dsh" } else { "kimi" };
+        value[key] = if name == NAME { requirements() } else { super::kimi_runtime::requirements() };
+        value
+    })
+}
+
+/// Restore uses the session's paths, independently of current default config.
+/// A future signed adapter may pin another exact upstream version; bundled r2
+/// keeps its original compiled checks in the caller.
+pub fn validate_external_deployment(name: &str, node: &Path, adapter: &Path, cli: &Path,
+    root: &Path, vendor_version: &str, rg: Option<&Path>) -> anyhow::Result<bool> {
+    let Some(dir) = adapter.parent().and_then(Path::parent) else { return Ok(false); };
+    if !dir.join("external-runtime.json").exists() { return Ok(false); }
+    ensure!(adapter.is_absolute() && same_path(adapter, &dir.join("src/server.mjs")), "invalid adapter path");
+    match name { NAME => verify_payload(dir)?, _ => super::kimi_runtime::verify_payload(dir)? }
+    let contract = external_contract(dir, name)?;
+    let package = if name == NAME { "@deepseek-ai/dsh" } else { crate::runtime::kimi::KIMI_PACKAGE };
+    ensure!(contract.external_root.packages.get(package).is_some_and(|v| v == vendor_version), "pinned upstream version differs from adapter contract");
+    ensure!(same_path(cli, &root.join(&contract.external_root.cli_entry)), "CLI must belong to the pinned external prefix");
+    let config = super::external_runtime::ExternalConfig {
+        external_root: Some(root.into()), node: Some(node.into()), rg: rg.map(Path::to_path_buf),
+    };
+    let status = super::external_runtime::probe(&contract, &config, &super::external_runtime::RealExec)?;
+    ensure!(status.ready(), "external runtime needs attention: {}", serde_json::to_string(&status.issues)?);
+    Ok(true)
+}
+
 impl Handler for DshRuntime {
     fn metadata(&self) -> &Metadata {
         &self.metadata
     }
     fn required_files(&self) -> &'static [&'static str] {
         REQUIRED_FILES
+    }
+    fn required_files_for(&self, dir: &Path) -> &'static [&'static str] {
+        payload_files(dir)
     }
     /// Explicit input only. A checkout's .dsh-install is staging, never the
     /// user's npm prefix. A prebuilt component payload is accepted unchanged.
@@ -320,6 +483,9 @@ impl Handler for DshRuntime {
         } else {
             source.to_path_buf()
         };
+        if adapter.join("external-runtime.json").exists() {
+            return copy_adapter_source(&adapter, dest, NAME, ADAPTER_FILES);
+        }
         same_component_version(&adapter, &self.metadata)?;
         let runtime = if adapter.join("runtime").is_dir() {
             adapter.join("runtime")
@@ -360,13 +526,17 @@ impl Handler for DshRuntime {
         false
     }
     fn configured_by_hand(&self) -> bool {
-        DshDeployment::selected().and_then(|d| d.validate()).is_ok()
+        selected_raw().and_then(|v| serde_json::from_value::<DshDeployment>(v).ok())
+            .is_some_and(|deployment| manual_presence(&deployment))
     }
     fn prepare(&self, ctx: &Context) -> anyhow::Result<Value> {
         if ctx.dry_run {
             return Ok(json!({"dryRun": true, "unpacked": check_layout(&ctx.dir).is_ok()}));
         }
         verify_payload(&ctx.dir)?;
+        if ctx.dir.join("external-runtime.json").exists() {
+            return prepare_external(ctx, NAME);
+        }
         let path = node_path(&ctx.dir, &self.options());
         let node = node_detail(path.as_deref(), ctx.exec);
         if node["ready"] != true {
@@ -375,10 +545,14 @@ impl Handler for DshRuntime {
         Ok(json!({"prepared": true, "dsh": {"version": DSH_VERSION, "node": node}}))
     }
     fn select(&self, ctx: &Context) -> anyhow::Result<Value> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         if ctx.dry_run {
             return Ok(json!({"selected": false, "dryRun": true}));
         }
         verify_payload(&ctx.dir)?;
+        if ctx.dir.join("external-runtime.json").exists() {
+            return select_external_dsh(ctx);
+        }
         let path = node_path(&ctx.dir, &self.options());
         let node = node_detail(path.as_deref(), ctx.exec);
         if node["ready"] != true {
@@ -431,6 +605,9 @@ impl Handler for DshRuntime {
 }
 
 pub fn probe_dir(dir: &Path, options: &Options, exec: &dyn Exec) -> Value {
+    if dir.join("external-runtime.json").exists() {
+        return cached_external_probe(dir, NAME, selected_is(dir));
+    }
     if let Err(error) = check_layout(dir) {
         return json!({"dir": dir, "dsh": requirements(), "state": states::DEGRADED,
             "problem": format!("{error:#}; install the component again")});
@@ -465,6 +642,18 @@ pub fn pins_for(root: &Path, sessions: impl IntoIterator<Item = Value>) -> BTree
     let mut pins = BTreeMap::new();
     for session in sessions {
         let deployment = session.get("deployment").unwrap_or(&session);
+        // Adapter-only deployments pin their component through the adapter,
+        // while install_root points outside cutex's component directories.
+        if let Some(adapter) = deployment["adapter"].as_str().map(PathBuf::from) {
+            if let Some(version) = adapter.parent().and_then(Path::parent) {
+                if version.parent().is_some_and(|p| same_path(p, root)) {
+                    if let Some(label) = version.file_name().and_then(|n| n.to_str()) {
+                        *pins.entry(label.into()).or_insert(0) += 1;
+                        continue;
+                    }
+                }
+            }
+        }
         let Some(install) = deployment["install_root"].as_str() else {
             continue;
         };

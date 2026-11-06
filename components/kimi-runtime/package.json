@@ -2,7 +2,13 @@
   "name": "cutex-kimi-runtime",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.19" },
-  "scripts": { "test": "node --test test/*.test.mjs" },
-  "dependencies": { "ws": "8.22.0" }
+  "engines": {
+    "node": ">=24.9.0 <25"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "ws": "8.22.0"
+  }
 }

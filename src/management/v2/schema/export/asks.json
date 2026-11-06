@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:cutex:management-v2:asks",
   "title": "AskList",
-  "description": "GET /v2/asks[?state=&involving=&peer=&open=&limit=] summaries. GET /v2/asks/{id} returns {ask} with owner detail. Peer records expose portable state and local delivery diagnostics.",
+  "description": "GET /v2/asks summaries. Owner cleanup pagination (asks-updated-before-cursor-v1) adds updatedBefore RFC3339 and opaque cursor, orders by updatedAt then askId ascending, and returns nextCursor. Keep filters and cutoff unchanged between pages. Without these parameters legacy order is unchanged. GET /v2/asks/{id} returns {ask} with owner detail.",
   "anyOf": [
     {
       "$ref": "#/$defs/askList"
@@ -137,6 +137,11 @@
             "string",
             "null"
           ]
+        },
+        "admissionFailure": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact permanent pre-dispatch refusal code, including zero-attempt failures; omitted on older records and when absent."
         },
         "execution": {
           "type": "string",
@@ -407,6 +412,10 @@
         },
         "hasMore": {
           "type": "boolean"
+          },
+          "nextCursor": {
+            "type": ["string", "null"],
+            "description": "Present in updatedBefore cleanup mode only. Percent-encode when sending as the next cursor."
         }
       }
     },
@@ -419,6 +428,7 @@
         "ask": {
           "type": "object",
           "properties": {
+            "admissionFailure": { "type": "string", "minLength": 1, "description": "Exact permanent pre-dispatch refusal code; no attempt is invented." },
             "controller": { "type": ["string", "null"] },
             "originallyRequestedBy": { "type": ["string", "null"] },
             "controlError": { "type": "string" },

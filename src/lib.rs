@@ -6,6 +6,8 @@
 
 pub mod agent_bus;
 pub mod agent_management;
+pub mod agent_names;
+pub mod name_target_pins;
 pub mod app_server;
 pub mod build_info;
 pub mod browser_relay;
@@ -44,6 +46,8 @@ pub mod runtime;
 pub mod services;
 pub mod session;
 pub mod short_ids;
+/// Common store layer (design 058 S0): keyed access, manifest, ratchet.
+pub mod store;
 /// Deterministic Task Service provider. The public surface is the revised v2
 /// contract; the older transition engine remains crate-private implementation
 /// evidence for the pre-deployment pilot.
@@ -52,6 +56,9 @@ pub mod ui;
 pub mod upgrade;
 /// Workflow runs (W1): approved orchestration scripts whose steps are asks.
 pub mod workflows;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[cfg(target_os = "linux")]
 pub mod inbound_mail;

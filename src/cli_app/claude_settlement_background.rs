@@ -3,6 +3,42 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+type Job = (String, String, u64);
+
+/// Full proof needs several native RPCs and history pages. The 75ms scheduler
+/// slot must not be its execution deadline. One bounded worker collects proof
+/// independently, so a slow adapter never blocks ordinary delivery polling.
+pub(crate) struct ObservationWorker {
+    sender: std::sync::mpsc::SyncSender<Job>,
+    pending: std::sync::Arc<std::sync::Mutex<BTreeSet<Job>>>,
+}
+
+impl ObservationWorker {
+    pub(crate) fn spawn(mut observe: impl FnMut(&str, &str, u64) + Send + 'static) -> std::io::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Job>(MAX_MESSAGES);
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+        let working = pending.clone();
+        std::thread::Builder::new().name("claude-settle".into()).spawn(move || {
+            for job in receiver {
+                observe(&job.0, &job.1, job.2);
+                if let Ok(mut pending) = working.lock() { pending.remove(&job); }
+            }
+        })?;
+        Ok(Self { sender, pending })
+    }
+
+    pub(crate) fn schedule(&self, agent: &str, message: &str, generation: u64) -> bool {
+        let Ok(mut pending) = self.pending.lock() else { return false; };
+        let job = (agent.to_owned(), message.to_owned(), generation);
+        if !pending.insert(job.clone()) { return false; }
+        if self.sender.try_send(job.clone()).is_err() {
+            pending.remove(&job);
+            return false;
+        }
+        true
+    }
+}
+
 pub(super) const BACKGROUND_BUDGET: Duration = Duration::from_millis(250);
 pub(super) const MESSAGE_BUDGET: Duration = Duration::from_millis(75);
 pub(super) const MAX_MESSAGES: usize = 4;
@@ -119,6 +155,27 @@ impl BackgroundObservations {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn slow_full_observation_does_not_block_or_duplicate_scheduling() {
+        let (started, running) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let worker = ObservationWorker::spawn(move |_, message, _| {
+            started.send(message.to_owned()).unwrap();
+            if message == "slow" { blocked.recv().unwrap(); }
+            finished.send(message.to_owned()).unwrap();
+        }).unwrap();
+        assert!(worker.schedule("agent", "slow", 1));
+        assert_eq!(running.recv_timeout(Duration::from_secs(5)).unwrap(), "slow");
+        assert!(!worker.schedule("agent", "slow", 1));
+        for n in 0..MAX_MESSAGES { assert!(worker.schedule("agent", &format!("queued-{n}"), 1)); }
+        assert!(!worker.schedule("agent", "full", 1));
+        // A full/slow worker returns immediately to the ordinary polling loop.
+        assert_eq!(done.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        release.send(()).unwrap();
+        for _ in 0..=MAX_MESSAGES { done.recv_timeout(Duration::from_secs(5)).unwrap(); }
+    }
 
     #[test]
     fn all_delivery_polls_precede_even_slow_background_and_cap_off_does_no_work() {

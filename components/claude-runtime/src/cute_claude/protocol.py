@@ -8,6 +8,7 @@ is caller-supplied provenance, not cryptographically authenticated agent identit
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import platform
 import inspect
@@ -24,6 +25,7 @@ from . import __version__, asks
 from .config import Settings
 from .engine import Engine
 from .errors import RpcError, require, text
+from .tool_gate import METHODS as TOOL_GATE_METHODS, SET as TOOL_GATE_SET, ToolGate
 from .provider import ProviderError
 from .store import COMPACT_EVENT, Store, dump, identifier
 from .model_config import ModelConfig
@@ -94,6 +96,14 @@ def requested_mode(params: dict, current: str) -> str | None:
     return current if current in {"default", "acceptEdits"} else "default"
 
 
+def owner_carrier_key(prefix: str, client_id: object) -> str:
+    """Keep short wire identities; bind overflow to the complete UTF-8 ID."""
+    value = text(client_id, 'clientUserMessageId', limit=256)
+    raw = value.encode('utf-8')
+    suffix = value if len(raw) <= 200 else hashlib.sha256(raw).hexdigest()
+    return prefix + suffix
+
+
 @dataclass(eq=False)
 class Peer:
     send: Send
@@ -119,6 +129,8 @@ class Server:
         engine.notify_view = self.broadcast_view
         self.peer_sequence = 0
         self.approvals = Approvals(self)
+        engine.tool_gate = ToolGate(engine)
+        engine.active_flags = self.active_flags
         engine.approve_tool = self.approvals.approve
         engine.rate_limits = RateLimits(store)
         engine.metrics = RuntimeMetrics(engine)
@@ -254,6 +266,8 @@ class Server:
                 "ensureThread": "claude/thread/ensure",
                 "persistentRuntime": bool(subscription and getattr(self.engine.driver, "persistent", False)),
                 "runtimeControl": ["claude/runtime/start", "claude/runtime/status", "claude/runtime/close"] if subscription else [],
+                # cutex r276 agent pause: hold the next tool call (tool_gate.py).
+                "toolGate": TOOL_GATE_SET if subscription else None,
                 "continuousEventReader": subscription, "idleKeepaliveModelRequests": False,
                 "features": self.features(), **self.external_inputs.capabilities()}
 
@@ -264,7 +278,7 @@ class Server:
                                          and self.settings.external_runtime_generation is not None)
         if self.settings.backend != "subscription":
             native = {"imageInput", "reasoning", "commandItems", "fileChangeItems", "turnDiff", "approvals",
-                      "userInputRequests", "agentTurnQuestions", "planMode", "planChecklist", "compact", "effort", "rateLimits",
+                      "userInputRequests", "userInputOptions", "agentTurnQuestions", "planMode", "planChecklist", "compact", "effort", "rateLimits",
                       "historyRevert", "fork", "threadDelete", "subagents", "subagentTranscripts", "backgroundSubagents", "autoReconnect", "backgroundTerminals", "mcpStatus", "fileRewind",
                       "versionedModelCatalog", "modelObservation", "safetyGrants", "fastMode", "sideChat", "forkWhileBusy",
                       "turnSteer", "permissionRules"}
@@ -273,11 +287,18 @@ class Server:
             features["claudePermissionModes"] = ["bypassPermissions"]
         return features
 
+    def active_flags(self, tid: str) -> list[str]:
+        kinds = {p.kind for p in self.approvals.pending.values() if p.thread_id == tid}
+        flags = (["waitingOnApproval"] if kinds - {"question"} else []) + (["waitingOnUserInput"] if "question" in kinds else [])
+        owner = getattr(getattr(self.engine, 'driver', None), 'owners', {}).get(tid)
+        if owner is not None and getattr(owner, 'notification_held', False):
+            flags.append('heldByNotification')
+        return flags + self.engine.tool_gate.flags(tid)
+
     def _thread_wire(self, tid: str, include_turns: bool = False) -> dict:
         self.store.thread(tid)
         active = self.store.db.execute("SELECT 1 FROM turns WHERE thread_id=? AND state='inProgress' LIMIT 1", (tid,)).fetchone()
-        kinds = {p.kind for p in self.approvals.pending.values() if p.thread_id == tid}
-        flags = (["waitingOnApproval"] if kinds - {"question"} else []) + (["waitingOnUserInput"] if "question" in kinds else [])
+        flags = self.active_flags(tid)
         status = {"type": "active", "activeFlags": flags} if active else {"type": "idle"}
         return thread_wire(self.store, self.history, tid, include_turns=include_turns,
                            effort=self._effort(tid), status=status)
@@ -412,7 +433,8 @@ class Server:
             return {"userAgent": f"cute-claude-app-server/{__version__}", "codexHome": str(self.settings.state_dir),
                     "presentationVersion": 1, "platformFamily": "windows" if sys.platform == "win32" else "unix", "platformOs": platform.system().lower(),
                     **self.external_inputs.capabilities(),
-                    "fullTextItemTerminal": self.features().get("fullTextItemTerminal") is True}, None
+                    "fullTextItemTerminal": self.features().get("fullTextItemTerminal") is True,
+                    "toolGate": TOOL_GATE_SET if self.settings.backend == 'subscription' else None}, None
         require(peer.initialized and peer.ready, "initialize and initialized are required", -32002)
         if method in EXTERNAL_INPUT_METHODS:
             return await self.external_inputs.dispatch(peer, method, params)
@@ -445,6 +467,14 @@ class Server:
                 require(owner.task.done() and owner.lease is None, "native child exit is not confirmed", -32009)
             self.shutdown_requested = True
             return {"runtimeId": self.runtime_id, "shutdownAccepted": True}, None
+        if method in TOOL_GATE_METHODS:
+            require(self.settings.backend == 'subscription', 'Claude subscription backend required')
+            tid = text(params.get('threadId'), 'threadId', limit=256)
+            self.store.thread(tid)
+            if method == TOOL_GATE_SET:
+                require(isinstance(params.get('held'), bool), 'held must be a boolean')
+                return await self.engine.tool_gate.set(tid, params['held']), None
+            return self.engine.tool_gate.snapshot(tid), None
         if method in {'claude/approvals/get', 'claude/approvals/set'}:
             require(self.settings.backend == 'subscription', 'Claude subscription backend required')
             tid = text(params.get('threadId'), 'threadId', limit=256)
@@ -663,7 +693,12 @@ class Server:
             owner = getattr(getattr(self.engine, 'driver', None), 'owners', {}).get(tid)
             require(owner is None or not owner.task.done(),
                     "Claude runtime has exited. Restart this Agent runtime in Cutex, then submit your new instruction; the failed input will not be replayed.", -32009)
-            if self.store.user_turn_busy(tid):
+            carries = self.external_inputs.owner_carries(tid, params['ownerCarries']) if 'ownerCarries' in params else []
+            carrier_id = None
+            if carries:
+                carrier_id = owner_carrier_key('owner-', params.get('clientUserMessageId'))
+            previous = self.store.db.execute('SELECT * FROM inputs WHERE thread_id=? AND message_id=?', (tid, carrier_id)).fetchone() if carrier_id else None
+            if not previous and self.store.user_turn_busy(tid):
                 # `data.reason` lets cutex keep the input in its own queue
                 # (e.g. an Agent Bus message was queued just before it).
                 raise RpcError(-32009, "thread busy; use claude/input/submit for a separate queued turn",
@@ -686,9 +721,14 @@ class Server:
                 # Echoed as userMessage.clientId: cutex deduplicates submits and
                 # clients match pending messages by it.
                 payload["clientId"] = client_id[:256]
-            receipt = self.store.enqueue(tid, identifier(), payload, self.settings.max_pending, resume_interrupted=True)
-            record = self.store.claim(tid, receipt["messageId"])
-            assert record is not None
+            if carries:
+                payload['metadata']['ownerCarries'] = carries
+            with self.store.transaction():
+                receipt = self.store.enqueue(tid, carrier_id or identifier(), payload, self.settings.max_pending, resume_interrupted=True)
+                self.external_inputs.reserve_owner_carries(tid, receipt['messageId'], carries)
+                if not receipt['duplicate']:
+                    record = self.store.claim(tid, receipt['messageId'])
+                    require(record is not None, 'owner claim refused', -32009)
             peer.subscriptions.add(tid)
             return {"turn": self.store.turn(receipt["turnId"], include_items=False)}, lambda: self.engine.wake(tid)
         if method == "turn/steer":
@@ -834,7 +874,7 @@ class Server:
         turn at once."""
         if self.settings.backend != "subscription":
             raise unsupported("turn/steer")
-        require(set(params) <= {"threadId", "input", "clientUserMessageId", "expectedTurnId"}, "unsupported steer fields")
+        require(set(params) <= {"threadId", "input", "clientUserMessageId", "expectedTurnId", "ownerCarries"}, "unsupported steer fields")
         tid = text(params.get("threadId"), "threadId", limit=256)
         thread = self.store.thread(tid)
         row = self.store.db.execute("SELECT id FROM turns WHERE thread_id=? AND state='inProgress' ORDER BY rowid DESC LIMIT 1", (tid,)).fetchone()
@@ -846,6 +886,9 @@ class Server:
             raise RpcError(-32600, f"expected active turn id {expected} but found {active}")
         require(not thread["archived"], "thread is archived", -32009)
         require(not thread["halted"], "queue paused; resume the agent before adding input", -32009)
+        owner = getattr(getattr(self.engine, 'driver', None), 'owners', {}).get(tid)
+        if owner is not None and getattr(owner, 'finishing_turn_id', None) == active:
+            raise RpcError(-32009, 'The turn is finishing; this input was not enqueued or steered.', {'reason': 'turnFinishing'})
         value, attachments, display = parse_turn_input(params.get("input"), images=True,
             skills=self.skills, cwd=thread["cwd"])
         # `steer` marks it for Store.drop_unread_steers (with or without images).
@@ -858,12 +901,17 @@ class Server:
         client_id = params.get("clientUserMessageId")
         mid = identifier()
         if isinstance(client_id, str) and client_id.strip():
-            payload["clientId"] = client_id[:256]
-            mid = "steer-" + client_id[:200]
+            mid = owner_carrier_key("steer-", client_id)
+            payload["clientId"] = client_id
+        carries = self.external_inputs.owner_carries(tid, params['ownerCarries']) if 'ownerCarries' in params else []
+        if carries:
+            text(params.get('clientUserMessageId'), 'clientUserMessageId', limit=256)
+            payload['metadata']['ownerCarries'] = carries
         with self.store.transaction():
             receipt = self.store.enqueue(tid, mid, payload, self.settings.max_pending)
+            self.external_inputs.reserve_owner_carries(tid, mid, carries)
             if not attachments:
-                self.busy_delivery.register(tid, mid, receipt)
+                self.busy_delivery.register(tid, mid, receipt, turn_id=active)
         peer.subscriptions.add(tid)
         return {"turnId": active}, (None if receipt["duplicate"] else lambda: self.engine.wake(tid))
 

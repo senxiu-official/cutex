@@ -1,0 +1,20 @@
+{
+  "_comment": "Release metadata for cutex 0.2.1 Beautiful World. Components use independent immutable release identities. The durable-state migration requires explicit confirmation and an offline backup.",
+  "mode": "full",
+  "packageRunRecommended": true,
+  "migrations": [
+    {
+      "id": "durable-state-sqlite",
+      "class": "one-way",
+      "since": "0.2.1",
+      "notes": {
+        "en": "Moves durable session, communication and usage state to SQLite-backed stores. Retain an offline backup; automatic rollback across this migration is unavailable.",
+        "zh-CN": "会话、通信及用量的持久状态迁入 SQLite。请保留离线备份；无法跨过本次迁移自动回退。"
+      }
+    }
+  ],
+  "notes": {
+    "en": "Agent rename and name history, browser scripting sessions, user layout memory, durable store migration, clearer message delivery and idle service sleep. Native 0.164.0-r59, Claude claude-r40, optional DSH dsh-r3 and Kimi kimi-r3. Existing runtime pins are retained until explicitly upgraded.",
+    "zh-CN": "智能体改名与名字历史、浏览器脚本会话、个人布局记忆、持久存储迁移、清晰的消息投递与服务空闲休眠。原生运行时 0.164.0-r59、Claude claude-r40，以及可选 DSH dsh-r3 和 Kimi kimi-r3。已有运行时保持固定版本，直到明确升级。"
+  }
+}

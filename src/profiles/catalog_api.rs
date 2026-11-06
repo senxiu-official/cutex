@@ -344,11 +344,7 @@ pub(crate) fn validate_catalog(catalog: &Value) -> anyhow::Result<()> {
 pub(crate) fn api_key(account: &StoredAccount) -> anyhow::Result<String> {
     account_auth_payload(account)
         .and_then(|auth| {
-            auth.get("OPENAI_API_KEY")
-                .or_else(|| auth.get("openai_api_key"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
+            super::api_key::from_auth(&auth)
                 .map(str::to_string)
         })
         .context("model discovery requires an API-key profile with a stored key")

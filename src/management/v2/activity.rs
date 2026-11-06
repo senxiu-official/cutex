@@ -1,7 +1,6 @@
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -12,6 +11,7 @@ use chrono::DateTime;
 use serde::Deserialize;
 use serde::Serialize;
 
+#[cfg(test)]
 use crate::config::atomic::write_private_pretty_json_atomic;
 use crate::config::paths::runtime_dir;
 use crate::observability::{
@@ -25,10 +25,8 @@ use super::model::NativeMessageKind;
 use super::model::MAX_SAFE_SEQUENCE;
 
 const ACTIVITY_STATE_FILE: &str = "session-activity-state.json";
-const ACTIVITY_LOCK_FILE: &str = "session-activity-state.lock";
 const OUTPUT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
-static ACTIVITY_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static ACTIVITY_RECORDER: OnceLock<ActivityRecorder> = OnceLock::new();
 
 /// Pure conversation projection shared by SessionResource and agent_list.
@@ -90,6 +88,177 @@ pub struct SessionActivityState {
     pub(crate) last_output_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_tool_call_turn_id: Option<String>,
+    /// The last turn that ended `failed` (capability `turn-error-surface`),
+    /// cleared by a later `completed` turn, kept by an `interrupted` one.
+    /// Absent in stores of older binaries (= never failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_error: Option<LastTurnError>,
+}
+
+/// Longest `lastTurnError.message` (characters).
+pub const TURN_ERROR_MESSAGE_CHARS: usize = 2000;
+/// Largest serialized `codexErrorInfo` kept; a larger one keeps its `code`.
+const TURN_ERROR_INFO_BYTES: usize = 2048;
+/// One owner notice per profile per rolling hour for the unauthorized family.
+pub const TURN_ERROR_NOTICE_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+
+/// `activity.lastTurnError` of a session (capability `turn-error-surface`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LastTurnError {
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    pub message: String,
+    pub code: String,
+    #[serde(default)]
+    pub codex_error_info: serde_json::Value,
+    pub at: String,
+    pub consecutive: u64,
+    /// Profile the failed turn ran on (the runtime's launch binding): counts
+    /// the sessions of a profile for the owner notice. Store only, never in
+    /// the session resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+}
+
+impl LastTurnError {
+    /// `code` is `unauthorized` or `refresh_token_reused`.
+    pub fn is_unauthorized_family(&self) -> bool {
+        is_unauthorized_code(&self.code)
+    }
+
+    fn profile_key(&self) -> Option<&str> {
+        self.profile_id.as_deref().or(self.profile_name.as_deref())
+    }
+
+    /// The `activity.lastTurnError` object of the session resource.
+    pub fn resource(&self) -> serde_json::Value {
+        serde_json::json!({
+            "turnId": self.turn_id,
+            "message": self.message,
+            "code": self.code,
+            "codexErrorInfo": self.codex_error_info,
+            "at": self.at,
+            "consecutive": self.consecutive,
+        })
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        parse_timestamp(&self.at).context("invalid lastTurnError.at")?;
+        anyhow::ensure!(self.consecutive >= 1 && self.consecutive <= MAX_SAFE_SEQUENCE,
+            "lastTurnError.consecutive is outside 1..JSON-safe");
+        anyhow::ensure!(self.message.chars().count() <= TURN_ERROR_MESSAGE_CHARS, "lastTurnError.message is too long");
+        anyhow::ensure!(!self.code.is_empty() && self.code.len() <= 128, "invalid lastTurnError.code");
+        Ok(())
+    }
+}
+
+/// `unauthorized` or `refresh_token_reused`.
+pub fn is_unauthorized_code(code: &str) -> bool {
+    matches!(code, "unauthorized" | "refresh_token_reused")
+}
+
+/// The stable `code` of a failed turn's error (contract turn-error-surface):
+/// `refresh_token_reused` (the message says the refresh token was already
+/// used, or the info / details name `refresh_token_reused`), else
+/// `unauthorized` (info `unauthorized` or an `httpStatusCode` 401), else
+/// the info string, the single key of an info object, or `other`.
+pub fn classify_turn_error(
+    message: &str,
+    codex_error_info: &serde_json::Value,
+    additional_details: &serde_json::Value,
+) -> String {
+    use serde_json::Value;
+    let names_reused =
+        |value: &Value| !value.is_null() && value.to_string().to_ascii_lowercase().contains("refresh_token_reused");
+    if message.to_lowercase().contains("refresh token was already used")
+        || names_reused(codex_error_info)
+        || names_reused(additional_details)
+    {
+        return "refresh_token_reused".into();
+    }
+    fn has_status_401(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => map
+                .iter()
+                .any(|(key, inner)| (key == "httpStatusCode" && inner.as_u64() == Some(401)) || has_status_401(inner)),
+            Value::Array(items) => items.iter().any(has_status_401),
+            _ => false,
+        }
+    }
+    if codex_error_info.as_str() == Some("unauthorized") || has_status_401(codex_error_info) {
+        return "unauthorized".into();
+    }
+    let code = match codex_error_info {
+        Value::String(code) => code.trim().to_string(),
+        Value::Object(map) if map.len() == 1 => map.keys().next().cloned().unwrap_or_default(),
+        _ => String::new(),
+    };
+    if code.is_empty() || code.len() > 128 {
+        "other".into()
+    } else {
+        code
+    }
+}
+
+/// A `turn/completed` with `turn.status == "failed"`, as recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnFailure {
+    turn_id: Option<String>,
+    message: String,
+    code: String,
+    codex_error_info: serde_json::Value,
+}
+
+impl TurnFailure {
+    fn from_turn(turn: &serde_json::Value) -> Self {
+        use serde_json::Value;
+        let error = turn.get("error").cloned().unwrap_or(Value::Null);
+        let message = error.get("message").and_then(Value::as_str).unwrap_or_default();
+        let info = error.get("codexErrorInfo").cloned().unwrap_or(Value::Null);
+        let details = error.get("additionalDetails").cloned().unwrap_or(Value::Null);
+        let code = classify_turn_error(message, &info, &details);
+        let info = if info.to_string().len() > TURN_ERROR_INFO_BYTES { Value::String(code.clone()) } else { info };
+        Self {
+            turn_id: turn.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string),
+            message: message.chars().take(TURN_ERROR_MESSAGE_CHARS).collect(),
+            code,
+            codex_error_info: info,
+        }
+    }
+}
+
+/// An owner notice a failed turn of the unauthorized family asks for (at
+/// most one per profile per rolling hour, [`TURN_ERROR_NOTICE_INTERVAL`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnErrorNotice {
+    pub cutex_session_id: String,
+    pub turn_id: Option<String>,
+    pub code: String,
+    pub consecutive: u64,
+    pub profile_id: Option<String>,
+    pub profile_name: Option<String>,
+    /// Sessions of the profile whose `lastTurnError` is of the unauthorized
+    /// family now (this one included).
+    pub affected_sessions: usize,
+}
+
+impl TurnErrorNotice {
+    /// The owner notice text (Chinese, as the other cutex notices).
+    pub fn text(&self) -> String {
+        let profile = self.profile_name.as_deref().or(self.profile_id.as_deref()).unwrap_or("（未知）");
+        let what = if self.code == "refresh_token_reused" {
+            "登录令牌刷新失败，是并发刷新冲突；下一条消息会自动重试。"
+        } else {
+            "登录未通过（unauthorized）；如果反复出现，可能需要重新登录这个配置。"
+        };
+        format!(
+            "配置「{profile}」上的一轮对话失败：{what}这个配置下目前有 {} 个会话的上一轮因登录失败。",
+            self.affected_sessions
+        )
+    }
 }
 
 impl SessionActivityState {
@@ -161,6 +330,9 @@ impl SessionActivityState {
             tool.validate()
                 .context("invalid last tool-call projection")?;
         }
+        if let Some(error) = self.last_turn_error.as_ref() {
+            error.validate()?;
+        }
         if self.last_output.is_some() != self.last_output_order.is_some()
             || self.last_tool_call.is_some() != self.last_tool_call_order.is_some()
         {
@@ -206,25 +378,34 @@ impl ActivityOrder {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct ActivityStore {
     #[serde(default = "activity_store_version")]
     version: u8,
     #[serde(default)]
-    sessions: HashMap<String, SessionActivityState>,
+    sessions: std::collections::BTreeMap<String, SessionActivityState>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     deleted_sessions: std::collections::BTreeSet<String>,
+    /// Profile key (id, else name; "" = unknown) → `receivedAt` of the last
+    /// unauthorized-family turn-error owner notice: the rolling-hour limit
+    /// survives a restart. One entry per profile, older ones pruned.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    turn_error_notices: std::collections::BTreeMap<String, String>,
 }
 
+#[cfg(test)]
 impl Default for ActivityStore {
     fn default() -> Self {
         Self {
             version: activity_store_version(),
-            sessions: HashMap::new(),
+            sessions: Default::default(),
             deleted_sessions: Default::default(),
+            turn_error_notices: Default::default(),
         }
     }
 }
 
+#[cfg(test)]
 fn activity_store_version() -> u8 {
     1
 }
@@ -292,10 +473,26 @@ impl ActivityRecorder {
         self.record_output_locked(root, &pending.cutex_session_id, generation, at, &mut output)
     }
 
+    #[cfg(test)]
     fn record_at(&self, root: &Path, envelope: &EventEnvelope) -> anyhow::Result<()> {
+        self.record_at_for(root, envelope, None, None).map(|_| ())
+    }
+
+    /// Records the event; `profile_id` / `profile_name` = the profile the
+    /// runtime runs on (kept with a failed turn's `lastTurnError`). Returns
+    /// the owner notice a failed turn of the unauthorized family asks for,
+    /// already counted against its profile's rolling hour.
+    fn record_at_for(
+        &self,
+        root: &Path,
+        envelope: &EventEnvelope,
+        profile_id: Option<&str>,
+        profile_name: Option<&str>,
+    ) -> anyhow::Result<Option<TurnErrorNotice>> {
         let Some(event) = activity_event(envelope) else {
-            return Ok(());
+            return Ok(None);
         };
+        let mut notice = None;
         let runtime_generation = envelope
             .correlation
             .runtime_generation
@@ -371,17 +568,39 @@ impl ActivityRecorder {
                     },
                 )?;
             }
-            ActivityEvent::TurnCompleted { interrupted } => {
+            ActivityEvent::TurnCompleted { interrupted, completed, failure } => {
                 let pending_at = output
                     .get(&envelope.cutex_session_id)
                     .filter(|checkpoint| checkpoint.runtime_generation == Some(runtime_generation))
                     .and_then(|checkpoint| checkpoint.latest_at.clone());
-                update_activity_at(
+                let failure = failure.map(|mut failure| {
+                    if failure.turn_id.is_none() {
+                        failure.turn_id = event_turn_id(envelope);
+                    }
+                    failure
+                });
+                let profile = (profile_id.map(str::trim).filter(|id| !id.is_empty()).map(str::to_string),
+                    profile_name.map(str::trim).filter(|name| !name.is_empty()).map(str::to_string));
+                notice = update_activity_with_store_at(
                     root,
                     &envelope.cutex_session_id,
                     runtime_generation,
                     |state| {
-                        let mut changed = merge_optional_timestamp(
+                        // An older turn end (redelivered, out of order) does
+                        // not move the turn error of a newer one.
+                        let newest = match state.last_turn_completed_at.as_deref() {
+                            Some(current) => parse_timestamp(&envelope.received_at)? >= parse_timestamp(current)?,
+                            None => true,
+                        };
+                        let mut changed = false;
+                        let mut recorded = None;
+                        if newest {
+                            let (error_changed, fresh) = apply_turn_outcome(
+                                state, completed, failure.as_ref(), &envelope.received_at, profile)?;
+                            changed |= error_changed;
+                            recorded = fresh;
+                        }
+                        changed |= merge_optional_timestamp(
                             &mut state.last_output_at,
                             pending_at.as_deref(),
                         )?;
@@ -407,7 +626,13 @@ impl ActivityRecorder {
                                 &envelope.received_at,
                             )?;
                         }
-                        Ok(changed)
+                        Ok((changed, recorded))
+                    },
+                    |store, recorded| match recorded {
+                        Some(recorded) if recorded.is_unauthorized_family() => {
+                            decide_turn_error_notice(store, &envelope.cutex_session_id, &recorded)
+                        }
+                        _ => Ok((false, None)),
                     },
                 )?;
                 clear_completed_output_checkpoint(
@@ -456,7 +681,122 @@ impl ActivityRecorder {
                 )?;
             }
         }
-        Ok(())
+        Ok(notice)
+    }
+}
+
+/// `lastTurnError` after a turn end (contract turn-error-surface): a
+/// `completed` turn clears it, a `failed` one sets it (`consecutive` counts
+/// the failed turns since the last completed one; the same turn reported
+/// again keeps its count), any other end leaves it. Returns (changed, the
+/// error of a newly failed turn).
+fn apply_turn_outcome(
+    state: &mut SessionActivityState,
+    completed: bool,
+    failure: Option<&TurnFailure>,
+    at: &str,
+    (profile_id, profile_name): (Option<String>, Option<String>),
+) -> anyhow::Result<(bool, Option<LastTurnError>)> {
+    if completed {
+        return Ok((state.last_turn_error.take().is_some(), None));
+    }
+    let Some(failure) = failure else {
+        return Ok((false, None));
+    };
+    let previous = state.last_turn_error.as_ref();
+    let same_turn = previous.is_some_and(|previous| previous.turn_id.is_some() && previous.turn_id == failure.turn_id);
+    let consecutive = match previous {
+        Some(previous) if same_turn => previous.consecutive,
+        Some(previous) => previous.consecutive.saturating_add(1).min(MAX_SAFE_SEQUENCE),
+        None => 1,
+    };
+    // The same turn reported again keeps when it failed and, when the
+    // redelivery does not name one, the profile it ran on.
+    let kept = previous.filter(|_| same_turn);
+    let error = LastTurnError {
+        turn_id: failure.turn_id.clone(),
+        message: failure.message.clone(),
+        code: failure.code.clone(),
+        codex_error_info: failure.codex_error_info.clone(),
+        at: kept.map_or_else(|| at.to_string(), |kept| kept.at.clone()),
+        consecutive,
+        profile_id: profile_id.or_else(|| kept.and_then(|kept| kept.profile_id.clone())),
+        profile_name: profile_name.or_else(|| kept.and_then(|kept| kept.profile_name.clone())),
+    };
+    error.validate()?;
+    if same_turn && previous == Some(&error) {
+        return Ok((false, None));
+    }
+    state.last_turn_error = Some(error.clone());
+    Ok((true, (!same_turn).then_some(error)))
+}
+
+/// The owner notice for `recorded` (unauthorized family) of session `id`,
+/// unless its profile had one within [`TURN_ERROR_NOTICE_INTERVAL`] (by the
+/// events' `receivedAt`). Returns (store changed, notice).
+fn decide_turn_error_notice(
+    store: &rusqlite::Connection,
+    id: &str,
+    recorded: &LastTurnError,
+) -> anyhow::Result<(bool, Option<TurnErrorNotice>)> {
+    let now = parse_timestamp(&recorded.at)?;
+    let key = recorded.profile_key().unwrap_or_default().to_string();
+    // This metadata is bounded by profiles, independent of session history.
+    // Use chrono rather than SQLite Julian floats to preserve subsecond fences.
+    let cutoff = (now - TURN_ERROR_NOTICE_INTERVAL).to_rfc3339();
+    let expired = {
+        // SQL selects expiry candidates; chrono below decides the exact fence.
+        // One second of slack covers SQLite's coarser timestamp precision.
+        let mut statement=store.prepare("SELECT profile,at FROM turn_error_notices WHERE julianday(at) IS NULL OR julianday(at)<=julianday(?1,'+1 second')")?;
+        let rows=statement.query_map([&cutoff], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().filter(|(_,at)| !parse_timestamp(at).is_ok_and(|last|
+            now.signed_duration_since(last) < TURN_ERROR_NOTICE_INTERVAL)).map(|(key,_)|key).collect::<Vec<_>>()
+    };
+    for key in expired { store.execute("DELETE FROM turn_error_notices WHERE profile=?1", [&key])?; }
+    // RFC3339 timestamps are compared by instant, including legacy offsets.
+    let previous: Option<String> = {
+        use rusqlite::OptionalExtension;
+        store.query_row("SELECT at FROM turn_error_notices WHERE profile=?1", [&key], |r| r.get(0)).optional()?
+    };
+    if previous.as_deref().and_then(|at| parse_timestamp(at).ok())
+        .is_some_and(|last| now.signed_duration_since(last) < TURN_ERROR_NOTICE_INTERVAL) {
+        return Ok((false, None));
+    }
+    store.execute("INSERT INTO turn_error_notices VALUES(?1,?2) ON CONFLICT(profile) DO UPDATE SET at=excluded.at", rusqlite::params![key, recorded.at])?;
+    let affected_sessions: i64 = store.query_row(
+        "SELECT count(*) FROM session_rows WHERE deleted=0 AND json_extract(CAST(data AS TEXT),'$.lastTurnError.code') IN ('unauthorized','refresh_token_reused') AND coalesce(json_extract(CAST(data AS TEXT),'$.lastTurnError.profileId'),json_extract(CAST(data AS TEXT),'$.lastTurnError.profileName'),'')=?1",
+        [&key], |r| r.get(0))?;
+    Ok((true, Some(TurnErrorNotice {
+        cutex_session_id: id.to_string(),
+        turn_id: recorded.turn_id.clone(),
+        code: recorded.code.clone(),
+        consecutive: recorded.consecutive,
+        profile_id: recorded.profile_id.clone(),
+        profile_name: recorded.profile_name.clone(),
+        affected_sessions: usize::try_from(affected_sessions)?,
+    })))
+}
+
+/// Owner notice kind `system.turnAuthFailed` (notification level tables).
+pub const TURN_ERROR_NOTICE_KIND: &str = "turnAuthFailed";
+
+fn send_turn_error_notice(notice: TurnErrorNotice) {
+    let session = notice.cutex_session_id.clone();
+    // Off the runtime event path: the owner notify store and the event
+    // journal are not touched while an event completes.
+    let spawned = std::thread::Builder::new().name("cutex-turn-error-notice".into()).spawn(move || {
+        crate::documents::notify_owner_for_turn(
+            TURN_ERROR_NOTICE_KIND,
+            &notice.cutex_session_id,
+            None,
+            notice.text(),
+            None,
+            notice.turn_id.clone(),
+        );
+    });
+    if let Err(error) = spawned {
+        eprintln!("turn error notice for {session} not sent: {error}");
     }
 }
 
@@ -485,6 +825,10 @@ enum ActivityEvent {
     TurnStarted,
     TurnCompleted {
         interrupted: bool,
+        /// `turn.status == "completed"`: clears `lastTurnError`.
+        completed: bool,
+        /// `turn.status == "failed"`: sets `lastTurnError`.
+        failure: Option<TurnFailure>,
     },
     FileChangeCompleted,
     ToolLifecycle {
@@ -494,10 +838,25 @@ enum ActivityEvent {
 }
 
 pub fn record_activity_event(envelope: &EventEnvelope) -> anyhow::Result<()> {
+    record_activity_event_for_profile(envelope, None, None)
+}
+
+/// As [`record_activity_event`] for a runtime launched on the profile
+/// `profile_id` / `profile_name`: a turn that fails with an unauthorized-family
+/// error also notifies the owner (at most once per profile per rolling hour).
+pub fn record_activity_event_for_profile(
+    envelope: &EventEnvelope,
+    profile_id: Option<&str>,
+    profile_name: Option<&str>,
+) -> anyhow::Result<()> {
     let root = runtime_dir()?.join("management-v2");
-    ACTIVITY_RECORDER
+    let notice = ACTIVITY_RECORDER
         .get_or_init(|| ActivityRecorder::new(OUTPUT_CHECKPOINT_INTERVAL))
-        .record_at(&root, envelope)
+        .record_at_for(&root, envelope, profile_id, profile_name)?;
+    if let Some(notice) = notice {
+        send_turn_error_notice(notice);
+    }
+    Ok(())
 }
 
 /// A passive output signal shares the existing one-second checkpoint cadence;
@@ -508,60 +867,24 @@ pub fn record_live_output_signal(pending: &super::model::PendingEvent) -> anyhow
         .record_live_at(&root, pending, &chrono::Utc::now().to_rfc3339())
 }
 
-pub fn load_session_activity_states() -> anyhow::Result<HashMap<String, SessionActivityState>> {
-    let root = runtime_dir()?.join("management-v2");
-    load_session_activity_states_at(&root)
+pub(super) fn activity_repository(root: &Path) -> anyhow::Result<super::session_row_store::Repository<SessionActivityState>> {
+    super::session_row_store::Repository::open(root, "session-activity", ACTIVITY_STATE_FILE, SessionActivityState::validate)
 }
 
-/// UI refreshes keep their previous snapshot while another process writes.
-pub fn try_load_session_activity_states() -> anyhow::Result<Option<HashMap<String, SessionActivityState>>> {
-    try_load_session_activity_states_at(&runtime_dir()?.join("management-v2"))
-}
-
-fn try_load_session_activity_states_at(root: &Path) -> anyhow::Result<Option<HashMap<String, SessionActivityState>>> {
-    let _guard = match ACTIVITY_STORE_LOCK.get_or_init(|| Mutex::new(())).try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-        Err(error) => anyhow::bail!("management v2 session activity lock: {error}"),
-    };
-    fs::create_dir_all(root)?;
-    secure_directory(root)?;
-    let lock = open_private_lock(&root.join(ACTIVITY_LOCK_FILE))?;
-    match lock.try_lock() {
-        Ok(()) => {},
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+/// Kit entry point. The CLI requires --daemon-stopped; domains switch separately.
+pub fn import_session_rows(store: &str) -> anyhow::Result<()> {
+    let root=runtime_dir()?.join("management-v2");
+    match store {
+        "session-activity" => {activity_repository(&root)?;},
+        "session-projection" => {super::session::projection_repository(&root)?;},
+        _ => anyhow::bail!("unknown S7 session store"),
     }
-    let result = load_activity_store(&root.join(ACTIVITY_STATE_FILE)).map(|store| Some(store.sessions));
-    let unlock = lock.unlock();
-    if result.is_ok() { unlock?; }
-    result
+    Ok(())
 }
 
-#[cfg(test)]
-#[test]
-fn ui_activity_refresh_skips_a_locked_store_and_recovers() {
-    let root = std::env::temp_dir().join(format!("cutex-ui-activity-{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let lock = open_private_lock(&root.join(ACTIVITY_LOCK_FILE)).unwrap();
-    lock.lock().unwrap();
-    let start = std::time::Instant::now();
-    assert!(try_load_session_activity_states_at(&root).unwrap().is_none());
-    assert!(start.elapsed() < Duration::from_secs(1));
-    lock.unlock().unwrap();
-    // Sibling tests share the process-wide ACTIVITY_STORE_LOCK, so a refresh may
-    // still be skipped briefly under the parallel test runner; recovery must
-    // happen once the in-process holder is gone.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if try_load_session_activity_states_at(&root).unwrap().is_some() {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "activity refresh never recovered");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    drop(lock);
-    fs::remove_dir_all(root).unwrap();
+/// Point read: unrelated sessions are never parsed or materialized.
+pub fn session_activity(id: &str) -> anyhow::Result<Option<SessionActivityState>> {
+    activity_repository(&runtime_dir()?.join("management-v2"))?.get(id)
 }
 
 fn activity_event(envelope: &EventEnvelope) -> Option<ActivityEvent> {
@@ -639,10 +962,16 @@ fn activity_event(envelope: &EventEnvelope) -> Option<ActivityEvent> {
             status: SafeToolCallStatus::Progress,
         }),
         "turn/started" => Some(ActivityEvent::TurnStarted),
-        "turn/completed" => Some(ActivityEvent::TurnCompleted {
-            interrupted: params.pointer("/turn/status").and_then(serde_json::Value::as_str)
-                == Some("interrupted"),
-        }),
+        "turn/completed" => {
+            let status = params.pointer("/turn/status").and_then(serde_json::Value::as_str);
+            Some(ActivityEvent::TurnCompleted {
+                interrupted: status == Some("interrupted"),
+                completed: status == Some("completed"),
+                failure: (status == Some("failed"))
+                    .then(|| params.get("turn").map(TurnFailure::from_turn))
+                    .flatten(),
+            })
+        }
         _ => None,
     }
 }
@@ -766,11 +1095,8 @@ fn forget_reverted_turns_at(root: &Path, id: &str, removed_turn_ids: &[&str]) ->
         return Ok(());
     }
     let removed = |turn: &Option<String>| turn.as_deref().is_none_or(|turn| removed_turn_ids.contains(&turn));
-    with_activity_store_lock(root, |path| {
-        let mut store = load_activity_store(path)?;
-        let Some(state) = store.sessions.get_mut(id) else {
-            return Ok(());
-        };
+    activity_repository(root)?.update(id, |_, row| {
+        let Some(state) = row.as_mut() else { return Ok(()); };
         let mut changed = false;
         if state.last_output.is_some() && removed(&state.last_output_turn_id) {
             (state.last_output, state.last_output_order, state.last_output_turn_id) = (None, None, None);
@@ -780,6 +1106,16 @@ fn forget_reverted_turns_at(root: &Path, id: &str, removed_turn_ids: &[&str]) ->
             (state.last_tool_call, state.last_tool_call_order, state.last_tool_call_turn_id) = (None, None, None);
             changed = true;
         }
+        // A failed turn the revert removed has nothing left to show.
+        if state
+            .last_turn_error
+            .as_ref()
+            .and_then(|error| error.turn_id.as_deref())
+            .is_some_and(|turn| removed_turn_ids.contains(&turn))
+        {
+            state.last_turn_error = None;
+            changed = true;
+        }
         if changed {
             state.revision = state
                 .revision
@@ -787,7 +1123,7 @@ fn forget_reverted_turns_at(root: &Path, id: &str, removed_turn_ids: &[&str]) ->
                 .filter(|revision| *revision <= MAX_SAFE_SEQUENCE)
                 .context("session activity revision exhausted")?;
             state.validate()?;
-            write_private_pretty_json_atomic(path, &store, "management v2 session activity")?;
+
         }
         Ok(())
     })
@@ -858,156 +1194,111 @@ fn update_activity_at(
     runtime_generation: u64,
     update: impl FnOnce(&mut SessionActivityState) -> anyhow::Result<bool>,
 ) -> anyhow::Result<()> {
+    update_activity_with_store_at(
+        root,
+        cutex_session_id,
+        runtime_generation,
+        |state| Ok((update(state)?, ())),
+        |_, ()| Ok((false, None::<()>)),
+    )
+    .map(|_| ())
+}
+
+/// As [`update_activity_at`]; `then` runs after the session's update in the
+/// same locked read-modify-write (store-level state such as the turn-error
+/// notice limit) and returns (changed, result). `None` when the event was
+/// fenced off (deleted session, older runtime generation).
+fn update_activity_with_store_at<U, T>(
+    root: &Path,
+    cutex_session_id: &str,
+    runtime_generation: u64,
+    update: impl FnOnce(&mut SessionActivityState) -> anyhow::Result<(bool, U)>,
+    then: impl FnOnce(&rusqlite::Connection, U) -> anyhow::Result<(bool, Option<T>)>,
+) -> anyhow::Result<Option<T>> {
     if cutex_session_id.is_empty() {
         anyhow::bail!("cutexSessionId must not be empty for session activity");
     }
-    with_activity_store_lock(root, |path| {
-        let mut store = load_activity_store(path)?;
-        if store.deleted_sessions.contains(cutex_session_id) {
-            return Ok(());
-        }
-        let state = store
-            .sessions
-            .entry(cutex_session_id.to_string())
-            .or_default();
+    activity_repository(root)?.update_then(cutex_session_id, |deleted, row| {
+        if deleted { return Ok(None); }
+        let state = row.get_or_insert_with(Default::default);
         if state
             .runtime_generation
             .is_some_and(|current| runtime_generation < current)
         {
-            return Ok(());
+            return Ok(None);
         }
         let generation_changed = state.runtime_generation != Some(runtime_generation);
         if generation_changed {
             state.runtime_generation = Some(runtime_generation);
         }
-        if update(state)? || generation_changed {
+        let (updated, carried) = update(state)?;
+        let state_changed = updated || generation_changed;
+        if state_changed {
             state.revision = state
                 .revision
                 .checked_add(1)
                 .filter(|revision| *revision <= MAX_SAFE_SEQUENCE)
                 .context("session activity revision exhausted")?;
             state.validate()?;
-            write_private_pretty_json_atomic(path, &store, "management v2 session activity")?;
+
         }
-        Ok(())
+        Ok(Some(carried))
+    }, |sql, carried| match carried {
+        Some(carried) => then(sql, carried).map(|(_, result)| result),
+        None => Ok(None),
     })
 }
 
 /// Remove a deleted session's rebuildable projection, never its history.
+#[cfg(test)]
+pub(crate) fn write_activity_test_row(root: &Path, id: &str, state: SessionActivityState) -> anyhow::Result<()> {
+    activity_repository(root)?.update(id, |deleted, row| {
+        anyhow::ensure!(!deleted, "test fixture cannot replace a deleted activity row");
+        *row = Some(state);
+        Ok(())
+    })
+}
+
 pub fn forget_deleted_session(cutex_session_id: &str) -> anyhow::Result<()> {
     forget_deleted_session_at(&runtime_dir()?.join("management-v2"), cutex_session_id)
 }
 
 fn forget_deleted_session_at(root: &Path, id: &str) -> anyhow::Result<()> {
-    with_activity_store_lock(root, |path| {
-        let mut store = load_activity_store(path)?;
-        let removed = store.sessions.remove(id).is_some();
-        if store.deleted_sessions.insert(id.to_string()) || removed {
-            write_private_pretty_json_atomic(path, &store, "management v2 session activity")?;
+    activity_repository(root)?.forget(id)
+}
+
+// Explicit complete selector listing. SQL transport is keyset/byte bounded;
+// point API and scheduler call sites use session_activity instead.
+#[cfg(test)]
+fn load_session_activity_states_at(root: &Path) -> anyhow::Result<HashMap<String, SessionActivityState>> {
+    let repo = activity_repository(root)?;
+    let mut result = HashMap::new();
+    let mut after = String::new();
+    loop {
+        let page = repo.page(&after, 200, 256 * 1024)?;
+        if page.is_empty() { break; }
+        for (id, row) in page {
+            after = id.clone();
+            if let Some(row) = row { result.insert(id, row); }
         }
-        Ok(())
-    })
-}
-
-fn load_session_activity_states_at(
-    root: &Path,
-) -> anyhow::Result<HashMap<String, SessionActivityState>> {
-    with_activity_store_lock(root, |path| Ok(load_activity_store(path)?.sessions))
-}
-
-fn with_activity_store_lock<T>(
-    root: &Path,
-    action: impl FnOnce(&Path) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    let _process_guard = ACTIVITY_STORE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| anyhow::anyhow!("management v2 session activity lock was poisoned"))?;
-    fs::create_dir_all(root)?;
-    secure_directory(root)?;
-    let lock_file = open_private_lock(&root.join(ACTIVITY_LOCK_FILE))?;
-    lock_file.lock()?;
-    let result = action(&root.join(ACTIVITY_STATE_FILE));
-    let unlock = lock_file.unlock();
-    if result.is_ok() {
-        unlock?;
     }
-    result
+    Ok(result)
 }
 
-fn load_activity_store(path: &Path) -> anyhow::Result<ActivityStore> {
-    let store = match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice::<ActivityStore>(&bytes).with_context(|| {
-            format!(
-                "Failed to parse management v2 session activity: {}",
-                path.display()
-            )
-        })?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ActivityStore::default(),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "Failed to read management v2 session activity: {}",
-                    path.display()
-                )
-            });
+#[cfg(test)]
+fn persisted_activity_json(root: &Path) -> Vec<u8> {
+    let repo = activity_repository(root).unwrap();
+    let mut store = ActivityStore::default();
+    let mut after = String::new();
+    loop {
+        let page = repo.page(&after,200,256*1024).unwrap();
+        if page.is_empty() {break;}
+        for (id,row) in page {
+            after=id.clone();
+            if let Some(row)=row {store.sessions.insert(id,row);} else {store.deleted_sessions.insert(id);}
         }
-    };
-    if store.version != activity_store_version() {
-        anyhow::bail!(
-            "unsupported management v2 session activity version: {}",
-            store.version
-        );
     }
-    for (cutex_session_id, state) in &store.sessions {
-        if cutex_session_id.is_empty() {
-            anyhow::bail!("session activity contains an empty cutexSessionId");
-        }
-        state
-            .validate()
-            .with_context(|| format!("invalid session activity for {cutex_session_id}"))?;
-    }
-    Ok(store)
-}
-
-fn open_private_lock(path: &Path) -> anyhow::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.mode(0o600);
-    }
-    let file = options.open(path)?;
-    secure_file(path)?;
-    Ok(file)
-}
-
-#[cfg(unix)]
-fn secure_directory(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn secure_directory(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn secure_file(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn secure_file(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
+    serde_json::to_vec(&store).unwrap()
 }
 
 #[cfg(test)]
@@ -1068,11 +1359,11 @@ mod tests {
             native: Some(NativeMessage {kind:NativeMessageKind::Notification,message:json!({"method":"item/agentMessage/delta","params":{"delta":"汉🙂"}})}),cutex:None,
         };
         recorder.record_live_at(&root, &pending, "2026-10-25T00:00:00.000Z").unwrap();
-        let first = fs::read(root.join(ACTIVITY_STATE_FILE)).unwrap();
+        let first = persisted_activity_json(&root);
         for millis in 1..1000 {
             recorder.record_live_at(&root, &pending, &format!("2026-10-25T00:00:00.{millis:03}Z")).unwrap();
         }
-        assert_eq!(fs::read(root.join(ACTIVITY_STATE_FILE)).unwrap(), first,
+        assert_eq!(persisted_activity_json(&root), first,
             "999 live fragments must not cause 999 durable writes");
         recorder.record_at(&root, &envelope("2026-10-25T00:00:01.100Z", "item/completed",
             json!({"threadId":"thread-1","item":{"id":"m","type":"agentMessage","text":"full 汉🙂"}}))).unwrap();
@@ -1080,11 +1371,11 @@ mod tests {
         assert_eq!(state.last_output_at.as_deref(), Some("2026-10-25T00:00:00.999Z"));
         assert_eq!(state.last_output_completed_at.as_deref(), Some("2026-10-25T00:00:01.100Z"));
         assert!(state.last_output.is_some(), "only the durable completion creates a preview");
-        let after_final = fs::read(root.join(ACTIVITY_STATE_FILE)).unwrap();
+        let after_final = persisted_activity_json(&root);
         let mut reasoning = pending;
         reasoning.native.as_mut().unwrap().message["method"] = json!("item/reasoning/textDelta");
         recorder.record_live_at(&root, &reasoning, "2026-10-25T00:00:10Z").unwrap();
-        assert_eq!(fs::read(root.join(ACTIVITY_STATE_FILE)).unwrap(), after_final);
+        assert_eq!(persisted_activity_json(&root), after_final);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1139,9 +1430,7 @@ mod tests {
             json!({"id": "m3", "type": "agentMessage", "text": "new answer"}))).unwrap();
         assert_eq!(state(&root).last_output.unwrap().display_text, "new answer");
         // A preview of an unknown turn (older store) is cleared by any revert.
-        let mut store = load_activity_store(&root.join(ACTIVITY_STATE_FILE)).unwrap();
-        store.sessions.get_mut("cutex.session-a").unwrap().last_tool_call_turn_id = None;
-        with_activity_store_lock(&root, |path| write_private_pretty_json_atomic(path, &store, "test")).unwrap();
+        activity_repository(&root).unwrap().update("cutex.session-a", |_, row| {row.as_mut().unwrap().last_tool_call_turn_id = None; Ok(())}).unwrap();
         forget_reverted_turns_at(&root, "cutex.session-a", &["turn-7"]).unwrap();
         let last = state(&root);
         assert!(last.last_tool_call.is_none());
@@ -1157,7 +1446,7 @@ mod tests {
         let mut store = ActivityStore::default();
         store.sessions.insert("gone".into(), SessionActivityState::default());
         store.sessions.insert("keep".into(), SessionActivityState::default());
-        with_activity_store_lock(&root, |path| write_private_pretty_json_atomic(path, &store, "test")).unwrap();
+        write_private_pretty_json_atomic(&root.join(ACTIVITY_STATE_FILE), &store, "test").unwrap();
         forget_deleted_session_at(&root, "gone").unwrap();
         let loaded = load_session_activity_states_at(&root).unwrap();
         assert!(!loaded.contains_key("gone"));
@@ -1239,7 +1528,7 @@ mod tests {
         }
         let resource = state(&root);
         assert_eq!(resource.last_conversation_at.as_deref(), Some("2026-10-18T04:00:05Z"));
-        let persisted = fs::read_to_string(root.join(ACTIVITY_STATE_FILE)).expect("read store");
+        let persisted = String::from_utf8(persisted_activity_json(&root)).unwrap();
         assert!(persisted.contains("lastConversationAt") && persisted.contains("lastTurnStartedAt"));
         fs::remove_dir_all(root).expect("remove test root");
     }
@@ -1324,7 +1613,7 @@ mod tests {
             )
             .expect("record after loading an r218 store");
         let persisted =
-            fs::read_to_string(root.join(ACTIVITY_STATE_FILE)).expect("read rewritten store");
+            String::from_utf8(persisted_activity_json(&root)).unwrap();
         assert!(persisted.contains("lastTurnCompletedAt"));
         assert!(!persisted.contains("taskTurnBindings"));
         fs::remove_dir_all(root).expect("remove test root");
@@ -1414,7 +1703,7 @@ mod tests {
         assert!(first
             .expect_err("unsupported state must fail")
             .to_string()
-            .contains("unsupported management v2 session activity version"));
+            .contains("unsupported session store version"));
 
         fs::remove_file(root.join(ACTIVITY_STATE_FILE)).expect("remove invalid state");
         recorder
@@ -1635,7 +1924,7 @@ mod tests {
         assert_eq!(tool.association, ObservationAssociation::session("cutex.session-a"));
 
         let persisted = String::from_utf8(
-            fs::read(root.join(ACTIVITY_STATE_FILE)).expect("read activity projection"),
+            persisted_activity_json(&root),
         )
         .expect("utf8 projection");
         for forbidden in [
@@ -1902,7 +2191,7 @@ mod tests {
             .expect("record activity");
 
         let value: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join(ACTIVITY_STATE_FILE)).expect("read activity state"),
+            &persisted_activity_json(&root),
         )
         .expect("parse activity state");
         assert_eq!(
@@ -1921,6 +2210,121 @@ mod tests {
             }))
         );
         fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    fn turn_end(at: &str, turn: &str, status: &str, error: serde_json::Value) -> EventEnvelope {
+        envelope(at, "turn/completed", json!({"threadId": "t", "turn": {"id": turn, "status": status, "error": error}}))
+    }
+
+    const REUSED: &str = "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.";
+
+    #[test]
+    fn turn_error_codes_are_classified() {
+        let none = serde_json::Value::Null;
+        assert_eq!(classify_turn_error(REUSED, &json!("unauthorized"), &none), "refresh_token_reused");
+        assert_eq!(classify_turn_error("REFRESH TOKEN WAS ALREADY USED", &none, &none), "refresh_token_reused");
+        assert_eq!(classify_turn_error("x", &json!("other"), &json!({"code": "refresh_token_reused"})), "refresh_token_reused");
+        assert_eq!(classify_turn_error("x", &json!({"refresh_token_reused": {}}), &none), "refresh_token_reused");
+        assert_eq!(classify_turn_error("x", &json!("unauthorized"), &none), "unauthorized");
+        assert_eq!(
+            classify_turn_error("unexpected status 401 Unauthorized: …", &json!({"httpConnectionFailed": {"httpStatusCode": 401}}), &none),
+            "unauthorized"
+        );
+        assert_eq!(classify_turn_error("x", &json!({"httpConnectionFailed": {"httpStatusCode": 502}}), &none), "httpConnectionFailed");
+        assert_eq!(classify_turn_error("x", &json!("usageLimitExceeded"), &none), "usageLimitExceeded");
+        assert_eq!(classify_turn_error("x", &json!({"a": 1, "b": 2}), &none), "other");
+        assert_eq!(classify_turn_error("x", &none, &none), "other");
+        assert_eq!(classify_turn_error("x", &json!(""), &none), "other");
+        assert!(is_unauthorized_code("unauthorized") && is_unauthorized_code("refresh_token_reused"));
+        assert!(!is_unauthorized_code("other"));
+        // Message bounded; an oversized info keeps its code.
+        let failure = TurnFailure::from_turn(&json!({"id": "t1", "status": "failed",
+            "error": {"message": "m".repeat(5000), "codexErrorInfo": {"big": "x".repeat(5000)}}}));
+        assert_eq!(failure.message.chars().count(), TURN_ERROR_MESSAGE_CHARS);
+        assert_eq!((failure.code.as_str(), failure.codex_error_info.clone()), ("big", json!("big")));
+    }
+
+    #[test]
+    fn last_turn_error_sets_counts_survives_interrupt_clears_on_completion_and_persists() {
+        let root = test_root("turn-error");
+        let recorder = ActivityRecorder::new(Duration::ZERO);
+        let load = |root: &Path| load_session_activity_states_at(root).unwrap().remove("cutex.session-a").unwrap();
+        let reused = json!({"message": REUSED, "codexErrorInfo": "unauthorized", "additionalDetails": null});
+        recorder.record_at_for(&root, &turn_end("2026-11-04T05:27:25.123Z", "turn-1", "failed", reused.clone()), Some("acct-1"), Some("work")).unwrap();
+        let error = load(&root).last_turn_error.expect("failed turn recorded");
+        assert_eq!(error.resource(), json!({"turnId": "turn-1", "message": REUSED, "code": "refresh_token_reused",
+            "codexErrorInfo": "unauthorized", "at": "2026-11-04T05:27:25.123Z", "consecutive": 1}));
+        assert_eq!((error.profile_id.as_deref(), error.profile_name.as_deref()), (Some("acct-1"), Some("work")));
+        // The same turn reported again keeps its count.
+        recorder.record_at(&root, &turn_end("2026-11-04T05:27:26Z", "turn-1", "failed", reused.clone())).unwrap();
+        assert_eq!(load(&root).last_turn_error, Some(error), "a redelivery keeps count, time and profile");
+        let http = json!({"message": "unexpected status 401 Unauthorized: …", "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}}});
+        recorder.record_at(&root, &turn_end("2026-11-04T05:30:00Z", "turn-2", "failed", http)).unwrap();
+        let error = load(&root).last_turn_error.unwrap();
+        assert_eq!((error.turn_id.as_deref(), error.code.as_str(), error.consecutive), (Some("turn-2"), "unauthorized", 2));
+        assert_eq!(error.codex_error_info, json!({"httpConnectionFailed": {"httpStatusCode": 401}}));
+        // Interrupted leaves it; a stale older end cannot move it.
+        recorder.record_at(&root, &turn_end("2026-11-04T05:31:00Z", "turn-3", "interrupted", serde_json::Value::Null)).unwrap();
+        recorder.record_at(&root, &turn_end("2026-11-04T05:00:00Z", "turn-0", "completed", serde_json::Value::Null)).unwrap();
+        let kept = load(&root).last_turn_error.unwrap();
+        assert_eq!((kept.turn_id.as_deref(), kept.consecutive), (Some("turn-2"), 2));
+        // Persisted with the activity state: a fresh reader (restart) sees it.
+        let persisted: serde_json::Value = serde_json::from_slice(&persisted_activity_json(&root)).unwrap();
+        assert_eq!(persisted.pointer("/sessions/cutex.session-a/lastTurnError/code"), Some(&json!("unauthorized")));
+        assert_eq!(persisted.pointer("/sessions/cutex.session-a/lastTurnError/consecutive"), Some(&json!(2)));
+        let restarted = ActivityRecorder::new(Duration::ZERO);
+        // Any other code counts on; a completed turn clears.
+        restarted.record_at(&root, &turn_end("2026-11-04T05:32:00Z", "turn-4", "failed",
+            json!({"message": "boom", "codexErrorInfo": "other"}))).unwrap();
+        assert_eq!(load(&root).last_turn_error.unwrap().consecutive, 3);
+        restarted.record_at(&root, &turn_end("2026-11-04T05:33:00Z", "turn-5", "completed", serde_json::Value::Null)).unwrap();
+        assert!(load(&root).last_turn_error.is_none());
+        let persisted = String::from_utf8(persisted_activity_json(&root)).unwrap();
+        assert!(!persisted.contains("lastTurnError"), "cleared, not kept: {persisted}");
+        restarted.record_at(&root, &turn_end("2026-11-04T05:34:00Z", "turn-6", "failed",
+            json!({"message": "again", "codexErrorInfo": "serverOverloaded"}))).unwrap();
+        assert_eq!(load(&root).last_turn_error.unwrap().consecutive, 1, "counting restarts after a completed turn");
+        // A revert that removed the failed turn clears it.
+        forget_reverted_turns_at(&root, "cutex.session-a", &["turn-6"]).unwrap();
+        assert!(load(&root).last_turn_error.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unauthorized_notices_are_limited_per_profile_per_rolling_hour() {
+        let root = test_root("turn-error-notice");
+        let recorder = ActivityRecorder::new(Duration::ZERO);
+        let unauthorized = json!({"message": "unexpected status 401", "codexErrorInfo": "unauthorized"});
+        let fail = |session: &str, at: &str, turn: &str, error: &serde_json::Value, profile: &str| {
+            let mut event = turn_end(at, turn, "failed", error.clone());
+            event.cutex_session_id = session.to_string();
+            recorder.record_at_for(&root, &event, Some(profile), Some(&format!("name-{profile}"))).unwrap()
+        };
+        let first = fail("cutex.a", "2026-11-04T05:00:00Z", "a1", &unauthorized, "p1").expect("first failure notifies");
+        assert_eq!((first.cutex_session_id.as_str(), first.turn_id.as_deref(), first.affected_sessions), ("cutex.a", Some("a1"), 1));
+        assert!(first.text().contains("配置「name-p1」") && first.text().contains("1 个会话"), "{}", first.text());
+        assert!(first.text().contains("重新登录"));
+        // Within the hour: a second failure on the profile (another session) is limited.
+        assert!(fail("cutex.b", "2026-11-04T05:20:00Z", "b1", &json!({"message": REUSED}), "p1").is_none());
+        // Other codes never notify; another profile has its own hour.
+        assert!(fail("cutex.c", "2026-11-04T05:21:00Z", "c1", &json!({"message": "x", "codexErrorInfo": "other"}), "p2").is_none());
+        let other = fail("cutex.d", "2026-11-04T05:22:00Z", "d1", &json!({"message": REUSED}), "p2").expect("per profile");
+        assert_eq!(other.affected_sessions, 1);
+        assert!(other.text().contains("并发刷新冲突") && other.text().contains("自动重试"), "{}", other.text());
+        // After the hour: another notice, counting both sessions of p1.
+        assert!(fail("cutex.a", "2026-11-04T05:59:59.999999999Z", "a2", &unauthorized, "p1").is_none());
+        let later = fail("cutex.a", "2026-11-04T06:00:00Z", "a3", &unauthorized, "p1").expect("rolling hour passed");
+        assert_eq!((later.affected_sessions, later.consecutive), (2, 3));
+        // The limit is persisted: a restarted recorder still honours it.
+        let restarted = ActivityRecorder::new(Duration::ZERO);
+        let mut event = turn_end("2026-11-04T06:10:00Z", "b2", "failed", unauthorized.clone());
+        event.cutex_session_id = "cutex.b".into();
+        assert!(restarted.record_at_for(&root, &event, Some("p1"), None).unwrap().is_none());
+        let db = rusqlite::Connection::open(root.join("session-activity.sqlite3")).unwrap();
+        let count: i64 = db.query_row("SELECT count(*) FROM turn_error_notices", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 2);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

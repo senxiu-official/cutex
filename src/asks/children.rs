@@ -41,6 +41,7 @@ pub struct AgentFacts {
     /// and which still matches it
     /// (`agent_management::reviewed_relaunch_receipt`).
     pub reviewed_relaunch: bool,
+    pub managed_online_by: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -57,8 +58,8 @@ pub struct Provenance {
     pub lifecycle_manager: String,
     /// `member` | `child` | `independent` | `quickChat`.
     pub kind: &'static str,
-    /// Offline explicit-launch agent: only the owner can start it (a live
-    /// binding is reconnected instead). Not part of the API body.
+    /// Offline explicit-launch agent: needs a reviewed relaunch or typed
+    /// managed Online (a live binding is reconnected instead). Internal only.
     #[serde(skip)]
     pub owner_start_required: bool,
     /// With `owner_start_required`: its creator or its project's Director
@@ -66,6 +67,9 @@ pub struct Provenance {
     /// (`asks::wake::decide`). Not part of the API body.
     #[serde(skip)]
     pub reviewed_relaunch: bool,
+    /// Current typed Online authority, not a historical creator grant.
+    #[serde(skip)]
+    pub managed_online_by: Vec<String>,
     /// The authorized Director of its project. Not part of the API body.
     #[serde(skip)]
     pub director: bool,
@@ -146,6 +150,7 @@ pub fn provenance(agents: &[AgentFacts]) -> BTreeMap<String, Provenance> {
                 kind,
                 owner_start_required: agent.explicit_launch && !agent.binding_live,
                 reviewed_relaunch: agent.explicit_launch && !agent.binding_live && agent.reviewed_relaunch,
+                managed_online_by: agent.managed_online_by.clone(),
                 director: agent.director,
             },
         );
@@ -196,7 +201,7 @@ pub fn check_child_limits(agents: &[AgentFacts], creator: &str, limits: &AskLimi
 
 /// Facts of every agent on this host (session store + Agent Management).
 pub fn load_facts() -> anyhow::Result<Vec<AgentFacts>> {
-    let snapshot = crate::memory::load_agent_management_snapshot().ok();
+    let snapshot = crate::memory::load_agent_management_directory().ok();
     let mut creator_of = BTreeMap::new();
     let mut project_of = BTreeMap::new();
     let mut directors = std::collections::BTreeSet::new();
@@ -240,6 +245,17 @@ pub fn load_facts() -> anyhow::Result<Vec<AgentFacts>> {
                     reviewed_relaunch: explicit_launch
                         && !binding_live
                         && crate::agent_management::reviewed_relaunch_receipt(sessions, record).is_some(),
+                    managed_online_by: snapshot.as_ref().map(|snapshot| {
+                        let Some(project) = project_of.get(&record.cutex_session_id) else { return Vec::new() };
+                        let candidates = snapshot.projects.values()
+                            .filter(|p| p.project_id.as_str() == project)
+                            .map(|p| p.authorized_director_session.as_str())
+                            .chain(snapshot.operator_grants.iter()
+                                .filter(|(id, _)| id.as_str() == project)
+                                .flat_map(|(_, grants)| grants.keys().map(|id| id.as_str())));
+                        candidates.filter(|caller| crate::agent_management::can_online_managed(
+                            snapshot, caller, &record.cutex_session_id)).map(str::to_string).collect()
+                    }).unwrap_or_default(),
                 }
             })
             .collect()

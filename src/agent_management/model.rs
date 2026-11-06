@@ -283,12 +283,19 @@ pub enum AgentOperation {
     QueryManaged,
     Online {
         cutex_session_id: CutexSessionId,
+        /// r274.1 (additive): start even when the agent's model is not on
+        /// the profile's model list (`profiles::model_check`); checked by
+        /// the Agent Bus for MCP callers. Absent from the wire when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_unlisted: bool,
     },
     Offline {
         cutex_session_id: CutexSessionId,
     },
     Restart {
         cutex_session_id: CutexSessionId,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_unlisted: bool,
     },
     /// Legacy wire name: reversible soft archive since r264. Permanent
     /// retirement is a separate owner-only request, never an AgentOperation.
@@ -329,6 +336,11 @@ pub enum AgentOperation {
 }
 
 impl AgentOperation {
+    /// `allow_unlisted` of an online / restart (false for other operations).
+    pub fn allow_unlisted(&self) -> bool {
+        matches!(self, Self::Online { allow_unlisted: true, .. } | Self::Restart { allow_unlisted: true, .. })
+    }
+
     pub fn bootstrap_intent(&self) -> Option<&AgentActionId> {
         match self {
             Self::Create {
@@ -423,7 +435,8 @@ impl<'de> Deserialize<'de> for AgentManagementRequest {
         let operation_fields: &[&str] = match operation {
             "create" => &["spec", "start_mode", "frozen_message", "bootstrap_intent"],
             "query_managed" => &[],
-            "online" | "offline" | "restart" | "close" => &["cutex_session_id"],
+            "online" | "restart" => &["cutex_session_id", "allow_unlisted"],
+            "offline" | "close" => &["cutex_session_id"],
             "replace" => &[
                 "bootstrap_intent",
                 "predecessor_cutex_session_id",
@@ -1081,6 +1094,8 @@ pub enum AgentManagementError {
     /// A conflict with an actionable detail. The detail starts with a stable
     /// reason token (for example `unresolved_agent_reservation`).
     ConflictDetail(String),
+    /// A pre-effect name refusal with stable owner-client details.
+    NameConflict(crate::agent_names::NameError),
     OwnerActionRequired(String),
     PersistenceUnavailable,
     InvalidStore,
@@ -1090,6 +1105,10 @@ pub enum AgentManagementError {
     ReconciliationUnavailable(String),
     /// The operation or tool was removed (wire code `tool_removed`).
     Removed(&'static str),
+    /// r271: the host authority fence was busy and the caller may not wait
+    /// for it (it holds a session lane). Nothing happened; retry shortly.
+    /// Wire code `admission_busy`, `details.reason: hostBusy` (design 050 §5).
+    HostBusy(String),
 }
 
 /// r219: refusal detail for a new `director_rotate` request (wire code
@@ -1117,6 +1136,7 @@ impl AgentManagementError {
             Self::ProjectNotAuthorized => "project_not_authorized",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) | Self::ConflictDetail(_) => "conflict",
+            Self::NameConflict(error) => error.code,
             Self::OwnerActionRequired(_) => "owner_action_required",
             Self::PersistenceUnavailable => "persistence_unavailable",
             Self::InvalidStore => "invalid_store",
@@ -1125,6 +1145,7 @@ impl AgentManagementError {
             Self::ReconciliationAmbiguous(_) => "reservation_evidence_ambiguous",
             Self::ReconciliationUnavailable(_) => "reservation_evidence_unavailable",
             Self::Removed(_) => "tool_removed",
+            Self::HostBusy(_) => crate::asks::pause_admission::ADMISSION_BUSY_CODE,
         }
     }
 
@@ -1140,6 +1161,7 @@ impl AgentManagementError {
     pub fn wire(&self) -> (String, String) {
         let class = self.code();
         match self {
+            Self::NameConflict(error) => (error.code.to_string(), error.message.clone()),
             Self::InvalidRequest(reason) | Self::NotFound(reason) | Self::Conflict(reason)
                 if is_reason_token(reason) =>
             {
@@ -1161,7 +1183,8 @@ impl AgentManagementError {
             | Self::External(reason)
             | Self::ReconciliationPresent(reason)
             | Self::ReconciliationAmbiguous(reason)
-            | Self::ReconciliationUnavailable(reason) => (class.to_string(), reason.clone()),
+            | Self::ReconciliationUnavailable(reason)
+            | Self::HostBusy(reason) => (class.to_string(), reason.clone()),
             _ => (class.to_string(), class.to_string()),
         }
     }
@@ -1179,6 +1202,7 @@ fn is_reason_token(value: &str) -> bool {
 impl fmt::Display for AgentManagementError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NameConflict(error) => fmt::Display::fmt(error, formatter),
             Self::InvalidRequest(reason)
             | Self::NotFound(reason)
             | Self::Conflict(reason)
@@ -1191,7 +1215,8 @@ impl fmt::Display for AgentManagementError {
             | Self::External(reason)
             | Self::ReconciliationPresent(reason)
             | Self::ReconciliationAmbiguous(reason)
-            | Self::ReconciliationUnavailable(reason) => {
+            | Self::ReconciliationUnavailable(reason)
+            | Self::HostBusy(reason) => {
                 write!(formatter, "{}: {reason}", self.code())
             }
             _ => formatter.write_str(self.code()),

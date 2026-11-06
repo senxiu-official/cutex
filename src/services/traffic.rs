@@ -14,6 +14,13 @@ struct Entry {
     persisted: Option<Instant>,
 }
 static TRAFFIC: OnceLock<Mutex<BTreeMap<String, Entry>>> = OnceLock::new();
+static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(super) fn revision() -> u64 {
+    REVISION.load(std::sync::atomic::Ordering::SeqCst)
+}
+fn changed() {
+    REVISION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
 fn entries() -> &'static Mutex<BTreeMap<String, Entry>> {
     TRAFFIC.get_or_init(Mutex::default)
 }
@@ -49,6 +56,7 @@ pub fn current_traffic(record: &super::store::ServiceRecord, at: Option<String>)
 /// decrements (saturating) when it closes.
 pub fn forget(slug: &str) {
     entries().lock().unwrap().remove(slug);
+    changed();
 }
 pub fn touch(slug: &str) {
     entries()
@@ -58,6 +66,7 @@ pub fn touch(slug: &str) {
         .or_default()
         .snapshot
         .last_traffic_at = Some(super::store::now_rfc3339());
+    changed();
 }
 pub struct ConnectionGuard(String);
 pub fn begin(slug: &str) -> ConnectionGuard {
@@ -65,12 +74,14 @@ pub fn begin(slug: &str) -> ConnectionGuard {
     let entry = entries.entry(slug.into()).or_default();
     entry.snapshot.active_connections += 1;
     entry.snapshot.last_traffic_at = Some(super::store::now_rfc3339());
+    changed();
     ConnectionGuard(slug.into())
 }
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         if let Some(entry) = entries().lock().unwrap().get_mut(&self.0) {
             entry.snapshot.active_connections = entry.snapshot.active_connections.saturating_sub(1);
+            changed();
         }
     }
 }

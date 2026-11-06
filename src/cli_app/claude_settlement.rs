@@ -5,18 +5,24 @@ use chrono::Utc;
 use cutex::app_server::external_input::{
     Delivery, DeliveryState, Envelope, ProcessingState, Response, SourceKind,
 };
-use cutex::management::v2::agent_bus_settlement_model::{Evidence, Observation};
+use cutex::management::v2::agent_bus_settlement_model::{Evidence, Observation, StaleAckEvidence};
 use cutex::management::v2::agent_bus_state::AgentBusMessageSnapshot;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
 const MAX_PAGES: usize = 16;
-const OBSERVATION_BUDGET: Duration = Duration::from_secs(15);
+pub(super) const OBSERVATION_BUDGET: Duration = Duration::from_secs(15);
+
+// r35 confirms per-message native context attachments before terminal output; its external
+// input payload, attempt UUID and terminal-history receipt contracts remain unchanged.
+fn audited_adapter_version(version: &Value) -> bool {
+    matches!(version.as_str(), Some("0.8.5" | "0.8.6" | "0.8.7" | "0.8.8"))
+}
 
 #[path = "claude_settlement_background.rs"]
 mod background;
-pub(super) use background::BackgroundObservations;
+pub(super) use background::{BackgroundObservations, ObservationWorker};
 
 /// Background work follows the same static advertisement as /v2/capabilities.
 /// Explicit owner collect keeps its independent full-proof path below.
@@ -97,17 +103,12 @@ pub(super) fn runtime_fence(evidence: &Evidence) -> anyhow::Result<bool> {
     let manager = super::MANAGER
         .get()
         .context("Claude settlement observer unavailable")?;
-    let sessions = cutex::session::store::load_cutex_session_store_shared()?;
-    let Some(record) = sessions.sessions.get(&evidence.recipient_id) else {
+    let Some(record) = cutex::asks::receipt_uncertainty::read_context::current_observer(&evidence.recipient_id)? else {
         return Ok(false);
     };
     if record.cutex_session_id != evidence.recipient_id
-        || record.runtime_backend
-            != cutex::session::model::CutexSessionRuntimeBackend::ClaudeSubscription
-        || record.is_retired()
-        || record.current_runtime_agent_id.is_none()
         || record.runtime_generation != evidence.observer_generation()
-        || record.app_server_thread_id() != Some(evidence.thread_id.as_str())
+        || record.thread_id != evidence.thread_id
     {
         return Ok(false);
     }
@@ -140,7 +141,9 @@ fn collect_connected(
     let Some(envelope) = snapshot.external_input.as_ref() else {
         return Ok(Observation::Ineligible);
     };
-    if !eligible(snapshot, envelope) {
+    let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
+    let stale = repository.stale_ack_candidate(&snapshot.message_id, Utc::now())?;
+    if !eligible(snapshot, envelope) && stale.is_none() {
         return Ok(Observation::Ineligible);
     }
     // Deliberately do not call manager(), observe(), ensure(), or capability
@@ -188,7 +191,11 @@ fn collect_connected(
             .snapshot_by_message_id(&snapshot.message_id)?
             .ok_or(Ineligible("message disappeared"))?;
         eligible_ensure!(
-            eligible(&current, envelope) && current.external_input.as_ref() == Some(envelope),
+            (eligible(&current, envelope)
+                || repository
+                    .stale_ack_candidate(&snapshot.message_id, Utc::now())?
+                    .is_some())
+                && current.external_input.as_ref() == Some(envelope),
             "message identity or receipt changed"
         );
         remaining(deadline)?;
@@ -196,15 +203,17 @@ fn collect_connected(
     };
     fence()?;
     let handle = existing_handle(manager, &query_envelope)?;
-    collect_read_binding_with_deadline(
+    collect_read_binding_with_deadline_qualified(
         envelope,
         observing_generation,
         |method, params, timeout| Ok(handle.request_with_timeout(method, params, timeout)?),
         fence,
         deadline,
+        stale,
     )
 }
 
+#[cfg(test)]
 fn collect_read_binding(
     frozen: &Envelope,
     observing_generation: u64,
@@ -221,16 +230,35 @@ fn collect_read_binding(
     )
 }
 
+#[cfg(test)]
 fn collect_read_binding_with_deadline(
+    frozen: &Envelope,
+    observing_generation: u64,
+    request: impl FnMut(&str, Value, Duration) -> anyhow::Result<Value>,
+    fence: impl FnMut() -> anyhow::Result<()>,
+    deadline: Instant,
+) -> anyhow::Result<Observation> {
+    collect_read_binding_with_deadline_qualified(
+        frozen,
+        observing_generation,
+        request,
+        fence,
+        deadline,
+        None,
+    )
+}
+
+fn collect_read_binding_with_deadline_qualified(
     frozen: &Envelope,
     observing_generation: u64,
     mut request: impl FnMut(&str, Value, Duration) -> anyhow::Result<Value>,
     fence: impl FnMut() -> anyhow::Result<()>,
     deadline: Instant,
+    stale: Option<StaleAckEvidence>,
 ) -> anyhow::Result<Observation> {
     let mut query = frozen.clone();
     query.runtime_generation = observing_generation;
-    let mut observation = collect_with_deadline(
+    let mut observation = collect_with_deadline_qualified(
         &query,
         |method, params| {
             request(
@@ -241,6 +269,7 @@ fn collect_read_binding_with_deadline(
         },
         fence,
         deadline,
+        stale,
     )?;
     if let Observation::Terminal(evidence) = &mut observation {
         evidence.runtime_generation = frozen.runtime_generation;
@@ -281,6 +310,9 @@ fn local_digest(envelope: &Envelope) -> anyhow::Result<String> {
     if envelope.message.delivery == Delivery::Soon {
         metadata["deliveryMode"] = json!("soon");
     }
+    if envelope.message.delivery == Delivery::Passive {
+        metadata["deliveryMode"] = json!("passive");
+    }
     let mut payload = json!({"source":envelope.message.source, "eventType":envelope.message.event_type,
         "text":envelope.message.text, "metadata":metadata});
     if let Some(view) = &envelope.view {
@@ -306,6 +338,7 @@ fn attempt_id(thread: &str, turn: &str) -> String {
 fn native(
     request: &mut impl FnMut(&str, Value) -> anyhow::Result<Value>,
     e: &Envelope,
+    stale: bool,
 ) -> anyhow::Result<Value> {
     let raw = request(
         "thread/externalInput/status",
@@ -352,11 +385,22 @@ fn native(
     eligible_ensure!(
         status.delivery_state == DeliveryState::Pending
             && status.receipt.is_none()
-            && matches!(
+            && (matches!(
                 status.processing.state,
                 ProcessingState::Held | ProcessingState::OutputObserved
-            )
-            && status.processing.attempt_id.is_some(),
+            ) || (stale
+                && matches!(
+                    status.processing.state,
+                    ProcessingState::Claimed | ProcessingState::Pending
+                ))
+                || (stale
+                    && e.message.delivery == Delivery::Passive
+                    && status.processing.state == ProcessingState::None))
+            && (status.processing.attempt_id.is_some()
+                || (stale
+                    && (status.processing.state == ProcessingState::Pending
+                        || (e.message.delivery == Delivery::Passive
+                            && status.processing.state == ProcessingState::None)))),
         "no eligible native attempt"
     );
     Ok(raw)
@@ -366,6 +410,7 @@ fn local(
     request: &mut impl FnMut(&str, Value) -> anyhow::Result<Value>,
     e: &Envelope,
     digest: &str,
+    stale: bool,
 ) -> anyhow::Result<Value> {
     let raw = request(
         "claude/input/status",
@@ -400,10 +445,21 @@ fn local(
             && raw["durable"] == true
             && raw["receiptScope"] == "local-inbox"
             && raw["contextPersisted"] != true
-            && matches!(
+            && (matches!(
                 raw["state"].as_str(),
                 Some("completed" | "failed" | "interrupted")
-            ),
+            ) || (stale
+                && matches!(
+                    raw["state"].as_str(),
+                    Some(
+                        "queued"
+                            | "pending"
+                            | "processing"
+                            | "injecting"
+                            | "injected"
+                            | "uncertain"
+                    )
+                ))),
         "ineligible local inbox state/identity"
     );
     Ok(raw)
@@ -487,6 +543,7 @@ fn history(
     request: &mut impl FnMut(&str, Value) -> anyhow::Result<Value>,
     e: &Envelope,
     actual: &str,
+    mut stale: Option<&mut StaleAckEvidence>,
 ) -> anyhow::Result<Value> {
     let read = request(
         "thread/read",
@@ -499,10 +556,11 @@ fn history(
         "history thread identity changed"
     );
     ensure!(
-        thread["modelProvider"] == "cute-claude" && thread["cliVersion"] == "0.8.5",
+        thread["modelProvider"] == "cute-claude" && audited_adapter_version(&thread["cliVersion"]),
         "unsupported history provider/version"
     );
     let mut turn = None;
+    let mut later = None;
     // Never materialize the bounded full transcript for each stuck message.
     // Turn pages carry metadata only; item pages are scoped to the actual turn.
     pages(
@@ -517,11 +575,61 @@ fn history(
             if candidate["id"] == actual {
                 eligible_ensure!(turn.is_none(), "duplicate actual turn");
                 turn = Some(candidate.clone());
-                return Ok(true);
             }
-            Ok(false)
+            if let Some(context) = stale.as_ref() {
+                let queued = context.accepted_at.timestamp_millis() as f64 / 1000.0;
+                if candidate["id"] != actual
+                    && candidate["status"] == "completed"
+                    && candidate["reverted"] != true
+                    && candidate["startedAt"]
+                        .as_f64()
+                        .is_some_and(|start| start > queued)
+                    && candidate["completedAt"]
+                        .as_f64()
+                        .zip(candidate["startedAt"].as_f64())
+                        .is_some_and(|(end, start)| {
+                            end >= start && end <= Utc::now().timestamp_millis() as f64 / 1000.0
+                        })
+                {
+                    // Prefer a deterministic witness within this bounded page rather than always
+                    // changing the evidence to the newest completed turn.
+                    if later
+                        .as_ref()
+                        .is_none_or(|old: &Value| candidate["id"].as_str() < old["id"].as_str())
+                    {
+                        later = Some(
+                            json!({"id":candidate["id"],"startedAt":candidate["startedAt"],"completedAt":candidate["completedAt"]}),
+                        );
+                    }
+                }
+            }
+            Ok(later.is_some()
+                || turn.as_ref().is_some_and(|turn| {
+                    stale.is_none()
+                        || matches!(
+                            turn["status"].as_str(),
+                            Some("completed" | "failed" | "interrupted")
+                        )
+                }))
         },
     )?;
+    if let (Some(context), Some(later)) = (stale.as_mut(), later) {
+        context.later_completed_turn_id = later["id"].as_str().map(str::to_owned);
+        let status = turn
+            .as_ref()
+            .filter(|turn| turn["reverted"] != true)
+            .and_then(|turn| turn["status"].as_str())
+            .filter(|status| {
+                matches!(
+                    *status,
+                    "completed" | "failed" | "interrupted" | "inProgress"
+                )
+            })
+            .unwrap_or("unknown");
+        // This proves only that the same thread moved on after durable acceptance. Old Continue
+        // paths may have no projected input item at all; do not manufacture a context receipt.
+        return Ok(json!({"id":actual,"status":status,"laterCompletedTurn":later}));
+    }
     let turn = turn.ok_or(Ineligible("actual turn absent/reverted"))?;
     eligible_ensure!(
         matches!(
@@ -553,6 +661,7 @@ fn history(
     )
 }
 
+#[cfg(test)]
 fn collect_with(
     e: &Envelope,
     mut request: impl FnMut(&str, Value) -> anyhow::Result<Value>,
@@ -561,11 +670,22 @@ fn collect_with(
     collect_with_deadline(e, &mut request, fence, Instant::now() + OBSERVATION_BUDGET)
 }
 
+#[cfg(test)]
 fn collect_with_deadline(
+    e: &Envelope,
+    request: impl FnMut(&str, Value) -> anyhow::Result<Value>,
+    fence: impl FnMut() -> anyhow::Result<()>,
+    deadline: Instant,
+) -> anyhow::Result<Observation> {
+    collect_with_deadline_qualified(e, request, fence, deadline, None)
+}
+
+fn collect_with_deadline_qualified(
     e: &Envelope,
     mut request: impl FnMut(&str, Value) -> anyhow::Result<Value>,
     mut fence: impl FnMut() -> anyhow::Result<()>,
     deadline: Instant,
+    stale: Option<StaleAckEvidence>,
 ) -> anyhow::Result<Observation> {
     let bounded_request = |method: &str, params: Value| -> anyhow::Result<Value> {
         remaining(deadline)?;
@@ -592,19 +712,36 @@ fn collect_with_deadline(
         }
         result
     };
-    classify(collect_validated(e, bounded_request, || {
-        remaining(deadline)?;
-        fence()?;
-        remaining(deadline)?;
-        Ok(())
-    }))
+    classify(collect_validated(
+        e,
+        bounded_request,
+        || {
+            remaining(deadline)?;
+            fence()?;
+            remaining(deadline)?;
+            Ok(())
+        },
+        stale,
+    ))
 }
 
 fn collect_validated(
     e: &Envelope,
     mut request: impl FnMut(&str, Value) -> anyhow::Result<Value>,
     mut fence: impl FnMut() -> anyhow::Result<()>,
+    mut stale: Option<StaleAckEvidence>,
 ) -> anyhow::Result<Observation> {
+    if let Some(context) = &stale {
+        eligible_ensure!(
+            context.min_wait_secs
+                == cutex::management::v2::agent_bus_settlement_model::STALE_ACK_MIN_WAIT_SECS
+                && context
+                    .accepted_at
+                    .checked_add_signed(chrono::Duration::seconds(context.min_wait_secs as i64))
+                    .is_some_and(|ready| ready <= Utc::now()),
+            "ACK wait threshold not reached"
+        );
+    }
     ensure!(
         matches!(e.version, 1 | 2),
         "unsupported frozen envelope version"
@@ -617,7 +754,17 @@ fn collect_validated(
         "frozen envelope digest conflict"
     );
     e.validate()?;
-    if e.message.delivery == Delivery::Passive || e.message.event_type != "agent_message" {
+    let task = e.message.event_type == cutex::agent_bus::claude_task::EVENT_TYPE
+        && e.message.source.kind == SourceKind::Service
+        && e.message.source.id == cutex::agent_bus::claude_task::SOURCE_ID
+        && e.view
+            .as_ref()
+            .is_some_and(|view| view.schema == cutex::agent_bus::claude_task::VIEW_SCHEMA);
+    let agent =
+        e.message.event_type == "agent_message" && e.message.source.kind == SourceKind::Agent;
+    if (e.message.delivery == Delivery::Passive && stale.is_none())
+        || !(agent || (task && stale.is_some()))
+    {
         return Ok(Observation::Ineligible);
     }
     fence()?;
@@ -626,32 +773,52 @@ fn collect_validated(
     // Future versions need an explicit compatibility review, not a >= guess.
     ensure!(
         caps["implementation"] == "cute-claude-app-server"
-            && caps["version"] == "0.8.5"
+            && audited_adapter_version(&caps["version"])
             && super::super::claude_ingress::offers_native(&caps),
         "unsupported Claude settlement adapter"
     );
     let digest = local_digest(e)?;
-    let before_native = native(&mut request, e)?;
-    let before_local = local(&mut request, e, &digest)?;
-    let actual = actual(e, &before_local)?;
+    let before_native = native(&mut request, e, stale.is_some())?;
+    let before_local = local(&mut request, e, &digest, stale.is_some())?;
+    let actual = if e.message.delivery == Delivery::Passive && stale.is_some() {
+        // Native note receipts intentionally have no own turn. This explicit sentinel is not
+        // an assignment claim; only a later completion on the same thread may qualify it.
+        "unassigned"
+    } else {
+        actual(e, &before_local)?
+    };
     let attempt = attempt_id(&e.thread_id, actual);
     eligible_ensure!(
-        before_native["statuses"][0]["processing"]["attemptId"] == attempt,
+        before_native["statuses"][0]["processing"]["attemptId"] == attempt
+            || (stale.is_some()
+                && (before_native["statuses"][0]["processing"]["state"] == "pending"
+                    || (e.message.delivery == Delivery::Passive
+                        && before_native["statuses"][0]["processing"]["state"] == "none"))
+                && before_native["statuses"][0]["processing"]["attemptId"].is_null()),
         "attempt/actual turn conflict"
     );
-    let turn = history(&mut request, e, actual)?;
+    if let Some(context) = stale.as_mut() {
+        context.native_attempt_id = before_native["statuses"][0]["processing"]["attemptId"]
+            .as_str()
+            .map(str::to_owned);
+    }
+    let turn = history(&mut request, e, actual, stale.as_mut())?;
     eligible_ensure!(
-        turn["status"] == before_local["state"],
+        turn["status"] == before_local["state"]
+            || stale
+                .as_ref()
+                .is_some_and(|context| context.later_completed_turn_id.is_some()),
         "local/terminal turn conflict"
     );
-    let after_local = local(&mut request, e, &digest)?;
-    let after_native = native(&mut request, e)?;
+    let after_local = local(&mut request, e, &digest, stale.is_some())?;
+    let after_native = native(&mut request, e, stale.is_some())?;
     eligible_ensure!(
         before_local == after_local && before_native == after_native,
         "receipt or input status changed during collection"
     );
     fence()?;
     Ok(Observation::Terminal(Evidence {
+        stale_ack: stale,
         observing_generation: None,
         schema_version: 1,
         runtime: "claude".into(),
@@ -682,6 +849,223 @@ fn collect_validated(
 mod tests {
     use super::*;
     use cutex::app_server::external_input::{Message, Source, SourceKind};
+
+    fn stale_context() -> StaleAckEvidence {
+        StaleAckEvidence {
+            queued_at: Utc::now() - chrono::Duration::seconds(700),
+            accepted_at: Utc::now() - chrono::Duration::seconds(600),
+            min_wait_secs: 300,
+            later_completed_turn_id: None,
+            native_attempt_id: None,
+        }
+    }
+
+    fn add_later(f: &mut Fixture) {
+        let at = Utc::now().timestamp() - 60;
+        f.thread["turns"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"later-root-turn","status":"completed",
+            "startedAt":at-10,"completedAt":at,"items":[],"itemsView":"full"}));
+    }
+
+    fn stale_run(f: &Fixture) -> anyhow::Result<Observation> {
+        collect_with_deadline_qualified(
+            &f.e,
+            |method, _| Ok(f.response(method)),
+            || Ok(()),
+            Instant::now() + OBSERVATION_BUDGET,
+            Some(stale_context()),
+        )
+    }
+
+    fn passive_fixture() -> Fixture {
+        let mut f = Fixture::new(false, "completed", false);
+        f.e.message.delivery = Delivery::Passive;
+        f.e.semantic_sha256 = f.e.digest();
+        f.native["statuses"][0]["semanticSha256"] = json!(f.e.semantic_sha256);
+        f.native["statuses"][0]["processing"] =
+            json!({"state":"none","attemptId":null,"reason":null});
+        f.local["semanticSha256"] = json!(local_digest(&f.e).unwrap());
+        f.local["state"] = json!("injected");
+        f.local["turnId"] = Value::Null;
+        f.local["deliveryMode"] = json!("passive");
+        f.thread["turns"] = json!([]);
+        f
+    }
+
+    #[test]
+    fn stale_passive_continue_without_own_turn_closes_followup_only_after_later_completion() {
+        let mut f = passive_fixture();
+        assert!(matches!(stale_run(&f).unwrap(), Observation::Ineligible));
+        add_later(&mut f);
+        let Observation::Terminal(evidence) = stale_run(&f).unwrap() else {
+            panic!("later turn should qualify old note")
+        };
+        evidence.validate_shape().unwrap();
+        assert_eq!(evidence.actual_turn_id, "unassigned");
+        assert_eq!(evidence.terminal_status, "unknown");
+        assert_eq!(evidence.processing_state, "none");
+        let proof = evidence.stale_ack.unwrap();
+        assert_eq!(
+            proof.later_completed_turn_id.as_deref(),
+            Some("later-root-turn")
+        );
+        assert!(proof.native_attempt_id.is_none());
+        assert_eq!(f.native["statuses"][0]["deliveryState"], "pending");
+        assert!(f.native["statuses"][0]["receipt"].is_null());
+    }
+
+    #[test]
+    fn stale_running_attempt_may_end_followup_after_target_moves_on_without_fake_terminal_state() {
+        let mut f = Fixture::new(false, "inProgress", false);
+        f.local["state"] = json!("processing");
+        f.native["statuses"][0]["processing"] =
+            json!({"state":"claimed","attemptId":attempt_id("thread","actual"),"reason":null});
+        add_later(&mut f);
+        let Observation::Terminal(evidence) = stale_run(&f).unwrap() else {
+            panic!("later turn proof missing")
+        };
+        assert_eq!(evidence.terminal_status, "inProgress");
+        evidence.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn stale_unclaimed_active_input_can_close_followup_with_later_turn_proof() {
+        let mut f = Fixture::new(false, "inProgress", false);
+        f.local["state"] = json!("queued");
+        f.native["statuses"][0]["processing"] =
+            json!({"state":"pending","attemptId":null,"reason":null});
+        f.thread["turns"] = json!([]);
+        add_later(&mut f);
+        let Observation::Terminal(evidence) = stale_run(&f).unwrap() else {
+            panic!("later proof missing")
+        };
+        assert_eq!(evidence.terminal_status, "unknown");
+        evidence.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn stale_failed_claude_task_uses_exact_original_terminal_payload() {
+        let mut f = Fixture::new(false, "failed", false);
+        f.e.message.source = Source {
+            kind: SourceKind::Service,
+            id: "Claude Task".into(),
+        };
+        f.e.message.event_type = "claude_task".into();
+        f.e.view.as_mut().unwrap().schema = "cutex.claude-task.v1".into();
+        f.e.semantic_sha256 = f.e.digest();
+        f.native["statuses"][0]["semanticSha256"] = json!(f.e.semantic_sha256);
+        f.local["semanticSha256"] = json!(local_digest(&f.e).unwrap());
+        let item = &mut f.thread["turns"][0]["items"][0];
+        item["output"] = json!(serde_json::to_string(&json!({"source":f.e.message.source,"type":f.e.message.event_type,"text":f.e.message.text})).unwrap());
+        item["externalInputView"] = json!(f.e.view);
+        let Observation::Terminal(evidence) = stale_run(&f).unwrap() else {
+            panic!("failed task should qualify")
+        };
+        assert_eq!(evidence.terminal_status, "failed");
+        assert!(evidence
+            .stale_ack
+            .as_ref()
+            .unwrap()
+            .later_completed_turn_id
+            .is_none());
+        evidence.validate_shape().unwrap();
+        f.e.message.source.id = "forged service".into();
+        f.e.semantic_sha256 = f.e.digest();
+        assert!(matches!(stale_run(&f).unwrap(), Observation::Ineligible));
+    }
+
+    #[test]
+    fn stale_soon_claude_task_failed_entry_can_use_later_completed_turn() {
+        for error in ["rate_limit", "server_error"] {
+            let mut f = Fixture::new(false, "failed", false);
+            f.e.message.delivery = Delivery::Soon;
+            f.e.message.source = Source { kind: SourceKind::Service, id: "Claude Task".into() };
+            f.e.message.event_type = "claude_task".into();
+            f.e.view.as_mut().unwrap().schema = "cutex.claude-task.v1".into();
+            f.e.semantic_sha256 = f.e.digest();
+            f.native["statuses"][0]["semanticSha256"] = json!(f.e.semantic_sha256);
+            f.native["statuses"][0]["processing"]["reason"] = json!("request_uncertain");
+            f.local["semanticSha256"] = json!(local_digest(&f.e).unwrap());
+            f.local["contextTurnId"] = Value::Null;
+            f.thread["turns"][0]["error"] = json!({"message":error});
+            // A failed native request need not have projected the original item.
+            // Later completion proves only that the target moved on, not receipt.
+            f.thread["turns"][0]["items"] = json!([]);
+            add_later(&mut f);
+            let Observation::Terminal(evidence) = stale_run(&f).unwrap() else {
+                panic!("failed Soon Claude Task should retain later-turn proof: {error}")
+            };
+            assert_eq!(evidence.actual_turn_id, "actual");
+            assert_eq!(evidence.terminal_status, "failed");
+            assert_eq!(evidence.stale_ack.as_ref().unwrap().later_completed_turn_id.as_deref(), Some("later-root-turn"));
+            assert!(f.native["statuses"][0]["receipt"].is_null());
+            evidence.validate_shape().unwrap();
+        }
+    }
+
+    #[test]
+    fn stale_ack_threshold_is_not_itself_receipt_or_close_permission() {
+        let f = passive_fixture();
+        let mut context = stale_context();
+        context.accepted_at = Utc::now() - chrono::Duration::seconds(299);
+        let result = collect_with_deadline_qualified(
+            &f.e,
+            |_, _| panic!("young input must not RPC"),
+            || Ok(()),
+            Instant::now() + OBSERVATION_BUDGET,
+            Some(context),
+        );
+        assert!(matches!(result.unwrap(), Observation::Ineligible));
+    }
+
+    #[test]
+    fn stale_later_turn_must_be_completed_after_acceptance_and_not_reverted_or_future() {
+        for bad in ["older", "failed", "future", "reverted", "missingStart"] {
+            let mut f = passive_fixture();
+            add_later(&mut f);
+            let later = &mut f.thread["turns"][0];
+            match bad {
+                "older" => {
+                    later["startedAt"] = json!(1);
+                    later["completedAt"] = json!(2);
+                }
+                "failed" => later["status"] = json!("failed"),
+                "future" => later["completedAt"] = json!(Utc::now().timestamp() + 3600),
+                "reverted" => later["reverted"] = json!(true),
+                _ => later["startedAt"] = Value::Null,
+            }
+            assert!(
+                matches!(stale_run(&f).unwrap(), Observation::Ineligible),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_collection_rechecks_context_receipt_before_authorizing_owner_review() {
+        let mut f = passive_fixture();
+        add_later(&mut f);
+        let mut local_reads = 0;
+        let result = collect_with_deadline_qualified(
+            &f.e,
+            |method, _| {
+                let mut response = f.response(method);
+                if method == "claude/input/status" {
+                    local_reads += 1;
+                    if local_reads > 1 {
+                        response["contextPersisted"] = json!(true);
+                    }
+                }
+                Ok(response)
+            },
+            || Ok(()),
+            Instant::now() + OBSERVATION_BUDGET,
+            Some(stale_context()),
+        );
+        assert!(matches!(result.unwrap(), Observation::Ineligible));
+    }
 
     struct Fixture {
         e: Envelope,
@@ -1132,8 +1516,14 @@ mod tests {
 
     #[test]
     fn only_audited_adapter_version_is_accepted() {
+        for version in ["0.8.5", "0.8.6", "0.8.7", "0.8.8"] {
+            let mut f = Fixture::new(false, "failed", false);
+            f.caps["version"] = json!(version);
+            f.thread["cliVersion"] = json!(version);
+            assert!(matches!(f.run().unwrap(), Observation::Terminal(_)));
+        }
         for (key, value) in [
-            ("version", json!("0.8.6")),
+            ("version", json!("0.8.9")),
             ("implementation", json!("another-adapter")),
             ("externalInputVersion", json!(0)),
         ] {
@@ -1141,6 +1531,9 @@ mod tests {
             f.caps[key] = value;
             assert!(f.run().is_err());
         }
+        let mut f = Fixture::new(false, "failed", false);
+        f.thread["cliVersion"] = json!("0.8.9");
+        assert!(f.run().is_err());
     }
 
     #[test]
@@ -1347,6 +1740,71 @@ mod tests {
                 assert!(result.is_err());
             }
         }
+    }
+
+    #[test]
+    fn full_worker_budget_reaches_failed_terminal_proof_after_the_old_slot_expired() {
+        // Alice-shaped after_turn + quota-failed input with request_uncertain,
+        // no output and no receipt. A normal delayed reply exceeds the old slot.
+        let f = Fixture::new(false, "failed", false);
+        let mut first = true;
+        let result = collect_read_binding_with_deadline(&f.e, 7, |method, _, _| {
+            if first { first = false; std::thread::sleep(Duration::from_millis(90)); }
+            Ok(f.response(method))
+        }, || Ok(()), Instant::now() + OBSERVATION_BUDGET).unwrap();
+        let Observation::Terminal(evidence) = result else { panic!("failed turn must be provable, not delivered"); };
+        assert_eq!(evidence.terminal_status, "failed");
+        assert_eq!(evidence.processing_state, "held");
+        assert!(f.native["statuses"][0]["receipt"].is_null());
+    }
+
+    #[test]
+    fn exhausted_worker_observation_is_visible_once_and_reopens_only_for_changed_facts() {
+        use cutex::management::v2::agent_bus_state::{AgentBusMessageRepository, AgentBusQueuedMessage};
+        let root = std::env::temp_dir().join(format!("settle-terminal-{}", uuid::Uuid::new_v4()));
+        let repository = AgentBusMessageRepository::open(&root).unwrap();
+        let f = Fixture::new(false, "failed", false);
+        let canonical = serde_json::from_value(json!({"id":f.e.message.id,"from":"sender","to":"recipient",
+            "fromCutexSessionId":"sender","toCutexSessionId":"recipient","content":f.e.message.text,
+            "deliveryMode":"after_turn","triggerTurn":true,"createdAtEpochSecs":1,"senderKind":"agent"})).unwrap();
+        repository.record_queued(AgentBusQueuedMessage {
+            owner_cutex_session_id: f.e.owner_id.clone(), message_id: f.e.message.id.clone(),
+            from_cutex_session_id: Some("sender".into()), to_cutex_session_id: f.e.owner_id.clone(),
+            from_runtime_agent_id: None, to_runtime_agent_id: None, delivery_mode: "after_turn".into(),
+            content: f.e.message.text.clone(), queued_at: Utc::now(), canonical_envelope: canonical,
+            semantic_sha256: "c".repeat(64),
+        }).unwrap();
+        repository.freeze_external_input(&f.e.owner_id, &f.e.message.id, |_| Ok(f.e.clone())).unwrap();
+        repository.record_local_inbox(&f.e.owner_id, &f.e.message.id, &f.local).unwrap();
+        let status: Response = serde_json::from_value(f.native.clone()).unwrap();
+        repository.observe_external_input(&f.e.message.id, &f.e, &status.statuses[0]).unwrap();
+        let original = repository.snapshot_by_message_id(&f.e.message.id).unwrap().unwrap();
+        let expired = Instant::now() - Duration::from_secs(1);
+        super::super::observe_settlement_message_with(&repository, &f.e.owner_id, &f.e.message.id, expired, 7,
+            |_, deadline| collect_read_binding_with_deadline(&f.e, 7, |_,_,_| panic!("expired worker must not RPC"), || Ok(()), deadline),
+            || Ok(true)).unwrap();
+        let failed = repository.snapshot_by_message_id(&f.e.message.id).unwrap().unwrap();
+        assert_eq!(failed.error.as_ref().unwrap()["details"]["observationState"], "failed");
+        assert_eq!(failed.state, original.state);
+        assert_eq!(failed.external_input_receipt, original.external_input_receipt);
+        assert_eq!(failed.external_input_last_observed, original.external_input_last_observed);
+        assert!(repository.receipt_read_inputs(&[f.e.message.id.clone()]).unwrap()[&f.e.message.id].terminal.is_none());
+        for _ in 0..3 {
+            super::super::observe_settlement_message_with(&repository, &f.e.owner_id, &f.e.message.id, expired, 7,
+                |_,_| panic!("terminal observation cannot loop"), || panic!("no fresh failure to fence")).unwrap();
+        }
+        assert_eq!(repository.snapshot_by_message_id(&f.e.message.id).unwrap(), Some(failed));
+        super::super::observe_settlement_message_with(&repository, &f.e.owner_id, &f.e.message.id,
+            Instant::now()+OBSERVATION_BUDGET, 8, |_, deadline| {
+                collect_read_binding_with_deadline(&f.e, 8, |method,_,_| {
+                    let mut response = f.response(method);
+                    if method == "thread/externalInput/status" {response["runtimeGeneration"] = json!(8);}
+                    Ok(response)
+                }, || Ok(()), deadline)
+            }, || Ok(true)).unwrap();
+        let recovered = repository.snapshot_by_message_id(&f.e.message.id).unwrap().unwrap();
+        assert!(recovered.error.is_none());
+        assert!(recovered.external_input_receipt.is_none(), "terminal proof is not consumption");
     }
 
     #[test]
@@ -1563,6 +2021,7 @@ mod tests {
                         id,
                         message,
                         deadline,
+                        7,
                         |snapshot, deadline| {
                             collected.set(collected.get() + 1);
                             assert_eq!(snapshot.external_input.as_ref(), Some(&f.e));
@@ -1577,6 +2036,7 @@ mod tests {
                                 deadline,
                             )
                         },
+                        || Ok(true),
                     )
                     .unwrap(); // real production F1 boundary swallows sidecar error
                     let retained = repository

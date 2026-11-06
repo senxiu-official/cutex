@@ -322,6 +322,9 @@ pub(crate) fn receive_with(
             (true, true) => "busy",
             (true, false) => "idle",
         };
+        // Recheck the immutable recipient at first delivery. Directory name
+        // resolution and its revision are evidence, never delivery authority.
+        super::asks::validate_inbound(peer, &request.target)?;
         let bus_id = deliver(&Delivery {
             target: &request.target,
             text: &request.text,
@@ -379,6 +382,10 @@ pub fn check_options(args: &Value) -> std::result::Result<(), AskError> {
     for key in object.keys() {
         match key.as_str() {
             "to" | "text" | "action_id" => {}
+            "targetScope" => {
+                serde_json::from_value::<crate::agent_names::NameScope>(object[key].clone())
+                    .map_err(|_| crate::asks::tools::invalid("targetScope: project with projectId, or unassigned"))?;
+            }
             "wake" if object[key].is_boolean() => {}
             "wake" => return Err(crate::asks::tools::invalid("wake: true or false")),
             "delegation" | "supersedes" => return Err(unsupported("delegation revisions are unavailable across hosts (remote brief revisions are unsupported)")),
@@ -408,10 +415,14 @@ pub fn send(
         return Err(crate::asks::tools::invalid("text: 1 byte to 16 KiB"));
     }
     let wake = object.get("wake").and_then(Value::as_bool).unwrap_or(false);
+    let scope = object.get("targetScope").map(|v| serde_json::from_value::<crate::agent_names::NameScope>(v.clone()))
+        .transpose().map_err(|_| crate::asks::tools::invalid("invalid targetScope"))?;
     let mut request = json!({"to": to, "text": text, "remote": true});
+    if let Some(scope) = &scope { request["targetScope"] = serde_json::to_value(scope).unwrap(); }
     if wake {
         request["wake"] = json!(true);
     }
+    let binding_digest=crate::approvals::request_digest(&request);
     crate::asks::tools::once(
         ctx,
         crate::asks::tools::AGENT_TELL,
@@ -419,7 +430,9 @@ pub fn send(
         &request,
         || {
             let result = (|| -> Result<Value> {
-                let (peer, target) = super::asks::resolve(&to)?;
+                let (peer, target) = super::asks::resolve_action(&to, scope.clone(), ctx.caller,
+                    crate::asks::tools::AGENT_TELL, action_id, &binding_digest)?;
+                let rename_detail = super::names::detail(&target);
                 if wake && !supports_wake(&peer) {
                     return Err(Error::new("wake_unsupported", 409));
                 }
@@ -503,10 +516,11 @@ pub fn send(
                 let outcome = crate::asks::tools::tell_detail_for(
                     &address, state, woke, false, ctx.facade, false,
                 );
-                let detail = match &downgrade {
+                let mut detail = match &downgrade {
                     Some(reason) => format!("Delivered to host {} as a note, not a wake ({reason}: that host's hourly limit of wakes from your host was reached). {outcome}", peer.label),
                     None => format!("Delivered to host {}. {outcome}", peer.label),
                 };
+                if !rename_detail.is_empty() { detail.push(' '); detail.push_str(&rename_detail); }
                 let mut value = json!({
                     "ok": true,
                     "to": address,

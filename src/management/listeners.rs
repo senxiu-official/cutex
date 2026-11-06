@@ -299,7 +299,7 @@ pub fn cors_preflight_headers(origin: Option<&str>) -> String {
         return base;
     }
     format!(
-        "{base}Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, If-Match, Last-Event-ID, Accept-Encoding\r\nAccess-Control-Max-Age: 600\r\n"
+        "{base}Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, If-Match, Last-Event-ID, Accept-Encoding, X-Cutex-Read-Priority\r\nAccess-Control-Max-Age: 600\r\n"
     )
 }
 

@@ -69,7 +69,15 @@ fn unavailable(e: anyhow::Error) -> UserInputExecutionError {
 /// Publish queued notices as Management v2 events (management process).
 /// Best effort: resources always reflect the store.
 pub fn publish_pending_notices(store: &OwnerNotifyStore) {
-    let notices = match store.with_state(|state| std::mem::take(&mut state.notices)) {
+    // Disk publication is outside the SQL writer. A busy publisher is already
+    // draining this outbox; callers need not wait behind it.
+    static PUBLISH:std::sync::Mutex<()>=std::sync::Mutex::new(());
+    let _publisher=match PUBLISH.try_lock() {
+        Ok(guard)=>guard,
+        Err(std::sync::TryLockError::Poisoned(error))=>error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock)=>return,
+    };
+    let notices = match store.claim_notices(100) {
         Ok(notices) => notices,
         Err(error) => {
             eprintln!("owner notify: could not read notices: {error:#}");
@@ -79,18 +87,28 @@ pub fn publish_pending_notices(store: &OwnerNotifyStore) {
     if notices.is_empty() {
         return;
     }
+    let ids:Vec<_>=notices.iter().map(|(id,_,_)|*id).collect();
     let Ok(repository) = super::repository::management_v2_repository() else {
+        let _=store.release_notices(&ids);
         return;
     };
-    for notice in notices {
+    for (index,(notice_id, idem_key, notice)) in notices.into_iter().enumerate() {
         if let Err(error) = super::server::append_cutex_event(
             repository,
             &notice.session,
-            super::model::EventCorrelation::default(),
+            super::model::EventCorrelation {management_request_id:Some(format!("owner-notify-outbox:{idem_key}")),..Default::default()},
             &notice.method,
             notice.params,
         ) {
             eprintln!("owner notify: could not publish {}: {error:#}", notice.method);
+            let _ = store.release_notices(&ids[index..]);
+            break;
+        } else {
+            if let Err(error)=store.ack_notice(notice_id) {
+                eprintln!("owner notify: could not acknowledge publication: {error:#}");
+                let _=store.release_notices(&ids[index..]);
+                break;
+            }
         }
     }
 }
@@ -109,7 +127,7 @@ pub fn mark_agent_read(agent_id: &str) -> usize {
         return 0;
     };
     let count = store
-        .with_state(|state| state.mark_agent_read(agent_id, chrono::Utc::now()))
+        .edit_agent_open(agent_id, |state| state.mark_agent_read(agent_id, chrono::Utc::now()))
         .unwrap_or(0);
     if count > 0 {
         publish_pending_notices(&store);
@@ -121,18 +139,16 @@ pub fn mark_agent_read(agent_id: &str) -> usize {
 /// first.
 pub fn bootstrap_records(cutex_session_id: &str) -> Value {
     let mut records = OwnerNotifyStore::open_default()
-        .and_then(|store| store.snapshot())
-        .map(|state| state.list("all", Some(cutex_session_id), BOOTSTRAP_RECORDS))
+        .and_then(|store| store.list("all", Some(cutex_session_id), BOOTSTRAP_RECORDS))
         .unwrap_or_default();
     records.reverse();
     json!(records)
 }
 
-/// Every record (summary needs and `messageToOwner`).
-pub fn all_records() -> Vec<OwnerNotification> {
+/// Pending records used by summary needs; answered history is never decoded.
+pub fn pending_records() -> Vec<OwnerNotification> {
     OwnerNotifyStore::open_default()
-        .and_then(|store| store.snapshot())
-        .map(|state| state.notifications.into_values().collect())
+        .and_then(|store| store.list("pending", None, usize::MAX))
         .unwrap_or_default()
 }
 
@@ -157,15 +173,25 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
         },
     };
     let agent = crate::http::query::query_value(&request.path, "agentId").filter(|id| !id.is_empty());
-    match OwnerNotifyStore::open_default().and_then(|store| store.snapshot()) {
-        Ok(state) => write_json_response(
+    let cursor=crate::http::query::query_value(&request.path,"cursor");
+    match OwnerNotifyStore::open_default().and_then(|store| store.notification_page(&filter, agent.as_deref(), false, cursor.as_deref(), crate::store::PageBudget {max_rows:limit,max_bytes:256*1024})) {
+        Ok((records,next)) => {let mut response=json!({"notifications":records});
+            if let Some(next)=next {response["nextCursor"]=json!(next);}
+            write_json_response(
             stream,
             200,
             "OK",
-            &json!({ "notifications": state.list(&filter, agent.as_deref(), limit) }),
-        ),
-        Err(error) => super::server::write_v2_error(stream, 503, "Service Unavailable", "owner_notify_unavailable",
-            &format!("owner notify store: {error:#}"), true, json!({})),
+            &response,
+        )},
+        Err(error) => page_error(stream,&error),
+    }
+}
+
+pub(super) fn page_error(stream:&mut TcpStream,error:&anyhow::Error)->anyhow::Result<()> {
+    match error.downcast_ref::<crate::store::StoreError>() {
+        Some(crate::store::StoreError::Invalid(_))=>super::server::write_v2_error(stream,400,"Bad Request","invalid_cursor","notification cursor is invalid",false,json!({})),
+        Some(crate::store::StoreError::Resync(reason))=>super::server::write_v2_error(stream,409,"Conflict","resync_required","notification cursor needs a fresh page",true,json!({"reason":format!("{reason:?}")})),
+        _=>super::server::write_v2_error(stream,503,"Service Unavailable","owner_notify_unavailable",&format!("owner notify store: {error:#}"),true,json!({})),
     }
 }
 
@@ -229,7 +255,7 @@ pub(super) fn dispatch_with(
             only_fields(&request.params, &["notificationId"])?;
             let id = notification_id(&request.params)?;
             let outcome = store
-                .with_state(|state| {
+                .edit_record(id, |state| {
                     if method == crate::owner_notify::ACK_METHOD {
                         state.acknowledge(cutex_session_id, id, now)
                     } else {
@@ -244,7 +270,7 @@ pub(super) fn dispatch_with(
             only_fields(&request.params, &["notificationId"])?;
             let id = notification_id(&request.params)?;
             let removed = store
-                .with_state(|state| state.delete(cutex_session_id, id))
+                .edit_record(id, |state| state.delete(cutex_session_id, id))
                 .map_err(unavailable)?
                 .map_err(owner_error)?;
             Ok(json!({ "notification": removed, "deleted": true }))
@@ -260,9 +286,8 @@ pub(super) fn dispatch_with(
                 .filter(|text| !text.is_empty() && text.chars().count() <= crate::owner_notify::store::MAX_REPLY_CHARS)
                 .ok_or_else(|| super::server::invalid_user_input_error("text: 1-20000 characters"))?;
             let record = store
-                .snapshot()
-                .map_err(unavailable)?
                 .check_reply(cutex_session_id, id)
+                .map_err(unavailable)?
                 .map_err(owner_error)?;
             let client_user_message_id = format!("owner-notify-reply-{id}");
             // The owner's own words: `auto` like typed input (023 Q2). Busy: read at
@@ -286,7 +311,7 @@ pub(super) fn dispatch_with(
                 client_user_message_id,
             };
             let notification = store
-                .with_state(|state| state.answered(cutex_session_id, id, reply, now))
+                .edit_record(id, |state| state.answered(cutex_session_id, id, reply, now))
                 .map_err(unavailable)?
                 .map_err(owner_error)?;
             Ok(json!({ "notification": notification, "submit": submitted }))

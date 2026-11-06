@@ -7,7 +7,12 @@ fn callback_flush_probe(inline_baseline: bool) {
     fn read_json(ws: &mut WebSocket<TcpStream>) -> Value {
         loop {
             if let Message::Text(text) = ws.read().unwrap() {
-                return serde_json::from_str(text.as_ref()).unwrap();
+                let request:Value=serde_json::from_str(text.as_ref()).unwrap();
+                if request["method"]=="claude/tasks/list" {
+                    write_json(ws,json!({"id":request["id"],"result":{"tasks":[],"completeInventory":true,"nextCursor":null}}));
+                    continue;
+                }
+                return request;
             }
         }
     }
@@ -61,14 +66,15 @@ fn callback_flush_probe(inline_baseline: bool) {
             &mut ws,
             json!({"id":resume["id"],"result":{"thread":{"id":"thread-q","status":{"type":"idle"},"turns":[]}}}),
         );
+        // A never-sent queued item needs only the newest turn (051 / S17).
         let history = read_json(&mut ws);
-        assert_eq!(history["method"], "thread/read");
+        assert_eq!(history["method"], "thread/turns/list");
         started_tx.send(()).unwrap();
         release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         // Became busy before flush: preserve the queue and never submit twice.
         write_json(
             &mut ws,
-            json!({"id":history["id"],"result":{"thread":{"id":"thread-q","turns":[{"id":"other-turn","status":"inProgress","items":[]}]}}}),
+            json!({"id":history["id"],"result":{"data":[{"id":"other-turn","status":"inProgress","items":[]}],"nextCursor":null}}),
         );
         let _ = ws.read();
     });

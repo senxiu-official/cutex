@@ -5,6 +5,210 @@ use serde_json::{json, Value};
 use super::model::*;
 use super::store::{queue_position, AskState};
 
+/// Keyset page for cleanup collection reads. Rows borrow an owned read-only
+/// snapshot; load receipt projections only after that snapshot is returned.
+pub struct CleanupPage<'a> {
+    pub asks: Vec<&'a AskRecord>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CleanupCursor {
+    version: u8,
+    updated_at: String,
+    ask_id: String,
+    scope: Value,
+}
+
+fn cleanup_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // Require ISO date/time spelling and an explicit zone, never local dates
+    // or chrono's permissive space/lowercase separator extensions.
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes.get(10) != Some(&b'T')
+        || !(value.ends_with('Z') || (bytes.len() >= 25
+            && matches!(bytes[bytes.len() - 6], b'+' | b'-')
+            && bytes[bytes.len() - 3] == b':')) {
+        return None;
+    }
+    super::parse_time(value)
+}
+
+/// Oldest update first, ties by ask ID ascending. `updated_before` is an
+/// inclusive RFC3339 instant (desktop age >= minAge). All predicates and the
+/// exclusive cursor boundary apply BEFORE limit. A cursor carries its key,
+/// not a row index, and remains usable after its anchor is deleted or changed.
+/// Keep the same filters/cutoff across pages; limit may change. This is a live
+/// view, not a frozen snapshot: later updates can move rows past the cursor.
+pub fn cleanup_page<'a>(
+    state: &'a AskState,
+    filter: &super::store::AskFilter,
+    peer: Option<&str>,
+    updated_before: Option<&str>,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<CleanupPage<'a>, super::store::AskError> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use super::store::AskError;
+    let invalid = |detail| AskError::new("invalid_request", detail);
+    if !(1..=1000).contains(&limit) {
+        return Err(invalid("limit must be 1..=1000"));
+    }
+    let cutoff = updated_before.map(|value| cleanup_time(value)
+        .ok_or_else(|| invalid("updatedBefore must be an RFC3339 timestamp"))).transpose()?;
+    let scope = json!({
+        "project": filter.project, "requester": filter.requester,
+        "target": filter.target, "state": filter.state, "involving": filter.involving,
+        "peer": peer, "updatedBefore": cutoff.map(|at| at.to_rfc3339()),
+    });
+    let after = cursor.map(|encoded| {
+        if encoded.is_empty() || encoded.len() > 8192 {
+            return Err(invalid("invalid asks cursor"));
+        }
+        let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| invalid("invalid asks cursor"))?;
+        let decoded: CleanupCursor = serde_json::from_slice(&bytes)
+            .map_err(|_| invalid("invalid asks cursor"))?;
+        if decoded.version != 1 || decoded.scope != scope || decoded.ask_id.is_empty()
+            || decoded.ask_id.len() > 256 || decoded.ask_id.chars().any(char::is_control)
+        {
+            return Err(invalid("asks cursor does not match this query"));
+        }
+        let at = cleanup_time(&decoded.updated_at).ok_or_else(|| invalid("invalid asks cursor timestamp"))?;
+        if cutoff.is_some_and(|cutoff| at > cutoff) {
+            return Err(invalid("asks cursor exceeds updatedBefore"));
+        }
+        Ok((at, decoded.ask_id))
+    }).transpose()?;
+    let mut rows = Vec::new();
+    for ask in state.asks.values().filter(|ask| filter.matches(ask)) {
+        if peer.is_some_and(|id| !ask.remote.as_ref().is_some_and(|remote| remote.peer_id == id)
+            && !matches!(&ask.requester, Requester::Peer { peer_id, .. } if peer_id == id)) {
+            continue;
+        }
+        let Some(at) = super::parse_time(&ask.updated_at) else {
+            // A malformed stored timestamp cannot satisfy an age filter.
+            // Without an age filter report the bad row rather than omitting it.
+            if cutoff.is_some() { continue; }
+            return Err(AskError::new("asks_unavailable", "ask has an invalid updatedAt timestamp"));
+        };
+        if cutoff.is_some_and(|cutoff| at > cutoff)
+            || after.as_ref().is_some_and(|(time, id)| (at, ask.ask_id.as_str()) <= (*time, id.as_str())) {
+            continue;
+        }
+        rows.push((at, ask));
+    }
+    rows.sort_by(|(a_time, a), (b_time, b)| (a_time, &a.ask_id).cmp(&(b_time, &b.ask_id)));
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = if has_more {
+        let (at, ask) = rows.last().expect("positive page limit");
+        let payload = CleanupCursor { version: 1, updated_at: at.to_rfc3339(), ask_id: ask.ask_id.clone(), scope };
+        Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)
+            .expect("cursor contains only JSON values")))
+    } else { None };
+    Ok(CleanupPage { asks: rows.into_iter().map(|(_, ask)| &**ask).collect(), has_more, next_cursor })
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use crate::asks::store::{tests::new_ask, AskFilter};
+
+    fn fixture() -> AskState {
+        let mut state = AskState::default();
+        let (template, _) = state.create_ask(new_ask("cleanup", "cleanup"), chrono::Utc::now()).unwrap();
+        state.asks.clear();
+        // Lexically different RFC3339 offsets represent the SAME instant.
+        for (id, updated, seq) in [
+            ("ask-b", "2026-10-29T10:00:00+10:00", 90),
+            ("ask-a", "2026-10-29T00:00:00Z", 91),
+            ("ask-c", "2026-10-30T00:00:00Z", 1),
+            ("ask-new", "2026-10-31T00:00:00Z", 100),
+        ] {
+            let mut ask = template.clone();
+            ask.ask_id = id.into();
+            ask.updated_at = updated.into();
+            ask.seq = seq;
+            state.asks.insert(id.into(), ask.into());
+        }
+        state
+    }
+
+    #[test]
+    fn cleanup_filters_before_limit_and_uses_instant_then_id() {
+        let mut state = fixture();
+        state.asks.get_mut("ask-a").unwrap().project_id = Some("hidden".into());
+        let filter = AskFilter { project: Some("alpha".into()), ..Default::default() };
+        let before = state.clone();
+        let page = cleanup_page(&state, &filter, None, Some("2026-10-30T00:00:00Z"), None, 1).unwrap();
+        assert_eq!(page.asks[0].ask_id, "ask-b");
+        assert!(page.has_more);
+        let next = cleanup_page(&state, &filter, None, Some("2026-10-30T00:00:00Z"), page.next_cursor.as_deref(), 5).unwrap();
+        assert_eq!(next.asks.iter().map(|ask| ask.ask_id.as_str()).collect::<Vec<_>>(), ["ask-c"]);
+        assert!(!next.has_more);
+        assert!(next.next_cursor.is_none());
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn cleanup_cursor_survives_anchor_deletion_and_insertion_before_it() {
+        let mut state = fixture();
+        let filter = AskFilter::default();
+        let first = cleanup_page(&state, &filter, None, Some("2026-10-30T00:00:00Z"), None, 1).unwrap();
+        assert_eq!(first.asks[0].ask_id, "ask-a");
+        let cursor = first.next_cursor.unwrap();
+        state.asks.remove("ask-a");
+        let mut earlier = state.asks["ask-b"].clone();
+        earlier.ask_id = "ask-0".into();
+        state.asks.insert(earlier.ask_id.clone(), earlier);
+        let page = cleanup_page(&state, &filter, None, Some("2026-10-30T00:00:00Z"), Some(&cursor), 10).unwrap();
+        assert_eq!(page.asks.iter().map(|ask| ask.ask_id.as_str()).collect::<Vec<_>>(), ["ask-b", "ask-c"]);
+    }
+
+    #[test]
+    fn cleanup_rejects_bad_inputs_and_cross_query_cursors() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let state = fixture();
+        let filter = AskFilter::default();
+        let cutoff = Some("2026-10-30T00:00:00Z");
+        let cursor = cleanup_page(&state, &filter, None, cutoff, None, 1).unwrap().next_cursor.unwrap();
+        for bad in ["", "%%%", "e30", "bnVsbA"] {
+            assert!(cleanup_page(&state, &filter, None, cutoff, Some(bad), 1).is_err());
+        }
+        let payload: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&cursor).unwrap()).unwrap();
+        for (field, value) in [("version", json!(2)), ("updatedAt", json!("bad")),
+            ("updatedAt", json!("2026-10-31T00:00:00Z")), ("askId", json!("")),
+            ("askId", json!("bad\nkey")), ("unexpected", json!(true))] {
+            let mut invalid = payload.clone();
+            invalid[field] = value;
+            let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&invalid).unwrap());
+            assert!(cleanup_page(&state, &filter, None, cutoff, Some(&encoded), 1).is_err(), "{field}");
+        }
+        assert!(cleanup_page(&state, &filter, None, cutoff, Some(&"A".repeat(8193)), 1).is_err());
+        for bad in ["2026-10-30", "2026-10-30T00:00:00", "2026-10-30 00:00:00Z", "2026-02-30T00:00:00Z"] {
+            assert!(cleanup_page(&state, &filter, None, Some(bad), None, 1).is_err());
+        }
+        for changed in [AskFilter { involving: Some("other".into()), ..Default::default() },
+            AskFilter { state: Some("open".into()), ..Default::default() }] {
+            assert!(cleanup_page(&state, &changed, None, cutoff, Some(&cursor), 1).is_err());
+        }
+        assert!(cleanup_page(&state, &filter, Some("peer-other"), cutoff, Some(&cursor), 1).is_err());
+        assert!(cleanup_page(&state, &filter, None, Some("2026-10-31T00:00:00Z"), Some(&cursor), 1).is_err());
+        // Equivalent time-zone spellings retain the same cursor scope.
+        assert!(cleanup_page(&state, &filter, None, Some("2026-10-30T10:00:00+10:00"), Some(&cursor), 1).is_ok());
+        assert!(cleanup_page(&state, &filter, None, cutoff, None, 0).is_err());
+    }
+
+    #[test]
+    fn cleanup_involving_and_peer_never_bypass_filter() {
+        let state = fixture();
+        let filter = AskFilter { involving: Some("unrelated".into()), ..Default::default() };
+        assert!(cleanup_page(&state, &filter, None, Some("2026-11-01T00:00:00Z"), None, 1).unwrap().asks.is_empty());
+        assert!(cleanup_page(&state, &AskFilter::default(), Some("unrelated"), Some("2026-11-01T00:00:00Z"), None, 1).unwrap().asks.is_empty());
+    }
+}
+
 /// The stored requester shape (`cutex_session_id`, kept one release) plus
 /// `cutexSessionId` (r208).
 pub fn requester_value(requester: &Requester) -> Value {
@@ -274,6 +478,9 @@ pub fn summary(state: &AskState, ask: &AskRecord) -> Value {
         "revisions": revisions_summary(ask),
         "supersededBy": ask.superseded_by,
     });
+    if let Some(code) = &ask.admission_failure {
+        value["admissionFailure"] = json!(code);
+    }
     insert_review_refs(&mut value, state, ask);
     insert_control(&mut value, ask, false);
     value

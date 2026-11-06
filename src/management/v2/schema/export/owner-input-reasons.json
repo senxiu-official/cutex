@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:owner-input-reasons",
+  "title": "OwnerInputReasons",
+  "description": "r271 owner admission (cutex-desktop docs/design/050 §5; owner-admission-busy-v1 / -held-v1 / -state-v1): every reason and error code an owner input can carry. Clients map each one explicitly; an unknown value is a contract break, never a fallback. Generated from management/v2/queue_order.rs and checked against it in tests.",
+  "$defs": {
+    "queuedReason": {
+      "description": "cutex/userInput/submit `queuedReason` (disposition queued) and queue item events.",
+      "enum": ["explicitQueue", "paused", "hostBusy", "delegationLease", "turnRunning", "imageBusy", "adapterQueued", "ownerQueueAhead", "joinRefused", "turnFinishing"]
+    },
+    "steerUnavailableReason": {
+      "description": "`steer_unavailable` error `details.reason`, and `joinRefusal`.",
+      "enum": ["joinChanged", "agentPaused", "admissionBusy", "delegationTurn", "runtimeNoSteer", "runtimeRefused", "noActiveTurn", "imagePathRequired", "imageUnavailable", "turnFinishing"]
+    },
+    "ownerInputErrorCode": {
+      "description": "Error `code` of an owner input request or cutex/userInput/failed.",
+      "enum": ["admission_busy", "steer_unavailable", "turn_conflict", "session_offline", "outcome_unknown", "request_outcome_unknown", "revision_conflict", "queue_item_not_found", "queue_input_already_submitted", "user_input_in_progress", "event_persistence_unavailable", "invalid_input", "app_server_unavailable", "interrupt_timeout", "owner_required", "admission_timeout"]
+    },
+    "ownerAdmissionState": {
+      "description": "queue/list `ownerAdmission.state`.",
+      "enum": ["idle", "turn", "finishing", "held"]
+    },
+    "ownerAdmissionHeldReason": {
+      "description": "queue/list `ownerAdmission.reason` when state is held.",
+      "enum": ["hostBusy", "stopHold", "paused", "delegationLease"]
+    }
+  }
+}

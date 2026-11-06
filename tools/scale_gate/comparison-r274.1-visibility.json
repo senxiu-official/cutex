@@ -1,0 +1,167 @@
+{
+  "prior_harness_sha": "d651ed2cf70139e4442bdc2c90bda86aa71d5cea",
+  "product_sha": "5c8eb804607939054ab8af761519049404cbf397",
+  "prior_session_and_host_evidence_valid": false,
+  "reasons": [
+    "agent_enabled false excluded host catalog",
+    "registration_class local_only / exposed_to_backend false hid active sessions",
+    "roster lock absent returned empty roster before JSON decode",
+    "roster +00:00 timestamps were invalid for typed canonical RFC3339 after lock was added"
+  ],
+  "cases": {
+    "health/N=4": {
+      "old": {
+        "response_bytes": 119.0,
+        "parse_bytes_per_request": 36483508,
+        "latency_median_ms": 625.6922999746166,
+        "peak_private_bytes": 710262784
+      },
+      "new": {
+        "response_bytes": 352.0,
+        "parse_bytes_per_request": 36462444,
+        "latency_median_ms": 638.753250008449,
+        "peak_private_bytes": 841949184
+      },
+      "verified": {
+        "stuck_bus_messages": 1
+      },
+      "new_failed": true
+    },
+    "sessions/N=4": {
+      "old": {
+        "response_bytes": 1397.0,
+        "parse_bytes_per_request": 1111,
+        "latency_median_ms": 52.62690002564341,
+        "peak_private_bytes": 428417024
+      },
+      "new": {
+        "response_bytes": 728836.5,
+        "parse_bytes_per_request": 3010,
+        "latency_median_ms": 503.96160007221624,
+        "peak_private_bytes": 594665472
+      },
+      "verified": {
+        "rows": 166,
+        "first_id": "cutex.scale-00000",
+        "last_id": "cutex.scale-00165"
+      },
+      "new_failed": false
+    },
+    "host-session-page/N=4": {
+      "old": {
+        "response_bytes": 81.0,
+        "parse_bytes_per_request": 261,
+        "latency_median_ms": 12.328100041486323,
+        "peak_private_bytes": 429789184
+      },
+      "new": {
+        "response_bytes": 451.0,
+        "parse_bytes_per_request": 261,
+        "latency_median_ms": 138.9381000190042,
+        "peak_private_bytes": 622759936
+      },
+      "verified": {
+        "rows": 1,
+        "id": "cutex.scale-00000",
+        "project": "scale-project"
+      },
+      "new_failed": true
+    },
+    "queue-list/N=4": {
+      "old": {
+        "response_bytes": 374.0,
+        "parse_bytes_per_request": 2231,
+        "latency_median_ms": 40.76050000730902,
+        "peak_private_bytes": 430682112
+      },
+      "new": {
+        "response_bytes": 949.0,
+        "parse_bytes_per_request": 2231,
+        "latency_median_ms": 30.79199994681403,
+        "peak_private_bytes": 622551040
+      },
+      "verified": {
+        "rows": 1,
+        "id": "queue-scale-sentinel",
+        "paused": true
+      },
+      "new_failed": false
+    },
+    "usage-day/N=4": {
+      "old": {
+        "response_bytes": 1098.0,
+        "parse_bytes_per_request": 167472062.75,
+        "latency_median_ms": 10950.621049967594,
+        "peak_private_bytes": 2332549120
+      },
+      "new": {
+        "response_bytes": 1098.0,
+        "parse_bytes_per_request": 167476861.75,
+        "latency_median_ms": 7243.131499970332,
+        "peak_private_bytes": 2457686016
+      },
+      "verified": {
+        "rows": 1,
+        "total": 6
+      },
+      "new_failed": true
+    },
+    "claude-api-quota/N=4": {
+      "old": {
+        "response_bytes": 1032.0,
+        "parse_bytes_per_request": 167470529.75,
+        "latency_median_ms": 10701.70070003951,
+        "peak_private_bytes": 2383802368
+      },
+      "new": {
+        "response_bytes": 1032.0,
+        "parse_bytes_per_request": 167475328.75,
+        "latency_median_ms": 7959.707650064956,
+        "peak_private_bytes": 2479108096
+      },
+      "verified": {
+        "source": "claudeApi",
+        "last30DaysTotal": 6
+      },
+      "new_failed": true
+    },
+    "delegation-restore/N=4": {
+      "old": {
+        "response_bytes": 10334.0,
+        "parse_bytes_per_request": 0,
+        "latency_median_ms": 38.073500036261976,
+        "peak_private_bytes": 955916288
+      },
+      "new": {
+        "response_bytes": 9974.0,
+        "parse_bytes_per_request": 0,
+        "latency_median_ms": 34.216800006106496,
+        "peak_private_bytes": 667013120
+      },
+      "verified": {
+        "rows": 10,
+        "closed": "completed"
+      },
+      "new_failed": false
+    },
+    "notifications/N=4": {
+      "old": {
+        "response_bytes": 20.0,
+        "parse_bytes_per_request": 76060,
+        "latency_median_ms": 9.318850061390549,
+        "peak_private_bytes": 955494400
+      },
+      "new": {
+        "response_bytes": 412.0,
+        "parse_bytes_per_request": 75116,
+        "latency_median_ms": 6.866499956231564,
+        "peak_private_bytes": 667693056
+      },
+      "verified": {
+        "rows": 1,
+        "id": "notice-scale-sentinel"
+      },
+      "new_failed": true
+    }
+  }
+}

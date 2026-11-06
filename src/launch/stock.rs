@@ -861,6 +861,7 @@ impl StockConfiguration {
             self.reasoning.as_ref(),
             None,
             true,
+            false,
         )?;
         Ok(())
     }
@@ -1052,6 +1053,7 @@ fn configuration_for_record(
         record.reasoning_defaults.as_ref(),
         None,
         migration,
+        false,
     )?;
     let profiles = crate::profiles::settings_api::load_store()?;
     let family = conversation_family_for_record(record, &profiles);
@@ -1107,6 +1109,7 @@ pub fn bootstrap_configuration(
         Some(&spec.reasoning),
         None,
         false,
+        false,
     )
 }
 
@@ -1123,6 +1126,7 @@ pub fn local_bootstrap_configuration(
         Some(&spec.model),
         Some(&spec.reasoning),
         None,
+        true,
         true,
     )
 }
@@ -1164,6 +1168,7 @@ pub fn local_configuration_with_selection(
         selected_and_default_effort(reasoning, defaults.and_then(|d| d.reasoning.as_ref()), inherited.reasoning.as_ref()).0,
         selected_and_default_effort(reasoning, defaults.and_then(|d| d.reasoning.as_ref()), inherited.reasoning.as_ref()).1,
         true,
+        false,
     )
 }
 
@@ -1189,6 +1194,9 @@ fn configuration_for_selection(
     selected_reasoning: Option<&String>,
     default_reasoning: Option<&String>,
     migration: bool,
+    // A new managed agent: its model must be on the profile's model list
+    // (`profiles::model_check`).
+    check_listed: bool,
 ) -> anyhow::Result<StockConfiguration> {
     use crate::profiles::model::{AccountsStore, CliKind, RuntimeConfig};
     // A new-session / inherited default effort is a DEFAULT, not a choice:
@@ -1302,6 +1310,15 @@ fn configuration_for_selection(
             selected_model,
             selected_reasoning,
         )?;
+        if check_listed {
+            super::selected_profile::validate_listed_model(
+                projection.catalog.as_ref(),
+                &account.name,
+                &model,
+                &crate::profiles::model_check::check(account, &model),
+                crate::profiles::model_check::unlisted_allowed(),
+            )?;
+        }
         let effort_fallback = super::selected_profile::EffortFallback::of(&model, selected_reasoning, profile_default, reasoning.as_deref());
         if let Some(fallback) = &effort_fallback {
             LAST_EFFORT_FALLBACK.with(|slot| *slot.borrow_mut() = Some(fallback.clone()));

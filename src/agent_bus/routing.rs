@@ -31,6 +31,8 @@ impl AgentTargetResolutionCode {
 
 #[derive(Debug)]
 pub struct AgentTargetResolutionError {
+    /// The durable recipient session of a `TargetUnavailable` refusal (054 decision 2).
+    target_cutex_session_id: Option<String>,
     code: AgentTargetResolutionCode,
     detail: String,
 }
@@ -38,13 +40,26 @@ pub struct AgentTargetResolutionError {
 impl AgentTargetResolutionError {
     fn new(code: AgentTargetResolutionCode, detail: impl Into<String>) -> Self {
         Self {
+            target_cutex_session_id: None,
             code,
             detail: detail.into(),
         }
     }
 
+    pub(crate) fn unavailable(target: &str, detail: impl Into<String>) -> Self {
+        Self {
+            target_cutex_session_id: Some(target.to_string()),
+            ..Self::new(AgentTargetResolutionCode::TargetUnavailable, detail)
+        }
+    }
+
     pub fn code(&self) -> AgentTargetResolutionCode {
         self.code
+    }
+
+    /// The durable session a `TargetUnavailable` refusal is about.
+    pub fn target_cutex_session_id(&self) -> Option<&str> {
+        self.target_cutex_session_id.as_deref()
     }
 
     pub fn ambiguous(detail: impl Into<String>) -> Self {
@@ -149,6 +164,74 @@ pub fn resolve_agent_target_for_sender_with_sessions(
     sender_agent_id: Option<&str>,
     all_groups: bool,
     sessions: Option<&CutexSessionStore>,
+) -> anyhow::Result<String> {
+    if sessions.is_none() {
+        return resolve_agent_target_with_notes(state,target,sender_agent_id,all_groups).map(|(id,_)|id);
+    }
+    resolve_registered_target(state,target,sender_agent_id,all_groups,sessions)
+}
+
+/// Formal names first bind a durable session; registered labels never override
+/// its current occurrence or turn into authority after a rename.
+pub fn resolve_agent_target_with_notes(
+    state:&Arc<Mutex<AgentBusState>>,target:&str,sender_agent_id:Option<&str>,all_groups:bool,
+) -> anyhow::Result<(String,Vec<crate::agent_names::RenameNote>)> {
+    let (exact_runtime,visible)={
+        let state=state.lock().map_err(|_|anyhow!("agent bus state lock poisoned"))?;
+        (state.agents.contains_key(target),visible_agents_for_request(&state,sender_agent_id,all_groups))
+    };
+    if exact_runtime||visible.iter().any(|agent|agent.session_id.as_deref()==Some(target)) {
+        return resolve_registered_target(state,target,sender_agent_id,all_groups,None).map(|id|(id,Vec::new()));
+    }
+    if is_full_durable_cutex_session_id(target) {
+        let mut sessions=CutexSessionStore::default();
+        if let Some(record)=crate::session::store::shared_session_row(target)? {
+            sessions.sessions.insert(target.into(),(*record).clone());
+        }
+        return resolve_registered_target(state,target,sender_agent_id,all_groups,Some(&sessions)).map(|id|(id,Vec::new()));
+    }
+    let sessions=crate::session::store::with_cutex_session_store(|store| {
+        let mut selected=CutexSessionStore::default();
+        for record in store.sessions.values().filter(|record|visible.iter().any(|agent|
+            record.current_runtime_agent_id.as_deref()==Some(agent.id.as_str())
+            ||record.codex_session_id.as_deref().is_some_and(|native|agent.session_id.as_deref()==Some(native)))) {
+            selected.sessions.insert(record.cutex_session_id.clone(),record.clone());
+        }
+        selected
+    })?;
+    let directory=crate::asks::directory::Directory::load().map_err(|e|anyhow!("{}",e.to_json()))?;
+    let caller=sender_agent_id.and_then(|runtime|sessions.sessions.values()
+        .find(|record|record.current_runtime_agent_id.as_deref()==Some(runtime)))
+        .map(|record|record.cutex_session_id.as_str());
+    // An authenticated legacy runtime without a durable caller may only use
+    // its existing group-scoped ephemeral endpoint names.
+    if sender_agent_id.is_none()||caller.is_some() {
+        match directory.resolve_scoped(caller,target,None) {
+            Ok((agent,resolution))=>{
+                let mut selected=CutexSessionStore::default();
+                if let Some(record)=crate::session::store::shared_session_row(&agent.cutex_session_id)? {
+                    selected.sessions.insert(agent.cutex_session_id.clone(),(*record).clone());
+                }
+                return resolve_registered_target(state,&agent.cutex_session_id,sender_agent_id,all_groups,Some(&selected))
+                    .map(|id|(id,resolution.rename_notes));
+            },
+            Err(error) if error.code=="id_not_found"=>{},
+            Err(error)=>return Err(anyhow::Error::new(AgentTargetResolutionError::new(
+                if error.code=="id_ambiguous" {AgentTargetResolutionCode::Ambiguous}else{AgentTargetResolutionCode::NotFound},
+                error.to_json().to_string()))),
+        }
+    }
+    let ephemeral=visible.into_iter().filter(|agent|agent.cutex_session_id.is_none()
+        &&!sessions.sessions.values().any(|record|record.current_runtime_agent_id.as_deref()==Some(agent.id.as_str())
+            ||record.codex_session_id.as_deref().is_some_and(|native|agent.session_id.as_deref()==Some(native))))
+        .collect::<Vec<_>>();
+    resolve_visible_agent_target(&ephemeral,target,all_groups,"visible ephemeral runtime scope")
+        .map(|agent|(agent.id,Vec::new())).map_err(Into::into)
+}
+
+fn resolve_registered_target(
+    state:&Arc<Mutex<AgentBusState>>,target:&str,sender_agent_id:Option<&str>,all_groups:bool,
+    sessions:Option<&CutexSessionStore>,
 ) -> anyhow::Result<String> {
     let state = state
         .lock()
@@ -268,20 +351,20 @@ fn resolve_durable_target(
                     .as_deref()
                     .filter(|_| !crate::agent_management::agent_execution_blocked(&record) && record.runtime_generation > 0);
                 let Some(runtime_id) = runtime_id else {
-                    return Err(AgentTargetResolutionError::new(
-                        AgentTargetResolutionCode::TargetUnavailable,
+                    return Err(AgentTargetResolutionError::unavailable(
+                        &record.cutex_session_id,
                         format!("Durable cutex session `{target}` has no current online endpoint"),
                     ));
                 };
                 let Some(agent) = state.agents.get(runtime_id) else {
-                    return Err(AgentTargetResolutionError::new(
-                        AgentTargetResolutionCode::TargetUnavailable,
+                    return Err(AgentTargetResolutionError::unavailable(
+                        &record.cutex_session_id,
                         format!("Durable cutex session `{target}` has no current online endpoint"),
                     ));
                 };
                 if !roster_agent_matches_session(agent, record) {
-                    return Err(AgentTargetResolutionError::new(
-                        AgentTargetResolutionCode::TargetUnavailable,
+                    return Err(AgentTargetResolutionError::unavailable(
+                        &record.cutex_session_id,
                         format!("Durable cutex session `{target}` has a stale runtime endpoint"),
                     ));
                 }

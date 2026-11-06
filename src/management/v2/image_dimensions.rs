@@ -8,13 +8,22 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const PNG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
 pub(super) fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    dimensions_in(bytes, bytes.len())
+}
+
+pub(super) fn header_len() -> usize {
+    MAX_HEADER_BYTES
+}
+
+/// `total`: the whole file's length when `bytes` is only its header (webp needs it).
+pub(super) fn dimensions_in(bytes: &[u8], total: usize) -> Option<(u32, u32)> {
     let header = &bytes[..bytes.len().min(MAX_HEADER_BYTES)];
     if header.starts_with(PNG) {
         png(header)
     } else if header.starts_with(b"\xff\xd8") {
         jpeg(header)
     } else if header.starts_with(b"RIFF") {
-        webp(header, bytes.len())
+        webp(header, total)
     } else if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
         gif(header)
     } else {

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Backend upgrade debug drill (default public 0.1.5 -> 0.2.0).
+"""Backend upgrade debug drill (default public 0.2.0 -> 0.2.1).
 
     python upgrade-e2e.py --from-cutex DIR --from-commit SHA --to-cutex DIR --to-commit SHA
-        --components DIR --work DIR --release-meta DIR --confirm-one-way 0.2.0
+        --components DIR --work DIR --release-meta DIR --confirm-one-way 0.2.1
         [--new-native none|stub|DIR] [--service-name LABEL] [--unit-dir DIR]
         [--claude-python PATH] [--rustc RUSTC] [--generator upgrade-manifest.py] [--no-cleanup]
 
@@ -40,9 +40,9 @@ The empty home does not prove migration of pre-existing nonempty asks/delegation
 
 Read-only public-asset verification (no executable, service or registry writes):
     python upgrade-e2e.py signed-asset-preflight --assets DIR --public-key TRUSTED_KEY
-        [--release 0.1.5] [--platform linux-x64|windows-x64]
+        [--release 0.2.0] [--platform linux-x64|windows-x64]
 This verifies actual signed assets, not real-binary upgrade acceptance. Its --help explains
-the disposable-VM acceptance path and the remaining formal 0.2.0 signing dependency.
+the disposable-VM acceptance path and the remaining formal 0.2.1 signing dependency.
 
 Needs Python 3.10+ with cryptography (CI pins it), rustc for the broken stub and Node >=24.9
 for component builds. Choose a --work path with a space; Windows private homes need an
@@ -988,18 +988,6 @@ def components(host: Host, args: argparse.Namespace, versions: dict[str, str]) -
 
 
 
-def synthetic_rollback_omission(to_label: str, to_commit: str) -> str | None:
-    """The approved CI exception is tied to validated build identity, never a ref name."""
-    if (to_label, to_commit) != ("0.2.0", "9f73365dd88e3ef4d9e145972f72ea9a28c59d47"):
-        return None
-    return (
-        "Frozen product9f 0.2.0: omit only the synthetic failed-release rollback leg. "
-        "The legacy converter rejects the already-SQLite 0.2.0 rollback target; "
-        "recovery is controlled by the next NEW upgrader. "
-        "Upgrade and component assertions remain required; other target identities run rollback. "
-        "Tracking: https://github.com/senxiu-official/cutex/blob/release/.github/ci/upgrade-rollback-same-target.md"
-    )
-
 
 def rollback_leg(host: Host, release: Release, generator: Path, work: Path, to_label: str, to_commit: str) -> None:
     phase(f"rollback leg: apply {BROKEN_LABEL} (its daemon exits) -> rolled-back on {to_label}")
@@ -1244,14 +1232,14 @@ def signed_asset_preflight(argv: list[str]) -> int:
     To exercise those bytes, use a fresh disposable VM per platform with no cutex install,
     the embedded release key, standard service names and a dedicated OS user/home. Mirror
     the unchanged signed channel, manifests and artifacts of BOTH releases (and components /
-    natives) onto an isolated source, then install 0.1.5 and check/stage/apply 0.2.0 with
-    --confirm-one-way 0.2.0. Never re-sign a manifest or inject a test trust key. The 0.2.0
+    natives) onto an isolated source, then install 0.2.0 and check/stage/apply 0.2.1 with
+    --confirm-one-way 0.2.1. Never re-sign a manifest or inject a test trust key. The 0.2.1
     formal signatures/channel exist only after the public signing workflow has run.
     """
     parser = argparse.ArgumentParser(description=signed_asset_preflight.__doc__)
     parser.add_argument("--assets", required=True, type=Path)
     parser.add_argument("--public-key", required=True, type=Path, help="independently trusted release key (not downloaded with assets)")
-    parser.add_argument("--release", default="0.1.5")
+    parser.add_argument("--release", default="0.2.0")
     parser.add_argument("--platform", choices=("linux-x64", "windows-x64"), default=PLATFORM)
     args = parser.parse_args(argv)
     root = args.assets
@@ -1283,7 +1271,7 @@ def signed_asset_preflight(argv: list[str]) -> int:
 # ------------------------------------------------------- formal production run
 
 FORMAL_PUBLIC_KEY = "RWRH9INhAb2gACJAg/h5EBjbudos2LXj6K+5hRBEGeVLDKaKzE+FICmS"
-FORMAL_NATIVE_VERSION = "0.164.0-r58"
+FORMAL_NATIVE_VERSION = "0.164.0-r59"
 FORMAL_RESERVED_PORTS = {24270, 24260, 25370, 25360, 24670, 24660, 24250}
 
 
@@ -1342,7 +1330,7 @@ def prepare_formal_mirror(args: argparse.Namespace, work: Path) -> dict:
     mirror = work / "mirror"
     docs = {}
     # Do not mix old/new manifests with the same filename during lookup.
-    for release, roots in (("0.1.5", [args.old_assets]), ("0.2.0", [args.signed_assets])):
+    for release, roots in (("0.2.0", [args.old_assets]), ("0.2.1", [args.signed_assets])):
         dest = mirror / f"cutex-{release}"
         manifest_path = copy_formal_signed("manifest.json", roots, dest, args.public_key)
         doc = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1354,7 +1342,7 @@ def prepare_formal_mirror(args: argparse.Namespace, work: Path) -> dict:
         copy_formal_signed("SHA256SUMS", roots, dest, args.public_key)
         artifact = doc["cutex"]["artifacts"][PLATFORM]
         require(artifact["name"] == f"cutex-{release}-{PLATFORM}.tar.gz", "unexpected cutex archive name")
-        artifact_roots = roots if release == "0.1.5" else [*args.build_assets, args.signed_assets]
+        artifact_roots = roots if release == "0.2.0" else [*args.build_assets, args.signed_assets]
         archive = copy_formal_signed(artifact["name"], [*artifact_roots, *roots],
                                      mirror / formal_label(artifact.get("tag", f"cutex-{release}")), args.public_key)
         verify_formal_artifact(archive, artifact)
@@ -1363,17 +1351,17 @@ def prepare_formal_mirror(args: argparse.Namespace, work: Path) -> dict:
         require(sums == [artifact["sha256"]], f"signed release SHA256SUMS mismatch: {release}")
         docs[release] = {"manifest": doc, "archive": archive, "dir": dest,
                          "caps": json.loads(caps.read_text(encoding="utf-8"))}
-    target = docs["0.2.0"]["manifest"]
+    target = docs["0.2.1"]["manifest"]
     require(target["cutex"]["commit"] == args.expected_commit, "signed target commit differs from expected Build/Sign SHA")
-    require(target["sequence"] > docs["0.1.5"]["manifest"]["sequence"], "target sequence must increase")
-    require(target.get("mode") == "full", "formal 0.2.0 must request full restart")
-    require(any(m.get("class") == "one-way" and m.get("since") == "0.2.0"
+    require(target["sequence"] > docs["0.2.0"]["manifest"]["sequence"], "target sequence must increase")
+    require(target.get("mode") == "full", "formal 0.2.1 must request full restart")
+    require(any(m.get("class") == "one-way" and m.get("since") == "0.2.1"
                 for m in target["cutex"].get("migrations", [])), "formal target lacks its one-way migration")
     channel_path = copy_formal_signed("channel.json", [args.signed_assets], mirror / "channel-release", args.public_key)
     channel = json.loads(channel_path.read_text(encoding="utf-8"))
     require(channel.get("schema") == "cutex/channel/v1" and channel.get("channel") == "release"
-            and channel.get("release") == "0.2.0" and channel.get("sequence") == target["sequence"]
-            and channel.get("manifestSha256") == ce.sha256(docs["0.2.0"]["dir"] / "manifest.json"),
+            and channel.get("release") == "0.2.1" and channel.get("sequence") == target["sequence"]
+            and channel.get("manifestSha256") == ce.sha256(docs["0.2.1"]["dir"] / "manifest.json"),
             "signed channel does not bind the supplied target manifest")
     native = target.get("native") or {}
     require(native.get("version") == args.expected_native_version, "signed manifest native version differs from requested version")
@@ -1384,7 +1372,7 @@ def prepare_formal_mirror(args: argparse.Namespace, work: Path) -> dict:
         artifact = part.get("artifacts", {}).get(PLATFORM)
         if artifact is None:
             continue
-        tag = formal_label(artifact.get("tag", "cutex-0.2.0"))
+        tag = formal_label(artifact.get("tag", "cutex-0.2.1"))
         archive = copy_formal_signed(formal_label(artifact["name"]), roots, mirror / tag, args.public_key)
         verify_formal_artifact(archive, artifact)
         if part is native:
@@ -1401,7 +1389,7 @@ def formal_runner_home(args: argparse.Namespace, environ: dict | None = None) ->
             "formal-assets runs only on fresh GitHub-hosted runners; never a developer/live host")
     require(sys.platform in ("linux", "win32"), "formal-assets supports Linux/Windows only")
     require(re.fullmatch(r"[0-9a-f]{40}", args.expected_commit) is not None, "expected commit must be a full SHA")
-    require(args.confirm_one_way == "0.2.0", "formal-assets requires --confirm-one-way 0.2.0")
+    require(args.confirm_one_way == "0.2.1", "formal-assets requires --confirm-one-way 0.2.1")
     require(args.management_port != args.bus_port and all(1024 <= p <= 65535 and p not in FORMAL_RESERVED_PORTS
             for p in (args.management_port, args.bus_port)), "invalid, colliding or reserved service ports")
     profile = env.get("USERPROFILE" if WINDOWS else "HOME", "")
@@ -1494,7 +1482,7 @@ def formal_old_matches(actual, expected, defaults=None) -> bool:
 
 
 def capture_formal_baseline(state_dir: Path, fixture: dict, blobs: dict[str, bytes]) -> dict:
-    """Read and validate the persisted 0.1.5 baseline, without trusting arbitrary changes.
+    """Read and validate the persisted 0.2.0 baseline, without trusting arbitrary changes.
 
     The missing target can reconcile the pending seed exactly once: pendingReview/rev1
     -> failed/rev2/closed(completed). No attempt or answer is created. All other seed
@@ -1502,7 +1490,23 @@ def capture_formal_baseline(state_dir: Path, fixture: dict, blobs: dict[str, byt
     An unchanged pending row is valid while startup is still settling; the driver
     waits for the reconciled row before starting the upgrade.
     """
-    baseline = json.loads((state_dir / "runtime/asks/asks-v1.json").read_text(encoding="utf-8"))
+    # Public 0.2.0 already owns asks in SQLite. Its legacy JSON is an import
+    # source and may remain stale after missing-target reconciliation.
+    database = state_dir / "runtime/management-v2/management-state.sqlite3"
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("BEGIN")
+        require(db.execute("SELECT format_version,verified FROM hot_store_meta WHERE store='asks'").fetchone() == (2, 1),
+                "old public asks store is not verified format 2")
+        rows = {}
+        for table in ("hot_store_rows", "asks_archive_rows"):
+            query = ("SELECT collection,row_key,value_json FROM hot_store_rows WHERE store='asks'"
+                     if table == "hot_store_rows" else "SELECT collection,row_key,value_json FROM asks_archive_rows")
+            for collection, key, value in db.execute(query):
+                require((collection, key) not in rows, "duplicate old authoritative hot/cold ask row")
+                rows[(collection, key)] = json.loads(value)
+        baseline = {"revision": rows[("state", "revision")], "nextSeq": rows[("state", "next_seq")]}
+        for collection in ("asks", "answers", "artifacts", "deliveries", "actions"):
+            baseline[collection] = {key: value for (group, key), value in rows.items() if group == collection}
     require(isinstance(baseline, dict) and baseline.get("nextSeq") == fixture["nextSeq"], "old baseline nextSeq changed")
     pending = baseline.get("asks", {}).get("ask-formal-pending") or {}
     original = fixture["asks"]["ask-formal-pending"]
@@ -1594,7 +1598,7 @@ def formal_cli_json(output: str) -> dict | None:
 
 def verify_formal_selection(host: "FormalHost", target: dict) -> dict:
     selected = host.selected_runtime()
-    bundle_path = host.base / "releases/0.2.0/manifests/default.json"
+    bundle_path = host.base / "releases/0.2.1/manifests/default.json"
     require(same_path(selected.get("bundle_manifest"), bundle_path), "new agents do not select the actual target bundle")
     bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
     native = target["native"]
@@ -1603,7 +1607,7 @@ def verify_formal_selection(host: "FormalHost", target: dict) -> dict:
     for field, path in (("executable", native_dir / f"codex-app-server{EXE}"),
                         ("code_mode_host", native_dir / f"codex-code-mode-host{EXE}"),
                         ("schema", native_dir / "codex_app_server_protocol.schemas.json"),
-                        ("facade", host.base / "releases/0.2.0" / f"cutex-mcp{EXE}")):
+                        ("facade", host.base / "releases/0.2.1" / f"cutex-mcp{EXE}")):
         pin = bundle.get(field) or {}
         require(same_path(pin.get("path"), path) and pin.get("sha256") == ce.sha256(path),
                 f"selected {field} does not pin the actual formal files")
@@ -1706,7 +1710,7 @@ class FormalHost(Host):
             time.sleep(1)
         if WINDOWS:
             self.command("service", "install", "--channel", "release", "--base", str(self.base),
-                         exe=self.base / "releases/0.2.0" / f"cutex{EXE}")
+                         exe=self.base / "releases/0.2.1" / f"cutex{EXE}")
         else:
             started = self.systemctl("start", self.bus_unit, self.management_unit)
             require(started.returncode == 0, "systemd start failed")
@@ -1754,7 +1758,7 @@ def formal_assert_api(host: FormalHost, fixture: dict, blobs: dict[str, bytes], 
 
 
 def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: dict[str, bytes]) -> dict:
-    old, target = docs["0.1.5"], docs["0.2.0"]
+    old, target = docs["0.2.0"], docs["0.2.1"]
     old_dir, target_dir = host.work / "old-release", host.work / "target-reference"
     extract_formal_release(old["archive"], old_dir)
     target_hashes = extract_formal_release(target["archive"], target_dir)
@@ -1764,14 +1768,14 @@ def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: d
     host.initialize(docs["mirror"], fixture, blobs)
     _, _, line = host.command("--version", exe=old_dir / f"cutex{EXE}")
     match = VERSION_LINE.search(line)
-    require(match is not None and match["label"] == "0.1.5" and match["commit7"] == old["manifest"]["cutex"]["commit"][:7],
-            "original public 0.1.5 binary identity mismatch")
+    require(match is not None and match["label"] == "0.2.0" and match["commit7"] == old["manifest"]["cutex"]["commit"][:7],
+            "original public 0.2.0 binary identity mismatch")
     host.install_attempted = True
     host.command("service", "install", "--channel", "release", "--base", str(host.base), exe=old_dir / f"cutex{EXE}")
-    old_ready = host.wait_ready("0.1.5")
+    old_ready = host.wait_ready("0.2.0")
     require(old_ready is not None and (old_ready.get("cutexBuild") or {}).get("profile") == "release"
             and (old_ready.get("cutexBuild") or {}).get("commit") == old["manifest"]["cutex"]["commit"],
-            "original production 0.1.5 did not start as a release build")
+            "original production 0.2.0 did not start as a release build")
     host.assert_services()
     formal_assert_api(host, fixture, blobs, immutable_only=True)
     baseline = wait_formal_baseline(host, fixture, blobs)
@@ -1782,24 +1786,24 @@ def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: d
     host.command("upgrade", "config", "--source", str(docs["mirror"]), "--package-run", "none")
     _, available, _ = host.command("upgrade", "check")
     target_doc = target["manifest"]
-    require(isinstance(available, dict) and available.get("release") == "0.2.0" and available.get("class") == "one-way"
+    require(isinstance(available, dict) and available.get("release") == "0.2.1" and available.get("class") == "one-way"
             and available.get("sequence") == target_doc["sequence"] and available.get("nativeVersion") == host.args.expected_native_version,
             "embedded release trust/check did not offer exact formal target")
     _, staged, _ = host.command("upgrade", "stage")
     require((staged or {}).get("preflightOk", (staged or {}).get("preflight_ok")) is True, "formal preflight failed")
-    require(all(ce.sha256(host.base / "releases/0.2.0" / name) == digest for name, digest in target_hashes.items()),
+    require(all(ce.sha256(host.base / "releases/0.2.1" / name) == digest for name, digest in target_hashes.items()),
             "production staged binaries differ from signed archive")
     code, _, refusal = host.command("upgrade", "apply", "--max-wait", "600", allow_failure=True)
     require(code != 0 and "one_way_unconfirmed" in refusal, "production updater did not refuse missing one-way consent")
     host.command(*apply_arguments(available, host.args.confirm_one_way), "--package-run", "none")
     host.upgrade_executed = True
-    ready = host.wait_ready("0.2.0")
+    ready = host.wait_ready("0.2.1")
     require(ready is not None and (ready.get("cutexBuild") or {}).get("commit") == host.args.expected_commit
             and (ready.get("cutexBuild") or {}).get("profile") == "release",
             "formal target service commit mismatch")
     state = json.loads((host.base / "upgrade/state.json").read_text(encoding="utf-8"))
     run = state.get("run") or {}
-    require(run.get("phase") == "committed" and run.get("fromRelease") == "0.1.5" and run.get("toRelease") == "0.2.0"
+    require(run.get("phase") == "committed" and run.get("fromRelease") == "0.2.0" and run.get("toRelease") == "0.2.1"
             and run.get("class") == "one-way", "formal upgrade did not commit exact one-way transition")
     host.assert_services()
     first_state = verify_formal_state(host.home / ".cutex", baseline, blobs)
@@ -1809,7 +1813,7 @@ def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: d
     require(status == 200 and not unexpected_capability_losses(features(before_caps), features(after_caps), removed),
             "formal upgrade lost undeclared capabilities")
     host.restart_services()
-    restarted = host.wait_ready("0.2.0")
+    restarted = host.wait_ready("0.2.1")
     require(restarted is not None and (restarted.get("cutexBuild") or {}).get("commit") == host.args.expected_commit
             and (restarted.get("cutexBuild") or {}).get("profile") == "release", "formal services failed exact-release restart")
     host.assert_services()
@@ -1818,14 +1822,14 @@ def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: d
     selection = verify_formal_selection(host, target_doc)
     require(all(ce.sha256(host.installed_cli.parent / name) == digest for name, digest in target_hashes.items()),
             "running install bytes differ from formal signed target")
-    return {"evidence": "formal-signed-managed-upgrade", "from": "0.1.5", "to": "0.2.0", "commit": host.args.expected_commit,
+    return {"evidence": "formal-signed-managed-upgrade", "from": "0.2.0", "to": "0.2.1", "commit": host.args.expected_commit,
             "selectionAfterRestart": selection, "nativeVersion": selection["nativeVersion"], "runId": run.get("runId"), "phase": run["phase"],
             "stateAfterApply": first_state, "stateAfterRestart": restarted_state, "upgradeExecuted": True,
             "productionServices": True, "testTrustOverrides": False, "rollbackAttempted": False}
 
 
 def formal_assets(argv: list[str]) -> int:
-    """Actual formal signed 0.1.5 -> 0.2.0 managed upgrade, fresh hosted runner only.
+    """Actual formal signed 0.2.0 -> 0.2.1 managed upgrade, fresh hosted runner only.
 
     --build-assets may be repeated for additional native build artifacts. --signed-assets
     accepts the nested Sign dry-run artifact; --old-assets and --native-assets contain
@@ -1840,8 +1844,8 @@ def formal_assets(argv: list[str]) -> int:
     parser.add_argument("--old-assets", required=True, type=Path)
     parser.add_argument("--native-assets", required=True, type=Path)
     parser.add_argument("--public-key", required=True, type=Path)
-    parser.add_argument("--from-release", choices=("0.1.5",), default="0.1.5")
-    parser.add_argument("--to-release", choices=("0.2.0",), default="0.2.0")
+    parser.add_argument("--from-release", choices=("0.2.0",), default="0.2.0")
+    parser.add_argument("--to-release", choices=("0.2.1",), default="0.2.1")
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-native-version", default=FORMAL_NATIVE_VERSION)
     parser.add_argument("--work", required=True, type=Path)
@@ -1948,12 +1952,7 @@ def main(argv: list[str] | None = None) -> int:
         if not failures:
             components(host, args, info["components"])
         if not failures:
-            omission = synthetic_rollback_omission(to_label, args.to_commit)
-            if omission is not None:
-                phase("scoped omission: synthetic rollback for frozen product9f 0.2.0")
-                warn(omission)
-            else:
-                rollback_leg(host, release, generator, work, to_label, args.to_commit)
+            rollback_leg(host, release, generator, work, to_label, args.to_commit)
     except Exception as error:  # noqa: BLE001 - report, collect logs, clean up
         failures.append(f"exception: {error!r}")
         log(f"  FAIL  {error!r}")

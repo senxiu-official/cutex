@@ -108,8 +108,9 @@ async def test_native_question_returns_actual_answer_and_persists_projection(ph,
         elif answer=='interrupt':
             bridge.revoke();await bridge.cancel_tools()
         else:
-            result={'answers':{}} if answer=='cancel' else {'answers':{'q0':{'answers':['Pink' if answer=='selected' else 'a custom color']}}}
-            await ph.server.handle(ph.peer,{'id':req['id'],'result':result})
+            response={'error':{'code':-1,'message':'cancel'}} if answer=='cancel' else {
+                'result':{'answers':{'q0':{'answers':['Pink' if answer=='selected' else 'a custom color']}}}}
+            await ph.server.handle(ph.peer,{'id':req['id'],**response})
         if answer=='interrupt':
             with pytest.raises(asyncio.CancelledError):await task
         else:

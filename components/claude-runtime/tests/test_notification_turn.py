@@ -72,7 +72,8 @@ async def test_the_model_is_told_in_the_system_prompt(ph):
         assert phrase in RUNTIME_LIMITS
     tid = await ph.thread()
     await ph.call('claude/runtime/start', {'threadId': tid})
-    assert RUNTIME_LIMITS in ph.sdk.clients[0].options.system_prompt['append']
+    from fake_sdk import rendered_system_prompt
+    assert RUNTIME_LIMITS in rendered_system_prompt(ph.sdk.clients[0].options)['append']
 
 
 async def test_ignoring_it_runs_nothing_and_an_input_still_waits(ph, monkeypatch):

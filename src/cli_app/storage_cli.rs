@@ -7,6 +7,29 @@ use cutex::cli::args::StorageCommand;
 
 pub(super) fn run(command: StorageCommand) -> anyhow::Result<()> {
     match command {
+        StorageCommand::NotificationStore {rollback,daemon_stopped} => {
+            anyhow::ensure!(daemon_stopped,"stop every cutex writer, then repeat with --daemon-stopped");
+            let store=cutex::owner_notify::store::OwnerNotifyStore::open_default()?;
+            if rollback {store.prepare_rollback()?;}
+            let mut report=store.migrate()?;report["rollbackPrepared"]=serde_json::json!(rollback);
+            println!("{}",serde_json::to_string(&report)?);
+            Ok(())
+        },
+        StorageCommand::ApprovalStore {rollback,daemon_stopped} => {
+            anyhow::ensure!(daemon_stopped,"stop every cutex writer, then repeat with --daemon-stopped");
+            let store=cutex::approvals::ApprovalStore::open_default()?;
+            if rollback {store.prepare_rollback()?;}
+            let mut report=store.migrate()?;report["rollbackPrepared"]=serde_json::json!(rollback);
+            println!("{}",serde_json::to_string(&report)?);
+            Ok(())
+        },
+        StorageCommand::SessionRowsImport {store,daemon_stopped} => {
+            anyhow::ensure!(daemon_stopped,"stop every cutex writer, then repeat with --daemon-stopped");
+            let started=std::time::Instant::now();
+            cutex::management::v2::activity::import_session_rows(&store)?;
+            println!("{}",serde_json::json!({"store":store,"ready":true,"elapsedMs":started.elapsed().as_millis()}));
+            Ok(())
+        },
         StorageCommand::AsksArchive {before,daemon_stopped} => {
             anyhow::ensure!(daemon_stopped,"stop every cutex writer, then repeat with --daemon-stopped");
             let now=chrono::Utc::now();
@@ -31,7 +54,62 @@ pub(super) fn run(command: StorageCommand) -> anyhow::Result<()> {
             target,
             daemon_stopped,
         } => rollback_export(&target, daemon_stopped),
+        StorageCommand::UsageIndex { verify } => usage_index(verify),
+        StorageCommand::RosterStatus => {
+            let status = cutex::agent_management::roster_status(&roster_root()?)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            Ok(())
+        }
+        StorageCommand::RosterImport { daemon_stopped } => {
+            anyhow::ensure!(daemon_stopped, "stop every cutex writer, then repeat with --daemon-stopped");
+            let store = cutex::agent_management::AgentManagementStore::open(roster_root()?)?;
+            println!("{}", serde_json::to_string_pretty(&store.import_now()?)?);
+            Ok(())
+        }
+        StorageCommand::OwnerInputImport { daemon_stopped } => {
+            anyhow::ensure!(daemon_stopped, "stop every cutex writer, then repeat with --daemon-stopped");
+            let root = cutex::config::paths::runtime_dir()?.join("management-v2");
+            let repository = cutex::management::v2::user_input::UserInputRepository::open(root)?;
+            println!("{}", serde_json::to_string_pretty(&repository.migration_report()?)?);
+            Ok(())
+        }
+        StorageCommand::RosterExport { daemon_stopped } => {
+            anyhow::ensure!(daemon_stopped, "stop every cutex writer, then repeat with --daemon-stopped");
+            let store = cutex::agent_management::AgentManagementStore::open(roster_root()?)?;
+            println!("{}", serde_json::to_string_pretty(&store.export_previous_now()?)?);
+            Ok(())
+        }
     }
+}
+
+fn usage_index(verify: bool) -> anyhow::Result<()> {
+    use cutex::management::v2::usage;
+    let started = std::time::Instant::now();
+    let sync = usage::sync_usage_index()?;
+    let sync_ms = started.elapsed().as_millis() as u64;
+    let verification = if verify { Some(usage::verify_usage_index()?) } else { None };
+    let path = usage::usage_index_path()?;
+    let bytes = |suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        std::fs::metadata(std::path::PathBuf::from(name)).map_or(0, |meta| meta.len())
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "sync": sync,
+            "syncMs": sync_ms,
+            "verification": verification,
+            "totalMs": started.elapsed().as_millis() as u64,
+            "indexBytes": bytes(""),
+            "walBytes": bytes("-wal"),
+        }))?
+    );
+    Ok(())
+}
+
+fn roster_root() -> anyhow::Result<std::path::PathBuf> {
+    Ok(cutex::config::paths::runtime_dir()?.join("agent-management").join("v1"))
 }
 
 fn rollback_export(target: &str, daemon_stopped: bool) -> anyhow::Result<()> {
@@ -148,7 +226,7 @@ mod tests {
         db.execute_batch("PRAGMA user_version=1;
             CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             INSERT INTO meta VALUES('store_revision','1');
-            CREATE TABLE sessions(key TEXT PRIMARY KEY,rev INTEGER NOT NULL,record_json TEXT NOT NULL);
+            CREATE TABLE sessions(key TEXT PRIMARY KEY,cutex_session_id TEXT NOT NULL,codex_session_id TEXT,formal_agent_name TEXT,archive_state TEXT NOT NULL,rev INTEGER NOT NULL,record_json TEXT NOT NULL);
             CREATE TABLE receipts(map TEXT NOT NULL,key TEXT NOT NULL,rev INTEGER NOT NULL,json TEXT NOT NULL,PRIMARY KEY(map,key));
             PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
         db.execute("INSERT INTO receipts VALUES('agent_archive','fixture',1,?1)",
@@ -274,7 +352,8 @@ mod tests {
     fn archive_commands_refuse_before_resolving_a_home_without_offline_confirmation() {
         use cutex::cli::args::StorageCommand;
         for command in [StorageCommand::AsksArchive {before:None,daemon_stopped:false},
-            StorageCommand::AsksArchiveRestore {target:"r261".into(),daemon_stopped:false}] {
+            StorageCommand::AsksArchiveRestore {target:"r261".into(),daemon_stopped:false},
+            StorageCommand::OwnerInputImport {daemon_stopped:false}] {
             assert!(super::run(command).unwrap_err().to_string().contains("--daemon-stopped"));
         }
     }

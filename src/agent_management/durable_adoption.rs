@@ -123,6 +123,7 @@ impl AgentManagementProvider {
         fork_source: Option<&crate::session::model::CutexSessionRecord>,
         created_by: Option<&crate::session::model::SessionCreatedBy>,
     ) -> anyhow::Result<HumanAdoptResult> {
+        let _runtime_reference = crate::runtime::reference_guard::acquire_shared()?;
         anyhow::ensure!(
             !request.formal_name.trim().is_empty()
                 && request.formal_name.trim() == request.formal_name

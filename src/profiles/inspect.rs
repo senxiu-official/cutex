@@ -162,11 +162,7 @@ pub fn account_uses_openai_auth(account: &StoredAccount) -> bool {
 
 pub fn account_uses_api_key_auth(account: &StoredAccount) -> bool {
     account_auth_payload(account).is_some_and(|json| {
-        json.get("OPENAI_API_KEY")
-            .or_else(|| json.get("openai_api_key"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|key| !key.is_empty())
+        super::api_key::from_auth(&json).is_some()
     })
 }
 

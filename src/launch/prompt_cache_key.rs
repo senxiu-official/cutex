@@ -245,18 +245,18 @@ mod tests {
     #[test]
     fn key_is_stable_and_workspace_scoped() {
         assert_eq!(
-            workspace_key("host-a", "/home/example/work"),
-            workspace_key("host-a", "/home/example/work")
+            workspace_key("host-a", "/home/example-user/work"),
+            workspace_key("host-a", "/home/example-user/work")
         );
         assert_ne!(
-            workspace_key("host-a", "/home/example/work"),
-            workspace_key("host-a", "/home/example/other")
+            workspace_key("host-a", "/home/example-user/work"),
+            workspace_key("host-a", "/home/example-user/other")
         );
         assert_ne!(
-            workspace_key("host-a", "/home/example/work"),
-            workspace_key("host-b", "/home/example/work")
+            workspace_key("host-a", "/home/example-user/work"),
+            workspace_key("host-b", "/home/example-user/work")
         );
-        let key = workspace_key("host-a", "/home/example/work");
+        let key = workspace_key("host-a", "/home/example-user/work");
         assert!(key.starts_with("cutex-host-a-") && key.len() == "cutex-host-a-".len() + 16);
     }
 

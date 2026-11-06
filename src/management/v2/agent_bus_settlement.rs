@@ -10,6 +10,90 @@ use super::agent_bus_settlement_model::{
 use super::agent_bus_state::{AgentBusMessageRepository, AgentBusMessageSnapshot};
 use crate::http::server::{write_json_response, SimpleHttpRequest};
 
+pub const EVIDENCE_PATH: &str = "/v2/agent-bus/stuck-messages/evidence";
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EvidenceRequest {
+    message_id: String,
+}
+
+/// Explicit owner demand. Updates only rebuildable evidence; never submits or closes input.
+fn evidence_with(
+    repository: &AgentBusMessageRepository,
+    message_id: &str,
+    now: DateTime<Utc>,
+    collector: impl FnOnce(&AgentBusMessageSnapshot) -> anyhow::Result<Observation>,
+) -> anyhow::Result<Result<serde_json::Value, Refusal>> {
+    let Some(snapshot) = repository.snapshot_by_message_id(message_id)? else {
+        return Ok(Err(Refusal::new(
+            404,
+            "message_not_found",
+            "message not found",
+        )));
+    };
+    if let Some(closed) = repository
+        .settlement_view_by_id(message_id, now)?
+        .filter(|view| view.closure.is_some())
+    {
+        return Ok(Ok(json!({"messageId":message_id,"settlement":closed})));
+    }
+    let lane = super::session_coordination::session_lane(&snapshot.to_cutex_session_id)?;
+    let _reservation = lane.reserve()?;
+    let evidence = match collector(&snapshot) {
+        Ok(Observation::Terminal(evidence)) => Some(evidence),
+        Ok(Observation::Ineligible) => None,
+        Err(_) => {
+            repository.observe_settlement(message_id, None, now)?;
+            return Ok(Err(Refusal::new(
+                503,
+                "settlement_observation_unavailable",
+                "trusted runtime observation unavailable",
+            )));
+        }
+    };
+    // Collection timestamps its observation after RPC/history reads. The request's initial
+    // clock must not classify that newly collected evidence as coming from the future.
+    let refreshed_at = now.max(Utc::now());
+    repository.observe_settlement(message_id, evidence, refreshed_at)?;
+    Ok(Ok(
+        json!({"messageId":message_id,"settlement":repository.settlement_view_by_id(message_id, refreshed_at)?}),
+    ))
+}
+
+/// Called only after the same owner/full-device authentication as close.
+pub fn handle_evidence(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
+    if request.method != "POST" {
+        return refusal(stream, &Refusal::new(405, "method_not_allowed", "use POST"));
+    }
+    let parsed = match serde_json::from_slice::<EvidenceRequest>(&request.body) {
+        Ok(parsed) if !parsed.message_id.trim().is_empty() && parsed.message_id.len() <= 512 => {
+            parsed
+        }
+        _ => {
+            return refusal(
+                stream,
+                &Refusal::new(400, "invalid_request", "expected only a bounded messageId"),
+            )
+        }
+    };
+    let result = super::agent_bus_state::agent_bus_message_repository().and_then(|repository| {
+        evidence_with(repository, &parsed.message_id, Utc::now(), model::collect)
+    });
+    match result {
+        Ok(Ok(value)) => write_json_response(stream, 200, "OK", &value),
+        Ok(Err(error)) => refusal(stream, &error),
+        Err(_) => refusal(
+            stream,
+            &Refusal::new(
+                503,
+                "agent_bus_state_unavailable",
+                "message settlement state unavailable",
+            ),
+        ),
+    }
+}
+
 pub fn parse(body: &[u8]) -> Result<CloseRequest, Refusal> {
     let request: CloseRequest = serde_json::from_slice(body).map_err(|_| {
         Refusal::new(
@@ -43,6 +127,10 @@ pub fn close_with_fence(
                 Ok(snapshot) => snapshot,
                 Err(refusal) => return Ok(Err(refusal)),
             };
+            // Same per-session execution lane as submit/stop/revert. Retain its reservation
+            // across fresh history collection AND the close commit; no mutex is held during IO.
+            let lane = super::session_coordination::session_lane(&snapshot.to_cutex_session_id)?;
+            let _reservation = lane.reserve()?;
             let evidence = match collector(&snapshot) {
                 Ok(Observation::Terminal(evidence)) => evidence,
                 Ok(Observation::Ineligible) => {
@@ -94,7 +182,8 @@ fn close_with(
 }
 
 /// A notification failure cannot undo an already committed close. Durable
-/// outbox entries survive and are retried on reads, replay and background work.
+/// outbox entries survive and are retried on explicit close replay and the
+/// observer's independent background recovery loop (including offline hosts).
 pub fn repair_outbox(repository: &AgentBusMessageRepository) {
     if let Err(error) = repository.flush_settlement_outbox() {
         eprintln!("warning: settlement outbox publication deferred: {error:#}");
@@ -199,6 +288,150 @@ mod tests {
     const TO: &str = "cutex.11111111-1111-4111-8111-111111111111";
     const FROM: &str = "cutex.22222222-2222-4222-8222-222222222222";
 
+    #[test]
+    fn explicit_evidence_demand_cannot_close_resend_or_invent_receipts() {
+        let fixture = Fixture::new();
+        let now = Utc::now();
+        fixture.queued("candidate", false);
+        let before = fixture
+            .repository
+            .snapshot_by_message_id("candidate")
+            .unwrap();
+        let value = evidence_with(&fixture.repository, "candidate", now, |_| {
+            Ok(Observation::Ineligible)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(value, json!({"messageId":"candidate","settlement":null}));
+        assert_eq!(
+            before,
+            fixture
+                .repository
+                .snapshot_by_message_id("candidate")
+                .unwrap()
+        );
+        let missing = evidence_with(&fixture.repository, "missing", now, |_| {
+            panic!("missing identity must not RPC")
+        })
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(missing.status, 404);
+        let unavailable = evidence_with(&fixture.repository, "candidate", now, |_| {
+            anyhow::bail!("disconnected")
+        })
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(unavailable.status, 503);
+        assert_eq!(
+            before,
+            fixture
+                .repository
+                .snapshot_by_message_id("candidate")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn explicit_evidence_demand_returns_current_token_and_replays_closed_state_offline() {
+        let fixture = Fixture::new();
+        let now = Utc::now();
+        let evidence = fixture.reviewed("reviewed-demand", now, "held");
+        let before = fixture
+            .repository
+            .snapshot_by_message_id("reviewed-demand")
+            .unwrap();
+        let value = evidence_with(&fixture.repository, "reviewed-demand", now, |_| {
+            Ok(Observation::Terminal(evidence.clone()))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(value["settlement"]["canClose"], true);
+        assert_eq!(value["settlement"]["state"], "outcome_unknown");
+        assert_eq!(
+            before,
+            fixture
+                .repository
+                .snapshot_by_message_id("reviewed-demand")
+                .unwrap()
+        );
+        let request = fixture.request("reviewed-demand");
+        close_with(&fixture.repository, &request, "owner", now, |_| {
+            Ok(Observation::Terminal(evidence))
+        })
+        .unwrap()
+        .unwrap();
+        let closed = evidence_with(&fixture.repository, "reviewed-demand", now, |_| {
+            panic!("committed closure must be readable offline")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(closed["settlement"]["state"], "closed");
+        assert_eq!(closed["settlement"]["canClose"], false);
+    }
+
+    #[test]
+    fn explicit_evidence_uses_post_collection_clock_without_accepting_future_evidence() {
+        let fixture = Fixture::new();
+        let start = Utc::now() - chrono::Duration::seconds(2);
+        let evidence = fixture.reviewed("new-observation", Utc::now(), "held");
+        let value = evidence_with(&fixture.repository, "new-observation", start, |_| {
+            Ok(Observation::Terminal(evidence.clone()))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            value["settlement"]["canClose"], true,
+            "an observation after request start is not future evidence"
+        );
+        let mut impossible = evidence;
+        impossible.observed_at = Utc::now() + chrono::Duration::minutes(10);
+        let value = evidence_with(&fixture.repository, "new-observation", start, |_| {
+            Ok(Observation::Terminal(impossible))
+        })
+        .unwrap()
+        .unwrap();
+        assert!(
+            value["settlement"].is_null(),
+            "genuinely future evidence remains ineligible"
+        );
+    }
+
+    #[test]
+    fn owner_close_serializes_history_proof_and_commit_with_same_session_revert_lane() {
+        let fixture = Fixture::new();
+        let now = Utc::now();
+        let evidence = fixture.reviewed("lane-proof", now, "held");
+        let request = fixture.request("lane-proof");
+        let lane = super::super::session_coordination::session_lane(TO).unwrap();
+        let assert_revert_blocked = || {
+            let other = lane.clone();
+            assert!(std::thread::spawn(move || matches!(
+                other.try_lock(),
+                Err(super::super::session_coordination::ReservationError::WouldBlock)
+            ))
+            .join()
+            .unwrap());
+        };
+        let result = close_with_fence(
+            &fixture.repository,
+            &request,
+            "owner",
+            now,
+            |_| {
+                assert_revert_blocked();
+                Ok(Observation::Terminal(evidence.clone()))
+            },
+            &|_| {
+                assert_revert_blocked();
+                Ok(true)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(result.changed);
+        assert!(lane.try_lock().is_ok(), "the reservation ends after commit");
+    }
+
     struct Fixture {
         repository: AgentBusMessageRepository,
         root: PathBuf,
@@ -290,6 +523,7 @@ mod tests {
                 })
                 .unwrap();
             let evidence = model::Evidence {
+                stale_ack: None,
                 observing_generation: None,
                 schema_version: 1,
                 runtime: "claude".into(),
@@ -428,6 +662,86 @@ mod tests {
             head.split_whitespace().nth(1).unwrap().parse().unwrap(),
             serde_json::from_str(body).unwrap(),
         )
+    }
+
+    #[test]
+    fn stuck_get_does_not_publish_or_repair_pending_settlement_outbox() {
+        let fixture = Fixture::new();
+        let now = Utc::now();
+        let evidence = fixture.reviewed("read-only", now, "held");
+        fixture.repository.close_settlement_fenced(&fixture.request("read-only"), "owner", &evidence, now, &|_| Ok(true))
+            .unwrap().unwrap();
+        use super::super::hot_store;
+        let db = fixture.root.join(hot_store::DATABASE_FILE);
+        let before = hot_store::verified_rows(&db, "agent_bus").unwrap().unwrap();
+        let before_evidence = hot_store::verified_rows(&db, "agent_bus_settlement_evidence").unwrap();
+        struct Offline;
+        impl super::super::agent_bus_stuck::LiveBus for Offline {
+            fn queued(&self) -> anyhow::Result<Vec<crate::agent_bus::queue::QueuedAgentBusMessage>> { Ok(vec![]) }
+            fn withdraw(&self, _: &[String], _: &str) -> anyhow::Result<Vec<(String,String)>> { panic!("GET cannot withdraw") }
+        }
+        let (_, events) = super::super::agent_bus_state::capture_events(|| {
+            for _ in 0..2 {
+                super::super::agent_bus_stuck::list_view(&fixture.repository, &Offline, 0, None, 200, now.timestamp() as u64, &|_| None).unwrap();
+            }
+        });
+        let after = hot_store::verified_rows(&db, "agent_bus").unwrap().unwrap();
+        assert_eq!(before.generation, after.generation, "GET flushed a durable outbox");
+        assert_eq!(before.rows, after.rows);
+        let after_evidence = hot_store::verified_rows(&db, "agent_bus_settlement_evidence").unwrap();
+        assert_eq!(before_evidence.map(|v|(v.generation,v.rows)), after_evidence.map(|v|(v.generation,v.rows)));
+        assert!(events.is_empty(), "GET published an event");
+        // Recovery still belongs to the explicit/background writer.
+        let (_, repaired) = super::super::agent_bus_state::capture_events(|| repair_outbox(&fixture.repository));
+        assert!(!repaired.is_empty());
+    }
+
+    #[test]
+    fn read_only_stuck_view_never_initializes_or_migrates_a_legacy_store() {
+        let fixture = Fixture::new();
+        let root = fixture.root.join("cold");
+        let reader = AgentBusMessageRepository::open_read_only(&root);
+        assert!(reader.stuck_messages(0, 100).unwrap().is_empty());
+        assert!(!root.exists(), "diagnostics initialized a repository");
+        std::fs::create_dir(&root).unwrap();
+        let legacy = root.join("agent-bus-message-state.json");
+        let bytes = br#"{"version":2,"messages":{}}"#;
+        std::fs::write(&legacy, bytes).unwrap();
+        assert!(reader.stuck_messages(0, 100).unwrap().is_empty());
+        assert!(reader.stuck_view_by_id("absent", 100).unwrap().is_none());
+        assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "GET created a lock or SQLite migration");
+        let sessions = root.join("cutex-sessions.json");
+        assert!(super::super::agent_bus_stuck::read_session_names(&sessions).unwrap().is_empty());
+        assert!(!sessions.exists());
+        std::fs::write(&sessions, br#"{"sessions":{}}"#).unwrap();
+        assert!(super::super::agent_bus_stuck::read_session_names(&sessions).unwrap().is_empty());
+        assert!(!root.join("cutex-sessions.sqlite3").exists());
+    }
+
+    #[test]
+    fn failed_observation_is_visible_idempotent_and_never_a_delivery_receipt() {
+        let fixture = Fixture::new();
+        let evidence = fixture.reviewed("unknown", Utc::now(), "held");
+        let before = fixture.repository.snapshot_by_message_id("unknown").unwrap().unwrap();
+        assert!(fixture.repository.record_settlement_observation_failure(&before, 9).unwrap());
+        let failed = fixture.repository.snapshot_by_message_id("unknown").unwrap().unwrap();
+        assert_eq!(failed.state, before.state);
+        assert_eq!(failed.external_input_receipt, before.external_input_receipt);
+        assert!(AgentBusMessageRepository::settlement_observation_failed(&failed, 9));
+        assert!(!AgentBusMessageRepository::settlement_observation_failed(&failed, 10));
+        assert!(!fixture.repository.record_settlement_observation_failure(&before, 9).unwrap(), "stale CAS changed a newer row");
+        assert!(!fixture.repository.record_settlement_observation_failure(&failed, 9).unwrap(), "same failure rewrote storage");
+        let row = fixture.repository.stuck_view_by_id("unknown", Utc::now().timestamp() as u64).unwrap().unwrap();
+        assert_eq!(row.error.unwrap()["details"]["observationState"], "failed");
+        assert!(row.reasons.iter().any(|r|r.contains("settlement_observation_unavailable")));
+        // Changed status, not elapsed time, permits another collection.
+        let mut changed = failed.clone();
+        changed.external_input_last_observed.as_mut().unwrap().processing.reason = Some(crate::app_server::external_input::HoldReason::RequestUncertain);
+        assert!(!AgentBusMessageRepository::settlement_observation_failed(&changed, 9));
+        assert!(fixture.repository.clear_settlement_observation_failure(&failed).unwrap());
+        fixture.repository.observe_settlement("unknown", Some(evidence), Utc::now()).unwrap();
+        assert!(fixture.repository.snapshot_by_message_id("unknown").unwrap().unwrap().error.is_none());
     }
 
     #[test]

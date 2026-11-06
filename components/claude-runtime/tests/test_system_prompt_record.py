@@ -8,8 +8,26 @@ The real CLI behaviour is probed by tests/test_system_prompt_native.py.
 from __future__ import annotations
 
 from cute_claude.sdk_runtime import PROMPT_RECORD, prompt_digest
+from fake_sdk import rendered_system_prompt
 from test_persistent import ph, until  # noqa: F401  (fixture)
 from test_side_chats import native, settle  # noqa: F401  (fixture)
+
+
+def test_file_append_preserves_snapshot_and_replaces_the_same_utf8_file(tmp_path):
+    import uuid
+    from cute_claude.sdk_runtime import file_backed_system_prompt
+    from prompt_fixture import large_append
+    tid = str(uuid.uuid4())
+    original = {'type':'preset','preset':'claude_code','append':large_append(),'snapshot':False}
+    option, flags = file_backed_system_prompt(original, tmp_path / '中文目录', tid)
+    assert option == {'type':'preset','preset':'claude_code','snapshot':False}
+    from pathlib import Path
+    path = Path(flags['append-system-prompt-file'])
+    assert path.read_bytes() == large_append().encode('utf-8')
+    changed = {**original, 'append':'新提示词\n'}
+    _, second = file_backed_system_prompt(changed, path.parent, tid)
+    assert second == flags and path.read_bytes() == '新提示词\n'.encode('utf-8')
+    assert list(path.parent.iterdir()) == [path]
 
 
 def record(h, tid):
@@ -25,18 +43,18 @@ async def restart(h, tid):
 async def test_unchanged_prompt_keeps_the_snapshot_and_a_changed_one_turns_it_off(ph):
     tid = await ph.thread()
     await ph.turn(tid, 'one'); await ph.drain()
-    first = ph.sdk.clients[0].options.system_prompt
+    first = rendered_system_prompt(ph.sdk.clients[0].options)
     assert 'snapshot' not in first and ph.sdk.clients[0].options.resume is None
     assert record(ph, tid) == {'digest': prompt_digest(first['append'])}
 
     same = await restart(ph, tid)
-    assert same.options.resume and same.options.system_prompt == first  # Record reused: same cache prefix.
+    assert same.options.resume and rendered_system_prompt(same.options) == first  # Record reused: same cache prefix.
 
     # A new harness / instructions text after the session's first request.
     ph.store.db.execute('UPDATE threads SET instructions=? WHERE id=?', ('NEW_ROLE_TEXT', tid))
     changed = await restart(ph, tid)
     assert changed.options.system_prompt['snapshot'] is False
-    assert changed.options.system_prompt['append'].endswith('NEW_ROLE_TEXT')
+    assert rendered_system_prompt(changed.options)['append'].endswith('NEW_ROLE_TEXT')
     assert record(ph, tid) == {'digest': prompt_digest(first['append'])}  # The native record is still the old one.
     await ph.turn(tid, 'two'); await ph.drain()
     again = await restart(ph, tid)
@@ -45,7 +63,7 @@ async def test_unchanged_prompt_keeps_the_snapshot_and_a_changed_one_turns_it_of
     # Back to the recorded text: the record is current again.
     ph.store.db.execute("UPDATE threads SET instructions='' WHERE id=?", (tid,))
     back = await restart(ph, tid)
-    assert back.options.system_prompt == first
+    assert rendered_system_prompt(back.options) == first
 
 
 async def test_compaction_rerecords_the_launch_prompt(ph):
@@ -55,7 +73,7 @@ async def test_compaction_rerecords_the_launch_prompt(ph):
     client = await restart(ph, tid)
     assert client.options.system_prompt['snapshot'] is False
     await client.events.put({'type': 'system', 'subtype': 'compact_boundary', 'data': {}})
-    current = prompt_digest(client.options.system_prompt['append'])
+    current = prompt_digest(rendered_system_prompt(client.options)['append'])
     await until(lambda: record(ph, tid) == {'digest': current})
     after = await restart(ph, tid)
     assert 'snapshot' not in after.options.system_prompt
@@ -76,7 +94,7 @@ async def test_auto_mode_change_after_the_first_request_reaches_the_prompt(ph):
     await ph.turn(tid, 'one'); await ph.drain()
     await ph.server.approvals.configure(tid, 'auto')
     client = await restart(ph, tid)
-    assert client.options.system_prompt['snapshot'] is False and AUTO_MODE_LIMIT in client.options.system_prompt['append']
+    assert client.options.system_prompt['snapshot'] is False and AUTO_MODE_LIMIT in rendered_system_prompt(client.options)['append']
 
 
 async def test_side_chat_inherits_the_parent_record(ph, native):
@@ -85,12 +103,12 @@ async def test_side_chat_inherits_the_parent_record(ph, native):
     await ph.turn(tid, 'one'); await ph.drain()
     for instructions in ('', 'NEW_ROLE_TEXT'):
         ph.store.db.execute('UPDATE threads SET instructions=? WHERE id=?', (instructions, tid))
-        parent = (await restart(ph, tid)).options.system_prompt
+        parent = rendered_system_prompt((await restart(ph, tid)).options)
         assert ('snapshot' in parent) == bool(instructions)
         chat = (await ph.call('claude/side/open', {'threadId': tid}))['chat']
         assert record(ph, chat['threadId']) == record(ph, tid)
         await ph.call('claude/side/send', {'threadId': tid, 'chatId': chat['id'], 'text': 'q', 'clientMessageId': 'm'})
         await settle(ph, tid, chat['id'])
         side = ph.sdk.clients[-1].options
-        assert side.resume == ph.engine.session(chat['threadId'])['session_id'] and side.system_prompt == parent
+        assert side.resume == ph.engine.session(chat['threadId'])['session_id'] and rendered_system_prompt(side) == parent
         await ph.call('claude/side/close', {'threadId': tid, 'chatId': chat['id']})

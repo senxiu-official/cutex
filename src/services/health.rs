@@ -25,6 +25,7 @@ pub enum ServiceHealth {
     Unreachable,
     Starting,
     Stopped,
+    StoppedIdle,
     CrashLooped,
 }
 
@@ -35,6 +36,7 @@ impl ServiceHealth {
             Self::Unreachable => "unreachable",
             Self::Starting => "starting",
             Self::Stopped => "stopped",
+            Self::StoppedIdle => "stoppedIdle",
             Self::CrashLooped => "crashLooped",
         }
     }
@@ -45,6 +47,7 @@ impl ServiceHealth {
             "unreachable" => Some(Self::Unreachable),
             "starting" => Some(Self::Starting),
             "stopped" => Some(Self::Stopped),
+            "stoppedIdle" => Some(Self::StoppedIdle),
             "crashLooped" => Some(Self::CrashLooped),
             _ => None,
         }
@@ -56,6 +59,9 @@ impl ServiceHealth {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSnapshot {
+    /// Supervisor projection for other processes; they must not invent lifecycle clocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_stop_at: Option<String>,
     #[serde(default)]
     pub last_traffic_at: Option<String>,
     pub health: ServiceHealth,
@@ -127,14 +133,29 @@ fn connect(port: u16) -> Option<TcpStream> {
 /// TCP connect to loopback; with a `path`, also `GET path` and require an
 /// HTTP status below 500 (a 404 still proves the server is up).
 pub fn probe(port: u16, path: Option<&str>) -> bool {
-    let Some(mut stream) = connect(port) else {
+    probe_inner(port, path, None)
+}
+
+/// Admission waits have one total budget, including slow HTTP probes.
+pub(super) fn probe_until(port: u16, path: Option<&str>, deadline: std::time::Instant) -> bool {
+    probe_inner(port, path, Some(deadline))
+}
+
+fn probe_inner(port: u16, path: Option<&str>, deadline: Option<std::time::Instant>) -> bool {
+    let remaining = || deadline.map_or(Some(HTTP_TIMEOUT), |at| at.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()).map(|d| d.min(HTTP_TIMEOUT)));
+    let connection = if let Some(deadline) = deadline {
+        [SocketAddr::from((Ipv4Addr::LOCALHOST, port)), SocketAddr::from((Ipv6Addr::LOCALHOST, port))].iter().find_map(|address| {
+            deadline.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()).and_then(|left| TcpStream::connect_timeout(address, left.min(CONNECT_TIMEOUT)).ok())
+        })
+    } else { connect(port) };
+    let Some(mut stream) = connection else {
         return false;
     };
     let Some(path) = path else {
         return true;
     };
-    stream.set_read_timeout(Some(HTTP_TIMEOUT)).ok();
-    stream.set_write_timeout(Some(HTTP_TIMEOUT)).ok();
+    let Some(timeout) = remaining() else { return false };
+    stream.set_write_timeout(Some(timeout)).ok();
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: cutex-services-probe\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
@@ -144,6 +165,8 @@ pub fn probe(port: u16, path: Option<&str>) -> bool {
     let mut buffer = [0_u8; 64];
     let mut read = 0;
     while read < 12 {
+        let Some(timeout) = remaining() else { return false };
+        stream.set_read_timeout(Some(timeout)).ok();
         match stream.read(&mut buffer[read..]) {
             Ok(0) | Err(_) => break,
             Ok(count) => read += count,
@@ -166,6 +189,25 @@ fn http_status_ok(head: &[u8]) -> bool {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn startup_probe_obeys_one_total_budget_even_for_a_slow_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+            for byte in b"HTTP/1.1 200 OK\r\n\r\n" {
+                if stream.write_all(&[*byte]).is_err() { break; }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let start = std::time::Instant::now();
+        assert!(!probe_until(port, Some("/"), start + Duration::from_millis(100)));
+        assert!(start.elapsed() < Duration::from_millis(600));
+        server.join().unwrap();
+        assert!(!probe_until(port, None, std::time::Instant::now() - Duration::from_millis(1)));
+    }
 
     #[test]
     fn external_health_follows_probe() {

@@ -119,7 +119,7 @@ and survive; only an explicit owner action creates a note from Side output.
 Important error codes:
 
 - `side_runtime_unsupported` (409): a Claude parent whose adapter does not
-  declare `sideChat` (claude-r20 and older), or a Side thread as parent.
+  declare `sideChat`, or a Side thread as parent.
 - `side_runtime_offline` (409): parent is not connected.
 - `side_chat_already_open` (409): different requested origin/model; includes id.
 - `side_fork_outcome_unknown` (409): fork result has not yet resolved.

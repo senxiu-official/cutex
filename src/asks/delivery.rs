@@ -37,6 +37,9 @@ fn push(state: &mut AskState, ask: &AskRecord, kind: DeliveryKind, ref_id: Strin
             claimed_by: None,
             event_id: None,
             passive,
+            owner_hold: false,
+            owner_input_id: None,
+            unsubmitted: true,
             settled_by: None,
             routed_to: None,
             created_at: now_rfc3339(now),
@@ -123,6 +126,27 @@ pub fn record_handover_delivery(state: &mut AskState, ask: &AskRecord, controlle
 /// The state name of a "needs the owner" delivery (r208).
 pub const BLOCKED_OWNER_ACTION: &str = "blockedOwnerAction";
 
+/// Source settlement of an obsolete notice, never a fabricated read receipt.
+pub const SUPERSEDED: &str = "superseded";
+
+/// Retire only notices proved never submitted or reserved. Frozen batches,
+/// owner carries, unknown sends and actual reads retain their original facts.
+pub fn supersede_blocked_owner_action(state: &mut AskState, ask_id: &str, now: DateTime<Utc>) {
+    for delivery in state.deliveries.values_mut().filter(|delivery| {
+        delivery.ask_id == ask_id
+            && delivery.kind == DeliveryKind::State
+            && delivery.ref_id == BLOCKED_OWNER_ACTION
+            && delivery.state == DeliveryState::Pending
+            && delivery.unsubmitted
+            && delivery.event_id.is_none()
+            && delivery.owner_input_id.is_none()
+    }) {
+        delivery.state = DeliveryState::Acknowledged;
+        delivery.settled_by = Some(SUPERSEDED.into());
+        delivery.updated_at = now_rfc3339(now);
+    }
+}
+
 /// The target is offline and cutex cannot bring it online (wake policy says
 /// never, or the wake failed in a way only the owner can fix): an
 /// actionable (non-passive) state item, once per ask, so the requester is
@@ -146,11 +170,13 @@ pub fn record_owner_stopped_delivery(state: &mut AskState, ask: &AskRecord, now:
     push(state, ask, DeliveryKind::State, ref_id, false, now)
 }
 
-/// Whether a pending delivery still needs to reach its requester: not of an
+/// Whether a pending delivery can be scheduled automatically (owner-held
+/// items remain available to explicit wait/read calls): not of an
 /// ask the requester already settled (accepted, abandoned or cancelled),
 /// which can only be left over from releases before r208.
 pub fn actionable(state: &AskState, delivery: &DeliveryRecord) -> bool {
     delivery.state == DeliveryState::Pending
+        && !delivery.owner_hold
         && !super::lineage::stopped_parent(state,&super::routing_policy::integration::local_host_id(),&delivery.ask_id)
         && !state.asks.get(&delivery.ask_id).is_some_and(|ask| {
             matches!(ask.closed, Some(CloseOutcome::Accepted | CloseOutcome::Abandoned | CloseOutcome::Cancelled))
@@ -311,6 +337,7 @@ pub fn coalesce_selected_into_event(state: &mut AskState, requester: &str, nativ
     for id in &ids {
         if let Some(delivery) = state.deliveries.get_mut(id) {
             delivery.state = DeliveryState::QueuedAsEvent;
+            delivery.unsubmitted = false;
             delivery.event_id = Some(event_id.clone());
             route(delivery, requester);
             delivery.updated_at = now_rfc3339(now);
@@ -352,18 +379,38 @@ pub fn acknowledge_event(state: &mut AskState, event_id: &str, turn_id: &str, no
 
 /// Nothing was delivered (refused / absent): put the items back.
 pub fn release_event(state: &mut AskState, event_id: &str, now: DateTime<Utc>) {
+    release_event_with(state, event_id, now, true);
+}
+
+fn release_event_with(state: &mut AskState, event_id: &str, now: DateTime<Utc>, unsubmitted: bool) {
     let Some(event) = state.events.remove(event_id) else {
         return;
     };
+    let mut released = Vec::new();
     for id in event.delivery_ids {
         if let Some(delivery) = state.deliveries.get_mut(&id) {
             if delivery.state == DeliveryState::QueuedAsEvent {
                 // Refused / absent (not unknown): pending again, resolved anew.
                 delivery.state = DeliveryState::Pending;
+                delivery.unsubmitted = unsubmitted;
                 delivery.event_id = None;
+                delivery.owner_input_id = None;
                 delivery.routed_to = None;
                 delivery.updated_at = now_rfc3339(now);
+                if delivery.kind == DeliveryKind::State && delivery.ref_id == BLOCKED_OWNER_ACTION {
+                    released.push(delivery.ask_id.clone());
+                }
             }
+        }
+    }
+    if unsubmitted {
+        for ask_id in released {
+            let obsolete = state.asks.get(&ask_id).is_some_and(|ask| {
+                ask.execution != ExecutionState::Queued || ask.closed.is_some()
+                    || !state.owner_action.get(&ask.target_cutex_session_id)
+                        .is_some_and(|ids| ids.contains(&ask_id))
+            });
+            if obsolete { supersede_blocked_owner_action(state, &ask_id, now); }
         }
     }
 }
@@ -378,7 +425,7 @@ pub fn release_event_unknown(state: &mut AskState, event_id: &str, now: DateTime
     let Some(event) = state.events.get(event_id).cloned() else {
         return Vec::new();
     };
-    release_event(state, event_id, now);
+    release_event_with(state, event_id, now, false);
     let mut kept = Vec::new();
     for id in event.delivery_ids {
         let moved = state.deliveries.get(&id).is_some_and(|delivery| {
@@ -402,7 +449,7 @@ pub const HANDOVER_UNKNOWN: &str = "handoverUnknown";
 /// (§8.3); the owner is notified by the caller.
 pub fn degrade_to_passive(state: &mut AskState, requester: &str, now: DateTime<Utc>) -> usize {
     let mut count = 0;
-    let mine = ids_for(state, requester, |delivery| delivery.state == DeliveryState::Pending && !delivery.passive);
+    let mine = ids_for(state, requester, |delivery| delivery.state == DeliveryState::Pending && !delivery.passive && !delivery.owner_hold);
     for id in mine {
         if let Some(delivery) = state.deliveries.get_mut(&id) {
             delivery.passive = true;

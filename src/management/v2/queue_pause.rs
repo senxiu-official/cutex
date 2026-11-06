@@ -408,6 +408,7 @@ mod tests {
         assert_eq!(again["alreadyPaused"], json!(true));
         assert_eq!(again["interruptedTurnId"], Value::Null);
         assert_eq!(methods(&events).len(), 1);
+        drop(queue);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -427,6 +428,7 @@ mod tests {
         assert_eq!(result["pause"], Value::Null);
         assert_eq!(result["interruptedTurnId"], json!("turn-1"));
         assert!(methods(&events).is_empty());
+        drop(queue);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -445,6 +447,7 @@ mod tests {
         .expect("stop");
         assert_eq!(result["paused"], json!(true));
         assert_eq!(result["interruptedTurnId"], Value::Null);
+        drop(queue);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -472,6 +475,7 @@ mod tests {
         .expect_err("interrupt failed");
         assert_eq!(error.code, "interrupt_timeout");
         assert!(queue.pause_state("session-a").expect("state").is_some());
+        drop(queue);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -511,6 +515,7 @@ mod tests {
             .expect("resume again");
         assert_eq!(again["resumed"], json!(false));
         assert_eq!(methods(&events).len(), 1);
+        drop(queue);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -560,6 +565,7 @@ mod tests {
         assert!(crate::management::v2::session::cutex_method_is_registered(STOP_METHOD));
         assert!(crate::management::v2::session::cutex_method_is_registered(PAUSE_METHOD));
         assert!(crate::management::v2::session::cutex_method_is_registered(RESUME_METHOD));
+        drop(queue);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -25,6 +25,10 @@ struct Fake {
     fail_send: Mutex<Option<EffectError>>,
     fail_rebind: Mutex<Option<EffectError>>,
     fail_dispose: Mutex<Option<EffectError>>,
+    /// Scripted `successor_start` answers (empty: online).
+    starts: Mutex<VecDeque<SuccessorStart>>,
+    /// Client message ids that landed (the user-input store deduplicates).
+    delivered: Mutex<HashSet<String>>,
 }
 
 fn at(seconds: i64) -> DateTime<Utc> {
@@ -70,6 +74,8 @@ impl Fake {
             fail_send: Mutex::new(None),
             fail_rebind: Mutex::new(None),
             fail_dispose: Mutex::new(None),
+            starts: Mutex::new(VecDeque::new()),
+            delivered: Mutex::new(HashSet::new()),
         }
     }
 
@@ -118,7 +124,11 @@ impl RotationEffects for Fake {
             .lock()
             .unwrap()
             .push((session.into(), client_id.into(), text.into()));
+        self.delivered.lock().unwrap().insert(client_id.into());
         Ok(())
+    }
+    fn successor_start(&self, _: &str) -> Result<SuccessorStart, EffectError> {
+        Ok(self.starts.lock().unwrap().pop_front().unwrap_or(SuccessorStart::Online))
     }
     fn turn_active(&self, _: &str) -> Result<bool, EffectError> {
         Ok(*self.turn_active.lock().unwrap())
@@ -126,7 +136,7 @@ impl RotationEffects for Fake {
     fn handoff_ready(&self, _: &Path) -> bool {
         *self.ready.lock().unwrap()
     }
-    fn find_agent_by_name(&self, _: &str, _: &str) -> Result<Option<String>, EffectError> {
+    fn find_successor_by_creation(&self, _: &Rotation) -> Result<Option<String>, EffectError> {
         Ok(self.found.lock().unwrap().clone())
     }
     fn create_successor(&self, rotation: &Rotation) -> Result<String, EffectError> {
@@ -546,6 +556,95 @@ fn a_failed_disposal_is_a_warning_and_the_successor_still_starts() {
     assert_eq!(done.warnings.len(), 1);
     assert!(done.warnings[0].starts_with("predecessor_dispose_failed: session_busy"), "{:?}", done.warnings);
     assert_eq!(driver.effects.messages.lock().unwrap().last().unwrap().0, "cutex.new");
+}
+
+fn successor_sends(driver: &Driver<Fake>) -> usize {
+    driver.effects.messages.lock().unwrap().iter().filter(|(session, ..)| session == "cutex.new").count()
+}
+
+/// r271.1: under fence contention the successor's start runs longer (its
+/// busy host is retried inside it). The rotation is not Done until the
+/// successor is online, and its first message lands exactly once.
+#[test]
+fn the_rotation_waits_for_the_successor_start_and_its_message_lands_once() {
+    let harness = Harness::new();
+    let driver = harness.driver(Fake::new());
+    let (rotation, _) = driver.start(&request("req-busy-start")).unwrap();
+    driver.tick();
+    driver.continue_without_handoff(&rotation.rotation_id).unwrap();
+    // Before the first message: offline; after it: its start runs.
+    driver.effects.starts.lock().unwrap().extend([SuccessorStart::NotStarted, SuccessorStart::Starting]);
+    driver.tick();
+    let waiting = get(&driver, &rotation.rotation_id);
+    assert_eq!(waiting.state, RotationState::PredecessorDisposed);
+    assert_eq!(successor_sends(&driver), 1);
+    // Still starting: nothing is sent again.
+    driver.effects.starts.lock().unwrap().extend([SuccessorStart::Starting, SuccessorStart::Starting]);
+    driver.tick();
+    driver.tick();
+    assert_eq!(get(&driver, &rotation.rotation_id).state, RotationState::PredecessorDisposed);
+    assert_eq!(successor_sends(&driver), 1);
+    // Online: Done, no warning, no attempts used.
+    driver.tick();
+    let done = get(&driver, &rotation.rotation_id);
+    assert_eq!(done.state, RotationState::Done, "{done:#?}");
+    assert!(done.warnings.is_empty() && done.error.is_none(), "{done:#?}");
+    assert_eq!(done.attempts, 0);
+    // The confirming send is the same deduplicated message: it landed once.
+    let successor = format!("owner-rotation-{}-successor", rotation.rotation_id);
+    assert!(driver.effects.delivered.lock().unwrap().contains(&successor));
+    assert_eq!(driver.effects.delivered.lock().unwrap().len(), 2, "handoff request + first message");
+}
+
+/// A failed start (a busy host past the start's own budget) is retried by
+/// sending the same message again; a real failure ends Done with that error
+/// as a warning, never as a busy host or a silent Done.
+#[test]
+fn a_failed_successor_start_is_retried_and_a_final_failure_is_visible() {
+    let harness = Harness::new();
+    let driver = harness.driver(Fake::new());
+    let (rotation, _) = driver.start(&request("req-failed-start")).unwrap();
+    driver.tick();
+    driver.continue_without_handoff(&rotation.rotation_id).unwrap();
+    let busy = EffectError::new("admission_busy", "hostBusy", true);
+    driver.effects.starts.lock().unwrap().extend([SuccessorStart::NotStarted, SuccessorStart::Failed(busy.clone())]);
+    driver.tick();
+    let waiting = get(&driver, &rotation.rotation_id);
+    assert_eq!(waiting.state, RotationState::PredecessorDisposed);
+    assert_eq!(waiting.attempts, 1);
+    // Next tick: the failed start is seen, the message re-sent, a new start runs.
+    driver.effects.starts.lock().unwrap().extend([SuccessorStart::Failed(busy), SuccessorStart::Starting]);
+    driver.tick();
+    let retried = get(&driver, &rotation.rotation_id);
+    assert_eq!(retried.state, RotationState::PredecessorDisposed);
+    assert_eq!(retried.attempts, 2);
+    assert_eq!(successor_sends(&driver), 2);
+    // The new start fails for real.
+    let real = EffectError::new("runtime_start_failed", "profile account missing", false);
+    driver.effects.starts.lock().unwrap().extend([SuccessorStart::Failed(real)]);
+    driver.tick();
+    let done = get(&driver, &rotation.rotation_id);
+    assert_eq!(done.state, RotationState::Done);
+    assert_eq!(done.warnings.len(), 1);
+    assert!(
+        done.warnings[0].starts_with("successor_start_failed: runtime_start_failed: profile account missing"),
+        "{:?}",
+        done.warnings
+    );
+    assert_eq!(successor_sends(&driver), 2, "a final failure sends nothing more");
+
+    // Offline with nothing running after the message: retried, then visible.
+    let driver = harness.driver(Fake::new());
+    let (rotation, _) = driver.start(&request("req-not-started")).unwrap();
+    driver.tick();
+    driver.continue_without_handoff(&rotation.rotation_id).unwrap();
+    driver.effects.starts.lock().unwrap().extend(std::iter::repeat_n(SuccessorStart::NotStarted, 2 * MAX_STEP_ATTEMPTS as usize));
+    for _ in 0..MAX_STEP_ATTEMPTS {
+        driver.tick();
+    }
+    let done = get(&driver, &rotation.rotation_id);
+    assert_eq!(done.state, RotationState::Done);
+    assert!(done.warnings[0].starts_with("successor_start_failed: successor_not_started"), "{:?}", done.warnings);
 }
 
 #[test]

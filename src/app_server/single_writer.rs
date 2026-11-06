@@ -359,11 +359,20 @@ impl Ledger {
             .as_ref()
             .is_some_and(|(read_at, _)| read_at.elapsed() < CACHE_TTL);
         if !fresh {
+            // Every lease may name the same Management process. Match the
+            // mutation path: probe each full PID/start-time identity once per
+            // refresh, without extending CACHE_TTL or the handoff window.
+            let mut live = std::collections::HashMap::<ProcessIdentity, bool>::new();
             let leases = self
                 .read()
                 .leases
                 .into_iter()
-                .filter(|(_, lease)| lease.owner != self.me && (self.is_live)(&lease.owner))
+                .filter(|(_, lease)| {
+                    lease.owner != self.me
+                        && *live
+                            .entry(lease.owner.clone())
+                            .or_insert_with(|| (self.is_live)(&lease.owner))
+                })
                 .map(|(id, lease)| (id, (lease.runtime_generation, lease.cut_at_ms)))
                 .collect();
             *cache = Some((Instant::now(), leases));

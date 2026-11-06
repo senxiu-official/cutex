@@ -323,30 +323,65 @@ pub fn aggregate_usage(
     pricing: Option<&PriceContext>,
     local_date: &dyn Fn(DateTime<Utc>) -> NaiveDate,
 ) -> UsageQueryResult {
-    let mut unpriced = BTreeMap::<(Option<String>, Option<String>), UnpricedModel>::new();
-    let mut rows = BTreeMap::<Vec<Option<String>>, (UsageRowKey, Accumulator)>::new();
-    let mut totals = Accumulator::default();
-    let mut warnings = ledger.warnings.clone();
-    let mut bad_timestamps = 0_u64;
-
+    let mut aggregation = UsageAggregation::new(query, labels, pricing, local_date);
     for entry in &ledger.entries {
-        let UsageLedgerEntry::Usage(sample) = entry else {
-            continue;
-        };
-        let Ok(observed) = parse_timestamp(&sample.observed_at) else {
-            bad_timestamps += 1;
-            continue;
-        };
-        let day = local_date(observed.with_timezone(&Utc));
-        if day < query.from || day > query.to {
-            continue;
+        if let UsageLedgerEntry::Usage(sample) = entry {
+            aggregation.add(sample);
         }
-        let (identity, key) = row_key(&query.group_by, sample, day, labels);
-        let (cost, priced_as) = pricing.map(|context| context.price_mapped(sample)).unwrap_or((None, None));
-        if pricing.is_some() && cost.is_none() {
+    }
+    aggregation.finish(ledger.warnings.clone())
+}
+
+/// [`aggregate_usage`] as a fold: samples are added one at a time in ledger
+/// order (`observedAt`, entry id), so a reader can stream them instead of
+/// holding the ledger.
+pub struct UsageAggregation<'a> {
+    query: &'a UsageQuery,
+    labels: &'a UsageLabels,
+    pricing: Option<&'a PriceContext>,
+    local_date: &'a dyn Fn(DateTime<Utc>) -> NaiveDate,
+    unpriced: BTreeMap<(Option<String>, Option<String>), UnpricedModel>,
+    rows: BTreeMap<Vec<Option<String>>, (UsageRowKey, Accumulator)>,
+    totals: Accumulator,
+    bad_timestamps: u64,
+}
+
+impl<'a> UsageAggregation<'a> {
+    pub fn new(
+        query: &'a UsageQuery,
+        labels: &'a UsageLabels,
+        pricing: Option<&'a PriceContext>,
+        local_date: &'a dyn Fn(DateTime<Utc>) -> NaiveDate,
+    ) -> Self {
+        Self {
+            query,
+            labels,
+            pricing,
+            local_date,
+            unpriced: BTreeMap::new(),
+            rows: BTreeMap::new(),
+            totals: Accumulator::default(),
+            bad_timestamps: 0,
+        }
+    }
+
+    pub fn add(&mut self, sample: &UsageSample) {
+        let query = self.query;
+        let Ok(observed) = parse_timestamp(&sample.observed_at) else {
+            self.bad_timestamps += 1;
+            return;
+        };
+        let day = (self.local_date)(observed.with_timezone(&Utc));
+        if day < query.from || day > query.to {
+            return;
+        }
+        let (identity, key) = row_key(&query.group_by, sample, day, self.labels);
+        let (cost, priced_as) = self.pricing.map(|context| context.price_mapped(sample)).unwrap_or((None, None));
+        if self.pricing.is_some() && cost.is_none() {
             let attribution = &sample.attribution;
             let model = model_key(attribution.model.as_deref());
-            let entry = unpriced
+            let entry = self
+                .unpriced
                 .entry((attribution.provider.clone(), model.clone()))
                 .or_insert_with(|| UnpricedModel {
                     provider: attribution.provider.clone(),
@@ -359,37 +394,47 @@ pub fn aggregate_usage(
         }
         let api_nanos =
             derive_sample_estimates(&sample.attribution, &sample.tokens).api_equivalent_usd_nanos;
-        rows.entry(identity)
+        self.rows
+            .entry(identity)
             .or_insert_with(|| (key, Accumulator::default()))
             .1
             .add(sample, cost, priced_as, api_nanos);
-        totals.add(sample, cost, priced_as, api_nanos);
+        self.totals.add(sample, cost, priced_as, api_nanos);
     }
-    if bad_timestamps > 0 {
-        warnings.push(format!(
-            "{bad_timestamps} usage samples had unreadable timestamps"
-        ));
-    }
-    let with_prices = pricing.is_some();
-    UsageQueryResult {
-        contract_version: 2,
-        from: query.from.format("%Y-%m-%d").to_string(),
-        to: query.to.format("%Y-%m-%d").to_string(),
-        group_by: query.group_by.clone(),
-        totals: totals.finish(with_prices),
-        rows: rows
-            .into_values()
-            .map(|(key, acc)| UsageRow {
-                profile_state: key.profile_state,
-                key,
-                amounts: acc.finish(with_prices),
-            })
-            .collect(),
-        currency: pricing.map(|context| context.display.code().to_string()),
-        pricing: pricing.map(|context| context.info.clone()),
-        unpriced_models: pricing.map(|_| unpriced.into_values().collect()),
-        recording_since: None,
-        warnings,
+
+    /// `ledger_warnings` (invalid ledger lines) come first, as before.
+    pub fn finish(self, ledger_warnings: Vec<String>) -> UsageQueryResult {
+        let mut warnings = ledger_warnings;
+        if self.bad_timestamps > 0 {
+            warnings.push(format!(
+                "{} usage samples had unreadable timestamps",
+                self.bad_timestamps
+            ));
+        }
+        let query = self.query;
+        let pricing = self.pricing;
+        let with_prices = pricing.is_some();
+        UsageQueryResult {
+            contract_version: 2,
+            from: query.from.format("%Y-%m-%d").to_string(),
+            to: query.to.format("%Y-%m-%d").to_string(),
+            group_by: query.group_by.clone(),
+            totals: self.totals.finish(with_prices),
+            rows: self
+                .rows
+                .into_values()
+                .map(|(key, acc)| UsageRow {
+                    profile_state: key.profile_state,
+                    key,
+                    amounts: acc.finish(with_prices),
+                })
+                .collect(),
+            currency: pricing.map(|context| context.display.code().to_string()),
+            pricing: pricing.map(|context| context.info.clone()),
+            unpriced_models: pricing.map(|_| self.unpriced.into_values().collect()),
+            recording_since: None,
+            warnings,
+        }
     }
 }
 

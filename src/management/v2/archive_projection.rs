@@ -24,7 +24,7 @@ pub fn fields(record: &CutexSessionRecord, authority: Option<&AgentManagementSna
             if let Some(sessions) = sessions {
                 if crate::session::metadata::live_formal_name_holder(sessions, record).is_some() { blockers.push("agent_name_taken"); }
             } else { blockers.push("archive_state_unavailable"); }
-            if let Some(agent) = state.agents.values().find(|a| a.cutex_session_id.as_str() == record.cutex_session_id) {
+            if let Some(agent) = state.agent_by_session(&record.cutex_session_id) {
                 let project = crate::agent_management::current_project_id(state, agent);
                 if project.as_ref().is_some_and(|p| !state.projects.contains_key(p) || state.project_tombstones.contains_key(p)
                     || state.project_states.get(p).is_some_and(|s| s.lifecycle != crate::agent_management::ProjectLifecycle::Active)) {

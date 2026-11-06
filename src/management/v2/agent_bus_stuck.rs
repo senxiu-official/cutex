@@ -31,23 +31,32 @@ use crate::agent_bus::queue::QueuedAgentBusMessage;
 use crate::http::server::{write_json_response, SimpleHttpRequest};
 
 pub const LIST_PATH: &str = "/v2/agent-bus/stuck-messages";
+pub const CONTENT_PATH: &str = "/v2/agent-bus/stuck-messages/content";
 pub const DISCARD_PATH: &str = "/v2/agent-bus/stuck-messages/discard";
+pub use super::agent_bus_settlement::EVIDENCE_PATH;
 pub use super::agent_bus_settlement_model::CLOSE_PATH;
 pub const DEFAULT_MIN_AGE_SECS: u64 = 3600;
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 1000;
 
 pub fn is_path(path: &str) -> bool {
-    matches!(path.split('?').next(), Some(LIST_PATH) | Some(DISCARD_PATH) | Some(CLOSE_PATH))
+    matches!(
+        path.split('?').next(),
+        Some(LIST_PATH) | Some(CONTENT_PATH) | Some(DISCARD_PATH) | Some(CLOSE_PATH) | Some(EVIDENCE_PATH)
+    )
 }
 
 /// The live bus as this module needs it (tests use a fake).
 pub trait LiveBus {
+    fn content(&self, _message_id: &str) -> anyhow::Result<Option<String>> { Ok(None) }
     fn queued(&self) -> anyhow::Result<Vec<QueuedAgentBusMessage>>;
     fn withdraw(&self, message_ids: &[String], reason: &str) -> anyhow::Result<Vec<(String, String)>>;
 }
 
 impl LiveBus for crate::agent_bus::client::AgentBusHttpClient {
+    fn content(&self, message_id: &str) -> anyhow::Result<Option<String>> {
+        self.queued_message_content(message_id)
+    }
     fn queued(&self) -> anyhow::Result<Vec<QueuedAgentBusMessage>> {
         self.queued_messages()
     }
@@ -59,6 +68,16 @@ impl LiveBus for crate::agent_bus::client::AgentBusHttpClient {
 
 /// Display name of a durable session (`None` for unknown ids).
 pub type NameOf<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// A durable record wins over a stale live queue. Neither read ACKs or repairs.
+pub fn content_view(repository: &AgentBusMessageRepository, live: &dyn LiveBus, id: &str)
+    -> anyhow::Result<Option<Value>> {
+    let repository = repository.read_only_view();
+    if let Some(text) = repository.message_content(id)? {
+        return Ok(Some(json!({"messageId":id, "text":text, "durable":true})));
+    }
+    Ok(live.content(id)?.map(|text| json!({"messageId":id, "text":text, "durable":false})))
+}
 
 fn party(id: Option<&str>, names: NameOf<'_>) -> Value {
     match id {
@@ -87,7 +106,10 @@ pub(super) fn list_view_with_receipt_loader(
     agent_id: Option<&str>, limit: usize, now_epoch_secs: u64, names: NameOf<'_>,
     read_receipts: &dyn Fn(&[String]) -> crate::asks::receipt_uncertainty::read_views::ReceiptReadContext,
 ) -> anyhow::Result<Value> {
-    super::agent_bus_settlement::repair_outbox(repository);
+    // A diagnostic read never repairs/publishes state, including on a cold
+    // legacy store. The observer loop and explicit close/replay own recovery.
+    let read_only = repository.read_only_view();
+    let repository = &read_only;
     let durable = repository.stuck_messages(min_age_secs, now_epoch_secs)?;
     let (queued, live_status) = match live.queued() {
         Ok(queued) => (queued, json!({"available": true})),
@@ -415,15 +437,49 @@ pub fn discard(
 }
 
 fn session_names() -> impl Fn(&str) -> Option<String> {
-    let sessions = crate::session::store::load_cutex_session_store_shared().ok();
-    move |id: &str| {
-        super::agent_bus_state::AgentParty::of_session(sessions.as_deref(), id).name
+    let names = crate::session::store::cutex_sessions_path()
+        .and_then(|path| read_session_names(&path)).unwrap_or_default();
+    move |id: &str| names.get(id).cloned()
+}
+
+/// Presentation cannot invoke the session writer opener either: a cold
+/// legacy/sentinel mismatch remains unnamed instead of importing/repairing it.
+pub(super) fn read_session_names(logical: &std::path::Path) -> anyhow::Result<std::collections::BTreeMap<String,String>> {
+    use rusqlite::{Connection, OpenFlags, OptionalExtension};
+    crate::config::paths::ensure_not_real_state(logical)?;
+    let empty = std::collections::BTreeMap::new();
+    let db = crate::session::store::session_database_path(logical);
+    if !db.is_file() { return Ok(empty); }
+    let sentinel = match std::fs::metadata(logical) {
+        Ok(meta) if meta.len() < 64 * 1024 => std::fs::read(logical)?,
+        _ => return Ok(empty),
+    };
+    if !crate::session::store::is_session_store_sentinel(&sentinel) { return Ok(empty); }
+    let mut connection = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    connection.busy_timeout(std::time::Duration::from_millis(250))?;
+    let tx = connection.transaction()?;
+    let version: i64 = tx.query_row("PRAGMA user_version", [], |row|row.get(0))?;
+    let schema: Option<String> = tx.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |row|row.get(0)).optional()?;
+    anyhow::ensure!(version == 1 && schema.as_deref() == Some("1"), "unsupported session names schema");
+    let mut query = tx.prepare("SELECT key, COALESCE(json_extract(record_json,'$.formal_agent_name'), json_extract(record_json,'$.display_name_override')) FROM sessions")?;
+    let rows = query.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?)))?;
+    let mut names = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, name) = row?;
+        if let Some(name) = name {
+            let name = super::agent_bus_state::sanitize_party_name(&name);
+            if !name.is_empty() { names.insert(id, name); }
+        }
     }
+    Ok(names)
 }
 
 /// HTTP entry (root already checked by the caller).
 pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
+    if path == EVIDENCE_PATH {
+        return super::agent_bus_settlement::handle_evidence(stream, request);
+    }
     if path == CLOSE_PATH {
         return super::agent_bus_settlement::handle(stream, request);
     }
@@ -437,13 +493,34 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
         };
         super::server::write_v2_error(stream, status, reason, code, message, status >= 500, json!({}))
     };
-    let repository = match super::agent_bus_state::agent_bus_message_repository() {
+    if matches!(path, LIST_PATH | CONTENT_PATH) && request.method != "GET" {
+        return error(stream, 405, "method_not_allowed", "use GET");
+    }
+    let read_only;
+    let repository = match if request.method == "GET" && matches!(path, LIST_PATH | CONTENT_PATH) {
+        read_only = AgentBusMessageRepository::open_read_only(
+            crate::config::paths::runtime_dir()?.join("management-v2"));
+        Ok(&read_only)
+    } else {
+        super::agent_bus_state::agent_bus_message_repository()
+    } {
         Ok(repository) => repository,
         Err(e) => return error(stream, 503, "agent_bus_state_unavailable", &format!("{e:#}")),
     };
     let config = crate::config::store::load_codez_config();
     let bus = crate::agent_bus::client::AgentBusHttpClient::from_config(&config);
     match (request.method.as_str(), path) {
+        ("GET", CONTENT_PATH) => {
+            let Some(id) = crate::http::query::query_value(&request.path, "messageId")
+                .filter(|id| !id.is_empty() && id.len() <= 256) else {
+                return error(stream, 400, "invalid_request", "messageId is required (at most 256 bytes)");
+            };
+            match content_view(repository, &bus, &id) {
+                Ok(Some(view)) => write_json_response(stream, 200, "OK", &view),
+                Ok(None) => error(stream, 404, "message_not_found", "no durable or queued message has this id"),
+                Err(e) => error(stream, 503, "message_content_unavailable", &format!("{e:#}")),
+            }
+        }
         ("GET", LIST_PATH) => {
             let query = |name: &str| crate::http::query::query_value(&request.path, name);
             let min_age = match query("minAgeSecs") {
@@ -491,7 +568,7 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
                 Err(e) => error(stream, 503, "agent_bus_state_unavailable", &format!("{e:#}")),
             }
         }
-        (_, LIST_PATH) => error(stream, 405, "method_not_allowed", "use GET"),
+        (_, LIST_PATH | CONTENT_PATH) => error(stream, 405, "method_not_allowed", "use GET"),
         _ => error(stream, 405, "method_not_allowed", "use POST"),
     }
 }

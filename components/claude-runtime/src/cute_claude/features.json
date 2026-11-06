@@ -1,8 +1,9 @@
 {
   "version": 1,
-  "release": "claude-r32",
+  "release": "claude-r40",
   "comment": "Feature switches cutex reads before it starts or talks to this adapter (components/claude-runtime/README.md). Catalog entries do not confirm account access.",
   "features": {
+    "systemAppendFile": true,
     "turnStart": true,
     "launchModelUpdate": true,
     "turnSteer": true,
@@ -19,6 +20,7 @@
     "commandOutputStreaming": false,
     "approvals": true,
     "userInputRequests": true,
+    "userInputOptions": true,
     "agentTurnQuestions": true,
     "systemAppend": true,
     "planMode": true,
@@ -42,6 +44,7 @@
     "subagents": true,
     "subagentTranscripts": true,
     "backgroundSubagents": true,
+    "toolGate": true,
     "autoReconnect": true,
     "fileRewind": true,
     "fileCheckpointing": true,
@@ -53,18 +56,33 @@
     "externalInput": true,
     "managedSkills": true,
     "memoryMode": false,
-    "permissionPresets": ["full", "auto", "readOnly"],
-    "claudePermissionModes": ["default", "acceptEdits", "plan", "auto", "bypassPermissions"],
+    "permissionPresets": [
+      "full",
+      "auto",
+      "readOnly"
+    ],
+    "claudePermissionModes": [
+      "default",
+      "acceptEdits",
+      "plan",
+      "auto",
+      "bypassPermissions"
+    ],
     "livePermissionMode": true,
     "liveModelEffort": true,
     "compactionModels": true,
     "permissionRules": true,
     "apiAccounts": true,
     "safetyGrants": true,
-    "settingSources": ["project", "user"],
+    "settingSources": [
+      "project",
+      "user"
+    ],
     "mcpServers": true,
     "claudeAiConnectors": true,
     "forkProfileDefaults": true,
-    "approvalWait": true
+    "approvalWait": true,
+    "browserCommand": true,
+    "browserScript": true
   }
 }

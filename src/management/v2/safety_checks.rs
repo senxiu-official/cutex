@@ -192,7 +192,7 @@ pub fn reconcile(cutex_session_id: &str, thread_id: &str) {
     };
     let agent_name = agent_name(cutex_session_id);
     let (settings, evaluator) = Evaluator::current_with_owner();
-    match store.with_state(|state| apply_snapshot(state, cutex_session_id, agent_name, thread_id, &blocks, &settings, &evaluator, Utc::now())) {
+    match store.edit_safety(cutex_session_id, &blocks.iter().filter_map(|b| b.get("blockId").and_then(Value::as_str).map(str::to_string)).collect::<Vec<_>>(), |state| apply_snapshot(state, cutex_session_id, agent_name, thread_id, &blocks, &settings, &evaluator, Utc::now())) {
         Ok(true) if crate::app_server::single_writer::owner_role() => super::owner_notify::publish_pending_notices(&store),
         Ok(_) => {}
         Err(error) => eprintln!("safety checks: could not reconcile {cutex_session_id}: {error:#}"),
@@ -224,7 +224,7 @@ pub fn on_runtime_notification(cutex_session_id: &str, thread_id: &str, method: 
     };
     let agent_name = agent_name(cutex_session_id);
     let (settings, evaluator) = Evaluator::current_with_owner();
-    let changed = store.with_state(|state| {
+    let changed = store.edit_safety(cutex_session_id, &params.get("block").and_then(|b| b.get("blockId")).and_then(Value::as_str).map(str::to_string).into_iter().collect::<Vec<_>>(), |state| {
         apply_notification(state, cutex_session_id, agent_name, None, method, params, &settings, &evaluator, Utc::now())
     });
     match changed {
@@ -255,10 +255,12 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
         },
     };
     let agent = crate::http::query::query_value(&request.path, "agentId").filter(|id| !id.is_empty());
-    match OwnerNotifyStore::open_default().and_then(|store| store.snapshot()) {
-        Ok(state) => write_json_response(stream, 200, "OK", &json!({ "blocks": list(&state, &filter, agent.as_deref(), limit) })),
-        Err(error) => super::server::write_v2_error(stream, 503, "Service Unavailable", "owner_notify_unavailable",
-            &format!("owner notify store: {error:#}"), true, json!({})),
+    let cursor=crate::http::query::query_value(&request.path,"cursor");
+    match OwnerNotifyStore::open_default().and_then(|store| store.notification_page(&filter, agent.as_deref(), true, cursor.as_deref(), crate::store::PageBudget {max_rows:limit,max_bytes:256*1024})) {
+        Ok((blocks,next)) => {let mut response=json!({"blocks":blocks});
+            if let Some(next)=next {response["nextCursor"]=json!(next);}
+            write_json_response(stream, 200, "OK", &response)},
+        Err(error) => super::owner_notify::page_error(stream,&error),
     }
 }
 
@@ -350,10 +352,8 @@ pub(super) fn dispatch_with(
     };
     let id = block_id(&request.params)?;
     let record = store
-        .snapshot()
-        .map_err(unavailable)?
         .safety_record(cutex_session_id, &id)
-        .cloned()
+        .map_err(unavailable)?
         .ok_or_else(|| error("safety_block_not_found", format!("no safety block {id} for this agent"), json!({ "blockId": id })))?;
     let current = record.safety_block.clone().expect("safety record has a block");
     if !current.is_open() {
@@ -372,7 +372,7 @@ pub(super) fn dispatch_with(
             // Someone else decided first (the attached TUI): take the runtime's state.
             if let Some(block) = data.get("block").and_then(|block| block_from_wire(&current.runtime, block)) {
                 let notification = store
-                    .with_state(|state| state.update_safety_block(cutex_session_id, block, now))
+                    .edit_record(&record.notification_id, |state| state.update_safety_block(cutex_session_id, block, now))
                     .map_err(unavailable)?
                     .map_err(owner_error)?
                     .0;
@@ -399,7 +399,7 @@ pub(super) fn dispatch_with(
         Err(RuntimeCallError::Failed(message)) => return Err(error("app_server_unavailable", message, json!({}))),
     };
     let notification = store
-        .with_state(|state| state.update_safety_block(cutex_session_id, decided.clone(), now))
+        .edit_record(&record.notification_id, |state| state.update_safety_block(cutex_session_id, decided.clone(), now))
         .map_err(unavailable)?
         .map_err(owner_error)?
         .0;

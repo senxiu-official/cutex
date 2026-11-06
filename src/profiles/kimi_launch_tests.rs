@@ -144,7 +144,7 @@ fn kimi_relay_profiles_keep_kimi_code_and_launch_on_the_relay() {
     let create = |body: &str| -> String {
         profiles_api::create_from_body(body.as_bytes()).unwrap()["profile"]["id"].as_str().unwrap().to_string()
     };
-    let relay_profile = create(r#"{"name":"RelayProfile","preset":"moonshot","baseUrl":"https://relay.example/v1","model":"kimi-k3","apiKey":"sk-fake-relay_profile"}"#);
+    let relay_profile = create(r#"{"name":"relay_profile","preset":"moonshot","baseUrl":"https://relay.example/v1","model":"kimi-k3","apiKey":"sk-fake-relay_profile"}"#);
     let coding = create(r#"{"name":"Coding relay","preset":"kimi-code","baseUrl":"http://127.0.0.1:9/kimi/v1","apiKey":"sk-fake-coding"}"#);
     for id in [&relay_profile, &coding] {
         let account = store_account(id);

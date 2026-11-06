@@ -509,6 +509,7 @@ pub(crate) fn request_handlers() -> AgentBusRequestHandlers {
         redrive_ordinary_messages,
         send_payload_response,
         agent_management: super::agent_management::handle_agent_management,
+        automatic_managed_online: super::agent_management::handle_automatic_managed_online,
         managed_archive: super::management_context::execute_managed_agent_archive,
         job_service_completion: dispatch_job_service_completion,
         job_service_completion_query: query_job_service_completion,
@@ -1084,7 +1085,15 @@ fn redrive_ordinary_messages_with(
             Some(refreshed_sessions.as_ref().unwrap_or(sessions)),
         ) {
             Ok(target) => target,
-            Err(_) => continue,
+            Err(error) => {
+                // 054 §2.9: the recipient has no runtime endpoint now.
+                if error.downcast_ref::<cutex::agent_bus::routing::AgentTargetResolutionError>()
+                    .is_some_and(|error| error.code() == cutex::agent_bus::routing::AgentTargetResolutionCode::TargetUnavailable)
+                {
+                    repository.input_ledger_agent_offline(&record.canonical_envelope.id);
+                }
+                continue;
+            }
         };
         let target_name = cutex::agent_bus::groups::resolve_agent_display_name(state, &target_id)
             .unwrap_or_else(|| target_id.clone());
@@ -1397,6 +1406,10 @@ fn send_payload_response_with_projection(
     } else {
         payload.resolved_delivery_mode()
     };
+    if payload.control_type.as_deref()==Some(cutex::agent_bus::rename_notice::CONTROL_TYPE)
+        ||payload.from.as_deref()==Some(cutex::agent_bus::rename_notice::SOURCE_ID) {
+        anyhow::bail!("Formal-name notices require the in-process durable owner outbox");
+    }
     let sender_kind = payload.sender_kind.clone().unwrap_or_default();
     if sender_kind.is_task_service_system() {
         anyhow::bail!(
@@ -1460,15 +1473,11 @@ fn send_payload_response_with_projection(
             "Agent Management system sender requires the in-process authorized service path"
         );
     }
-    let durable_sessions = is_full_durable_cutex_session_id(&payload.to)
-        .then(load_cutex_session_store)
-        .transpose()?;
-    let target_id = match resolve_agent_target_for_sender_with_sessions(
+    let (target_id,rename_notes) = match cutex::agent_bus::routing::resolve_agent_target_with_notes(
         state,
         &payload.to,
         payload.from_agent_id.as_deref(),
         payload.all_groups,
-        durable_sessions.as_ref(),
     ) {
         Ok(target_id) => target_id,
         Err(err) => {
@@ -1681,7 +1690,8 @@ fn send_payload_response_with_projection(
             &to_cutex_session_id,
             payload.sender_facts.clone().unwrap_or_default(),
         );
-        durable_deduplicated = !agent_bus_message_repository()?.record_queued_with_meta(
+        let frozen_label=canonical_recipient_label(target_agent.as_ref().unwrap().base_name.as_deref(),&target_agent.as_ref().unwrap().name,&target_agent.as_ref().unwrap().id).to_owned();
+        durable_deduplicated = !agent_bus_message_repository()?.record_queued_with_meta_and_recipient_label(
             AgentBusQueuedMessage {
                 owner_cutex_session_id: to_cutex_session_id.clone(),
                 message_id: message_id.clone(),
@@ -1696,6 +1706,7 @@ fn send_payload_response_with_projection(
                 semantic_sha256,
             },
             meta,
+            frozen_label,
         )?;
     }
     let outcome = if let Some(previous) = previous_alarm.as_ref().filter(|s| s.state != "pending") {
@@ -1856,6 +1867,7 @@ fn send_payload_response_with_projection(
         "control_type": send_record.control_type,
         "external_action_id": send_record.external_action_id,
         "external_message_id": send_record.external_message_id,
+        "detail":(!rename_notes.is_empty()).then(||rename_notes.iter().map(|note|note.text()).collect::<Vec<_>>().join("\n")),
     }))
 }
 
@@ -2038,8 +2050,11 @@ fn run_agent_bus_with_service_root(
             "{YELLOW}warning:{RESET} durable ordinary-message startup redrive failed: {error:#}"
         );
     }
+    // 054 owner decision 9: ledger records for bus messages already open.
+    cutex::management::v2::agent_bus_state::spawn_input_ledger_backfill();
     cutex::agent_bus::alarms::spawn()?;
     spawn_director_address_dispatch(Arc::clone(&state));
+    super::agent_name_notices::spawn(Arc::clone(&state));
     let active_requests = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
@@ -2574,7 +2589,7 @@ mod tests {
             );
             let current = state.agents.get_mut(new_runtime).unwrap();
             current.name = "display-worker.123abc".to_string();
-            current.base_name = Some("stable-worker".to_string());
+            current.base_name = Some("renamed-worker".to_string());
         }
         let mut sessions = CutexSessionStore::default();
         let mut session = cutex::session::model::CutexSessionRecord::new_at(
@@ -2623,7 +2638,7 @@ mod tests {
         .unwrap();
         let semantic_sha256 = cutex::app_server::bus_bridge::inter_agent_semantic_sha256(&params);
         repository
-            .record_queued(AgentBusQueuedMessage {
+            .record_queued_with_meta_and_recipient_label(AgentBusQueuedMessage {
                 owner_cutex_session_id: durable_id.to_string(),
                 message_id: message_id.clone(),
                 from_cutex_session_id: Some("cutex.source".to_string()),
@@ -2635,7 +2650,7 @@ mod tests {
                 queued_at: Utc::now(),
                 canonical_envelope: envelope,
                 semantic_sha256: semantic_sha256.clone(),
-            })
+            },Default::default(),"stable-worker".into())
             .unwrap();
 
         assert_eq!(
@@ -2652,9 +2667,10 @@ mod tests {
         assert_eq!(current.name, "display-worker.123abc");
         assert_eq!(
             canonical_recipient_label(current.base_name.as_deref(), &current.name, &current.id,),
-            "stable-worker"
+            "renamed-worker"
         );
-        let redriven_params = cutex::app_server::bus_bridge::inter_agent_params(
+        let redriven_params = cutex::app_server::bus_bridge::durable_inter_agent_params(
+            &repository,
             "",
             canonical_recipient_label(current.base_name.as_deref(), &current.name, &current.id),
             durable_id,

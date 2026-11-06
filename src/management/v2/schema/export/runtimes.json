@@ -26,7 +26,8 @@
       "required": ["cutexSessionId", "name"],
       "properties": {
         "cutexSessionId": { "type": "string" },
-        "name": { "type": "string" }
+        "name": { "type": "string" },
+        "externalRuntimePath": { "type": "boolean", "description": "Native executable pin lives outside this instance's runtime/native managed directory. No file or pin is changed by this view." }
       }
     },
     "entry": {
@@ -39,11 +40,14 @@
         "path": { "type": "string", "description": "<release dir>/<file> (native) or the adapter directory name (claude)." },
         "releaseDir": { "type": "string" },
         "sha256Prefix": { "type": "string" },
-        "selected": { "type": "boolean", "description": "Used for new sessions." },
+        "selected": { "type": "boolean", "description": "Used for new sessions, identified by the selected executable SHA. An unknown SHA selects its unregistered entry; registry latest is never a fallback." },
         "latest": { "type": "boolean", "description": "Native registry latest runtime." },
         "missing": { "type": "boolean", "description": "The recorded files no longer exist." },
         "agents": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/agentRef" } },
-        "agentCount": { "type": "integer", "minimum": 0 }
+        "agentCount": { "type": "integer", "minimum": 0 },
+        "selectedManaged": { "type": "boolean", "description": "Present for a selected native executable when managed-root information is available." },
+        "externalAgentCount": { "type": "integer", "minimum": 0, "description": "Agents pinned to executables outside runtime/native; old pins remain valid." },
+        "managedAgentCount": { "type": "integer", "minimum": 0 }
       }
     },
     "runtimes": {

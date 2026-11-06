@@ -1,0 +1,28 @@
+{
+  "schema": "cutex/external-runtime/v1",
+  "name": "kimi-runtime",
+  "version": "kimi-r3",
+  "payload": "adapter-v1",
+  "externalRoot": {
+    "kind": "npm-prefix",
+    "packages": {
+      "@moonshot-ai/kimi-code": "2.3.3",
+      "ws": "8.22.0"
+    },
+    "cliEntry": "node_modules/@moonshot-ai/kimi-code/dist/main.mjs"
+  },
+  "node": {
+    "range": ">=24.9.0 <25",
+    "recommended": "24.21.0",
+    "features": [
+      "node:sqlite"
+    ]
+  },
+  "checks": {
+    "rg": true,
+    "nodePty": true
+  },
+  "environment": {
+    "installRoot": "KIMI_INSTALL_ROOT"
+  }
+}

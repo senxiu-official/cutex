@@ -160,9 +160,6 @@ jobs:
           VERSION: ${{ matrix.version }}
           PLATFORM: ${{ matrix.platform }}
         run: PYTHON="$E2E_PYTHON" bash "components/$NAME/build.sh" "$PLATFORM" "$VERSION" "$RUNNER_TEMP/out"
-      - name: Preserve the immutable claude-r32 Linux byte recipe
-        if: matrix.name == 'claude-runtime' && matrix.version == 'claude-r32' && matrix.platform == 'linux-x64'
-        run: '"$E2E_PYTHON" ci/.github/ci/claude-r32-compat.py "$RUNNER_TEMP/out" --source-commit "$(git rev-parse HEAD)"'
       - name: Check the output
         env:
           NAME: ${{ matrix.name }}

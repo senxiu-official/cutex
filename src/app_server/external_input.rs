@@ -680,6 +680,7 @@ impl ExternalInputClient {
             artifacts,
         };
         result.fence()?;
+        crate::memory::idle_note::transport::install(&result.client.handle(), owner, &result.binding.thread_id, generation);
         Ok(result)
     }
     pub fn binding(&self) -> &ExternalInputBinding {
@@ -885,6 +886,20 @@ impl ExternalInputClient {
             Some(turn_id) => ExclusiveSubmit::Started { turn_id, status },
             None => ExclusiveSubmit::Replayed(status),
         })
+    }
+    /// r276 agent pause: cute-codex holds the bound thread's next tool call
+    /// (`initialize.toolGateVersion` 1, `thread/toolGate/set`).
+    pub fn supports_tool_gate(&self) -> bool {
+        self.initialize_response()
+            .get("toolGateVersion")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|version| version >= 1)
+    }
+    pub fn set_tool_gate(&self, held: bool) -> anyhow::Result<serde_json::Value> {
+        ensure!(self.supports_tool_gate(), "native tool gate unavailable");
+        let mut params = self.params();
+        params["held"] = serde_json::Value::from(held);
+        self.request("thread/toolGate/set", params)
     }
     /// N2: reopen the native external-input gate without a human turn.
     pub fn resume_gate(&self) -> anyhow::Result<serde_json::Value> {

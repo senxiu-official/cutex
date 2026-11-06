@@ -172,6 +172,18 @@ pub fn pending_event_from_app_server(
             return Ok(NativeEventDisposition::OtherThread { thread_id, pending });
         }
     }
+    // 054 §2.9: a native user item carrying the owner's clientId (input
+    // ledger): a Codex echo, or a Claude steer echo (r274.2 §9.1).
+    if let AppServerEvent::Notification(notification) = event {
+        if let Some(client_id) = pending.correlation.client_user_message_id.as_deref() {
+            if super::input_ledger_owner::is_owner_user_item(&notification.raw) {
+                let item = notification.raw.pointer("/params/item/id").and_then(serde_json::Value::as_str);
+                let turn = notification.raw.pointer("/params/turnId").and_then(serde_json::Value::as_str);
+                let claude = context.runtime_backend == "claude_subscription";
+                super::input_ledger_owner::observe_user_item(&context.cutex_session_id, client_id, item, claude, turn);
+            }
+        }
+    }
     Ok(NativeEventDisposition::Publish(pending))
 }
 

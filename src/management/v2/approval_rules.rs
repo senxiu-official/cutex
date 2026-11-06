@@ -201,6 +201,15 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
             }
         }
         ("GET", Route::Audit) => {
+            if crate::http::query::query_value(&request.path,"page").as_deref()==Some("keyset") {
+                let after=crate::http::query::query_value(&request.path,"after");
+                let limit=crate::http::query::query_value(&request.path,"limit").as_deref().unwrap_or("100").parse::<usize>().ok().filter(|n|(1..=200).contains(n));
+                let Some(limit)=limit else {return invalid(stream,"limit must be 1..=200".into());};
+                return match store.rule_audit_page(after.as_deref(),crate::store::PageBudget{max_rows:limit,max_bytes:256*1024}) {
+                    Ok((audit,next))=>write_json_response(stream,200,"OK",&json!({"audit":audit,"nextCursor":next})),
+                    Err(failure)=>super::approvals::page_error(stream,&failure),
+                };
+            }
             let cursor = crate::http::query::query_value(&request.path, "cursor").as_deref().unwrap_or("0").parse::<usize>().ok();
             let limit = crate::http::query::query_value(&request.path, "limit").as_deref().unwrap_or("100").parse::<usize>().ok().filter(|limit| (1..=200).contains(limit));
             let (Some(cursor), Some(limit)) = (cursor, limit) else { return invalid(stream, "cursor must be non-negative and limit must be 1..=200".into()) };

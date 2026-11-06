@@ -505,6 +505,8 @@ pub struct AgentBusAckResponse {
 pub struct AgentBusSendResponse {
     pub id: String,
     #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
     pub from: Option<String>,
     pub to: String,
     #[serde(default)]

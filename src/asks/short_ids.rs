@@ -10,6 +10,12 @@ pub const PATH: &str = "/api/asks/v1/resolve-ids";
 // Absorb ordinary writer contention without asking agents to retry business
 // calls. Persistent contention still refuses before receipt/business admission.
 const PREFLIGHT_LOOKUP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+thread_local! { static LOCAL_PIN_ACCESSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+fn note_local_pin_access() {
+    #[cfg(test)]
+    LOCAL_PIN_ACCESSES.with(|count|count.set(count.get()+1));
+}
 fn failure(e: anyhow::Error) -> AskError {
     AskError::new(
         "persistence_unavailable",
@@ -129,16 +135,88 @@ fn resolve(
 }
 
 pub fn normalize(ctx: &ToolContext<'_>, tool: &str, args: Value) -> Result<Value, AskError> {
-    normalize_inner(ctx, tool, args, false)
+    normalize_with_notes(ctx,tool,args,None).map(|(arguments,_)|arguments)
 }
 
-fn normalize_inner(ctx: &ToolContext<'_>, tool: &str, mut args: Value, preflight: bool) -> Result<Value, AskError> {
+pub fn normalize_with_notes(ctx: &ToolContext<'_>, tool: &str, args: Value, action: Option<&str>)
+    -> Result<(Value,Vec<crate::agent_names::RenameNote>),AskError> {
+    let mut notes=Vec::new();
+    let arguments=normalize_inner(ctx,tool,args,false,action,&mut notes)?;
+    Ok((arguments,notes))
+}
+
+fn selected_name(ctx:&ToolContext<'_>, tool:&str, input:&str, scope:Option<&crate::agent_names::NameScope>)
+    -> Result<crate::agent_names::NameResolution,AskError> {
+    if matches!(tool,"agent_archive"|"agent_restore"|"member_runtime"|"member_replace")&&is_complete_session_id(input) {
+        return Ok(crate::agent_names::NameResolution {cutex_session_id:input.trim().into(),current_name:input.trim().into(),
+            scope:scope.cloned().unwrap_or(crate::agent_names::NameScope::Unassigned),index_revision:0,rename_notes:Vec::new()});
+    }
+    let directory=ctx.world.directory()?;
+    let (_,resolution)=if matches!(tool,"agent_tell"|"alarm_set") {
+        directory.resolve_tell_scoped(ctx.caller,input,scope)?
+    } else { directory.resolve_scoped(Some(ctx.caller),input,scope)? };
+    Ok(resolution)
+}
+
+fn local_pin_resolution(binding:crate::name_target_pins::Binding)->Result<crate::agent_names::NameResolution,AskError> {
+    if binding.peer_id.is_some() {return Err(AskError::new("idempotency_conflict","this action is bound to a remote target"))}
+    let resolution:crate::agent_names::NameResolution=serde_json::from_value(binding.detail)
+        .map_err(|_|AskError::new("name_target_pins_corrupt","invalid stored name-resolution metadata"))?;
+    if resolution.cutex_session_id!=binding.cutex_session_id
+        ||resolution.rename_notes.iter().any(|note|note.cutex_session_id!=binding.cutex_session_id) {
+        return Err(AskError::new("name_target_pins_corrupt","resolution metadata does not match the pinned identity"));
+    }
+    Ok(resolution)
+}
+
+fn pinned_name(ctx:&ToolContext<'_>, tool:&str, input:&str, scope:Option<&crate::agent_names::NameScope>,
+    action:Option<&str>, digest:&str, preflight:bool) -> Result<crate::agent_names::NameResolution,AskError> {
+    use crate::name_target_pins::{self as pins,Key,Binding};
+    let directory=ctx.world.directory()?;
+    // Full IDs arriving at the business handler are the canonical projection
+    // of preflight's already-pinned request. They must not hash as a new raw
+    // named request. Preflight pins both names and explicit IDs.
+    let canonical=!preflight&&directory.agents.contains_key(input.trim());
+    let Some(action)=action.filter(|_|ctx.facade>=super::tools::FACADE_AGENT_NAMES&&!canonical) else {
+        return selected_name(ctx,tool,input,scope);
+    };
+    let key=Key {caller:ctx.caller,tool,action,digest};
+    let pin_error=|error:pins::PinError|AskError::new(error.code(),format!("durable target binding: {error}"));
+    note_local_pin_access();
+    if let Some(binding)=pins::lookup(&key).map_err(pin_error)? {
+        return local_pin_resolution(binding);
+    }
+    let authority=crate::agent_management::AgentManagementStore::open_default().map_err(failure)?;
+    let _fence=authority.try_lock_delivery_mutations().map_err(|error|AskError::new("persistence_unavailable",error.to_string()))?
+        .ok_or_else(||AskError::new("admission_busy","the name authority is busy; retry the same action_id"))?;
+    let path=crate::session::store::cutex_sessions_path().map_err(failure)?;
+    crate::session::store::with_session_store_lock(&path,||Ok((|| {
+        // Authority and session fences cover the fresh scope/name snapshot
+        // through the durable pin. No message or queue entry is sent here.
+        let resolution=selected_name(ctx,tool,input,scope)?;
+        let proposed=Binding {peer_id:None,cutex_session_id:resolution.cutex_session_id.clone(),
+            detail:serde_json::to_value(&resolution).map_err(|_|AskError::new("persistence_unavailable","name metadata serialization failed"))?};
+        note_local_pin_access();
+        let stored=pins::bind(&key,&proposed).map_err(pin_error)?;
+        local_pin_resolution(stored)
+    })())).map_err(failure)?
+}
+
+fn normalize_inner(ctx: &ToolContext<'_>, tool: &str, mut args: Value, preflight: bool,
+    action:Option<&str>, notes:&mut Vec<crate::agent_names::RenameNote>) -> Result<Value, AskError> {
     let (tool, canonical) = if super::tools::is_tool(tool) {
         super::tools::canonical(tool, args)
     } else {
         (tool, args)
     };
     args = canonical;
+    let explicit_scope:Option<crate::agent_names::NameScope>=args.get("targetScope").cloned().map(serde_json::from_value).transpose()
+        .map_err(|_|super::tools::invalid("targetScope must be project/projectId or unassigned"))?;
+    let mut raw=args.clone();
+    if let Some(object)=raw.as_object_mut() {object.remove("action_id");}
+    let digest=crate::approvals::request_digest(&raw);
+    let alarm_action=(tool=="alarm_set").then(||args["alarm_id"].as_str().map(|id|format!("alarm:{id}"))).flatten();
+    let selected_action=action.map(str::to_owned).or_else(||args["action_id"].as_str().map(str::to_owned)).or(alarm_action);
     super::tools::check_director_peer_alias(&args)?;
     // A role address is resolved once by the authority-fenced tools handler, not by names.
     // A cross-host tell carries only `to` (name@host) and inline text: refuse
@@ -173,7 +251,6 @@ fn normalize_inner(ctx: &ToolContext<'_>, tool: &str, mut args: Value, preflight
     } else {
         ctx.store.lookup_snapshot(&resources).map_err(failure)?
     };
-    let directory = ctx.world.directory()?;
     // Complete-only reply exception stays in Directory::resolve_tell.
     for field in match tool {
         "agent_delegate" | "agent_pause" | "agent_resume" => vec!["target"],
@@ -195,16 +272,15 @@ fn normalize_inner(ctx: &ToolContext<'_>, tool: &str, mut args: Value, preflight
             // `recipient_archived` before its receipt can be returned.
             if matches!(tool, "agent_archive" | "agent_restore" | "member_runtime" | "member_replace")
                 && is_complete_session_id(input)
+                && !(preflight&&ctx.facade>=super::tools::FACADE_AGENT_NAMES)
             {
                 args[field] = json!(input.trim());
                 continue;
             }
-            let agent = if matches!(tool, "agent_tell" | "alarm_set") {
-                directory.resolve_tell(ctx.caller, input)?
-            } else {
-                directory.resolve(Some(ctx.caller), input).map_err(|mut e| { if tool=="agent_delegate" && e.code=="id_not_found" { let suggestions=crate::peers::asks::suggestions(input); if !suggestions.is_empty() { if !e.extra.is_object(){e.extra=json!({});}e.extra["suggestions"]=json!(suggestions); } } e })?
-            };
-            args[field] = json!(agent.cutex_session_id);
+            let resolution=pinned_name(ctx,tool,input,explicit_scope.as_ref(),selected_action.as_deref(),&digest,preflight)
+                .map_err(|mut e| { if tool=="agent_delegate" && e.code=="id_not_found" { let suggestions=crate::peers::asks::suggestions(input); if !suggestions.is_empty() { if !e.extra.is_object(){e.extra=json!({});}e.extra["suggestions"]=json!(suggestions); } } e })?;
+            notes.extend(resolution.rename_notes);
+            args[field] = json!(resolution.cutex_session_id);
         }
     }
     for field in ["delegation", "follow_up"] {
@@ -254,6 +330,9 @@ fn normalize_inner(ctx: &ToolContext<'_>, tool: &str, mut args: Value, preflight
             }
         }
     }
+    if !matches!(tool,"agent_delegate"|"agent_tell"|"agent_name_history") {
+        if let Some(object)=args.as_object_mut() {object.remove("targetScope");}
+    }
     Ok(args)
 }
 
@@ -264,8 +343,8 @@ fn is_complete_session_id(input: &str) -> bool {
     q.kind == Some(Kind::Session) && !q.suffix_only && q.valid_hex && q.hex.len() == 32
 }
 
-/// Fenced read-only facade preflight. It returns canonical arguments, not a
-/// management receipt; management::invoke hashes those arguments afterwards.
+/// Fenced facade preflight. It returns canonical arguments, not a management
+/// receipt; named targets are durably pinned before business dispatch.
 pub fn handle(ctx: &ToolContext<'_>, body: &[u8]) -> Value {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -279,8 +358,13 @@ pub fn handle(ctx: &ToolContext<'_>, body: &[u8]) -> Value {
             return AskError::new("invalid_arguments", "expected tool and arguments").to_json()
         }
     };
-    match normalize_inner(ctx, &request.tool, request.arguments, true) {
-        Ok(arguments) => json!({"ok":true,"arguments":arguments}),
+    let mut notes=Vec::new();
+    match normalize_inner(ctx, &request.tool, request.arguments, true,None,&mut notes) {
+        Ok(arguments) => {
+            let mut response=json!({"ok":true,"arguments":arguments});
+            if ctx.facade>=super::tools::FACADE_AGENT_NAMES&&!notes.is_empty() {response["resolutionNotes"]=json!(notes);}
+            response
+        },
         Err(error) => error.to_json(),
     }
 }
@@ -294,6 +378,58 @@ pub(crate) mod tests {
         tools,
     };
     use chrono::Utc;
+
+    #[test]
+    fn remote_address_retries_never_access_local_target_pins() {
+        context("remote-pins-skip",|ctx| {
+            let ctx=ToolContext {facade:tools::FACADE_AGENT_NAMES,..*ctx};
+            let args=json!({"target":"Worker@remote","text":"remote brief","action_id":"remote-pins-skip",
+                "targetScope":{"kind":"project","projectId":"remote-project"}});
+            let before=LOCAL_PIN_ACCESSES.with(|count|count.get());
+            for _ in 0..2 {assert_eq!(normalize(&ctx,"agent_delegate",args.clone()).unwrap(),args);}
+            assert_eq!(LOCAL_PIN_ACCESSES.with(|count|count.get()),before);
+        });
+    }
+
+    #[test]
+    fn local_name_retry_keeps_the_first_sid_after_caller_scope_changes() {
+        use crate::agent_names::{NameScope,RenameRequest};
+        use crate::agent_bus::boundary::AgentBoundary;
+        use crate::config::agent_security::{AgentSecurityConfig,CrossProjectAccess};
+        let (mut world,_world_dir)=world("name-pin-scope");
+        let (store,_store_dir)=temp_store("name-pin-scope");
+        let a=format!("cutex.{}",uuid::Uuid::new_v4());
+        let b=format!("cutex.{}",uuid::Uuid::new_v4());
+        let old=format!("Old-{}",uuid::Uuid::new_v4());
+        let new=format!("New-{}",uuid::Uuid::new_v4());
+        let mut security=AgentSecurityConfig::default();security.cross_project=CrossProjectAccess::Host;
+        world.directory.boundary=AgentBoundary::new(&security,Default::default(),Default::default());
+        world.directory.agents.get_mut(REQUESTER).unwrap().project=Some("pin-a".into());
+        for (id,name,project) in [(&a,&new,"pin-a"),(&b,&old,"pin-b")] {
+            let mut agent=crate::asks::directory::tests::agent(id,name);agent.project=Some(project.into());
+            world.directory.agents.insert(id.clone(),agent);
+        }
+        let path=crate::session::store::cutex_sessions_path().unwrap();
+        let mut record=crate::session::model::CutexSessionRecord::new(a.clone(),None,"host".into(),"/workspace".into(),None).unwrap();
+        record.formal_agent_name=Some(old.clone());record.agent_enabled=true;
+        crate::session::store::with_locked_session_rows(&path,|rows|{rows.insert_session(&a,record);rows.commit()?;Ok(())}).unwrap();
+        crate::session::store::rename_formal_name_at(&path,&a,&RenameRequest {request_id:uuid::Uuid::new_v4().to_string(),expected_revision:1,name:new},
+            &NameScope::for_project(Some("pin-a")),None,"human-management").unwrap();
+        let send=|_:&tools::TellSend<'_>|Ok(json!({"ok":true}));
+        let chain=|_:&str,_:&str,_:&str|None;let clock=Utc::now;let sleep=||();
+        let call=|world:&crate::asks::scheduler::tests::FakeWorld,args:Value| {
+            let ctx=ToolContext {store:&store,world,caller:REQUESTER,now:Utc::now(),send:&send,wake_chain:&chain,
+                clock:&clock,sleep:&sleep,wait:true,facade:tools::FACADE_AGENT_NAMES};
+            normalize_with_notes(&ctx,"agent_delegate",args,None).unwrap()
+        };
+        let args=json!({"target":old,"text":"do not retain this brief in a target pin","action_id":uuid::Uuid::new_v4().to_string()});
+        let first=call(&world,args.clone());assert_eq!(first.0["target"],a);assert_eq!(first.1.len(),1);
+        world.directory.agents.get_mut(REQUESTER).unwrap().project=Some("pin-b".into());
+        let replay=call(&world,args.clone());assert_eq!(replay.0["target"],a);assert_eq!(replay.1,first.1);
+        let mut next=args;next["action_id"]=json!(uuid::Uuid::new_v4().to_string());
+        assert_eq!(call(&world,next).0["target"],b);
+        crate::session::store::with_locked_session_rows(&path,|rows|{rows.remove_session(&a);rows.commit()?;Ok(())}).unwrap();
+    }
 
     #[test]
     fn designated_director_can_resolve_its_question_without_whole_delegation_access(){
@@ -329,6 +465,14 @@ pub(crate) mod tests {
             wait: true,
             facade: tools::FACADE_DELEGATIONS,
         })
+    }
+
+    #[test]
+    fn history_read_preserves_explicit_name_scope_without_creating_a_target_pin() {
+        context("history-scope",|ctx| {
+            let input=json!({"target":"old-name","targetScope":{"kind":"project","projectId":"history-project"},"limit":7});
+            assert_eq!(normalize(ctx,tools::AGENT_NAME_HISTORY,input.clone()).unwrap(),input);
+        });
     }
 
     #[test]
@@ -549,7 +693,7 @@ pub(crate) mod tests {
             );
             let result = tools::handle(
                 ctx,
-                json!({"tool":"agent_list","arguments":{},"action_id":"list"})
+                json!({"tool":"agent_list","arguments":{"include_offline":true},"action_id":"list"})
                     .to_string()
                     .as_bytes(),
             );

@@ -66,7 +66,8 @@ fn unfinished_creation_exposes_only_scoped_durable_context_without_effects() {
 fn unfinished_creation_without_identity_or_failure_stays_unknown() {
     let (mut snapshot, q) = fixture();
     snapshot.failure_events.clear();
-    let action = snapshot.actions.values_mut().next().unwrap();
+    let first = snapshot.actions.keys().next().unwrap().clone();
+    let action = snapshot.actions.get_mut(&first).unwrap();
     action.phase = crate::agent_management::AgentActionPhase::Prepared;
     action.phase_sequence = 0;
     action.known_native_session_id = None;
@@ -135,5 +136,34 @@ fn audit_observation_failure_has_allowlisted_reason_without_sensitive_tail() {
         assert_eq!(value["status"], "unknown");
         assert_eq!(value["outcomeUnknown"], true);
         assert_eq!(value["result"]["durableContext"]["phase"], "configured");
+    }
+}
+
+/// r276 (EVA 2026-11-04): a create whose runtime start failed on an agent bus
+/// timeout says how to finish it; the stored detail carries the class prefix.
+#[test]
+fn a_failed_runtime_start_names_its_reason_and_the_exact_retry() {
+    for (detail, reason, retry) in [
+        ("owner_action_required: agent_bus_unavailable: Failed to read agent bus response (external outcome unknown)", Some("agent_bus_unavailable"), true),
+        ("owner_action_required: session_online_failed: native start incomplete; private tail", Some("runtime_start_failed"), true),
+        ("owner_action_required: agent_bus_observation_failed: private tail", Some("agent_bus_observation_failed"), false),
+        ("owner_action_required: unrecognized_failure: private tail", None, false),
+    ] {
+        let (mut snapshot, q) = fixture();
+        snapshot.failure_events.remove("failure-two");
+        let failure = snapshot.failure_events.get_mut("failure-one").unwrap();
+        failure.detail = detail.into();
+        let value = management_query_with(&snapshot, CALLER, &q, |_| panic!("no child lookup")).unwrap();
+        let context = &value["result"]["durableContext"];
+        assert_eq!(context["failures"][0].get("reasonCode"), reason.map(|r| json!(r)).as_ref(), "{detail}");
+        assert_eq!(context["failures"][0].get("retry").is_some(), retry);
+        assert_eq!(context.get("retry").is_some(), retry);
+        assert_eq!(context.get("hint").is_some(), retry);
+        if retry {
+            assert_eq!(context["retry"], "exact");
+            assert!(context["hint"].as_str().unwrap().contains("same agent_create"));
+        }
+        assert!(!value.to_string().contains("private"));
+        assert_eq!(value["status"], "unknown");
     }
 }

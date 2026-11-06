@@ -2,6 +2,58 @@
 
 ## Uncertain active-message follow-up settlement
 
+### Aged ACK waits and explicit evidence demand
+
+`agent-bus-stale-ack-settlement-v1` extends the original settlement capability.
+An accepted Claude input may qualify after **300 seconds since durable inbox
+acceptance**, when its exact entry turn ended or the same thread completed a
+later turn after acceptance. Age alone never qualifies a close. New records
+retain `inboxAcceptedAt`; legacy records conservatively use the last business
+update timestamp. `queuedAt` remains the original enqueue time, not an ACK-wait
+timer. The evidence carries both timestamps and the fixed `minWaitSecs:300`.
+
+The additional scope includes ordinary passive agent notes and provenance-checked
+Claude Task completion notifications. All other protected controls, Job and
+delegation internals remain excluded. Passive notes have no entry turn/native
+attempt: evidence honestly uses `actualTurnId:"unassigned"`,
+`terminalStatus:"unknown"`, and a verified `laterCompletedTurnId`. Its derived
+bookkeeping UUID is not a provider or claimed native attempt. A running or absent
+old entry can similarly be followed up only with the later-turn proof; it is not
+converted into a terminal or delivered input.
+
+The owner can request fresh evidence even when a row has no cached settlement:
+
+```http
+POST /v2/agent-bus/stuck-messages/evidence
+Content-Type: application/json
+
+{"messageId":"message-id"}
+```
+
+It has the same authenticated owner/full-device scope as close, accepts exactly
+one bounded nonblank `messageId`, and returns
+`{messageId,settlement:...|null}`. Unknown identity is 404; unavailable trusted
+observation/storage is 503. Ineligible evidence is null, not invented permission.
+The endpoint refreshes only rebuildable observations, never submits, retries,
+acknowledges or closes an input. An existing committed closure is readable even
+when the runtime is offline. The unchanged close endpoint independently collects
+again and enforces its token, runtime, receipt and write-lock checks.
+
+The desktop retains local hiding on older hosts and exposes a hidden-row list
+with per-row unhide. On capable hosts an owner bulk action obtains and submits a
+separate evidence-bound close for each hidden ID, reports each refusal, and
+removes a local hidden entry only after confirmed server closure. A failed or
+uncertain write remains visible for inspection and reuses its original request
+identity; it is never replaced with a resend.
+
+The evidence view adds optional `staleAck` with `queuedAt`, `acceptedAt`,
+`minWaitSecs`, nullable/absent `nativeAttemptId`, and nullable/absent
+`laterCompletedTurnId`. Legacy terminal evidence stays unchanged. Older strict
+readers reject extended persisted evidence rather than silently dropping closure
+identity; the existing business-format closure fence remains in effect.
+
+### Original terminal-entry scope
+
 Capability `agent-bus-message-settlement-v1` adds an optional `settlement` to
 message snapshots, stuck-message rows and `AdmissionNextStep` rows. Delivery
 facts stay separate. `outcome_unknown` says the adapter-assigned actual turn
@@ -100,13 +152,14 @@ All data uses `runtime/management-v2/management-state.sqlite3`, existing
   to **8 in the same transaction**. That record holds the complete evidence,
   exact request, immutable audit (actor/time/reason/original state/identities,
   request and evidence digests) and per-session notification outbox. Existing
-  r263/r264 readers reject version 8 instead of silently dropping closure or
+  readers that predate this settlement format reject version 8 instead of silently dropping closure or
   redriving its original message. Closed audit/request rows are not aged out.
 - Close excludes the item from admission and resubmission but leaves receipt
   reconciliation available. `cutex/agentBus/messageSettlementUpdated` carries
   `{messageId,requestId,settlement}` to both session streams after commit.
-  Per-session outbox acknowledgment repairs partial publication after restart
-  or reads; a crash between publication and acknowledgment may repeat an event
+  Per-session outbox acknowledgment repairs partial publication through the
+  independent background recovery loop (including offline hosts) and explicit
+  close replay, never a GET; a crash between publication and acknowledgment may repeat an event
   with the same request ID, never another business close. Consumers apply the
   projection idempotently and retain it when delivery events arrive later.
 
@@ -115,9 +168,30 @@ commit, with `requestId` equal to the server evidence token (or a server
 notification UUID when clearing it). `settlement:null` explicitly clears only
 an unclosed observation. A known closure is never erased by null/stale replay
 or a later delivery event. Observation notifications are rebuildable: a lost
-publication is repaired on the next controlled refresh or authoritative
-bootstrap/list read. Both sent and received bootstrap rows expose the same
-projection. Actual owner closes use the durable per-session outbox above.
+publication can be replaced by the authoritative projection on the next
+bootstrap/list read; that read does not publish events. Both sent and received
+bootstrap rows expose the same projection. Actual owner closes use the durable
+per-session outbox above.
+
+`GET /v2/agent-bus/stuck-messages` is diagnostic only. It does not flush the
+outbox, create locks/directories, change permissions, or migrate legacy Bus or
+session stores. Existing verified SQLite/legacy Bus bytes are read without
+repair; absent data stays empty and unsupported data fails closed. Missing or
+unreconciled session names/observer identity stay unknown.
+
+Automatic Claude proof collection runs on one worker with a four-job waiting
+queue and duplicate suppression. Its execution budget is 15 seconds, separate
+from the post-delivery scheduler's 75 ms message slot; native RPCs share that
+budget. It never holds up ordinary delivery polls. Repository/lock IO remains
+cooperative rather than a hard wall-clock deadline. A failed attempt clears
+close evidence and records `error.code=settlement_observation_unavailable`,
+`details.observationState=failed` in the existing message error field. This
+diagnostic updates that message row but does not change its Bus format/state,
+replay it, fabricate a receipt, or claim non-consumption. The error and reason
+are visible in the owner stuck-message view. Identical observer generation,
+envelope digest and native status do not trigger another automatic RPC attempt;
+changed facts permit another observation. Actual closure/discard remains an
+explicit owner action.
 
 Kit guards may allow only the exact observation namespace/version described
 above. `AgentBusMessageRepository::validate_settlement_observations_read_only`
@@ -151,7 +225,7 @@ serve --port 24260`. The start log says which source was used
 token. If a token from 1–3 differs from `config.json`'s, the bus warns: local
 agents and cutex clients authenticate with the `config.json` token.
 
-Older releases (r216 and earlier) already fall back to `config.json` when
+Earlier readers already fall back to `config.json` when
 `--token` is absent, so the service definitions can be changed before or after
 the binary upgrade.
 
@@ -222,7 +296,7 @@ default; read when the bus starts).
   holds fewer than N matching lines, the rotated ones (gz included), newest
   first.
 
-Rollback to r216: the old bus appends to `agent-bus-audit.jsonl` again and
+With the older audit layout, the bus appends to `agent-bus-audit.jsonl` again and
 ignores rotated files and the `agent_bus_audit` block (an old binary that
 rewrites `config.json` drops that block; defaults apply again after the next
 upgrade).
@@ -302,7 +376,7 @@ task/control records still require `--allow-protected`; use
 Older owner tools stay: `cutex human external-input analyze|release|discard`
 (pre-native `stale_held` only).
 
-## Idle delegation results and owner input (r263)
+## Idle delegation results and owner input
 
 Successful delegation results for an idle session batch for at most five seconds
 from the oldest pending delivery, including a cold cache. Shorter configured
@@ -321,7 +395,7 @@ the previous conservative path. A clearly oversized/full inbox can still prevent
 combined context; the owner's instruction remains deliverable and results remain
 available for explicit reading rather than being replayed.
 
-## 4. Wake timing for a busy recipient (r217h1 / r217h2, typed in r220)
+## 4. Wake timing for a busy recipient
 
 A wake (`after_turn` bus message: agent_tell wakes, owner wakes, alarms, Job
 completions, watchdogs) or delegation results for a **busy** Codex recipient
@@ -338,7 +412,7 @@ turn end. Capability `wake-busy-wait`.
 ```
 
 Absent (or not a number) = 120; `0` = next step at once; `null` or negative =
-never early (the r217 after-turn behaviour; saved back as `null`). Read per
+never early (after-turn-only behaviour; saved back as `null`). Read per
 delivery: a change applies without a restart.
 
 `GET|PATCH /v2/settings`: `agentBus {wakeBusyWaitSecs: 0-86400 | null}`

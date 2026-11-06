@@ -390,7 +390,16 @@ mod tests {
         crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap();
         let question = store
             .with_state(|state| {
-                crate::asks::questions::record_question(state, TARGET, 1, &json!(42), &json!({"turnId": "turn-1", "questions": []}), now)
+                crate::asks::questions::record_question(
+                    state,
+                    TARGET,
+                    1,
+                    &json!(42),
+                    &json!({"turnId":"turn-1", "questions":[{
+                        "id":"q0", "question":"Proceed?", "options":null, "isOther":true
+                    }]}),
+                    now,
+                )
             })
             .unwrap()
             .unwrap();

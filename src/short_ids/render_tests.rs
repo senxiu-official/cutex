@@ -105,6 +105,7 @@ fn isolated_rendering_keeps_full_mode_and_raw_content_and_does_not_nest_ask_lock
         answer_bytes: raw.len(),
         review: true,
         flags: vec![],
+        error: None,
     };
     let answer_text = render::return_piece(&answer, 0, 800, None);
     assert!(answer_text.starts_with(&format!(

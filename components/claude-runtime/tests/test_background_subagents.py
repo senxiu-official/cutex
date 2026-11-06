@@ -179,6 +179,46 @@ async def test_background_usage_is_added_to_the_origin_turn(ph):
     assert updates[-1]['turnId'] == run.turn and updates[-1]['tokenUsage']['total']['outputTokens'] >= entry['usage']['output_tokens']
 
 
+async def test_background_output_comes_from_the_run_transcript(ph):
+    # The stream copy of a child message carries the usage of its first blocks
+    # (output_tokens as of message_start); the transcript line has the final count.
+    # Seen on EVA 2026-10-30: 302,625 output tokens written, 4,138 reported.
+    run = await replay(ph, 'default', mode='default')
+    task_id = 'aa335f43da4fb68e1'
+    streamed = {}
+    for event in PROBE['default']:
+        data = event['data']
+        if event['kind'] == 'msg' and data.get('type') == 'assistant' and data.get('parent_tool_use_id'):
+            old = streamed.get(data['message_id'], {})
+            streamed[data['message_id']] = {k: max(v, old.get(k, 0)) for k, v in data['usage'].items()}
+    folder = Path(ph.engine.driver.config_dir) / 'projects' / 'D--work' / run.owner.session_id / 'subagents'
+    folder.mkdir(parents=True)
+    lines = []
+    for message_id, usage in streamed.items():
+        final = {**usage, 'output_tokens': 1000}
+        # Claude Code writes one line per content block, each with the message's final usage.
+        lines += [json.dumps({'type': 'assistant', 'message': {'id': message_id, 'usage': final}})] * 2
+    lines.append('{"type": "assistant", "mess')  # a line still being written
+    (folder / f'agent-{task_id}.jsonl').write_text('\n'.join(lines))
+    (folder / 'agent-someone-else.jsonl').write_text(lines[0])
+    await run.until()
+    usage = json.loads(ph.store.db.execute('SELECT usage FROM turns WHERE id=?', (run.turn,)).fetchone()[0])
+    [entry] = [c for c in usage['modelRequests'] if c['kind'] == 'background-task']
+    assert entry['usage']['output_tokens'] == 1000 * len(streamed)
+    # cutex splits the background part per agent from this running total.
+    updates = [e['params'] for e in ph.store.events(run.tid, 0, 10000) if e['method'] == 'thread/tokenUsage/updated']
+    assert updates[-1]['tokenUsage']['backgroundTotal']['outputTokens'] == 1000 * len(streamed)
+    assert updates[-1]['tokenUsage']['total']['outputTokens'] >= updates[-1]['tokenUsage']['backgroundTotal']['outputTokens']
+    assert entry['usage']['cache_read_input_tokens'] == sum(u['cache_read_input_tokens'] for u in streamed.values())
+
+
+async def test_transcript_usage_refuses_unsafe_ids(ph):
+    subagents = ph.engine.subagents
+    assert subagents.transcript_usage('not-a-uuid', 'aa335f43da4fb68e1') == {}
+    assert subagents.transcript_usage('29ff2967-a742-4c08-b8ed-d52a2872775a', '../x') == {}
+    assert subagents.transcript_usage('29ff2967-a742-4c08-b8ed-d52a2872775a', 'missing') == {}
+
+
 async def test_usage_of_a_task_ending_inside_its_turn_waits_for_the_result(ph):
     tid, turn, bridge = await begin(ph)
     await ph.engine.add_task_usage(tid, turn, 'task-x', {'output_tokens': 5})

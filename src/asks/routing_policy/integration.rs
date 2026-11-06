@@ -87,6 +87,11 @@ pub fn trusted_context(
         if reference.host_id() != host {
             return Err(cross_host_unsupported());
         }
+        // r271: a deleted session whose roster row awaits cleanup has no
+        // authority, whatever the row still says.
+        if crate::agent_management::pending_forget::contains(reference.id()) {
+            return Err(error(RoutingError::NotAuthorized));
+        }
         let member = snapshot
             .agents
             .values()
@@ -578,7 +583,7 @@ pub fn check_admission(
     }
     let verdict = result.map_err(error)?;
     if let Some(stored) = state.asks.get_mut(ask_id) {
-        stored.routing_grant_id = ask.routing_grant_id;
+        stored.routing_grant_id = ask.routing_grant_id.clone();
     }
     Ok(verdict)
 }
@@ -634,7 +639,7 @@ pub fn with_authority<T>(
             format!("routing authority fence: {e}"),
         )
     })?;
-    let snapshot = roster.snapshot().map_err(|e| {
+    let snapshot = roster.directory_snapshot_shared().map_err(|e| {
         AskError::new(
             "persistence_unavailable",
             format!("routing authority snapshot: {e}"),
@@ -657,7 +662,7 @@ pub fn with_creation_snapshot_for_world<T>(
         return run(&fixture.snapshot);
     }
     let _ = world;
-    let snapshot = Directory::director_snapshot()?;
+    let snapshot = Directory::director_snapshot_shared()?;
     run(&snapshot)
 }
 
@@ -683,7 +688,7 @@ pub fn try_with_authority_for_world<T>(
     else {
         return Ok(None);
     };
-    let snapshot = roster.snapshot().map_err(|e| {
+    let snapshot = roster.directory_snapshot_shared().map_err(|e| {
         AskError::new(
             "persistence_unavailable",
             format!("routing authority snapshot: {e}"),

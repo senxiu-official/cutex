@@ -138,7 +138,7 @@ pub fn handle_with(
             "delegation": new.delegation, "job": new.job,
         }));
         store
-            .with_state(|state| {
+            .create_action(caller.agent_id, Some(action_id), now, |state| {
                 match state.replay(caller.agent_id, action_id, &digest) {
                     Ok(Some(result)) => return Ok(result),
                     Err(()) => {

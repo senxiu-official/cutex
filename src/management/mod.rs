@@ -11,6 +11,7 @@ pub mod remote;
 pub mod server;
 pub mod service;
 pub mod user_home;
+pub mod user_layout;
 pub mod user_profiles;
 pub mod users;
 pub mod v2;

@@ -178,7 +178,7 @@ mod tests {
         let items = vec![
             ReturnItem::Answer { ask_id: "ask-1".into(), title: "T".into(), target: "Helper".into(),
                 status: AnswerStatus::Completed, answer_id: "ans-1".into(), revision: 1, inline: None, answer_bytes: 0,
-                review: true, flags: vec![] },
+                review: true, flags: vec![], error: None },
             ReturnItem::Question { ask_id: "ask-1".into(), title: "T".into(), target: "Helper".into(),
                 question_id: "q-1".into(), questions: json!([{"question": "Which file?"}]) },
             ReturnItem::State { ask_id: "ask-2".into(), title: "U".into(), target: "Helper".into(), state: "busy".into() },

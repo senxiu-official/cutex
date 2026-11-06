@@ -1,7 +1,7 @@
 //! Owner notify: agent → owner messages (cutex-desktop
 //! `docs/research/owner-notify.md`).
 //!
-//! - [`store`]: the records (one private, file-locked JSON document under
+//! - [`store`]: the records (private keyed SQL rows under
 //!   `<cutex runtime dir>/owner-notify/`, shared by the Agent Bus process,
 //!   which creates records from the `owner_notify` tool, and the management
 //!   process, which publishes their events and applies the owner's ack /
@@ -34,3 +34,4 @@ pub const CAPABILITY: &str = "owner-messages";
 /// and the `deleted` event exist, and reply refuses records that do not
 /// ask for one.
 pub const DELETE_CAPABILITY: &str = "owner-notify-delete";
+mod sql;

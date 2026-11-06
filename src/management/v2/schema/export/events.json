@@ -3,8 +3,43 @@
   "$id": "urn:cutex:management-v2:events",
   "title": "EventPage",
   "description": "GET /v2/events (page) and GET /v2/events/stream (SSE `cutex_management_event_v2`, data = one envelope; `cutex_management_stream_error`, data = error.json). `native.message` is a raw app-server JSON-RPC message; `cutex.params` per cutex-methods-v2.",
-  "anyOf": [{ "$ref": "#/$defs/eventPage" }, { "$ref": "#/$defs/eventEnvelope" }],
+  "anyOf": [{ "$ref": "#/$defs/eventPage" }, { "$ref": "#/$defs/eventEnvelope" }, { "$ref": "#/$defs/sessionStatusEnvelope" }],
   "$defs": {
+    "sessionBackgroundWorkChanged": {
+      "description": "Capability session-background-work. Opt in with sessionStatus=true. SSE event session_status, cutex envelope method=cutex/session/backgroundWork/changed, params=this object. No durable event/cursor/replay. Re-read sessions on reconnect or stream-error/resync.",
+      "type": "object", "required": ["cutexSessionId", "runtimeGeneration", "backgroundWork"],
+      "properties": {
+        "cutexSessionId": { "type": "string" },
+        "runtimeGeneration": { "type": "integer", "minimum": 0 },
+        "backgroundWork": {
+          "type": ["object", "null"],
+          "required": ["running", "subagents", "shells", "terminals", "complete"],
+          "properties": {
+            "running": { "type": "boolean" },
+            "subagents": { "type": "integer", "minimum": 0 },
+            "shells": { "type": "integer", "minimum": 0 },
+            "terminals": { "type": "integer", "minimum": 0 },
+            "complete": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "sessionStatusEnvelope": {
+      "description": "Ephemeral session_status SSE only, never durable replay or feed cursor advance. No SSE id. Sequence is observation-only and may be zero.",
+      "type": "object", "required": ["contractVersion", "source", "cutexSessionId", "hostId", "cutex", "cursor", "sequence"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "source": { "const": "cutex" },
+        "cutexSessionId": { "type": "string" },
+        "hostId": { "type": "string" },
+        "cursor": { "const": "" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "cutex": { "type": "object", "required": ["method", "params"], "properties": {
+          "method": { "const": "cutex/session/backgroundWork/changed" },
+          "params": { "$ref": "#/$defs/sessionBackgroundWorkChanged" }
+        } }
+      }
+    },
     "checkpoint": {
       "type": "object",
       "required": ["streamId", "sequence", "cursor"],

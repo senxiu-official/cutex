@@ -23,6 +23,17 @@ pub struct ExportedSchema {
 pub const SCHEMAS: &[ExportedSchema] = &[
     super::archive::api::EXPORTED_SCHEMA,
     ExportedSchema {
+        name: "host-session", title: "Exact host session catalog row",
+        routes: &["GET /v2/host/sessions/{id}"],
+        text: include_str!("schema/export/host-session.json"),
+    },
+    ExportedSchema {
+        name: "session-deltas",
+        title: "Session catalog pages and deltas",
+        routes: &["GET /v2/sessions/page", "GET /v2/sessions/changes"],
+        text: include_str!("schema/export/session-deltas.json"),
+    },
+    ExportedSchema {
         name: "guides-preferences", title: "Owner-user guide preferences",
         routes: &["GET /v2/human/preferences/guides", "PUT /v2/human/preferences/guides"],
         text: include_str!("schema/export/guides-preferences.json"),
@@ -220,6 +231,12 @@ pub const SCHEMAS: &[ExportedSchema] = &[
         text: include_str!("schema/export/runtimes.json"),
     },
     ExportedSchema {
+        name: "runtime-prune",
+        title: "Owner runtime cleanup",
+        routes: &["GET /v2/runtimes/prune", "POST /v2/runtimes/prune"],
+        text: include_str!("schema/export/runtime-prune.json"),
+    },
+    ExportedSchema {
         name: "claude-accounts",
         title: "Claude accounts",
         routes: &[
@@ -253,6 +270,8 @@ pub const SCHEMAS: &[ExportedSchema] = &[
         text: include_str!("schema/export/kimi-accounts.json"),
     },
     super::owner_rotation_api::EXPORTED_SCHEMA,
+    super::queue_order::REASONS_EXPORTED_SCHEMA,
+    super::input_ledger::EXPORTED_SCHEMA,
     super::artifact_store::EXPORTED_SCHEMA,
     super::host_info::EXPORTED_SCHEMA,
     super::alarms_api::EXPORTED_SCHEMA,
@@ -292,6 +311,10 @@ pub const SCHEMAS: &[ExportedSchema] = &[
             "DELETE /v2/users/me/devices/{tokenId}",
             "GET|PUT /v2/users/me/home",
             "GET|PUT|DELETE /v2/users/me/home/cover",
+            "GET /v2/users/me/layout",
+            "PUT|DELETE /v2/users/me/layout/{section}",
+            "PUT /v2/users/me/layout/pointer",
+            "event cutex/users/me/layoutChanged",
         ],
         text: include_str!("schema/export/users.json"),
     },
@@ -401,6 +424,31 @@ pub fn assert_valid(name: &str, definition: &str, value: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_work_schema_hashes_and_ephemeral_status_contract() {
+        use sha2::{Digest,Sha256};
+        for (name,expected) in [
+            ("sessions","5c04d9f931e4b33c411b6c9ac60dbf6cfdf4c6742a0342b4ee7ba6d35e269950".to_string()),
+            ("events","aaacd6fffa8fbd4d082d64c0409efe0f2f4a0e736e4b0f14c67c8aac8fe1753c".to_string()),
+        ] {
+            let text=SCHEMAS.iter().find(|s|s.name==name).unwrap().text;
+            assert!(!text.contains('\r'),"embedded schema must stay LF");
+            assert_eq!(format!("{:x}",Sha256::digest(text.as_bytes())),expected);
+        }
+        let work=json!({"running":true,"subagents":1,"shells":0,"terminals":2,"complete":false});
+        assert_valid("sessions","backgroundWork",&work);
+        assert!(!validator("sessions","backgroundWork").unwrap().is_valid(&json!({"running":3,"subagents":0,"shells":0,"terminals":0,"complete":true})));
+        for work in [work,Value::Null] {
+            let params=json!({"cutexSessionId":"cutex.a","runtimeGeneration":1,"backgroundWork":work});
+            assert_valid("events","sessionBackgroundWorkChanged",&params);
+            assert_valid("events","sessionStatusEnvelope",&json!({"contractVersion":2,"source":"cutex","cutexSessionId":"cutex.a","hostId":"test",
+                "cursor":"","sequence":0,"cutex":{"method":"cutex/session/backgroundWork/changed","params":params}}));
+        }
+        let capabilities=super::super::capabilities::capabilities_resource();
+        assert_eq!(capabilities["features"]["sessionBackgroundWork"],true);
+        assert!(capabilities["featureList"].as_array().unwrap().iter().any(|v|v=="session-background-work"));
+    }
 
     #[test]
     fn guides_and_creation_provenance_schemas_match_the_additive_contract() {

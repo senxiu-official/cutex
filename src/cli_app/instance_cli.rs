@@ -106,6 +106,7 @@ fn canonical_spelling(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn use_runtime(source: &Path, registry: Option<&Path>) -> anyhow::Result<()> {
+    let _runtime_reference = cutex::runtime::reference_guard::acquire_shared()?;
     let home = require_custom_home()?;
     let source = canonical_spelling(source)?;
     let bytes = std::fs::read(&source).with_context(|| format!("read {}", source.display()))?;

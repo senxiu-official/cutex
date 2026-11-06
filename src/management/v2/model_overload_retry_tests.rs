@@ -15,6 +15,148 @@ fn pending(s: &State, id: &str) -> Plan {
 }
 
 #[test]
+fn visible_retry_lifecycle_generation_thread_and_lease_fences() {
+    let mut s = State::default();
+    let lease = AdmissionLease { cutex_session_id: "s".into(), holder: LeaseHolder::Owner,
+        native_message_id: "owner-message".into(), runtime_generation: 9,
+        turn_id: Some("failed".into()), since: now().to_rfc3339() };
+    s.terminal("s", "thread", 9, &failed("failed"), Some(lease.clone()), now());
+    let view = |s: &State, lease: Option<&AdmissionLease>| s.auto_retry("s", Some("thread"), 9, lease, None);
+    let p = pending(&s, "s");
+    let initial = view(&s, Some(&lease)).unwrap();
+    assert!(initial.holds_admission);
+    assert_eq!(initial.phase, Phase::Pending);
+    assert_eq!(initial.turn_id, "failed");
+    assert_eq!(initial.attempt, 1);
+    assert_eq!(initial.max_attempts, 3);
+    assert_eq!(initial.at, p.at);
+    assert!(s.auto_retry("other", Some("thread"), 9, Some(&lease), None).is_none());
+    assert!(s.auto_retry("s", Some("other"), 9, Some(&lease), None).is_none());
+    assert!(s.auto_retry("s", Some("thread"), 10, Some(&lease), None).is_none());
+    assert!(s.auto_retry("s", Some("thread"), 9, Some(&lease), Some("newer")).is_none());
+    assert!(view(&s, None).is_none());
+    let mut replacement = lease.clone(); replacement.native_message_id = "replacement".into();
+    assert!(view(&s, Some(&replacement)).is_none());
+    replacement = lease.clone(); replacement.runtime_generation = 10;
+    assert!(view(&s, Some(&replacement)).is_none());
+    s.claim("s", &p.plan_id, p.at.parse().unwrap()).unwrap();
+    assert_eq!(view(&s, Some(&lease)).unwrap().phase, Phase::Firing);
+    s.sessions.get_mut("s").unwrap().plan.as_mut().unwrap().phase = Phase::Uncertain;
+    assert_eq!(view(&s, Some(&lease)).unwrap().phase, Phase::Uncertain);
+    let plan = s.sessions.get_mut("s").unwrap().plan.as_mut().unwrap();
+    plan.phase = Phase::Binding; plan.binding_turn_id = Some("retry-turn".into());
+    replacement = lease.clone(); replacement.turn_id = Some("retry-turn".into());
+    assert_eq!(view(&s, Some(&replacement)).unwrap().phase, Phase::Binding);
+    assert!(s.auto_retry("s", Some("thread"), 9, Some(&replacement), Some("retry-turn")).is_some());
+    let binding = s.clone();
+    s.sessions.get_mut("s").unwrap().plan.as_mut().unwrap().phase = Phase::Running;
+    assert!(view(&s, Some(&replacement)).is_none());
+    s = binding;
+    s.cancel("s", "ownerStop", now());
+    assert!(s.holds("s", Some("failed")), "settlement remains authoritative internally");
+    assert!(view(&s, Some(&lease)).is_none(), "cancelled settlement is never a live retry");
+}
+
+#[test]
+fn visible_retry_without_retained_lease_does_not_claim_a_hold() {
+    let mut s = State::default();
+    s.terminal("s", "thread", 9, &failed("failed"), None, now());
+    let retry = s.auto_retry("s", Some("thread"), 9, None, None).unwrap();
+    assert!(!retry.holds_admission);
+    let wire = serde_json::to_value(&retry).unwrap();
+    assert_eq!(wire["phase"], "pending");
+    assert_eq!(wire["scheduledAt"], pending(&s, "s").scheduled_at);
+    let mut admission = super::super::admission::AdmissionSnapshot::default();
+    assert_eq!(serde_json::to_value(&admission).unwrap().get("autoRetry"), Some(&Value::Null));
+    admission.auto_retry = Some(retry);
+    assert_eq!(serde_json::to_value(admission).unwrap()["autoRetry"], wire);
+}
+
+#[test]
+fn typed_retry_event_survives_running_and_immediate_next_failure() {
+    let mut s = State::default();
+    s.terminal("s", "thread", 9, &failed("original"), None, now());
+    let p = pending(&s, "s");
+    let before = changed_payload("s", "scheduled", &s, None);
+    assert_eq!(before["retry"]["failedTurnId"], "original");
+    assert!(before["retry"].get("turnId").is_none());
+    let evidence = retry_evidence(&p, Some("continued"));
+    let plan = s.sessions.get_mut("s").unwrap().plan.as_mut().unwrap();
+    plan.phase = Phase::Running; plan.turn_id = "continued".into();
+    assert_eq!(changed_payload("s", "fired", &s, None)["retry"], evidence);
+    s.terminal("s", "thread", 9, &failed("continued"), None, now());
+    assert_eq!(pending(&s, "s").attempt, 2);
+    let fired = changed_payload("s", "fired", &s, Some(evidence.clone()));
+    assert_eq!(fired["retry"], evidence, "receipt event describes the attempt that actually fired");
+    assert_eq!(fired["retry"]["attempt"], 1);
+    assert_eq!(fired["retry"]["failedTurnId"], "original");
+    assert_eq!(fired["retry"]["turnId"], "continued");
+}
+
+#[test]
+fn old_journal_keeps_v1_identity_while_new_attempt_uses_v2() {
+    let mut s = State::default();
+    s.terminal("s", "thread", 9, &failed("original"), None, now());
+    let p = pending(&s, "s");
+    assert_eq!(p.envelope_version, 2);
+    let mut old = serde_json::to_value(&p).unwrap();
+    old.as_object_mut().unwrap().remove("envelopeVersion");
+    assert_eq!(serde_json::from_value::<Plan>(old).unwrap().envelope_version, 1);
+}
+
+#[test]
+fn visible_retry_admission_explains_only_a_matching_hold_without_reordering() {
+    use super::super::admission::{AdmissionNextStep, project_auto_retry};
+    let mut s = State::default();
+    s.terminal("s", "thread", 9, &failed("failed"), None, now());
+    let mut retry = s.auto_retry("s", Some("thread"), 9, None, None).unwrap();
+    let row = |id: &str, reason: Option<&str>, held: Option<&str>| serde_json::from_value::<AdmissionNextStep>(json!({
+        "id":id,"deliveryKind":"answer","enqueuedAt":now().to_rfc3339(),"timing":"nextStep",
+        "waitReason":reason,"held":held
+    })).unwrap();
+    let mut rows = vec![row("waiting", None, None), row("receipt", Some("nativeReceipt"), None),
+        row("owner-stop", None, Some("ownerStop")), row("coalescing", Some("resultCoalescing"), None)];
+    let before = rows.clone();
+    project_auto_retry(&mut rows, Some(&retry));
+    assert_eq!(rows, before, "a lease-free retry does not block ridealongs");
+    retry.holds_admission = true;
+    project_auto_retry(&mut rows, Some(&retry));
+    assert_eq!(rows[0].wait_reason.as_deref(), Some("autoRetry"));
+    assert_eq!(rows[1], before[1]);
+    assert_eq!(rows[2], before[2]);
+    assert_eq!(rows[3].wait_reason.as_deref(), Some("autoRetry"));
+    for (a, b) in rows.iter().zip(before.iter()) {
+        assert_eq!((&a.id, &a.enqueued_at, &a.timing, &a.next_step_at, a.eligible),
+                   (&b.id, &b.enqueued_at, &b.timing, &b.next_step_at, b.eligible));
+    }
+}
+
+#[test]
+fn visible_retry_wire_matches_admission_and_exported_schemas_including_clear() {
+    let mut s = State::default();
+    s.terminal("s", "thread", 9, &failed("failed"), None, now());
+    let mut retry = s.auto_retry("s", Some("thread"), 9, None, None).unwrap();
+    retry.holds_admission = true;
+    let mut admission = super::super::admission::AdmissionSnapshot::default();
+    for schema in [include_str!("schema/cutex-methods-v2.json"), include_str!("schema/export/bootstrap.json")] {
+        let schema: Value = serde_json::from_str(schema).unwrap();
+        let root = json!({"$ref":"#/$defs/admission", "$defs":schema["$defs"]});
+        let validator = jsonschema::validator_for(&root).unwrap();
+        admission.auto_retry = None;
+        validator.validate(&serde_json::to_value(&admission).unwrap()).unwrap();
+        admission.auto_retry = Some(retry.clone());
+        validator.validate(&serde_json::to_value(&admission).unwrap()).unwrap();
+    }
+    let schema: Value = serde_json::from_str(include_str!("schema/export/sessions.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema["$defs"]["autoRetry"]).unwrap();
+    validator.validate(&serde_json::to_value(&retry).unwrap()).unwrap();
+    let mut invalid = serde_json::to_value(&retry).unwrap(); invalid["phase"] = json!("running");
+    assert!(!validator.is_valid(&invalid));
+    invalid["phase"] = json!("pending"); invalid.as_object_mut().unwrap().remove("holdsAdmission");
+    assert!(!validator.is_valid(&invalid));
+}
+
+#[test]
 fn reserved_cancel_rejects_other_lane_even_with_equal_token_without_dispatch() {
     let a = format!("reserved-a-{}", uuid::Uuid::new_v4());
     let b = format!("reserved-b-{}", uuid::Uuid::new_v4());

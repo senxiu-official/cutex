@@ -91,7 +91,9 @@ impl AgentManagementProvider {
         action: &AgentActionId,
         runtime: &mut dyn StockRuntimeExecutor,
     ) -> anyhow::Result<HumanRuntimeRecovery> {
-        let _mutation = self.store().lock_mutations()?;
+        // r271 (051 §2): fence-first when the owner route opted in.
+        let lane = super::fence_first::fence_first_session_lane(Some(id.as_str()))?;
+        let _locks = self.entry_locks(lane.as_deref(), false, "runtime recovery")?;
         let journal = recovery_path(path, action)?;
         let previous: Option<HumanRuntimeRecovery> = match std::fs::read(&journal) {
             Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
@@ -213,6 +215,29 @@ enum ClaimCleanup {
     StopWedged(crate::session::model::CutexSessionRecord, AgentActionId),
 }
 
+/// The host authority fence (or the stock execution lock) was busy while the
+/// caller held a session lane: nothing was read or cleared. Wraps
+/// [`crate::asks::pause_admission::Deferred`], so `is_deferred` recognizes it
+/// and clients get `admission_busy` / `hostBusy` (desktop design 050 §5).
+thread_local! {
+    static WEDGED_STOP_OUTSIDE_FENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `clear` so that a wedged launch's runtime is stopped after the host
+/// fence is released (holding only the session lane) and the fence is taken
+/// again only for the claim change (r271 launch-claim sweep, 051 §2).
+pub fn with_wedged_stop_outside_fence<T>(clear: impl FnOnce() -> T) -> T {
+    let previous = WEDGED_STOP_OUTSIDE_FENCE.with(|flag| flag.replace(true));
+    let result = clear();
+    WEDGED_STOP_OUTSIDE_FENCE.with(|flag| flag.set(previous));
+    result
+}
+
+pub fn launch_claim_host_busy() -> anyhow::Error {
+    anyhow::Error::new(crate::asks::pause_admission::Deferred)
+        .context("host_busy: the launch claim check waits for the host authority fence; retry shortly")
+}
+
 impl AgentManagementProvider {
     /// Clear a launch claim (and stale `Prepared` start intents) left behind
     /// by a crashed launch, so the owner never has to replay or repair it by
@@ -229,10 +254,29 @@ impl AgentManagementProvider {
         owner_alive: &mut LaunchClaimOwnerProbe<'_>,
         stop_wedged: &mut WedgedLaunchStop<'_>,
     ) -> anyhow::Result<bool> {
-        let _execution = super::provider::provider_execution_lock()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("stock execution lock unavailable"))?;
-        let _mutation = self.store().lock_mutations()?;
+        // r271 lock protocol (051 §2, decision A): a caller holding a session
+        // lane never waits for the execution lock or the host fence; lifecycle
+        // takes lanes after both (native stop). It only tries, and a busy host
+        // is a typed, retryable hostBusy (`launch_claim_host_busy`). Lane-free
+        // callers keep the blocking path.
+        let lane_held = crate::management::v2::session_coordination::thread_holds_lane();
+        let execution = if lane_held {
+            match super::provider::provider_execution_lock().try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return Err(launch_claim_host_busy()),
+                Err(std::sync::TryLockError::Poisoned(_)) => anyhow::bail!("stock execution lock unavailable"),
+            }
+        } else {
+            super::provider::provider_execution_lock()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("stock execution lock unavailable"))?
+        };
+        let mutation = if lane_held {
+            self.store().try_lock_delivery_mutations()?.ok_or_else(launch_claim_host_busy)?
+        } else {
+            self.store().lock_mutations()?
+        };
+        let mut locks = Some((execution, mutation));
         let outcome = with_locked_session_store(path, |sessions| {
             let Some(record) = sessions.sessions.get(id.as_str()).cloned() else {
                 return Ok(ClaimCleanup::Nothing);
@@ -316,8 +360,22 @@ impl AgentManagementProvider {
             ClaimCleanup::Cleared => return Ok(true),
             ClaimCleanup::StopWedged(record, action) => (record, action),
         };
+        // The launch-claim sweep (r271, 051 §2) stops a runtime outside the
+        // fence, holding only the lane (`stop_wedged` reserves it), and takes
+        // the fence again only for the claim change.
+        let outside = WEDGED_STOP_OUTSIDE_FENCE.with(std::cell::Cell::get);
+        if outside {
+            drop(locks.take());
+        }
         stop_wedged(&record)
             .with_context(|| format!("stopping the runtime of failed launch {}", action.as_str()))?;
+        if outside {
+            let execution = super::provider::provider_execution_lock()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("stock execution lock unavailable"))?;
+            locks = Some((execution, self.store().lock_mutations()?));
+        }
+        let _locks = locks;
         with_locked_session_store(path, |sessions| {
             let now = chrono::Utc::now().to_rfc3339();
             if let Some(current) = sessions.sessions.get_mut(id.as_str()) {
@@ -508,6 +566,60 @@ mod tests {
             .unwrap();
         assert_eq!(state.state, "failed");
     }
+    /// r271 (051 §2 decision A): a lane holder never waits for the host
+    /// fence or the execution lock. With either busy it gets a typed hostBusy
+    /// within milliseconds (no deadlock, no lock-order panic) and nothing is
+    /// cleared; the lane-free path then clears the dead claim.
+    #[test]
+    fn lane_holder_gets_host_busy_instead_of_waiting_for_the_fence() {
+        let f = fixture();
+        let lane = crate::management::v2::session_coordination::session_lane(&uuid::Uuid::new_v4().to_string()).unwrap();
+        let probe_never = &mut |_: &crate::session::model::CutexSessionRecord, _: Option<&StockRuntimeReceipt>| -> anyhow::Result<bool> {
+            panic!("a busy host never reaches the claim probe")
+        };
+        // Host fence held elsewhere (a lifecycle action).
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let root = f.root.join("provider");
+        let holder = std::thread::spawn(move || {
+            let store = AgentManagementStore::open(&root).unwrap();
+            let _fence = store.lock_mutations().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        {
+            let _lane = lane.reserve().unwrap();
+            let started = std::time::Instant::now();
+            let error = f.provider.clear_dead_launch_claim(&f.path, &f.id, probe_never, &mut |_| panic!("nothing to stop")).unwrap_err();
+            assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
+            assert!(crate::asks::pause_admission::is_deferred(&error), "{error:#}");
+            assert!(format!("{error:#}").starts_with("host_busy"), "{error:#}");
+        }
+        assert!(load_cutex_session_store_from_path(&f.path).unwrap().sessions[f.id.as_str()].app_server_launch_claim_id.is_some());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // Execution lock busy (a launch in this process): same answer.
+        {
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let _execution = super::super::provider::provider_execution_lock().lock().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            held_rx.recv().unwrap();
+            let _lane = lane.reserve().unwrap();
+            let error = f.provider.clear_dead_launch_claim(&f.path, &f.id, probe_never, &mut |_| panic!("nothing to stop")).unwrap_err();
+            assert!(crate::asks::pause_admission::is_deferred(&error), "{error:#}");
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+        }
+        // Lane free and fence free: the dead claim is cleared as before.
+        assert!(f.provider.clear_dead_launch_claim(&f.path, &f.id, &mut |_, _| Ok(false), &mut |_| panic!("nothing to stop")).unwrap());
+        assert!(load_cutex_session_store_from_path(&f.path).unwrap().sessions[f.id.as_str()].app_server_launch_claim_id.is_none());
+    }
+
     #[test]
     fn dead_launch_claim_is_cleared_automatically_and_action_is_abandoned() {
         let f = fixture();

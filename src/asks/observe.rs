@@ -140,16 +140,60 @@ pub fn observe_with(
     now: DateTime<Utc>,
     requeue_on_quota: &dyn Fn() -> bool,
 ) -> anyhow::Result<()> {
+    observe_inner(store, session, method, params, now, requeue_on_quota, None)
+}
+
+/// Replay a terminal history fact missed while the observer was disconnected.
+/// The lease captured before the native read must still be current.
+pub fn observe_bound_completion(
+    store: &AskStore, lease: &AdmissionLease, turn: &Value, now: DateTime<Utc>,
+    requeue_on_quota: &dyn Fn() -> bool,
+) -> anyhow::Result<()> {
+    if turn.get("id").and_then(Value::as_str) != lease.turn_id.as_deref()
+        || !matches!(turn.get("status").and_then(Value::as_str), Some("completed" | "failed" | "interrupted")) {
+        return Ok(());
+    }
+    observe_inner(store, &lease.cutex_session_id, "turn/completed", &json!({"turn":turn}), now, requeue_on_quota, Some(lease))
+}
+
+/// Compare-and-remove for non-Ask bound leases. Preserve the accepted event
+/// and its receipts even when its observer missed the terminal notification.
+pub(crate) fn release_bound_input(store: &AskStore, lease: &AdmissionLease, now: DateTime<Utc>) -> anyhow::Result<()> {
+    let Some(turn_id) = lease.turn_id.as_deref() else { return Ok(()); };
+    if matches!(lease.holder, LeaseHolder::Ask { .. }) { return Ok(()); }
+    store.with_state(|state| {
+        if state.leases.get(&lease.cutex_session_id) != Some(lease) { return; }
+        if let LeaseHolder::Event { event_id } = &lease.holder {
+            super::delivery::acknowledge_event(state, event_id, turn_id, now);
+            if let Some(event) = state.events.get_mut(event_id) {
+                event.compaction_reminder_pending = false;
+            }
+        }
+        state.leases.remove(&lease.cutex_session_id);
+    })
+}
+
+fn observe_inner(
+    store: &AskStore, session: &str, method: &str, params: &Value,
+    now: DateTime<Utc>, requeue_on_quota: &dyn Fn() -> bool, expected: Option<&AdmissionLease>,
+) -> anyhow::Result<()> {
     if !is_relevant(method) {
         return Ok(());
     }
     let Some(turn_id) = turn_id_of(method, params) else {
         return Ok(());
     };
+    if method == "turn/completed" {
+        // 054 §2.10: results this turn accepted but did not prove read.
+        if let Some(status @ ("interrupted" | "failed")) = params.pointer("/turn/status").and_then(Value::as_str) {
+            super::ledger::results_turn_ended(store, session, &turn_id, status);
+        }
+    }
     // Keep only identity and artifact readers, never an owned AskState (or
     // an old shared generation) while waiting for the subsequent write.
     let projection = store.project_snapshot(|state| {
         let lease = state.leases.get(session)?;
+        if expected.is_some_and(|expected| expected != lease) { return None; }
         if lease.turn_id.as_deref() != Some(turn_id.as_str()) { return None; }
         let mut readers = Vec::new();
         let mut own_message = None;
@@ -164,11 +208,12 @@ pub fn observe_with(
                 }
             }
         }
-        Some((lease.holder.clone(), readers, own_message))
+        Some((lease.clone(), readers, own_message))
     })?;
-    let Some((holder, readers, own_message)) = projection else {
+    let Some((lease, readers, own_message)) = projection else {
         return Ok(());
     };
+    let holder = lease.holder.clone();
     if let LeaseHolder::Event { event_id } = &holder {
         if method == "thread/compacted" || is_compaction_item(method, params) {
             let event_id = event_id.clone();
@@ -177,14 +222,13 @@ pub fn observe_with(
         }
         if method == "turn/completed" {
             if crate::management::v2::model_overload_retry::holds_default(session, Some(&turn_id)) { return Ok(()); }
-            let event_id = event_id.clone();
-            store.with_state(|state| {
-                super::delivery::acknowledge_event(state, &event_id, &turn_id, now);
-                if let Some(event) = state.events.get_mut(&event_id) {
-                    event.compaction_reminder_pending = false;
-                }
-                state.leases.remove(session);
-            })?;
+            release_bound_input(store, &lease, now)?;
+        }
+        return Ok(());
+    }
+    if matches!(holder, LeaseHolder::Owner) && method == "turn/completed" {
+        if !crate::management::v2::model_overload_retry::holds_default(session, Some(&turn_id)) {
+            release_bound_input(store, &lease, now)?;
         }
         return Ok(());
     }
@@ -290,11 +334,15 @@ pub fn observe_with(
         "turn/completed" => {
             let turn = params.get("turn").cloned().unwrap_or(Value::Null);
             if crate::management::v2::quota_continue::quota_failure(&turn)
-                && requeue_quota_failure(store, session, &ask_id, attempt, &turn, requeue_on_quota, now)?
+                && requeue_quota_failure(store, session, &ask_id, attempt, &turn, requeue_on_quota, now, expected)?
             {
                 return Ok(());
             }
-            finalize(store, session, &ask_id, attempt, &turn, None, now)?;
+            if let Some(expected) = expected {
+                finalize_fenced(store, session, &ask_id, attempt, &turn, None, now, expected)?;
+            } else {
+                finalize(store, session, &ask_id, attempt, &turn, None, now)?;
+            }
         }
         _ => {}
     }
@@ -323,6 +371,7 @@ fn requeue_quota_failure(
     turn: &Value,
     requeue_on_quota: &dyn Fn() -> bool,
     now: DateTime<Utc>,
+    expected: Option<&AdmissionLease>,
 ) -> anyhow::Result<bool> {
     let Some(ask) = store.snapshot()?.asks.get(ask_id).cloned() else {
         return Ok(false);
@@ -343,7 +392,8 @@ fn requeue_quota_failure(
     store.with_state(|state| {
         // Another end-of-turn path already ended this attempt: nothing to
         // requeue (and not a second `quota_requeues` count).
-        if !attempt_open(state, ask_id, attempt)
+        if expected.is_some_and(|lease| state.leases.get(session) != Some(lease))
+            || !attempt_open(state, ask_id, attempt)
             || state.asks.get(ask_id).and_then(|a|a.attempts.iter().find(|r|r.n == attempt)).is_some_and(|r| turn.get("id").and_then(Value::as_str).is_some_and(|id|r.turn_id.as_deref()!=Some(id))) {
             return true;
         }
@@ -638,8 +688,9 @@ fn finalize_inner(
         }
         if let Some(updated) = state.asks.get(ask_id).cloned() {
             super::delivery::record_answer_delivery(state, &updated, &answer_id, now);
-            // Owner decision 2026-10-08: the owner stopped the ask's turn
-            // (stop, or interrupt-and-send): the requester is woken when idle
+            // Owner decision 2026-10-08: the ask's turn was stopped through
+            // the owner route (including a host upgrade, stop, or
+            // interrupt-and-send): the requester is woken when idle
             // to decide (retry, reassign, close), even for passive asks.
             let owner_stopped = updated
                 .attempts

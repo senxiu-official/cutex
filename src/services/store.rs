@@ -154,6 +154,14 @@ pub struct ServiceRecord {
     /// (also across daemon restarts) until it is started again.
     #[serde(default)]
     pub stopped: bool,
+    /// Absent on older registrations: preserve their forever-running behavior.
+    #[serde(default)]
+    pub idle_stop_preset: super::idle::IdleStopPreset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_idle_at: Option<String>,
+    /// A failed on-demand attempt needs an explicit start/restart before retrying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_wake_failed_at: Option<String>,
     /// Managed only: the owning agent's latest `service_restart` request.
     /// A change seen by the supervisor restarts the running process once
     /// (not part of the launch fingerprint; ignored on daemon start).
@@ -443,6 +451,8 @@ pub enum Caller {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegisterRequest {
     #[serde(default)]
+    pub idle_stop_preset: Option<String>,
+    #[serde(default)]
     pub proxy_host_header: Option<String>,
     pub slug: String,
     #[serde(default)]
@@ -515,6 +525,8 @@ where
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateRequest {
+    #[serde(default)]
+    pub idle_stop_preset: Option<String>,
     #[serde(default)]
     pub proxy_host_header: Option<String>,
     #[serde(default)]
@@ -1392,6 +1404,9 @@ impl ServiceStore {
                 env: env.clone(),
                 login_link_command: request.login_link_command.clone(),
                 stopped: existing.as_ref().is_some_and(|r| r.archived),
+                idle_stop_preset: super::idle::policy(runtime, lifetime, request.idle_stop_preset.as_deref(), existing.as_ref())?,
+                stopped_idle_at: existing.as_ref().filter(|_| runtime == ServiceRuntime::Managed && lifetime == ServiceLifetime::Persistent).and_then(|r| r.stopped_idle_at.clone()),
+                idle_wake_failed_at: existing.as_ref().filter(|_| runtime == ServiceRuntime::Managed && lifetime == ServiceLifetime::Persistent).and_then(|r| r.idle_wake_failed_at.clone()),
                 restart_requested_at: existing
                     .as_ref()
                     .and_then(|record| record.restart_requested_at.clone()),
@@ -1710,6 +1725,11 @@ impl ServiceStore {
             if record.owner_scope == ServiceOwnerScope::Project && record.project_id.is_none() {
                 return Err(project_scope_unavailable("a project service needs a projectId"));
             }
+            record.idle_stop_preset = super::idle::policy(record.runtime, record.lifetime, request.idle_stop_preset.as_deref(), Some(&before))?;
+            if !super::idle::eligible(&record) || record.stopped || record.archived {
+                record.stopped_idle_at = None;
+                record.idle_wake_failed_at = None;
+            }
             validate_runtime_fields(&record)?;
             record.ceiling = ceiling_for(record.runtime);
             if record != before {
@@ -1835,6 +1855,7 @@ impl ServiceStore {
                 at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
             }
             record.restart_requested_at = Some(at);
+            record.idle_wake_failed_at = None;
             Ok(record.clone())
         })
     }
@@ -1846,8 +1867,10 @@ impl ServiceStore {
                 .services
                 .get_mut(slug)
                 .ok_or_else(|| ServicesError::not_found(slug))?;
-            if record.stopped != stopped {
+            if record.stopped != stopped || record.stopped_idle_at.is_some() || record.idle_wake_failed_at.is_some() {
                 record.stopped = stopped;
+                record.stopped_idle_at = None;
+                record.idle_wake_failed_at = None;
                 record.updated_at = now_rfc3339();
             }
             Ok(record.clone())
@@ -1964,6 +1987,8 @@ fn validate_owner_text(value: &str, max: usize, field: &str) -> ServicesResult<S
 }
 
 fn read_registry(path: &Path) -> anyhow::Result<Registry> {
+    #[cfg(test)]
+    REGISTRY_READS.with(|count|count.set(count.get()+1));
     match std::fs::read(path) {
         Ok(bytes) => {
             let mut value: Value = serde_json::from_slice(&bytes)
@@ -1976,6 +2001,9 @@ fn read_registry(path: &Path) -> anyhow::Result<Registry> {
         Err(error) => Err(error.into()),
     }
 }
+
+#[cfg(test)]
+thread_local! { pub(super) static REGISTRY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 /// Upgrade records written before the services simplification in place. A
 /// pre-v2 `pinned` belonged to the retired on-demand model, so it is dropped;
@@ -2048,6 +2076,14 @@ pub fn service_view(record: &ServiceRecord, state: Option<&RuntimeSnapshot>) -> 
         "localUrl": record.url_for_host("127.0.0.1"),
     });
     if record.runtime.supervised() {
+        view["idleStopPreset"] = json!(record.idle_stop_preset);
+        view["idleStopAt"] = json!(if super::idle::eligible(record) && record.idle_stop_preset.seconds().is_some() && !record.stopped && !record.archived && record.stopped_idle_at.is_none() { state.and_then(|s| s.idle_stop_at.as_deref()) } else { None });
+        view["stoppedIdleAt"] = json!(record.stopped_idle_at);
+        view["idleWakeFailedAt"] = json!(record.idle_wake_failed_at);
+        view["stoppedIdle"] = json!(!record.stopped && record.stopped_idle_at.is_some());
+        if !record.stopped && record.stopped_idle_at.is_some() && state.is_none_or(|s| s.pid.is_none()) {
+            view["health"] = json!("stoppedIdle");
+        }
         view["command"] = serde_json::to_value(&record.command).unwrap_or(Value::Null);
         view["cwd"] = json!(record.cwd);
         view["envKeys"] = json!(record.env.keys().collect::<Vec<_>>());
@@ -2593,6 +2629,7 @@ mod tests {
         let old = store.get(&slug).unwrap();
         assert!(service_view(&old, None)["lastTrafficAt"].is_string());
         let state = RuntimeSnapshot {
+            idle_stop_at: None,
             last_traffic_at: crate::services::traffic::snapshot(&slug).last_traffic_at,
             health: ServiceHealth::Reachable,
             last_seen_at: None,

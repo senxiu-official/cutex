@@ -15,6 +15,9 @@ use std::{
 
 pub const PATH: &str = "/v2/health";
 pub const FIX_PATH: &str = "/v2/health/fix";
+#[cfg(unix)]
+#[path = "health_profile_permissions.rs"]
+mod profile_permissions;
 pub fn is_path(path: &str) -> bool {
     matches!(path.split('?').next(), Some(PATH | FIX_PATH))
 }
@@ -233,7 +236,7 @@ fn session_findings(store: &CutexSessionStore, running: &dyn Fn(u32) -> bool) ->
 
 #[cfg(unix)]
 fn profile_directory_findings(root: &Path) -> anyhow::Result<Vec<Finding>> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = match std::fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() => metadata,
@@ -261,12 +264,16 @@ fn profile_directory_findings(root: &Path) -> anyhow::Result<Vec<Finding>> {
                     json!({
                         "path":path,
                         "mode":format!("{mode:04o}"),
+                        "uid":metadata.uid(),
+                        "device":metadata.dev(),
+                        "inode":metadata.ino(),
                         "criterion":"profile auth ancestor is group/other writable; profile launches may be refused",
                         "nextAction":"Owner: review this directory, then run chmod 0700 on this exact path. Existing permissions are never changed automatically.",
                         "nextActionZhCN":"请由所有者检查此目录，再对这个确切路径执行 chmod 0700。现有目录权限不会自动修改。",
                         "repairCommand":["chmod","0700","--",path]
                     }),
-                    None,
+                    (metadata.uid() == unsafe { libc::geteuid() } && mode & 0o400 != 0)
+                        .then_some("secure_profile_directory"),
                 )
             })
         })
@@ -332,6 +339,10 @@ pub fn scan() -> anyhow::Result<Value> {
     let store = crate::session::store::load_cutex_session_store_shared()?;
     let mut findings = session_findings(&store, &process_may_be_running);
     findings.extend(integration_dedupe_findings(&crate::config::paths::runtime_dir()?.join("management-v2")));
+    if let Some(detail) = super::runtime_journal::health() {
+        let code = detail["condition"].as_str().unwrap_or("event_journal_unavailable");
+        findings.push(finding(code, None, detail.clone(), None));
+    }
     // Report-only and best-effort: a profile store problem must not hide the
     // other findings.
     if let Ok(accounts) = load_accounts() {
@@ -470,6 +481,17 @@ struct FixOutcome {
     planned: Vec<Value>,
 }
 
+/// The filesystem mutation succeeded, but durability or its audit did not.
+/// Preserve this distinction in the API's applied list before returning failure.
+#[derive(Debug)]
+struct RepairAlreadyApplied(anyhow::Error);
+impl std::fmt::Display for RepairAlreadyApplied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "profile permissions changed to 0700; {}", self.0)
+    }
+}
+impl std::error::Error for RepairAlreadyApplied {}
+
 /// Walk the selected findings in order; `apply_one` fixes one finding and
 /// returns the session it resolved. Stops at the first failure, reporting
 /// what was applied before it.
@@ -504,6 +526,9 @@ fn apply_findings(
                 outcome.applied.push(finding.id.clone());
             }
             Err(error) => {
+                if error.downcast_ref::<RepairAlreadyApplied>().is_some() {
+                    outcome.applied.push(finding.id.clone());
+                }
                 return Err(FixFailure {
                     error,
                     applied: outcome.applied,
@@ -546,8 +571,20 @@ pub fn fix(request: &FixRequest, context: ManagementRequestContext) -> Result<Va
     )
 }
 
-/// Apply one finding's fix; returns the session it resolved.
+/// Apply one finding's fix; returns the repaired session/directory identity.
 fn apply_fix(finding: &Finding, context: ManagementRequestContext) -> anyhow::Result<String> {
+    #[cfg(unix)]
+    if finding.fix.as_ref().is_some_and(|fix| fix.action == "secure_profile_directory") {
+        let path = profile_permissions::repair(
+            &crate::profiles::materialize::materialized_profiles_dir()?, finding,
+        )?;
+        crate::agent_bus::audit::append_agent_bus_audit_record(json!({
+            "event":"health_fixed", "timestamp":chrono::Utc::now().to_rfc3339(),
+            "findingId":finding.id, "code":finding.code, "path":path,
+            "action":finding.fix, "mode":"0700"
+        })).map_err(|error| RepairAlreadyApplied(error.context("health audit failed; inspect the current directory and preserve this response")))?;
+        return Ok(format!("profile-directory:{}", path.display()));
+    }
     if finding
         .fix
         .as_ref()
@@ -1027,7 +1064,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn writable_profile_directories_are_report_only() {
+    fn writable_profile_directory_scan_is_read_only_and_explicit_fixes_are_planned() {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = crate::config::paths::test_home_env_lock();
@@ -1055,7 +1092,7 @@ mod tests {
         assert_eq!(findings.len(), 3);
         assert!(findings.iter().all(|f| f.code == "profile_directory_writable"
             && f.severity == "warn"
-            && f.fix.is_none()));
+            && f.fix.as_ref().is_some_and(|fix| fix.action == "secure_profile_directory")));
         assert_eq!(findings[0].detail["path"], json!(root));
         assert_eq!(findings[0].detail["mode"], "0775");
         assert_eq!(
@@ -1064,9 +1101,9 @@ mod tests {
         );
         let selected = findings.iter().map(|f| f.id.clone()).collect();
         let outcome =
-            apply_findings(&findings, &selected, false, |_| unreachable!()).unwrap();
+            apply_findings(&findings, &selected, true, |_| unreachable!()).unwrap();
         assert!(outcome.applied.is_empty());
-        assert_eq!(outcome.skipped.len(), 3);
+        assert_eq!(outcome.planned.len(), 3);
         for finding in &findings {
             let path = Path::new(finding.detail["path"].as_str().unwrap());
             let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;

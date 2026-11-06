@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+from fake_sdk import rendered_system_prompt
 
 from cute_claude.config import Settings
 from cute_claude.protocol import Server
@@ -357,11 +358,13 @@ async def test_sdk_public_driver_option_wiring_and_same_task_ownership(sh, monke
     o = client.options
     assert o.tools == {'type':'preset','preset':'claude_code'} and o.allowed_tools == ['mcp__cutex__read_file','mcp__cutex__list_directory'] and o.strict_mcp_config
     assert o.permission_mode == 'bypassPermissions'
-    assert o.extra_args == {'allow-dangerously-skip-permissions':None, 'replay-user-messages':None}
+    assert {k:v for k,v in o.extra_args.items() if k != 'append-system-prompt-file'} == {'allow-dangerously-skip-permissions':None, 'replay-user-messages':None}
+    assert Path(o.extra_args['append-system-prompt-file']).read_text(encoding='utf-8') == sh.engine.settings.preset_append('')
     assert o.enable_file_checkpointing is False and o.forward_subagent_text is True  # subagent_transcripts
     assert o.setting_sources == [] and o.plugins == [] and not o.continue_conversation
     # Claude Code's preset prompt; the host note (no --system-append-file) is appended.
-    assert o.system_prompt == {'type': 'preset', 'preset': 'claude_code', 'append': sh.engine.settings.preset_append('')}
+    assert o.system_prompt == {'type': 'preset', 'preset': 'claude_code'}
+    assert rendered_system_prompt(o)['append'] == sh.engine.settings.preset_append('')
     assert o.session_id and o.resume is None
     assert o.env['CLAUDE_CODE_MAX_RETRIES'] == '0'
     assert o.env['CLAUDE_CONFIG_DIR'] == str(tmp_path/'account')
@@ -421,7 +424,7 @@ async def test_auto_mode_thread_gets_the_cutex_approvals_note(sh, monkeypatch, t
     turn = await sh.turn(tid, 'TOOL:read_file')
     await sh.drain()
     assert sh.store.turn(turn)['status'] == 'completed'
-    append = sdk.clients[0].options.system_prompt['append']
+    append = rendered_system_prompt(sdk.clients[0].options)['append']
     assert append == sh.engine.settings.preset_append('', 'auto') and AUTO_MODE_LIMIT in append
 
 

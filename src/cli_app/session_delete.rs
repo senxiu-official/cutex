@@ -662,6 +662,11 @@ pub(crate) fn delete_for_management(
     }
     // Busy: a launch in progress or a running turn.
     if let Err(error) = super::management_context::auto_clear_dead_launch_claim(&key) {
+        // r271: the claim check only tried the busy host fence (this request
+        // holds the session lane). Nothing was deleted; retry shortly.
+        if cutex::asks::pause_admission::is_deferred(&error) {
+            return Err(cutex::management::v2::server::admission_busy_user_input_error("route", error));
+        }
         eprintln!("session delete: launch claim check failed for {key}: {error:#}");
     }
     let (_, record) = load(&key)?;
@@ -732,7 +737,14 @@ pub(crate) fn delete_for_management(
 
     clear_project_service_registrant(&key, &receipt_path, &mut receipt)?;
 
-    let removed = cutex::session::store::remove_cutex_session_record(&record).map_err(|error| {
+    // r271 (051 §2): from here until the roster row is gone (possibly by the
+    // lane-free sweep), every roster/authority reader treats this id as gone.
+    if let Err(error) = cutex::agent_management::pending_forget::mark(&key) {
+        eprintln!("session delete: pending-forget marker for {key} not written: {error:#}");
+    }
+    let removed = cutex::session::store::remove_cutex_session_record(&record).inspect_err(|_| {
+        let _ = cutex::agent_management::pending_forget::clear(&key);
+    }).map_err(|error| {
         UserInputExecutionError {
             stage: "persistence".into(),
             code: "persistence_uncertain".into(),
@@ -761,7 +773,15 @@ pub(crate) fn delete_for_management(
             .map_err(|error| anyhow::anyhow!("{error:#}"))
             .and_then(|provider| provider.forget_deleted_session(&id).map_err(anyhow::Error::from))
         {
-            eprintln!("session delete: roster cleanup failed for {key}: {error:#}");
+            // r271: busy host fence under the lane; the lane-free sweep
+            // removes the roster row once the fence is free.
+            if error.downcast_ref::<cutex::agent_management::AgentManagementError>()
+                .is_some_and(|error| matches!(error, cutex::agent_management::AgentManagementError::HostBusy(_)))
+            {
+                super::owner_admission::sweep_forget_deleted_session(&key);
+            } else {
+                eprintln!("session delete: roster cleanup failed for {key}: {error:#}");
+            }
         }
     }
     for (label, result) in [
@@ -1162,6 +1182,54 @@ mod tests {
         .unwrap();
         assert_eq!(receipt["nativeDelete"], "storageMove");
         assert!(cutex::session::store::load_cutex_session_store().unwrap().sessions.is_empty());
+    }
+
+    /// r271 (051 §2 decision A): delete holds the session lane, so with the
+    /// host fence busy its launch-claim check answers hostBusy at once and
+    /// deletes nothing. The lane-free sweep clears the dead claim once the
+    /// fence is free, and the retried delete succeeds.
+    #[test]
+    fn busy_fence_delete_is_host_busy_then_the_sweep_clears_the_dead_claim() {
+        let test = crate::cli_app::test_home::IsolatedTestHome::new("delete-claim-busy").unwrap();
+        let manifest = test.root().join("bundle-r177.json");
+        std::fs::write(&manifest, "{}").unwrap();
+        let manifest = manifest.canonicalize().unwrap();
+        let mut target = local_explicit_launch(ORIGINAL, &manifest);
+        target.app_server_launch_claim_id = Some("claim-of-a-crashed-launch".into());
+        let key = target.cutex_session_id.clone();
+        let mut store = cutex::session::model::CutexSessionStore::default();
+        store.sessions.insert(key.clone(), target);
+        cutex::session::store::save_cutex_session_store(&store).unwrap();
+        let request = SessionDeleteRequest { expected_revision: None, only_if_empty: false };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            cutex::asks::pause_admission::acquire_worker_fence().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            cutex::asks::pause_admission::release_worker_fence();
+        });
+        held_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let error = delete_for_management(&key, &request).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        assert_eq!((error.code.as_str(), error.retryable), ("admission_busy", true), "{error:?}");
+        assert_eq!(error.details["reason"], "hostBusy");
+        let kept = cutex::session::store::load_cutex_session_store().unwrap();
+        assert!(kept.sessions[&key].app_server_launch_claim_id.is_some(), "no half delete");
+        assert!(super::super::owner_admission::launch_claim_sweep_pending(&key));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let swept = std::time::Instant::now();
+        super::super::owner_admission::sweep_launch_claims_once();
+        assert!(swept.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!super::super::owner_admission::launch_claim_sweep_pending(&key));
+        let cleared = cutex::session::store::load_cutex_session_store().unwrap();
+        assert!(cleared.sessions[&key].app_server_launch_claim_id.is_none(), "dead claim cleared lane-free");
+        let receipt = delete_for_management(&key, &request).unwrap();
+        assert_eq!(receipt["nativeDelete"], "storageMove");
+        assert!(cutex::session::store::load_cutex_session_store().unwrap().sessions.is_empty());
+        assert!(!cutex::agent_management::pending_forget::contains(&key), "roster cleanup finished");
     }
 
     /// A native that starts but predates `thread/delete`.

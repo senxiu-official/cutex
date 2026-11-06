@@ -773,6 +773,9 @@ pub struct AskRecord {
     /// FIFO position key across the target's queue (enqueue order).
     pub seq: u64,
     pub execution: ExecutionState,
+    /// Permanent pre-dispatch refusal, including asks with zero attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_failure: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold: Option<Hold>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1166,9 +1169,21 @@ pub struct DeliveryRecord {
     pub event_id: Option<String>,
     #[serde(default)]
     pub passive: bool,
+    /// Explicit per-item owner hold; session stop/resume never changes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_hold: bool,
+    /// Atomic owner reservation retained through receipt reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_input_id: Option<String>,
+    /// Positive source-store proof that no native submit can have occurred.
+    /// Frozen events clear it; only a proven refusal restores it. Older
+    /// records default to unproven, including Pending after an unknown send.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unsubmitted: bool,
     /// Why an item was acknowledged without an event or a wait (r208):
     /// `read` (`delegation_read` of that revision) or `closed`
-    /// (`delegation_close` / `delegation_stop`). The state stays
+    /// (`delegation_close` / `delegation_stop`), or `superseded` (obsolete,
+    /// proved unsubmitted blocked-owner notification). The state stays
     /// `acknowledged` so older releases read the record unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_by: Option<String>,

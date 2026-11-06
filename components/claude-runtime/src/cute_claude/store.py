@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .errors import RpcError, require
+from . import history_order, usage_totals
 from .asks import ask_ref
 from .browser_content import journal_result
 
@@ -144,6 +145,9 @@ class Store:
             self.db.execute('''CREATE TABLE IF NOT EXISTS session_operations(
                 id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, kind TEXT NOT NULL,
                 state TEXT NOT NULL, data TEXT NOT NULL, created REAL NOT NULL)''')
+            # Rebuildable usage read model (058 S2); turns.usage keeps its format.
+            usage_totals.ensure_schema(self.db)
+            history_order.ensure_schema(self.db)
             self.db.execute("INSERT OR REPLACE INTO meta VALUES('schema','2')")
 
     def thread_properties(self, tid: str) -> dict:
@@ -347,7 +351,10 @@ class Store:
             if old:
                 require(old["semantic_hash"] == digest, "messageId reused with different semantic content", -32010)
                 return self.note_receipt(old, True)
-            count = self.db.execute("SELECT count(*) FROM notes WHERE thread_id=? AND state='pending'", (tid,)).fetchone()[0]
+            count = self.db.execute('''SELECT count(*) FROM notes n WHERE n.thread_id=? AND
+                (n.state='pending' OR (n.state='reserved' AND EXISTS(SELECT 1 FROM inputs i
+                 WHERE i.thread_id=n.thread_id AND i.message_id=json_extract(n.payload,'$.metadata.ownerCarrier')
+                 AND i.state IN ('queued','processing'))))''', (tid,)).fetchone()[0]
             require(count < max_pending, "inbox capacity reached", -32001)
             self.db.execute("INSERT INTO notes(thread_id,message_id,semantic_hash,payload,state,created) VALUES(?,?,?,?,'pending',?)",
                             (tid, mid, digest, canonical, time.time()))
@@ -376,6 +383,19 @@ class Store:
             self.put_item(turn_id, item)
             self.db.execute("UPDATE notes SET state='injected',turn_id=? WHERE seq=?", (turn_id, row["seq"]))
             taken.append((item, self.project_input(payload)[0]["text"]))
+        return taken
+
+    def take_owner_carries(self, tid: str, carrier: str, turn_id: str) -> list[tuple[dict, str]]:
+        """Only the carrier's own claim may consume reserved identities."""
+        taken = []
+        rows = self.db.execute("""SELECT * FROM notes WHERE thread_id=? AND state='reserved'
+            AND json_extract(payload,'$.metadata.ownerCarrier')=? ORDER BY seq""", (tid, carrier)).fetchall()
+        for row in rows:
+            payload = json.loads(row['payload'])
+            item = self.external_item(row['message_id'], payload)
+            self.put_item(turn_id, item)
+            self.db.execute("UPDATE notes SET state='injected',turn_id=? WHERE seq=?", (turn_id, row['seq']))
+            taken.append((item, self.project_input(payload)[0]['text']))
         return taken
 
     @staticmethod
@@ -479,7 +499,7 @@ class Store:
             # owner turn as separate text blocks before the owner's text
             # (`turn_note_frames`), so only the owner's own text expands @path
             # mentions. `/compact` reads none: they wait for the next turn.
-            notes = [] if compact else self._take_notes(tid, row["turn_id"])
+            notes = [] if compact else self.take_owner_carries(tid, row["message_id"], row["turn_id"]) + self._take_notes(tid, row["turn_id"])
             model_content = content
             if notes:
                 model_content = [{"type": "text", "text": "\n\n".join([frame for _, frame in notes] + [content[0]["text"]])}]

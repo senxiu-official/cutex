@@ -15,6 +15,16 @@ import anyio
 END = object()
 
 
+def rendered_system_prompt(options):
+    """Prompt semantics at the CLI boundary, without mutating SDK options."""
+    prompt = dict(options.system_prompt)
+    path = (options.extra_args or {}).get('append-system-prompt-file')
+    if path:
+        assert 'append' not in prompt
+        prompt['append'] = Path(path).read_text(encoding='utf-8')
+    return prompt
+
+
 async def materialize(prompt):
     """(prompt text, replayable prompt) for a string or one streamed user message."""
     if isinstance(prompt, str):

@@ -836,8 +836,7 @@ fn fetch_json_via(
     let mut req = agent.get(&c.url).header("Accept", "application/json");
     if matches!(c.auth, Auth::ProfileApiKey | Auth::ProfileApiKeyRaw) {
         let v: Value = serde_json::from_slice(auth).context("Profile credential unavailable")?;
-        let key = v["OPENAI_API_KEY"]
-            .as_str()
+        let key = super::api_key::from_auth(&v)
             .filter(|s| !s.is_empty())
             .context("Profile has no API key")?;
         let value = if c.auth == Auth::ProfileApiKey { format!("Bearer {key}") } else { key.to_string() };
