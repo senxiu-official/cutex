@@ -243,6 +243,23 @@ def expect_needs_user(component: dict, code: str, label: str) -> None:
           f"{label}: top-level steps are non-empty strings ({steps!r})")
 
 
+def expect_install_needs_user(value: dict | None, code: str, label: str) -> None:
+    """An unsuccessful selection reports its step in the operation, not selected state.
+
+    The component view can still be missing or show an older selected version.
+    Assert the actual install receipt without inventing a component status.
+    """
+    result = (value or {}).get("result") or {}
+    step = next((phase.get("needsUser") for phase in
+                 (result.get("select") or {}, result.get("prepare") or {}) if phase.get("needsUser")), {})
+    check(result.get("outcome") == "needsUser" and result.get("selected") is False,
+          f"{label}: install did not select an incomplete runtime ({result.get('outcome')}, selected={result.get('selected')})")
+    check(step.get("code") == code, f"{label}: install needsUser code {code} (got {step.get('code')})")
+    steps = step.get("steps")
+    check(isinstance(steps, list) and len(steps) > 0 and all(isinstance(s, str) and s.strip() for s in steps),
+          f"{label}: operation provides actionable prerequisite steps ({steps!r})")
+
+
 def status(cutex: Cutex, name: str, **kw) -> dict:
     _, value, _ = cutex.run("component", "status", name, **kw)
     return component_of(value)
@@ -341,8 +358,8 @@ def claude_runtime(args: argparse.Namespace, cutex: Cutex, version: str, work: P
         log("\n== phase: Python too old")
         _, out, _ = cutex.run("component", "install", name, extra={"CUTEX_CLAUDE_PYTHON": args.old_python}, path=path)
         comp = component_of(out)
-        expect_needs_user(comp, "python_too_old", "old Python")
-        check(comp.get("selected") == version, f"old Python: version {version} installed (got {comp.get('selected')})")
+        expect_install_needs_user(out, "python_too_old", "old Python")
+        check(((out or {}).get("result") or {}).get("version") == version, f"old Python: version {version} staged without selection")
         version_dir = cutex.base / "components" / name / version
         check((version_dir / "receipt.json").is_file(), f"signed archive unpacked with a receipt in {version_dir}")
         check(not cutex.deployment.exists(), "old Python: nothing selected for new agents")
@@ -354,7 +371,7 @@ def claude_runtime(args: argparse.Namespace, cutex: Cutex, version: str, work: P
     _, out, _ = cutex.run("component", "install", name,
                           extra={} if bundled_cli else tui, path=default_path)
     comp = component_of(out)
-    expect_needs_user(comp, "codex_runtime_missing" if bundled_cli else "claude_cli_missing", "default install")
+    expect_install_needs_user(out, "codex_runtime_missing" if bundled_cli else "claude_cli_missing", "default install")
     prepare = ((out or {}).get("result") or {}).get("prepare") or {}
     receipt = prepare.get("receipt") or {}
     base_python = receipt.get("basePython")
@@ -395,13 +412,13 @@ def claude_runtime(args: argparse.Namespace, cutex: Cutex, version: str, work: P
     log("\n== phase: explicit missing system CLI (must not silently fall back)")
     missing_cli = {**tui, "CUTEX_CLAUDE_CLI": str(work / "missing-cli")}
     _, out, _ = cutex.run("component", "install", name, extra=missing_cli, path=path)
-    expect_needs_user(component_of(out), "claude_cli_missing", "explicit missing CLI")
+    expect_install_needs_user(out, "claude_cli_missing", "explicit missing CLI")
 
     log("\n== phase: stub claude, no Codex runtime")
     stub = make_stub_claude(cutex.home, work)
     override = {"CUTEX_CLAUDE_CLI": str(stub)}
     _, out, _ = cutex.run("component", "install", name, extra=override, path=path)
-    expect_needs_user(component_of(out), "codex_runtime_missing", "no Codex runtime")
+    expect_install_needs_user(out, "codex_runtime_missing", "no Codex runtime")
 
     log("\n== phase: stub claude + TUI binary -> login required")
     _, out, _ = cutex.run("component", "install", name, extra={**tui, **override}, path=path)

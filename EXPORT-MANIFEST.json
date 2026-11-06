@@ -29,8 +29,8 @@
     },
     {
       "path": ".github/ci/component-e2e.py",
-      "sha256": "e52c7bf202419775c60fff7fae003dae58f592db8d5fb5b70553ec3d11d305c5",
-      "size": 29759
+      "sha256": "de33e54e74f7073110aea9236903ad07e58986ccdddddb129e33fdc2e3cdc2ed",
+      "size": 30860
     },
     {
       "path": ".github/ci/component-release-policy.json",
