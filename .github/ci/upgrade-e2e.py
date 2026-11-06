@@ -327,6 +327,43 @@ def same_path(a: str | Path | None, b: Path) -> bool:
     return bool(a) and Path(_plain(a)).resolve() == Path(_plain(b)).resolve()
 
 
+def verified_selected_bundle(host, release: str) -> tuple[Path, dict]:
+    """Verify original or content-addressed selection against the actual release pins.
+
+    Managed copies change paths, not artifact identity. Shared configuration is
+    mutable and is not copied; its manifest entry must remain unchanged.
+    """
+    expected_path = host.base / "releases" / release / "manifests/default.json"
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    selected = host.selected_runtime()
+    require(bool(selected.get("bundle_manifest")), "selected bundle is missing")
+    actual_path = Path(_plain(selected["bundle_manifest"])).resolve()
+    managed_root = (host.home / ".cutex/runtime/native").resolve()
+    actual = json.loads(actual_path.read_text(encoding="utf-8"))
+    if not same_path(actual_path, expected_path):
+        require(actual_path.parent == managed_root / "bundles", "selected bundle escapes managed bundle storage")
+        require(actual_path.name == ce.sha256(actual_path) + ".json", "managed bundle content digest differs")
+    roles = {"executable", "cli", "code_mode_host", "facade", "schema"}
+    require({k: v for k, v in actual.items() if k not in roles} ==
+            {k: v for k, v in expected.items() if k not in roles},
+            "selected bundle identity/config differs from the target release")
+    for role in roles:
+        original, copy = expected.get(role), actual.get(role)
+        if original is None:
+            require(copy is None, f"unexpected selected {role}")
+            continue
+        require(isinstance(copy, dict), f"selected {role} pin missing")
+        source = Path(_plain(original["path"])).resolve()
+        selected_file = Path(_plain(copy.get("path", ""))).resolve()
+        require(ce.sha256(source) == original["sha256"], f"target release {role} bytes differ")
+        require(copy.get("sha256") == original["sha256"], f"selected {role} hash differs from target release")
+        require(same_path(selected_file, source) or
+                (selected_file.parent.parent == managed_root and selected_file.name == source.name),
+                f"selected {role} escapes its original or managed artifact location")
+        require(ce.sha256(selected_file) == original["sha256"], f"selected {role} bytes differ from target release")
+    return actual_path, expected
+
+
 # ------------------------------------------------------------- the release
 
 
@@ -931,12 +968,10 @@ def new_agents(host: Host, from_label: str, to_label: str, mode: str, new_native
               f"reload: new agents keep releases/{from_label}/manifests/default.json (got {selected.get('bundle_manifest')})")
         warn(f"reload mode: NEW agents keep {from_label}'s runtime bundle and cutex-mcp facade; {to_label}'s facade reaches no agent")
         return
-    if not check(same_path(selected.get("bundle_manifest"), target),
-                 f"full: new agents use releases/{to_label}/manifests/default.json (got {selected.get('bundle_manifest')})"):
-        return
+    selected_path, bundle = verified_selected_bundle(host, to_label)
+    check(True, f"full: selected bundle {selected_path} pins the exact target artifacts")
     check(same_path(selected.get("native_home"), Path(host.native_home_before or "/nonexistent")),
           f"the native home is kept ({selected.get('native_home')})")
-    bundle = json.loads(target.read_text(encoding="utf-8"))
     facade = host.base / "releases" / to_label / f"cutex-mcp{EXE}"
     pinned = bundle.get("facade") or {}
     check(same_path(pinned.get("path"), facade) and pinned.get("sha256") == ce.sha256(facade),
@@ -1015,9 +1050,8 @@ def rollback_leg(host: Host, release: Release, generator: Path, work: Path, to_l
           f"GET /v2/upgrade still installed {to_label}")
     host.services_up(f"after the rollback ({to_label})")
     if run.get("mode") == "full":
-        selected = host.selected_runtime()
-        check(same_path(selected.get("bundle_manifest"), host.base / "releases" / to_label / "manifests" / "default.json"),
-              f"after the rollback new agents use releases/{to_label}/manifests/default.json again (got {selected.get('bundle_manifest')})")
+        selected_path, _ = verified_selected_bundle(host, to_label)
+        check(True, f"after rollback: {selected_path} pins the exact target artifacts")
     if jobs_before:
         deadline = time.time() + 60
         while time.time() < deadline and not host.active(host.job_unit):
@@ -1597,10 +1631,7 @@ def formal_cli_json(output: str) -> dict | None:
 
 
 def verify_formal_selection(host: "FormalHost", target: dict) -> dict:
-    selected = host.selected_runtime()
-    bundle_path = host.base / "releases/0.2.1/manifests/default.json"
-    require(same_path(selected.get("bundle_manifest"), bundle_path), "new agents do not select the actual target bundle")
-    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bundle_path, bundle = verified_selected_bundle(host, "0.2.1")
     native = target["native"]
     require(bundle.get("upstream_commit") == native["commit"], "selected native commit differs from signed manifest")
     native_dir = host.base / "natives" / native["version"]

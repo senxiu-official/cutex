@@ -41,7 +41,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: component-e2e-${{ github.ref }}
+  group: component-e2e-${{ github.ref }}-${{ inputs.adapter_only && 'adapters' || 'components' }}
   cancel-in-progress: true
 
 env:
