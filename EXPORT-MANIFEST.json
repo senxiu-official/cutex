@@ -119,8 +119,8 @@
     },
     {
       "path": ".github/ci/resume-signatures.py",
-      "sha256": "46c981d2fcebbf3cc38d8f7eedaac8e4aab200a7c19ff214ca82bb8b00da7499",
-      "size": 2156
+      "sha256": "5f4838838f8506f19bffdc33ad9c397c9f6076019e6190163944caacd6b6cac7",
+      "size": 2278
     },
     {
       "path": ".github/ci/sign-and-upload.sh",
@@ -174,8 +174,8 @@
     },
     {
       "path": ".github/workflows/sign-release.yml",
-      "sha256": "1022ea1dc6ac4ecd43206befdb894e754aebc76bd93f0dee61832a183096cf78",
-      "size": 11771
+      "sha256": "1a0a68d31fb8bcb35580ed00ff0a2bdeb7aa13c6cde18cca52983a1d1302166b",
+      "size": 11901
     },
     {
       "path": ".github/workflows/upgrade-e2e.yml",

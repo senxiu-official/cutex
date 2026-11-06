@@ -29,7 +29,9 @@ def restore(source: Path, target: Path, public_key: Path) -> int:
             subprocess.run(['minisign', '-V', '-q', '-p', str(public_key), '-m', str(path)], check=True)
             hashes[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
     cache = target / 'signatures'
-    cache.mkdir(parents=True, exist_ok=False)
+    if cache.exists() and any(cache.iterdir()):
+        raise ValueError('Refusing to replace a nonempty signature cache')
+    cache.mkdir(parents=True, exist_ok=True)
     count = 0
     for signature in source.rglob('*.minisig'):
         name = signature.name.removesuffix('.minisig')
