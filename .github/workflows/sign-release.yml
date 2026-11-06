@@ -66,6 +66,11 @@ on:
         required: false
         default: true
         type: boolean
+      resume_sign_run:
+        description: "Prior signing run to resume with identical signed bytes and timestamp"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -156,6 +161,20 @@ jobs:
           line=$(sed -n 2p "$key")
           [ -n "$line" ] && echo "::add-mask::$line"
           head -n 1 "$key" | grep -q '^untrusted comment: ' || { echo "::error::MINISIGN_SECRET_KEY is not a minisign key file"; exit 1; }
+      - name: Restore retained signatures after a partial upload
+        if: inputs.resume_sign_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_RUN: ${{ inputs.resume_sign_run }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RESUME_RUN" =~ ^[1-9][0-9]*$ ]] || exit 1
+          gh run download "$RESUME_RUN" -R "$GITHUB_REPOSITORY" -n "sign-release-$RESUME_RUN" -D "$RUNNER_TEMP/resume-sign"
+          mkdir "$RUNNER_TEMP/published-before-resume"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p manifest.json -D "$RUNNER_TEMP/published-before-resume"
+          cmp "$RUNNER_TEMP/resume-sign/sign/release/manifest.json" "$RUNNER_TEMP/published-before-resume/manifest.json"
+          python3 .github/ci/resume-signatures.py "$RUNNER_TEMP/resume-sign/sign" "$RUNNER_TEMP/sign" .github/ci/cutex-release.pub
       - name: Sign and upload
         env:
           GH_TOKEN: ${{ github.token }}
@@ -169,6 +188,7 @@ jobs:
           RELEASE: ${{ inputs.release }}
           PREVIOUS_CAPABILITIES: ${{ inputs.previous_capabilities }}
           DRY_RUN: ${{ inputs.dry_run }}
+          RESUME_RUN: ${{ inputs.resume_sign_run }}
         run: |
           set -euo pipefail
           args=(cutex --run "$RUN_ID" --tag "$TAG" --sequence "$SEQUENCE" --key "$RUNNER_TEMP/minisign-release.key"
@@ -178,6 +198,7 @@ jobs:
           [ -z "$RELEASE" ] || args+=(--release "$RELEASE")
           [ -z "$PREVIOUS_CAPABILITIES" ] || args+=(--previous-capabilities ".github/ci/release-meta/$PREVIOUS_CAPABILITIES")
           [ "$DRY_RUN" = true ] || args+=(--upload)
+          [ -z "$RESUME_RUN" ] || args+=(--signed-only)
           bash .github/ci/sign-and-upload.sh "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/sign.log"
           {
             if [ "$DRY_RUN" = true ]; then echo "### Dry run: nothing uploaded"; else echo "### Signed and uploaded"; fi

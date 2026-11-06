@@ -5,7 +5,7 @@
   "sourceCommit": null,
   "sourceCommitNote": "withheld: kept in the private export record next to the export directory",
   "license": "Apache-2.0",
-  "fileCount": 1534,
+  "fileCount": 1535,
   "files": [
     {
       "path": ".cargo/config.toml",
@@ -118,6 +118,11 @@
       "size": 14765
     },
     {
+      "path": ".github/ci/resume-signatures.py",
+      "sha256": "46c981d2fcebbf3cc38d8f7eedaac8e4aab200a7c19ff214ca82bb8b00da7499",
+      "size": 2156
+    },
+    {
       "path": ".github/ci/sign-and-upload.sh",
       "sha256": "f627eec11dfeeaf5c4a6e341b8e04ba771bc0f286bc66290991327a3d5a63413",
       "size": 31189
@@ -169,8 +174,8 @@
     },
     {
       "path": ".github/workflows/sign-release.yml",
-      "sha256": "60fb3ee82f759c2ed0e65d731cb308225a67b802d24a3d7c7c6fb9a88d97c34c",
-      "size": 10587
+      "sha256": "1022ea1dc6ac4ecd43206befdb894e754aebc76bd93f0dee61832a183096cf78",
+      "size": 11771
     },
     {
       "path": ".github/workflows/upgrade-e2e.yml",
