@@ -389,3 +389,19 @@ fn an_interrupt_that_never_stops_the_turn_times_out() {
     assert_eq!(f.path("q1"), (InputState::Failed, Some("interrupt_timeout".into()), Surface::Timeline));
     assert!(f.repository.list(SESSION).unwrap().1.is_empty(), "failed: the retry resends it");
 }
+
+/// The real path through `send_start` is in `tests/input_ledger_e2e.rs`
+/// (`stuck_interrupt_send`): here, the proof reaches the ledger before the send.
+#[test]
+fn a_carried_steer_proven_absent_goes_out_without_its_carries() {
+    let f = Fake::new();
+    let record = steered(&f, "m1");
+    let mut carrying = Next::accepted().turn("t1");
+    carrying.carries = Some(vec!["note".into()]);
+    let record = f.ledger.transition(SESSION, "m1", Expect::rev(record.rev), carrying).unwrap().record;
+    assert_eq!(run(&f, SESSION, &request(&record)).unwrap(), Outcome::Interrupted { turn_id: "t1".into(), started: true });
+    let done = f.record("m1");
+    assert_eq!(done.state, InputState::InContext);
+    assert!(done.carries.is_empty(), "{:?}", done.carries);
+    assert_eq!(f.calls().iter().filter(|call| call.starts_with("turn/start")).count(), 1);
+}

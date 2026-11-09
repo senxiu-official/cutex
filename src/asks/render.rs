@@ -465,6 +465,9 @@ pub fn flag_note(flag: &str) -> Option<&'static str> {
 pub fn state_note(state: &str, target: &str, ask_id: &str) -> Option<String> {
     let ask_id = crate::short_ids::display(ask_id);
     let target = crate::short_ids::display(target);
+    if let Some(revision) = state.strip_prefix("revisionUnacknowledged:") {
+        return Some(format!("Revision {revision} was not acknowledged before this delegation closed. Its application is unconfirmed; send a follow-up with agent_delegate(follow_up=\"{ask_id}\") for further work."));
+    }
     match state {
         super::delivery::BLOCKED_OWNER_ACTION => Some(format!(
             "{target} is offline and cutex cannot automatically start it. Ask the owner or an authorized project manager (its Director, or a permitted operator) to explicitly bring it online, subject to the normal launch checks. The delegation stays queued until then: wait, delegate to another agent, or cancel it with delegation_stop(delegation=\"{ask_id}\")."

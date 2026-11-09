@@ -837,6 +837,15 @@ impl AskState {
                 json!({"askId": snapshot.ask_id, "outcome": snapshot.closed, "revision": snapshot.revision}),
             );
         }
+        // Record the closure outcome in this transaction, including a revision
+        // whose send won transport admission but lost the race with closure.
+        // No scheduler scan or archive/restart recovery window is needed.
+        if snapshot.closed.is_some() && (before.3.is_none() || extras_before.3 != snapshot.revisions) {
+            for revision in snapshot.revisions.iter()
+                .filter(|revision| revision.report_closed && revision.level != RevisionLevel::Acknowledged) {
+                super::delivery::record_revision_closed(self, &snapshot, &revision.id, now);
+            }
+        }
         if (before.0 == ExecutionState::Queued && after.0 != ExecutionState::Queued)
             || (before.3.is_none() && after.3.is_some()) {
             super::delivery::supersede_blocked_owner_action(self, ask_id, now);

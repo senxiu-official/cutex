@@ -278,6 +278,12 @@ pub enum CommandKind {
         command: ImCommand,
     },
 
+    /// Pair a device through the pinned home relay (owner-local only)
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
+    },
+
     /// Serve backend-facing coding session management APIs
     Management {
         #[command(subcommand)]
@@ -2405,3 +2411,44 @@ mod component_index_args_tests {
         }
     }
 }
+
+#[derive(Debug, clap::Subcommand)]
+pub enum RelayCommand {
+    /// Switch public QR pairing without restarting Management
+    Pairing {
+        #[command(subcommand)] command: RelayPairingCommand,
+        #[arg(long,global=true)] port: Option<u16>,
+    },
+    /// Create a five-minute QR invitation on the running local daemon
+    Invite {
+        #[arg(long)] user: Option<String>,
+        #[arg(long, value_parser=["full","chat","read"], default_value="full")] scope: String,
+        #[arg(long)] label: Option<String>,
+        #[arg(long)] device_id: Option<String>,
+        #[arg(long)] port: Option<u16>,
+    },
+    /// Approve the exact pending phone after comparing its six-digit code
+    Approve {
+        invite_id: String,
+        #[arg(long)] short_code: String,
+        #[arg(long)] port: Option<u16>,
+    },
+}
+
+#[cfg(test)]
+mod relay_args_tests {
+    use super::*;
+    use clap::Parser;
+    #[test]
+    fn relay_cli_requires_an_explicit_owner_approve_code() {
+        for action in ["on","off","status"] {
+            assert!(matches!(Cli::try_parse_from(["cutex","relay","pairing",action,"--port","24379"]).unwrap().command,Some(CommandKind::Relay{command:RelayCommand::Pairing{..}})));
+        }
+        assert!(matches!(Cli::try_parse_from(["cutex","relay","invite","--scope","read","--port","24379"]).unwrap().command,Some(CommandKind::Relay{command:RelayCommand::Invite{..}})));
+        assert!(Cli::try_parse_from(["cutex","relay","approve","rpi-example"]).is_err());
+        assert!(matches!(Cli::try_parse_from(["cutex","relay","approve","rpi-example","--short-code","123456","--port","24379"]).unwrap().command,Some(CommandKind::Relay{command:RelayCommand::Approve{..}})));
+    }
+}
+
+#[derive(Debug,clap::Subcommand)]
+pub enum RelayPairingCommand {On,Off,Status}

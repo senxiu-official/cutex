@@ -294,6 +294,8 @@ pub struct ServicesContext {
     /// The calling credential (client / device token id, or `root`): the
     /// scope of a lease open's `clientLeaseId`.
     pub caller: String,
+    /// This process's runtime view (`online` of eligible owners).
+    pub load_runtime_status: crate::management::server::ManagementRuntimeStatusLoader,
 }
 
 /// The calling credential of the current request.
@@ -304,19 +306,21 @@ fn current_caller() -> String {
 }
 
 impl ServicesContext {
-    pub fn default_context() -> ServicesResult<Self> {
+    pub fn default_context(load_runtime_status: crate::management::server::ManagementRuntimeStatusLoader) -> ServicesResult<Self> {
         match crate::services::supervisor::global() {
             Some(supervisor) => Ok(Self {
                 store: supervisor.store().clone(),
                 supervisor: Some(supervisor),
                 owner_check: validate_owner_session,
                 caller: current_caller(),
+                load_runtime_status,
             }),
             None => Ok(Self {
                 store: ServiceStore::open_default().map_err(ServicesError::unavailable)?,
                 supervisor: None,
                 owner_check: validate_owner_session,
                 caller: current_caller(),
+                load_runtime_status,
             }),
         }
     }
@@ -452,7 +456,7 @@ pub fn route_json(
                     slug,
                     &sessions,
                     &projects,
-                    crate::session::runtime_intent::record_online,
+                    |record| crate::session::runtime_intent::record_online_with(record, context.load_runtime_status),
                 )?,
             ))
         }
@@ -690,7 +694,7 @@ fn write_error(stream: &mut TcpStream, error: &ServicesError) -> anyhow::Result<
 }
 
 /// Entry point after the root credential check.
-pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
+pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, load_runtime_status: crate::management::server::ManagementRuntimeStatusLoader) -> anyhow::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
     let Some(route) = parse_path(path) else {
         return write_error(
@@ -698,7 +702,7 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
             &ServicesError::new(404, "route_not_found", "unknown services route"),
         );
     };
-    let context = match ServicesContext::default_context() {
+    let context = match ServicesContext::default_context(load_runtime_status) {
         Ok(context) => context,
         Err(error) => return write_error(stream, &error),
     };
@@ -788,7 +792,7 @@ mod tests {
         store.register(serde_json::from_value(json!({"slug":"manual", "runtime":"managed", "lifetime":"persistent", "port":31482, "command":["must-not-execute"]})).unwrap(), &Caller::Owner).unwrap();
         store.set_stopped("manual", true).unwrap();
         let supervisor = Supervisor::new(store.clone(), Box::new(|_| {}));
-        let context = ServicesContext { store: store.clone(), supervisor: Some(supervisor), owner_check: |_| Ok(()), caller: "root".into() };
+        let context = ServicesContext { store: store.clone(), supervisor: Some(supervisor), owner_check: |_| Ok(()), caller: "root".into(), load_runtime_status: |_| Ok(None) };
         let path = "/v2/services/manual/view-ticket";
         assert_eq!(route_json(&context, "POST", path, &parse_path(path).unwrap(), br#"{"start":true}"#).unwrap_err().code, "service_manually_stopped");
         assert!(store.get("manual").unwrap().stopped);
@@ -819,6 +823,7 @@ mod tests {
             supervisor: None,
             owner_check: |_| panic!("a read must not assign an owner"),
             caller: "root".into(),
+            load_runtime_status: |_| Ok(None),
         };
         let route = parse_path(path).unwrap();
         for method in ["POST", "PATCH", "DELETE"] {
@@ -854,6 +859,7 @@ mod tests {
             supervisor: None,
             owner_check: |_| panic!("read must not assign"),
             caller: "root".into(),
+            load_runtime_status: |_| Ok(None),
         };
         context
             .store
@@ -1041,6 +1047,7 @@ mod tests {
             supervisor: None,
             owner_check: |_| Ok(()),
             caller: "root".into(),
+            load_runtime_status: |_| Ok(None),
         };
         context
             .store
@@ -1145,6 +1152,7 @@ mod tests {
             supervisor: None,
             owner_check: |_| Ok(()),
             caller: "root".into(),
+            load_runtime_status: |_| Ok(None),
         };
         let route = parse_path("/v2/services/web/lease").unwrap();
         let (status, lease) = route_json(&context, "POST", "", &route, b"{}").unwrap();
@@ -1182,6 +1190,7 @@ mod tests {
             supervisor: None,
             owner_check: |_| Ok(()),
             caller: "client-token-2".into(),
+            load_runtime_status: |_| Ok(None),
         };
         let (_, theirs) = route_json(&other, "POST", "", &route, keyed).unwrap();
         assert_ne!(theirs["leaseId"], first["leaseId"]);
@@ -1264,6 +1273,7 @@ mod tests {
             supervisor: None,
             owner_check: |_| Ok(()),
             caller: "root".into(),
+            load_runtime_status: |_| Ok(None),
         };
         let call = |method: &str, path: &str, body: &str| {
             let route = parse_path(path.split('?').next().unwrap()).unwrap();
@@ -1407,6 +1417,7 @@ mod tests {
             supervisor: None,
             owner_check,
             caller: "root".into(),
+            load_runtime_status: |_| Ok(None),
         };
         let call = |method: &str, path: &str, body: &str| {
             let route = parse_path(path.split('?').next().unwrap()).unwrap();

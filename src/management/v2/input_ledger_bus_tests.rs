@@ -247,6 +247,22 @@ fn plan_only_uses_allowed_edges_and_never_moves_back() {
 // Repository writes → ledger (§2.9 rows)
 
 #[test]
+fn unbound_acceptance_deadline_hands_off_to_its_carrying_turn_once() {
+    let f = Fixture::new();
+    let input = new_input(None, "unbound", Some(FROM), "after_turn", "notice", None);
+    f.on(|| drive(TO, "unbound", &input, &Target::Accepted { turn:None }));
+    assert!(f.record("unbound").unwrap().deadline.is_some());
+    let bound = Target::Accepted { turn:Some("carrying-turn".into()) };
+    f.on(|| drive(TO, "unbound", &input, &bound));
+    assert!(f.record("unbound").unwrap().deadline.is_none());
+    let grace = Utc::now() + chrono::Duration::seconds(60);
+    f.on(|| f.ledger.transition(TO, "unbound", input_ledger::Expect::ANY,
+        Next::accepted().deadline(Some(grace))).unwrap());
+    f.on(|| drive(TO, "unbound", &input, &bound));
+    assert_eq!(f.record("unbound").unwrap().deadline.as_deref(), Some(grace.to_rfc3339_opts(chrono::SecondsFormat::Millis, true).as_str()));
+}
+
+#[test]
 fn wake_queued_sent_accepted_read_in_moves_next_up_to_timeline() {
     let f = Fixture::new();
     let (_, events) = f.on(|| {

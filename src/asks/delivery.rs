@@ -112,6 +112,13 @@ pub fn record_state_delivery(state: &mut AskState, ask: &AskRecord, reason: &str
     push(state, ask, DeliveryKind::State, ref_id, passive, now)
 }
 
+/// A sent revision cannot be acknowledged after closure. Report this once per
+/// revision, independently of answer delivery and later receipt reconciliation.
+pub fn record_revision_closed(state: &mut AskState, ask: &AskRecord, revision: &str, now: DateTime<Utc>) -> Option<String> {
+    push(state, ask, DeliveryKind::State, format!("revisionUnacknowledged:{revision}"),
+        ask.options.notify == Notify::Passive, now)
+}
+
 /// The state name of a handover summary (design 044 §4.3).
 pub const HANDED_OVER: &str = "handedOver";
 

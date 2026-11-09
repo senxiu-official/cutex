@@ -357,7 +357,7 @@ pub fn claude_system_append_sections_with_transport(record: &CutexSessionRecord,
 pub fn claude_system_append_with_snapshot(record: &CutexSessionRecord, file_append: bool) -> (Vec<(&'static str, String)>, Option<super::idle_note::Snapshot>) {
     let cwd = Path::new(&record.cwd);
     let claude_md = crate::runtime::claude::code_sources::project_settings_active(record);
-    let memory = super::launch_memory_context_or_warn(&record.cutex_session_id);
+    let memory = super::cached_launch_memory_context_or_warn(&record.cutex_session_id);
     let root = memory.as_ref().map(|memory| memory.file_reference_root(cwd)).unwrap_or(cwd);
     let snapshot = memory.as_ref().and_then(|memory| memory.index_snapshot.clone());
     let sections = compose_claude_sections(

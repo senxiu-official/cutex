@@ -1,4 +1,4 @@
-//! Owner-only bounded key transport; full public resources stay on session GET.
+//! Owner-only bounded catalog keys, optional public projections, and changes.
 use crate::http::server::{write_json_response, SimpleHttpRequest};
 use crate::session::store::{session_changes_at, session_page_at, SessionChanges};
 use crate::store::{ChangeCursor, PageBudget};
@@ -8,6 +8,7 @@ use std::net::TcpStream;
 
 pub const CAPABILITY: &str = "session-deltas-v1";
 pub const HOST_CAPABILITY: &str = "session-deltas-host-v1";
+pub const RESOURCES_CAPABILITY: &str = "session-deltas-resources-v1";
 
 fn with_host_metadata(mut value: serde_json::Value) -> serde_json::Value {
     value["hostId"] = json!(crate::platform::host::current_host_name());
@@ -17,8 +18,11 @@ fn with_host_metadata(mut value: serde_json::Value) -> serde_json::Value {
     value
 }
 
-pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
-    match resource(&request.path) {
+pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest,
+    context: crate::management::server::ManagementRequestContext,
+    repository: &super::repository::EventRepository,
+) -> anyhow::Result<()> {
+    match resource_body(&request.path, Some((context.load_registry, context.load_runtime_status, repository))).map(with_host_metadata) {
         Ok(value) => write_json_response(stream, 200, "OK", &value),
         Err(error) => match crate::store::StoreError::from(error) {
             crate::store::StoreError::Invalid(message) => super::server::write_v2_error(
@@ -51,12 +55,14 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
     }
 }
 
+#[cfg(test)]
 fn resource(path: &str) -> anyhow::Result<serde_json::Value> {
-    resource_body(path).map(with_host_metadata)
+    resource_body(path, None).map(with_host_metadata)
 }
 
-fn resource_body(path: &str) -> anyhow::Result<serde_json::Value> {
-    let (delta, budget, cursor, retired) = (|| -> anyhow::Result<_> {
+fn resource_body(path: &str, projection: Option<(crate::management::server::ManagementRegistryLoader, super::session::RuntimeStatusLoader,
+    &super::repository::EventRepository)>) -> anyhow::Result<serde_json::Value> {
+    let (delta, budget, cursor, retired, include) = (|| -> anyhow::Result<_> {
         anyhow::ensure!(path.len() <= 8192, "session query too long");
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         let delta = route == "/v2/sessions/changes";
@@ -67,10 +73,16 @@ fn resource_body(path: &str) -> anyhow::Result<serde_json::Value> {
         };
         let mut cursor = None;
         let mut retired = false;
+        let mut include = std::collections::HashSet::new();
         let mut seen = std::collections::HashSet::new();
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
             anyhow::ensure!(seen.insert(key.to_string()), "duplicate query parameter");
             match key.as_ref() {
+                "include" if !delta => {
+                    for field in value.split(',') {
+                        anyhow::ensure!(matches!(field, "resource" | "hostRow") && include.insert(field.to_string()), "invalid include");
+                    }
+                }
                 "cursor" => cursor = Some(value.into_owned()),
                 "limit" => budget.max_rows = value.parse()?,
                 "maxBytes" => budget.max_bytes = value.parse()?,
@@ -92,7 +104,7 @@ fn resource_body(path: &str) -> anyhow::Result<serde_json::Value> {
             "invalid session query budget"
         );
         anyhow::ensure!(!delta || cursor.is_some(), "cursor required");
-        Ok((delta, budget, cursor, retired))
+        Ok((delta, budget, cursor, retired, include))
     })()
     .map_err(|error| crate::store::StoreError::Invalid(error.to_string()))?;
     let path = crate::session::store::cutex_sessions_path()?;
@@ -120,7 +132,24 @@ fn resource_body(path: &str) -> anyhow::Result<serde_json::Value> {
     Ok(
         match session_page_at(&path, retired, cursor.as_deref(), budget)? {
             Some(page) => {
-                json!({"sessions":page.rows.iter().zip(&page.revisions).map(|(r,rev)|json!({"cutexSessionId":r.cutex_session_id,"revision":rev})).collect::<Vec<_>>(),
+                let mut rows: Vec<_> = page.rows.iter().zip(&page.revisions).map(|(r,rev)|json!({"cutexSessionId":r.cutex_session_id,"revision":rev})).collect();
+                if !include.is_empty() {
+                    let (load_registry, load_runtime_status, repository) = projection.context("catalog projection context required")?;
+                    if include.contains("resource") {
+                        let registry = load_registry()?;
+                        for (row, resource) in rows.iter_mut().zip(super::session::catalog_resources(&page.rows, &registry, load_runtime_status, repository)?) {
+                            row["resource"] = resource;
+                        }
+                    }
+                    if include.contains("hostRow") {
+                        let hosts = super::host_sessions::catalog_rows(&page.rows, load_runtime_status);
+                        let by_id: std::collections::HashMap<_,_> = hosts["data"].as_array().unwrap().iter().map(|row| (row["id"].as_str().unwrap(), row)).collect();
+                        for row in &mut rows {
+                            row["hostRow"] = by_id.get(row["cutexSessionId"].as_str().unwrap()).map(|v| (*v).clone()).unwrap_or(serde_json::Value::Null);
+                        }
+                    }
+                }
+                json!({"sessions":rows,
             "nextCursor":page.next,"changeCursor":page.change_cursor.encode(),"oversizeFirst":page.oversize_first})
             }
             None => {
@@ -133,6 +162,57 @@ fn resource_body(path: &str) -> anyhow::Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn comparable(mut resource: serde_json::Value) -> serde_json::Value {
+        resource.as_object_mut().unwrap().remove("observedAt");
+        resource
+    }
+    #[test]
+    fn included_projections_match_exact_reads_and_preserve_key_only_pages() {
+        let _home_lock = crate::config::paths::test_home_env_lock();
+        use crate::store::{ApplyBatch, Expect, KeyedStore, Scope};
+        let path = crate::session::store::cutex_sessions_path().unwrap();
+        let repo = crate::session::store::SessionRepository::open(&path).unwrap();
+        let id = format!("cutex.{}", uuid::Uuid::new_v4());
+        let mut record = crate::session::model::CutexSessionRecord::new_at(id.clone(), None,
+            crate::platform::host::current_host_name(), "/synthetic".into(), None,
+            "2026-11-04T00:00:00Z".into()).unwrap();
+        record.agent_enabled = true;
+        repo.apply(ApplyBatch::new(Scope::Host).put(id.clone(), std::sync::Arc::new(record), Expect::Absent)).unwrap();
+        let events = super::super::repository::management_v2_repository().unwrap();
+        let registry = crate::im::registry::ImRegistry::default();
+        let value = resource_body("/v2/sessions/page?include=resource,hostRow",
+            Some((|| Ok(crate::im::registry::ImRegistry::default()), |_| Ok(None), events))).unwrap();
+        let row = value["sessions"].as_array().unwrap().iter().find(|r| r["cutexSessionId"] == id).unwrap();
+        let exact = super::super::session::session_resource_including_hidden(&id, &registry, |_| Ok(None), events).unwrap().unwrap();
+        assert_eq!(comparable(row["resource"].clone()), comparable(exact));
+        let host = super::super::host_sessions::exact_value_at(&path,
+            &crate::platform::host::current_host_name(), &id, |_| Ok(None)).unwrap();
+        assert_eq!(row["hostRow"], host["data"][0]);
+        let schema: serde_json::Value = serde_json::from_str(include_str!("schema/export/session-deltas.json")).unwrap();
+        assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&with_host_metadata(value)));
+        let foreign_id = format!("cutex.{}", uuid::Uuid::new_v4());
+        let foreign = crate::session::model::CutexSessionRecord::new_at(foreign_id.clone(), None,
+            "foreign-host".into(), "/synthetic".into(), None, "2026-11-04T00:00:00Z".into()).unwrap();
+        repo.apply(ApplyBatch::new(Scope::Host).put(foreign_id.clone(), std::sync::Arc::new(foreign), Expect::Absent)).unwrap();
+        let value = resource_body("/v2/sessions/page?include=resource,hostRow",
+            Some((|| Ok(crate::im::registry::ImRegistry::default()), |_| Ok(None), events))).unwrap();
+        let row = value["sessions"].as_array().unwrap().iter().find(|r| r["cutexSessionId"] == foreign_id).unwrap();
+        assert!(row["resource"].is_null() && row["hostRow"].is_null());
+        crate::session::store::update_session_row(&path, &id, |r| {
+            r.archive_state = crate::session::model::CutexSessionArchiveState::Retired; Ok(())
+        }).unwrap();
+        let value = resource_body("/v2/sessions/page?lifecycle=retired&include=resource,hostRow",
+            Some((|| Ok(crate::im::registry::ImRegistry::default()), |_| panic!("retired row must not load runtime"), events))).unwrap();
+        let row = value["sessions"].as_array().unwrap().iter().find(|r| r["cutexSessionId"] == id).unwrap();
+        assert_eq!(comparable(row["resource"].clone()), comparable(super::super::session::retired_session_resource(&id).unwrap().unwrap()));
+        assert!(row["hostRow"].is_null());
+        let keys = resource("/v2/sessions/page").unwrap();
+        assert!(keys["sessions"].as_array().unwrap().iter().all(|row| row.get("resource").is_none() && row.get("hostRow").is_none()));
+        for query in ["include=", "include=raw", "include=resource,resource", "include=resource&include=hostRow"] {
+            assert!(resource(&format!("/v2/sessions/page?{query}")).is_err());
+        }
+        assert!(resource("/v2/sessions/changes?cursor=a&include=resource").is_err());
+    }
     #[test]
     fn real_catalog_delta_and_resync_responses_match_the_exported_schema() {
         let _home_lock=crate::config::paths::test_home_env_lock();

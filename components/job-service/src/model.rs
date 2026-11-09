@@ -209,6 +209,10 @@ pub struct FrozenCompletionRequestV2 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct JobRecord {
+    /// Live Linux observation, checked against the recorded process birth.
+    /// This is not a durable job state or a terminal outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_process_state: Option<ProcessObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external: Option<ExternalJob>,
     pub schema: String,
@@ -234,6 +238,13 @@ pub struct JobRecord {
     pub output_reference: String,
     #[serde(default)]
     pub completion_delivery: CompletionDeliverySummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessObservation {
+    pub state: String,
+    pub observed_at_epoch_millis: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

@@ -25,18 +25,19 @@ fn unavailable(stream: &mut TcpStream, error: anyhow::Error) -> anyhow::Result<(
 }
 
 /// Socket entry point; the caller has already verified the root credential.
-pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Result<()> {
+pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest, load_status: crate::management::server::ManagementRuntimeStatusLoader) -> anyhow::Result<()> {
+    let online = |record: &crate::session::model::CutexSessionRecord| runtime_intent::record_online_with(record, load_status);
     let loaded = runtime_intent::store_path().and_then(|path| Ok((path, crate::session::store::load_cutex_session_store()?)));
     let (path, sessions) = match loaded {
         Ok(loaded) => loaded,
         Err(error) => return unavailable(stream, error),
     };
     match request.method.as_str() {
-        "GET" => match runtime_intent::candidates_resource_at(&path, &sessions, &runtime_intent::record_online, &crate::platform::host::current_host_name()) {
+        "GET" => match runtime_intent::candidates_resource_at(&path, &sessions, &online, &crate::platform::host::current_host_name()) {
             Ok(body) => write_json_response(stream, 200, "OK", &body),
             Err(error) => unavailable(stream, error),
         },
-        "DELETE" => match runtime_intent::dismiss_at(&path, &sessions, &runtime_intent::record_online) {
+        "DELETE" => match runtime_intent::dismiss_at(&path, &sessions, &online) {
             Ok(dismissed) => write_json_response(stream, 200, "OK", &json!({ "dismissed": dismissed })),
             Err(error) => unavailable(stream, error),
         },

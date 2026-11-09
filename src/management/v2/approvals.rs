@@ -379,8 +379,8 @@ fn decider(client: BTreeMap<String, String>) -> crate::approvals::ApprovalDecide
     let remote = connection.as_ref().is_some_and(|info| info.remote);
     crate::approvals::ApprovalDecider {
         by: "owner".into(),
-        connection: connection.as_ref().map(|_| if remote { "remote" } else { "loopback" }.to_string()),
-        peer: connection.filter(|info| info.remote).map(|info| info.peer.ip().to_string()),
+        connection: connection.as_ref().map(|_| if crate::management::relay::current_peer().is_some() {"relay"} else if remote { "remote" } else { "loopback" }.to_string()),
+        peer: if crate::management::relay::current_peer().is_some() {Some("relay".into())} else {connection.filter(|info| info.remote).map(|info| info.peer.ip().to_string())},
         client,
     }
 }

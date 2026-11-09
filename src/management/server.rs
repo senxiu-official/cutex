@@ -276,6 +276,7 @@ pub fn run_management_server_on(
     }
     // Create the persisted instance id before the first client asks for it.
     let _ = crate::management::instance::instance_id();
+    crate::management::v2::host_files::prime_secret_path_cache();
     // P1 users: run the one-time migration (every existing client / device
     // token → owner) before the first request, so its moment is well defined.
     if let Err(error) = crate::management::users::UserStore::open_default()
@@ -295,11 +296,14 @@ pub fn run_management_server_on(
     // Loopback listeners first so a slow Tailscale never delays them.
     let mut ordered: Vec<ListenSpec> = specs.iter().filter(|s| s.is_loopback()).cloned().collect();
     ordered.extend(specs.iter().filter(|s| !s.is_loopback()).cloned());
-    let handles = crate::management::listeners::start_listeners(
+    let mut handles = crate::management::listeners::start_listeners(
         &ordered,
         allow_remote,
         serve_management_connection,
     )?;
+    if let Some(handle)=crate::management::relay::start_optional(allow_remote,serve_management_connection) {
+        handles.push(handle);
+    }
     if let Some(ListenSpec::Socket(handoff)) = ordered.first() {
         let handoff = *handoff;
         std::thread::spawn(move || register_handoff(handoff.ip(), handoff.port()));
@@ -460,7 +464,7 @@ pub(super) fn write_capacity_refusal(
 ) -> anyhow::Result<()> {
     set_keep_alive(KeepAlive::Off);
     crate::management::v2::server::write_v2_error(
-        stream, 503, "Service Unavailable", "heavy_read_capacity_exceeded",
+        stream, 503, "Service Unavailable", refusal.error_code(),
         refusal.reason.message(), true, refusal.details(),
     )
 }
@@ -518,7 +522,7 @@ pub(crate) fn remote_gate(
 fn is_public_route(method: &str, path: &str) -> bool {
     matches!(
         (method, path),
-        ("POST", crate::management::v2::pairing::PAIR_PATH) | ("POST", "/peer/v1/pair") | ("GET", "/")
+        ("POST", "/pair/v2/apply" | "/pair/v2/challenge" | "/pair/v2/poll" | "/pair/v2/fetch") | ("POST", crate::management::v2::pairing::PAIR_PATH) | ("POST", "/peer/v1/pair") | ("GET", "/")
     )
 }
 
@@ -537,9 +541,18 @@ pub fn handle_parsed_management_request(
         .next()
         .unwrap_or(request.path.as_str())
         .to_string();
+    // Relay has no public exceptions, including preflight and pairing.
+    if let Some(error) = crate::management::relay::request_gate(&request, &path) {
+        return crate::management::v2::server::write_v2_error(
+            stream, error.0, error.1, error.2, error.3, false, serde_json::json!({}),
+        );
+    }
     // CORS preflight: never authenticated.
     if request.method == "OPTIONS" {
         return write_cors_preflight(stream, &request);
+    }
+    if request.method=="POST" && matches!(path.as_str(),"/pair/v2/apply"|"/pair/v2/challenge"|"/pair/v2/poll"|"/pair/v2/fetch") {
+        return crate::management::relay::pairing::direct(stream,&request);
     }
     let remote = !crate::management::listeners::current_request_is_loopback();
     if let Some((status, reason, code, message)) = remote_gate(remote, &request, &path) {
@@ -554,7 +567,7 @@ pub fn handle_parsed_management_request(
     let verified = if crate::management::client_tokens::presents_client_token(&request) {
         match crate::management::client_tokens::ClientTokenStore::open_default() {
             Ok(store) => {
-                let peer_ip = peer.map(|peer| peer.ip().to_string());
+                let peer_ip = if crate::management::relay::current_peer().is_some() {Some("relay".to_string())} else {peer.map(|peer| peer.ip().to_string())};
                 crate::management::client_tokens::authenticate_management_request_from(
                     &mut request,
                     agent_management_admin_token,
@@ -575,6 +588,16 @@ pub fn handle_parsed_management_request(
             stream, 401, "Unauthorized", "unauthorized",
             "valid cutex management authentication is required", false, serde_json::json!({}),
         );
+    }
+    if let Some(error) = crate::management::relay::token_gate(verified.as_ref()) {
+        return crate::management::v2::server::write_v2_error(
+            stream, error.0, error.1, error.2, error.3, false, serde_json::json!({}),
+        );
+    }
+    if crate::management::relay::current_peer().is_some()
+        && verified.as_ref().is_some_and(|token|!token.scope.is_full())
+        && (path=="/v2/fs" || path.starts_with("/v2/fs/")) {
+        return crate::management::v2::server::write_v2_error(stream,403,"Forbidden","relay_workspace_only","read/chat relay devices must use the authorized session or project workspace routes",false,serde_json::json!({}));
     }
     let principal = verified.as_ref().map(|token| token.principal.clone());
     let device_scope = verified.as_ref().map(|token| token.scope);
@@ -604,6 +627,18 @@ pub fn handle_parsed_management_request(
                 crate::management::v2::access::Gate::Continue => {}
             }
         }
+    }
+    if path == "/v2/relay-certificate" || path.starts_with("/v2/relay-certificate/") || path == "/v2/relay-enrollment" || path.starts_with("/v2/relay-enrollment/") {
+        return crate::management::relay::credentials::handle(stream,&request);
+    }
+    if path.starts_with("/v2/service-relay/") {
+        return crate::management::relay::service::handle(stream, &request);
+    }
+    if path == "/v2/relay" || path.starts_with("/v2/relay/") || path=="/v2/pairing/invites" || path.starts_with("/v2/pairing/invites/") {
+        if !crate::management::v2::server::authenticated_root_request(&request, agent_management_admin_token) {
+            return crate::management::v2::server::write_v2_error(stream, 401, "Unauthorized", "unauthorized", "valid Management authentication is required", false, serde_json::json!({}));
+        }
+        return crate::management::relay::handle(stream, &request);
     }
     if path == crate::management::v2::pairing::PAIR_PATH {
         return crate::management::v2::pairing::handle_pair(stream, &request);

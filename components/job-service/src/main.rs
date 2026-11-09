@@ -101,7 +101,9 @@ fn serve(args: &[String]) -> Result<(), JobError> {
         per_stream_output_bytes: 1024 * 1024,
         max_read_bytes: 64 * 1024,
         cancel_grace: Duration::from_secs(2),
-        max_jobs: 1024,
+        // Whole-state save measurements and the retained-history limit:
+        // docs/history-cap.md.
+        max_jobs: 4096,
         max_active_jobs: 16,
         allowed_launchers,
         external_sources,

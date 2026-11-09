@@ -123,7 +123,7 @@ pub fn handle_v2_request(
             return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
                 "the Management root credential is required for services", false, json!({}));
         }
-        return super::services::handle(stream, request);
+        return super::services::handle(stream, request, context.load_runtime_status);
     }
     if super::director::is_path(path) {
         if !authenticated_root_request(request, agent_management_admin_token) {
@@ -272,7 +272,7 @@ pub fn handle_v2_request(
             return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
                 "the Management root credential is required for runtime restore", false, json!({}));
         }
-        return super::runtime_restore_api::handle(stream, request);
+        return super::runtime_restore_api::handle(stream, request, context.load_runtime_status);
     }
     if path == super::runtime_prune::PATH {
         if !authenticated_root_request(request, agent_management_admin_token) {
@@ -1014,7 +1014,7 @@ fn handle_v2_request_with_repository(
         ("GET", "/v2/nci-verification") | ("PUT", "/v2/nci-verification/config") | ("DELETE", "/v2/nci-verification/config") | ("POST", "/v2/nci-verification/key") | ("GET", "/v2/nci-verification/helper") => super::nci_verification::handle(stream, request),
         ("GET", "/v2/inbound-mail") | ("PUT", "/v2/inbound-mail/config") | ("DELETE", "/v2/inbound-mail/config") | ("POST", "/v2/inbound-mail/test") => super::inbound_mail::handle(stream, request),
         ("POST", "/v2/job-service/output") => super::human_jobs::handle_output(stream, request),
-        ("GET", "/v2/sessions/page" | "/v2/sessions/changes") => super::session_deltas::handle(stream, request),
+        ("GET", "/v2/sessions/page" | "/v2/sessions/changes") => super::session_deltas::handle(stream, request, context, repository),
         ("GET", "/v2/sessions") => {
             super::archive::handle_session_collection_get(stream, request, context, repository, root)
         }

@@ -528,6 +528,7 @@ mod tests {
             updated_at_epoch_secs: 12,
             process_id: None,
             process_start_ticks: None,
+            observed_process_state: None,
             exit_code: Some(0),
             terminal_reason: None,
             execution: Some(ExecutionObservation {
@@ -548,6 +549,37 @@ mod tests {
             },
             output_reference: "job-output:job_0123456789abcdef".into(),
             completion_delivery: CompletionDeliverySummary::default(),
+        }
+    }
+
+    /// Synthetic complete-state cost, including flush/fsync/rename/directory fsync.
+    /// Run with `cargo test --release save_cost_at_history_sizes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn save_cost_at_history_sizes() {
+        for count in [1024, 4096, 8192, 16384] {
+            let root = tempfile::tempdir().unwrap();
+            let (store, mut state) = Store::open(root.path().join("state"), CompletionWireVersion::V2, true).unwrap();
+            for i in 0..count {
+                let mut job = terminal_job();
+                job.job_id = format!("job_{i:016x}");
+                job.request.action_id = format!("action-{i:016x}");
+                job.request.command_summary = Some("synthetic history save benchmark".repeat(4));
+                job.request.cwd = format!("/synthetic/project-{i:08x}");
+                state.action_index.insert(job.request.action_id.clone(), job.job_id.clone());
+                insert_outbox(&mut state.outbox, &job, CompletionWireVersion::V2).unwrap();
+                state.jobs.insert(job.job_id.clone(), job);
+            }
+            store.save(&mut state).unwrap();
+            let mut times = Vec::new();
+            for _ in 0..7 {
+                let started = std::time::Instant::now();
+                store.save(&mut state).unwrap();
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(f64::total_cmp);
+            println!("save_cost jobs={count} bytes={} median_ms={:.3} max_ms={:.3}",
+                std::fs::metadata(&store.state_path).unwrap().len(), times[3], times[6]);
         }
     }
 

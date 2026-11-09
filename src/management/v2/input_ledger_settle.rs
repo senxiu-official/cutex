@@ -147,7 +147,7 @@ pub fn parse_external_status(response: &Value) -> Check {
         "retryable_error" => Check::Held(Some("retryableError".into())),
         "pending" => match processing {
             "held" => Check::Held(reason),
-            "claimed" => Check::Unpersisted,
+            "claimed" | "output_observed" => Check::Unpersisted,
             _ => Check::Queued,
         },
         _ => Check::Unavailable,
@@ -202,24 +202,29 @@ pub fn check(runtime: &dyn Runtime, record: &InputRecord, turn: Option<&str>) ->
 /// found; for a bus message its message id (ExternalInput items and the
 /// Claude adapter's `external_event` items carry the message id).
 pub fn check_bound(runtime: &dyn Runtime, record: &InputRecord, turn: Option<&str>) -> (Check, Option<String>) {
+    let (check, item, _) = check_full(runtime, record, turn);
+    (check, item)
+}
+
+/// Include the carrying turn only when the native receipt supplies it.
+fn check_full(runtime: &dyn Runtime, record: &InputRecord, turn: Option<&str>) -> (Check, Option<String>, Option<String>) {
     let session = &record.cutex_session_id;
     let view = runtime.view(session);
-    if !view.connected {
-        return (Check::Unavailable, None);
-    }
+    if !view.connected { return (Check::Unavailable, None, None); }
     if record.kind == InputKind::Owner {
         let (Some(thread), Some(turn)) = (view.thread_id.as_deref(), turn.or(record.turn_id.as_deref())) else {
-            return (Check::Unavailable, None);
+            return (Check::Unavailable, None, None);
         };
         let params = json!({"threadId": thread, "turnId": turn, "limit": 200, "sortDirection": "asc"});
-        return match runtime.request(session, "thread/items/list", params) {
+        let (checked, item) = match runtime.request(session, "thread/items/list", params) {
             Ok(response) => parse_turn_items_bound(&response, &record.input_id),
             Err(_) => (Check::Unavailable, None),
         };
+        return (checked, item, None);
     }
-    let result = check_unbound(runtime, record, &view);
-    let item = (is_bus(record.kind) && matches!(result, Check::Persisted(_))).then(|| record.input_id.clone());
-    (result, item)
+    let (checked, carrying_turn) = check_unbound(runtime, record, &view);
+    let item = (is_bus(record.kind) && matches!(checked, Check::Persisted(_))).then(|| record.input_id.clone());
+    (checked, item, carrying_turn)
 }
 
 /// `next` bound to the native item a check found (only an `inContext` one).
@@ -230,8 +235,15 @@ pub fn bind_checked(next: Option<Next>, item: Option<String>) -> Option<Next> {
     }
 }
 
+fn bind_receipt_turn(next: Option<Next>, turn: Option<String>) -> Option<Next> {
+    next.map(|next| match turn {
+        Some(turn) if next.state == InputState::InContext => next.turn(turn),
+        _ => next,
+    })
+}
+
 /// [`check_bound`] of a record that is not the owner's.
-fn check_unbound(runtime: &dyn Runtime, record: &InputRecord, view: &RuntimeView) -> Check {
+fn check_unbound(runtime: &dyn Runtime, record: &InputRecord, view: &RuntimeView) -> (Check, Option<String>) {
     let session = &record.cutex_session_id;
     if is_bus(record.kind) {
         return match runtime.bus_external_key(&record.input_id) {
@@ -239,22 +251,31 @@ fn check_unbound(runtime: &dyn Runtime, record: &InputRecord, view: &RuntimeView
                 let params = json!({"version": 1, "ownerId": owner, "threadId": thread,
                     "runtimeGeneration": view.generation, "messages": [key]});
                 match runtime.request(session, "thread/externalInput/status", params) {
-                    Ok(response) => parse_external_status(&response),
-                    Err(_) => Check::Unavailable,
+                    Ok(response) => {
+                        let checked = parse_external_status(&response);
+                        let turn = matches!(checked, Check::Persisted(_)).then(|| response.pointer("/statuses/0/receipt/turnId")
+                            .and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)).flatten();
+                        (checked, turn)
+                    }
+                    Err(_) => (Check::Unavailable, None),
                 }
             }
             None => {
-                let Some(thread) = view.thread_id.as_deref() else { return Check::Unavailable };
+                let Some(thread) = view.thread_id.as_deref() else { return (Check::Unavailable, None) };
                 match runtime.request(session, "claude/input/status", json!({"threadId": thread, "messageId": record.input_id})) {
-                    Ok(response) => parse_local_status(&response),
-                    Err(error) if error.contains("-32004") || error.contains("not found") => Check::Absent,
-                    Err(_) => Check::Unavailable,
+                    Ok(response) => {
+                        let checked = parse_local_status(&response);
+                        let turn = matches!(checked, Check::Persisted(_)).then(|| response.get("turnId")
+                            .and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)).flatten();
+                        (checked, turn)
+                    }
+                    Err(error) if error.contains("-32004") || error.contains("not found") => (Check::Absent, None),
+                    Err(_) => (Check::Unavailable, None),
                 }
             }
         };
     }
-    // Delegations settle in the asks scheduler (one status check per event).
-    Check::Unavailable
+    (Check::Unavailable, None)
 }
 
 /// Why a check runs.
@@ -405,8 +426,9 @@ pub fn session_delivery(facts: &DeliveryFacts, now: DateTime<Utc>) -> Value {
 /// §2.2 `stalled{noProgress}`: a `waiting` record that should move (its
 /// reason is not one of [`STALL_EXEMPT`]) while its session is `idle`, and
 /// did not change for `stall_after`, is marked; the mark goes when the
-/// session is no longer idle (a state change clears it anyway). Returns the
-/// transition to write, or `None`.
+/// session is no longer idle (a state change clears it anyway). Not a
+/// [`il::stranded_resend`]: no turn can move it, its mark and actions stay.
+/// `since` is when the wait began. Returns the transition to write, or `None`.
 pub fn stall_next(record: &InputRecord, idle: bool, now: DateTime<Utc>, stall_after: Duration) -> Option<Next> {
     if record.state != InputState::Waiting {
         return None;
@@ -414,7 +436,7 @@ pub fn stall_next(record: &InputRecord, idle: bool, now: DateTime<Utc>, stall_af
     let reason = record.reason.as_deref().unwrap_or("afterTurn");
     let marked = record.stalled.as_ref().is_some_and(|stalled| stalled.reason == "noProgress");
     let eligible = idle && !STALL_EXEMPT.contains(&reason);
-    if marked && !eligible {
+    if marked && !eligible && !il::stranded_resend(record) {
         return Some(Next::waiting(reason).stalled(None));
     }
     if !eligible || record.stalled.is_some() {
@@ -422,7 +444,7 @@ pub fn stall_next(record: &InputRecord, idle: bool, now: DateTime<Utc>, stall_af
     }
     let quiet = parse_time(&record.updated_at)
         .is_some_and(|at| now - at >= chrono::Duration::from_std(stall_after).unwrap_or_default());
-    quiet.then(|| Next::waiting(reason).stalled(Some(Stalled { reason: "noProgress".into(), since: rfc3339(now) })))
+    quiet.then(|| Next::waiting(reason).stalled(Some(Stalled { reason: "noProgress".into(), since: record.since.clone() })))
 }
 
 /// When [`stall_next`] would next mark one of these records (`None`: none
@@ -674,21 +696,26 @@ pub fn reconnected(ledger: &InputLedger, runtime: &dyn Runtime, session: &str, g
             }
             InputState::Accepted if is_delegation(record.kind) => was_stalled.then(|| Next::accepted().stalled(None)),
             InputState::Accepted if generation_changed => {
-                let (result, item) = check_bound(runtime, &record, None);
-                bind_checked(settle_next(record.kind, Occasion::GenerationChanged, &result), item)
+                let (result, item, carrying_turn) = check_full(runtime, &record, None);
+                bind_receipt_turn(bind_checked(settle_next(record.kind, Occasion::GenerationChanged, &result), item), carrying_turn)
             }
             InputState::Accepted => {
                 let running = record.turn_id.is_some() && view.active_turn == record.turn_id;
-                if running || record.turn_id.is_none() {
+                if running {
                     was_stalled.then(|| Next::accepted().stalled(None))
                 } else {
                     // The turn ended while nobody watched: one check now; no
                     // answer yet → the receipt grace restarts now.
-                    match check_bound(runtime, &record, None) {
-                        (result @ (Check::Persisted(_) | Check::Absent | Check::Held(_) | Check::Conflict | Check::Unpersisted), item) => {
-                            bind_checked(settle_next(record.kind, Occasion::ReceiptDeadline, &result), item)
+                    match check_full(runtime, &record, None) {
+                        (result @ (Check::Persisted(_) | Check::Absent | Check::Held(_) | Check::Conflict | Check::Unpersisted), item, carrying_turn) => {
+                            bind_receipt_turn(bind_checked(settle_next(record.kind, Occasion::ReceiptDeadline, &result), item), carrying_turn)
                         }
-                        (Check::Queued | Check::Unavailable, _) => {
+                        (Check::Queued, _, _) if record.turn_id.is_none() => {
+                            // A native pending item still waits for its first
+                            // carrying turn. Admission alone is not a receipt.
+                            was_stalled.then(|| Next::accepted().stalled(None))
+                        }
+                        (Check::Queued | Check::Unavailable, _, _) => {
                             Some(Next::accepted().stalled(None).deadline(Some(after(now, ledger.deadlines().receipt_grace))))
                         }
                     }
@@ -737,13 +764,18 @@ pub fn deadline_decision(
             OwnerDelivery::Unknown | OwnerDelivery::None => Some(Next::uncertain("outcomeUnknown")),
         },
         InputState::Accepted => {
-            let (result, item) = check_bound(runtime, record, None);
+            let (result, item, carrying_turn) = check_full(runtime, record, None);
+            if is_bus(record.kind) && record.turn_id.is_none() && result == Check::Queued {
+                // A pending native queue is positive evidence of waiting.
+                // Retire this one-shot check instead of polling an expired deadline.
+                return Some(Next::accepted().deadline(None));
+            }
             // Still held by an interrupt (turn_ended re-checks once).
             let occasion = match &result {
                 Check::Held(reason) if reason.as_deref() == Some("interrupted") => Occasion::TurnInterrupted,
                 _ => Occasion::ReceiptDeadline,
             };
-            bind_checked(settle_next(record.kind, occasion, &result), item)
+            bind_receipt_turn(bind_checked(settle_next(record.kind, occasion, &result), item), carrying_turn)
         }
         _ => il::deadline_next(record),
     }
@@ -984,6 +1016,9 @@ struct Engine {
     /// Sessions whose accepted records wait for the runtime after a restart.
     reconnect_checks: BTreeSet<String>,
     restart_cursor: Option<Option<(String, String)>>,
+    /// The last session whose actions the restart reconcile recomputed: pages
+    /// are in session order, one that spans two pages is done once.
+    restart_refreshed: Option<String>,
     /// When this management process started: the restart reconcile only
     /// judges records last written before it ([`restart_next`]).
     process_started: DateTime<Utc>,
@@ -1032,6 +1067,7 @@ impl Engine {
             known: BTreeSet::new(),
             reconnect_checks: BTreeSet::new(),
             restart_cursor: Some(None),
+            restart_refreshed: None,
             // The engine starts lazily (first v2 request) and slowly under
             // load; records this process wrote before that are not leftovers
             // either, so the OS process creation time, not the engine's.
@@ -1336,6 +1372,21 @@ impl Engine {
             }
         };
         let now = Utc::now();
+        // Rows an older build wrote: their actions, once per session.
+        let sessions = restart_refresh_sessions(&page, self.restart_refreshed.as_deref());
+        if let Some(last) = sessions.last() {
+            self.restart_refreshed = Some((*last).to_string());
+        }
+        for session in sessions {
+            match ledger.refresh_open_actions(session) {
+                Ok(change) => {
+                    if let Err(error) = il::publish_delivery(session, &change) {
+                        eprintln!("cutex input ledger (settle): publish {session}: {error:#}");
+                    }
+                }
+                Err(error) => eprintln!("cutex input ledger (settle): restart actions {session}: {error}"),
+            }
+        }
         for record in &page {
             match restart_next(record, &LiveOwnerStores, self.process_started) {
                 Restart::Skip => {}
@@ -1376,6 +1427,13 @@ impl Engine {
 }
 
 fn drift_one(ledger: &InputLedger, record: &InputRecord, now: DateTime<Utc>) {
+    if carried_input_left_behind(ledger, record, now) {
+        let next = Next::uncertain("outcomeUnknown").details(record.details.clone());
+        if apply(ledger, record, next).is_some() {
+            eprintln!("{DRIFT_LOG}: {}/{}: {} -> uncertain (its carrier is over)", record.cutex_session_id, record.input_id, record.state);
+        }
+        return;
+    }
     let steps = match record.kind {
         InputKind::Owner => owner_drift(record, &LiveOwnerStores, now),
         kind if is_delegation(kind) => {
@@ -1415,6 +1473,80 @@ fn drift_one(ledger: &InputLedger, record: &InputRecord, now: DateTime<Utc>) {
     }
 }
 
+/// The sessions of a restart `page` whose open owner rows still need their
+/// actions recomputed: pages are in session order, so only the first can be
+/// the one `done` on the page before.
+fn restart_refresh_sessions<'a>(page: &'a [InputRecord], done: Option<&str>) -> Vec<&'a str> {
+    let mut sessions: Vec<&str> = page.iter()
+        .filter(|record| record.kind == InputKind::Owner && matches!(record.state, InputState::Accepted | InputState::Held | InputState::Waiting))
+        .map(|record| record.cutex_session_id.as_str())
+        .collect();
+    sessions.dedup();
+    sessions.retain(|session| done != Some(*session));
+    sessions
+}
+
+/// Whether the send that carried `input` can no longer get it read (057
+/// section 6): that send is gone, no longer carries it, was given up, or was
+/// read in a turn that has ended (`turn_over`: asked only then). A carrier the
+/// owner can still resend (`uncertain`, `failed`) is not over.
+fn carrier_over(input: &str, carrier: Option<&InputRecord>, turn_over: impl FnOnce() -> bool) -> bool {
+    let Some(carrier) = carrier else { return true };
+    if !carrier.carries.iter().any(|id| id == input) {
+        return true;
+    }
+    match carrier.state {
+        InputState::InContext => turn_over(),
+        InputState::Rejected | InputState::Discarded | InputState::Superseded => true,
+        _ => false,
+    }
+}
+
+/// A carried input still reserved for a send that is over, not read, and not
+/// given back (no return capability, or the runtime never had it). Nothing
+/// else moves it: `uncertain` gives it its own retry and dismiss, and a later
+/// receipt still settles it.
+fn carried_input_left_behind(ledger: &InputLedger, record: &InputRecord, now: DateTime<Utc>) -> bool {
+    if !matches!(record.state, InputState::Sending | InputState::Accepted)
+        || il::shown_to_agent(record)
+        || record.details.get(il::READ_SIGNAL).is_some()
+        || parse_time(&record.updated_at).is_some_and(|at| (now - at).num_seconds() < DRIFT_MIN_AGE_SECS)
+    {
+        return false;
+    }
+    let Some(owner) = record.details.get("carriedByOwner").and_then(Value::as_str) else { return false };
+    let session = &record.cutex_session_id;
+    // Bus notes only: a carried delegation result is moved by the asks store
+    // when its event's turn ends (`uncertain{turnInterrupted}`).
+    let reserved = is_bus(record.kind) && super::agent_bus_state::agent_bus_message_repository()
+        .and_then(|repository| repository.owner_carry_ids(session, owner))
+        .is_ok_and(|ids| ids.contains(&record.input_id));
+    if !reserved {
+        return false;
+    }
+    let Ok(carrier) = ledger.get(session, &[owner.to_string()]).map(|mut got| got.records.pop()) else { return false };
+    carrier_over(&record.input_id, carrier.as_ref(), || thread_idle(ledger, session))
+}
+
+/// An input the owner retried that an idle thread does not take: the runtime
+/// still holds that id and does not run it again, and `accepted` has no
+/// action. Back to `uncertain`, so it can at least be dismissed. (A passive
+/// input waits for a next turn; that is not this.)
+fn retry_not_taken(ledger: &InputLedger, record: &InputRecord) -> bool {
+    record.state == InputState::Accepted
+        && record.attempt >= 2
+        && record.turn_id.is_none()
+        && record.intent.timing != il::Timing::Passive
+        && !il::shown_to_agent(record)
+        && record.details.get(il::READ_SIGNAL).is_none()
+        && thread_idle(ledger, &record.cutex_session_id)
+}
+
+fn thread_idle(ledger: &InputLedger, session: &str) -> bool {
+    ledger.list(session, il::ListQuery::default())
+        .is_ok_and(|list| list.delivery.is_some_and(|delivery| delivery.get("turn").is_none_or(Value::is_null)))
+}
+
 /// Drift (§2.12) of a bus record: the agent-bus store says where it should
 /// be ([`super::input_ledger_bus::target_of`]). Only a different STATE the
 /// §2.3 edges allow is corrected (waiting reasons written by other paths —
@@ -1452,6 +1584,13 @@ fn bus_drift_one(_ledger: &InputLedger, record: &InputRecord, now: DateTime<Utc>
             return;
         }
     };
+    if retry_not_taken(_ledger, record) {
+        let next = Next::uncertain("outcomeUnknown").details(record.details.clone());
+        if apply(_ledger, record, next).is_some() {
+            eprintln!("{DRIFT_LOG}: {}/{}: accepted -> uncertain (the runtime holds the retried input)", record.cutex_session_id, record.input_id);
+        }
+        return;
+    }
     let Some(target) = bus_drift(record, view.as_ref(), now) else { return };
     let Some((_, _, input)) = view else { return };
     let before = record.state;
@@ -1855,22 +1994,45 @@ pub(super) fn retry(
     }
     let (id, expected_rev) = parse_retry(session, params)?;
     let ledger = il::default_ledger().map_err(|error| il::ledger_error(LedgerError::Storage(error)))?;
+    retry_on(ledger, session, &id, expected_rev, resubmit)
+}
+
+/// [`retry`] on `ledger`, the request parsed and allowed.
+fn retry_on(
+    ledger: &InputLedger,
+    session: &str,
+    id: &str,
+    expected_rev: u64,
+    resubmit: &mut dyn FnMut(&Value) -> Result<Value, UserInputExecutionError>,
+) -> Result<Value, UserInputExecutionError> {
+    let id = id.to_string();
+    let before = ledger.get(session, std::slice::from_ref(&id)).map_err(il::ledger_error)?.records.pop();
     let transition = retry_transition_checked(ledger, session, &id, expected_rev, &|record| redelivery_precheck(session, record))?;
     let redelivery = match transition.record.kind {
-        InputKind::Owner => match ledger.payload(session, &id).map(|payload| {
-            // The owner asked to send it again: an earlier native acceptance
-            // of the same id (C-010) must not answer this resend as a repeat.
-            forget_owner_acceptance(session, &id);
-            payload
-        }) {
-            Ok(Some(payload)) => match resubmit(&payload) {
+        InputKind::Owner => {
+            let sent = match ledger.payload(session, &id) {
+                Ok(Some(payload)) => {
+                    // The owner asked to send it again: an earlier native acceptance
+                    // of the same id (C-010) must not answer this resend as a repeat.
+                    if forget_owner_acceptance(session, &id) {
+                        resend_alone(ledger, session, &transition.record);
+                    }
+                    resubmit(&payload)
+                }
+                Ok(None) => Err(retry_error("retry_payload_unavailable", "the original submit is no longer kept".into(), json!({}))),
+                Err(error) => Err(il::ledger_error(error)),
+            };
+            match sent {
                 Ok(result) => json!({"path": "ownerResubmit", "ok": true, "error": null, "result": result}),
-                Err(error) => json!({"path": "ownerResubmit", "ok": false, "error": error_json(&error)}),
-            },
-            Ok(None) => json!({"path": "ownerResubmit", "ok": false,
-                "error": {"code": "retry_payload_unavailable", "message": "the original submit is no longer kept", "retryable": false, "details": {}}}),
-            Err(error) => json!({"path": "ownerResubmit", "ok": false, "error": error_json(&il::ledger_error(error))}),
-        },
+                Err(error) => {
+                    let mut failure = error_json(&error);
+                    if before.as_ref().is_some_and(|before| refused_resend_returns(ledger, session, &id, before)) {
+                        failure["details"]["nothingSent"] = json!(true);
+                    }
+                    json!({"path": "ownerResubmit", "ok": false, "error": failure})
+                }
+            }
+        }
         InputKind::DelegationRequest => {
             let result = crate::asks::store::AskStore::open_default().and_then(|store| {
                 store.with_state(|state| crate::asks::lifecycle::retry(state, &id, None, Utc::now()).map(|_| ()))
@@ -1898,12 +2060,81 @@ pub(super) fn retry(
 /// Clear the C-010 `accepted` delivery record of owner input `id` (CAS on
 /// the record read), so the owner's explicit resend goes out instead of
 /// being answered `deduplicated` (r274.2 §9.4). `sending` / `unknown`
-/// records stay: they still guard an unresolved native request.
-fn forget_owner_acceptance(session: &str, id: &str) {
-    let Ok(repository) = super::user_input::user_input_repository() else { return };
-    if let Ok(Some(delivery @ super::user_input::InputDelivery::Accepted { .. })) = repository.delivery(session, id) {
-        if let Err(error) = repository.set_delivery(session, id, Some(&delivery), None) {
-            eprintln!("cutex input ledger (settle): retry {session}/{id}: clear the earlier acceptance: {error:#}");
+/// records stay: they still guard an unresolved native request. `true`: no
+/// delivery record is left, nothing unresolved guards this id.
+fn forget_owner_acceptance(session: &str, id: &str) -> bool {
+    let Ok(repository) = super::user_input::user_input_repository() else { return false };
+    match repository.delivery(session, id) {
+        Ok(None) => true,
+        Ok(Some(delivery @ super::user_input::InputDelivery::Accepted { .. })) => match repository.set_delivery(session, id, Some(&delivery), None) {
+            Ok(cleared) => cleared,
+            Err(error) => {
+                eprintln!("cutex input ledger (settle): retry {session}/{id}: clear the earlier acceptance: {error:#}");
+                false
+            }
+        },
+        _ => false,
+    }
+}
+
+/// The owner resends an input whose steer is over, while the bundle it carried
+/// stays reserved (057 §6: only a proven-unsent path or the note's own retry
+/// releases it). The empty `carries` says this send goes without that bundle
+/// (`OwnerCarries::goes_alone`), also when a later flush sends it.
+fn resend_alone(ledger: &InputLedger, session: &str, record: &InputRecord) {
+    if record.carries.is_empty() {
+        return;
+    }
+    let mut alone = Next::waiting("ownerRetry");
+    alone.carries = Some(Vec::new());
+    match ledger.transition(session, &record.input_id, Expect::rev(record.rev), alone) {
+        Ok(transition) => {
+            if let Err(error) = il::publish(&transition) {
+                eprintln!("cutex input ledger (settle): publish {session}/{}: {error:#}", record.input_id);
+            }
+        }
+        Err(error) => eprintln!("cutex input ledger (settle): retry {session}/{}: {error}", record.input_id),
+    }
+}
+
+/// A resubmit refused without a word to the ledger (`error_step`: "nothing was
+/// sent, retry later" and the like) would leave `waiting{ownerRetry}` with no
+/// queue item, held input, timer or action. Back to what `before` was, with its
+/// actions. `false`: the record moved on, its own outcome stands.
+fn refused_resend_returns(ledger: &InputLedger, session: &str, id: &str, before: &InputRecord) -> bool {
+    let current = match ledger.get(session, &[id.to_string()]) {
+        Ok(mut got) => got.records.pop(),
+        Err(error) => {
+            eprintln!("cutex input ledger (settle): retry {session}/{id}: {error}");
+            None
+        }
+    };
+    let Some(current) = current.filter(|record| record.state == InputState::Waiting && record.reason.as_deref() == Some("ownerRetry")) else {
+        return false;
+    };
+    let reason = before.reason.as_deref();
+    let mut back = if before.state == InputState::Failed {
+        let mut failed = Next::failed(reason.unwrap_or("notDelivered"));
+        failed.error = before.error.clone();
+        failed
+    } else if il::owner_stuck(before) {
+        Next::uncertain(il::stuck_uncertain_reason(before))
+    } else {
+        Next::uncertain(reason.unwrap_or("outcomeUnknown"))
+    };
+    if !il::owner_stuck(before) {
+        back = back.details(before.details.clone());
+    }
+    match ledger.transition(session, id, Expect::rev(current.rev), back) {
+        Ok(transition) => {
+            if let Err(error) = il::publish(&transition) {
+                eprintln!("cutex input ledger (settle): publish {session}/{id}: {error:#}");
+            }
+            true
+        }
+        Err(error) => {
+            eprintln!("cutex input ledger (settle): retry {session}/{id}: {error}");
+            false
         }
     }
 }

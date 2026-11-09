@@ -1,0 +1,20 @@
+{
+  "_comment": "Release metadata for cutex 0.2.2 Beautiful World. The durable-state migration remains declared for older source versions; immutable component archives are reused.",
+  "mode": "full",
+  "packageRunRecommended": true,
+  "migrations": [
+    {
+      "id": "durable-state-sqlite",
+      "class": "one-way",
+      "since": "0.2.1",
+      "notes": {
+        "en": "Moves durable session, communication and usage state to SQLite-backed stores. Retain an offline backup; automatic rollback across this migration is unavailable.",
+        "zh-CN": "会话、通信及用量的持久状态迁入 SQLite。请保留离线备份；无法跨过本次迁移自动回退。"
+      }
+    }
+  ],
+  "notes": {
+    "en": "Cached filesystem root identity, a separate Git status worker pool and per-repository request coalescing keep management responsive. Includes native 0.167.0-r60; existing Claude claude-r40, DSH dsh-r3, Kimi kimi-r3 and job-service 0.1.1 archives are reused. Existing agents retain their selected runtimes.",
+    "zh-CN": "缓存文件系统根身份，Git 状态使用独立线程池并合并同一仓库的请求，保持管理接口响应。提供原生运行时 0.167.0-r60；复用 Claude claude-r40、DSH dsh-r3、Kimi kimi-r3 和 job-service 0.1.1 的既有包。已有智能体保持所选运行时。"
+  }
+}

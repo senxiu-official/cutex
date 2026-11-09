@@ -520,6 +520,23 @@ pub static MANIFEST: &[StoreSpec] = &[
         Json { path: "profiles-v1.json" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
     base("client-tokens", &["src/management/client_tokens.rs"],
         Json { path: "management-clients/tokens.json" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
+    // Relay trust is separate from ordinary upgrade backups. These R0 entries
+    // retain current trust, never restore stale auth snapshots. Pre-QR readers
+    // reject bootstrap metadata in identity.json: the kit refuses an r279
+    // rollback before stopping services when those fields are present.
+    base("relay-identity", &["src/management/relay.rs", "src/management/relay/bootstrap.rs"],
+        Json { path: "management-relay/identity.json" }, SmallConfig, &domain::OWN_FILE).config(64 * 1024),
+    base("relay-certificates", &["src/management/relay.rs"],
+        Json { path: "management-relay/certificates.json" }, SmallConfig, &domain::OWN_FILE).config(16 * 1024 * 1024),
+    // Bounded authentication coordination, not an unbounded cache. Each file
+    // is an OwnFile domain; the encrypted journal is the durable cross-file
+    // operation/outbox and token activation is its final security commit.
+    base("relay-pairing-key", &["src/management/relay/pairing.rs"],
+        Json { path: "management-relay/pairing-recovery-key.json" }, SmallConfig, &domain::OWN_FILE).config(4 * 1024),
+    base("relay-pairing-journal", &["src/management/relay/pairing.rs"],
+        Json { path: "management-relay/pairing-journal.json" }, SmallConfig, &domain::OWN_FILE).config(2 * 1024 * 1024),
+    base("relay-audit", &["src/management/relay.rs"],
+        Jsonl { path: "management-relay/audit.jsonl" }, AppendLog, &domain::OWN_FILE).append(),
     base("hosts", &["src/management/connections.rs"],
         Json { path: "hosts.json" }, SmallConfig, &domain::OWN_FILE).config(SMALL),
     base("im-sessions", &["src/im/registry.rs", "src/session/im_exposure_migration.rs"],
@@ -671,6 +688,16 @@ mod tests {
         assert_eq!(spec("asks").domain.id, "management-state");
         assert!(find("no-such-store").is_none());
         assert!(std::panic::catch_unwind(|| spec("no-such-store")).is_err());
+    }
+
+    #[test]
+    fn relay_pairing_auth_files_have_real_owners_and_caps() {
+        for (id,path,cap) in [("relay-pairing-key","management-relay/pairing-recovery-key.json",4*1024),("relay-pairing-journal","management-relay/pairing-journal.json",2*1024*1024)] {
+            let entry=spec(id);assert_eq!(entry.owner,&["src/management/relay/pairing.rs"]);
+            assert!(matches!(entry.canonical,Canonical::Json{path:p} if p==path));
+            assert_eq!(entry.access,Access::SmallConfig{max_bytes:cap});assert_eq!(entry.rollback,Rollback::R0);
+        }
+        assert!(spec("relay-identity").owner.contains(&"src/management/relay/bootstrap.rs"));
     }
 
     /// The scale gate (design §7) and the manifest name the same stores.

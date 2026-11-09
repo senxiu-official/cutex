@@ -57,7 +57,7 @@ pub(super) fn handle_exact(stream:&mut TcpStream,request:&SimpleHttpRequest,cont
     write_json_response(stream,200,"OK",&value)
 }
 
-fn exact_value_at(path:&std::path::Path,host:&str,id:&str,load:crate::management::server::ManagementRuntimeStatusLoader)->anyhow::Result<serde_json::Value> {
+pub(super) fn exact_value_at(path:&std::path::Path,host:&str,id:&str,load:crate::management::server::ManagementRuntimeStatusLoader)->anyhow::Result<serde_json::Value> {
     let mut store=crate::session::model::CutexSessionStore::default();
     if let Some(record)=crate::session::store::host_session_row_at(path,host,id)? {
         store.sessions.insert_shared(record.cutex_session_id.clone(),record);
@@ -116,6 +116,24 @@ pub(super) fn handle(
     value["nextCursor"] = json!(next);
     annotate_projects(&mut value);
     write_json_response(stream,200,"OK",&value)
+}
+
+pub(super) fn catalog_rows(
+    records: &[std::sync::Arc<crate::session::model::CutexSessionRecord>],
+    load: crate::management::server::ManagementRuntimeStatusLoader,
+) -> serde_json::Value {
+    let host = crate::platform::host::current_host_name();
+    let versions = crate::launch::version_registry::load_relaxed();
+    let mut data = Vec::new();
+    for chunk in records.chunks(200) {
+        let mut store = crate::session::model::CutexSessionStore::default();
+        for record in chunk { store.sessions.insert_shared(record.cutex_session_id.clone(), record.clone()); }
+        let value = project(&store, &host, &Query { limit: Some(200), ..Default::default() }, load, versions.as_ref());
+        data.extend(value["data"].as_array().unwrap().iter().cloned());
+    }
+    let mut value = json!({"data":data});
+    annotate_projects(&mut value);
+    value
 }
 
 fn annotate_projects(value:&mut serde_json::Value) {
@@ -271,7 +289,7 @@ mod tests {
   let route="/v2/host/sessions/cutex.target";
   assert_eq!(super::super::access::classify("GET",route),Some(super::super::access::Class::OwnerOnly));
   let request=crate::http::server::SimpleHttpRequest {method:"GET".into(),path:route.into(),headers:Default::default(),body:Vec::new()};
-  assert_eq!(super::super::control_capacity::classify(&request),super::super::control_capacity::WorkClass::HeavyRead);
+  assert_eq!(super::super::control_capacity::classify(&request),super::super::control_capacity::WorkClass::Control);
   std::fs::remove_dir_all(root).unwrap();
  }
  #[test] fn catalog_pages_exclude_foreign_records_and_runtime_secrets(){

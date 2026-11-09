@@ -578,10 +578,16 @@ fn submit_v2_with_repository_and_image_settings(
             PriorDelivery::None => None,
             PriorDelivery::Deduplicated(turn_id) => Some(turn_id),
             PriorDelivery::InProgress(delivery) => {
-                return Err(delivery_in_progress_error(
+                let mut error = delivery_in_progress_error(
                     &command.params.client_user_message_id,
                     Some(&delivery),
-                ))
+                );
+                // Nothing a later resend finds can prove these absent: an
+                // image input, or a send to a thread that is not read here.
+                if image_steering::contains_images(&command.params.input) || delivery.thread_id() != command.thread_id {
+                    error.details["retryCannotHelp"] = json!(true);
+                }
+                return Err(error);
             }
         },
     };
@@ -913,7 +919,7 @@ fn queue_on_idle(
     let (asks_first, ledger_reason) = if ask_lease_held(session) {
         (Some("delegationLease"), ledger::lease_reason(session))
     } else {
-        match repository.owner_start_with_reason(session, owner_head).map_err(queue_persistence_error)? {
+        match repository.owner_send_start_with_reason(session, owner_head, command.params.strategy == UserInputStrategy::Auto).map_err(queue_persistence_error)? {
             (OwnerStart::Ready, _) => (None, None),
             (OwnerStart::Blocked, reason) => (Some("delegationLease"), Some(reason)),
             (OwnerStart::Deferred, _) => return host_busy(repository, command, None, true).map(Some),
@@ -1039,6 +1045,9 @@ enum PriorDelivery {
 /// Queued inputs and image inputs never use these absence heuristics to
 /// release an unresolved reservation. The registered identity binds the
 /// original image input, independently of the current busyBehavior setting.
+/// A send that carried notes (a source reservation) needs the same proof
+/// about its own thread, and only the owner's resend acts on it: it goes
+/// alone, its notes stay reserved (057 section 6).
 fn resolve_prior_delivery(
     repository: &cutex::management::v2::user_input::UserInputRepository,
     cutex_session_id: &str,
@@ -1055,11 +1064,16 @@ fn resolve_prior_delivery(
     // Queued and direct image inputs retain unresolved reservations across timeouts and
     // binding changes. Neither an idle snapshot nor a new thread proves
     // that the earlier native request will never execute.
-    if matches!(delivery, InputDelivery::Sending { .. } | InputDelivery::Unknown { .. })
+    let unresolved = matches!(delivery, InputDelivery::Sending { .. } | InputDelivery::Unknown { .. });
+    if unresolved
         && (retain_unresolved || repository.list(cutex_session_id)?.1.iter()
-            .any(|item| item.client_user_message_id == client_user_message_id)
-            || super::owner_carries::OwnerCarries::has_reservation(cutex_session_id, client_user_message_id)?)
+            .any(|item| item.client_user_message_id == client_user_message_id))
     {
+        return Ok(PriorDelivery::InProgress(delivery));
+    }
+    let carried = unresolved && super::owner_carries::OwnerCarries::has_reservation(cutex_session_id, client_user_message_id)?;
+    // Only the history of the thread it went to can prove a carrier absent.
+    if carried && delivery.thread_id() != thread_id {
         return Ok(PriorDelivery::InProgress(delivery));
     }
     let clear = |delivery: &InputDelivery| -> anyhow::Result<PriorDelivery> {
@@ -1098,6 +1112,9 @@ fn resolve_prior_delivery(
                 })
                 .unwrap_or(true);
             if active_turn_id_from_thread(thread).is_none() && settled {
+                if carried && !super::owner_carries::OwnerCarries::resend_goes_alone(cutex_session_id, client_user_message_id)? {
+                    return Ok(PriorDelivery::InProgress(delivery.clone()));
+                }
                 eprintln!(
                     "\x1b[33mwarning:\x1b[0m {cutex_session_id}: an earlier send of clientUserMessageId {client_user_message_id} is not in the idle native thread; sending it again"
                 );
@@ -1274,7 +1291,9 @@ fn send_user_input_native_request(
     let generation = status.as_ref().filter(|status| status.connected && status.thread_id == command.thread_id)
         .map(|status| status.runtime_generation);
     let carries = if matches!(method, "turn/start" | "turn/steer") && owner_reopens_gate(command)
-        && generation.is_some_and(|generation| super::owner_carries::OwnerCarries::supported(session, generation)) {
+        && generation.is_some_and(|generation| super::owner_carries::OwnerCarries::supported(session, generation))
+        && !super::owner_carries::OwnerCarries::goes_alone(session, &command.params.client_user_message_id)
+            .map_err(|error| execution_error("native_request", "owner_carry_reservation_failed", error, true, false))? {
         Some(super::owner_carries::OwnerCarries::prepare(session, &command.params.client_user_message_id,
             &command.thread_id, generation.expect("checked above"))
             .map_err(|error| {
@@ -3521,6 +3540,29 @@ mod tests {
     }
 
     #[test]
+    fn idle_send_passes_unstarted_delegation_and_explicit_queue_waits() {
+        for strategy in [UserInputStrategy::Auto, UserInputStrategy::Queue] {
+            let (root, repository) = queue_repository("owner-send-before-ask");
+            let session = format!("cutex.owner-send-{}", uuid::Uuid::new_v4());
+            let ask = admission_ask(&repository, &session);
+            let mut command = queue_command(&session, "send");
+            command.params.strategy = strategy;
+            let sent = std::cell::RefCell::new(Vec::new());
+            let execution = route_submit(&command, &repository, None, true, &recording_sender(&sent), &no_flush).unwrap();
+            if strategy == UserInputStrategy::Auto {
+                assert_eq!(execution.disposition, UserInputDisposition::Started);
+                assert_eq!(*sent.borrow(), ["turn/start send"]);
+            } else {
+                assert_eq!(execution.disposition, UserInputDisposition::Queued);
+                assert!(sent.borrow().is_empty());
+                assert_eq!(repository.admission(&session).unwrap().items[0].id, ask);
+            }
+            drop(repository);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn idle_owner_starts_with_staged_results_without_queueing() {
         use cutex::asks::model::{AnswerMetadata, AnswerRecord, AnswerStatus, Requester};
         for strategy in [UserInputStrategy::Auto, UserInputStrategy::Queue] {
@@ -3747,11 +3789,12 @@ mod tests {
         let ask = admission_ask(&repository, &session);
         let mut command = queue_command(&session, "after-ask");
         command.params.strategy = UserInputStrategy::Auto;
-        let queued = submit_v2_with_repository(command, &repository, |_, _| Some(None), no_history,
-            never_sent, no_flush).unwrap();
-        assert_eq!(queued.disposition, UserInputDisposition::Queued);
+        let started = submit_v2_with_repository(command, &repository, |_, _| Some(None), no_history,
+            recording_sender(&sent), no_flush).unwrap();
+        assert_eq!(started.disposition, UserInputDisposition::Started);
         assert!(repository.admission(&session).unwrap().items.iter().any(|item| item.id == ask));
-        assert_eq!(clients(&repository, &session), ["held", "after-ask"]);
+        assert_eq!(*sent.borrow(), ["turn/start fresh", "turn/start after-ask"]);
+        assert_eq!(clients(&repository, &session), ["held"]);
         drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }

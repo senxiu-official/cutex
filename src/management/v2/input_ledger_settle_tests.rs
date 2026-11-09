@@ -133,11 +133,47 @@ fn status(delivery: &str, processing: &str, reason: Option<&str>) -> Value {
 }
 
 #[test]
+fn reconnect_checks_accepted_bus_without_a_carrying_turn_and_does_not_reaccept_uncertain() {
+    for persisted in [true, false] {
+        let f = Fixture::new();
+        f.go("orphan", Next::sending().create(note_input()));
+        f.go("orphan", Next::accepted());
+        let reply = json!({"contextPersisted":persisted,"state":"failed","turnId":"proved-turn"});
+        let runtime = FakeRuntime::connected(None).answer("claude/input/status", Ok(reply));
+        let (changed, _) = il::capture_events(|| reconnected(&f.ledger, &runtime, "s1", false, t0()));
+        assert_eq!(changed, 1);
+        let row = f.get("orphan");
+        assert_eq!(row.state, if persisted { InputState::InContext } else { InputState::Uncertain });
+        if persisted { assert_eq!(row.turn_id.as_deref(), Some("proved-turn")); }
+        if !persisted {
+            assert!(row.actions.contains(&il::Action::Dismiss));
+            let target = super::super::input_ledger_bus::Target::Accepted { turn:None };
+            assert!(super::super::input_ledger_bus::plan(Some(row.state), &target, Timing::AfterTurn).is_empty());
+        }
+        il::capture_events(|| reconnected(&f.ledger, &runtime, "s1", false, t0()));
+        assert_eq!(runtime.calls.borrow().len(), 1, "no replay or repeated check of settled inputs");
+    }
+}
+
+#[test]
+fn unbound_native_pending_input_retires_its_one_shot_deadline() {
+    let f = Fixture::new();
+    f.go("pending", Next::sending().create(note_input()));
+    let record = f.go("pending", Next::accepted().deadline(Some(t0()))).record;
+    let runtime = FakeRuntime::connected(None).answer("claude/input/status", Ok(json!({"state":"queued"})));
+    let next = deadline_decision(&record, &runtime, &NoStores, t0()).unwrap();
+    assert_eq!(next.state, InputState::Accepted);
+    assert_eq!(next.deadline, Some(None));
+    assert_eq!(runtime.calls.borrow().len(), 1);
+}
+
+#[test]
 fn native_statuses_map_to_checks() {
     assert_eq!(parse_external_status(&status("context_persisted", "none", None)), Check::Persisted(Evidence::ExternalInputPersisted));
     assert_eq!(parse_external_status(&status("unknown", "none", None)), Check::Absent);
     assert_eq!(parse_external_status(&status("pending", "held", Some("interrupted"))), Check::Held(Some("interrupted".into())));
     assert_eq!(parse_external_status(&status("pending", "claimed", None)), Check::Unpersisted);
+    assert_eq!(parse_external_status(&status("pending", "output_observed", None)), Check::Unpersisted);
     assert_eq!(parse_external_status(&status("pending", "pending", None)), Check::Queued);
     assert_eq!(parse_external_status(&status("conflict", "none", None)), Check::Conflict);
     assert_eq!(parse_external_status(&json!({})), Check::Unavailable);
@@ -904,4 +940,208 @@ fn a_wake_turn_shown_its_record_is_a_delivery_turn() {
     accepted_owner(&f, "o1", "t4");
     f.go("o1", Next::accepted().turn("t4").details(json!({il::READ_SIGNAL: "steerEcho"})));
     assert_eq!(turn_inputs(&f.ledger, "s1", "t4").0.as_deref(), Some("owner"));
+}
+
+// Stuck resend (owner report 2026-11-07).
+
+fn refused_resend() -> UserInputExecutionError {
+    UserInputExecutionError {
+        stage: "route".into(),
+        code: "user_input_in_progress".into(),
+        message: "an earlier submit of this clientUserMessageId has not resolved yet; nothing was sent, retry later".into(),
+        retryable: true,
+        details: json!({"delivery": "unknown"}),
+        outcome_unknown: false,
+    }
+}
+
+#[test]
+fn a_refused_owner_resend_returns_to_retry_and_dismiss_and_says_nothing_was_sent() {
+    let f = Fixture::new();
+    let payload = json!({"clientUserMessageId": "m", "strategy": "auto", "input": []});
+    let settled: [(&str, Next); 2] = [("uncertain", Next::uncertain("outcomeUnknown")), ("failed", Next::failed("notDelivered"))];
+    for (id, last) in settled {
+        f.go(id, Next::received().create(owner_input()));
+        f.go(id, Next::sending());
+        let before = f.go(id, last).record;
+        f.ledger.put_payload("s1", id, &payload).unwrap();
+        let mut sent = 0;
+        let (result, _) = il::capture_events(|| retry_on(&f.ledger, "s1", id, before.rev, &mut |_| {
+            sent += 1;
+            Err(refused_resend())
+        }));
+        let result = result.unwrap();
+        assert_eq!(sent, 1);
+        assert_eq!(result["redelivery"]["ok"], false, "{result}");
+        assert_eq!(result["redelivery"]["error"]["code"], "user_input_in_progress", "{result}");
+        assert_eq!(result["redelivery"]["error"]["details"]["nothingSent"], true, "{result}");
+        assert!(result["redelivery"]["error"]["message"].as_str().unwrap().contains("nothing was sent"), "{result}");
+        let after = f.get(id);
+        assert_eq!((after.state, after.reason.clone()), (before.state, before.reason.clone()), "back where it was");
+        assert_eq!(after.actions, vec![il::Action::Retry, il::Action::Dismiss]);
+        assert_eq!(result["record"]["state"], before.state.to_string());
+        // The row keeps working: a later resend may go through.
+        let (later, _) = il::capture_events(|| retry_on(&f.ledger, "s1", id, after.rev, &mut |_| Ok(json!({}))));
+        assert_eq!(later.unwrap()["redelivery"]["ok"], true);
+    }
+    // No payload left: the same, not a row without actions.
+    f.go("gone", Next::received().create(owner_input()));
+    f.go("gone", Next::sending());
+    let before = f.go("gone", Next::uncertain("outcomeUnknown")).record;
+    let (result, _) = il::capture_events(|| retry_on(&f.ledger, "s1", "gone", before.rev, &mut |_| panic!("no payload to send")));
+    assert_eq!(result.unwrap()["redelivery"]["error"]["details"]["nothingSent"], true);
+    assert_eq!(f.get("gone").actions, vec![il::Action::Retry, il::Action::Dismiss]);
+}
+
+/// The row a refused resend left behind before this fix (r277): no queue
+/// item, no held input, no timer. Marked by the stall check, it gets actions.
+fn stranded_resend(f: &Fixture, id: &str) -> InputRecord {
+    f.go(id, Next::received().create(owner_input()));
+    f.go(id, Next::sending());
+    f.go(id, Next::uncertain("outcomeUnknown"));
+    let waiting = f.go(id, Next::waiting("ownerRetry")).record;
+    let late = t0() + chrono::Duration::seconds(31);
+    f.go(id, stall_next(&waiting, true, late, Duration::from_secs(30)).unwrap()).record
+}
+
+#[test]
+fn a_stranded_owner_resend_can_be_retried_or_dismissed() {
+    let f = Fixture::new();
+    let stranded = stranded_resend(&f, "a");
+    assert_eq!(stranded.actions, vec![il::Action::Retry, il::Action::Dismiss]);
+    let (retried, _) = il::capture_events(|| retry_transition(&f.ledger, "s1", "a", stranded.rev));
+    let retried = retried.unwrap().record;
+    assert_eq!((retried.state, retried.reason.as_deref()), (InputState::Waiting, Some("ownerRetry")));
+    assert!(retried.stalled.is_none());
+
+    let stranded = stranded_resend(&f, "b");
+    let (dismissed, _) = il::capture_events(|| il::dismiss_one(&f.ledger, "s1", "b", stranded.rev));
+    let dismissed = dismissed.unwrap().record;
+    assert_eq!((dismissed.state, dismissed.reason.as_deref()), (InputState::Discarded, Some("ownerDiscarded")));
+
+    // A resend still on its way has no mark and offers nothing.
+    f.go("c", Next::received().create(owner_input()));
+    f.go("c", Next::sending());
+    f.go("c", Next::uncertain("outcomeUnknown"));
+    assert!(f.go("c", Next::waiting("ownerRetry")).record.actions.is_empty());
+}
+
+#[test]
+fn the_stall_mark_of_a_stranded_resend_does_not_flip_and_keeps_the_real_wait() {
+    let f = Fixture::new();
+    let stall = Duration::from_secs(30);
+    f.go("a", Next::received().create(owner_input()));
+    f.go("a", Next::sending());
+    f.go("a", Next::uncertain("outcomeUnknown"));
+    let waiting = f.go("a", Next::waiting("ownerRetry")).record;
+    let marked = f.go("a", stall_next(&waiting, true, t0() + chrono::Duration::seconds(31), stall).unwrap()).record;
+    assert_eq!(marked.stalled.as_ref().unwrap().since, waiting.since, "since the wait began, not since the last look");
+    // Busy, idle, busy: no write at all.
+    for minutes in 1..6 {
+        let now = t0() + chrono::Duration::minutes(minutes);
+        assert!(stall_next(&marked, minutes % 2 == 0, now, stall).is_none(), "minute {minutes}");
+    }
+    // Another waiting record still loses its mark when the session gets busy.
+    let wake = f.go("w", Next::waiting("afterTurn").create(note_input())).record;
+    let wake = f.go("w", stall_next(&wake, true, t0() + chrono::Duration::seconds(31), stall).unwrap()).record;
+    assert_eq!(wake.stalled.as_ref().unwrap().since, wake.since);
+    assert!(stall_next(&wake, false, t0() + chrono::Duration::seconds(40), stall).is_some());
+}
+
+#[test]
+fn payloads_of_records_that_can_still_go_out_outlive_the_retention() {
+    let f = Fixture::new();
+    let payload = json!({"clientUserMessageId": "m", "input": []});
+    for (id, last) in [("waits", Next::waiting("ownerRetry")), ("uncertain", Next::uncertain("outcomeUnknown")), ("failed", Next::failed("notDelivered")), ("done", Next::in_context(il::Evidence::TurnStartInput))] {
+        f.go(id, Next::received().create(owner_input()));
+        f.go(id, Next::sending());
+        if id == "waits" {
+            f.go(id, Next::uncertain("outcomeUnknown"));
+        }
+        f.go(id, last);
+        f.ledger.put_payload("s1", id, &payload).unwrap();
+    }
+    f.ledger.put_payload("s1", "no-record", &payload).unwrap();
+    let later = t0() + chrono::Duration::days(8);
+    assert_eq!(f.ledger.compact_payloads(later, PAYLOAD_RETENTION, 100).unwrap(), 2, "the settled one and the one without a record");
+    for id in ["waits", "uncertain", "failed"] {
+        assert!(f.ledger.payload("s1", id).unwrap().is_some(), "{id}");
+    }
+    assert!(f.ledger.payload("s1", "done").unwrap().is_none());
+    assert!(f.ledger.payload("s1", "no-record").unwrap().is_none());
+}
+
+fn carried_owner(f: &Fixture, id: &str, note: &str) {
+    f.go(id, Next::received().create(NewInput {
+        kind: InputKind::Owner,
+        sender: InputSender { kind: SenderKind::Owner, id: "owner".into(), name: "owner".into(), host: None, cutex_session_id: None },
+        intent: InputIntent { strategy: Some(Strategy::Auto), delivery_mode: None, timing: Timing::NextStep },
+        preview: "owner".into(),
+        ask_id: None,
+        remote: None,
+    }));
+    let mut sending = Next::sending();
+    sending.carries = Some(vec![note.to_string()]);
+    f.go(id, sending);
+}
+
+#[test]
+fn a_carrier_is_over_when_it_cannot_read_the_note_any_more() {
+    let f = Fixture::new();
+    carried_owner(&f, "open", "n");
+    let ask = || -> bool { panic!("no need to ask") };
+    assert!(carrier_over("n", None, ask), "gone");
+    assert!(!carrier_over("n", Some(&f.get("open")), ask), "in flight");
+    assert!(carrier_over("other", Some(&f.get("open")), ask), "the note is not on this send any more");
+    f.go("open", Next::uncertain("outcomeUnknown"));
+    assert!(!carrier_over("n", Some(&f.get("open")), ask), "its outcome is open");
+    carried_owner(&f, "dismissed", "n");
+    f.go("dismissed", Next::uncertain("outcomeUnknown"));
+    f.go("dismissed", Next::discarded("ownerDiscarded"));
+    assert!(carrier_over("n", Some(&f.get("dismissed")), ask));
+    carried_owner(&f, "failed", "n");
+    f.go("failed", Next::failed("notDelivered"));
+    assert!(!carrier_over("n", Some(&f.get("failed")), ask), "the owner can still resend or dismiss it");
+    carried_owner(&f, "read", "n");
+    f.go("read", Next::in_context(il::Evidence::TurnStartInput));
+    assert!(!carrier_over("n", Some(&f.get("read")), || false), "its turn is running");
+    assert!(carrier_over("n", Some(&f.get("read")), || true), "its turn ended and the note was not read");
+}
+
+// r279 review: the restart refresh rewrites a whole session's rows. A row on a
+// later page must still count as left over from before this process, and a
+// session that spans two pages is scanned once.
+#[test]
+fn the_restart_refresh_leaves_later_pages_to_be_judged_and_scans_a_session_once() {
+    let f = Fixture::new();
+    let delivery = json!({"state": "turn", "runtimeConnected": true, "turnId": "t1", "turn": {"turnId": "t1"}});
+    f.ledger.delivery_changed("s1", &delivery).unwrap();
+    for id in ["a", "b", "c"] {
+        carried_owner(&f, id, "n");
+        f.go(id, Next::accepted().turn("t1"));
+    }
+    // What an older build stored for them.
+    let db = rusqlite::Connection::open(f.ledger.path()).unwrap();
+    for id in ["a", "b", "c"] {
+        let raw: String = db.query_row("SELECT record_json FROM input_ledger WHERE input_id=?1", [id], |r| r.get(0)).unwrap();
+        let mut stored: Value = serde_json::from_str(&raw).unwrap();
+        stored["actions"] = json!(["retry"]);
+        db.execute("UPDATE input_ledger SET record_json=?1 WHERE input_id=?2", rusqlite::params![stored.to_string(), id]).unwrap();
+    }
+    drop(db);
+    let started = t0() + chrono::Duration::seconds(50);
+    f.ledger.set_clock(started + chrono::Duration::seconds(1));
+    let first = f.ledger.unsettled_page(None, 2).unwrap();
+    assert_eq!(first.len(), 2);
+    let sessions = restart_refresh_sessions(&first, None);
+    assert_eq!(sessions, ["s1"]);
+    let change = f.ledger.refresh_open_actions("s1").unwrap();
+    assert_eq!(change.records.len(), 3, "the whole session at once");
+    let last = first.last().unwrap();
+    let second = f.ledger.unsettled_page(Some(&(last.cutex_session_id.clone(), last.input_id.clone())), 2).unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(second[0].actions.iter().all(|action| *action != il::Action::Retry), "refreshed: {:?}", second[0].actions);
+    assert!(matches!(restart_next(&second[0], &NoStores, started), Restart::ReconnectCheck), "still left over");
+    assert!(restart_refresh_sessions(&second, Some("s1")).is_empty(), "no second scan");
+    assert_eq!(restart_refresh_sessions(&second, Some("s0")), ["s1"]);
 }

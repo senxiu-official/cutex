@@ -53,9 +53,15 @@ record against the thread it just read:
 | any, recorded for another native thread | — | record cleared, sent again |
 | `sending` / `unknown` | a turn is running, or the record is < 30 s old | `202 user_input_in_progress`, nothing sent |
 | `sending` / `unknown` | idle, without the input, record ≥ 30 s old | record cleared, sent again (warning logged) |
+| `sending` / `unknown`, it carried notes | idle, same thread, without the input, record ≥ 30 s old, the owner's `cutex/input/retry` | record cleared, sent alone: `carries` empties, the notes stay reserved |
+| `sending` / `unknown`, it carried notes | anything else (busy, younger, another thread, not the owner's resend) | `202 user_input_in_progress`, nothing sent |
+| `sending` / `unknown`, image input or a carrier sent to another thread | any | as above, with `details.retryCannotHelp: true`: only dismissing ends it |
 
 An accepted input always appears in an idle thread's history unless it was reverted. That is why
 "idle and absent after the grace period" counts as proof that the earlier send did not land.
+A steer that turns up later than that is refused by its `expectedTurnId`. A first `turn/start` has
+no such guard: if it arrives after its resend, the model reads the message twice, in two turns with
+the same `clientId`, and the record stays settled on the first.
 
 `user_input_in_progress`: HTTP 202, `retryable: true`,
 `details {clientUserMessageId, delivery: "sending"|"unknown", retryAfterMs: 2000}`. It is **not**

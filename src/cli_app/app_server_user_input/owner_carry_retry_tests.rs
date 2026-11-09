@@ -170,6 +170,32 @@ fn owner_carry_retry_source_snapshot(source: &OwnerCarryRetrySource) -> Value {
     }
 }
 
+/// A crash between the source reservation and `record_reservation`: nothing
+/// was attached to any native request. The owner's resend goes alone; the
+/// source reservation stays, whatever the runtime could say about it.
+#[test]
+fn owner_carry_crash_before_the_ledger_write_stays_reserved_and_sends_alone() {
+    if test_runs_in_private_home("owner_carry_crash_before_the_ledger_write_stays_reserved_and_sends_alone") {
+        return;
+    }
+    use cutex::management::v2::input_ledger as il;
+    let session = format!("cutex.{}", uuid::Uuid::new_v4());
+    let client = "crash-window-owner";
+    il::default_ledger().unwrap().transition(&session, client, il::Expect::NEW, il::Next::received().create(il::NewInput {
+        kind: il::InputKind::Owner,
+        sender: il::InputSender { kind: il::SenderKind::Owner, id: "owner".into(), name: "owner".into(), host: None, cutex_session_id: None },
+        intent: il::InputIntent { strategy: Some(il::Strategy::Auto), delivery_mode: None, timing: il::Timing::NextStep },
+        preview: "owner".into(),
+        ask_id: None,
+        remote: None,
+    })).unwrap();
+    let source = owner_carry_retry_reserve_source("bus", &session, client);
+    let before = owner_carry_retry_source_snapshot(&source);
+    assert!(super::super::owner_carries::OwnerCarries::has_reservation(&session, client).unwrap());
+    assert!(super::super::owner_carries::OwnerCarries::goes_alone(&session, client).unwrap());
+    assert_eq!(owner_carry_retry_source_snapshot(&source), before, "a check moves nothing");
+}
+
 #[test]
 fn owner_carry_retry_retains_unresolved_without_capability_after_replacement() {
     if test_runs_in_private_home(
@@ -287,6 +313,92 @@ fn owner_carry_retry_retains_unresolved_without_capability_after_replacement() {
                 drop(repository);
                 std::fs::remove_dir_all(root).unwrap();
             }
+        }
+    }
+}
+
+/// Owner report 2026-11-08: the owner's resend of a carrier whose delivery never
+/// resolved. Same proof as a non-carried send: the thread is idle, the grace is
+/// over and the history this request read does not show it. It then goes alone:
+/// the delivery is cleared, `carries` emptied, the source reservation untouched
+/// (057 section 6). Anything short of that proof stays refused, moving nothing.
+#[test]
+fn owner_carry_resend_goes_alone_only_on_the_absence_proof() {
+    if test_runs_in_private_home("owner_carry_resend_goes_alone_only_on_the_absence_proof") {
+        return;
+    }
+    use cutex::management::v2::input_ledger as il;
+    let old = || (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    let idle = || json!([]);
+    let busy = || json!([{"id": "turn-running", "status": "inProgress", "items": []}]);
+    // (name, resend, thread replaced, age, turns, goes out)
+    let cases: Vec<(&str, bool, bool, String, Value, bool)> = vec![
+        ("proven", true, false, old(), idle(), true),
+        ("within-grace", true, false, Utc::now().to_rfc3339(), idle(), false),
+        ("busy", true, false, old(), busy(), false),
+        // That thread's history was not read, so nothing proves it absent.
+        ("other-thread", true, true, old(), idle(), false),
+        // Not the owner's resend: a blind repeat of the same id.
+        ("not-a-resend", false, false, old(), idle(), false),
+    ];
+    for state_name in ["sending", "unknown"] {
+        for (name, resending, replaced_thread, since, turns, goes_out) in &cases {
+            let case = format!("owner-carry-alone-{state_name}-{name}");
+            let (root, repository) = queue_repository(&case);
+            let session = format!("cutex.{}", uuid::Uuid::new_v4());
+            let mut command = retry_command(&session, "initial-request");
+            let client = command.params.client_user_message_id.clone();
+            repository.register_identity(&session, &command.params).unwrap();
+            let prior = if state_name == "sending" {
+                InputDelivery::Sending { thread_id: command.thread_id.clone(), since: since.clone() }
+            } else {
+                InputDelivery::Unknown { thread_id: command.thread_id.clone(), since: since.clone() }
+            };
+            assert!(repository.set_delivery(&session, &client, None, Some(prior.clone())).unwrap());
+            let ledger = il::default_ledger().unwrap();
+            ledger.transition(&session, &client, il::Expect::NEW, il::Next::received().create(il::NewInput {
+                kind: il::InputKind::Owner,
+                sender: il::InputSender { kind: il::SenderKind::Owner, id: "owner".into(), name: "owner".into(), host: None, cutex_session_id: None },
+                intent: il::InputIntent { strategy: Some(il::Strategy::Auto), delivery_mode: None, timing: il::Timing::NextStep },
+                preview: "owner".into(),
+                ask_id: None,
+                remote: None,
+            })).unwrap();
+            let mut carrying = il::Next::sending();
+            carrying.carries = Some(vec!["the-note".into()]);
+            ledger.transition(&session, &client, il::Expect::ANY, carrying).unwrap();
+            ledger.transition(&session, &client, il::Expect::ANY, il::Next::uncertain("outcomeUnknown")).unwrap();
+            if *resending {
+                ledger.transition(&session, &client, il::Expect::ANY, il::Next::waiting("ownerRetry")).unwrap();
+            }
+            let source = owner_carry_retry_reserve_source("bus", &session, &client);
+            let before = owner_carry_retry_source_snapshot(&source);
+            if *replaced_thread {
+                command.thread_id = "replacement-thread".into();
+            }
+            command.management_request_id = "the-resend".into();
+            let sent = std::cell::RefCell::new(Vec::new());
+            let result = submit_v2_with_repository(command, &repository, |_, _| Some(None), thread_with(turns.clone()), recording_sender(&sent), no_flush);
+            let record = ledger.get(&session, std::slice::from_ref(&client)).unwrap().records.pop().unwrap();
+            if *goes_out {
+                let execution = result.unwrap_or_else(|error| panic!("{case}: {error:?}"));
+                assert_eq!(execution.disposition, UserInputDisposition::Started, "{case}");
+                assert_eq!(*sent.borrow(), vec![format!("turn/start {client}")], "{case}");
+                assert!(record.carries.is_empty(), "{case}: {:?}", record.carries);
+                assert!(super::super::owner_carries::OwnerCarries::goes_alone(&session, &client).unwrap(), "{case}");
+                assert!(matches!(repository.delivery(&session, &client).unwrap(), Some(InputDelivery::Accepted { .. })), "{case}");
+            } else {
+                let error = result.expect_err(&case);
+                assert_eq!(error.code, "user_input_in_progress", "{case}");
+                assert_eq!(error.details["delivery"], state_name, "{case}");
+                assert_eq!(error.details.get("retryCannotHelp").is_some(), *replaced_thread, "{case}: {}", error.details);
+                assert!(sent.borrow().is_empty(), "{case}");
+                assert_eq!(record.carries, vec!["the-note".to_string()], "{case}");
+                assert_eq!(repository.delivery(&session, &client).unwrap(), Some(prior), "{case}");
+            }
+            assert_eq!(owner_carry_retry_source_snapshot(&source), before, "{case}: the reservation is untouched");
+            drop(repository);
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 }

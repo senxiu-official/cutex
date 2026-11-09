@@ -95,6 +95,30 @@ pub fn launch_memory_context_or_warn(cutex_session_id: &str) -> Option<LaunchMem
     }
 }
 
+/// Prefix-caching runtimes preserve their system index across a warm relaunch.
+/// Native Codex continues to load the current index directly.
+pub fn cached_launch_memory_context_or_warn(session: &str) -> Option<LaunchMemoryContext> {
+    let mut context = launch_memory_context_or_warn(session)?;
+    let selected = (|| -> anyhow::Result<Option<super::idle_note::Snapshot>> {
+        let Some(current) = context.index_snapshot.clone() else { return Ok(None) };
+        let conversation_at = crate::management::v2::activity::session_activity(session)?
+            .and_then(|s| s.conversation_at())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.timestamp_millis());
+        let store = super::idle_note::NoteStore::open(&crate::config::paths::config_dir()?)?;
+        store.relaunch_index(session, current, chrono::Utc::now().timestamp_millis(), conversation_at).map(Some)
+    })();
+    match selected {
+        Ok(Some(snapshot)) => {
+            context.instructions = render_memory_instructions(&context.scope, Some(&snapshot.index));
+            context.index_snapshot = Some(snapshot);
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("memory relaunch index unavailable for {session}: {error:#}"),
+    }
+    Some(context)
+}
+
 /// Short file-citation section injected for every managed Agent (desktop
 /// renders these links as clickable file references; it resolves absolute
 /// paths and paths relative to the workspace root alike).

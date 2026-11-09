@@ -299,6 +299,7 @@ pub fn uploaded_by(cutex_session_id: &str, token_id: &str, path: &str) -> bool {
 }
 
 fn uploaded_by_in(root: &Path, cutex_session_id: &str, token_id: &str, path: &str) -> bool {
+    if crate::artifacts::paths::validate_local_path(Path::new(path)).is_err(){return false;}
     let Ok(dir) = std::fs::canonicalize(root.join(session_dir_name(cutex_session_id))) else {
         return false;
     };
@@ -316,26 +317,25 @@ fn uploaded_by_in(root: &Path, cutex_session_id: &str, token_id: &str, path: &st
     dir.join(format!("{name}{}", uploader_marker_suffix(token_id))).is_file()
 }
 
-/// Size of `path` only if it is one of this session's own stored attachments.
+/// Size only within this session's or a recorded fork ancestor's attachment directory.
 pub(super) fn stored_dimensions(root: &Path, cutex_session_id: &str, path: &str) -> Option<(u32, u32)> {
-    use std::io::Read;
-    let dir = std::fs::canonicalize(root.join(session_dir_name(cutex_session_id))).ok()?;
     let file = std::fs::canonicalize(path).ok()?;
     if super::workspace::display_path(&file) != path && file.as_os_str() != path {
         return None;
     }
     let name = file.file_name()?.to_string_lossy().into_owned();
-    if file.parent() != Some(dir.as_path()) || !is_attachment_file_name(&name) {
-        return None;
+    if !is_attachment_file_name(&name) { return None; }
+    let mut session = cutex_session_id.to_owned();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..32 {
+        if !seen.insert(session.clone()) { break; }
+        if std::fs::canonicalize(root.join(session_dir_name(&session))).ok()
+            .is_some_and(|dir| file.parent() == Some(dir.as_path())) {
+            return super::image_dimensions::from_path(&file);
+        }
+        session = crate::session::fork::load(&session)?.source_session_id;
     }
-    let handle = std::fs::File::open(&file).ok()?;
-    let total = usize::try_from(handle.metadata().ok()?.len()).ok()?;
-    let mut header = Vec::with_capacity(super::image_dimensions::header_len().min(total));
-    handle
-        .take(super::image_dimensions::header_len() as u64)
-        .read_to_end(&mut header)
-        .ok()?;
-    super::image_dimensions::dimensions_in(&header, total)
+    None
 }
 
 /// Remove a deleted session's attachments (best effort).

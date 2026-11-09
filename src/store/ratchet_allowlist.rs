@@ -52,6 +52,7 @@ pub(super) const SQL_USERS: &[(&str, &str)] = &[];
 /// Whole-state sites per (file, pattern) at S0, labelled with the owning store
 /// ("caller" = calls another store's whole-state API). Only shrinks.
 pub(super) const ALLOWED: &[(&str, &str, usize, &str)] = &[
+    ("src/management/relay.rs", "full_file_parse", 2, "allow: existing relay identity port projection and capped 1000-certificate trust registry; registration adds no production read sites"),
     ("src/cli_app/tool_gate.rs", "with_state", 2, "allow: pause/presence metadata only, on runtime generation change or held-call notification; cached read-only idle ticks"),
     ("src/management/v2/runtime_prune.rs", "load_all", 1, "allow: explicit owner-triggered runtime deletion inventory must inspect every session reference"),
     ("src/management/v2/server.rs", "load_all", 1, "allow: owner-triggered stop requester runtime-ID/name resolution, no idle/background reads"),

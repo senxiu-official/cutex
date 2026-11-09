@@ -159,6 +159,7 @@ fn front_matter(skill_md: &Path) -> (Option<String>, Option<String>) {
 
 /// The archivable entry for a skill path: (root kind, entry path, kind).
 fn resolve_entry(roots: &Roots, path: &str) -> Result<(&'static str, PathBuf, &'static str), ArchiveError> {
+    crate::artifacts::paths::validate_local_path(Path::new(path)).map_err(|_|err(403,"path_forbidden","unsafe skill path",json!({})))?;
     let raw = PathBuf::from(path);
     if path.is_empty() || !raw.is_absolute() || raw.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         return Err(err(400, "invalid_request", "path must be an absolute skill path without ..", json!({})));
@@ -433,6 +434,7 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
     let path = request.path.split('?').next().unwrap_or(&request.path);
     let reason = |status: u16| match status {
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",

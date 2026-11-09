@@ -603,6 +603,32 @@ mod tests {
     }
 
     #[test]
+    fn fork_images_use_parent_attachments_and_copied_sizes_survive_retention() {
+        let _home_lock = crate::config::paths::test_home_env_lock();
+        let base = std::env::temp_dir().join(format!("fork-image-{}", uuid::Uuid::new_v4()));
+        let root = base.join("attachments");
+        let parent = format!("cutex.{}", uuid::Uuid::new_v4());
+        let child = format!("cutex.{}", uuid::Uuid::new_v4());
+        let settings = crate::config::attachments::AttachmentSettings { max_bytes: 1 << 20, retention_days: 30 };
+        let (_, upload) = super::super::attachments::store_upload(&root, &parent, Some("image/png"), &png(), settings).unwrap();
+        crate::session::fork::save(&child, &crate::session::fork::ForkOrigin {
+            source_session_id: parent.clone(), source_profile: None, target_profile: None,
+            history_bytes: 0, cold_cache: false,
+        }).unwrap();
+        let store = EventBlobStore::at(base.join("blobs")).with_attachments(&root);
+        let mut item = json!({"type":"localImage","path":upload["path"]});
+        store.normalize(&child, &mut item).unwrap();
+        assert_eq!((item["width"].as_u64(), item["height"].as_u64()), (Some(1), Some(1)));
+        fs::remove_file(upload["path"].as_str().unwrap()).unwrap();
+        store.normalize(&child, &mut item).unwrap();
+        assert_eq!((item["width"].as_u64(), item["height"].as_u64()), (Some(1), Some(1)));
+        let mut old = json!({"type":"localImage","path":upload["path"]});
+        store.normalize(&child, &mut old).unwrap();
+        assert!(old.get("width").is_none(), "old size-less items stay unchanged when the file is gone");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn oversized_completed_text_roundtrips_full_json_and_preserves_reference_on_replay() {
         let dir = std::env::temp_dir().join(format!("eb-full-{}", uuid::Uuid::new_v4()));
         let store = EventBlobStore::at(&dir);

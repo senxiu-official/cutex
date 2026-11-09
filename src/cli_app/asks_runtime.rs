@@ -378,6 +378,11 @@ impl AskRuntime for ManagementAskRuntime {
         }
     }
 
+    fn return_owner_carry(&self, session: &str, generation: u64, submission: &Submission) -> bool {
+        record(session).is_some_and(|record| record.claude_session.is_some())
+            && super::asks_claude::return_owner_note(session, generation, submission)
+    }
+
     fn message_status(&self, session: &str, generation: u64, submission: &Submission) -> NativeMessageStatus {
         if record(session).is_some_and(|record| record.claude_session.is_some()) {
             return super::asks_claude::message_status(session, generation, submission);

@@ -373,6 +373,12 @@ pub trait AskRuntime {
     /// input lock and answer `Busy` when the owner got there first.
     fn submit_exclusive(&self, session: &str, generation: u64, submission: &Submission) -> SubmitOutcome;
     fn message_status(&self, session: &str, generation: u64, submission: &Submission) -> NativeMessageStatus;
+    /// 057 §6: take a carried results event back from the runtime. `true`:
+    /// its carrier steer is proven never read and the runtime no longer has
+    /// it. Anything else (no such runtime, not proven, a failed call): `false`.
+    fn return_owner_carry(&self, _session: &str, _generation: u64, _submission: &Submission) -> bool {
+        false
+    }
     /// N2: interrupt the turn without closing the native external-input gate.
     fn interrupt_keep_gate(&self, session: &str, turn_id: &str) -> anyhow::Result<()>;
     /// Implement only when the transport binds to the supplied generation.
@@ -3192,6 +3198,8 @@ pub(crate) mod tests {
         pub mcp_calls: RefCell<Vec<(String, String, Value)>>,
         /// Native status queries (`message_status`) made.
         pub status_queries: RefCell<usize>,
+        /// Native message ids `return_owner_carry` gives back.
+        pub carries_returned: RefCell<std::collections::BTreeSet<String>>,
         /// r217h2: the runtime takes `soon` (results at the next step).
         pub next_step: std::cell::Cell<bool>,
         pub durable_next_step: std::cell::Cell<bool>,
@@ -3256,6 +3264,9 @@ pub(crate) mod tests {
                 .get(&submission.message_id)
                 .cloned()
                 .unwrap_or(NativeMessageStatus::Absent)
+        }
+        fn return_owner_carry(&self, _session: &str, _generation: u64, submission: &Submission) -> bool {
+            self.carries_returned.borrow().contains(&submission.message_id)
         }
         fn interrupt_keep_gate(&self, session: &str, turn_id: &str) -> anyhow::Result<()> {
             if !self.target_status(session).online {
@@ -3487,6 +3498,8 @@ pub(crate) mod tests {
         queue.enqueue(TARGET, "thread", id, &params).unwrap();
         queue.list(TARGET).unwrap().1.into_iter().find(|item| item.client_user_message_id == id).unwrap()
     }
+
+    include!("scheduler_priority_tests.rs");
 
     fn queued_answer(store: &AskStore, id: &str, now: DateTime<Utc>) -> String {
         queued_answer_for(store, id, TARGET, REQUESTER, now)

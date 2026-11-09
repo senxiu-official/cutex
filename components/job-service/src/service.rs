@@ -404,6 +404,7 @@ impl JobService {
             updated_at_epoch_secs: now,
             process_id: None,
             process_start_ticks: None,
+            observed_process_state: None,
             exit_code: None,
             terminal_reason: None,
             execution: None,
@@ -886,6 +887,7 @@ impl JobService {
             updated_at_epoch_secs: now,
             process_id: None,
             process_start_ticks: None,
+            observed_process_state: None,
             exit_code: None,
             terminal_reason: None,
             execution: None,
@@ -1182,6 +1184,7 @@ impl JobService {
             None
         };
         let data: Vec<_> = jobs.into_iter().map(|j| serde_json::json!({
+            "observedProcessState":observe_process(j),
             "jobId":j.job_id, "actionId":j.request.action_id.chars().take(512).collect::<String>(),
             "sessionId":j.request.subscriber_cutex_session_id, "state":j.state,
             "command":j.request.command_summary.as_deref().map(|c| c.chars().take(crate::model::COMMAND_SUMMARY_MAX_CHARS).collect::<String>()),
@@ -1230,6 +1233,7 @@ impl JobService {
         if let Some(external) = &mut job.external {
             external.stale = stale;
         }
+        job.observed_process_state = observe_process(&job);
         Ok(job)
     }
 
@@ -1645,6 +1649,11 @@ fn validate_external_text(value: &str, max: usize, spaces: bool) -> Result<(), J
         ));
     }
     Ok(())
+}
+
+fn observe_process(job: &JobRecord) -> Option<crate::model::ProcessObservation> {
+    if job.state != JobState::Running || job.external.is_some() { return None; }
+    process::observed_process_state(job.process_id?, job.process_start_ticks?)
 }
 
 fn agent_job_projection(mut job: JobRecord) -> JobRecord {

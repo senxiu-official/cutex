@@ -977,3 +977,47 @@ mod cli_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+/// Uses the daemon's loopback owner channel, so CLI and desktop share state.
+pub(crate) fn run_relay(command: cutex::cli::args::RelayCommand) -> anyhow::Result<()> {
+    use cutex::cli::args::RelayCommand;
+    let config=load_codez_config();
+    let port=match &command {RelayCommand::Invite{port,..}|RelayCommand::Approve{port,..}|RelayCommand::Pairing{port,..}=>*port}.unwrap_or_else(||cutex::management::service::management_port(&config));
+    validate_management_port(port)?;
+    let root=management_root_credential(&config,None)?;
+    let call=|method:&str,path:&str,body:Option<&serde_json::Value>|->anyhow::Result<serde_json::Value>{
+        let bytes=body.map(serde_json::to_vec).transpose()?;
+        management_http_json(&management_base_url(port),method,path,Some(root),bytes.as_deref())
+    };
+    match command {
+        RelayCommand::Pairing{command,..}=>{
+            use cutex::cli::args::RelayPairingCommand;
+            let result=match command {
+                RelayPairingCommand::Status=>call("GET","/v2/relay/pairing",None)?,
+                RelayPairingCommand::On=>call("POST","/v2/relay/pairing",Some(&serde_json::json!({"enabled":true})))?,
+                RelayPairingCommand::Off=>call("POST","/v2/relay/pairing",Some(&serde_json::json!({"enabled":false})))?,
+            };
+            println!("{}",serde_json::to_string_pretty(&result)?);
+        }
+        RelayCommand::Invite{user,scope,label,device_id,..}=>{
+            let mut body=serde_json::json!({"scope":scope});
+            if let Some(user)=user{body["userId"]=serde_json::json!(user)}
+            if let Some(label)=label{body["label"]=serde_json::json!(label)}
+            if let Some(id)=device_id{body["deviceId"]=serde_json::json!(id)}
+            let result=call("POST","/v2/pairing/invites",Some(&body))?;
+            let qr=result["qr"].as_str().context("daemon returned no QR invitation")?;
+            println!("{}",qrcode::QrCode::new(qr.as_bytes())?.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build());
+            println!("{qr}");
+            println!("Invite {}  user={}  scope={}  expires={}\nCompare the phone code, then: cutex relay approve {} --short-code <code>",result["inviteId"],result["userId"],result["scope"],result["expiresAt"],result["inviteId"].as_str().unwrap_or(""));
+        }
+        RelayCommand::Approve{invite_id,short_code,..}=>{
+            if short_code.len()!=6||!short_code.bytes().all(|b|b.is_ascii_digit()){anyhow::bail!("short code must have six digits")}
+            let list=call("GET","/v2/pairing/invites",None)?;
+            let request=list["invites"].as_array().and_then(|rows|rows.iter().find(|i|i["inviteId"]==invite_id && i["shortCode"]==short_code)).context("no matching pending invite/code")?;
+            println!("Allow {} ({}) for user {}, scope {}, code {}",request["deviceName"],request["platform"],request["userId"],request["scope"],short_code);
+            let result=call("POST",&format!("/v2/pairing/invites/{invite_id}/approve"),Some(&serde_json::json!({"requestId":request["requestId"],"shortCode":short_code,"confirm":true})))?;
+            println!("{}",serde_json::to_string_pretty(&result)?);
+        }
+    }
+    Ok(())
+}

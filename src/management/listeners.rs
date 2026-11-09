@@ -108,7 +108,8 @@ pub fn set_current_client_token(token: Option<VerifiedClientToken>) {
 
 /// True unless the current request arrived on a remote listener.
 pub fn current_request_is_loopback() -> bool {
-    current_connection().is_none_or(|info| !info.remote)
+    crate::management::relay::current_peer().is_none()
+        && current_connection().is_none_or(|info| !info.remote)
 }
 
 static ACTIVE_REMOTE: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
@@ -148,7 +149,7 @@ pub fn pairing_urls() -> Vec<String> {
     urls
 }
 
-fn is_tailscale_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_tailscale_ip(ip: IpAddr) -> bool {
     // CGNAT range 100.64.0.0/10 used by Tailscale.
     matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
 }
@@ -312,38 +313,38 @@ static CONNECTIONS: ConnectionPool = ConnectionPool {
     bulk: AtomicUsize::new(0),
 };
 
-/// Holds one connection slot; released on drop.
-pub struct ConnectionSlot { bulk: bool, pool: &'static ConnectionPool }
-
+/// Shared by the HTTP handler and TLS transport; both admission classes are
+/// released only after the final holder finishes draining.
+#[derive(Clone)]
+pub struct ConnectionSlot {
+    _permit: Arc<ConnectionPermit>,
+}
+struct ConnectionPermit {
+    bulk: Mutex<bool>,
+    pool: &'static ConnectionPool,
+}
 impl ConnectionSlot {
-    pub fn acquire() -> Option<Self> {
-        Self::acquire_from(&CONNECTIONS)
+    pub fn acquire() -> Option<Self> {Self::acquire_from(&CONNECTIONS)}
+    fn acquire_from(pool: &'static ConnectionPool) -> Option<Self> {Self::acquire_below(pool,MAX_CONNECTIONS)}
+    /// Retain the relay's independent 32-slot loopback reserve.
+    pub(crate) fn acquire_remote() -> Option<Self> {Self::acquire_below(&CONNECTIONS,MAX_CONNECTIONS-32)}
+    fn acquire_below(pool: &'static ConnectionPool, limit: usize) -> Option<Self> {
+        pool.open.fetch_update(Ordering::SeqCst,Ordering::SeqCst,|n|(n<limit).then_some(n+1)).ok()?;
+        Some(Self{_permit:Arc::new(ConnectionPermit{bulk:Mutex::new(false),pool})})
     }
-
-    fn acquire_from(pool: &'static ConnectionPool) -> Option<Self> {
-        let previous = pool.open.fetch_add(1, Ordering::SeqCst);
-        if previous >= MAX_CONNECTIONS {
-            pool.open.fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
-        Some(Self { bulk: false, pool })
-    }
-
-    /// Bulk keep-alive connections retain their bulk slot while idle. This
-    /// leaves capacity for new control connections, not just active requests.
+    /// A keep-alive bulk slot is charged once, including across TLS clones.
     pub fn restrict_to_bulk(&mut self) -> bool {
-        if self.bulk { return true; }
-        let limit = MAX_CONNECTIONS - crate::management::v2::control_capacity::CONTROL_CONNECTION_RESERVE;
-        if self.pool.bulk.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < limit).then_some(n + 1)).is_err() { return false; }
-        self.bulk = true;
-        true
+        let Ok(mut bulk)=self._permit.bulk.lock() else{return false;};
+        if *bulk {return true;}
+        let limit=MAX_CONNECTIONS-crate::management::v2::control_capacity::CONTROL_CONNECTION_RESERVE;
+        if self._permit.pool.bulk.fetch_update(Ordering::AcqRel,Ordering::Acquire,|n|(n<limit).then_some(n+1)).is_err(){return false;}
+        *bulk=true;true
     }
 }
-
-impl Drop for ConnectionSlot {
+impl Drop for ConnectionPermit {
     fn drop(&mut self) {
-        if self.bulk { self.pool.bulk.fetch_sub(1, Ordering::AcqRel); }
-        self.pool.open.fetch_sub(1, Ordering::SeqCst);
+        if *self.bulk.get_mut().unwrap_or_else(|e|e.into_inner()){self.pool.bulk.fetch_sub(1,Ordering::AcqRel);}
+        self.pool.open.fetch_sub(1,Ordering::SeqCst);
     }
 }
 
@@ -383,7 +384,8 @@ fn dispatch_connection(
     remote: bool,
     serve: fn(TcpStream, ConnectionInfo, ConnectionSlot),
 ) {
-    let Some(slot) = ConnectionSlot::acquire() else {
+    let remote = remote && !peer.ip().is_loopback();
+    let Some(slot) = (if remote { ConnectionSlot::acquire_remote() } else { ConnectionSlot::acquire() }) else {
         std::thread::spawn(move || {
             let _ = crate::management::v2::server::write_v2_error(
                 &mut stream,
@@ -398,7 +400,6 @@ fn dispatch_connection(
         return;
     };
     // A wildcard listener also accepts loopback peers: those are local.
-    let remote = remote && !peer.ip().is_loopback();
     let info = ConnectionInfo { remote, peer };
     std::thread::spawn(move || serve(stream, info, slot));
 }
@@ -491,6 +492,7 @@ pub fn start_listeners(
 ) -> anyhow::Result<Vec<std::thread::JoinHandle<()>>> {
     let mut handles = Vec::new();
     for spec in specs {
+        crate::services::control_ports::note(spec.port());
         if !spec.is_loopback() && !allow_remote {
             eprintln!(
                 "\x1b[33mwarning:\x1b[0m refusing management listener {spec:?}: remote listeners need a Management root credential (management_api_token) so client/device tokens can authenticate"
@@ -663,6 +665,16 @@ fn tailscale_dns_name() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_transport_clone_retains_shared_bulk_and_open_permits() {
+        let pool=Box::leak(Box::new(ConnectionPool{open:AtomicUsize::new(0),bulk:AtomicUsize::new(0)}));
+        let mut http=ConnectionSlot::acquire_from(pool).unwrap();let mut transport=http.clone();
+        assert!(http.restrict_to_bulk());assert!(transport.restrict_to_bulk());
+        assert_eq!(pool.open.load(Ordering::SeqCst),1);assert_eq!(pool.bulk.load(Ordering::SeqCst),1);
+        drop(http);assert_eq!(pool.open.load(Ordering::SeqCst),1);assert_eq!(pool.bulk.load(Ordering::SeqCst),1);
+        drop(transport);assert_eq!(pool.open.load(Ordering::SeqCst),0);assert_eq!(pool.bulk.load(Ordering::SeqCst),0);
+    }
 
     #[test]
     fn bulk_keepalive_connections_cannot_take_reserved_control_slots() {

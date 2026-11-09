@@ -171,6 +171,28 @@ pub(crate) fn status(
     )
 }
 
+/// `thread/externalInput/returnCarries`. Only a status that could still mean
+/// "never read" is worth asking about (a carrier the runtime reports dropped,
+/// or a lost answer to an earlier call). `true`: the runtime proved its carrier
+/// steer never read and no longer has it.
+pub(crate) fn may_be_returned(status: &Status) -> bool {
+    use cutex::app_server::external_input::{HoldReason, ProcessingState};
+    status.receipt.is_none() && match status.processing.state {
+        ProcessingState::Held => status.processing.reason == Some(HoldReason::Interrupted),
+        ProcessingState::None => status.delivery_state == DeliveryState::Unknown,
+        _ => false,
+    }
+}
+
+pub(crate) fn return_carry(handle: &AppServerHandle, envelope: &Envelope, generation: u64) -> anyhow::Result<bool> {
+    let mut params = binding_params(&envelope.owner_id, &envelope.thread_id, generation);
+    params["messages"] = json!([envelope.key()]);
+    let response = handle.request("thread/externalInput/returnCarries", params)?;
+    anyhow::ensure!(response["ownerId"] == envelope.owner_id.as_str() && response["threadId"] == envelope.thread_id.as_str()
+        && response["runtimeGeneration"] == generation, "returnCarries answered another binding");
+    Ok(response["returned"].as_array().is_some_and(|returned| returned.iter().any(|id| id == envelope.message.id.as_str())))
+}
+
 pub(crate) fn persisted_turn(status: &Status) -> Option<&str> {
     (status.delivery_state == DeliveryState::ContextPersisted)
         .then(|| {

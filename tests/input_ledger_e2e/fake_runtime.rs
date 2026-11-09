@@ -61,6 +61,9 @@ pub struct Script {
     /// 057 harness opt-in only: simulate atomic owner request + carried inputs.
     /// This fake does not prove the production adapters implement that contract.
     pub owner_input_carries: bool,
+    /// Claude adapter `ownerCarryReturn`: `thread/externalInput/returnCarries`
+    /// gives back the carried notes of a steer an interrupt dropped unread.
+    pub owner_carry_return: bool,
     /// Delay before answering `turn/start` / `turn/steer` / `claude/input/submit`.
     pub start_delay: Duration,
     pub steer_delay: Duration,
@@ -135,6 +138,7 @@ impl Default for Script {
     fn default() -> Self {
         Self {
             owner_input_carries: false,
+            owner_carry_return: false,
             start_delay: Duration::ZERO,
             steer_delay: Duration::ZERO,
             drop_turn_completed: false,
@@ -211,6 +215,8 @@ struct State {
     /// Steers not read yet (`Script::pending_steer`): (turn id, item).
     pending_steers: Vec<(String, Value)>,
     pending_owner_carries: HashMap<String, Vec<String>>,
+    /// Carried notes given back: id to semantic digest (a lost answer repeats).
+    returned_carries: HashMap<String, String>,
 }
 
 pub struct FakeRuntime {
@@ -253,6 +259,7 @@ impl FakeRuntime {
                 ordinal: 0,
                 pending_steers: Vec::new(),
                 pending_owner_carries: HashMap::new(),
+                returned_carries: HashMap::new(),
             })
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -312,6 +319,15 @@ impl FakeRuntime {
     }
 
     /// Steers the running turn has not read yet (`Script::pending_steer`).
+    /// The carrier never reached the runtime: it does not hold `id` at all.
+    pub fn forget_input(&self, id: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.inbox.retain(|entry| entry.id != id);
+        for ids in state.pending_owner_carries.values_mut() {
+            ids.retain(|carried| carried != id);
+        }
+    }
+
     pub fn pending_steers(&self) -> Vec<Value> {
         self.state.lock().unwrap().pending_steers.iter().map(|(_, item)| item.clone()).collect()
     }
@@ -557,6 +573,14 @@ fn complete_locked(state: &mut State, status: &str) -> Option<String> {
     // Unread steers: a completed turn reads them, an interrupt drops them.
     let (read, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut state.pending_steers).into_iter().partition(|(turn, _)| *turn == current);
     state.pending_steers = rest;
+    // The adapter's `_inbox`: a dropped carrier's notes report it.
+    if state.script.owner_carry_return && status != "completed" {
+        let dropped: Vec<String> = read.iter().filter_map(|(_, item)| item["clientId"].as_str())
+            .filter_map(|client| state.pending_owner_carries.get(client)).flatten().cloned().collect();
+        for entry in state.inbox.iter_mut().filter(|entry| dropped.contains(&entry.id)) {
+            entry.state = "interrupted".into();
+        }
+    }
     // Claude `claude_slip_steers`: they run as the next turn's input instead.
     let slip = kind == Kind::Claude && state.script.claude_slip_steers && status == "completed";
     let slipped: Vec<Value> = if slip { read.iter().map(|(_, item)| item.clone()).collect() } else { Vec::new() };
@@ -768,6 +792,7 @@ fn handle(ctx: &Ctx, request: Value, tx: &mpsc::Sender<String>) {
                     "externalInputControlVersion": 1, "externalInputDeliveries": ["after_turn", "passive", "soon"]})
             } else { json!({"userAgent": format!("input-ledger-e2e-fake-{}", ctx.kind.name())}) };
             if script.owner_input_carries { response["ownerInputCarries"] = json!(1); }
+            if script.owner_carry_return { response["ownerCarryReturn"] = json!(1); }
             Ok(response)
         }
         "thread/resume" | "thread/read" if script.history_unreadable && method == "thread/read" => {
@@ -818,6 +843,7 @@ fn handle(ctx: &Ctx, request: Value, tx: &mpsc::Sender<String>) {
         }
         "thread/externalInput/submit" => external_submit(ctx, &mut state, &params),
         "thread/externalInput/status" => Ok(external_status(ctx, &state, &params)),
+        "thread/externalInput/returnCarries" if script.owner_carry_return => Ok(return_carries(ctx, &mut state, &params)),
         // S33 history revert: Codex `thread/revert` (paginated threads),
         // the Claude adapter's `claude/thread/inspect` / `claude/thread/revert`
         // (`session_ops.py`: the receipt of a committed revert).
@@ -901,6 +927,11 @@ fn start_or_steer(ctx: &Ctx, state: &mut State, method: &str, params: &Value, sc
         return Err(error.clone());
     }
     let client = params["clientUserMessageId"].as_str().or(params["clientId"].as_str()).unwrap_or("").to_string();
+    // Sent alone: what an earlier send of this id carried does not ride along
+    // (the adapter keys it to that send's own carrier).
+    if params.get("ownerCarries").is_none() {
+        state.pending_owner_carries.remove(&client);
+    }
     let steer = method == "turn/steer";
     if steer {
         if ctx.kind == Kind::Claude && !script.claude_same_turn_steering {
@@ -1168,6 +1199,27 @@ fn entry_status(script: &Script, entry: &InboxEntry) -> Value {
     };
     json!({"messageId": entry.id, "semanticSha256": entry.semantic, "deliveryState": delivery,
         "receipt": receipt_value, "processing": processing})
+}
+
+/// `ExternalInputService._return_carries`: only a carry whose steer was dropped
+/// unread leaves; the proof repeats until the identity is submitted again.
+fn return_carries(ctx: &Ctx, state: &mut State, params: &Value) -> Value {
+    let mut returned = Vec::new();
+    for key in params["messages"].as_array().cloned().unwrap_or_default() {
+        let (id, digest) = (key["messageId"].as_str().unwrap_or(""), key["semanticSha256"].as_str().unwrap_or(""));
+        if let Some(at) = state.inbox.iter().position(|e| e.id == id) {
+            if state.inbox[at].state == "interrupted" && state.inbox[at].delivery == "owner_carry" && state.inbox[at].turn.is_none() && state.inbox[at].semantic == digest {
+                state.inbox.remove(at);
+                for ids in state.pending_owner_carries.values_mut() { ids.retain(|carried| carried != id); }
+                state.returned_carries.insert(id.to_string(), digest.to_string());
+                returned.push(id.to_string());
+            }
+        } else if state.returned_carries.get(id).is_some_and(|proof| proof == digest) {
+            returned.push(id.to_string());
+        }
+    }
+    json!({"version": 1, "ownerId": params["ownerId"], "threadId": ctx.thread,
+        "runtimeGeneration": params["runtimeGeneration"], "returned": returned})
 }
 
 fn external_status(ctx: &Ctx, state: &State, params: &Value) -> Value {

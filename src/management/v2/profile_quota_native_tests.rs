@@ -87,12 +87,12 @@ fn normalizes_a_rate_limits_read_response() {
 
 #[test]
 fn quota_config_gauges_keep_their_shape() {
-    // HTTP reader gauges serialize without the native-only fields.
+    // Missing percentages are explicit null; the native source tag stays optional.
     let mut gauge = normalize(&sample_read()["rateLimits"], 1).remove(0);
     gauge.used_percent = None;
     gauge.source = None;
     let view = serde_json::to_value(&gauge).unwrap();
-    assert!(view.get("usedPercent").is_none());
+    assert_eq!(view.get("usedPercent"), Some(&Value::Null));
     assert!(view.get("source").is_none());
 }
 
@@ -369,4 +369,44 @@ fn quota_updated_event_matches_the_method_schema() {
     )
     .is_err());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reset_boundary_hides_old_percentages_in_get_and_event_gauges() {
+    let profile = account("chatgpt");
+    let mut snapshot = NativeQuotaSnapshot::new(&profile);
+    snapshot.fetched_at = Some(90);
+    snapshot.rate_limits = Some(json!({"primary":{"usedPercent":75,"resetsAt":100},"credits":{"balance":12}}));
+    let before = snapshot.gauges(99, 300);
+    assert_eq!(before[0].remaining_percent, Some(25.0));
+    let after = snapshot.gauges(100, 300);
+    assert!(after[0].stale);
+    assert_eq!(after[0].remaining_percent, None);
+    assert_eq!(after[0].used_percent, None);
+    assert_eq!(after[1].balance.as_deref(), Some("12.00"));
+    let event = event_params(&snapshot, &after, 100, 300, false);
+    assert!(event["gauges"][0]["usedPercent"].is_null());
+    assert!(event["gauges"][0]["remainingPercent"].is_null());
+    snapshot.last_error = Some("failed".into());
+    snapshot.last_attempt_at = Some(101);
+    assert!(snapshot.gauges(101, 300)[0].remaining_percent.is_none());
+    snapshot.fetched_at = Some(100);
+    snapshot.last_error = None;
+    assert_eq!(snapshot.gauges(101, 300)[0].remaining_percent, Some(25.0));
+}
+
+#[test]
+fn sparse_post_reset_notification_cannot_revalidate_a_sticky_window() {
+    let dir = temp_dir();
+    let profile = account("chatgpt");
+    let read = json!({"rateLimits":{"primary":{"usedPercent":75,"resetsAt":100}}});
+    apply_read_at(&dir, &profile, Ok(read), 90).unwrap();
+    let (snapshot, _) = apply_notification_at(&dir, &profile,
+        &json!({"rateLimits":{"credits":{"balance":12}}}), 101).unwrap().unwrap();
+    assert!(snapshot.gauges(101, 300)[0].remaining_percent.is_none());
+    assert_eq!(snapshot.last_successful_read_at, Some(90));
+    let (snapshot, change) = apply_read_at(&dir, &profile,
+        Ok(json!({"rateLimits":{"primary":{"usedPercent":75,"resetsAt":100},"credits":{"balance":12}}})), 102).unwrap();
+    assert!(change.content, "revalidation must publish even when the provider keeps the same values");
+    assert_eq!(snapshot.gauges(102, 300)[0].remaining_percent, Some(25.0));
 }

@@ -453,6 +453,14 @@ pub fn drive(session: &str, id: &str, input: &NewInput, target: &Target) -> Opti
     let existing = current(session, id);
     let mut last = None;
     for next in plan(existing.as_ref().map(|record| record.state), target, input.intent.timing) {
+        let next = if next.state == InputState::Accepted && matches!(target, Target::Accepted { turn: None }) && input.intent.timing != Timing::Passive {
+            next.deadline(Some(chrono::Utc::now() + chrono::Duration::seconds(60)))
+        } else if matches!(target, Target::Accepted { turn: Some(_) })
+            && existing.as_ref().is_some_and(|row| row.state == InputState::Accepted && row.turn_id.is_none()) {
+            // Once a carrying turn is known, its end owns receipt grace.
+            // A repeated acceptance must not erase an existing turn-end grace.
+            next.deadline(None)
+        } else { next };
         last = write(session, id, next.create(input.clone()));
         if last.is_none() {
             break;

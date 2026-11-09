@@ -594,6 +594,17 @@ impl From<serde_json::Error> for LedgerError {
 // Rules (pure)
 
 /// §2.3 state machine. `from: None` is a record that does not exist yet.
+/// `details` key of a `waiting{returned}` written after the runtime proved the
+/// steer that carried this input never read (057 §6, invariant 8's exception).
+pub const CARRIER_UNREAD: &str = "carrierUnread";
+
+fn carrier_unread_return(kind: InputKind, to: &Next) -> bool {
+    kind != InputKind::Owner
+        && to.state == InputState::Waiting
+        && to.reason.as_deref() == Some("returned")
+        && to.details.as_ref().is_some_and(|details| details[CARRIER_UNREAD] == true)
+}
+
 pub fn edge_allowed(kind: InputKind, from: Option<InputState>, to: &Next) -> bool {
     use InputState::*;
     let owner = kind == InputKind::Owner;
@@ -634,7 +645,11 @@ pub fn edge_allowed(kind: InputKind, from: Option<InputState>, to: &Next) -> boo
         // any native IO (the runtime is still away): failed again, with its
         // actions; never left waiting with none.
         (Waiting, Failed) => owner,
+        // The same for a resend whose first outcome stays unknown (an earlier
+        // send is unresolved): back to `uncertain`, with its actions.
+        (Waiting, Uncertain) => owner,
         (Uncertain, InContext | Discarded) => true,
+        (Accepted | Uncertain, Waiting) if carrier_unread_return(kind, to) => true,
         // r274.2 §9.4: the owner discards a failed message of theirs.
         (Failed, Discarded) => owner && to.reason.as_deref() == Some("ownerDiscarded"),
         // The owner's resend / retry, same id.
@@ -792,12 +807,26 @@ pub fn interrupt_send_legal(
 /// (`stalled{noProgress}` with `details.stuck` = one of [`STUCK_CASES`]:
 /// the runtime generation changed since it was accepted, the lease of its
 /// turn is stale, or an orphan nothing will read or settle).
+///
+/// Also [`stranded_resend`].
 pub fn owner_stuck(record: &InputRecord) -> bool {
     record.kind == InputKind::Owner
-        && matches!(record.state, InputState::Sending | InputState::Accepted)
-        && record.stalled.as_ref().is_some_and(|stalled| {
-            stalled.reason == "runtimeDisconnected" || (stalled.reason == "noProgress" && stuck_case(record).is_some())
-        })
+        && (stranded_resend(record)
+            || matches!(record.state, InputState::Sending | InputState::Accepted)
+                && record.stalled.as_ref().is_some_and(|stalled| {
+                    stalled.reason == "runtimeDisconnected" || (stalled.reason == "noProgress" && stuck_case(record).is_some())
+                }))
+}
+
+/// An owner `waiting{ownerRetry}` the stall check marked. A resend in progress
+/// leaves that state within its own request; one a host before this rule
+/// refused stays in it for good, with no queue item, held input or timer
+/// (owner report 2026-11-07).
+pub fn stranded_resend(record: &InputRecord) -> bool {
+    record.kind == InputKind::Owner
+        && record.state == InputState::Waiting
+        && record.reason.as_deref() == Some("ownerRetry")
+        && record.stalled.as_ref().is_some_and(|stalled| stalled.reason == "noProgress")
 }
 
 /// `details` key naming why an owner `accepted` record is stuck.
@@ -815,6 +844,9 @@ pub fn stuck_case(record: &InputRecord) -> Option<&'static str> {
 /// stuck record: the runtime that had it is gone (`runtimeLost`), or cutex
 /// cannot tell where it is (`outcomeUnknown`).
 pub fn stuck_uncertain_reason(record: &InputRecord) -> &'static str {
+    if stranded_resend(record) {
+        return "outcomeUnknown";
+    }
     match (record.stalled.as_ref().map(|stalled| stalled.reason.as_str()), stuck_case(record)) {
         (Some("noProgress"), Some("leaseStale" | "orphan")) => "outcomeUnknown",
         _ => "runtimeLost",
@@ -1094,7 +1126,11 @@ fn apply(
         record.timeline_item_id = None;
     }
     // Runtime said Absent: same id goes again (§2.10), next attempt.
-    if from == Some(InputState::Sending) && next.state == InputState::Waiting && next.reason.as_deref() == Some("returned") {
+    let carrier_unread = matches!(from, Some(InputState::Accepted | InputState::Uncertain)) && carrier_unread_return(kind, next);
+    if carrier_unread {
+        record.turn_id = None;
+    }
+    if (from == Some(InputState::Sending) || carrier_unread) && next.state == InputState::Waiting && next.reason.as_deref() == Some("returned") {
         record.attempt += 1;
         // The next attempt is another native item (a new event id).
         record.timeline_item_id = None;
@@ -1115,6 +1151,11 @@ fn apply(
             record.details = json!({});
         }
         record.details["mayArriveTwice"] = Value::Bool(true);
+        if record.sender.kind == SenderKind::ClaudeTask {
+            record.details["retryEffect"] = json!("redeliverNotice");
+            record.details["taskRestartsOnRetry"] = json!(false);
+            record.details["recoveryDescription"] = json!("Delivery of this Claude Task notice is unconfirmed. Retry sends the notice again; it does not restart the task. Dismiss ignores the notice.");
+        }
     }
     record.error = match next.state {
         InputState::Failed | InputState::Rejected => Some(next.error.clone().unwrap_or_else(|| InputError {
@@ -1690,7 +1731,7 @@ impl InputLedger {
         let mut refreshed = Vec::new();
         if let Some((delivery, true)) = &change {
             let skip: Vec<&str> = items.iter().map(|(id, _, _)| id.as_str()).collect();
-            refreshed = refresh_actions(&tx, session, &row.epoch, delivery, state_revision, now, outbox, &skip, seq)?;
+            refreshed = refresh_actions(&tx, session, &row.epoch, delivery, state_revision, now, outbox, &skip, seq, true)?;
         }
         commit_timed(tx, outbox)?;
         let change = change.map(|(delivery, changed)| DeliveryChange {
@@ -1859,6 +1900,43 @@ impl InputLedger {
         Ok(victims.len())
     }
 
+    /// The open owner records' stored `actions` under this build's rules and
+    /// the stored delivery: an older build wrote them, and only a delivery
+    /// change recomputes them. A difference is published like a delivery
+    /// change at one new revision, and keeps `updatedAt`: not a new write, so
+    /// the restart reconcile still judges a row on a later page
+    /// ([`super::input_ledger_settle::restart_next`]). None (or no delivery
+    /// stored yet, its first write recomputes them) writes nothing and uses no
+    /// revision.
+    pub fn refresh_open_actions(&self, session: &str) -> Result<DeliveryChange, LedgerError> {
+        validate_id("cutexSessionId", session)?;
+        let now = self.now();
+        let outbox = self.outbox_on();
+        let mut guard = self.lock()?;
+        let connection = guard.connection.as_mut().expect("opened under lock");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let unchanged = |ledger_epoch: String, state_revision: u64, delivery: Value| DeliveryChange {
+            delivery, changed: false, ledger_epoch, state_revision, outboxed: false, records: Vec::new(),
+        };
+        let Some(row) = session_row(&tx, session)? else {
+            return Ok(unchanged(file_epoch(&tx)?, 0, Value::Null));
+        };
+        let Some(delivery) = parse_delivery(Some(&row))? else {
+            return Ok(unchanged(row.epoch, row.state_revision, Value::Null));
+        };
+        let state_revision = row.state_revision.checked_add(1)
+            .filter(|revision| *revision <= super::model::MAX_SAFE_SEQUENCE)
+            .ok_or_else(|| LedgerError::Storage(anyhow::anyhow!("session stateRevision exhausted")))?;
+        let stored = store_delivery(&tx, session, &row, &delivery, state_revision, now, outbox)?;
+        let records = refresh_actions(&tx, session, &row.epoch, &stored, state_revision, now, outbox, &[], 1, false)?;
+        if records.is_empty() {
+            // Dropped: the delivery write above rolls back.
+            return Ok(unchanged(row.epoch, row.state_revision, delivery));
+        }
+        commit_timed(tx, outbox)?;
+        Ok(DeliveryChange { delivery: stored, changed: true, ledger_epoch: row.epoch, state_revision, outboxed: outbox, records })
+    }
+
     /// Store the session's SessionDelivery (§2.6) and give it the next
     /// `stateRevision`, so `deliveryChanged` and `stateChanged` share one
     /// gapless sequence (§2.8). `delivery` is the §2.6 object; its
@@ -1897,7 +1975,7 @@ impl InputLedger {
         let stored = store_delivery(&tx, session, &row, delivery, state_revision, now, outbox)?;
         // `interruptSend` depends on the running turn: the open owner
         // records' actions follow the delivery at the same revision.
-        let records = refresh_actions(&tx, session, &row.epoch, &stored, state_revision, now, outbox, &[], 1)?;
+        let records = refresh_actions(&tx, session, &row.epoch, &stored, state_revision, now, outbox, &[], 1, true)?;
         commit_timed(tx, outbox)?;
         Ok(DeliveryChange { delivery: stored, changed: true, ledger_epoch: row.epoch, state_revision, outboxed: outbox, records })
     }
@@ -2198,8 +2276,13 @@ impl InputLedger {
         let mut guard = self.lock()?;
         let connection = guard.connection.as_mut().expect("opened under lock");
         Ok(connection.execute(
+            // A record that can still go out keeps its text, however old:
+            // not settled, or `uncertain` / `failed` with a retry on offer.
             "DELETE FROM input_ledger_payloads WHERE rowid IN
-               (SELECT rowid FROM input_ledger_payloads WHERE created_at_ms < ?1 LIMIT ?2)",
+               (SELECT p.rowid FROM input_ledger_payloads p WHERE p.created_at_ms < ?1 AND NOT EXISTS
+                  (SELECT 1 FROM input_ledger r WHERE r.session = p.session AND r.input_id = p.input_id
+                     AND (r.terminal = 0 OR r.state = 'failed'))
+                LIMIT ?2)",
             params![cutoff, i64::try_from(limit).unwrap_or(i64::MAX)],
         )?)
     }
@@ -2251,7 +2334,8 @@ fn store_delivery(
 /// `held`, `waiting`: the only ones `interruptSend` can apply to) in line
 /// with `delivery`; each one that changes takes `state_revision` (outbox
 /// seq from `seq`). `skip`: records the caller writes in this transaction.
-/// One indexed read of the session's open rows, only on a delivery change.
+/// One indexed read of the session's open rows, only on a delivery change
+/// or at a process start ([`InputLedger::refresh_open_actions`]).
 #[allow(clippy::too_many_arguments)]
 fn refresh_actions(
     tx: &rusqlite::Transaction<'_>,
@@ -2263,6 +2347,7 @@ fn refresh_actions(
     outbox: bool,
     skip: &[&str],
     mut seq: u64,
+    touch: bool,
 ) -> Result<Vec<InputRecord>, LedgerError> {
     let rows: Vec<String> = {
         let mut statement = tx.prepare_cached(
@@ -2284,7 +2369,9 @@ fn refresh_actions(
         record.actions = actions;
         record.rev += 1;
         record.state_revision = state_revision;
-        record.updated_at = timestamp(now);
+        if touch {
+            record.updated_at = timestamp(now);
+        }
         let input_id = record.input_id.clone();
         upsert_record(tx, session, &input_id, &record, state_revision, now)?;
         if outbox {

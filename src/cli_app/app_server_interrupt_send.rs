@@ -247,6 +247,15 @@ pub(super) fn run(ops: &dyn Ops, session: &str, request: &InterruptSendRequest) 
                 step(ops, session, &id, rev, Next::in_context(Evidence::HistoryRead).turn(turn.clone()));
                 return Ok(Outcome::Interrupted { turn_id: turn, started: false });
             }
+            // Dropped, and the bundle it carried with it. That bundle stays
+            // reserved (057 §6): this goes out alone (`OwnerCarries::goes_alone`).
+            TurnCheck::Absent if !record.carries.is_empty() => {
+                let mut alone = Next::sending().reason(isend::SENDING_REASON).details(mark.clone());
+                alone.carries = Some(Vec::new());
+                if let Some(next) = step(ops, session, &id, rev, alone) {
+                    rev = next;
+                }
+            }
             TurnCheck::Absent => {}
             // Unprovable either way: never resent blindly (owner decision 3).
             TurnCheck::Unavailable => {

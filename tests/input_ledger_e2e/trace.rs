@@ -286,6 +286,11 @@ pub fn check_surface_trace(trace: &Trace, options: AssertOptions) -> Result<Trac
     // (stream, session) -> (stateRevision, inputs) of the stateChanged run
     // at the last revision (an open batch).
     let mut batches: HashMap<(String, String), (u64, std::collections::HashSet<String>)> = HashMap::new();
+    // The outbox can append again after a publisher dies before deleting its
+    // rows. Only the same complete params on the same stream are a replay;
+    // envelope sequence/time may differ. Keep every identity, including older
+    // batch members, so a replayed prefix cannot move the revision head back.
+    let mut published: HashMap<(String, String, String, u64, String, Option<String>), Vec<u8>> = HashMap::new();
 
     for (index, entry) in trace.entries.iter().enumerate() {
         let at = format!("#{index} {}/{}", entry.source, entry.kind);
@@ -302,6 +307,19 @@ pub fn check_surface_trace(trace: &Trace, options: AssertOptions) -> Result<Trac
                     errors.push(format!("{at}: event without stateRevision"));
                     continue;
                 };
+                let input = (entry.kind == "stateChanged").then(|| p["record"]["inputId"].as_str()).flatten();
+                let identity = (entry.source.clone(), session.to_string(), epoch.clone(), revision,
+                    entry.kind.clone(), input.map(str::to_string));
+                // Trace payloads are parsed JSON: compare all serialized params,
+                // never just stateRevision/record.rev or selected state fields.
+                let bytes = serde_json::to_vec(p).expect("trace payload serializes");
+                if let Some(before) = published.get(&identity) {
+                    if *before != bytes {
+                        errors.push(format!("{at}: {session} conflicting replay at stateRevision {revision}"));
+                    }
+                    continue;
+                }
+                published.insert(identity, bytes);
                 let key = (entry.source.clone(), session.to_string());
                 let jump = resubscribed.remove(&key);
                 // A batch write (`input_ledger::record_batch`, e.g. queue merge)
@@ -313,7 +331,6 @@ pub fn check_surface_trace(trace: &Trace, options: AssertOptions) -> Result<Trac
                 // first transition of an interruptSend written with its
                 // delivery (`transition_batch_with_delivery`), come right after
                 // it at its revision (§2.8: clients apply them by `rev`).
-                let input = (entry.kind == "stateChanged").then(|| p["record"]["inputId"].as_str()).flatten();
                 let same_epoch = revisions.get(&key).is_some_and(|(last_epoch, _)| *last_epoch == epoch);
                 let batch_member = same_epoch
                     && input.is_some_and(|input| {
@@ -904,17 +921,62 @@ mod tests {
     }
 
     #[test]
-    fn revision_hole_duplicate_and_regression_are_rejected() {
+    fn revision_holes_and_unseen_regressions_are_rejected() {
         let mut hole = good_s1();
         hole.entries.remove(1); // the deliveryChanged at revision 2
         assert!(errors(&hole).iter().any(|e| e.contains("hole 1 -> 3")), "{:?}", errors(&hole));
 
-        let mut duplicate = good_s1();
-        let again = duplicate.entries[2].clone();
-        duplicate.entries.insert(3, again);
-        let e = errors(&duplicate);
-        assert!(e.iter().any(|e| e.contains("stateRevision 3 not above 3")), "{e:?}");
-        assert!(e.iter().any(|e| e.contains("rev 2 not above 2")), "{e:?}");
+        let mut regression = good_s1();
+        regression.push(delivery(T0 + 60, 3, "idle"));
+        assert!(errors(&regression).iter().any(|e| e.contains("stateRevision 3 not above 4")), "{:?}", errors(&regression));
+    }
+
+    #[test]
+    fn an_identical_outbox_replay_prefix_keeps_the_revision_head() {
+        let mut t = good_s1();
+        let prefix = t.entries[..3].to_vec();
+        for (i, mut entry) in prefix.into_iter().enumerate() {
+            entry.at_ms = T0 + 60 + i as i64;
+            entry.sequence = Some(100 + i as u64);
+            t.push(entry);
+        }
+        // Includes both stateChanged and deliveryChanged, replayed after a
+        // later record version; replay must not regress either version head.
+        t.push(delivery(T0 + 70, 5, "idle"));
+        assert!(errors(&t).is_empty(), "{:?}", errors(&t));
+        let mut hole = t;
+        hole.push(delivery(T0 + 80, 7, "idle"));
+        assert!(errors(&hole).iter().any(|e| e.contains("hole 5 -> 7")), "{:?}", errors(&hole));
+    }
+
+    #[test]
+    fn a_replay_with_different_payload_at_the_same_revision_is_rejected() {
+        for index in [1, 2] { // deliveryChanged and stateChanged
+            let mut t = good_s1();
+            let mut conflict = t.entries[index].clone();
+            conflict.at_ms = T0 + 60;
+            conflict.sequence = Some(100);
+            if conflict.kind == "stateChanged" {
+                conflict.payload["record"]["reason"] = "different-reason".into();
+            } else {
+                conflict.payload["delivery"]["state"] = "idle".into();
+            }
+            t.push(conflict);
+            assert!(errors(&t).iter().any(|e| e.contains("conflicting replay")), "{:?}", errors(&t));
+        }
+    }
+
+    #[test]
+    fn an_event_seen_on_another_stream_cannot_hide_a_gap() {
+        let mut t = good_s1();
+        let mut first = delivery(T0 + 60, 1, "idle");
+        first.source = "host".into();
+        t.push(first);
+        let mut unseen = t.entries[2].clone();
+        unseen.source = "host".into();
+        unseen.at_ms = T0 + 70;
+        t.push(unseen);
+        assert!(errors(&t).iter().any(|e| e.contains("hole 1 -> 3")), "{:?}", errors(&t));
     }
 
     /// `record_batch` (queue merge): one revision, one stateChanged per
@@ -936,10 +998,11 @@ mod tests {
         t.push(changed(T0 + 20, "session", record("q0", "inContext", None, "timeline", 3, 5, None)));
         assert!(errors(&t).is_empty(), "{:?}", errors(&t));
 
-        // The same input twice at one revision is a duplicate, batch or not.
+        // A different record version for the same input/revision conflicts,
+        // batch or not (an identical outbox replay is allowed).
         let mut twice = batch();
         twice.push(changed(T0 + 11, "session", record("q1", "superseded", Some("mergedInsert"), "none", 3, 4, None)));
-        assert!(errors(&twice).iter().any(|e| e.contains("stateRevision 4 not above 4")), "{:?}", errors(&twice));
+        assert!(errors(&twice).iter().any(|e| e.contains("conflicting replay at stateRevision 4")), "{:?}", errors(&twice));
 
         // After the batch the next revision must still be gapless.
         let mut hole = batch();
@@ -962,10 +1025,10 @@ mod tests {
         assert!(led_errors.is_empty(), "{led_errors:?}");
         let mut led_twice = led.clone();
         led_twice.push(changed(T0 + 13, "session", record("q9", "waiting", Some("explicitQueue"), "nextUp", 2, 5, None)));
-        assert!(errors(&led_twice).iter().any(|e| e.contains("stateRevision 5 not above 5")), "{:?}", errors(&led_twice));
+        assert!(errors(&led_twice).iter().any(|e| e.contains("conflicting replay at stateRevision 5")), "{:?}", errors(&led_twice));
         let mut second_delivery = led.clone();
         second_delivery.push(delivery(T0 + 13, 5, "idle"));
-        assert!(errors(&second_delivery).iter().any(|e| e.contains("stateRevision 5 not above 5")), "{:?}", errors(&second_delivery));
+        assert!(errors(&second_delivery).iter().any(|e| e.contains("conflicting replay at stateRevision 5")), "{:?}", errors(&second_delivery));
         // Records of an older revision after the delivery are still rejected.
         let mut stale = batch();
         stale.push(delivery(T0 + 11, 5, "idle"));

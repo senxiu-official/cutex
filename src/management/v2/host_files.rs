@@ -59,6 +59,7 @@ pub fn read_host_file(params: &HashMap<String, String>) -> WorkspaceResult<Value
         ));
     }
     let requested = PathBuf::from(raw);
+    validate_path(&requested)?;
     if !requested.is_absolute() {
         return Err(WorkspaceError::new(
             400,
@@ -98,8 +99,11 @@ pub fn read_host_file(params: &HashMap<String, String>) -> WorkspaceResult<Value
 /// workspace file read (`workspace_fs::file_resource`): a workspace rooted
 /// at the home directory must not hand it out either.
 pub(crate) fn refuse_root_credential_file(path: &std::path::Path) -> WorkspaceResult<()> {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if is_owner_local_secret_file(&canonical) && !crate::management::users::request_is_owner_local()
+    crate::artifacts::paths::validate_resolved_local_path(path).map_err(|_|WorkspaceError::new(403,"path_forbidden","network, device and alternate-stream paths are unavailable"))?;
+    // Owner-local reads are already allowed. Still validate path transport above,
+    // but do not classify every file in an owner-local tree/status request.
+    if crate::management::users::request_is_owner_local() { return Ok(()); }
+    if secret_path_cache::classify_validated(path, false)
     {
         let refused = crate::management::users::owner_local_only("readRootCredential");
         return Err(WorkspaceError::new(403, refused.code, refused.message));
@@ -107,29 +111,71 @@ pub(crate) fn refuse_root_credential_file(path: &std::path::Path) -> WorkspaceRe
     Ok(())
 }
 
-/// Canonical comparison also protects alternate spellings and symlink aliases,
-/// exactly as for the root credential. No secret contents are read to classify.
-fn is_owner_local_secret_file(canonical: &std::path::Path) -> bool {
-    if crate::config::paths::config_path()
-        .ok()
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .is_some_and(|config| config == canonical)
+// Cached IDs only add denials: reuse of a retired ID can conservatively deny
+// an ordinary file, never allow a private namespace. Do not keep private files
+// open in the cache: that prevents Windows from moving their parent directory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u64,
+    id: u128,
+}
+#[cfg(test)]
+fn same_file_identity(a: impl AsRef<std::path::Path>, b: impl AsRef<std::path::Path>) -> bool {
+    record_identity_read(a.as_ref());
+    record_identity_read(b.as_ref());
+    #[cfg(unix)]
     {
-        return true;
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
     }
-    let Some(home) = crate::config::paths::config_dir().ok() else {
-        return false;
-    };
-    // Retain the previous final-file alias check too. The secret writer rejects
-    // linked storage, but generic file reads must not expose its linked target.
-    if std::fs::canonicalize(home.join("runtime/profile-link/secret-v1"))
-        .ok()
-        .is_some_and(|secret| secret == canonical)
-    {
-        return true;
+    #[cfg(not(unix))]
+    { same_file::is_same_file(a, b).unwrap_or(false) }
+}
+
+#[cfg(test)]
+thread_local! {
+    static IDENTITY_READS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+#[cfg(test)]
+fn record_identity_read(path: &std::path::Path) {
+    IDENTITY_READS.with(|n| {
+        let (all, relay_root) = n.get();
+        n.set((all + 1, relay_root + usize::from(path.file_name().is_some_and(|s| s == "management-relay"))));
+    });
+}
+
+#[path = "secret_path_cache.rs"]
+mod secret_path_cache;
+
+pub(crate) fn prime_secret_path_cache() { secret_path_cache::prime(); }
+pub(crate) fn refresh_secret_path_cache() { secret_path_cache::refresh(); }
+
+pub(crate) fn is_relay_private_path(path: &std::path::Path) -> bool {
+    if crate::artifacts::paths::validate_resolved_local_path(path).is_err() { return true; }
+    secret_path_cache::classify_validated(path, true)
+}
+pub(crate) fn validate_path(path: &std::path::Path) -> WorkspaceResult<()> {
+    crate::artifacts::paths::validate_local_path(path).map_err(|_|WorkspaceError::new(403,"path_forbidden","network, device and alternate-stream paths are unavailable"))
+}
+pub(crate) fn refuse_private_tree(path: &std::path::Path) -> WorkspaceResult<()> {
+    refuse_root_credential_file(path)?;
+    if !crate::management::users::request_is_owner_local() {
+        let canonical=std::fs::canonicalize(path).unwrap_or_else(|_|path.to_path_buf());
+        if crate::config::paths::config_dir().ok().map(|p|p.join("management-relay")).and_then(|p|std::fs::canonicalize(p).ok()).is_some_and(|secret|secret.starts_with(&canonical)) {
+            let e=crate::management::users::owner_local_only("readRelayPrivateTree");return Err(WorkspaceError::new(403,e.code,e.message));
+        }
     }
-    canonicalize_existing_prefix(&home.join("runtime/profile-link"))
-        .is_some_and(|directory| canonical.starts_with(directory))
+    Ok(())
+}
+
+/// Single final-handle check against cached private namespaces and file IDs.
+/// A1's pre-open network/reparse check is separate and remains unconditional.
+pub(crate) fn is_owner_local_secret_file(path: &std::path::Path) -> bool {
+    if crate::artifacts::paths::validate_resolved_local_path(path).is_err() { return true; }
+    secret_path_cache::classify_validated(path, false)
 }
 
 /// A concurrent DELETE (or first PUT) can leave the protected leaf or directory
@@ -176,8 +222,67 @@ pub fn handle(
 }
 
 #[cfg(test)]
+#[path = "relay_path_hot_tests.rs"]
+mod cost_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn relay_path_hot_static_reads_root_identity_at_most_once() {
+        let home = crate::profiles::lifecycle::tests::TestHome::new();
+        let relay = crate::config::paths::config_dir().unwrap().join("management-relay");
+        std::fs::create_dir_all(&relay).unwrap();
+        std::fs::write(relay.join("identity.json"), "synthetic-key").unwrap();
+        let root = home.root().join("public");
+        let nested = root.join("a/b/c/d/e/f/g/h");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("ok.txt"), "public").unwrap();
+        let root = root.canonicalize().unwrap();
+        IDENTITY_READS.with(|n| n.set((0, 0)));
+        assert!(crate::services::static_files::resolve(&root, "/a/b/c/d/e/f/g/h/ok.txt").is_some());
+        let (all, relay_root) = IDENTITY_READS.with(|n| n.get());
+        eprintln!("relay_path_hot static identity_reads={all} relay_root_reads={relay_root}");
+        assert!(relay_root <= 1, "one classification must read the relay root identity once, got {relay_root}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_identity_checks_preserve_hardlinks_without_opening_fifos() {
+        let dir = std::env::temp_dir().join(format!("cutex-file-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let original = dir.join("original");
+        let alias = dir.join("alias");
+        let pipe = dir.join("pipe");
+        std::fs::write(&original, b"synthetic secret").unwrap();
+        std::fs::hard_link(&original, &alias).unwrap();
+        let name = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(same_file_identity(&original, &alias));
+        assert!(!same_file_identity(&original, &pipe));
+        assert!(same_file_identity(&pipe, &pipe));
+        assert!(!same_file_identity(&original, dir.join("absent")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn round2_all_filesystem_entry_points_reject_aliases_before_io() {
+        use super::super::{host_dirs,workspace::{ResolvedRoot,Scope}};
+        let root=crate::config::paths::home_dir().unwrap();
+        for alias in [r"\\localhost\C$\cutex-review-fixture",r"\\127.0.0.1\C$\cutex-review-fixture",r"\\?\UNC\localhost\C$\fixture",r"\\?\C:\fixture",r"\\.\C:\fixture",r"C:\fixture::$DATA"] {
+            assert_eq!(read_host_file(&params(alias,None)).unwrap_err().status,403,"host file {alias}");
+            if !alias.starts_with(r"\\?\C:") {
+                assert!(refuse_root_credential_file(std::path::Path::new(alias)).is_err(),"guard {alias}");
+                assert!(is_relay_private_path(std::path::Path::new(alias)),"private check must fail closed {alias}");
+            }
+            assert_eq!(host_dirs::list_dirs(Some(alias),Some(&root),10).unwrap_err().status,403,"host dirs {alias}");
+            assert_eq!(ResolvedRoot::from_dir(Scope {kind:super::super::workspace::ScopeKind::Session,id:"fixture".into()},std::path::Path::new(alias)).unwrap_err().status,403,"workspace root {alias}");
+            assert_eq!(crate::services::static_files::check_root(alias,&root.join(".cutex/services"),&crate::services::store::Caller::Owner).unwrap_err().status,403,"static root {alias}");
+        }
+    }
 
     struct RequestContextGuard {
         connection: Option<crate::management::listeners::ConnectionInfo>,
@@ -270,7 +375,7 @@ mod tests {
         allowed: bool,
     ) {
         let file = root.canonical.join(relative);
-        let host = read_host_file(&params(file.to_str().unwrap(), None));
+        let host = read_host_file(&params(&super::super::workspace::display_path(&file), None));
         let workspace = super::super::workspace_fs::file_resource(root, &params(relative, None));
         for result in [host, workspace] {
             if allowed {
@@ -298,7 +403,7 @@ mod tests {
             assert_secret_reads(&root, "runtime/profile-link/secret-v1", false);
             assert_secret_reads(&root, "runtime/profile-link/./secret-v1", false);
             assert!(read_host_file(&params(
-                root.canonical.join("ordinary-report.txt").to_str().unwrap(),
+                &super::super::workspace::display_path(&root.canonical.join("ordinary-report.txt")),
                 None
             ))
             .is_ok());
@@ -426,6 +531,30 @@ mod tests {
         assert_secret_reads(&root, "synthetic-linked-target", false);
         context.request(false, None);
         assert_secret_reads(&root, "synthetic-linked-target", true);
+    }
+
+    #[test]
+    fn a1_secret_guards_work_without_relay_setup_on_ordinary_listeners() {
+        use crate::management::client_tokens::IssuedVia;
+        let (_home,root)=secret_fixture();let context=RequestContextGuard::new();
+        let dir=root.canonical.join("management-relay");assert!(!dir.exists());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("identity.json"),"synthetic inactive relay key fixture").unwrap();
+        std::fs::write(root.canonical.join("config.json"),"synthetic root credential fixture").unwrap();
+        // No setup, valid relay identity or TLS listener is involved. The path
+        // guard also protects ordinary loopback/tailnet device access.
+        let previous=crate::management::relay::current_peer();crate::management::relay::set_peer(None);
+        for remote in [false,true] {
+            context.request(remote,Some(IssuedVia::Pairing));
+            for name in ["config.json","management-relay/identity.json"] {
+                let path=super::super::workspace::display_path(&root.canonical.join(name));
+                let error=read_host_file(&params(&path,None)).unwrap_err();
+                assert_eq!((error.status,error.code),(403,"owner_local_only"));
+            }
+            let ordinary=super::super::workspace::display_path(&root.canonical.join("ordinary-report.txt"));
+            assert_eq!(read_host_file(&params(&ordinary,None)).unwrap()["content"],"synthetic report");
+        }
+        crate::management::relay::set_peer(previous);
     }
 
     fn params(path: &str, max: Option<&str>) -> HashMap<String, String> {

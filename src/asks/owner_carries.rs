@@ -988,6 +988,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 057 §6: a carried results event comes back only when the runtime gives
+    /// it back; a hold or a missing status alone changes nothing.
+    #[test]
+    fn a_carried_result_is_released_only_when_the_runtime_gives_it_back() {
+        let (world, world_dir) = world("owner-carry-returned");
+        let (store, dir) = temp_store("owner-carry-returned-store");
+        let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+        runtime.set(REQUESTER, |status| status.active_turn_id = Some("busy".into()));
+        let now = Utc::now();
+        let delivery = pending(&store, "r", now);
+        let bundle = reserve_owner_results(&store, REQUESTER, "owner-dropped", 1, ReceiverLimit::Off, DocumentSettings::default(), now).unwrap().unwrap();
+        let message = bundle.submission.message_id.clone();
+        for status in [NativeMessageStatus::Held { reason: "interrupted".into(), turn_id: None },
+            NativeMessageStatus::Absent, NativeMessageStatus::Pending, NativeMessageStatus::Unavailable("no".into())] {
+            runtime.native.borrow_mut().insert(message.clone(), status);
+            crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap();
+            let state = store.snapshot().unwrap();
+            assert_eq!(state.deliveries[&delivery].owner_input_id.as_deref(), Some("owner-dropped"));
+            assert!(state.events.contains_key(&bundle.event_id));
+        }
+        runtime.carries_returned.borrow_mut().insert(message.clone());
+        crate::asks::scheduler::tick(&world, &runtime, &store, now).unwrap();
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.deliveries[&delivery].owner_input_id, None);
+        assert!(!state.events.contains_key(&bundle.event_id));
+        assert!(state.next_step_leases.get(REQUESTER).is_none_or(|lease| lease.native_message_id != message));
+        for dir in [dir, world_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     #[test]
     fn owner_batch_caps_source_ids_and_only_marks_accepted_as_carried() {
         let (store, dir) = temp_store("owner-carry-cap");

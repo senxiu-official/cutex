@@ -11,6 +11,7 @@
 
 pub mod agent_api;
 mod authority;
+pub mod control_ports;
 pub mod health;
 pub mod idle;
 pub mod process;

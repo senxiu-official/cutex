@@ -64,7 +64,9 @@ pub fn save_codez_config(config: &CodezConfig) -> anyhow::Result<()> {
 }
 
 fn save_codez_config_to_path(path: &Path, config: &CodezConfig) -> anyhow::Result<()> {
-    write_private_pretty_json_atomic(path, config, "config file")
+    write_private_pretty_json_atomic(path, config, "config file")?;
+    crate::management::v2::host_files::refresh_secret_path_cache();
+    Ok(())
 }
 
 #[cfg(test)]

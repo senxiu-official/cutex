@@ -409,6 +409,46 @@ impl ClientTokenStore {
         platform: Option<String>,
         scope: DeviceScope,
     ) -> anyhow::Result<IssuedClientToken> {
+        self.issue_record_staged(label, kind, device_name, platform, scope, false)
+    }
+
+    pub(crate) fn issue_pending_relay_device(&self, label: &str, platform: &str, scope: DeviceScope) -> anyhow::Result<IssuedClientToken> {
+        self.issue_record_staged(label, Some(KIND_DEVICE), Some(validate_label(label)?), Some(platform.into()), scope, true)
+    }
+
+    /// Plan before inserting, so pairing can durably record its operation first.
+    pub(crate) fn prepare_relay_device(label: &str) -> anyhow::Result<IssuedClientToken> {
+        Ok(IssuedClientToken {
+            token_id: format!("{TOKEN_ID_PREFIX}{}", &uuid::Uuid::new_v4().simple().to_string()[..16]),
+            label: validate_label(label)?, token: generate_token(), created_at: crate::management::instance::now_utc(),
+        })
+    }
+
+    pub(crate) fn stage_relay_device(&self, issued: &IssuedClientToken, device_name: &str, platform: &str, scope: DeviceScope) -> anyhow::Result<()> {
+        let record = ClientTokenRecord {
+            token_id: issued.token_id.clone(), label: issued.label.clone(),
+            token_sha256: format!("pending-relay:{}", token_hash_hex(&issued.token)), created_at: issued.created_at.clone(),
+            kind: Some(KIND_DEVICE.into()), device_name: Some(validate_label(device_name)?), platform: Some(platform.into()),
+            owner_name: None, scope: scope.stored(), issued_via: Some(IssuedVia::PAIRING.into()),
+        };
+        self.with_store(|store| {
+            if store.tokens.len() >= MAX_TOKENS { anyhow::bail!("client token store full"); }
+            if store.tokens.iter().any(|r|r.token_id==record.token_id) { anyhow::bail!("relay operation token already exists"); }
+            store.tokens.push(record); Ok(())
+        })
+    }
+
+    pub(crate) fn activate_relay_device(&self, id: &str, token: &str) -> anyhow::Result<()> {
+        self.with_store(|store| {
+            let record = store.tokens.iter_mut().find(|r| r.token_id == id).context("relay token revoked or missing")?;
+            let hash = token_hash_hex(token);
+            if record.token_sha256 != hash && record.token_sha256 != format!("pending-relay:{hash}") { anyhow::bail!("relay token changed"); }
+            record.token_sha256 = hash;
+            Ok(())
+        })
+    }
+
+    fn issue_record_staged(&self, label: &str, kind: Option<&str>, device_name: Option<String>, platform: Option<String>, scope: DeviceScope, staged: bool) -> anyhow::Result<IssuedClientToken> {
         let label = validate_label(label)?;
         let token = generate_token();
         let token_sha256 = token_hash_hex(&token);
@@ -417,7 +457,7 @@ impl ClientTokenStore {
         let record = ClientTokenRecord {
             token_id: token_id.clone(),
             label: label.clone(),
-            token_sha256,
+            token_sha256: if staged { format!("pending-relay:{token_sha256}") } else { token_sha256 },
             created_at: created_at.clone(),
             kind: kind.map(str::to_string),
             device_name,
@@ -718,11 +758,16 @@ impl VerifiedClientToken {
     /// Uncached validation for a browser admission/dispatch/result boundary.
     /// A separate CLI may have removed the token without changing our atomic.
     pub fn still_valid_uncached(&self) -> bool {
-        ClientTokenStore::open_default().ok()
-            .and_then(|store| read_store(&store.tokens_path()).ok())
+        ClientTokenStore::open_default().ok().is_some_and(|store| self.still_valid_at(&store))
+    }
+
+    /// Explicit store for a transport watcher whose thread must not resolve a
+    /// different test/instance home. Always uncached, including access bindings.
+    pub(crate) fn still_valid_at(&self, store: &ClientTokenStore) -> bool {
+        read_store(&store.tokens_path()).ok()
             .and_then(|store| match_token(&store.tokens, &self.presented))
             .is_some_and(|matched| matched.token_id == self.token_id && matched.scope == self.scope)
-            && self.same_access_in(None)
+            && self.same_access_in(Some(store))
     }
     /// Still present in the (cached, at most 2 s old) default store, and
     /// still acting as the same user with the same grant and device scope. A

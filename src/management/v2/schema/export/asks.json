@@ -250,7 +250,8 @@
             "object",
             "null"
           ],
-          "description": "The handler yielded to wait for jobs (hold waitingForEvent): {jobs, until: all|any, resume: all|each, since, timeoutAt, note, attempt}"
+          "properties": {"canResume": {"type": "boolean", "description": "The local handler has yielded and the owner may request resumption through cutex/ask/resume."}},
+          "description": "The handler yielded to wait for jobs (hold waitingForEvent): {jobs, until: all|any, resume: all|each, since, timeoutAt, note, attempt, canResume}"
         },
         "resume": {
           "type": [

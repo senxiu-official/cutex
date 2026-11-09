@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 struct Slot;
@@ -92,8 +92,18 @@ pub fn intercept(
             return true;
         }
     };
-    serve(stream, buffer, info, &store, &slug);
+    serve(stream, buffer, info, &store, &slug, None);
     true
+}
+pub(crate) fn serve_relay(
+    stream: &mut TcpStream,
+    info: &ConnectionInfo,
+    store: &ServiceStore,
+    slug: &str,
+    policy: &crate::management::relay::service::Policy,
+) {
+    crate::management::relay::service::with_response_policy(policy.origin(), ||
+        serve(stream, &mut Vec::new(), info, store, slug, Some(policy)));
 }
 fn serve(
     stream: &mut TcpStream,
@@ -101,9 +111,10 @@ fn serve(
     info: &ConnectionInfo,
     store: &ServiceStore,
     slug: &str,
+    relay: Option<&crate::management::relay::service::Policy>,
 ) {
     let supervisor = crate::services::supervisor::global();
-    serve_with_supervisor(stream, buffer, info, store, slug, supervisor.as_ref());
+    serve_with_supervisor(stream, buffer, info, store, slug, supervisor.as_ref(), relay);
 }
 
 fn serve_with_supervisor(
@@ -113,6 +124,7 @@ fn serve_with_supervisor(
     store: &ServiceStore,
     slug: &str,
     supervisor: Option<&Arc<crate::services::supervisor::Supervisor>>,
+    relay: Option<&crate::management::relay::service::Policy>,
 ) {
     let max = match store.load() {
         Ok(registry) => registry.settings.proxy_max_connections as usize,
@@ -126,10 +138,9 @@ fn serve_with_supervisor(
         return;
     };
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_nodelay(true);
     let mut host = None;
-    let mut upstream: Option<TcpStream> = None;
-    let mut upstream_buffer = Vec::new();
     let mut upstream_port = None;
     let mut traffic_guard = None;
     loop {
@@ -158,14 +169,15 @@ fn serve_with_supervisor(
         };
         let this_host = head.get("host").unwrap().to_ascii_lowercase();
         if host.as_ref().is_some_and(|host| host != &this_host)
-            || head::service_slug(&this_host).as_deref() != Some(slug)
+            || (relay.is_none() && head::service_slug(&this_host).as_deref() != Some(slug))
         {
             let _ = error(stream, 421, "host_changed");
             break;
         }
         host = Some(this_host);
-        if !auth::cross_site_allowed(&head)
-            || (head.websocket() && !auth::websocket_origin_allowed(&head))
+        if relay.is_some_and(|policy| !policy.allows(&head))
+            || (relay.is_none() && (!auth::cross_site_allowed(&head)
+            || (head.websocket() && !auth::websocket_origin_allowed(&head))))
         {
             if target.split('?').next() == Some("/__cutex/auth") {
                 for (name, value) in url::form_urlencoded::parse(target.split_once('?').map_or("", |(_, q)| q).as_bytes()) {
@@ -176,7 +188,7 @@ fn serve_with_supervisor(
             break;
         }
         let path = target.split('?').next().unwrap_or(target);
-        if path == "/__cutex/auth" {
+        if relay.is_none() && path == "/__cutex/auth" {
             let args: Vec<_> = url::form_urlencoded::parse(
                 target
                     .split_once('?')
@@ -214,7 +226,7 @@ fn serve_with_supervisor(
             let _ = error(stream, 404, "reserved_path");
             break;
         }
-        if !auth::authorized(store, slug, &head) {
+        if relay.is_none() && !auth::authorized(store, slug, &head) {
             let _ = error(stream, 401, "ticket_required");
             break;
         }
@@ -238,7 +250,8 @@ fn serve_with_supervisor(
             break;
         }
         if record.runtime == ServiceRuntime::Static {
-            let _ = crate::services::static_files::serve(&record, method, target, stream);
+            let headers = relay.map(|p| crate::management::relay::service::response_headers(p.origin())).unwrap_or_default();
+            let _ = crate::services::static_files::serve_with_headers(&record, method, target, stream, &headers);
             break;
         }
         if record.runtime == ServiceRuntime::Managed {
@@ -263,7 +276,11 @@ fn serve_with_supervisor(
                 break;
             }
         }
-        let request = match forward::request_bytes(&head, &record, &info.peer.ip().to_string()) {
+        if crate::services::control_ports::check(record.port).is_err() {
+            let _ = error(stream,403,"service_control_port_forbidden");break;
+        }
+        let bytes = if relay.is_some(){forward::request_bytes_relay(&head,&record,&info.peer.ip().to_string())}else{forward::request_bytes(&head,&record,&info.peer.ip().to_string())};
+        let request = match bytes {
             Ok(bytes) => bytes,
             Err(_) => {
                 let _ = error(stream, 400, "invalid_request");
@@ -274,23 +291,28 @@ fn serve_with_supervisor(
             let _ = error(stream, 503, "service_changed");
             break;
         }
-        if upstream.is_none() {
-            match TcpStream::connect_timeout(
+        // HTTP keep-alive on the client does not promise that the backend's
+        // idle socket survives until its next request. Use one upstream per
+        // request; a completed response never leaves a stale socket to reuse.
+        // exchange/tunnel retain it until a streaming response/upgrade ends.
+        let started = Instant::now();
+        let mut upstream = match TcpStream::connect_timeout(
                 &([127, 0, 0, 1], record.port).into(),
                 Duration::from_secs(3),
             ) {
                 Ok(s) => {
                     let _ = s.set_nodelay(true);
                     let _ = s.set_write_timeout(Some(Duration::from_secs(30)));
-                    upstream = Some(s);
                     upstream_port = Some(record.port);
+                    s
                 }
-                Err(_) => {
+                Err(cause) => {
+                    log_failure(slug, method, "connect", &cause, Some(false), started.elapsed());
                     let _ = error(stream, 502, "upstream_unreachable");
                     break;
                 }
-            }
-        }
+            };
+        let mut upstream_buffer = Vec::new();
         if let Some(expect) = head.get("expect") {
             if !expect.eq_ignore_ascii_case("100-continue") {
                 let _ = error(stream, 417, "expectation_failed");
@@ -300,25 +322,42 @@ fn serve_with_supervisor(
                 break;
             }
         }
-        let upstream = upstream.as_mut().unwrap();
-        if upstream.write_all(&request).is_err() {
+        if let Err(cause) = upstream.write_all(&request) {
+            log_failure(slug, method, "request_head", &cause, Some(false), started.elapsed());
             let _ = error(stream, 502, "upstream_unreachable");
             break;
         }
         super::traffic::touch(slug);
-        match forward::exchange(stream, upstream, buffer, &mut upstream_buffer, &head, slug) {
+        match forward::exchange_with_policy(stream, &mut upstream, buffer, &mut upstream_buffer, &head, slug, relay.map(|p|p.origin())) {
             Ok(forward::Response::Upgrade) => {
-                let _ = forward::tunnel(stream, upstream, buffer, slug);
+                if let Err(cause) = forward::tunnel(stream, &mut upstream, buffer, slug) {
+                    log_failure(slug, method, "upgrade_tunnel", &cause, Some(true), started.elapsed());
+                }
                 break;
             }
             Ok(forward::Response::KeepAlive) if !head.closes() => {}
             _ => break,
         }
     }
-    if let Some(upstream) = upstream {
-        let _ = upstream.shutdown(Shutdown::Both);
-    }
     let _ = stream.shutdown(Shutdown::Both);
+}
+
+/// Deliberately omit URLs, headers, bodies and even error Display text: all
+/// may contain service credentials. Unknown/custom methods are content too.
+fn failure_event(slug: &str, method: &str, stage: &str, cause: &io::Error,
+    response_started: Option<bool>, elapsed: Duration) -> serde_json::Value {
+    let method = match method {
+        "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "CONNECT" | "TRACE" => method,
+        _ => "OTHER",
+    };
+    serde_json::json!({"schema":1,"slug":slug,"method":method,"stage":stage,
+        "errorKind":format!("{:?}",cause.kind()),"osError":cause.raw_os_error(),
+        "responseStarted":response_started,"elapsedMs":elapsed.as_millis(),"upstreamReused":false})
+}
+
+fn log_failure(slug: &str, method: &str, stage: &str, cause: &io::Error,
+    response_started: Option<bool>, elapsed: Duration) {
+    eprintln!("cutex-service-proxy-error {}", failure_event(slug, method, stage, cause, response_started, elapsed));
 }
 /// No byte of a new request arrived before the idle timeout or the peer reset.
 fn idle_close(error: &io::Error, buffer: &[u8]) -> bool {
@@ -362,7 +401,8 @@ fn error_with_detail(
     } else {
         ""
     };
-    write!(stream,"HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nX-Cutex-Service-Error: {code}\r\n{auth}Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{body}",body.len())
+    let policy_headers = crate::management::relay::service::error_headers();
+    write!(stream,"HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nX-Cutex-Service-Error: {code}\r\n{auth}Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n{policy_headers}Connection: close\r\n\r\n{body}",body.len())
 }
 
 #[cfg(test)]

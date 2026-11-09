@@ -1031,12 +1031,32 @@ pub struct Gauge {
     /// Configuration problem that prevented any read (e.g. no auto preset).
     pub error: Option<String>,
     /// Used share of the window (native rate-limit gauges only).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub used_percent: Option<f64>,
     /// `native` for gauges normalized from the native `account/rateLimits`
     /// data; absent for quota-config (HTTP reader) gauges.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<&'static str>,
+}
+
+impl Gauge {
+    /// Old window readings cannot describe the window after its reset.
+    pub fn past_unobserved_reset(&self, now: i64) -> bool {
+        self.kind == "window" && self.reset_at.is_some_and(|reset| reset <= now
+            && self.observed_at.is_none_or(|observed| observed < reset))
+    }
+
+    pub fn invalidate_past_reset(&mut self, now: i64) {
+        self.invalidate_past_reset_since(now, self.observed_at);
+    }
+
+    pub fn invalidate_past_reset_since(&mut self, now: i64, successful_read: Option<i64>) {
+        if self.kind == "window" && self.reset_at.is_some_and(|reset| reset <= now
+            && successful_read.is_none_or(|observed| observed < reset)) {
+            self.stale = true;
+            self.remaining_percent = None;
+            self.used_percent = None;
+        }
+    }
 }
 
 fn gauge_kind(c: &Config) -> &'static str {
@@ -1090,13 +1110,14 @@ pub fn resolve_extras(a: &StoredAccount) -> Vec<(usize, anyhow::Result<Config>)>
 /// One HTTP response is reused for gauges that share a URL within a call.
 pub fn gauges(a: &StoredAccount, force: bool) -> anyhow::Result<Vec<Gauge>> {
     let proxy = profile_proxy(a);
-    let gauges = gauges_in(
+    let mut gauges = gauges_in(
         a,
         force,
         &crate::config::paths::runtime_dir()?.join("profile-quota"),
         |c, auth| fetch_json_via(c, auth, &proxy),
     )?;
     // Best-effort trend snapshots (throttled per gauge); never fails the read.
+    for gauge in &mut gauges { gauge.invalidate_past_reset(chrono::Utc::now().timestamp()); }
     crate::management::v2::usage::record_quota_gauges(&a.id, &a.name, &gauges);
     Ok(gauges)
 }
@@ -1338,6 +1359,27 @@ pub fn command(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn expired_http_window_masks_values_but_balance_and_post_reset_reads_survive() {
+        let mut gauge = Gauge { id: "primary".into(), label: "Q".into(), display_label: None,
+            kind: "window", remaining_percent: Some(20.0), used_percent: None,
+            balance: None, reset_at: Some(100), window_label: None, observed_at: Some(90),
+            stale: false, error: None, source: None };
+        gauge.invalidate_past_reset(99);
+        assert_eq!(gauge.remaining_percent, Some(20.0));
+        gauge.invalidate_past_reset(100);
+        let wire = serde_json::to_value(&gauge).unwrap();
+        assert_eq!(wire["stale"], true);
+        assert!(wire["remainingPercent"].is_null() && wire["usedPercent"].is_null());
+        gauge.observed_at = Some(100); gauge.remaining_percent = Some(95.0); gauge.stale = false;
+        gauge.invalidate_past_reset(101);
+        assert_eq!(gauge.remaining_percent, Some(95.0));
+        gauge.kind = "balance"; gauge.observed_at = Some(90); gauge.balance = Some("12".into());
+        gauge.invalidate_past_reset(101);
+        assert!(!gauge.stale);
+        assert_eq!(gauge.balance.as_deref(), Some("12"));
+    }
     use super::*;
 
     #[test]

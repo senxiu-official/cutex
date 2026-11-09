@@ -874,6 +874,18 @@ pub fn returned_jobs(state: &AskState, session: &str, ids: &[String]) -> Vec<Job
     })
 }
 
+/// 057 §6: the runtime proved the steer that carried these never read and
+/// gave them back: `waiting{returned}`, also from `accepted` / `uncertain`
+/// (invariant 8's one exception), and sent again as ordinary results.
+pub fn results_returned_unread(state: &AskState, session: &str, ids: &[String]) {
+    if il::enabled() {
+        enqueue(results_jobs(state, session, ids, |input| {
+            let back = Next::waiting("returned").details(json!({il::CARRIER_UNREAD: true})).create(input.clone());
+            vec![step(back, &[SENDING, ACCEPTED, UNCERTAIN])]
+        }));
+    }
+}
+
 /// The event's outcome cannot be reconciled (decision 3): `uncertain`.
 pub fn results_unknown(state: &AskState, session: &str, ids: &[String]) {
     if il::enabled() {

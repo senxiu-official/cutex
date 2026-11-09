@@ -325,19 +325,45 @@ fn step_gate(context: ManagementRequestContext, session: &str, turn: &str) -> Op
     if current.as_deref() != Some(turn) {
         return Some("turn_ended");
     }
-    match crate::asks::store::AskStore::open_default().and_then(|store| crate::asks::pause_admission::is_held(&store, session)) {
-        Ok(false) => None,
-        // Unknown pause state: hold, never guess "not paused".
-        _ => Some("agent_paused"),
+    match crate::asks::store::AskStore::open_default() {
+        Ok(store) => pause_refusal(&store, session),
+        Err(_) => Some("pause_state_unavailable"),
+    }
+}
+
+/// How long a step waits while the host authority fence is held (another
+/// agent's start or stop, an owner input's admission) before giving up.
+const FENCE_WAIT: Duration = Duration::from_secs(5);
+
+/// Only a recorded pause (the agent's own or its project's) is agent_paused.
+/// A busy authority fence decides nothing: wait for it without blocking on it,
+/// then say the host was busy. An unreadable pause state holds the step too,
+/// under its own code; neither claims the owner paused the agent.
+fn pause_refusal(store: &crate::asks::store::AskStore, session: &str) -> Option<&'static str> {
+    pause_refusal_with(FENCE_WAIT, || crate::asks::pause_admission::gate(store, session))
+}
+fn pause_refusal_with(wait: Duration, mut gate: impl FnMut() -> anyhow::Result<crate::asks::pause_admission::Gate>) -> Option<&'static str> {
+    use crate::asks::pause_admission::Gate;
+    let deadline = Instant::now() + wait;
+    loop {
+        match gate() {
+            Ok(Gate::Open) => return None,
+            Ok(Gate::Paused) => return Some("agent_paused"),
+            Ok(Gate::Deferred) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(Gate::Deferred) => return Some("host_busy"),
+            Err(_) => return Some("pause_state_unavailable"),
+        }
     }
 }
 
 /// Codes the broker answers itself: no step was sent, so no request id.
-const UNSENT: &[&str] = &["turn_ended", "agent_paused", "step_limit", "script_timeout", "invalid_request"];
+const UNSENT: &[&str] = &["turn_ended", "agent_paused", "host_busy", "pause_state_unavailable", "step_limit", "script_timeout", "invalid_request"];
 
 fn refusal(code: &str) -> Value {
     let message = match code {
         "turn_ended" => "This turn has ended; no step was sent. Browser steps run only in the turn that started the script.",
+        "host_busy" => "The host was busy for a few seconds (another agent starting or stopping, or an owner action); no step was sent. Send this step again.",
+        "pause_state_unavailable" => "The host could not read whether this agent is paused; no step was sent. Try again shortly; tell the owner if it keeps happening.",
         _ => "The owner paused this agent; no step was sent. End this call; work continues when the owner resumes.",
     };
     json!({"isError": true, "content": [{"type": "text", "text": json!({"error": {"code": code, "message": message}}).to_string()}]})
@@ -531,6 +557,53 @@ mod tests {
         serde_json::from_str(result.content["content"][0]["text"].as_str().unwrap()).unwrap()
     }
 
+    /// Another agent's start or an owner admission holding the host authority
+    /// fence is not a pause: the step is not refused as agent_paused.
+    #[test]
+    fn a_busy_authority_fence_is_not_reported_as_an_owner_pause() {
+        let (store, dir) = crate::asks::store::tests::temp_store("script-step-fence");
+        store.with_state(|_| ()).unwrap();
+        let session = "cutex.script-fence";
+        assert_eq!(pause_refusal(&store, session), None);
+        let roster = crate::agent_management::AgentManagementStore::open_default().unwrap();
+        let fence = roster.lock_mutations().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let held = crate::asks::store::AskStore::at(&dir);
+        let worker = std::thread::spawn(move || tx.send(pause_refusal(&held, session)).unwrap());
+        let refused = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        worker.join().unwrap();
+        assert_ne!(refused, Some("agent_paused"), "a busy fence must not read as the owner's pause");
+        // Released within the step's wait: the step goes ahead.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let held = crate::asks::store::AskStore::at(&dir);
+        let worker = std::thread::spawn(move || tx.send(pause_refusal(&held, session)).unwrap());
+        std::thread::sleep(Duration::from_millis(300));
+        drop(fence);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), None);
+        worker.join().unwrap();
+        // The owner's real pause still refuses the step as agent_paused.
+        let _ = store.with_state(|s| crate::asks::agent_pause::pause(s, session, "owner", None, chrono::Utc::now())).unwrap();
+        assert_eq!(pause_refusal(&store, session), Some("agent_paused"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    /// The step's decision over the pause gate: wait out a busy fence, then
+    /// say the host was busy; an unreadable state is its own code.
+    #[test]
+    fn step_gate_waits_out_a_busy_fence_and_names_each_refusal() {
+        use crate::asks::pause_admission::Gate;
+        let mut answers = vec![Gate::Deferred, Gate::Deferred, Gate::Open].into_iter();
+        assert_eq!(pause_refusal_with(Duration::from_secs(5), || Ok(answers.next().unwrap())), None);
+        let started = Instant::now();
+        assert_eq!(pause_refusal_with(Duration::from_millis(200), || Ok(Gate::Deferred)), Some("host_busy"));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(pause_refusal_with(Duration::from_secs(5), || Ok(Gate::Paused)), Some("agent_paused"));
+        assert_eq!(pause_refusal_with(Duration::from_secs(5), || anyhow::bail!("store")), Some("pause_state_unavailable"));
+        for code in ["host_busy", "pause_state_unavailable"] {
+            assert!(UNSENT.contains(&code));
+            assert!(!refusal(code).to_string().contains("owner paused"), "{code}");
+        }
+        assert!(refusal("host_busy").to_string().contains("Send this step again"));
+    }
     /// The kernel keeps state between calls; every step is one `browser`
     /// command with its own derived request id; failures carry it; images
     /// are returned only when emitted; reset forgets variables.

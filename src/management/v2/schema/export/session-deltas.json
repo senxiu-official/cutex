@@ -28,7 +28,9 @@
         "revision": {
           "type": "integer",
           "minimum": 0
-        }
+        },
+        "resource": { "type": ["object", "null"], "description": "Owner session resource; null for an ineligible row." },
+        "hostRow": { "type": ["object", "null"], "description": "Host session catalog row; null for retired or ineligible rows." }
       }
     },
     "sessionChange": {

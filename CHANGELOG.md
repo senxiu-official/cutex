@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2 "Beautiful World" (2026-11-09)
+
+- Filesystem root identity checks are cached; Git status uses its own worker pool and coalesces concurrent reads for the same repository. Other management requests remain available while Git is slow.
+- Includes native 0.167.0-r60. Claude claude-r40, DSH dsh-r3, Kimi kimi-r3 and job-service 0.1.1 retain their existing signed archives. Existing agents keep their selected runtime until explicitly upgraded.
+- Owner message retries retain reserved notes when an uncertain prior send cannot be proven delivered.
+
+- 文件系统根身份检查使用缓存；Git 状态使用独立线程池，同一仓库的并发读取合并处理。Git 较慢时仍可处理其他管理请求。
+- 提供原生运行时 0.167.0-r60；Claude claude-r40、DSH dsh-r3、Kimi kimi-r3 和 job-service 0.1.1 保持原有签名包。已有智能体保持所选运行时，直到明确升级。
+- 主人重试消息时，若无法确认先前的发送是否投递，随带通知仍保持预留。
+
 ## 0.2.1 "Beautiful World" (2026-11-06)
 
 - Agents can change their formal names while preserving identity and name history.

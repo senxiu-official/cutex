@@ -120,7 +120,11 @@ impl World {
             fakes.push(FakeRuntime::start_with(*kind, &workspace, script));
             sleepers.push(match kind {
                 // The bound PID serves the endpoint (r273.1 ownership check).
+                #[cfg(not(unix))]
                 Kind::Codex => Sleeper::forwarding(fakes[index].port),
+                #[cfg(unix)]
+                Kind::Codex => Sleeper::forwarding_in(fakes[index].port,
+                    home.config_dir.join("runtime/app-server").join(format!("il-e2e-{index}-codex"))),
                 Kind::Claude => Sleeper::spawn(),
             });
             specs.push(SeededAgentSpec {

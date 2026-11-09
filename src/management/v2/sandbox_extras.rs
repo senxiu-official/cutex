@@ -119,6 +119,7 @@ pub fn validate_roots(record: &CutexSessionRecord, roots: &[String], cutex_home:
     let cwd = crate::session::metadata::normalize_session_cwd(crate::session::service::cutex_session_launch_cwd(record));
     let mut kept: Vec<String> = Vec::new();
     for root in roots {
+        crate::artifacts::paths::validate_local_path(Path::new(root)).map_err(|_|Refusal::new(400,"invalid_writable_root","unsafe writable root"))?;
         let canonical = Path::new(root)
             .canonicalize()
             .map_err(|_| Refusal::new(400, "invalid_writable_root", format!("writable root does not exist on this host: {root}")))?;

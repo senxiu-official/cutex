@@ -119,7 +119,8 @@ impl ClaudeQuotaSnapshot {
         self.windows
             .iter()
             .enumerate()
-            .map(|(index, window)| Gauge {
+            .map(|(index, window)| {
+                let mut gauge = Gauge {
                 id: format!("claude-{index}"),
                 label: "Claude".to_string(),
                 kind: "window",
@@ -133,6 +134,9 @@ impl ClaudeQuotaSnapshot {
                 error: None,
                 used_percent: Some(window.used_percent),
                 source: Some("claude"),
+                };
+                gauge.invalidate_past_reset(now);
+                gauge
             })
             .collect()
     }
@@ -153,6 +157,8 @@ impl ClaudeQuotaSnapshot {
     fn fingerprint(&self) -> Value {
         json!({
             "windows": self.windows,
+            "resetObserved": self.windows.iter().map(|window| window.reset_at.map(|reset|
+                self.fetched_at.is_some_and(|read| read >= reset))).collect::<Vec<_>>(),
             "failing": self.last_error.is_some(),
             "credentialsExpired": self.credentials_expired_at.is_some(),
         })
@@ -370,7 +376,10 @@ pub fn quota_view(profile: &StoredAccount, force: bool) -> anyhow::Result<(Vec<G
         refresh(&account)?
     } else {
         let snapshot = load_at(&dir, &account);
-        if refresh_due(snapshot.as_ref(), now, interval) {
+        let past_reset = snapshot.as_ref().is_some_and(|s| s.gauges(now, interval).iter().any(|g| g.past_unobserved_reset(now)));
+        let recently_attempted = snapshot.as_ref().and_then(|s| s.last_attempt_at)
+            .is_some_and(|at| now.saturating_sub(at) < MIN_FORCED_INTERVAL_SECS);
+        if !recently_attempted && (past_reset || refresh_due(snapshot.as_ref(), now, interval)) {
             spawn_refresh(&account);
             spawned = true;
         }
@@ -489,6 +498,28 @@ mod tests {
 
     fn window(label: &str, used: f64) -> ClaudeWindow {
         ClaudeWindow { label: label.to_string(), used_percent: used, reset_at: Some(1_791_435_600) }
+    }
+
+    #[test]
+    fn past_reset_stays_unknown_until_a_successful_post_reset_read() {
+        let mut snapshot = ClaudeQuotaSnapshot { fetched_at: Some(90),
+            windows: vec![StoredWindow { label: "5h".into(), used_percent: 80.0, reset_at: Some(100) }],
+            ..Default::default() };
+        assert_eq!(snapshot.gauges(99, 300)[0].remaining_percent, Some(20.0));
+        for now in [100, 101] {
+            let gauge = &snapshot.gauges(now, 300)[0];
+            assert!(gauge.stale);
+            assert_eq!(gauge.remaining_percent, None);
+            assert_eq!(gauge.used_percent, None);
+        }
+        snapshot.fetched_at = Some(101);
+        assert_eq!(snapshot.gauges(102, 300)[0].remaining_percent, Some(20.0));
+        let dir = temp_dir();
+        let windows = || vec![ClaudeWindow { label: "5h".into(), used_percent: 80.0, reset_at: Some(100) }];
+        apply_read_at(&dir, DEFAULT_ACCOUNT_ID, Ok(windows()), 90).unwrap();
+        let (_, changed) = apply_read_at(&dir, DEFAULT_ACCOUNT_ID, Ok(windows()), 101).unwrap();
+        assert!(changed, "post-reset revalidation must publish even if values stay the same");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

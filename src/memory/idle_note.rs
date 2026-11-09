@@ -92,6 +92,8 @@ pub struct State {
     pub seen_at: i64,
     pub launch: Snapshot,
     pub launch_at: i64,
+    #[serde(default)]
+    pub index_capture_at: Option<i64>,
     pub launch_deferred: bool,
     pub pending: Option<Pending>,
 }
@@ -106,6 +108,7 @@ impl State {
             seen_at: now,
             launch: snapshot,
             launch_at: now,
+            index_capture_at: Some(now),
             launch_deferred: false,
             pending: None,
         }
@@ -134,6 +137,21 @@ pub struct NoteStore {
     rows: KvStore<String, Row>,
 }
 impl NoteStore {
+    /// Keep the exact system-index bytes of a warm prefix-caching launch. Notes may
+    /// advance `seen`; they do not change the system prefix captured at launch.
+    pub fn relaunch_index(&self, session: &str, current: Snapshot, now: i64, conversation_at: Option<i64>) -> anyhow::Result<Snapshot> {
+        let Some(row) = self.get(session)? else { return Ok(current) };
+        let state = row.value;
+        if state.launch.project != current.project || state.launch.path != current.path {
+            return Ok(current);
+        }
+        let activity = self.activity(session)?.map(|stamp| stamp.at);
+        let last = activity.into_iter().chain(conversation_at).max()
+            .unwrap_or(state.index_capture_at.unwrap_or(state.launch_at));
+        Ok(if now.checked_sub(last).is_some_and(|gap| gap >= 0 && gap < IDLE_AFTER_MS) {
+            state.launch
+        } else { current })
+    }
     pub fn open(home: &Path) -> anyhow::Result<Self> {
         let db = StoreDb::open(&crate::store::domain::SESSION_ACTIVITY, home)?;
         Ok(Self {
@@ -245,15 +263,21 @@ impl NoteStore {
         self.update(session, |value| {
             match value {
                 Some(state) if state.seen.project == snapshot.project => {
+                    let same_launch = state.launch == snapshot;
                     state.serial = state
                         .serial
                         .checked_add(1)
                         .context("memory reminder serial exhausted")?;
                     state.launch_serial = state.serial;
+                    if state.launch != snapshot {
+                        state.index_capture_at = Some(now);
+                    } else if state.index_capture_at.is_none() {
+                        state.index_capture_at = Some(state.launch_at);
+                    }
                     state.launch = snapshot.clone();
                     state.launch_at = now;
                     state.launch_deferred = deferred;
-                    if !deferred {
+                    if !deferred && !same_launch {
                         state.seen = snapshot.clone();
                         state.seen_at = now;
                         state.pending = None;

@@ -27,7 +27,7 @@ pub fn check(ask: &AskRecord, requester: &str, supersedes: Option<&str>) -> Resu
     if ask.remote.is_some() { return Err(AskError::new("remote_unsupported","remote brief revisions are unavailable in P0")); }
     ask.require_controller(requester, "ask_not_found", "no such delegation of yours")?;
     if !ask.is_open() {
-        return Err(AskError::new("ask_closed", "it is already closed; send a follow-up with agent_delegate instead").with(json!({"closed": ask.closed})));
+        return Err(AskError::new("ask_closed", "it is already closed; send a follow-up with agent_delegate instead").with(json!({"closed": ask.closed,"execution":ask.execution,"open":false})));
     }
     if ask.revisions.len() >= MAX_REVISIONS {
         return Err(AskError::new("too_many_revisions", format!("a delegation takes at most {MAX_REVISIONS} revisions; send a follow-up delegation instead")));
@@ -79,6 +79,7 @@ pub fn record(
         wake,
         sent_at: now_rfc3339(now),
         level: RevisionLevel::Sent,
+        report_closed: true,
         delivered_at: None,
         in_context_at: None,
         turn_id: None,
@@ -220,6 +221,48 @@ pub fn acknowledge(state: &mut AskState, handler: &str, ask_id: &str, id: &str, 
 mod tests {
     use super::*;
     use crate::asks::store::tests::{new_ask, REQUESTER, TARGET};
+
+    #[test]
+    fn closed_revision_has_one_explicit_requester_outcome() {
+        let now = Utc::now();
+        let (store, dir) = crate::asks::store::tests::temp_store("revision-closed-outcome");
+        let (world, world_dir) = crate::asks::scheduler::tests::world("revision-closed-outcome");
+        let ask_id = store.with_state(|state| {
+            let id = state.create_ask(new_ask("revision-close", "brief"), now).unwrap().0.ask_id;
+            record(state, &id, "v2", "late change", None, Some("msg-late".into()), false, now).unwrap();
+            record(state, &id, "v3", "applied change", None, Some("msg-applied".into()), false, now).unwrap();
+            acknowledge(state, TARGET, &id, "v3", "applied", now).unwrap();
+            record(state, &id, "v4", "historical revision", None, Some("msg-historical".into()), false, now).unwrap();
+            state.update_ask(&id, now, |ask| {
+                ask.revisions.last_mut().unwrap().report_closed = false;
+                ask.closed = Some(CloseOutcome::Completed);
+                ask.execution = ExecutionState::Answered;
+            });
+            assert_eq!(state.deliveries.len(), 1, "closure records its revision outcome atomically");
+            id
+        }).unwrap();
+        reconcile(&world, &store, now).unwrap();
+        reconcile(&world, &store, now).unwrap();
+        let state = store.shared().unwrap();
+        assert_eq!(state.deliveries.len(), 1);
+        let delivery = state.deliveries.values().next().unwrap();
+        assert_eq!(delivery.ref_id, "revisionUnacknowledged:v2");
+        assert_eq!(delivery.requester_cutex_session_id, REQUESTER);
+        assert!(!delivery.passive);
+        let item = super::super::returns::return_item(&store, &state, delivery).unwrap();
+        let value = super::super::returns::item_json(&item);
+        assert_eq!(value["state"], "revisionUnacknowledged:v2");
+        assert!(value["detail"].as_str().unwrap().contains("Revision v2 was not acknowledged"));
+        assert_eq!(acknowledge(&mut state.as_ref().clone(), TARGET, &ask_id, "v2", "late", now).unwrap_err().code, "ask_closed");
+        drop(state);
+        drop(store);
+        let reopened = AskStore::at(&dir);
+        reconcile(&world, &reopened, now).unwrap();
+        assert_eq!(reopened.shared().unwrap().deliveries.len(), 1, "outcome deduplication survives a store reopen");
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+        if world_dir.exists() { std::fs::remove_dir_all(world_dir).unwrap(); }
+    }
 
     #[test]
     fn levels_rise_and_acks_need_the_handler() {

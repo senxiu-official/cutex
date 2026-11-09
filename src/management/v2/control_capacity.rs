@@ -15,6 +15,8 @@ pub const FOREGROUND_QUEUE_RESERVE: usize = 16;
 const READ_PRIORITY_HEADER: &str = "x-cutex-read-priority";
 pub const STREAM_LIMIT: usize = 128;
 pub const FILE_TRANSFER_LIMIT: usize = 2;
+pub const GIT_STATUS_REQUEST_LIMIT: usize = 16;
+static GIT_STATUS_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static TRANSFERS: AtomicUsize = AtomicUsize::new(0);
 static HEAVY: HeavyPool = HeavyPool::new(HEAVY_READ_LIMIT, HEAVY_READ_QUEUE_LIMIT);
 static STREAMS: AtomicUsize = AtomicUsize::new(0);
@@ -32,6 +34,7 @@ mod priority_tests;
 pub enum WorkClass {
     Control,
     HeavyRead,
+    GitStatus,
     Stream,
     FileTransfer,
 }
@@ -56,10 +59,14 @@ pub fn classify(request: &SimpleHttpRequest) -> WorkClass {
         return WorkClass::Stream;
     }
     if request.method == "GET" && path.starts_with("/v2/host/sessions/") {
-        return WorkClass::HeavyRead;
+        return WorkClass::Control;
     }
     if request.method == "GET" && (path.ends_with("/stream") || path == "/v2/summary/events" || fs_watch || side_wait) {
         return WorkClass::Stream;
+    }
+    if request.method == "GET" && matches!(super::workspace::parse_route(path),
+        Some(super::workspace::WorkspaceRoute::Scoped(_, super::workspace::ScopedRoute::GitStatus))) {
+        return WorkClass::GitStatus;
     }
     if request.method == "POST" && path == "/v2/host/sessions"
         || (path == "/v2/runtimes/prune" && matches!(request.method.as_str(), "GET" | "POST")) {
@@ -68,7 +75,8 @@ pub fn classify(request: &SimpleHttpRequest) -> WorkClass {
     if request.method == "GET"
         && (path == "/v2/runtimes/prune"
             || path == "/v2/sessions"
-            || path.starts_with("/v2/sessions/")
+            || matches!(path, "/v2/sessions/page" | "/v2/sessions/changes")
+            || (path.starts_with("/v2/sessions/") && super::server::session_id_from_path(path).is_none())
             || path == "/v2/summary"
             || path == "/v2/events"
             || path.starts_with("/v2/artifacts")
@@ -112,6 +120,7 @@ pub enum RefusalReason {
     ControlConnectionReserve,
     StreamLimit,
     FileTransferLimit,
+    GitStatusLimit,
 }
 impl RefusalReason {
     fn name(self) -> &'static str {
@@ -121,6 +130,7 @@ impl RefusalReason {
             Self::ControlConnectionReserve => "control_connection_reserve",
             Self::StreamLimit => "stream_limit",
             Self::FileTransferLimit => "file_transfer_limit",
+            Self::GitStatusLimit => "git_status_request_limit",
         }
     }
     pub fn message(self) -> &'static str {
@@ -130,6 +140,7 @@ impl RefusalReason {
             Self::ControlConnectionReserve => "bulk connection limit reached; remaining connections are reserved for control; retry shortly",
             Self::StreamLimit => "stream capacity is exhausted; retry shortly",
             Self::FileTransferLimit => "file transfer capacity is exhausted; retry shortly",
+            Self::GitStatusLimit => "git status is busy; retry shortly",
         }
     }
 }
@@ -143,6 +154,9 @@ pub struct AdmissionRefusal {
     streams_active: usize,
 }
 impl AdmissionRefusal {
+    pub fn error_code(&self) -> &'static str {
+        if self.reason == RefusalReason::GitStatusLimit { "git_status_busy" } else { "heavy_read_capacity_exceeded" }
+    }
     fn new(reason: RefusalReason, heavy: (usize, usize)) -> Self {
         // Heavy counts are captured under the decision's lock for queue
         // refusals. Other pools are sampled, not one atomic global snapshot.
@@ -159,6 +173,7 @@ impl AdmissionRefusal {
             "approximate": true,
             "heavyReadsActive": self.heavy.0, "heavyReadsWaiting": self.heavy.1,
             "heavyReadLimit": HEAVY_READ_LIMIT, "heavyReadQueueLimit": HEAVY_READ_QUEUE_LIMIT,
+            "gitStatusRequestLimit": GIT_STATUS_REQUEST_LIMIT,
             "heavyReadWaitMs": HEAVY_READ_WAIT.as_millis(),
             "backgroundReadWaitMs": BACKGROUND_READ_WAIT.as_millis(),
             "backgroundReadLimit": HEAVY_READ_LIMIT - 1,
@@ -368,6 +383,7 @@ fn admit_priority(class: WorkClass, background: bool) -> Result<Permit, Admissio
     }
     let pool = match class {
         WorkClass::Control => None,
+        WorkClass::GitStatus => Some((&GIT_STATUS_REQUESTS, GIT_STATUS_REQUEST_LIMIT)),
         WorkClass::HeavyRead => unreachable!("heavy reads use their own waiting lane"),
         WorkClass::Stream => Some((&STREAMS, STREAM_LIMIT)),
         WorkClass::FileTransfer => Some((&TRANSFERS, FILE_TRANSFER_LIMIT)),
@@ -375,7 +391,9 @@ fn admit_priority(class: WorkClass, background: bool) -> Result<Permit, Admissio
     if let Some((counter, limit)) = pool {
         if !take(counter, limit) {
             REFUSED.fetch_add(1, Ordering::Relaxed);
-            let reason = if class == WorkClass::FileTransfer {
+            let reason = if class == WorkClass::GitStatus {
+                RefusalReason::GitStatusLimit
+            } else if class == WorkClass::FileTransfer {
                 RefusalReason::FileTransferLimit
             } else {
                 RefusalReason::StreamLimit
@@ -435,7 +453,9 @@ pub fn snapshot() -> serde_json::Value {
         "heavyReadWaitTimeouts": HEAVY.timed_out.load(Ordering::Relaxed),
         "heavyReadQueueFull": HEAVY.queue_full.load(Ordering::Relaxed), "streamLimit": STREAM_LIMIT,
         "streamsActive": STREAMS.load(Ordering::Relaxed), "fileTransfersActive": TRANSFERS.load(Ordering::Relaxed),
-        "fileTransferLimit": FILE_TRANSFER_LIMIT, "refused": REFUSED.load(Ordering::Relaxed) })
+        "fileTransferLimit": FILE_TRANSFER_LIMIT, "refused": REFUSED.load(Ordering::Relaxed),
+        "gitStatusRequestLimit": GIT_STATUS_REQUEST_LIMIT, "gitStatusRequestsActive": GIT_STATUS_REQUESTS.load(Ordering::Relaxed),
+        "gitStatus": super::workspace_git::status_diagnostics() })
 }
 
 #[cfg(test)]
@@ -475,6 +495,50 @@ mod tests {
         }
     }
     #[test]
+    fn git_status_routes_use_their_own_capacity_not_conversation_reads() {
+        for path in ["/v2/projects/p/git/status", "/v2/sessions/cutex.a/git/status", "/v2/projects/p%20a/git/status?x=1"] {
+            assert_eq!(classify(&request("GET", path, "")), WorkClass::GitStatus, "{path}");
+            assert_ne!(classify(&request("POST", path, "")), WorkClass::GitStatus);
+        }
+        assert_eq!(classify(&request("GET", "/v2/sessions/cutex.a/history", "")), WorkClass::HeavyRead);
+        assert_eq!(classify(&request("GET", "/v2/projects/p/fs/watch", "")), WorkClass::Stream);
+        assert_eq!(classify(&request("GET", "/v2/projects/p/git/status/extra", "")), WorkClass::Control);
+        let git: Vec<_> = (0..GIT_STATUS_REQUEST_LIMIT).map(|_| admit(WorkClass::GitStatus).unwrap()).collect();
+        let refusal = admit(WorkClass::GitStatus).err().expect("Git HTTP requests must be bounded");
+        assert_eq!(refusal.error_code(), "git_status_busy");
+        let history: Vec<_> = (0..HEAVY_READ_LIMIT).map(|_| admit(WorkClass::HeavyRead).unwrap()).collect();
+        let control = admit(WorkClass::Control).unwrap();
+        drop((git, history, control));
+        assert_eq!(GIT_STATUS_REQUESTS.load(Ordering::Relaxed), 0);
+        assert!(admit(WorkClass::GitStatus).is_ok());
+    }
+    #[test]
+    fn git_status_busy_is_transient_at_both_admission_layers() {
+        use std::io::Read;
+        for outer in [true, false] {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = std::thread::spawn(move || {
+                let mut stream = std::net::TcpStream::connect(address).unwrap();
+                let mut text = String::new(); stream.read_to_string(&mut text).unwrap(); text
+            });
+            let (mut stream, _) = listener.accept().unwrap();
+            if outer {
+                crate::management::server::write_capacity_refusal(&mut stream, &AdmissionRefusal::new(RefusalReason::GitStatusLimit, (0, 0))).unwrap();
+            } else {
+                crate::management::v2::workspace::write_error(&mut stream,
+                    &crate::management::v2::workspace::WorkspaceError::new(503, "git_status_busy", "git status is busy; retry shortly")).unwrap();
+            }
+            drop(stream);
+            let text = client.join().unwrap();
+            assert!(text.starts_with("HTTP/1.1 503 "));
+            let value: serde_json::Value = serde_json::from_str(text.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(value["error"]["code"], "git_status_busy");
+            assert_eq!(value["error"]["retryable"], true);
+            assert_eq!(value["error"]["details"]["retryAfterMs"], 250);
+        }
+    }
+    #[test]
     fn native_turn_pages_share_heavy_capacity() {
         let held: Vec<_> = (0..HEAVY_READ_LIMIT)
             .map(|_| admit(WorkClass::HeavyRead).unwrap()).collect();
@@ -496,8 +560,12 @@ mod tests {
 
     #[test]
     fn costly_routes_cannot_take_control_capacity() {
+        for path in ["/v2/sessions/cutex.a", "/v2/sessions/cutex.a?lifecycle=retired", "/v2/host/sessions/cutex.a"] {
+            assert_eq!(classify(&request("GET", path, "")), WorkClass::Control, "{path}");
+        }
         for path in [
             "/v2/sessions",
+            "/v2/sessions/page?include=resource,hostRow",
             "/v2/sessions/cutex.a/bootstrap",
             "/v2/sessions/cutex.a/history?limit=100",
             "/v2/summary",
@@ -856,7 +924,8 @@ mod tests {
             assert!(!output.contains(value));
         }
         let capacity = refusal.details()["capacity"].clone();
-        assert_eq!(capacity.as_object().unwrap().len(), 18);
+        assert_eq!(capacity.as_object().unwrap().len(), 19);
+        assert_eq!(capacity["gitStatusRequestLimit"], GIT_STATUS_REQUEST_LIMIT);
         assert!(capacity.as_object().unwrap().iter().all(|(key, value)|
             key == "approximate" && value == true || value.is_u64()));
     }

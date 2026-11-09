@@ -32,6 +32,12 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     (super::question_answers::FEATURE, "userInputOptionsV1"),
     ("image-input-steering", "imageInputSteering"),
     ("live-text-deltas", "liveTextDeltas"),
+    // Dedicated home TLS entry and owner-local CSR registry.
+    ("home-relay-mtls-v1", "homeRelayMtlsV1"),
+    ("relay-pairing-v2", "relayPairingV2"),
+    ("relay-pairing-switch-v1", "relayPairingSwitchV1"),
+    ("relay-service-channel-v1", "relayServiceChannelV1"),
+    ("relay-workspace-files-v1", "relayWorkspaceFilesV1"),
     ("director-address", "directorAddress"),
     ("director-change-notices", "directorChangeNotices"),
     ("director-handover", "directorHandover"),
@@ -1109,6 +1115,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("sessions-changed-event", "sessionsChangedEvent"),
     (super::session_deltas::CAPABILITY, "sessionDeltasV1"),
     (super::session_deltas::HOST_CAPABILITY, "sessionDeltasHostV1"),
+    (super::session_deltas::RESOURCES_CAPABILITY, "sessionDeltasResourcesV1"),
     // 2026-10-15 (owner decision): agent_create / member_replace `task` is a
     // delegation from the calling agent to the new agent (asks/create_task.rs):
     // the agent starts idle, then the task goes through agent_delegate, so its

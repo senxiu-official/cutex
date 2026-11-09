@@ -1339,13 +1339,13 @@ impl Supervisor {
                     self.start_service(slug)?;
                 }
                 let deadline = Instant::now() + OPEN_READY_TIMEOUT;
-                loop {
-                    let ready = probe(record.port, record.path.as_deref());
-                    if ready || Instant::now() >= deadline {
-                        if ready {
-                            self.probe_all();
-                        }
-                        break;
+                let ready = loop {
+                    if super::health::probe_until(record.port, record.path.as_deref(), deadline) {
+                        self.probe_all();
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
                     }
                     let alive = {
                         let inner = self.inner.lock().expect("services supervisor");
@@ -1355,9 +1355,16 @@ impl Supervisor {
                             .is_some_and(|entry| entry.running.is_some())
                     };
                     if !alive {
-                        break;
+                        break false;
                     }
                     std::thread::sleep(Duration::from_millis(250));
+                };
+                if !ready {
+                    // A ticket would immediately redirect to a backend which
+                    // still cannot answer (and turn startup into a 502).
+                    // Leave the process alone; a later open can find it ready.
+                    return Err(ServicesError::new(503, "service_start_timeout",
+                        "Service is not ready after waiting for startup. Try opening it again; it may still be starting."));
                 }
             }
         }

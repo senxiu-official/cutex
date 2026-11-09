@@ -6,7 +6,7 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.2.1 — Beautiful World**: agent rename and name history, persistent browser scripting, clearer queued-message delivery, per-user layout memory and idle service sleep. Includes native 0.164.0-r59 and Claude runtime claude-r40; optional DSH and Kimi adapters use dsh-r3 and kimi-r3. This update migrates durable state to SQLite and requires explicit one-way confirmation; retain a backup before upgrading. See [CHANGELOG.md](CHANGELOG.md).
+**0.2.2 — Beautiful World**: management requests remain responsive while Git status runs in a separate worker pool; repeated reads for the same repository share one request, and filesystem identity checks are cached. Includes native 0.167.0-r60 and retains Claude claude-r40, DSH dsh-r3 and Kimi kimi-r3. Existing agents keep their selected runtimes until explicitly upgraded. Upgrades from 0.2.0 still cross the durable-state migration and require explicit one-way confirmation. See [CHANGELOG.md](CHANGELOG.md).
 
 > **Current limitations:**
 > - **Phone push / pairing a phone**: there is no public phone app yet.

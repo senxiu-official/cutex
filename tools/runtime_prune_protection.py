@@ -169,10 +169,16 @@ def build_index(operation_dir, active_executable, install_base=None):
     def add(value, label):
         paths.add(str(absolute(value, label)))
 
+    state = read(original_files[state_path])
     for name, fields in FIELDS.items():
         relative = 'runtime/' + name + '/deployment.json'
-        require(relative in backup_files, 'missing backup reference: ' + relative)
         proof = object_value(protected.get(name + '-runtime'), 'before ' + name + ' binding')
+        if proof.get('exists') is False:
+            require(proof.get('sha256') is None, 'absent before deployment has a hash: ' + name)
+            require(relative not in backup_files, 'absent before deployment has a backup: ' + name)
+            require(state.get(name + '-runtime') is None, 'absent before deployment has selected component: ' + name)
+            continue
+        require(relative in backup_files, 'missing backup reference: ' + relative)
         require(proof.get('exists') is True, 'before ' + name + ' deployment required')
         verified(backup_files[relative], proof.get('sha256'), 'before ' + name + ' deployment binding')
         deployment = read(backup_files[relative])

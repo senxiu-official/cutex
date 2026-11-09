@@ -309,16 +309,18 @@ class StagingTests(unittest.TestCase):
     def check(self, kit_tool):
         before = (kit_tool / 'deploy.py').read_bytes()
         applied = staging.stage(kit_tool)
-        self.assertEqual(len(applied), len(staging.DEPLOY_EDITS) + 1)
+        optional_notice = int(b'After activation, auto-online restores' not in before)
+        self.assertEqual(len(applied), len(staging.DEPLOY_EDITS) + 1 - optional_notice)
         after = (kit_tool / 'deploy.py').read_bytes()
         self.assertEqual(b'\r\n' in before, b'\r\n' in after)
-        self.assertEqual(after.count(b'\r\n'), before.count(b'\r\n') + (1 if b'\r\n' in before else 0))
+        self.assertEqual(after.count(b'\r\n'), before.count(b'\r\n') + (7 if b'\r\n' in before else 0))
         self.assertEqual(staging.stage(kit_tool), [])
         self.assertEqual((kit_tool / 'deploy.py').read_bytes(), after)
         text = after.decode()
         compile(text, 'deploy.py', 'exec')
         self.assertIn("upgrade complete.');self.claude_default();importlib.import_module('upgrade_online_kit').after_activation(self,op)", text)
         self.assertTrue((kit_tool / 'upgrade_online_kit.py').is_file())
+        self.assertTrue((kit_tool / 'kit_activation_preflight.py').is_file())
         # The CLI accepts the new mode and flag without touching any host.
         probe = ('import sys;sys.argv=["deploy.py","activate","--no-auto-online"];import deploy;'
                  'deploy.Deploy=lambda:(_ for _ in ()).throw(SystemExit("parsed:"+str(sys.argv)));deploy.main()')
@@ -337,7 +339,7 @@ class StagingTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix='uao-stage-'))
         self.addCleanup(shutil.rmtree, root, True)
         (root / 'deploy.py').write_text('print(1)\n')
-        with self.assertRaisesRegex(ValueError, 'anchor activate.after-complete matched 0 times'):
+        with self.assertRaisesRegex(ValueError, 'anchor preflight.process-evidence matched 0 times'):
             staging.stage(root)
         self.assertEqual((root / 'deploy.py').read_text(), 'print(1)\n')
         self.assertFalse((root / 'upgrade_online_kit.py').exists())

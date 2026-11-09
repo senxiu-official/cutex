@@ -388,6 +388,39 @@ mod tests {
     }
 
     #[test]
+    fn cold_start_timeout_refuses_ticket_then_later_open_succeeds_without_restart() {
+        use crate::management::v2::services::{route_json, Route, ServicesContext};
+        let (_root, store, record, supervisor, starts, _) = setup(server(), "ephemeral");
+        store.mutate(|registry| {
+            let row = registry.services.get_mut(&record.slug).unwrap();
+            row.env.insert("CUTEX_IDLE_TEST_DELAY_MS".into(), "16000".into());
+            row.path = Some("/".into());
+            Ok(())
+        }).unwrap();
+        supervisor.start().unwrap();
+        struct StopOnDrop(Arc<Supervisor>);
+        impl Drop for StopOnDrop { fn drop(&mut self) { self.0.shutdown(); } }
+        let _shutdown = StopOnDrop(supervisor.clone());
+        let context = ServicesContext {store:store.clone(), supervisor:Some(supervisor.clone()),
+            owner_check: |_| Ok(()), caller:"root".into(), load_runtime_status: |_| Ok(None)};
+        let route = Route::ViewTicket(record.slug.clone());
+        let result = route_json(&context, "POST", "", &route, br#"{"start":true}"#);
+        let error = result.err().expect("unready service must not issue a ticket");
+        assert_eq!((error.status, error.code), (503, "service_start_timeout"));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !probe(record.port, Some("/")) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (status, ticket) = route_json(&context, "POST", "", &route, br#"{"start":true}"#).unwrap();
+        // Never include the actual one-use ticket in assertion output.
+        assert_eq!(status, 200);
+        assert!(ticket.get("ticket").and_then(Value::as_str).is_some());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        shut_down(&supervisor, record.port);
+    }
+
+    #[test]
     fn thirty_two_proxy_waiters_share_one_wake_and_daemon_restart_leaves_sleepers_asleep() {
         let (_root, store, record, supervisor, starts, _) = setup(server(), "persistent");
         make_sleeping(&store, &record);

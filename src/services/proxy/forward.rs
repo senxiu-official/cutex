@@ -5,7 +5,7 @@ use crate::services::{store::ServiceRecord, traffic};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// On Windows, shutting down a cloned socket need not wake a pending recv.
 /// Bound each read and check cancellation so joining a pump cannot stall.
@@ -80,6 +80,12 @@ impl Read for WatchedReader<'_> {
 }
 
 pub fn request_bytes(head: &Head, record: &ServiceRecord, peer: &str) -> io::Result<Vec<u8>> {
+    request_bytes_policy(head,record,peer,false)
+}
+pub(crate) fn request_bytes_relay(head:&Head,record:&ServiceRecord,peer:&str)->io::Result<Vec<u8>>{
+    request_bytes_policy(head,record,peer,true)
+}
+fn request_bytes_policy(head: &Head, record: &ServiceRecord, peer: &str, relay:bool) -> io::Result<Vec<u8>> {
     head.request()?;
     let nominated: Vec<_> = head
         .headers
@@ -130,7 +136,8 @@ pub fn request_bytes(head: &Head, record: &ServiceRecord, peer: &str) -> io::Res
                 .map(str::trim)
                 .filter(|part| {
                     let name = part.split('=').next().unwrap_or("");
-                    !name.to_ascii_lowercase().starts_with("cutex_svc_")
+                    let lower = name.to_ascii_lowercase();
+                    !lower.starts_with("cutex_svc_") && !(relay && lower.starts_with("cutex_view_"))
                 })
                 .filter(|part| !part.is_empty())
                 .collect();
@@ -306,14 +313,21 @@ fn response(
     slug: &str,
     uploading: &AtomicBool,
     upload_failed: &AtomicBool,
+    relay_origin: Option<&str>,
 ) -> io::Result<Response> {
     let mut started = false;
+    let began = Instant::now();
+    let mut stage = "response_head";
     let result = (|| {
         upstream.set_read_timeout(Some(Duration::from_secs(30)))?;
         let mut interim = 0;
         loop {
-            let raw = read_head(upstream, buffer)?.ok_or_else(invalid)?;
+            let raw = read_head(upstream, buffer)?.ok_or_else(||
+                io::Error::new(io::ErrorKind::UnexpectedEof, "upstream closed before response head"))?;
             let head = Head::parse(&raw)?;
+            let raw = if let Some(origin) = relay_origin {
+                crate::management::relay::service::response_head(&head,origin)?
+            } else {raw};
             let parts: Vec<_> = head.first.splitn(3, ' ').collect();
             if parts.len() < 2 || !matches!(parts[0], "HTTP/1.1" | "HTTP/1.0") {
                 return Err(invalid());
@@ -326,6 +340,7 @@ fn response(
                 if !request.websocket() || !head.websocket() {
                     return Err(invalid());
                 }
+                stage = "response_write";
                 client.write_all(&raw)?;
                 started = true;
                 traffic::touch(slug);
@@ -343,8 +358,10 @@ fn response(
                 }
                 // Expect:100-continue was acknowledged locally, so suppress duplicates.
                 if status != 100 {
+                    stage = "response_write";
                     client.write_all(&raw)?;
                 }
+                stage = "response_head";
                 continue;
             }
             let body = if request.request()?.0 == "HEAD" || matches!(status, 204 | 304) {
@@ -355,12 +372,14 @@ fn response(
             let keep = body != Body::UntilClose
                 && !head.has_token("connection", "close")
                 && parts[0] != "HTTP/1.0";
+            stage = "response_write";
             client.write_all(&raw)?;
             started = true;
             traffic::touch(slug);
             // SSE and other streaming bodies can remain silent for over 30 seconds.
             upstream.set_read_timeout(Some(Duration::from_secs(1)))?;
             let peer = client.try_clone()?;
+            stage = "response_body";
             let copied = copy_body(
                 &mut WatchedReader {
                     input: upstream,
@@ -380,6 +399,9 @@ fn response(
             });
         }
     })();
+    if let Err(cause) = &result {
+        super::log_failure(slug, request.request()?.0, stage, cause, Some(started), began.elapsed());
+    }
     if result.is_err() && !started {
         if upload_failed.load(Ordering::Acquire) {
             let _ = super::error(client, 400, "invalid_request_body");
@@ -393,6 +415,7 @@ fn response(
 /// Read the upstream while streaming an upload: a server may reject a request
 /// before consuming its body. A completed early response cancels that upload
 /// and closes the connection instead of waiting for the browser's body.
+#[cfg(test)]
 pub fn exchange(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
@@ -401,7 +424,20 @@ pub fn exchange(
     request: &Head,
     slug: &str,
 ) -> io::Result<Response> {
+    exchange_with_policy(client,upstream,pending,upstream_pending,request,slug,None)
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exchange_with_policy(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+    pending: &mut Vec<u8>,
+    upstream_pending: &mut Vec<u8>,
+    request: &Head,
+    slug: &str,
+    relay_origin: Option<&str>,
+) -> io::Result<Response> {
     let body = request.body(false)?;
+    let began = Instant::now();
     let uploading = AtomicBool::new(false);
     let upload_failed = AtomicBool::new(false);
     if matches!(body, Body::Empty | Body::Length(0)) {
@@ -413,6 +449,7 @@ pub fn exchange(
             slug,
             &uploading,
             &upload_failed,
+            relay_origin,
         );
     }
     client.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -433,6 +470,8 @@ pub fn exchange(
                 slug,
             );
             if result.is_err() {
+                super::log_failure(slug, request.request().map_or("OTHER", |r| r.0),
+                    "request_body", result.as_ref().unwrap_err(), None, began.elapsed());
                 upload_failed.store(true, Ordering::Release);
                 let _ = writer.shutdown(Shutdown::Both);
             }
@@ -447,6 +486,7 @@ pub fn exchange(
             slug,
             &uploading,
             &upload_failed,
+            relay_origin,
         );
         let early = uploading.load(Ordering::Acquire);
         if early {

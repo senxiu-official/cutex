@@ -221,7 +221,7 @@ pub fn definitions_for(runtime: ToolRuntime, wait: bool) -> Vec<Value> {
             }, "additionalProperties": false}}));
     }
     tools.extend([
-        json!({"name": AGENT_PAUSE, "description": "Pause a member of the project you currently direct. The admission gate is durable and immediate. A running tool finishes first; Claude r37+ and native 8c27f353+ pause at the next tool call, while DSH and Kimi pause at turn end. All queued owner and agent input remains in place.",
+        json!({"name": AGENT_PAUSE, "description": "Pause a member of the project you currently direct. The admission gate is durable and immediate. A running tool finishes first. Runtimes with a tool gate pause at the next tool call; DSH and Kimi pause at turn end. All queued owner and agent input remains in place.",
             "inputSchema": {"type":"object","properties":{"target":{"type":"string","description":"Agent id or unique name in your project."},"action_id":action_schema()},"required":["target"],"additionalProperties":false}}),
         json!({"name": AGENT_RESUME, "description": "Resume a member of the project you currently direct. Existing queued work drains in normal admission order.",
             "inputSchema": {"type":"object","properties":{"target":{"type":"string","description":"Agent id or unique name in your project."},"action_id":action_schema()},"required":["target"],"additionalProperties":false}}),
@@ -953,8 +953,8 @@ fn agent_list_with_reads(ctx: &ToolContext<'_>, args: Value,
             })
         })
         .collect();
-    // Only items still on their way: not read, not of an ask you closed.
-    let unclaimed = state
+    // Resolve visibility before projecting any pending notice or its title.
+    let pending: Vec<_> = state
         .deliveries
         .values()
         .filter(|delivery| super::delivery::actionable(&state, delivery))
@@ -963,7 +963,9 @@ fn agent_list_with_reads(ctx: &ToolContext<'_>, args: Value,
             let Some(ask) = state.asks.get(&delivery.ask_id) else { return false; };
             ownership.pending_recipient(ask, delivery).as_deref() == Some(ctx.caller)
         })
-        .count();
+        .collect();
+    let pending_notices = list_output::pending_notices(&state, &pending);
+    let unclaimed = pending.len();
     let caller_paused = state.pauses.contains_key(ctx.caller);
     let open_questions: Vec<Value> = state
         .questions
@@ -995,6 +997,7 @@ fn agent_list_with_reads(ctx: &ToolContext<'_>, args: Value,
         "delegations_to_me": incoming,
         "open_questions": open_questions,
         "unclaimed_results": unclaimed,
+        "pending_notices": pending_notices,
         "delegation_paused": caller_paused,
         "hint": if caller_paused {
             "The owner paused delegation for you: results are kept until the owner resumes (or writes to you); read one now with delegation_read."
@@ -2397,14 +2400,27 @@ fn enqueue_prepared_tell(ctx: &ToolContext<'_>, prepared: &PreparedTell, busines
         value["messageId"] = json!(message_id);
     }
     if let Some((ask_id, _, id, _)) = &prepared.revision {
-        let recorded = ctx.store.with_records(&[ask_id],|state| super::revisions::record(state, ask_id, id,
-            &prepared.original_text, prepared.supersedes.as_deref(), message_id, prepared.wake, ctx.now));
-        if let Err(error) = recorded {
-            if business.is_some() { return Ok(uncertain_tell(prepared)); }
-            return Err(store_error(error));
-        }
+        let recorded = ctx.store.with_records(&[ask_id], |state| {
+            super::revisions::record(state, ask_id, id, &prepared.original_text,
+                prepared.supersedes.as_deref(), message_id, prepared.wake, ctx.now)?;
+            let ask = state.asks.get(ask_id)?.clone();
+            Some(json!({"execution":ask.execution,"review":ask.review,"closed":ask.closed,
+                "open":ask.is_open(),"revision":ask.revision}))
+        });
+        let delegation_state = match recorded {
+            Ok(Some(state)) => state,
+            Ok(None) => return Ok(uncertain_tell(prepared)),
+            Err(error) => {
+                if business.is_some() { return Ok(uncertain_tell(prepared)); }
+                return Err(store_error(error));
+            }
+        };
         value["delegation"] = json!(ask_id);
+        value["delegationState"] = delegation_state;
         value["revision"] = json!({"id":id,"level":RevisionLevel::Sent,"supersedes":prepared.supersedes});
+        if value["delegationState"]["open"] == false {
+            value["detail"] = json!("The note was sent, but the delegation closed before its revision was recorded. It cannot be acknowledged on this delegation; send a follow-up delegation for further work.");
+        }
     }
     if prepared.downgraded { value["wakeDowngraded"] = json!(true); }
     if prepared.narrower { value["tagged_narrower"] = json!(true); }
@@ -2586,6 +2602,55 @@ mod director_tool_tests {
     use std::cell::RefCell;
 
     #[test]
+    fn revision_send_reports_open_state_and_preserves_it_on_action_replay() {
+        let f = Fixture::new();
+        let created = f.call(&f.director, 3, AGENT_DELEGATE,
+            json!({"target":f.caller,"text":"open revision"}), "revision-open-source");
+        assert_eq!(created["ok"], true, "{created}");
+        let id = f.ask_id("revision-open-source");
+        let args = json!({"delegation":id,"text":"change the brief"});
+        let send = |_: &TellSend<'_>| Ok(json!({"ok":true,"id":"bus-open-revision"}));
+        let result = f.call_with_send(&f.director, 3, AGENT_TELL, args.clone(), "revision-open", &send);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["delegationState"]["open"], true);
+        assert!(result["delegationState"]["closed"].is_null());
+        f.store.with_state(|state| {
+            state.update_ask(&id, Utc::now(), |ask| ask.closed = Some(CloseOutcome::Completed));
+        }).unwrap();
+        let must_not_send = |_: &TellSend<'_>| -> anyhow::Result<Value> { panic!("replay must not send twice") };
+        let replay = f.call_with_send(&f.director, 3, AGENT_TELL, args, "revision-open", &must_not_send);
+        assert_eq!(replay, result, "the snapshot belongs to the immutable original send receipt");
+    }
+
+    #[test]
+    fn revision_send_reports_closure_racing_the_bus_send() {
+        let f = Fixture::new();
+        let created = f.call(&f.director, 3, AGENT_DELEGATE,
+            json!({"target":f.caller,"text":"revision race"}), "revision-race-source");
+        assert_eq!(created["ok"], true, "{created}");
+        let id = f.ask_id("revision-race-source");
+        let send = |_: &TellSend<'_>| {
+            f.store.with_state(|state| {
+                state.update_ask(&id, Utc::now(), |ask| {
+                    ask.closed = Some(CloseOutcome::Completed);
+                    ask.execution = ExecutionState::Answered;
+                });
+            }).unwrap();
+            Ok(json!({"ok":true,"id":"bus-racing-revision"}))
+        };
+        let result = f.call_with_send(&f.director, 3, AGENT_TELL,
+            json!({"delegation":id,"text":"change the result"}), "revision-race", &send);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["delegationState"]["closed"], "completed");
+        assert_eq!(result["delegationState"]["open"], false);
+        assert_eq!(result["messageId"], "bus-racing-revision");
+        let state = f.store.shared().unwrap();
+        assert_eq!(state.asks[&id].revisions.len(), 1);
+        assert_eq!(state.deliveries.values().filter(|delivery|
+            delivery.ref_id == "revisionUnacknowledged:v2").count(), 1);
+    }
+
+    #[test]
     fn agent_tell_message_id_requires_a_real_bus_receipt() {
         let f = Fixture::new();
         for (action, receipt) in [("missing-bus-id", json!({"ok":true})),
@@ -2736,7 +2801,7 @@ mod director_tool_tests {
             for (id,message) in [(&owned,"receipt-authorized-message"),(&private,"receipt-private-message"),(&closed,"receipt-closed-message")] {
                 state.asks.get_mut(id).unwrap().revisions.push(RevisionRecord {
                     id:"v2".into(),text:format!("revision for {message}"),supersedes:None,message_id:Some(message.into()),wake:false,
-                    sent_at:"2026-10-27T01:02:03Z".into(),level:RevisionLevel::Sent,delivered_at:None,in_context_at:None,
+                    sent_at:"2026-10-27T01:02:03Z".into(),level:RevisionLevel::Sent,report_closed:false,delivered_at:None,in_context_at:None,
                     turn_id:None,acknowledged_at:None,ack_text:None,
                 });
             }

@@ -174,10 +174,15 @@ macro_rules! owner_prefixes {
 /// Ordered: the first matching rule wins. Scoped rules use the exact path
 /// parsers of the handlers they guard; `OwnerOnly` prefix rules follow.
 const SCOPED_RULES: &[Rule] = &[
+    Rule {methods:ANY,matcher:Matcher::Prefix("/v2/pairing/"),class:Class::OwnerOnly},
     Rule { methods: GET_PUT_DELETE, matcher: Matcher::Shape(super::user_layout_api::is_path), class: Class::Scoped(Scoped::UserLayout) },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/sessions/page"), class: Class::OwnerOnly },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/sessions/changes"), class: Class::OwnerOnly },
     Rule { methods: ANY, matcher: Matcher::Shape(|path| super::delegations::parse_path(path).is_some()), class: Class::OwnerOnly },
+    Rule { methods: GET, matcher: Matcher::Exact("/v2/relay-certificate"), class: Class::AnyPrincipal },
+    Rule { methods: POST, matcher: Matcher::Exact("/v2/relay-certificate/renew"), class: Class::AnyPrincipal },
+    Rule { methods: POST, matcher: Matcher::Exact("/v2/relay-enrollment"), class: Class::AnyPrincipal },
+    Rule { methods: GET, matcher: Matcher::Prefix("/v2/relay-enrollment/"), class: Class::AnyPrincipal },
     Rule { methods: POST, matcher: Matcher::Exact(super::pairing::PAIR_PATH), class: Class::Public },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/capabilities"), class: Class::HostRead },
     Rule { methods: GET, matcher: Matcher::Exact("/v2/host"), class: Class::HostRead },
@@ -239,6 +244,7 @@ const OWNER_RULES: &[Rule] = owner_prefixes![
     "/v2/runtimes", "/v2/services", "/v2/sessions", "/v2/settings", "/v2/side-chats",
     "/v2/storage", "/v2/summary", "/v2/task-service", "/v2/tasks", "/v2/terminals", "/v2/test", "/v2/upgrade", "/v2/usage",
     "/v2/user-instructions", "/v2/users", "/v2/workflows",
+    "/v2/relay", "/v2/service-relay", "/v2/relay-certificate", "/v2/relay-enrollment",
 ];
 
 fn rule_matches(rule: &Rule, method: &str, path: &str) -> bool {

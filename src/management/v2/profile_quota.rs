@@ -130,7 +130,36 @@ pub fn read_gauges(account: &crate::profiles::model::StoredAccount, refresh: boo
     } else {
         None
     };
+    if !native && !claude && !refresh && gauges.iter().any(|g| g.past_unobserved_reset(chrono::Utc::now().timestamp())) {
+        spawn_http_reset_read(account.clone());
+    }
     Ok(ProfileGauges { gauges, native_quota, source })
+}
+
+/// Deduplicate reset-triggered HTTP reads and bound retries after failures.
+fn spawn_http_reset_read(account: crate::profiles::model::StoredAccount) {
+    static READS: std::sync::Mutex<std::collections::BTreeMap<String, i64>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let now = chrono::Utc::now().timestamp();
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    if reads.get(&account.id).is_some_and(|at| now.saturating_sub(*at) < 30) { return; }
+    reads.retain(|_, at| now.saturating_sub(*at) < 30);
+    reads.insert(account.id.clone(), now);
+    drop(reads);
+    let _ = std::thread::Builder::new().name("cutex-http-quota-reset".into()).spawn(move || {
+        match quota::gauges(&account, true) {
+            Ok(gauges) => {
+                if let Ok(repository) = super::repository::management_v2_repository() {
+                    let _ = super::server::append_cutex_event(repository,
+                        super::services::HOST_EVENT_SESSION_ID, super::model::EventCorrelation::default(),
+                        super::profile_quota_native::PROFILE_QUOTA_UPDATED_EVENT,
+                        json!({"profile":{"id":account.id,"name":account.name},"source":"quotaConfig",
+                            "gauges":gauges,"nativeQuota":null,"hostId":crate::platform::host::current_host_name()}));
+                }
+            }
+            Err(error) => eprintln!("profile quota: reset read failed: {error:#}"),
+        }
+    });
 }
 
 pub(super) fn handle(

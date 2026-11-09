@@ -4,6 +4,36 @@ use std::time::{Duration, Instant};
 use std::sync::mpsc;
 use fs2::FileExt;
 
+#[test]
+fn named_tell_waits_for_authority_then_pins_once_or_refuses_without_pin() {
+    super::tests::context("name-fence-wait", |ctx| {
+        let ctx=ToolContext {facade:super::super::tools::FACADE_AGENT_NAMES,..*ctx};
+        let authority=crate::agent_management::AgentManagementStore::open_default().unwrap();
+        drop(authority.try_lock_delivery_mutations().unwrap().unwrap());
+        let path=authority.root().join("agent-management-mutation-v1.lock");
+        let args=json!({"to":"Kimi","text":"private fence regression","action_id":"name-fence-wait"});
+        let (_release,worker)=locked(path.clone(),Some(Duration::from_millis(150)));
+        let at=Instant::now();
+        let first=normalize(&ctx,"agent_tell",args.clone()).unwrap();
+        worker.join().unwrap();
+        assert!(at.elapsed()>=Duration::from_millis(100));
+        // An already durable pin can replay even while the fence is held.
+        let (release,worker)=locked(path,None);
+        assert_eq!(normalize(&ctx,"agent_tell",args.clone()).unwrap(),first);
+        let mut next=args.clone(); next["action_id"]=json!("name-fence-timeout");
+        let at=Instant::now();
+        assert_eq!(normalize(&ctx,"agent_tell",next.clone()).unwrap_err().code,"admission_busy");
+        assert!(at.elapsed()>=PREFLIGHT_LOOKUP_LOCK_TIMEOUT && at.elapsed()<Duration::from_secs(4));
+        let digest=crate::approvals::request_digest(&{
+            let mut raw=next.clone(); raw.as_object_mut().unwrap().remove("action_id"); raw
+        });
+        let key=crate::name_target_pins::Key {caller:ctx.caller,tool:"agent_tell",action:"name-fence-timeout",digest:&digest};
+        assert!(crate::name_target_pins::lookup(&key).unwrap().is_none());
+        release.send(()).unwrap();worker.join().unwrap();
+        assert_eq!(normalize(&ctx,"agent_tell",next).unwrap()["to"],first["to"]);
+    });
+}
+
 fn locked(path: std::path::PathBuf, delay: Option<Duration>) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
     let (ready, entered) = mpsc::channel();
     let (release, wait) = mpsc::channel();

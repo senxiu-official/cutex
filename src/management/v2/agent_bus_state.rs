@@ -494,6 +494,32 @@ impl AgentBusMessageRepository {
         })
     }
 
+    /// 057 §6: the runtime proved the steer that carried `message_id` never
+    /// read and gave it back. The reservation ends and the message is an
+    /// ordinary pending one again; native evidence of any kind keeps it.
+    pub fn return_unread_owner_carry(
+        &self, session: &str, message_id: &str, frozen: &crate::app_server::external_input::Envelope,
+    ) -> anyhow::Result<bool> {
+        self.update_inner(DirtyRows::Messages(vec![message_id.to_string()]), false, |store| {
+            let Some(row) = store.messages.get_mut(message_id) else { return Ok((false, false)) };
+            let s = &row.snapshot;
+            if row.owner_carry.is_none() || s.to_cutex_session_id != session || s.external_input.as_ref() != Some(frozen)
+                || s.state != "pending" || s.a2_submission_id.is_some() || s.a4_receipt.is_some()
+                || s.local_inbox_receipt.is_some() || s.external_input_receipt.is_some() {
+                return Ok((false, false));
+            }
+            row.owner_carry = None;
+            row.snapshot.external_input = None;
+            row.snapshot.external_input_last_observed = None;
+            row.updated_at = Utc::now().to_rfc3339();
+            Ok((true, true))
+        })
+    }
+
+    pub fn owner_carried(&self, session: &str, input_id: &str) -> anyhow::Result<bool> {
+        Ok(self.get(input_id)?.is_some_and(|row| row.snapshot.to_cutex_session_id == session && row.owner_carry.is_some()))
+    }
+
     /// Explicit per-input hold. Session resume must not call this method.
     pub fn set_owner_hold(&self, session: &str, input_id: &str, held: bool) -> anyhow::Result<bool> {
         self.update_message(input_id, |store| {

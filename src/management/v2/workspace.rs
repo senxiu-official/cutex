@@ -126,6 +126,7 @@ pub struct ResolvedRoot {
 
 impl ResolvedRoot {
     pub fn from_dir(scope: Scope, dir: &Path) -> WorkspaceResult<Self> {
+        super::host_files::validate_path(dir)?;
         let canonical = std::fs::canonicalize(dir).map_err(|_| {
             WorkspaceError::new(
                 409,
@@ -133,6 +134,7 @@ impl ResolvedRoot {
                 format!("workspace root does not exist: {}", dir.display()),
             )
         })?;
+        super::host_files::refuse_root_credential_file(&canonical)?;
         if !canonical.is_dir() {
             return Err(WorkspaceError::new(
                 409,
@@ -265,7 +267,8 @@ pub fn handle(
             ),
         );
     }
-    let restricted = crate::management::users::current_principal().is_some_and(|principal| !principal.is_owner());
+    let restricted = crate::management::users::current_principal().is_some_and(|principal| !principal.is_owner())
+        || (crate::management::relay::current_peer().is_some() && crate::management::listeners::current_client_token().is_some_and(|token|!token.scope.is_full()));
     dispatch(stream, request, |scope| {
         let root = resolve_root(scope, context)?;
         if restricted {
@@ -368,7 +371,10 @@ fn dispatch(
                 }
                 (_, ScopedRoute::FsWatch) => super::workspace_fs::watch_stream(stream, &root),
                 (_, ScopedRoute::GitStatus) => {
-                    write_result(stream, super::workspace_git::status_resource(&root))
+                    match super::workspace_git::status_resource(&root) {
+                        Ok(value) => write_ok(stream, value.as_ref()),
+                        Err(error) => write_error(stream, &error),
+                    }
                 }
                 (_, ScopedRoute::GitDiff) => {
                     write_result(stream, super::workspace_git::diff_resource(&root, &params))
@@ -475,8 +481,8 @@ pub fn write_error(stream: &mut TcpStream, error: &WorkspaceError) -> anyhow::Re
                 "source": "cutex",
                 "code": error.code,
                 "message": error.message,
-                "retryable": false,
-                "details": {},
+                "retryable": error.code == "git_status_busy",
+                "details": if error.code == "git_status_busy" { json!({"retryAfterMs":250}) } else { json!({}) },
             }
         }),
     )
@@ -492,6 +498,7 @@ fn reason(status: u16) -> &'static str {
         409 => "Conflict",
         416 => "Range Not Satisfiable",
         501 => "Not Implemented",
+        503 => "Service Unavailable",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         503 => "Service Unavailable",
@@ -528,6 +535,9 @@ mod tests {
             assert_eq!((error.status, error.code), (403, "workspace_root_too_broad"));
         }
         let filesystem_root = std::fs::canonicalize(&base).unwrap().ancestors().last().unwrap().to_path_buf();
+        // Raw client paths use the display form; canonicalize itself adds a
+        // verbatim prefix on Windows, which the raw-path boundary now refuses.
+        let filesystem_root = PathBuf::from(display_path(&filesystem_root));
         assert!(non_owner_root_allowed_with(&root(&filesystem_root), &[]).is_err());
         let _ = std::fs::remove_dir_all(base);
     }

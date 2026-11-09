@@ -20,6 +20,21 @@ MODULE = MAIN_MODULE = "importlib.import_module('upgrade_online_kit')"
 
 # (name, pattern, replacement, marker proving the edit is already in place)
 DEPLOY_EDITS = [
+    ('preflight.process-evidence',
+     r'^    def process_rows\(self\):$',
+     "    def process_rows(self):{nl}        return importlib.import_module('kit_activation_preflight').process_rows(self){nl}"
+     "    def service_process_ids(self):{nl}        return importlib.import_module('kit_activation_preflight').service_process_ids(self){nl}"
+     "    def orphan_agent_preflight(self):{nl}        return importlib.import_module('kit_activation_preflight').orphan_agent_preflight(self){nl}"
+     "    def _legacy_process_rows(self):",
+     'def _legacy_process_rows(self):'),
+    ('preflight.check-only',
+     r'h=self\.identity\(\);self\.service_health\(\);self\.integrity\(\)',
+     'h=self.identity();self.service_health();self.orphan_agent_preflight();self.integrity()',
+     'self.service_health();self.orphan_agent_preflight();self.integrity()'),
+    ('activate.inherited-online-notice',
+     r'After activation, auto-online restores only agents this operation confirmed offline\.',
+     'After activation, auto-online restores agents confirmed offline by this operation or an earlier failed attempt of this release.',
+     'or an earlier failed attempt of this release.'),
     ('activate.after-complete',
      r"(self\.start_selected\(op,pins,selection_fenced=True\);print\('ACTIVATED )(.*?)( \(input ledger on\)); agents remain offline; use the named list in desktop\.'\);self\.claude_default\(\)",
      r"\1\2\3; upgrade complete.');self.claude_default();" + MODULE +".after_activation(self,op)",
@@ -69,6 +84,9 @@ def edit(text, edits, where):
     for name, pattern, replacement, marker in edits:
         if marker in text:
             continue
+        # Older r276 tools predate this notice; there is nothing to update.
+        if name == 'activate.inherited-online-notice' and 'After activation, auto-online restores' not in text:
+            continue
         # A line-end anchor must not leave the CR of a CRLF file behind.
         if pattern.endswith('$') and not pattern.endswith('\\$'):
             pattern = pattern[:-1] + r'(?=\r?$)'
@@ -98,6 +116,7 @@ def stage(kit_tool):
     if (kit / 'owner.sh').is_file():
         edit((kit / 'owner.sh').read_bytes().decode('utf-8'), OWNER_SH_EDITS, 'owner.sh')
     shutil.copyfile(TOOLS / 'upgrade_online_kit.py', kit / 'upgrade_online_kit.py')
+    shutil.copyfile(TOOLS / 'kit_activation_preflight.py', kit / 'kit_activation_preflight.py')
     applied = rewrite(kit / 'deploy.py', DEPLOY_EDITS)
     if (kit / 'owner.sh').is_file():
         applied += rewrite(kit / 'owner.sh', OWNER_SH_EDITS)

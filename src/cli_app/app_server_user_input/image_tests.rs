@@ -35,6 +35,7 @@ fn image_auto_steer_unresolved_never_expires_or_changes_binding() {
                         |_, _| Some(None), |_, _| panic!("existing identity"), idle_thread,
                         |_, _, _, _| { sends.set(sends.get() + 1); panic!("unresolved image resent") }, no_flush).unwrap_err();
                     assert_eq!(error.code, "user_input_in_progress");
+                    assert_eq!(error.details["retryCannotHelp"], true);
                     assert_eq!(repository.delivery(&command.cutex_session_id, "direct-image").unwrap(), Some(unresolved.clone()));
                     assert!(repository.list(&command.cutex_session_id).unwrap().1.is_empty());
                 }

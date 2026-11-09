@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
-**0.2.1 — Beautiful World**：智能体改名与名字历史、持久浏览器脚本、清晰的排队消息投递、个人布局记忆和服务空闲休眠。提供原生运行时 0.164.0-r59、Claude 运行时 claude-r40，以及可选的 dsh-r3 / kimi-r3 适配器。本次更新将持久状态迁入 SQLite，须明确确认单向升级；升级前保留备份。详见 [CHANGELOG.md](CHANGELOG.md)。
+**0.2.2 — Beautiful World**：Git 状态使用独立线程池，同一仓库的重复读取合并处理，文件系统身份检查使用缓存，避免阻塞其他管理请求。提供原生运行时 0.167.0-r60，保留 Claude claude-r40、DSH dsh-r3 和 Kimi kimi-r3。已有智能体保持所选运行时，直到明确升级。从 0.2.0 升级仍需跨越持久状态迁移，并明确确认单向升级。详见 [CHANGELOG.md](CHANGELOG.md)。
 
 > **当前限制：**
 > - **手机推送 / 配对手机**：还没有公开的手机应用。

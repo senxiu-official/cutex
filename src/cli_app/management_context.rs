@@ -5353,6 +5353,18 @@ while True:
     /// store -> HTTP result and replayed durable event. No mutation test double.
     #[test]
     fn badge_metadata_http_persists_and_emits_set_preserve_clear_and_refusals() {
+        // Production repositories stay pinned to one process home. Other CLI
+        // tests can leave background readers alive after changing that home;
+        // exercise this complete HTTP/event contract in its own process.
+        if std::env::var_os("CUTEX_BADGE_METADATA_HTTP_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli_app::management_context::tests::badge_metadata_http_persists_and_emits_set_preserve_clear_and_refusals", "--nocapture", "--test-threads=1"])
+                .env("CUTEX_BADGE_METADATA_HTTP_CHILD", "1")
+                .output().expect("run isolated metadata HTTP contract");
+            assert!(output.status.success(), "isolated metadata HTTP contract failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
         use cutex::management::v2::contract_validation::{
             validate_cutex_event_message, validate_cutex_response,
         };

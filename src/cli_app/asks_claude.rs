@@ -423,6 +423,26 @@ fn owner_note_status(session: &str, generation: u64, submission: &Submission) ->
     }
 }
 
+/// 057 §6: `true` only when the runtime gave this carried results note back.
+pub(crate) fn return_owner_note(session: &str, generation: u64, submission: &Submission) -> bool {
+    if !cutex::asks::returns::is_owner_note(&submission.message_id)
+        || !super::app_server_user_input::session_manager(session).owner_carry_return_supported(session, generation) {
+        return false;
+    }
+    let result = (|| -> anyhow::Result<bool> {
+        let record = super::asks_runtime::record(session).ok_or_else(|| anyhow::anyhow!("session missing"))?;
+        let thread = record.app_server_thread_id().ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+        let envelope = owner_note_envelope(session, thread, generation, submission)?;
+        let handle = handle(session, generation)?;
+        let status = super::claude_ingress::status(&handle, &envelope, generation)?;
+        Ok(super::claude_ingress::may_be_returned(&status) && super::claude_ingress::return_carry(&handle, &envelope, generation)?)
+    })();
+    result.unwrap_or_else(|error| {
+        eprintln!("owner carries: return {} of {session}: {error:#}", submission.message_id);
+        false
+    })
+}
+
 fn thread_and_handle(session: &str) -> anyhow::Result<(String, u64, AppServerHandle)> {
     let record = super::asks_runtime::record(session).ok_or_else(|| anyhow::anyhow!("no such session"))?;
     let thread_id = record

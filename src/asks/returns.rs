@@ -128,13 +128,13 @@ pub fn item_json(item: &ReturnItem) -> Value {
             "question_id": question_id,
             "questions": questions,
         }),
-        ReturnItem::State { ask_id, title, target, state } => json!({
-            "kind": "state",
-            "ask_id": ask_id,
-            "title": title,
-            "target": target,
-            "state": state,
-        }),
+        ReturnItem::State { ask_id, title, target, state } => {
+            let mut value = json!({"kind":"state","ask_id":ask_id,"title":title,"target":target,"state":state});
+            if state.starts_with("revisionUnacknowledged:") {
+                value["detail"] = json!(super::render::state_note(state, target, ask_id));
+            }
+            value
+        },
     }
 }
 
@@ -775,7 +775,27 @@ pub fn admit_events(
         let event_id = event_id.clone();
         let owner_carry = event.delivery_ids.iter().any(|id|
             state.deliveries.get(id).is_some_and(|d| d.owner_input_id.is_some()));
-        match runtime.message_status(&session, reconcile_generation, &submission) {
+        let status = runtime.message_status(&session, reconcile_generation, &submission);
+        // 057 §6: its carrier steer proven never read, the runtime gave it
+        // back. The owner's lane is free: no send of this owner is under way.
+        if owner_carry && !matches!(status, NativeMessageStatus::Persisted { .. } | NativeMessageStatus::Held { turn_id: Some(_), .. }) {
+            let lane = runtime.result_admission_lane(&session)?;
+            let reservation = lane.as_ref().map(|lane| lane.try_lock());
+            let owner = event.delivery_ids.iter().find_map(|id| state.deliveries.get(id).and_then(|d| d.owner_input_id.clone()));
+            if let Some(owner) = owner.filter(|_| !matches!(reservation, Some(Err(_)))
+                && runtime.return_owner_carry(&session, reconcile_generation, &submission)) {
+                if super::owner_carries::release_owner_results(store, &session, &owner, now)? {
+                    super::ledger::results_returned_unread(&state, &session, &event.delivery_ids);
+                    forget_next_step(&event_id);
+                    forget_unavailable(&event_id);
+                    if !store.shared()?.leases.contains_key(&session) {
+                        report.released.push(session.clone());
+                    }
+                    continue;
+                }
+            }
+        }
+        match status {
             // The atomic request can still be in flight when a status query
             // says absent. Only its submitting lane can prove it unsent.
             NativeMessageStatus::Absent | NativeMessageStatus::Unavailable(_)

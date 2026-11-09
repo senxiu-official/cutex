@@ -209,6 +209,7 @@ pub struct OwnerDeviceNotice {
 
 pub const OWNER_DEVICE_ADDED: &str = "cutex/access/ownerDeviceAdded";
 pub const VIA_PAIRING: &str = "pairing";
+const VIA_PAIRING_V2_APPROVED: &str = "pairing-v2-approved";
 pub const VIA_ASSIGNED: &str = "assigned";
 pub const VIA_PERSON_KEY: &str = "personKey";
 pub const VIA_SSH: &str = "ssh";
@@ -626,6 +627,7 @@ impl UserStore {
         }
         let via = match actor {
             "pairing-code" => VIA_PAIRING,
+            "pairing-v2-approved" => VIA_PAIRING_V2_APPROVED,
             "cli" => VIA_SSH,
             _ => VIA_ASSIGNED,
         };
@@ -767,6 +769,7 @@ fn record_new_owner_devices(before: &State, after: &mut State, via: &str) {
         .collect();
     for token in added {
         after.new_owner_devices.retain(|notice| notice.token_id != token);
+        if via == VIA_PAIRING_V2_APPROVED { continue; }
         after.new_owner_devices.push(OwnerDeviceNotice { token_id: token, at: now.clone(), via: via.to_string(), announced: false });
     }
     let bindings = &after.bindings;
@@ -1006,6 +1009,17 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cutex-users-{}", uuid::Uuid::new_v4()));
         let store = UserStore::at(root.join("users"), ClientTokenStore::at(root.join("clients")));
         (root, store)
+    }
+
+    #[test]
+    fn v2_explicit_allow_suppresses_only_its_own_new_owner_notice() {
+        let (root,store)=temp();store.snapshot().unwrap();
+        for (actor,notice) in [("pairing-v2-approved",false),("pairing-code",true),("cli",true),("root",true)] {
+            let issued=store.tokens().issue(actor).unwrap();store.bind_token(&issued.token_id,Some(OWNER),actor).unwrap();
+            assert_eq!(store.snapshot().unwrap().new_owner_devices.iter().any(|n|n.token_id==issued.token_id),notice);
+        }
+        assert_eq!(store.snapshot().unwrap().new_owner_devices.len(),3);
+        let _=std::fs::remove_dir_all(root);
     }
 
     #[test]

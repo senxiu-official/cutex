@@ -169,6 +169,64 @@ pub fn forbidden_reason(path: &Path) -> Option<String> {
     None
 }
 
+/// Reject network/device/ADS forms before *any* filesystem operation. Also
+/// inspect existing reparse/symlink components before canonicalize can follow
+/// one onto SMB. A same-user filesystem mutation race remains an OS boundary.
+pub fn validate_local_path(path: &Path) -> Result<(), PathError> {
+    validate_local(path, false, 0)
+}
+/// For paths returned by canonicalize, allow only the local drive verbatim
+/// prefix that Windows itself adds. Verbatim UNC/device forms stay forbidden.
+pub fn validate_resolved_local_path(path: &Path) -> Result<(), PathError> {
+    validate_local(path, true, 0)
+}
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LOCAL_COMPONENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[test]
+fn round2_network_symlink_is_rejected_without_following_it() {
+    let root=std::env::temp_dir().join(format!("relay-link-{}",uuid::Uuid::new_v4().simple()));std::fs::create_dir_all(&root).unwrap();let link=root.join("network");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("//localhost/not-a-share",&link).unwrap();
+    #[cfg(windows)]
+    if let Err(error)=std::os::windows::fs::symlink_dir(r"\\localhost\not-a-share",&link){eprintln!("network symlink creation unavailable: {error}");std::fs::remove_dir(root).unwrap();return;}
+    assert!(validate_local_path(&link.join("secret")).is_err());
+    #[cfg(unix)]
+    std::fs::remove_file(link).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(link).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}
+fn validate_local(path: &Path, resolved: bool, depth: usize) -> Result<(), PathError> {
+    let forbidden=||PathError::Forbidden("network, device and alternate-stream paths are unavailable".into());
+    if depth > 32 {return Err(forbidden());}
+    let text=path.to_string_lossy();
+    if text.len()>4096 || text.chars().any(char::is_control){return Err(forbidden());}
+    let mut raw=text.as_ref();
+    #[cfg(windows)]
+    if resolved && raw.starts_with(r"\\?\") {
+        let rest=&raw[4..];
+        if rest.as_bytes().get(1)==Some(&b':') && rest.as_bytes()[0].is_ascii_alphabetic() {raw=rest;}
+    }
+    #[cfg(not(windows))]
+    let _=resolved;
+    if raw.starts_with("\\\\") || raw.starts_with("//") || raw.starts_with("\\/") || raw.starts_with("/\\") || raw.starts_with(r"\??\") {return Err(forbidden());}
+    #[cfg(windows)]
+    if raw.char_indices().any(|(i,c)| c==':' && !(i==1 && raw.as_bytes()[0].is_ascii_alphabetic())) {return Err(forbidden());}
+    let mut prefix=PathBuf::new();
+    for component in Path::new(raw).components() {
+        prefix.push(component);
+        #[cfg(test)]
+        LOCAL_COMPONENT_READS.with(|n| n.set(n.get() + 1));
+        if let Ok(target)=std::fs::read_link(&prefix) {
+            let target=if target.is_absolute(){target}else{prefix.parent().unwrap_or(Path::new("")).join(target)};
+            validate_local(&target,true,depth+1)?;
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a publish path: relative paths are joined to `base`; the result
 /// must be a regular file inside one of `roots` and not forbidden.
 pub fn resolve(path: &str, base: Option<&Path>, roots: &[PathBuf]) -> Result<Resolved, PathError> {
@@ -196,6 +254,7 @@ pub fn resolve(path: &str, base: Option<&Path>, roots: &[PathBuf]) -> Result<Res
         let base = base.ok_or_else(|| PathError::Invalid("a relative path needs a working directory; give an absolute path".into()))?;
         base.join(given)
     };
+    validate_local_path(&joined)?;
     let path = match std::fs::canonicalize(&joined) {
         Ok(path) => strip_verbatim(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

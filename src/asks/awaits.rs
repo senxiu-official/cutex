@@ -785,13 +785,23 @@ mod tests {
         };
         // Awaited completions go passive and are recorded once per event.
         let (mut state, ask_id) = setup(AwaitUntil::All, AwaitResume::All, None);
+        assert_eq!(crate::asks::view::await_summary(&state.asks[&ask_id])["canResume"], false);
         assert!(note_job_completion(&mut state, TARGET, "job-1", "evt-1", &exited(0), now));
         yielded(&mut state, &ask_id, now);
         assert!(state.asks[&ask_id].is_waiting());
+        assert_eq!(crate::asks::view::await_summary(&state.asks[&ask_id])["canResume"], true);
+        let mut summary = crate::asks::view::summary(&state, &state.asks[&ask_id]);
+        crate::management::v2::schema_export::assert_valid("asks", "askSummary", &summary);
+        summary["await"]["canResume"] = json!("true");
+        assert!(!crate::management::v2::schema_export::validator("asks", "askSummary").unwrap().is_valid(&summary));
+        let waiting = crate::asks::view::requester_view(&state, &state.asks[&ask_id]);
+        assert_eq!(waiting["waiting"]["can_resume"], true);
+        assert_eq!(waiting["waiting"]["resume_action"]["arguments"]["delegation"], ask_id);
         assert_eq!(wake_due(&mut state, now), Vec::<String>::new());
         assert!(note_job_completion(&mut state, TARGET, "job-2", "evt-2", &exited(0), now));
         let ask = &state.asks[&ask_id];
         assert!(!ask.is_waiting() && ask.resume_pending());
+        assert!(crate::asks::view::await_summary(ask).is_null());
         let resume = ask.resume.as_ref().unwrap();
         assert_eq!((resume.reason, resume.from_attempt), (ResumeReason::Jobs, 1));
         assert_eq!(ask.execution, ExecutionState::Running);

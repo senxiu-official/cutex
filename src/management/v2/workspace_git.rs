@@ -21,6 +21,11 @@ use super::workspace::WorkspaceResult;
 const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 const UNTRACKED_COUNT_LIMIT: u64 = 1024 * 1024;
 
+#[path = "git_status_capacity.rs"]
+mod status_capacity;
+pub(crate) fn invalidate_status(root: &Path) { status_capacity::invalidate(root); }
+pub(crate) fn status_diagnostics() -> Value { status_capacity::diagnostics() }
+
 fn git_command(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command
@@ -42,6 +47,8 @@ fn git_command(dir: &Path) -> Command {
 
 /// Run git in `dir`; `input` is written to stdin when present.
 pub(super) fn run_git(dir: &Path, args: &[&str], input: Option<&[u8]>) -> std::io::Result<Output> {
+    crate::artifacts::paths::validate_resolved_local_path(dir).map_err(|_|std::io::ErrorKind::PermissionDenied)?;
+    crate::artifacts::paths::validate_resolved_local_path(&dir.join(".git")).map_err(|_|std::io::ErrorKind::PermissionDenied)?;
     let mut command = git_command(dir);
     command.args(args);
     if input.is_none() {
@@ -173,6 +180,7 @@ fn numstat(root: &Path, cached: bool) -> HashMap<String, (Option<u64>, Option<u6
 }
 
 fn count_lines(path: &Path) -> Option<u64> {
+    super::host_files::refuse_root_credential_file(path).ok()?;
     let meta = path.metadata().ok()?;
     if !meta.is_file() || meta.len() > UNTRACKED_COUNT_LIMIT {
         return None;
@@ -186,7 +194,11 @@ fn count_lines(path: &Path) -> Option<u64> {
 }
 
 /// `GET {scope}/git/status`.
-pub fn status_resource(root: &ResolvedRoot) -> WorkspaceResult<Value> {
+pub fn status_resource(root: &ResolvedRoot) -> WorkspaceResult<std::sync::Arc<Value>> {
+    status_capacity::get(&root.canonical, || status_uncached(root))
+}
+
+fn status_uncached(root: &ResolvedRoot) -> WorkspaceResult<Value> {
     let dir = &root.canonical;
     let Some(prefix) = repo_prefix(dir) else {
         return Ok(json!({
@@ -402,6 +414,7 @@ pub fn diff_resource(
     root: &ResolvedRoot,
     params: &HashMap<String, String>,
 ) -> WorkspaceResult<Value> {
+    super::host_files::refuse_private_tree(&root.canonical)?;
     let staged = match params.get("staged").map(String::as_str) {
         None | Some("false") | Some("0") => false,
         Some("true") | Some("1") => true,

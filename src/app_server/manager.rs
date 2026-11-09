@@ -669,6 +669,14 @@ impl AppServerRuntimeManager {
             && runtime.supports_owner_carries
     }
 
+    /// 057 §6: the runtime can give back a dropped steer's carried notes.
+    pub fn owner_carry_return_supported(&self, session: &str, generation: u64) -> bool {
+        let Ok(runtimes) = self.runtimes.lock() else { return false };
+        let Some(runtime) = runtimes.get(session) else { return false };
+        let Ok(status) = runtime.status.lock() else { return false };
+        status.connected && status.runtime_generation == generation && runtime.supports_owner_carry_return
+    }
+
     pub fn status(
         &self,
         cutex_session_id: &str,
@@ -1249,6 +1257,7 @@ impl AppServerRuntimeManager {
         let runtime = ManagedRuntime {
             developer_instructions,
             supports_owner_carries: initialize_response.get("ownerInputCarries").and_then(Value::as_u64) == Some(1),
+            supports_owner_carry_return: initialize_response.get("ownerCarryReturn").and_then(Value::as_u64) == Some(1),
             supports_cutex_ingress,
             endpoint,
             handle,
@@ -1281,6 +1290,7 @@ impl AppServerRuntimeManager {
 struct ManagedRuntime {
     developer_instructions: Option<String>,
     supports_owner_carries: bool,
+    supports_owner_carry_return: bool,
     supports_cutex_ingress: bool,
     endpoint: AppServerEndpoint,
     handle: AppServerHandle,
@@ -1986,6 +1996,7 @@ mod tests {
                 ManagedRuntime {
                     developer_instructions: None,
                     supports_owner_carries: false,
+                    supports_owner_carry_return: false,
                     supports_cutex_ingress: true,
                     endpoint: AppServerEndpoint::LoopbackWebSocket {
                         url: "ws://127.0.0.1:1".to_string(),
@@ -2403,7 +2414,24 @@ mod tests {
                 &mut socket,
                 json!({ "id": read["id"].clone(), "result": { "thread": { "id": "thread-1" } } }),
             );
-            let _ = socket.read();
+            // Inventory polling may race the foreground read and bridge start.
+            // Keep this fake runtime alive until the client actually closes it.
+            loop {
+                match socket.read() {
+                    Ok(Message::Text(text)) => {
+                        let request: Value = serde_json::from_str(text.as_ref()).unwrap();
+                        let result = match request["method"].as_str() {
+                            Some("claude/tasks/list") => json!({"tasks":[],"completeInventory":false}),
+                            Some("thread/backgroundTerminals/list" | "thread/loaded/list") => json!({"data":[],"nextCursor":null}),
+                            other => panic!("unexpected request after thread/read: {other:?}"),
+                        };
+                        write_json(&mut socket, json!({"id":request["id"],"result":result}));
+                    }
+                    Ok(Message::Ping(payload)) => socket.send(Message::Pong(payload)).unwrap(),
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(message) => panic!("unexpected frame after thread/read: {message:?}"),
+                }
+            }
         });
 
         let (event_tx, event_rx) = mpsc::channel();
@@ -2503,6 +2531,11 @@ mod tests {
             })
             .expect("thread/read");
         assert_eq!(read["thread"]["id"], "thread-1");
+        // Make the former premature-close race deterministic in this test.
+        let inventory = manager.handle("cutex-1").unwrap()
+            .request("thread/loaded/list", json!({"cursor":null}))
+            .expect("background inventory after foreground read");
+        assert_eq!(inventory["data"], json!([]));
         assert!(
             manager
                 .status("cutex-1")

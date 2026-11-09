@@ -351,6 +351,7 @@ fn http_get(
     deadline: Instant,
     accept: &str,
 ) -> Result<Answer, FetchError> {
+    if super::control_ports::forbidden(record.port){return Err(FetchError::new("service_control_port_forbidden","service target is a cutex control port"));}
     let address = SocketAddr::from(([127, 0, 0, 1], record.port));
     let mut stream = TcpStream::connect_timeout(&address, remaining(deadline)?).map_err(|error| {
         if matches!(error.kind(), std::io::ErrorKind::TimedOut) {

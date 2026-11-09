@@ -481,7 +481,7 @@ pub fn parse_user_input_submit_params(value: &Value) -> Result<UserInputSubmitPa
             .ok_or_else(|| "strategy is required".to_string())?,
     )
     .map_err(|error| format!("invalid strategy: {error}"))?;
-    let input = object
+    let mut input = object
         .get("input")
         .and_then(Value::as_array)
         .filter(|input| !input.is_empty())
@@ -490,6 +490,7 @@ pub fn parse_user_input_submit_params(value: &Value) -> Result<UserInputSubmitPa
     for item in &input {
         validate_user_input(item)?;
     }
+    record_image_dimensions(&mut input);
     let expected_turn_id = match object.get("expectedTurnId") {
         None | Some(Value::Null) => None,
         Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
@@ -543,10 +544,14 @@ pub fn validate_user_input(value: &Value) -> Result<(), String> {
             }
         }
         "image" => required_string("url")?,
-        "localImage" => required_string("path")?,
+        "localImage" => {
+            required_string("path")?;
+            crate::artifacts::paths::validate_local_path(std::path::Path::new(object["path"].as_str().unwrap())).map_err(|_|"unsafe local image path".to_string())?;
+        }
         "skill" | "mention" => {
             required_string("name")?;
             required_string("path")?;
+            crate::artifacts::paths::validate_local_path(std::path::Path::new(object["path"].as_str().unwrap())).map_err(|_|"unsafe local input path".to_string())?;
         }
         _ => return Err(format!("unsupported native UserInput type: {input_type}")),
     }
@@ -558,6 +563,22 @@ pub fn validate_user_input(value: &Value) -> Result<(), String> {
         return Err("image detail must be a string or null".to_string());
     }
     Ok(())
+}
+
+/// Presentation metadata is captured at admission, while the file is available.
+/// Missing/unreadable/unsupported images must not reject an otherwise valid send.
+fn record_image_dimensions(input: &mut [Value]) {
+    for item in input {
+        if item["type"] != "localImage" { continue; }
+        if item["width"].as_u64().is_some_and(|n| n > 0)
+            && item["height"].as_u64().is_some_and(|n| n > 0) { continue; }
+        let dimensions = item["path"].as_str().and_then(|path|
+            super::image_dimensions::from_path(Path::new(path)));
+        if let Some((width, height)) = dimensions {
+            item["width"] = width.into();
+            item["height"] = height.into();
+        }
+    }
 }
 
 impl UserInputRepository {
@@ -630,6 +651,8 @@ impl UserInputRepository {
         params: &UserInputSubmitParams,
     ) -> anyhow::Result<QueueEnqueueDecision> {
         let identity_sha256 = input_identity_sha256(params)?;
+        let mut recorded_input = params.input.clone();
+        record_image_dimensions(&mut recorded_input);
         self.ask_store().inspect(|asks| self.mutate_session(cutex_session_id, &[params.client_user_message_id.as_str()], true, |store| {
             let state = store
                 .sessions
@@ -666,7 +689,7 @@ impl UserInputRepository {
                 queue_id: Uuid::new_v4().to_string(),
                 client_user_message_id: params.client_user_message_id.clone(),
                 origin: params.origin.clone(),
-                input: params.input.clone(),
+                input: recorded_input.clone(),
                 position: state.items.len() as u64,
                 revision: 1,
                 state: "queued".to_string(),
@@ -681,6 +704,20 @@ impl UserInputRepository {
                 item: item.clone(),
             });
             self.sync_admission(cutex_session_id, state, asks)?;
+            if params.strategy != UserInputStrategy::Queue {
+                // Preserve earlier owner inputs. Place this send before the
+                // first unstarted delegation after the last earlier owner.
+                let last_owner = state.admission.snapshot.items.iter()
+                    .rposition(|row| row.kind == "owner" && row.id != item.queue_id);
+                let before = state.admission.snapshot.items.iter().enumerate()
+                    .filter(|(index, _)| last_owner.is_none_or(|last| *index > last))
+                    .find(|(_, row)| row.kind == "ask" && asks.asks.get(&row.id)
+                        .is_some_and(|ask| ask.execution == crate::asks::model::ExecutionState::Queued && ask.attempts.is_empty()))
+                    .map(|(_, row)| row.reference());
+                if let Some(before) = before {
+                    state.admission.move_owner(&item.queue_id, Some(&before), true)?;
+                }
+            }
             Ok(QueueEnqueueDecision::Queued(item))
         }))?
     }
@@ -764,8 +801,14 @@ impl UserInputRepository {
     /// real Ask `delegationLease`; ledger only, the wire keeps
     /// `queuedReason: delegationLease`).
     pub fn owner_start_with_reason(&self, session: &str, queue_id: Option<&str>) -> anyhow::Result<(OwnerStart, &'static str)> {
+        self.owner_send_start_with_reason(session, queue_id, false)
+    }
+
+    /// An ordinary send may pass a delegation that has never started. Explicit
+    /// queueing and queued-item flushes retain their recorded admission order.
+    pub fn owner_send_start_with_reason(&self, session: &str, queue_id: Option<&str>, ordinary_send: bool) -> anyhow::Result<(OwnerStart, &'static str)> {
         let mut reason = "delegationLease";
-        Ok(match self.owner_may_start_admission(session, queue_id, &mut reason)? {
+        Ok(match self.owner_may_start_admission(session, queue_id, ordinary_send, &mut reason)? {
             crate::asks::pause_admission::Admission::Ready(true) => (OwnerStart::Ready, reason),
             crate::asks::pause_admission::Admission::Ready(false) => (OwnerStart::Blocked, reason),
             crate::asks::pause_admission::Admission::Deferred => {
@@ -775,7 +818,7 @@ impl UserInputRepository {
         })
     }
 
-    fn owner_may_start_admission(&self, session: &str, queue_id: Option<&str>, reason: &mut &'static str) -> anyhow::Result<crate::asks::pause_admission::Admission<bool>> {
+    fn owner_may_start_admission(&self, session: &str, queue_id: Option<&str>, ordinary_send: bool, reason: &mut &'static str) -> anyhow::Result<crate::asks::pause_admission::Admission<bool>> {
         // Owner decision 1 (input ledger switch): the idle agent takes the
         // owner's message before ride-alongs that are already eligible.
         // Read before the fence (the switch may read config.json).
@@ -786,6 +829,10 @@ impl UserInputRepository {
         let admission = self.admission(session)?;
         match crate::asks::pause_admission::try_with_state(&self.ask_store(), move |state, _| {
             let mut admission = admission;
+            if ordinary_send && queue_id.is_none() {
+                admission.items.retain(|item| item.kind != "ask" || !state.asks.get(&item.id)
+                    .is_some_and(|ask| ask.execution == crate::asks::model::ExecutionState::Queued && ask.attempts.is_empty()));
+            }
             if super::admission::owner_priority(session) || owner_first {
                 admission.next_step.clear();
             } else {
@@ -1224,11 +1271,12 @@ impl UserInputRepository {
         cutex_session_id: &str,
         queue_id: &str,
         expected_revision: u64,
-        input: Vec<Value>,
+        mut input: Vec<Value>,
     ) -> anyhow::Result<Option<UserInputQueueItem>> {
         for item in &input {
             validate_user_input(item).map_err(anyhow::Error::msg)?;
         }
+        record_image_dimensions(&mut input);
         self.mutate_session(cutex_session_id, &[], true, |store| {
             let Some(state) = store.sessions.get_mut(cutex_session_id) else {
                 return Ok(None);
@@ -1257,10 +1305,7 @@ impl UserInputRepository {
             stored.item.input = input;
             stored.item.updated_at = Utc::now().to_rfc3339();
             let client_user_message_id = stored.item.client_user_message_id.clone();
-            let identity_sha256 = canonical_request_sha256(&serde_json::json!({
-                "origin": stored.item.origin,
-                "input": stored.item.input,
-            }))?;
+            let identity_sha256 = canonical_input_identity(&stored.item.origin, &stored.item.input)?;
             let mut item = stored.item.clone();
             item.position = position as u64;
             if let Some(identity) = state.identities.get_mut(&client_user_message_id) {
@@ -1280,13 +1325,14 @@ impl UserInputRepository {
         &self,
         cutex_session_id: &str,
         items: &[(String, u64)],
-        input: Option<Vec<Value>>,
+        mut input: Option<Vec<Value>>,
     ) -> anyhow::Result<Option<(UserInputQueueItem, Vec<UserInputQueueItem>)>> {
         if let Some(input) = &input {
             for item in input {
                 validate_user_input(item).map_err(anyhow::Error::msg)?;
             }
         }
+        if let Some(input) = &mut input { record_image_dimensions(input); }
         self.mutate_session(cutex_session_id, &[], true, |store| {
             let Some(state) = store.sessions.get_mut(cutex_session_id) else {
                 return Ok(None);
@@ -1317,10 +1363,7 @@ impl UserInputRepository {
                 stored.input = merged_input;
                 stored.updated_at = now.clone();
             }
-            let identity_sha256 = canonical_request_sha256(&serde_json::json!({
-                "origin": state.items[first].item.origin,
-                "input": state.items[first].item.input,
-            }))?;
+            let identity_sha256 = canonical_input_identity(&state.items[first].item.origin, &state.items[first].item.input)?;
             let survivor_id = state.items[first].item.client_user_message_id.clone();
             if let Some(identity) = state.identities.get_mut(&survivor_id) {
                 identity.canonical_sha256 = identity_sha256;
@@ -1502,9 +1545,21 @@ fn positioned_items(state: &SessionInputState) -> Vec<UserInputQueueItem> {
 }
 
 fn input_identity_sha256(params: &UserInputSubmitParams) -> anyhow::Result<String> {
+    canonical_input_identity(&params.origin, &params.input)
+}
+
+fn canonical_input_identity(origin: &UserInputOrigin, input: &[Value]) -> anyhow::Result<String> {
+    // A retry after retention must keep its original identity even when the
+    // local file can no longer supply these daemon-recorded display fields.
+    let mut input = input.to_vec();
+    for item in &mut input {
+        if item["type"] == "localImage" {
+            if let Some(map) = item.as_object_mut() { map.remove("width"); map.remove("height"); }
+        }
+    }
     canonical_request_sha256(&serde_json::json!({
-        "origin": params.origin,
-        "input": params.input,
+        "origin": origin,
+        "input": input,
     }))
 }
 
@@ -1561,6 +1616,38 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn admitted_local_image_sizes_survive_missing_files_and_identity_retries() {
+        let root = std::env::temp_dir().join(format!("image-admission-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("owner.png");
+        let png = [137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137];
+        fs::write(&path, png).unwrap();
+        let request = json!({"clientUserMessageId":"image-admission", "origin":{"kind":"other","clientId":"desktop"},
+            "strategy":"queue", "input":[{"type":"localImage","path":path},
+                {"type":"localImage","path":root.join("missing")},
+                {"type":"text","text":"look"}]});
+        let admitted = parse_user_input_submit_params(&request).unwrap();
+        assert_eq!((admitted.input[0]["width"].as_u64(), admitted.input[0]["height"].as_u64()), (Some(1), Some(1)));
+        assert!(admitted.input[1].get("width").is_none());
+        let repo_path = root.join("repository");
+        let repo = UserInputRepository::open(&repo_path).unwrap();
+        repo.enqueue("s", "thread", "request", &admitted).unwrap();
+        fs::remove_file(&path).unwrap();
+        let retry = parse_user_input_submit_params(&request).unwrap();
+        assert!(retry.input[0].get("width").is_none());
+        assert_eq!(input_identity_sha256(&admitted).unwrap(), input_identity_sha256(&retry).unwrap());
+        assert!(matches!(repo.enqueue("s", "thread", "retry", &retry).unwrap(), QueueEnqueueDecision::Deduplicated(_)));
+        drop(repo);
+        let reopened = UserInputRepository::open(&repo_path).unwrap();
+        let (_, items) = reopened.list("s").unwrap();
+        assert_eq!(items[0].input[0]["width"], 1);
+        assert_eq!(items[0].input[0]["height"], 1);
+        assert!(items[0].input[1].get("width").is_none());
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn explicit_join_parser_requires_complete_identity_and_auto_strategy() {

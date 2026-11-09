@@ -25,6 +25,10 @@ pub const SLEEPER_ENV: &str = "INPUT_LEDGER_E2E_SLEEPER";
 /// The fake's port a Codex sleeper forwards to (see [`forward_loopback`]).
 pub const SLEEPER_FORWARD_ENV: &str = "INPUT_LEDGER_E2E_SLEEPER_FORWARD";
 const SLEEPER_PORT_MARKER: &str = "INPUT_LEDGER_E2E_SLEEPER_PORT=";
+#[cfg(unix)]
+pub const SLEEPER_UNIX_ENV: &str = "INPUT_LEDGER_E2E_SLEEPER_UNIX";
+#[cfg(unix)]
+const SLEEPER_UNIX_MARKER: &str = "INPUT_LEDGER_E2E_SLEEPER_UNIX=";
 /// Agent group of every seeded agent (`cutex agent send` resolves targets
 /// inside the sender's groups).
 pub const AGENT_GROUP: &str = "il-e2e";
@@ -91,6 +95,8 @@ impl PrivateHome {
             assert!(!base.starts_with(profile.join(".cutex")));
         }
         let root = base.join("runs").join(format!("{name}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        #[cfg(unix)]
+        let root = base.join(format!("r{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".cutex-test-private-home"), "input_ledger_e2e private home\n").unwrap();
         let config_dir = root.join(".cutex");
@@ -121,6 +127,8 @@ pub struct Sleeper {
     endpoint: Option<String>,
     /// Kept open so the forwarder never writes to a closed pipe.
     _stdout: Option<BufReader<std::process::ChildStdout>>,
+    #[cfg(unix)]
+    socket_path: Option<PathBuf>,
 }
 
 impl Sleeper {
@@ -137,11 +145,12 @@ impl Sleeper {
 
     pub fn spawn() -> Self {
         let child = Self::command().stdout(Stdio::null()).spawn().expect("spawn sleeper");
-        Self { child, endpoint: None, _stdout: None }
+        Self { child, endpoint: None, _stdout: None, #[cfg(unix)] socket_path: None }
     }
 
     /// A sleeper that listens on a loopback port of its own and forwards each
     /// connection to the fake runtime on `target` ([`forward_loopback`]).
+    #[cfg(not(unix))]
     pub fn forwarding(target: u16) -> Self {
         let mut child = Self::command()
             .env(SLEEPER_FORWARD_ENV, target.to_string())
@@ -166,6 +175,29 @@ impl Sleeper {
         Self { child, endpoint: Some(format!("ws://127.0.0.1:{port}")), _stdout: Some(stdout) }
     }
 
+    #[cfg(unix)]
+    pub fn forwarding_in(target: u16, runtime_dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let path = runtime_dir.join("rpc.sock");
+        assert!(path.as_os_str().as_encoded_bytes().len() < 108, "use a shorter marked E2E base");
+        let mut child = Self::command().env(SLEEPER_FORWARD_ENV, target.to_string())
+            .env(SLEEPER_UNIX_ENV, &path).stdout(Stdio::piped()).spawn().expect("spawn Unix forwarding sleeper");
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if stdout.read_line(&mut line).unwrap() == 0 {
+                let _ = child.kill(); let _ = child.wait();
+                panic!("Unix forwarding sleeper exited before its listener was ready");
+            }
+            if let Some((_, reported)) = line.trim().split_once(SLEEPER_UNIX_MARKER) {
+                assert_eq!(Path::new(reported), path);
+                break;
+            }
+        }
+        Self { child, endpoint: Some(format!("unix://{}", path.display())), _stdout: Some(stdout), socket_path: Some(path) }
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -180,6 +212,8 @@ impl Drop for Sleeper {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        #[cfg(unix)]
+        if let Some(path) = &self.socket_path { let _ = std::fs::remove_file(path); }
     }
 }
 
@@ -210,6 +244,34 @@ pub fn forward_loopback(target: u16) -> ! {
             };
             let upstream = std::thread::spawn(move || relay(outer_read, inner));
             relay(inner_read, outer);
+            let _ = upstream.join();
+        });
+    }
+    std::process::exit(0)
+}
+
+/// The bound child owns this Unix listener, so Linux's real SO_PEERCRED
+/// verification observes the same PID stored in the session binding.
+#[cfg(unix)]
+pub fn forward_unix(target: u16, path: &Path) -> ! {
+    use std::os::unix::net::UnixListener;
+    assert!(path.is_absolute());
+    std::thread::spawn(|| { std::thread::sleep(Duration::from_secs(3 * 3600)); std::process::exit(0); });
+    let listener = UnixListener::bind(path).expect("bind owned sleeper Unix forwarder");
+    let mut stdout = std::io::stdout();
+    writeln!(stdout, "{SLEEPER_UNIX_MARKER}{}", path.display()).unwrap(); stdout.flush().unwrap();
+    for outer in listener.incoming() {
+        let Ok(mut outer) = outer else { continue };
+        std::thread::spawn(move || {
+            let Ok(mut inner) = TcpStream::connect(("127.0.0.1", target)) else { return };
+            let _ = inner.set_nodelay(true);
+            let (Ok(mut outer_read), Ok(mut inner_read)) = (outer.try_clone(), inner.try_clone()) else { return };
+            let upstream = std::thread::spawn(move || {
+                let _ = std::io::copy(&mut outer_read, &mut inner);
+                let _ = outer_read.shutdown(Shutdown::Both); let _ = inner.shutdown(Shutdown::Both);
+            });
+            let _ = std::io::copy(&mut inner_read, &mut outer);
+            let _ = inner_read.shutdown(Shutdown::Both); let _ = outer.shutdown(Shutdown::Both);
             let _ = upstream.join();
         });
     }
@@ -267,6 +329,8 @@ pub fn seed_sessions(home: &PrivateHome, agents: &[(&SeededAgentSpec, &FakeRunti
                     "schema_version": "input-ledger-e2e-fixture", "schema_sha256": "input-ledger-e2e-fixture",
                     "started_at": now_rfc3339(),
                 });
+                #[cfg(unix)]
+                { record["app_server_runtime"]["transport"] = json!("unix_socket"); }
             }
             Kind::Claude => {
                 let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("components").join("claude-runtime");
@@ -356,7 +420,13 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn configure(home: PrivateHome, options: DaemonOptions) -> Self {
+    pub fn configure(home: PrivateHome, mut options: DaemonOptions) -> Self {
+        if options.executable.is_none() {
+            if let Some(path) = std::env::var_os("INPUT_LEDGER_E2E_DAEMON") {
+                let path = PathBuf::from(path); assert!(path.is_absolute() && path.is_file());
+                options.executable = Some(path);
+            }
+        }
         let port = free_port(MANAGEMENT_PORTS);
         let bus_port = free_port(BUS_PORTS);
         let token = uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();

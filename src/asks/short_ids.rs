@@ -169,6 +169,24 @@ fn local_pin_resolution(binding:crate::name_target_pins::Binding)->Result<crate:
     Ok(resolution)
 }
 
+// Called by the synchronous control worker before business admission. Never
+// retry a business operation while waiting for the authority fence.
+fn name_pin_fence(authority:&crate::agent_management::AgentManagementStore)
+    -> Result<crate::platform::lock_accounting::FileGuard,AskError> {
+    let deadline=std::time::Instant::now()+PREFLIGHT_LOOKUP_LOCK_TIMEOUT;
+    loop {
+        if let Some(fence)=authority.try_lock_delivery_mutations()
+            .map_err(|error|AskError::new("persistence_unavailable",error.to_string()))? {
+            return Ok(fence);
+        }
+        let remaining=deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(AskError::new("admission_busy","the name authority is busy; retry the same action_id"));
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+    }
+}
+
 fn pinned_name(ctx:&ToolContext<'_>, tool:&str, input:&str, scope:Option<&crate::agent_names::NameScope>,
     action:Option<&str>, digest:&str, preflight:bool) -> Result<crate::agent_names::NameResolution,AskError> {
     use crate::name_target_pins::{self as pins,Key,Binding};
@@ -187,8 +205,7 @@ fn pinned_name(ctx:&ToolContext<'_>, tool:&str, input:&str, scope:Option<&crate:
         return local_pin_resolution(binding);
     }
     let authority=crate::agent_management::AgentManagementStore::open_default().map_err(failure)?;
-    let _fence=authority.try_lock_delivery_mutations().map_err(|error|AskError::new("persistence_unavailable",error.to_string()))?
-        .ok_or_else(||AskError::new("admission_busy","the name authority is busy; retry the same action_id"))?;
+    let _fence=name_pin_fence(&authority)?;
     let path=crate::session::store::cutex_sessions_path().map_err(failure)?;
     crate::session::store::with_session_store_lock(&path,||Ok((|| {
         // Authority and session fences cover the fresh scope/name snapshot

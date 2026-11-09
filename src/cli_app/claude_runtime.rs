@@ -1,7 +1,7 @@
 //! Management's read-only connection to already running Claude adapters.
 //! Recovery reconnects observers; it never spawns an adapter or a model turn.
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -773,8 +773,16 @@ fn deliver_messages_with(
             // an Unknown carried item as an independent turn or passive note.
             if let Some(envelope) = repository.snapshot_by_message_id(&message.id)?.and_then(|snapshot| snapshot.external_input) {
                 reconcile_native_message(id, record.runtime_generation, &envelope)?;
-                if repository.snapshot_by_message_id(&message.id)?.is_some_and(|snapshot| snapshot.state == "delivered") {
+                let snapshot = repository.snapshot_by_message_id(&message.id)?;
+                if snapshot.as_ref().is_some_and(|snapshot| snapshot.state == "delivered") {
                     bus.ack(runtime, &[message.id.clone()])?;
+                } else if manager().owner_carry_return_supported(id, record.runtime_generation)
+                    && repository.owner_carried(id, &message.id)?
+                    && snapshot.and_then(|snapshot| snapshot.external_input_last_observed).is_none_or(|status| super::claude_ingress::may_be_returned(&status))
+                    && super::claude_ingress::return_carry(&handle, &envelope, record.runtime_generation)?
+                    && repository.return_unread_owner_carry(id, &message.id, &envelope)? {
+                    super::owner_carries::OwnerCarries::note_returned(id, &message.id);
+                    wake_delivery(id);
                 }
             }
             continue;
@@ -1091,6 +1099,8 @@ fn invalidate_settlement_observations(id: &str) {
 }
 
 pub(super) fn disconnect(id: &str) -> anyhow::Result<()> {
+    DELIVERY_WAKE_TARGETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id);
+    DELIVERY_WAKE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id);
     invalidate_settlement_observations(id);
     let _guard = OBSERVATION_LOCK
         .lock()
@@ -1107,7 +1117,25 @@ static DELIVERY_WAKE_SIGNAL: Condvar = Condvar::new();
 /// Some Claude session took deliveries at the observer's last pass: only
 /// then does [`follow_queued_messages`] keep its event subscription (none,
 /// and so no shared-journal following, on a host without Claude agents).
-static DELIVERY_WAKE_WANTED: AtomicBool = AtomicBool::new(false);
+static DELIVERY_WAKE_TARGETS: Mutex<BTreeMap<String, RuntimeIdentity>> = Mutex::new(BTreeMap::new());
+
+/// Recheck the observer's successful occurrences before scheduling a retry.
+/// A stop, retirement or replacement invalidates its old delayed wake even
+/// while the regular observer has not reached its next candidate scan.
+fn wanted_delivery_targets() -> BTreeMap<String, u64> {
+    let targets = DELIVERY_WAKE_TARGETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    if targets.is_empty() { return BTreeMap::new(); }
+    let Ok(sessions) = cutex::session::store::load_cutex_session_store_shared() else { return BTreeMap::new() };
+    targets.into_iter().filter_map(|(id, identity)| {
+        let record = sessions.sessions.get(&id)?;
+        let same = !record.is_retired() && record.runtime_generation == identity.generation
+            && record.runtime_pid == Some(identity.pid)
+            && record.claude_session.as_ref()?.connection_id == identity.connection_id;
+        let connected = manager().status(&id).ok().flatten().is_some_and(|status|
+            status.connected && status.runtime_generation == identity.generation);
+        (same && connected).then_some((id, identity.generation))
+    }).collect()
+}
 
 pub(super) fn wake_delivery(id: &str) {
     let mut woken = DELIVERY_WAKE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1211,21 +1239,65 @@ fn deliver_woken(
     bus: &cutex::agent_bus::client::AgentBusHttpClient,
     attempts: &mut HashMap<String, (u64, Instant)>,
 ) {
-    if !healthy.contains(id) {
+    if !healthy.contains(id) || !wanted_delivery_targets().contains_key(id) {
         return;
     }
     if let Err(error) = deliver_messages(id, bus, attempts) {
         eprintln!("Claude delivery on wake for {id}: {error:#}");
         healthy.remove(id);
+        DELIVERY_WAKE_TARGETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id);
     }
 }
 
-/// A bus message was queued for a session (`cutex/agentBus/messageQueued`):
-/// wake its delivery.
-fn wake_for_event(event: &cutex::management::v2::model::EventEnvelope) {
-    if !event.cutex_session_id.is_empty()
-        && event.cutex.as_ref().is_some_and(|cutex| cutex.method == "cutex/agentBus/messageQueued") {
+// The durable queued event precedes the bus's in-memory enqueue. A
+// non-waiting poll can therefore miss it; retry once after this interval.
+const QUEUED_WAKE_AGAIN: Duration = Duration::from_millis(250);
+
+struct PendingDeliveryWake {
+    generation: u64,
+    at: Instant,
+    last: Instant,
+}
+
+#[derive(Default)]
+struct QueuedDeliveryWakes(BTreeMap<String, PendingDeliveryWake>);
+
+impl QueuedDeliveryWakes {
+    fn retain(&mut self, wanted: &BTreeMap<String, u64>) {
+        self.0.retain(|id, pending| wanted.get(id) == Some(&pending.generation));
+    }
+    fn queued(&mut self, id: &str, generation: u64, now: Instant) {
+        let at = now + QUEUED_WAKE_AGAIN;
+        // One entry per wanted occurrence, independent of message volume.
+        // Preserve the first deadline under a continuous stream; remember
+        // its tail too so the final event still gets a full delayed retry.
+        self.0.entry(id.to_string()).and_modify(|pending| pending.last = at)
+            .or_insert(PendingDeliveryWake { generation, at, last: at });
+    }
+    fn due(&mut self, now: Instant) -> Vec<String> {
+        let mut ready = Vec::new();
+        self.0.retain(|id, pending| {
+            if pending.at > now { return true; }
+            ready.push(id.clone());
+            if pending.last > now {
+                pending.at = pending.last;
+                true
+            } else { false }
+        });
+        ready
+    }
+    fn wait(&self, now: Instant) -> Duration {
+        self.0.values().map(|pending| pending.at.saturating_duration_since(now))
+            .min().unwrap_or(Duration::from_millis(500)).min(Duration::from_millis(500))
+    }
+}
+
+fn wake_for_event(event: &cutex::management::v2::model::EventEnvelope,
+    wanted: &BTreeMap<String, u64>, again: &mut QueuedDeliveryWakes) {
+    if let Some(&generation) = wanted.get(&event.cutex_session_id).filter(|_|
+        event.cutex.as_ref().is_some_and(|cutex| cutex.method == "cutex/agentBus/messageQueued")) {
         wake_delivery(&event.cutex_session_id);
+        again.queued(&event.cutex_session_id, generation, Instant::now());
     }
 }
 
@@ -1233,14 +1305,18 @@ fn wake_for_event(event: &cutex::management::v2::model::EventEnvelope) {
 /// the shared journal watcher) from now on while `wanted()`, waking delivery
 /// for every bus message queued. Never returns. A lagged or lost
 /// subscription only costs the wake (the 5 s pass delivers).
-fn follow_queued_messages(repository: &cutex::management::v2::repository::EventRepository, wanted: impl Fn() -> bool) {
+fn follow_queued_messages(repository: &cutex::management::v2::repository::EventRepository, wanted: impl Fn() -> BTreeMap<String, u64>) {
     let mut subscription: Option<cutex::management::v2::repository::EventSubscription> = None;
+    let mut again = QueuedDeliveryWakes::default();
     loop {
-        if !wanted() {
+        let wanted = wanted();
+        again.retain(&wanted);
+        if wanted.is_empty() {
             subscription = None;
             std::thread::sleep(Duration::from_millis(500));
             continue;
         }
+        for id in again.due(Instant::now()) { wake_delivery(&id); }
         let Some(live) = subscription.as_ref() else {
             let subscribed = repository.checkpoint().ok().and_then(|checkpoint| {
                 repository.page_and_subscribe(cutex::management::v2::repository::ReplayQuery {
@@ -1256,11 +1332,11 @@ fn follow_queued_messages(repository: &cutex::management::v2::repository::EventR
             subscription = subscribed;
             continue;
         };
-        let lost = match live.receiver.recv_timeout(Duration::from_millis(500)) {
+        let lost = match live.receiver.recv_timeout(again.wait(Instant::now())) {
             Ok(event) => {
-                wake_for_event(&event);
+                wake_for_event(&event, &wanted, &mut again);
                 for event in live.receiver.try_iter().take(1024) {
-                    wake_for_event(&event);
+                    wake_for_event(&event, &wanted, &mut again);
                 }
                 false
             }
@@ -1277,7 +1353,7 @@ pub(super) fn spawn_observer() -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("cutex-claude-delivery-wake".into())
         .spawn(|| match management_v2_repository() {
-            Ok(repository) => follow_queued_messages(repository, || DELIVERY_WAKE_WANTED.load(Ordering::Relaxed)),
+            Ok(repository) => follow_queued_messages(repository, wanted_delivery_targets),
             Err(error) => eprintln!("Claude delivery wake: {error:#}"),
         })?;
     cutex::management::v2::agent_bus_settlement_model::register_collector(settlement::collect);
@@ -1422,7 +1498,8 @@ pub(super) fn spawn_observer() -> anyhow::Result<()> {
                         last_pass_log = Some(Instant::now());
                     }
                 }
-                DELIVERY_WAKE_WANTED.store(!healthy.is_empty(), Ordering::Relaxed);
+                *DELIVERY_WAKE_TARGETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = healthy.iter()
+                    .filter_map(|id| previous_candidates.get(id).map(|identity| (id.clone(), identity.clone()))).collect();
                 // The next pass in 5 s; meanwhile deliver at once to a
                 // session a bus message was queued for or whose turn ended.
                 let until = Instant::now() + Duration::from_secs(5);
@@ -2079,6 +2156,36 @@ mod delivery_wake_tests {
         WAKE_SET.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[test]
+    fn queued_wakes_coalesce_bursts_without_postponing_the_first_or_losing_the_tail() {
+        let now = Instant::now();
+        let mut again = QueuedDeliveryWakes::default();
+        for _ in 0..100_000 { again.queued("a", 1, now); }
+        again.queued("b", 2, now);
+        assert_eq!(again.0.len(), 2);
+        again.queued("a", 1, now + Duration::from_millis(249));
+        assert!(again.due(now + Duration::from_millis(249)).is_empty());
+        assert_eq!(again.due(now + QUEUED_WAKE_AGAIN), vec!["a", "b"]);
+        assert_eq!(again.0.len(), 1);
+        assert_eq!(again.wait(now + QUEUED_WAKE_AGAIN), Duration::from_millis(249));
+        assert_eq!(again.due(now + Duration::from_millis(499)), vec!["a"]);
+        assert!(again.0.is_empty());
+    }
+
+    #[test]
+    fn queued_wakes_cancel_removed_or_replaced_occurrences_before_waking() {
+        let now = Instant::now();
+        let mut again = QueuedDeliveryWakes::default();
+        for (id, generation) in [("stopped", 1), ("replaced", 1), ("active", 2)] {
+            again.queued(id, generation, now);
+        }
+        again.retain(&BTreeMap::from([("replaced".to_string(), 2), ("active".to_string(), 2)]));
+        assert_eq!(again.due(now + QUEUED_WAKE_AGAIN), vec!["active"]);
+        again.queued("active", 2, now);
+        again.retain(&BTreeMap::new());
+        assert!(again.due(now + QUEUED_WAKE_AGAIN).is_empty());
+    }
+
     /// 054 S24: the observer waits at most until its next pass, and returns
     /// at once with the sessions woken meanwhile (from any thread).
     #[test]
@@ -2237,7 +2344,7 @@ mod delivery_wake_tests {
             .join(cutex::management::v2::input_ledger::DATABASE_FILE);
         let repository = agent_bus_message_repository().unwrap();
         let events = management_v2_repository().unwrap();
-        std::thread::spawn(move || follow_queued_messages(events, || true));
+        std::thread::spawn(move || follow_queued_messages(events, || BTreeMap::from([(JOB_OWNER.to_string(), 1)])));
         let queue = |message: &cutex::agent_bus::model::AgentBusMessage, from: Option<&str>| {
             repository.record_queued(AgentBusQueuedMessage {
                 owner_cutex_session_id: JOB_OWNER.into(), message_id: message.id.clone(),

@@ -229,7 +229,7 @@ impl PrivateInstance {
     fn new() -> Self {
         let root = crate::config::paths::home_dir()
             .unwrap()
-            .join(format!("access-http-{}", uuid::Uuid::new_v4()));
+            .join(format!("ah-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(crate::config::paths::PRIVATE_HOME_MARKER), b"").unwrap();
         let previous = instance::selected().unwrap();
@@ -2151,4 +2151,210 @@ fn own_home_page_and_cover_per_user() {
     assert_eq!(status, 200);
     assert_eq!(homes.get(&bob.id).unwrap().revision, 0);
     assert_eq!(homes.get(&alice.id).unwrap().revision, 2);
+}
+#[test]
+fn relay_loopback_never_accepts_root_public_pairing_or_another_device_token() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let (a, _) = tokens.issue_device("relay A", "A", "android").unwrap();
+    let (b, _) = tokens.issue_device("relay B", "B", "android").unwrap();
+    let host_cli = tokens.issue("host desktop").unwrap();
+    struct ClearRelay;
+    impl Drop for ClearRelay { fn drop(&mut self) { crate::management::relay::set_peer(None); } }
+    let _clear = ClearRelay;
+    crate::management::relay::set_peer(Some(crate::management::relay::RelayPeer {device_id: a.token_id.clone(), certificate_id: "a".repeat(64)}));
+    // exchange_raw explicitly supplies remote=false and loopback peer. TLS
+    // identity still forces remote permissions and owner-local refusal.
+    for bearer in [None, Some(ROOT)] {
+        let (status, _) = exchange("GET", "/v2/users/me", bearer, &json!({}));
+        assert_eq!(status, 401);
+    }
+    for path in ["/", "/v2/pair", "/v2/pairing-codes", "/peer/v1/pair", "/v2/relay/certificates"] {
+        let (status, value) = exchange("POST", path, Some(&a.token), &json!({}));
+        assert_eq!((status, code(&value)), (403, "relay_path_forbidden"), "{path}: {value}");
+    }
+    assert_eq!(exchange("OPTIONS", "/v2", Some(&b.token), &json!({})).0, 403);
+    for bearer in [&b.token, &host_cli.token] {
+        let (status, value) = exchange("GET", "/v2/users/me", Some(bearer), &json!({}));
+        assert_eq!((status, code(&value)), (403, "relay_device_mismatch"), "{value}");
+    }
+    let (status, value) = exchange("GET", "/v2/users/me", Some(&a.token), &json!({}));
+    assert_eq!(status, 200, "{value}");
+    // A same-device certificate cannot turn an owner device into owner-local.
+    let (status, value) = exchange("DELETE", "/v2/users/owner-person", Some(&a.token), &json!({}));
+    assert_eq!((status, code(&value)), (403, "owner_person_local_only"), "{value}");
+    crate::management::relay::set_peer(None);
+    // Ordinary loopback keeps its old root permissions/public health route.
+    assert_eq!(exchange_raw("GET", "/", Some(ROOT), &json!({}), "").0, 200);
+}
+#[test]
+fn round2_relay_read_chat_use_scoped_workspace_and_never_host_files() {
+    use crate::management::client_tokens::DeviceScope;
+    let _lock=crate::config::paths::test_home_env_lock();let instance=PrivateInstance::new();
+    let work=instance.root.join("workspace");std::fs::create_dir_all(&work).unwrap();std::fs::write(work.join("ok.txt"),"workspace-ok").unwrap();
+    let host=crate::platform::host::current_host_name();let mut sessions=crate::session::model::CutexSessionStore::default();
+    let mut record=crate::session::model::CutexSessionRecord::new("cutex.relay-files".into(),None,host,work.to_string_lossy().into_owned(),None).unwrap();
+    record.exposed_to_backend=true;record.registration_class=crate::agent_bus::model::AgentRegistrationClass::Persistent;sessions.sessions.insert(record.cutex_session_id.clone(),record);
+    let mut broad=crate::session::model::CutexSessionRecord::new("cutex.relay-broad".into(),None,crate::platform::host::current_host_name(),instance.root.to_string_lossy().into_owned(),None).unwrap();broad.exposed_to_backend=true;broad.registration_class=crate::agent_bus::model::AgentRegistrationClass::Persistent;sessions.sessions.insert(broad.cutex_session_id.clone(),broad);
+    crate::session::store::save_cutex_session_store(&sessions).unwrap();
+    let tokens=ClientTokenStore::open_default().unwrap();let users=UserStore::beside(&tokens);
+    let path=format!("/v2/fs/file?path={}",url::form_urlencoded::byte_serialize(work.join("ok.txt").to_string_lossy().as_bytes()).collect::<String>());
+    for scope in [DeviceScope::Read,DeviceScope::Chat,DeviceScope::Full] {
+        let(device,_)=tokens.issue_device_scoped("test","phone","android",scope).unwrap();users.bind_token(&device.token_id,Some(OWNER),"root").unwrap();
+        crate::management::relay::set_peer(Some(crate::management::relay::RelayPeer{device_id:device.token_id.clone(),certificate_id:"a".repeat(64)}));
+        let(status,value)=p2_exchange("GET",&path,&device.token,&json!({}));
+        assert_eq!(status,if scope.is_full(){200}else{403},"{value}");
+        if !scope.is_full(){assert_eq!(code(&value),"relay_workspace_only");assert_eq!(p2_exchange("GET","/v2/fs/dirs",&device.token,&json!({})).0,403);}
+        if !scope.is_full(){let(status,value)=p2_exchange("GET","/v2/sessions/cutex.relay-broad/fs/dir",&device.token,&json!({}));assert_eq!((status,code(&value)),(403,"workspace_root_too_broad"));}
+        let(status,value)=p2_exchange("GET","/v2/sessions/cutex.relay-files/fs/file?path=ok.txt",&device.token,&json!({}));assert_eq!(status,200,"{value}");
+        crate::management::relay::set_peer(None);
+        assert_eq!(p2_exchange("GET",&path,&device.token,&json!({})).0,200,"ordinary listener compatibility");
+    }
+}
+#[test]
+fn round2_secret_file_identity_protects_hardlinks_across_file_workspace_static() {
+    let _lock=crate::config::paths::test_home_env_lock();let instance=PrivateInstance::new();
+    let home=crate::config::paths::config_dir().unwrap();std::fs::create_dir_all(home.join("management-relay")).unwrap();
+    std::fs::write(home.join("config.json"),serde_json::to_vec(&json!({"management_api_token":ROOT})).unwrap()).unwrap();std::fs::write(home.join("management-relay/identity.json"),"ca-fixture").unwrap();
+    let outside=instance.root.join("safe");std::fs::create_dir_all(&outside).unwrap();
+    let tokens=ClientTokenStore::open_default().unwrap();let(device,_)=tokens.issue_device("test","phone","android").unwrap();
+    UserStore::beside(&tokens).bind_token(&device.token_id,Some(OWNER),"root").unwrap();
+    let mut sessions=crate::session::model::CutexSessionStore::default();
+    let mut record=crate::session::model::CutexSessionRecord::new("cutex.alias".into(),None,crate::platform::host::current_host_name(),outside.to_string_lossy().into_owned(),None).unwrap();record.exposed_to_backend=true;record.registration_class=crate::agent_bus::model::AgentRegistrationClass::Persistent;sessions.sessions.insert(record.cutex_session_id.clone(),record);crate::session::store::save_cutex_session_store(&sessions).unwrap();
+    let resolved=crate::management::v2::workspace::ResolvedRoot::from_dir(crate::management::v2::workspace::Scope{kind:crate::management::v2::workspace::ScopeKind::Session,id:"fixture".into()},&outside).unwrap();
+    for (secret,name) in [(home.join("config.json"),"config-alias.html"),(home.join("management-relay/identity.json"),"ca-alias.html")] {
+        let alias=outside.join(name);std::fs::hard_link(secret,&alias).unwrap();
+        let path=format!("/v2/fs/file?path={}",url::form_urlencoded::byte_serialize(alias.to_string_lossy().as_bytes()).collect::<String>());
+        assert_eq!(exchange("GET",&path,Some(&device.token),&json!({})).0,403,"hardlink {name}");
+        assert_eq!(p2_exchange("GET",&format!("/v2/sessions/cutex.alias/fs/file?path={name}"),&device.token,&json!({})).0,403,"workspace hardlink {name}");
+        listeners::set_current_connection(Some(ConnectionInfo{remote:true,peer:"127.0.0.1:40000".parse().unwrap()}));
+        assert!(crate::management::v2::workspace_fs::resolve_rel(&resolved,name).is_err());
+        assert!(crate::services::static_files::resolve(&std::fs::canonicalize(&outside).unwrap(),&format!("/{name}")).is_none());
+    }
+}
+#[test]
+#[cfg(windows)]
+fn round2_http_path_route_inventory_rejects_network_and_device_inputs() {
+    let _lock=crate::config::paths::test_home_env_lock();let _instance=PrivateInstance::new();
+    let tokens=ClientTokenStore::open_default().unwrap();let(dev,_)=tokens.issue_device("paths","paths","android").unwrap();UserStore::beside(&tokens).bind_token(&dev.token_id,Some(OWNER),"root").unwrap();
+    for alias in [r"\\localhost\C$\missing-review-root",r"\\127.0.0.1\C$\missing-review-root",r"\\?\UNC\localhost\C$\fixture",r"\\?\C:\fixture",r"\\.\C:\fixture",r"C:\fixture::$DATA"] {
+        let encoded=url::form_urlencoded::byte_serialize(alias.as_bytes()).collect::<String>();
+        for endpoint in ["/v2/fs/file","/v2/fs/dirs"] {assert_eq!(exchange("GET",&format!("{endpoint}?path={encoded}"),Some(&dev.token),&json!({})).0,403,"{endpoint} {alias}");}
+        assert_eq!(exchange("POST","/v2/services",Some(ROOT),&json!({"slug":"bad-root","runtime":"static","root":alias})).0,403);
+        assert_eq!(exchange("GET",&format!("/v2/claude/skills/import?source={encoded}"),Some(ROOT),&json!({})).0,400);
+        assert_eq!(exchange("POST","/v2/claude/skills/import",Some(ROOT),&json!({"source":alias,"names":["fixture"]})).0,400);
+        assert_eq!(exchange("POST","/v2/codex/skills/archive",Some(ROOT),&json!({"requestId":uuid::Uuid::new_v4().to_string(),"path":alias})).0,403,"archive {alias}");
+        assert!(!crate::management::v2::attachments::uploaded_by("cutex.test",&dev.token_id,alias));
+        assert!(crate::management::v2::user_input::validate_user_input(&json!({"type":"localImage","path":alias})).is_err());
+        let mut sessions=crate::session::store::load_cutex_session_store().unwrap();let mut record=crate::session::model::CutexSessionRecord::new("cutex.unc-root".into(),None,crate::platform::host::current_host_name(),alias.into(),None).unwrap();record.exposed_to_backend=true;record.registration_class=crate::agent_bus::model::AgentRegistrationClass::Persistent;sessions.sessions.insert(record.cutex_session_id.clone(),record);crate::session::store::save_cutex_session_store(&sessions).unwrap();
+        for suffix in ["fs/dir","fs/file?path=x","fs/search?q=x","fs/watch","git/status","git/diff?path=x"] {assert_eq!(p2_exchange("GET",&format!("/v2/sessions/cutex.unc-root/{suffix}"),&dev.token,&json!({})).0,403,"{suffix} {alias}");}
+    }
+}
+#[test]
+fn relay_certificate_api_requires_owner_local_and_issues_only_registered_devices() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let (device, _) = tokens.issue_device("phone", "phone", "android").unwrap();
+    let users = UserStore::beside(&tokens);
+    users.bind_token(&device.token_id, Some(OWNER), "root").unwrap();
+    let (status, value) = exchange("POST", "/v2/relay/setup", Some(ROOT), &json!({"bind":"127.0.0.1:39483", "serverNames":["home.test"]}));
+    assert_eq!(status, 201, "{value}");
+    assert!(value["caPem"].as_str().unwrap().contains("BEGIN CERTIFICATE"));
+    assert_eq!(value["serverCaSha256"].as_str().unwrap().len(), 64);
+    assert!(!value.to_string().contains("PRIVATE KEY"));
+    let key = rcgen::KeyPair::generate().unwrap();
+    let csr = rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
+    let (enroll_status,enrollment)=exchange("POST","/v2/relay-enrollment",Some(&device.token),&json!({"csrPem":csr,"deviceId":"untrusted-device-id"}));
+    assert_eq!(enroll_status,200,"{enrollment}");assert_eq!(enrollment["deviceId"],device.token_id);
+    let body = json!({"enrollmentId":enrollment["enrollmentId"],"csrSha256":enrollment["csrSha256"],"keySha256":enrollment["keySha256"],"confirm":true});
+    let (status, value) = exchange("POST", "/v2/relay/certificates", Some(&device.token), &body);
+    assert_eq!((status, code(&value)), (403, "owner_local_only"));
+    REMOTE.with(|c| c.set(true));
+    let host_cli = tokens.issue("owner desktop").unwrap();
+    users.bind_token(&host_cli.token_id, Some(OWNER), "root").unwrap();
+    let (status, value) = exchange("POST", "/v2/relay/certificates", Some(&host_cli.token), &body);
+    REMOTE.with(|c| c.set(false));
+    assert_eq!((status, code(&value)), (403, "owner_local_only"));
+    let (status, value) = exchange("POST", "/v2/relay/certificates", Some(ROOT), &body);
+    assert_eq!(status, 201, "{value}");
+    assert_eq!(value["schema"], "cutex.relay-certificate.v1");
+    assert_eq!(value["deviceId"], device.token_id);
+    let cert_id = value["certificateId"].as_str().unwrap();
+    let path = format!("/v2/relay/certificates/{cert_id}");
+    let (_, records) = exchange("GET", "/v2/relay/certificates", Some(ROOT), &json!({}));
+    assert_eq!(records["certificates"].as_array().unwrap().len(), 1);
+    assert!(!records.to_string().contains("PRIVATE KEY"));
+    assert_eq!(exchange_raw("DELETE", &format!("/v2/relay/certificates/{}",cert_id.to_ascii_uppercase()), Some(ROOT), &json!({}), "").0, 204);
+    assert_eq!(exchange_raw("DELETE", &path, Some(ROOT), &json!({}), "").0, 204);
+    let (_, records) = exchange("GET", "/v2/relay/certificates", Some(ROOT), &json!({}));
+    assert_eq!(records["certificates"][0]["revoked"], true);
+    assert_eq!(records["certificates"][0]["active"], false);
+    let (status, value) = exchange("POST", "/v2/relay/certificates", Some(ROOT), &json!({"deviceId":"unknown", "csrPem": csr}));
+    assert_eq!((status, code(&value)), (400, "relay_invalid_request"));
+}
+
+#[test]
+fn review_relay_private_directory_never_reaches_non_owner_local_file_reads() {
+    let _home_lock=crate::config::paths::test_home_env_lock();let _instance=PrivateInstance::new();
+    let tokens=ClientTokenStore::open_default().unwrap();let users=UserStore::beside(&tokens);
+    let dir=crate::config::paths::config_dir().unwrap().join("management-relay");std::fs::create_dir_all(&dir).unwrap();
+    let file=dir.join("identity.json");std::fs::write(&file,b"private-ca-fixture").unwrap();
+    for scope in crate::management::client_tokens::DeviceScope::ALL {
+        let (token,_)=tokens.issue_device_scoped("phone","phone","android",scope).unwrap();
+        users.bind_token(&token.token_id,Some(OWNER),"root").unwrap();
+        for remote in [false,true] {
+            REMOTE.with(|r|r.set(remote));
+            let (status,value)=exchange("GET",&format!("/v2/fs/file?path={}",file.display()),Some(&token.token),&json!({}));
+            REMOTE.with(|r|r.set(false));
+            assert_eq!((status,code(&value)),(403,"owner_local_only"),"scope={scope:?} remote={remote}: {value}");
+        }
+    }
+    let mut proof=crate::management::client_tokens::VerifiedClientToken::test_token("paired");proof.issued_via=crate::management::client_tokens::IssuedVia::Pairing;
+    listeners::set_current_client_token(Some(proof));
+    let meta=file.metadata().unwrap();
+    assert!(crate::management::v2::workspace_fs::file_content_value(&file,"identity.json",&meta,1024).is_err());
+    assert!(crate::management::v2::host_files::refuse_root_credential_file(&dir).is_err());
+    assert!(crate::management::v2::host_files::refuse_private_tree(dir.parent().unwrap()).is_err());
+    assert!(crate::artifacts::paths::forbidden_reason(&std::fs::canonicalize(&file).unwrap()).is_some());
+    listeners::set_current_client_token(None);
+    let (_,value)=exchange("GET",&format!("/v2/fs/file?path={}",file.display()),Some(ROOT),&json!({}));
+    assert_eq!(value["content"],"private-ca-fixture","owner-local access remains possible");
+}
+
+#[test]
+fn relay_enrollment_and_early_renewal_bind_csr_to_device_without_widening_read_scope() {
+    use crate::management::client_tokens::DeviceScope;
+    let _lock=crate::config::paths::test_home_env_lock();let _instance=PrivateInstance::new();
+    let tokens=ClientTokenStore::open_default().unwrap();let users=UserStore::beside(&tokens);
+    let(a,_)=tokens.issue_device_scoped("A","A","android",DeviceScope::Read).unwrap();
+    let(b,_)=tokens.issue_device("B","B","android").unwrap();
+    users.bind_token(&a.token_id,Some(OWNER),"root").unwrap();users.bind_token(&b.token_id,Some(OWNER),"root").unwrap();
+    let(status,setup)=exchange("POST","/v2/relay/setup",Some(ROOT),&json!({"bind":"127.0.0.1:39485","serverNames":["renew.test"]}));assert_eq!(status,201,"{setup}");
+    let key=rcgen::KeyPair::generate().unwrap();let csr=rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
+    let(status,enrollment)=exchange("POST","/v2/relay-enrollment",Some(&a.token),&json!({"csrPem":csr,"deviceId":b.token_id}));assert_eq!(status,200,"{enrollment}");assert_eq!(enrollment["deviceId"],a.token_id);
+    let poll=format!("/v2/relay-enrollment/{}",enrollment["enrollmentId"].as_str().unwrap());assert_eq!(exchange("GET",&poll,Some(&b.token),&json!({})).0,403);
+    let mut approve=json!({"enrollmentId":enrollment["enrollmentId"],"csrSha256":"wrong","keySha256":enrollment["keySha256"],"confirm":true});assert_eq!(exchange("POST","/v2/relay/certificates",Some(ROOT),&approve).0,400);
+    approve["csrSha256"]=enrollment["csrSha256"].clone();let(status,issued)=exchange("POST","/v2/relay/certificates",Some(ROOT),&approve);assert_eq!(status,201,"{issued}");
+    let(_,polled)=exchange("GET",&poll,Some(&a.token),&json!({}));assert_eq!(polled["certificate"]["certificateId"],issued["certificateId"]);
+    assert_eq!(issued["origin"], "https://renew.test");
+    assert!(issued.get("tailnet").is_none());
+    assert_eq!(polled["certificate"], issued);
+    struct Reset;impl Drop for Reset{fn drop(&mut self){crate::management::relay::set_peer(None);}}
+    let _reset=Reset;let certificate_id=issued["certificateId"].as_str().unwrap().to_string();
+    crate::management::relay::set_peer(Some(crate::management::relay::RelayPeer{device_id:a.token_id.clone(),certificate_id:certificate_id.clone()}));
+    let(status,state)=exchange("GET","/v2/relay-certificate",Some(&a.token),&json!({}));assert_eq!(status,200,"{state}");assert_eq!(state["renewalRequired"],false);assert!(state["server"]["expiresAt"].is_string());
+    let new_key=rcgen::KeyPair::generate().unwrap();let new_csr=rcgen::CertificateParams::default().serialize_request(&new_key).unwrap().pem().unwrap();
+    let(status,value)=exchange("POST","/v2/relay-certificate/renew",Some(&a.token),&json!({"csrPem":new_csr}));assert_eq!((status,code(&value)),(409,"relay_renewal_too_early"));
+    let path=crate::config::paths::config_dir().unwrap().join("management-relay/certificates.json");let mut registry:Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();registry["certificates"][0]["expiresAt"]=json!((chrono::Utc::now()+chrono::Duration::days(6)).to_rfc3339());crate::config::atomic::write_private_pretty_json_atomic(&path,&registry,"test aging").unwrap();
+    let(status,renewed)=exchange("POST","/v2/relay-certificate/renew",Some(&a.token),&json!({"csrPem":new_csr}));assert_eq!(status,200,"{renewed}");assert_eq!(renewed["deviceId"],a.token_id);assert_ne!(renewed["certificateId"],issued["certificateId"]);
+    let(status,retry)=exchange("POST","/v2/relay-certificate/renew",Some(&a.token),&json!({"csrPem":new_csr}));assert_eq!(status,200,"{retry}");assert_eq!(retry["certificateId"],renewed["certificateId"]);
+    assert_eq!(renewed["origin"], issued["origin"]);
+    assert!(renewed.get("tailnet").is_none());
+    assert_eq!(retry, renewed);
+    assert_eq!(tokens.list().unwrap().into_iter().find(|t|t.token_id==a.token_id).unwrap().scope,DeviceScope::Read);
+    let(status,value)=exchange("POST","/v2/relay-certificate/renew",Some(&b.token),&json!({"csrPem":new_csr}));assert_eq!((status,code(&value)),(403,"relay_device_mismatch"));
+    crate::management::relay::set_peer(None);assert_eq!(exchange("POST","/v2/relay-certificate/renew",Some(&a.token),&json!({"csrPem":new_csr})).0,403);
+    let(status,rotated)=exchange("POST","/v2/relay/rotate-server",Some(ROOT),&json!({}));assert_eq!(status,201,"{rotated}");assert_eq!(rotated["serverCaSha256"],setup["serverCaSha256"]);assert!(!rotated.to_string().contains("PRIVATE KEY"));
 }

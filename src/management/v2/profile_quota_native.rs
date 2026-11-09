@@ -99,6 +99,9 @@ pub struct NativeQuotaSnapshot {
     pub profile_name: String,
     /// Unix seconds of the last successful observation (read or notification).
     pub fetched_at: Option<i64>,
+    /// Last successful full read. Sparse live notifications cannot revalidate
+    /// a sticky window after its reset.
+    pub last_successful_read_at: Option<i64>,
     /// `read` (account/rateLimits/read) or `notification` (account/rateLimits/updated).
     pub source: Option<String>,
     /// Normalized native `RateLimitSnapshot` (codex bucket, camelCase).
@@ -170,6 +173,9 @@ impl NativeQuotaSnapshot {
         let mut gauges = normalize(rate_limits, fetched_at);
         for gauge in &mut gauges {
             gauge.stale = stale;
+            let read_at = self.last_successful_read_at.or_else(||
+                (self.source.as_deref() != Some("notification")).then_some(fetched_at));
+            gauge.invalidate_past_reset_since(now, read_at);
         }
         gauges
     }
@@ -215,6 +221,13 @@ impl NativeQuotaSnapshot {
             .collect();
         json!({
             "gauges": gauges,
+            "resetObserved": (["primary", "secondary"].map(|key| {
+                let reset = self.rate_limits.as_ref().and_then(|r| r.get(key))
+                    .and_then(|w| w.get("resetsAt")).and_then(Value::as_i64);
+                let read = self.last_successful_read_at.or_else(||
+                    (self.source.as_deref() != Some("notification")).then_some(self.fetched_at).flatten());
+                reset.map(|reset| read.is_some_and(|read| read >= reset))
+            })),
             "planType": self.rate_limits.as_ref().and_then(|r| r.get("planType")).cloned(),
             "ordinaryUsageAllowed": self.ordinary_usage_allowed,
             "resetCreditsAvailable": self.reset_credits_available,
@@ -426,6 +439,7 @@ pub fn apply_read_at(
                     .pointer("/rateLimitResetCredits/availableCount")
                     .and_then(Value::as_i64);
                 snapshot.fetched_at = Some(now);
+                snapshot.last_successful_read_at = Some(now);
                 snapshot.source = Some("read".to_string());
                 snapshot.last_error = None;
                 snapshot.consecutive_failures = 0;
@@ -463,6 +477,9 @@ pub fn apply_notification_at(
     }
     let reports_plan = known_plan(update.get("planType")).is_some();
     update_at(dir, account, |snapshot| {
+        if snapshot.last_successful_read_at.is_none() && snapshot.source.as_deref() == Some("read") {
+            snapshot.last_successful_read_at = snapshot.fetched_at;
+        }
         if reports_plan {
             snapshot.plan_type_observed_at = Some(now);
         } else if snapshot.plan_type_observed_at.is_none() {
@@ -756,7 +773,9 @@ pub fn quota_view(account: &StoredAccount, force: bool) -> anyhow::Result<(Vec<G
             .as_ref()
             .and_then(|s| s.last_attempt_at)
             .is_some_and(|attempt| now.saturating_sub(attempt) < MIN_FORCED_INTERVAL_SECS);
-        if !recently_attempted && refresh_due(snapshot.as_ref(), now, interval) && !in_flight(&account.id) {
+        let past_reset = snapshot.as_ref().is_some_and(|s| s.gauges(now, interval).iter().any(|g|
+            g.kind == "window" && g.stale && g.remaining_percent.is_none() && g.reset_at.is_some_and(|reset| reset <= now)));
+        if !recently_attempted && (past_reset || refresh_due(snapshot.as_ref(), now, interval)) && !in_flight(&account.id) {
             spawn_refresh(account.clone());
             spawned = true;
         }

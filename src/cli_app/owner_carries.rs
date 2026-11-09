@@ -29,6 +29,16 @@ pub(crate) struct OwnerCarries {
     had_results: bool,
 }
 
+fn returned_details(details: &Value) -> Value {
+    let mut details = details.clone();
+    if let Some(object) = details.as_object_mut() {
+        object.remove("carriedByOwner");
+    }
+    details["ownerHold"] = json!(false);
+    details[il::CARRIER_UNREAD] = json!(true);
+    details
+}
+
 fn canonical_policy(
     session: &str,
     record: &cutex::session::model::CutexSessionRecord,
@@ -96,6 +106,54 @@ impl OwnerCarries {
             delivery.owner_input_id.as_deref() == Some(owner)
                 && cutex::asks::delivery::is_for(&state, delivery, session)
         }))
+    }
+
+    /// A send of `owner` that leaves its old reservation alone: the steer
+    /// that carried it is over (its record's `carries` was emptied by the
+    /// interrupt proof or the owner's resend). C-010 answers first for a send
+    /// whose outcome is unresolved. Carrying nothing, it can release nothing.
+    pub(crate) fn goes_alone(session: &str, owner: &str) -> Result<bool> {
+        if !Self::has_reservation(session, owner)? {
+            return Ok(false);
+        }
+        let record = il::default_ledger()?.get(session, &[owner.to_string()])?.records.pop();
+        Ok(record.is_some_and(|record| record.carries.is_empty()))
+    }
+
+    /// The bus note `input` is ordinary again (`return_unread_owner_carry`):
+    /// `waiting{returned}`, whatever its carrier's outcome says about it.
+    pub(crate) fn note_returned(session: &str, input: &str) {
+        let Ok(ledger) = il::default_ledger() else {
+            return;
+        };
+        let Some(record) = ledger.get(session, &[input.to_string()]).ok().and_then(|mut got| got.records.pop()) else {
+            return;
+        };
+        if matches!(record.state, InputState::Sending | InputState::Accepted | InputState::Uncertain | InputState::Waiting) {
+            il::record(session, input, Expect::rev(record.rev), Next::waiting("returned").details(returned_details(&record.details)));
+        }
+    }
+
+    /// The owner's resend of a carrier now proven absent: `carries` empties
+    /// so this send goes alone ([`Self::goes_alone`]). `false`: this is not
+    /// such a resend, the send stays unresolved.
+    pub(crate) fn resend_goes_alone(session: &str, owner: &str) -> Result<bool> {
+        let ledger = il::default_ledger()?;
+        let Some(record) = ledger.get(session, &[owner.to_string()])?.records.pop() else {
+            return Ok(false);
+        };
+        if record.state != InputState::Waiting || record.reason.as_deref() != Some("ownerRetry") {
+            return Ok(false);
+        }
+        if !record.carries.is_empty() {
+            let mut alone = Next::waiting("ownerRetry");
+            alone.carries = Some(Vec::new());
+            let transition = ledger.transition(session, owner, Expect::rev(record.rev), alone)?;
+            if let Err(error) = il::publish(&transition) {
+                eprintln!("cutex input ledger: publish {session}/{owner}: {error:#}");
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn supported(session: &str, generation: u64) -> bool {

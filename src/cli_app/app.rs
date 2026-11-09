@@ -157,6 +157,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         Some(CommandKind::Notify { command }) => notify::run_command(command)?,
         Some(CommandKind::Im { command }) => agent::im(command)?,
         Some(CommandKind::Management { command }) => management::run_command(command)?,
+        Some(CommandKind::Relay { command }) => management::run_relay(command)?,
         Some(CommandKind::Instance { command }) => super::instance_cli::run(command)?,
         Some(CommandKind::Upgrade { command }) => super::upgrade_cli::run_upgrade(command)?,
         Some(CommandKind::Storage { command }) => super::storage_cli::run(command)?,

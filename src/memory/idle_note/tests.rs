@@ -23,6 +23,35 @@ fn root() -> std::path::PathBuf {
 }
 
 #[test]
+fn claude_relaunch_keeps_system_index_until_idle_boundary() {
+    let path = root();
+    let store = NoteStore::open(&path).unwrap();
+    let old = snapshot("old\n");
+    let new = snapshot("new\n");
+    store.launch("s", old.clone(), 0, false).unwrap();
+    assert_eq!(store.relaunch_index("s", new.clone(), IDLE_AFTER_MS - 1, None).unwrap(), old);
+    // Repeated launches must not indefinitely extend warmth without activity.
+    store.launch("s", old.clone(), 1000, false).unwrap();
+    assert_eq!(store.relaunch_index("s", new.clone(), IDLE_AFTER_MS, None).unwrap(), new);
+    store.turn_activity("s", "turn", IDLE_AFTER_MS - 100, false).unwrap();
+    assert_eq!(store.relaunch_index("s", new.clone(), IDLE_AFTER_MS, None).unwrap(), old);
+    drop(store);
+    let reopened = NoteStore::open(&path).unwrap();
+    assert_eq!(reopened.relaunch_index("s", new.clone(), 2 * IDLE_AFTER_MS, None).unwrap(), new);
+    assert_eq!(reopened.relaunch_index("s", new.clone(), -1, None).unwrap(), new);
+    let mut moved = new.clone(); moved.project = "other".into();
+    assert_eq!(reopened.relaunch_index("s", moved.clone(), IDLE_AFTER_MS, None).unwrap(), moved);
+    let mut moved = new.clone(); moved.path = "/another/MEMORY.md".into();
+    assert_eq!(reopened.relaunch_index("s", moved.clone(), IDLE_AFTER_MS, None).unwrap(), moved);
+    // A delivered passive note changes `seen`, never the captured system bytes.
+    let note = reopened.reserve("s", new.clone(), 2 * IDLE_AFTER_MS, Some(0), false).unwrap().unwrap();
+    reopened.delivered("s", &note.id, 2 * IDLE_AFTER_MS).unwrap();
+    assert_eq!(reopened.relaunch_index("s", new, 2 * IDLE_AFTER_MS, Some(2 * IDLE_AFTER_MS - 1)).unwrap(), old);
+    drop(reopened);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn seventy_minute_boundary_busy_and_clock_rollback() {
     let state = State::seeded(snapshot("old\n"), 0);
     for runtime in ["codex", "claude", "dsh", "kimi"] {

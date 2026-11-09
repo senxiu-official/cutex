@@ -152,6 +152,20 @@ pub fn record_online(record: &CutexSessionRecord) -> bool {
         && !crate::session::boot_fence::with_host_probe(|host| crate::session::boot_fence::binding_is_proven_gone(record, host))
 }
 
+/// [`record_online`] with this process's runtime view, for every answer given
+/// while Management runs. A Claude session keeps no `app_server_runtime`
+/// binding: its adapter connection, live at the record's generation, is the
+/// only evidence (what `runtime.status` of the session resource reports).
+pub fn record_online_with(record: &CutexSessionRecord, load_status: crate::management::server::ManagementRuntimeStatusLoader) -> bool {
+    if record.claude_session.is_none() {
+        return record_online(record);
+    }
+    load_status(&record.cutex_session_id)
+        .ok()
+        .flatten()
+        .is_some_and(|status| status.connected && status.runtime_generation == record.runtime_generation)
+}
+
 fn candidate_ids(state: &IntentState, sessions: &CutexSessionStore, online: &dyn Fn(&CutexSessionRecord) -> bool) -> Vec<String> {
     state
         .intents
@@ -381,6 +395,77 @@ mod tests {
         let offline = |_: &CutexSessionRecord| false;
         assert_eq!(detect_unclean_stop_at(&path, &sessions, &offline, None, "t2").unwrap(), 1);
         assert_eq!(load_at(&path).unwrap().intents.keys().collect::<Vec<_>>(), ["cutex.a"]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn claude_status(connected: bool, runtime_generation: u64) -> crate::app_server::manager::AppServerManagedRuntimeStatus {
+        crate::app_server::manager::AppServerManagedRuntimeStatus {
+            background_work: Default::default(),
+            cutex_session_id: "cutex.claude".into(),
+            thread_id: "thread".into(),
+            runtime_generation,
+            connected,
+            active_turn_id: None,
+            active_turn_observed_at: None,
+            thread_status: None,
+            thread_status_observed_at: None,
+            thread_settings: None,
+            thread_settings_source: None,
+            thread_settings_complete: false,
+            thread_settings_observed_at: None,
+            runtime_workspace_roots: None,
+            instruction_sources: None,
+            resume_snapshot_observed_at: None,
+            event_method_counts: Default::default(),
+            initialized_user_agent: None,
+            last_event_at: None,
+            last_error: None,
+        }
+    }
+
+    fn claude_sessions() -> CutexSessionStore {
+        let mut sessions = store(&["cutex.claude"]);
+        let record = sessions.sessions.get_mut("cutex.claude").unwrap();
+        record.claude_session = Some(serde_json::from_value(json!({
+            "deployment": {"python": "/fixture/python", "adapter_source": "/fixture/adapter",
+                "claude_cli": "/fixture/claude", "claude_home": "/fixture/home", "tui_binary": "/fixture/tui"},
+            "thread_id": "thread", "state_dir": "/fixture/state", "model": "sonnet"
+        })).unwrap());
+        record.runtime_generation = 2;
+        sessions
+    }
+
+    #[test]
+    fn a_claude_session_is_online_by_its_connection_at_the_current_generation() {
+        let sessions = claude_sessions();
+        let record = &sessions.sessions["cutex.claude"];
+        assert!(record.app_server_runtime.is_none());
+        assert!(!record_online(record));
+        assert!(record_online_with(record, |_| Ok(Some(claude_status(true, 2)))));
+        assert!(!record_online_with(record, |_| Ok(Some(claude_status(false, 2)))), "disconnected");
+        assert!(!record_online_with(record, |_| Ok(Some(claude_status(true, 1)))), "an earlier runtime");
+        assert!(!record_online_with(record, |_| Ok(None)), "not known to this process");
+        assert!(!record_online_with(record, |_| anyhow::bail!("unavailable")));
+    }
+
+    #[test]
+    fn a_session_without_claude_keeps_the_binding_rule() {
+        let sessions = store(&["cutex.host"]);
+        assert!(!record_online_with(&sessions.sessions["cutex.host"], |_| panic!("the binding decides")));
+    }
+
+    #[test]
+    fn a_connected_claude_agent_is_not_listed_nor_forgotten_as_a_restore_candidate() {
+        let path = temp();
+        let sessions = claude_sessions();
+        note_online_at(&path, "cutex.claude", "t1").unwrap();
+        // Management starting: nothing connected yet, so it is a candidate.
+        assert_eq!(detect_unclean_stop_at(&path, &sessions, &record_online, None, "t2").unwrap(), 1);
+        let connected = |record: &CutexSessionRecord| record_online_with(record, |_| Ok(Some(claude_status(true, 2))));
+        let body = candidates_resource_at(&path, &sessions, &connected, "h").unwrap();
+        assert_eq!((body["items"].clone(), body["uncleanSince"].clone()), (json!([]), Value::Null));
+        assert_eq!(dismiss_at(&path, &sessions, &connected).unwrap(), 0);
+        assert!(load_at(&path).unwrap().intents.contains_key("cutex.claude"));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

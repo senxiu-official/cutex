@@ -129,6 +129,7 @@ fn resolve_source(raw: Option<&str>) -> Result<PathBuf, String> {
     match raw.filter(|raw| !raw.is_empty()) {
         Some(raw) => {
             let path = PathBuf::from(raw);
+            crate::artifacts::paths::validate_local_path(&path).map_err(|_|"network, device and alternate-stream source paths are forbidden".to_string())?;
             if !path.is_absolute() || raw.chars().any(char::is_control) || raw.chars().count() > 4096 {
                 return Err("source must be an absolute directory path".into());
             }
@@ -155,6 +156,8 @@ fn valid_name(name: &str) -> bool {
 /// Canonical source root and target root, refusing overlapping directories.
 /// `None` for the source = it does not exist.
 fn roots(source: &Path, target: &Path) -> Result<(Option<PathBuf>, PathBuf), ImportError> {
+    crate::artifacts::paths::validate_resolved_local_path(source).map_err(|_|ImportError::Invalid("unsafe source path".into()))?;
+    crate::artifacts::paths::validate_resolved_local_path(target).map_err(|_|ImportError::Invalid("unsafe target path".into()))?;
     let source = match source.canonicalize() {
         Ok(path) if path.is_dir() => Some(path),
         Ok(_) => return Err(ImportError::Invalid("source is not a directory".into())),

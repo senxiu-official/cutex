@@ -73,6 +73,20 @@ fn note(kind: InputKind, timing: Timing) -> NewInput {
 // --- state machine -----------------------------------------------------------
 
 #[test]
+fn uncertain_task_notice_explains_notification_only_retry() {
+    let f = Fixture::new();
+    let mut input = note(InputKind::SystemNotice, Timing::AfterTurn);
+    input.sender = sender(SenderKind::ClaudeTask);
+    f.go("task", Next::sending().create(input)).unwrap();
+    f.go("task", Next::accepted()).unwrap();
+    let row = f.go("task", Next::uncertain("receiptTimeout")).unwrap().record;
+    assert_eq!(row.details["retryEffect"], "redeliverNotice");
+    assert_eq!(row.details["taskRestartsOnRetry"], false);
+    assert!(row.actions.contains(&Action::Retry));
+    assert!(row.actions.contains(&Action::Dismiss));
+}
+
+#[test]
 fn notice_hold_is_explicit_and_schema_checked() {
     let request = json!({"inputId": "notice", "expectedRev": 1, "held": true});
     assert_eq!(parse_hold(request.as_object().unwrap()).unwrap(), ("notice".into(), 1, true));
@@ -174,6 +188,23 @@ fn probe(state: InputState) -> Next {
     next
 }
 
+/// 057 §6: only a note whose carrier is proven unread goes back, only with
+/// that proof, and never an owner message.
+#[test]
+fn a_carried_note_goes_back_to_waiting_only_with_the_proof() {
+    let proof = Next::waiting("returned").details(json!({"carrierUnread": true}));
+    for from in [InputState::Accepted, InputState::Uncertain] {
+        assert!(edge_allowed(InputKind::AgentMessage, Some(from), &proof), "{from}");
+        assert!(edge_allowed(InputKind::DelegationResult, Some(from), &proof), "{from}");
+        assert!(!edge_allowed(InputKind::Owner, Some(from), &proof), "{from}");
+        assert!(!edge_allowed(InputKind::AgentMessage, Some(from), &Next::waiting("returned")), "{from}");
+        assert!(!edge_allowed(InputKind::AgentMessage, Some(from), &Next::waiting("afterTurn").details(json!({"carrierUnread": true}))), "{from}");
+    }
+    for from in [InputState::InContext, InputState::Discarded, InputState::Rejected, InputState::Superseded] {
+        assert!(!edge_allowed(InputKind::AgentMessage, Some(from), &proof), "{from}");
+    }
+}
+
 #[test]
 fn state_machine_edges_match_the_contract() {
     use InputState::*;
@@ -192,7 +223,7 @@ fn state_machine_edges_match_the_contract() {
                 // `probe(Sending)` is `sending{interruptSend}` (the owner's
                 // cutex/input/interruptSend takes a steer back, r274).
                 let expected = allowed_any.contains(&(*from, *to))
-                    || owner && matches!((from, to), (Sending, Failed) | (Accepted, Failed) | (Accepted, Sending) | (Waiting, Failed));
+                    || owner && matches!((from, to), (Sending, Failed) | (Accepted, Failed) | (Accepted, Sending) | (Waiting, Failed) | (Waiting, Uncertain));
                 assert_eq!(edge_allowed(kind, Some(*from), &probe(*to)), expected, "{kind} {from} -> {to}");
             }
         }
@@ -1293,4 +1324,45 @@ fn stuck_owner_records_offer_retry_and_dismiss() {
     assert!(dismissible(&failed));
     let discarded = f.go("s", Next::discarded("ownerDiscarded")).unwrap().record;
     assert_eq!((discarded.state, discarded.surface), (InputState::Discarded, Surface::None));
+}
+
+#[test]
+fn refresh_open_actions_fixes_stored_actions_and_writes_nothing_otherwise() {
+    let f = Fixture::new();
+    let delivery = json!({"state": "idle", "runtimeConnected": true, "turn": null});
+    f.ledger.delivery_changed("s1", &delivery).unwrap();
+    f.go("m", Next::received().create(owner(Strategy::Auto))).unwrap();
+    f.go("m", Next::sending()).unwrap();
+    f.go("m", Next::uncertain("outcomeUnknown")).unwrap();
+    f.go("m", Next::waiting("ownerRetry")).unwrap();
+    let marked = f.go("m", Next::waiting("ownerRetry").stalled(Some(Stalled { reason: "noProgress".into(), since: "2026-11-01T00:00:00Z".into() }))).unwrap().record;
+    assert_eq!(marked.actions, vec![Action::Retry, Action::Dismiss]);
+    let revision = f.ledger.list("s1", ListQuery::default()).unwrap().state_revision;
+    // Nothing differs: no revision, no write.
+    let same = f.ledger.refresh_open_actions("s1").unwrap();
+    assert!(!same.changed);
+    assert_eq!(f.ledger.list("s1", ListQuery::default()).unwrap().state_revision, revision);
+    assert_eq!(f.ledger.get("s1", &["m".into()]).unwrap().records.remove(0).rev, marked.rev);
+    // What r277 stored for that row.
+    let db = Connection::open(f.ledger.path()).unwrap();
+    let raw: String = db.query_row("SELECT record_json FROM input_ledger WHERE input_id='m'", [], |r| r.get(0)).unwrap();
+    let mut stored: Value = serde_json::from_str(&raw).unwrap();
+    stored["actions"] = json!([]);
+    db.execute("UPDATE input_ledger SET record_json=?1 WHERE input_id='m'", [stored.to_string()]).unwrap();
+    drop(db);
+    assert!(f.ledger.get("s1", &["m".into()]).unwrap().records.remove(0).actions.is_empty());
+    f.at(100);
+    let fixed = f.ledger.refresh_open_actions("s1").unwrap();
+    assert!(fixed.changed);
+    assert_eq!(fixed.state_revision, revision + 1);
+    assert_eq!(fixed.records.len(), 1);
+    let row = f.ledger.get("s1", &["m".into()]).unwrap().records.remove(0);
+    assert_eq!(row.actions, vec![Action::Retry, Action::Dismiss]);
+    assert_eq!(row.rev, marked.rev + 1);
+    // Not a new write to judge: a later restart page still sees this row as left over.
+    assert_eq!(row.updated_at, marked.updated_at);
+    assert_eq!(row.state_revision, revision + 1);
+    // Done: a second pass does nothing. A session with no row or no delivery neither.
+    assert!(!f.ledger.refresh_open_actions("s1").unwrap().changed);
+    assert!(!f.ledger.refresh_open_actions("nobody").unwrap().changed);
 }

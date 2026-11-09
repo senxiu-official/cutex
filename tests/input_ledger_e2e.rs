@@ -234,6 +234,10 @@ fn stale_blocked_notice_private_daemon_recovery() {
 fn harness_sleeper_child() {
     if std::env::var_os(daemon::SLEEPER_ENV).is_some() {
         if let Some(target) = std::env::var(daemon::SLEEPER_FORWARD_ENV).ok().and_then(|port| port.parse().ok()) {
+            #[cfg(unix)]
+            if let Some(path) = std::env::var_os(daemon::SLEEPER_UNIX_ENV) {
+                daemon::forward_unix(target, std::path::Path::new(&path));
+            }
             daemon::forward_loopback(target);
         }
         std::thread::sleep(Duration::from_secs(3 * 3600));
@@ -1033,7 +1037,6 @@ fn s10_ctask_pass(kind: Kind) {
             "transcript": format!("claude:fixture:task:{task}")}}}));
     let notice = wait_kind(&w, b, "systemNotice", 1, T).remove(0);
     wait_active(fake_b);
-    let served_during_slow_initialize=Instant::now()<slow_initialize_ends;
     fake_b.complete("completed");
     w.wait_settled(&[&notice], SETTLE);
     w.daemon.wait_active_turn(&sid_b, false, T);
@@ -1065,13 +1068,9 @@ fn s10_ctask_pass(kind: Kind) {
         log.lines().filter(|line| line.contains("Claude observer pass")).collect::<Vec<_>>().join("\n"));
     let slow_pass = slow_pass.unwrap();
     eprintln!("s10p: notice sent {lag} ms after it was queued; {slow_pass}");
+    // The wake's bound. Who served it does not matter: a dedicated wake worker
+    // or the pass itself (zero-wait bus polls leave nothing after A's visit to wait for).
     assert!(lag <= 2000, "{notice}: sent {lag} ms after it was queued (not served between sessions of the pass)");
-    // A dedicated wake worker may serve B before A even finishes connecting,
-    // so the pass counter can stay zero. Prove that earlier native start by
-    // the fake's actual initialize deadline; do not accept a post-pass enqueue.
-    assert!(!slow_pass.contains(" 0 woken served") || served_during_slow_initialize,
-        "the wake waited for the pass to end: {slow_pass}");
-    eprintln!("s10p: native delivery before slow initialize ended: {served_during_slow_initialize}");
 }
 one!(s10_claude_task_notice_during_a_slow_pass, s10_ctask_pass, Kind::Claude, green);
 
@@ -1693,6 +1692,13 @@ fn s20c_run(kind: Kind, restart: bool) {
                 && e.cutex_session_id.as_deref() == Some(sid.as_str()))
             .find_map(|e| e.payload.get("delivery").cloned())
     };
+    let turn_delivery = |d: &Value| d["state"] == "turn" && d["turn"]["turnId"] == json!(running)
+        && d["turn"]["kind"] == "delivery" && d["lease"]["holder"] == "event" && d["lease"]["turnId"] == json!(running);
+    // Accepted input, native turn observation and lease-bound delivery are
+    // separate publications. Restart only after the full scenario precondition
+    // is observed; accepted alone can still have an older unbound delivery.
+    assert!(w.wait(T, |t| delivery_of(t, 0).is_some_and(|d| turn_delivery(&d))),
+        "the running delivery turn and its bound event lease before restart: {:?}", delivery_of(&w.trace(), 0));
     let before = delivery_of(&w.trace(), 0).expect("a delivery before the restart");
     assert_eq!(before["lease"]["holder"], "event", "{before}");
     assert_eq!(before["lease"]["turnId"], json!(running), "{before}");
@@ -1706,8 +1712,6 @@ fn s20c_run(kind: Kind, restart: bool) {
     assert_eq!(w.daemon.active_turn(&sid).as_deref(), Some(running.as_str()), "activeTurnId is the running turn");
     assert_eq!(w.daemon.session(&sid)["runtime"]["runtimeGeneration"], generation, "same generation");
     assert_eq!(w.fake(0).active_turn().map(|t| t["id"].clone()), Some(json!(running)), "the fake still runs it");
-    let turn_delivery = |d: &Value| d["state"] == "turn" && d["turn"]["turnId"] == json!(running)
-        && d["turn"]["kind"] == "delivery" && d["lease"]["holder"] == "event" && d["lease"]["turnId"] == json!(running);
     let calls_before = w.fake(0).calls().len();
     w.submit(0, "s20c-owner", "auto", json!({})).expect("submit");
     // Waiting, or joined the running turn; never a turn of its own.
@@ -2748,10 +2752,19 @@ fn switch_off_s10_job_notice_reaches_claude() {
 
 #[test]
 fn switch_off_s24_cross_host_tell_reaches_claude_at_once() {
-    let mut receiver_spec = WorldSpec::new(&[Kind::Claude]).bus().ledger(false).persistent(0).script(0, auto(300));
+    timed_cross_host_tell_reaches_claude_at_once(false);
+}
+
+#[test]
+fn s24_cross_host_tell_reaches_claude_at_once() {
+    timed_cross_host_tell_reaches_claude_at_once(true);
+}
+
+fn timed_cross_host_tell_reaches_claude_at_once(ledger_on: bool) {
+    let mut receiver_spec = WorldSpec::new(&[Kind::Claude]).bus().ledger(ledger_on).persistent(0).script(0, auto(300));
     receiver_spec.options.peers = true;
     let b = World::start("off-s24-claude", receiver_spec);
-    let mut sender_spec = WorldSpec::new(&[Kind::Codex]).bus().ledger(false).persistent(0).script(0, auto(300));
+    let mut sender_spec = WorldSpec::new(&[Kind::Codex]).bus().ledger(ledger_on).persistent(0).script(0, auto(300));
     sender_spec.options.peers = true;
     let a = World::start("off-s24-sender-claude", sender_spec);
     let pair = daemon::pair_peers(&a.daemon, &b.daemon, b.sid(0));
@@ -2797,7 +2810,8 @@ fn switch_off_s24_cross_host_tell_reaches_claude_at_once() {
     assert!(took < Duration::from_millis(1500), "busy note reached the Claude adapter after {took:?}");
     b.fake(0).complete("completed");
     idle(&b);
-    assert!(!b.daemon.home.ledger_file().exists() && !a.daemon.home.ledger_file().exists(), "switch off: no ledger file");
+    assert_eq!(b.daemon.home.ledger_file().exists(), ledger_on, "receiver ledger mode");
+    assert_eq!(a.daemon.home.ledger_file().exists(), ledger_on, "sender ledger mode");
     b.finish(LOOSE);
     a.finish(LOOSE);
 }
@@ -3087,3 +3101,550 @@ fn r276_r275_notice_delivery_claude(){r276_previous_notice_delivery(Kind::Claude
 #[test]
 #[ignore="requires R276_PREVIOUS_EXE pinned to exact r275, isolated kit-predecessor probe"]
 fn r276_r275_notice_delivery_codex(){r276_previous_notice_delivery(Kind::Codex);}
+
+// ---------------------------------------------------------------------------
+// Stuck resend (owner report 2026-11-07): a Design 057 carry reserved by an
+// owner steer the runtime then dropped. Actual daemon, real source-store
+// reservation, the real `send_start` path (the unit tests fake it).
+
+/// An unread owner steer that carries a bus note, in a running turn.
+fn carried_steer(id_base: &str, kind: Kind) -> (World, String, String, String) {
+    let script = Script { pending_steer: true, claude_soon: true, ..Script::default() };
+    let mut spec = WorldSpec::new(&[kind, Kind::Codex]).bus().script(0, script).owner_carries(0);
+    spec.options.wake_busy_wait_secs = Some(60);
+    let w = World::start(&name(id_base, kind), spec);
+    let turn = w.fake(0).begin_turn();
+    w.daemon.wait_active_turn(w.sid(0), true, T);
+    assert!(w.bus_send(1, 0, &format!("{id_base} carried note"), &[]).status.success());
+    let notice = wait_kind(&w, 0, "agentMessage", 1, T).remove(0);
+    let owner = format!("{id_base}-owner");
+    w.submit(0, &owner, "auto", json!({})).expect("busy owner steer");
+    let steers = w.fake(0).wait_call("turn/steer", 1, T);
+    assert_eq!(carry_ids_057(&steers[0].params), [notice.clone()], "the steer carries the note");
+    assert!(w.source_owner_blocked(0, &notice), "the source store holds the real reservation");
+    (w, turn, notice, owner)
+}
+
+fn owner_sends(w: &World, method: &str, id: &str) -> Vec<Value> {
+    w.fake(0).calls_of(method).into_iter().filter(|call| call.params["clientUserMessageId"] == id).map(|call| call.params).collect()
+}
+
+fn native_user_items(w: &World, id: &str) -> usize {
+    w.fake(0).turns().iter().flat_map(|turn| turn["items"].as_array().unwrap().clone())
+        .filter(|item| item["type"] == "userMessage" && item["clientId"] == id).count()
+}
+
+fn resend(w: &World, id: &str) -> Value {
+    let record = w.input_record(0, id);
+    assert!(record["actions"].as_array().is_some_and(|actions| actions.iter().any(|action| action == "retry")), "{record}");
+    let result = w.daemon.cutex(w.sid(0), "cutex/input/retry", json!({"inputId": id, "expectedRev": record["rev"]})).expect("retry");
+    w.recorder.mark("retry", result.clone());
+    result
+}
+
+// interruptSend of the steer: it was proven dropped, so it goes out once as
+// the next turn's first input, alone. The note's reservation is not released
+// and the note is not carried again.
+fn stuck_interrupt_send(kind: Kind) {
+    let (w, turn, notice, owner) = carried_steer("stuck-isend", kind);
+    let ready = w.wait(T, |t| t.records("session", &owner).last().is_some_and(|r| r["state"] == "accepted"
+        && r["actions"].as_array().is_some_and(|a| a.iter().any(|a| a == "interruptSend"))));
+    assert!(ready, "{:?}", w.trace().path(&owner));
+    let record = w.input_record(0, &owner);
+    let list = w.recorder.read_input_list(&w.daemon, w.sid(0)).expect("input/list");
+    let result = w.daemon.cutex(w.sid(0), "cutex/input/interruptSend", json!({"inputId": owner, "expectedRev": record["rev"],
+        "expectedTurnId": turn, "expectedRuntimeGeneration": list["delivery"]["runtimeGeneration"]})).expect("interruptSend");
+    w.recorder.mark("interruptSend", result.clone());
+    w.wait_settled(&[&owner], SETTLE);
+    let done = w.input_record(0, &owner);
+    assert_eq!(done["state"], "inContext", "the proven-dropped steer goes out: {done} path {:?}", w.trace().path(&owner));
+    assert_eq!(done["evidence"], "turnStartInput", "{done}");
+    let starts = owner_sends(&w, "turn/start", &owner);
+    assert_eq!(starts.len(), 1, "one turn/start only: {starts:?}");
+    assert!(carry_ids_057(&starts[0]).is_empty(), "the note is not carried again: {:?}", starts[0]);
+    assert_eq!(owner_sends(&w, "turn/steer", &owner).len(), 1);
+    assert_eq!(native_user_items(&w, &owner), 1, "one native occurrence");
+    assert!(done["carries"].as_array().is_none_or(|ids| ids.is_empty()), "{done}");
+    assert!(w.source_owner_blocked(0, &notice), "057 section 6: an absent carrier does not release the reservation");
+    assert_ne!(w.input_record(0, &notice)["state"], "inContext", "the note was not read");
+    w.finish(LOOSE);
+}
+both!(stuck_interrupt_send_goes_out_alone_once, stuck_interrupt_send, green);
+
+// A plain stop drops both unread steers. The later one is resent first and
+// overtakes; the earlier, carrying one must still get out, once.
+fn stuck_overtaken(kind: Kind) {
+    let (w, _turn, notice, earlier) = carried_steer("stuck-over", kind);
+    let later = "stuck-over-later".to_string();
+    w.submit(0, &later, "auto", json!({})).expect("second steer");
+    w.fake(0).wait_call("turn/steer", 2, T);
+    w.wait_state(&later, "accepted", T);
+    w.fake(0).complete("interrupted");
+    w.daemon.wait_active_turn(w.sid(0), false, T);
+    w.wait_state(&earlier, "failed{notDelivered}", SETTLE);
+    w.wait_state(&later, "failed{notDelivered}", SETTLE);
+
+    assert_eq!(resend(&w, &later)["redelivery"]["ok"], true);
+    w.wait_settled(&[&later], SETTLE);
+    assert_eq!(w.input_record(0, &later)["state"], "inContext");
+    assert!(w.fake(0).active_turn().is_some(), "the later message's turn runs");
+
+    let result = resend(&w, &earlier);
+    assert_eq!(result["redelivery"]["ok"], true, "the earlier message is not stranded: {result}");
+    let again = owner_sends(&w, "turn/steer", &earlier);
+    assert_eq!(again.len(), 2, "first steer + one resend: {again:?}");
+    assert!(carry_ids_057(&again[1]).is_empty(), "alone: {:?}", again[1]);
+    w.fake(0).complete("completed");
+    w.wait_settled(&[&earlier], SETTLE);
+    let done = w.input_record(0, &earlier);
+    assert_eq!(done["state"], "inContext", "{done} path {:?}", w.trace().path(&earlier));
+    assert_eq!(native_user_items(&w, &earlier), 1, "one native occurrence");
+    assert_eq!(native_user_items(&w, &later), 1, "one native occurrence");
+    assert!(w.source_owner_blocked(0, &notice));
+    w.finish(LOOSE);
+}
+both!(stuck_overtaking_never_strands_the_earlier_message, stuck_overtaken, green);
+
+// Claude: the adapter proves a dropped steer's note unread and gives it back.
+
+fn returned_steer(id_base: &str) -> (World, String, String, String) {
+    let script = Script { pending_steer: true, claude_soon: true, owner_carry_return: true, ..Script::default() };
+    let mut spec = WorldSpec::new(&[Kind::Claude, Kind::Codex]).bus().script(0, script).owner_carries(0);
+    spec.options.wake_busy_wait_secs = Some(60);
+    let w = World::start(&name(id_base, Kind::Claude), spec);
+    let turn = w.fake(0).begin_turn();
+    w.daemon.wait_active_turn(w.sid(0), true, T);
+    assert!(w.bus_send(1, 0, &format!("{id_base} carried note"), &[]).status.success());
+    let notice = wait_kind(&w, 0, "agentMessage", 1, T).remove(0);
+    let owner = format!("{id_base}-owner");
+    w.submit(0, &owner, "auto", json!({})).expect("busy owner steer");
+    let steers = w.fake(0).wait_call("turn/steer", 1, T);
+    assert_eq!(carry_ids_057(&steers[0].params), [notice.clone()], "the steer carries the note");
+    (w, turn, notice, owner)
+}
+
+fn wait_returned(w: &World, notice: &str) -> Value {
+    let returned = w.wait(SETTLE, |t| t.records("session", notice).iter().any(|r| r["state"] == "waiting" && r["reason"] == "returned"));
+    assert!(returned, "the note came back: {:?}", w.trace().path(notice));
+    let trace = w.trace();
+    let records = trace.records("session", notice);
+    (*records.iter().find(|r| r["state"] == "waiting" && r["reason"] == "returned").unwrap()).clone()
+}
+
+fn note_occurrences(w: &World, notice: &str) -> usize {
+    w.fake(0).turns().iter().flat_map(|turn| turn["items"].as_array().unwrap().clone())
+        .filter(|item| item["id"] == notice).count()
+}
+
+// Stopped by interrupt and send: the message goes out alone, and the note it
+// carried comes back and is delivered once, on its own.
+fn returned_after_interrupt_send(kind: Kind) {
+    assert_eq!(kind, Kind::Claude);
+    let (w, turn, notice, owner) = returned_steer("ret-isend");
+    let ready = w.wait(T, |t| t.records("session", &owner).last().is_some_and(|r| r["state"] == "accepted"
+        && r["actions"].as_array().is_some_and(|a| a.iter().any(|a| a == "interruptSend"))));
+    assert!(ready, "{:?}", w.trace().path(&owner));
+    let record = w.input_record(0, &owner);
+    let list = w.recorder.read_input_list(&w.daemon, w.sid(0)).expect("input/list");
+    w.daemon.cutex(w.sid(0), "cutex/input/interruptSend", json!({"inputId": owner, "expectedRev": record["rev"],
+        "expectedTurnId": turn, "expectedRuntimeGeneration": list["delivery"]["runtimeGeneration"]})).expect("interruptSend");
+    w.wait_settled(&[&owner], SETTLE);
+    assert_eq!(owner_sends(&w, "turn/start", &owner).len(), 1);
+    let back = wait_returned(&w, &notice);
+    assert!(back["details"].get("carriedByOwner").is_none(), "{back}");
+    assert_eq!(back["details"]["carrierUnread"], true, "{back}");
+    assert!(back["turnId"].is_null(), "not in any turn: {back}");
+    assert_ne!(back["surface"], "timeline", "{back}");
+    assert!(!w.source_owner_blocked(0, &notice), "the reservation is gone");
+    // The owner's turn, then the note's own turn behind it.
+    w.fake(0).complete("completed");
+    assert!(w.wait(SETTLE, |_| w.fake(0).active_turn().is_some() && note_occurrences(&w, &notice) > 0), "the note goes out in its own turn");
+    w.fake(0).complete("completed");
+    w.wait_settled(&[&notice], SETTLE);
+    let done = w.input_record(0, &notice);
+    assert_eq!(done["state"], "inContext", "{done} path {:?}", w.trace().path(&notice));
+    assert_eq!(note_occurrences(&w, &notice), 1, "one native occurrence");
+    let submits: Vec<_> = w.fake(0).calls_of("thread/externalInput/submit").into_iter()
+        .filter(|call| call.params["message"]["id"] == notice.as_str()).collect();
+    assert_eq!(submits.len(), 1, "sent on its own once: {submits:?}");
+    assert_eq!(owner_sends(&w, "turn/steer", &owner).len(), 1);
+    w.finish(LOOSE);
+}
+one!(returned_note_after_interrupt_send_goes_out_once, returned_after_interrupt_send, Kind::Claude, green);
+
+// A plain stop: the note comes back with nothing else done; the owner's own
+// resend later adds no second copy.
+fn returned_after_plain_stop(kind: Kind) {
+    assert_eq!(kind, Kind::Claude);
+    let (w, _turn, notice, owner) = returned_steer("ret-stop");
+    w.fake(0).complete("interrupted");
+    w.daemon.wait_active_turn(w.sid(0), false, T);
+    w.wait_state(&owner, "failed{notDelivered}", SETTLE);
+    wait_returned(&w, &notice);
+    assert!(w.wait(SETTLE, |_| w.fake(0).active_turn().is_some() && note_occurrences(&w, &notice) > 0), "the note goes out in its own turn");
+    assert_eq!(resend(&w, &owner)["redelivery"]["ok"], true);
+    w.fake(0).complete("completed");
+    w.wait_settled(&[&notice, &owner], SETTLE);
+    assert_eq!(note_occurrences(&w, &notice), 1, "one native occurrence");
+    assert_eq!(native_user_items(&w, &owner), 1, "one native occurrence");
+    w.finish(LOOSE);
+}
+one!(returned_note_after_a_plain_stop_is_not_doubled_by_the_owners_resend, returned_after_plain_stop, Kind::Claude, green);
+
+// Read at a tool boundary before the stop: not proven unread, it stays.
+fn not_returned_when_read(kind: Kind) {
+    assert_eq!(kind, Kind::Claude);
+    let (w, _turn, notice, owner) = returned_steer("ret-read");
+    w.fake(0).step().expect("the boundary reads the steer and its note");
+    assert!(w.wait(T, |_| note_occurrences(&w, &notice) == 1), "read");
+    w.fake(0).complete("interrupted");
+    w.daemon.wait_active_turn(w.sid(0), false, T);
+    std::thread::sleep(Duration::from_secs(7));
+    let trace = w.trace();
+    assert!(!trace.records("session", &notice).iter().any(|r| r["state"] == "waiting" && r["reason"] == "returned"),
+        "{:?}", trace.path(&notice));
+    assert!(w.fake(0).calls_of("thread/externalInput/submit").iter().all(|call| call.params["message"]["id"] != notice.as_str()),
+        "never sent a second time");
+    assert_eq!(note_occurrences(&w, &notice), 1);
+    assert_eq!(native_user_items(&w, &owner), 1);
+    w.finish(LOOSE);
+}
+one!(a_note_read_before_the_stop_is_never_returned, not_returned_when_read, Kind::Claude, green);
+
+// A runtime without `ownerCarryReturn`: not asked, the reservation stays.
+fn old_adapter_keeps_the_reservation(kind: Kind) {
+    assert_eq!(kind, Kind::Claude);
+    let (w, _turn, notice, owner) = carried_steer("ret-old", kind);
+    w.fake(0).complete("interrupted");
+    w.daemon.wait_active_turn(w.sid(0), false, T);
+    w.wait_state(&owner, "failed{notDelivered}", SETTLE);
+    std::thread::sleep(Duration::from_secs(7));
+    assert!(w.fake(0).calls_of("thread/externalInput/returnCarries").is_empty());
+    assert!(w.source_owner_blocked(0, &notice));
+    w.finish(LOOSE);
+}
+one!(a_runtime_without_the_capability_keeps_the_reservation, old_adapter_keeps_the_reservation, Kind::Claude, green);
+
+// Owner report 2026-11-08 (real desktop): a carried steer whose reply was lost
+// has an unresolved delivery and a source reservation. Once the thread is idle,
+// the grace is over and history does not show it, the owner's resend goes alone.
+
+/// A carrying steer whose reply is lost in a dropped connection; its turn then stops.
+fn lost_reply_steer(id_base: &str, kind: Kind, give_back: bool) -> (World, String, String, String) {
+    let script = Script { pending_steer: true, claude_soon: true, owner_carry_return: give_back, steer_delay: Duration::from_secs(4), ..Script::default() };
+    let mut spec = WorldSpec::new(&[kind, Kind::Codex]).bus().script(0, script).owner_carries(0);
+    spec.options.wake_busy_wait_secs = Some(60);
+    let w = World::start(&name(id_base, kind), spec);
+    let turn = w.fake(0).begin_turn();
+    w.daemon.wait_active_turn(w.sid(0), true, T);
+    assert!(w.bus_send(1, 0, &format!("{id_base} carried note"), &[]).status.success());
+    let notice = wait_kind(&w, 0, "agentMessage", 1, T).remove(0);
+    let owner = format!("{id_base}-owner");
+    let body = json!({"requestId": uuid::Uuid::new_v4().to_string(), "method": "cutex/userInput/submit", "params": {
+        "clientUserMessageId": owner, "origin": {"kind": "other", "clientId": "input-ledger-e2e"}, "strategy": "auto",
+        "input": [{"type": "text", "text": owner, "text_elements": []}]}});
+    let (port, token, sid) = (w.daemon.port, w.daemon.token.clone(), w.sid(0).to_string());
+    let sent = std::thread::spawn(move || daemon::http_request(port, &token, "POST", &format!("/v2/sessions/{sid}/cutex/requests"), Some(&body)));
+    let steers = w.fake(0).wait_call("turn/steer", 1, T);
+    assert_eq!(carry_ids_057(&steers[0].params), [notice.clone()], "the steer carries the note");
+    std::thread::sleep(Duration::from_millis(500));
+    w.fake(0).disconnect_all();
+    w.fake(0).script(|s| s.steer_delay = Duration::ZERO);
+    let _ = sent.join().expect("submit thread");
+    w.daemon.wait_connected(w.sid(0), Duration::from_secs(60));
+    w.fake(0).complete("interrupted");
+    w.daemon.wait_active_turn(w.sid(0), false, T);
+    let retryable = w.wait(SETTLE, |t| t.records("session", &owner).last().is_some_and(|r| r["state"] == "uncertain"
+        && r["actions"].as_array().is_some_and(|a| a.iter().any(|a| a == "retry"))));
+    assert!(retryable, "{:?}", w.trace().path(&owner));
+    (w, turn, notice, owner)
+}
+
+fn unknown_carrier_goes_alone(kind: Kind) {
+    let (w, turn, notice, owner) = lost_reply_steer("alone", kind, false);
+    // Within the grace: refused, nothing sent, the row keeps its actions and its carries.
+    let early = resend(&w, &owner);
+    assert_eq!(early["redelivery"]["ok"], false, "{early}");
+    assert_eq!(early["redelivery"]["error"]["code"], "user_input_in_progress", "{early}");
+    assert_eq!(early["redelivery"]["error"]["details"]["nothingSent"], true, "{early}");
+    assert_eq!(owner_sends(&w, "turn/start", &owner).len(), 0);
+    assert_eq!(owner_sends(&w, "turn/steer", &owner).len(), 1);
+    let row = w.input_record(0, &owner);
+    assert_eq!(row["state"], "uncertain", "{row}");
+    assert_eq!(row["actions"], json!(["retry", "dismiss"]), "{row}");
+    assert_eq!(row["carries"], json!([notice.clone()]), "{row}");
+    // Idle, the grace is over, history does not show it: it goes out, alone, once.
+    std::thread::sleep(Duration::from_secs(32));
+    let late = resend(&w, &owner);
+    assert_eq!(late["redelivery"]["ok"], true, "{late}");
+    let starts = owner_sends(&w, "turn/start", &owner);
+    assert_eq!(starts.len(), 1, "one turn/start: {starts:?}");
+    assert!(carry_ids_057(&starts[0]).is_empty(), "the note is not carried again: {:?}", starts[0]);
+    w.fake(0).complete("completed");
+    w.wait_settled(&[&owner], SETTLE);
+    // `inContext` comes with the turn's input; the native item is bound a moment
+    // later, in its own write. Take the row once both are in.
+    assert!(w.wait(SETTLE, |_| w.input_record(0, &owner)["timelineItemId"].is_string()), "{:?}", w.trace().path(&owner));
+    let done = w.input_record(0, &owner);
+    assert_eq!(done["state"], "inContext", "{done} path {:?}", w.trace().path(&owner));
+    assert!(done["carries"].as_array().is_none_or(|ids| ids.is_empty()), "{done}");
+    assert_eq!(native_user_items(&w, &owner), 1, "one native occurrence");
+    assert!(w.source_owner_blocked(0, &notice), "057 section 6: the note stays reserved");
+    assert_ne!(w.input_record(0, &notice)["state"], "inContext", "the note was not read");
+    assert_eq!(note_occurrences(&w, &notice), 0);
+    // The lost steer turns up late, on a later turn: its expected turn is gone.
+    let later = w.fake(0).begin_turn();
+    let late_steer = fake_runtime::Client::connect(&w.fake(0).url).request("turn/steer", json!({"threadId": w.fake(0).thread,
+        "expectedTurnId": turn, "clientUserMessageId": owner, "input": [{"type": "text", "text": owner, "text_elements": []}]}));
+    assert!(late_steer.is_err(), "{late_steer:?}");
+    assert_ne!(later, turn);
+    w.fake(0).complete("completed");
+    w.daemon.wait_active_turn(w.sid(0), false, T);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(native_user_items(&w, &owner), 1);
+    assert_eq!(owner_sends(&w, "turn/start", &owner).len(), 1, "nothing sent again");
+    let still = w.input_record(0, &owner);
+    for field in ["state", "turnId", "timelineItemId", "carries"] {
+        assert_eq!(still[field], done[field], "nothing moved: {field} {still}");
+    }
+    assert!(still["rev"].as_u64() >= done["rev"].as_u64(), "{still}");
+    // The accepted risk, as on the non-carried path: a late first turn/start
+    // has no turn to be held to. The model reads it twice; the row stays one row.
+    let late_start = fake_runtime::Client::connect(&w.fake(0).url).request("turn/start", json!({"threadId": w.fake(0).thread,
+        "clientUserMessageId": owner, "input": [{"type": "text", "text": owner, "text_elements": []}]}));
+    assert!(late_start.is_ok(), "{late_start:?}");
+    w.fake(0).complete("completed");
+    w.daemon.wait_active_turn(w.sid(0), false, T);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(native_user_items(&w, &owner), 2);
+    let after = w.input_record(0, &owner);
+    assert_eq!(after["state"], "inContext", "{after}");
+    assert_eq!(after["turnId"], done["turnId"], "{after}");
+    w.finish(LOOSE);
+}
+both!(a_carrier_with_an_unknown_delivery_goes_out_alone_after_the_grace, unknown_carrier_goes_alone, green);
+
+// With the capability: the note the dropped steer carried comes back and goes out once.
+fn unknown_carrier_note_returns(kind: Kind) {
+    assert_eq!(kind, Kind::Claude);
+    let (w, _turn, notice, owner) = lost_reply_steer("alone-ret", kind, true);
+    // The interrupted turn proved it unread: it is back, in its own turn, and
+    // the owner's resend waits for that turn like any other.
+    wait_returned(&w, &notice);
+    assert!(w.wait(SETTLE, |_| w.fake(0).active_turn().is_some() && note_occurrences(&w, &notice) > 0), "the note goes out in its own turn");
+    std::thread::sleep(Duration::from_secs(32));
+    let busy = resend(&w, &owner);
+    assert_eq!(busy["redelivery"]["error"]["code"], "user_input_in_progress", "{busy}");
+    w.fake(0).complete("completed");
+    w.wait_settled(&[&notice], SETTLE);
+    w.daemon.wait_active_turn(w.sid(0), false, T);
+    let late = resend(&w, &owner);
+    assert_eq!(late["redelivery"]["ok"], true, "{late}");
+    assert_eq!(owner_sends(&w, "turn/start", &owner).len(), 1);
+    w.fake(0).complete("completed");
+    w.wait_settled(&[&owner], SETTLE);
+    assert_eq!(note_occurrences(&w, &notice), 1, "one native occurrence");
+    assert_eq!(native_user_items(&w, &owner), 1, "one native occurrence");
+    w.finish(LOOSE);
+}
+one!(the_note_of_a_carrier_gone_alone_returns_once, unknown_carrier_note_returns, Kind::Claude, green);
+
+// An upgrade: rows written by an older build keep the actions it stored, and
+// a restart whose stored delivery is unchanged did not recompute them.
+fn restart_gives_old_rows_their_actions(kind: Kind) {
+    let script = Script { auto_complete_after: None, ..Script::default() };
+    let mut w = World::start(&name("old-actions", kind), WorldSpec::new(&[kind]).script(0, script));
+    let sid = w.sid(0).to_string();
+    let id = "old-actions-m1";
+    w.fake(0).begin_turn();
+    w.daemon.wait_active_turn(&sid, true, T);
+    w.submit(0, id, "auto", json!({})).expect("steer");
+    w.wait_state(id, "accepted", T);
+    w.fake(0).complete("interrupted");
+    w.daemon.wait_active_turn(&sid, false, T);
+    let stored = w.wait(SETTLE, |t| t.records("session", id).last().is_some_and(|r| r["state"] == "failed" || r["state"] == "uncertain" || r["state"] == "inContext"));
+    assert!(stored, "{:?}", w.trace().path(id));
+    w.recorder.stop().save(&w.daemon.home.root.join("preparation-trace.jsonl")).unwrap();
+    w.recorder = daemon::Recorder::new();
+    w.daemon.stop_all();
+    let path = w.daemon.home.ledger_file();
+    let (before_rev, before_revision) = {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        // What r277 left: a stranded resend, no actions.
+        let raw: String = db.query_row("SELECT record_json FROM input_ledger WHERE input_id = ?1", [id], |r| r.get(0)).unwrap();
+        let mut record: Value = serde_json::from_str(&raw).unwrap();
+        record["state"] = json!("waiting");
+        record["reason"] = json!("ownerRetry");
+        record["surface"] = json!("nextUp");
+        record["evidence"] = Value::Null;
+        record["stalled"] = json!({"reason": "noProgress", "since": record["since"]});
+        record["actions"] = json!([]);
+        db.execute("UPDATE input_ledger SET record_json = ?1, state = 'waiting', terminal = 0 WHERE input_id = ?2", rusqlite::params![record.to_string(), id]).unwrap();
+        // The delivery a restart will find again.
+        let delivery: String = db.query_row("SELECT delivery_json FROM input_ledger_sessions WHERE session = ?1", [&sid], |r| r.get(0)).unwrap();
+        let mut delivery: Value = serde_json::from_str(&delivery).unwrap();
+        delivery["state"] = json!("idle");
+        delivery["runtimeConnected"] = json!(true);
+        delivery["turn"] = Value::Null;
+        db.execute("UPDATE input_ledger_sessions SET delivery_json = ?1 WHERE session = ?2", rusqlite::params![delivery.to_string(), sid]).unwrap();
+        let revision: i64 = db.query_row("SELECT state_revision FROM input_ledger_sessions WHERE session = ?1", [&sid], |r| r.get(0)).unwrap();
+        (record["rev"].as_u64().unwrap(), revision)
+    };
+    w.daemon.start();
+    w.daemon.wait_connected(&sid, world::CONNECT_TIMEOUT);
+    w.recorder.subscribe_latest(&w.daemon, "session", Some(&sid));
+    let until = Instant::now() + Duration::from_secs(8);
+    let row = loop {
+        let row = w.input_record(0, id);
+        if row["actions"] == json!(["retry", "dismiss"]) || Instant::now() >= until {
+            break row;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(row["actions"], json!(["retry", "dismiss"]), "the upgrade left it without actions: {row}");
+    assert!(row["rev"].as_u64().unwrap() > before_rev, "{row}");
+    let list = w.recorder.read_input_list(&w.daemon, &sid).expect("input/list");
+    assert!(list["delivery"]["stateRevision"].as_i64().unwrap() > before_revision, "{list}");
+    w.finish(LOOSE);
+}
+both!(a_restart_gives_rows_of_an_older_build_their_actions, restart_gives_old_rows_their_actions, green);
+
+// The carrier is over, nothing proved the note unread and the adapter cannot
+// give it back: without a restart the note gets its own retry and dismiss.
+fn wait_note_way_out(w: &World, notice: &str) -> Value {
+    let free = w.wait(Duration::from_secs(150), |_| {
+        let note = w.input_record(0, notice);
+        note["state"] == "uncertain" && note["actions"] == json!(["retry", "dismiss"])
+    });
+    let note = w.input_record(0, notice);
+    assert!(free, "{note} path {:?}", w.trace().path(notice));
+    assert_ne!(note["surface"], "timeline", "{note}");
+    assert_eq!(note_occurrences(w, notice), 0, "not read");
+    note
+}
+
+fn retry_note(w: &World, notice: &str) {
+    let retried = resend(w, notice);
+    assert_eq!(retried["redelivery"]["ok"], true, "{retried}");
+    assert_eq!(retried["redelivery"]["mayArriveTwice"], true, "it cannot be proven unread: {retried}");
+    assert!(!w.source_owner_blocked(0, notice), "the retry leaves the bundle");
+}
+
+// The runtime never had it: the retry reaches the model, once, and is not undone.
+fn note_retry_goes_once(w: &World, notice: &str) {
+    w.fake(0).forget_input(notice);
+    retry_note(w, notice);
+    // The debug delivery repeats a pending submit every sweep; the runtime
+    // holds one input per id, so what counts is what the model reads.
+    let read = w.wait(SETTLE, |_| {
+        if w.fake(0).active_turn().is_some() {
+            w.fake(0).complete("completed");
+        }
+        w.input_record(0, notice)["state"] == "inContext"
+    });
+    assert!(read, "{} path {:?}", w.input_record(0, notice), w.trace().path(notice));
+    std::thread::sleep(Duration::from_secs(40));
+    assert_eq!(w.input_record(0, notice)["state"], "inContext");
+    assert_eq!(note_occurrences(w, notice), 1, "one native occurrence");
+}
+
+// The runtime holds it as interrupted and does not run the same id again: the
+// row does not sit at accepted with no action, the owner can still dismiss it.
+fn note_retry_not_taken_can_be_dismissed(w: &World, notice: &str) {
+    retry_note(w, notice);
+    let note = wait_note_way_out(w, notice);
+    w.daemon.cutex(w.sid(0), "cutex/input/dismiss", json!({"inputId": notice, "expectedRev": note["rev"]})).expect("dismiss note");
+    assert_eq!(w.input_record(0, notice)["state"], "discarded");
+    assert_eq!(note_occurrences(w, notice), 0);
+}
+
+fn carrier_failed(w: &World, owner: &str) {
+    w.fake(0).complete("interrupted");
+    w.daemon.wait_active_turn(w.sid(0), false, T);
+    let retryable = w.wait(SETTLE, |t| t.records("session", owner).last().is_some_and(|r|
+        r["actions"].as_array().is_some_and(|a| a.iter().any(|a| a == "retry"))));
+    assert!(retryable, "{:?}", w.trace().path(owner));
+}
+
+fn note_after_carrier_went_alone(kind: Kind) {
+    let (w, _turn, notice, owner) = carried_steer("note-alone", kind);
+    carrier_failed(&w, &owner);
+    let sent = resend(&w, &owner);
+    assert_eq!(sent["redelivery"]["ok"], true, "{sent}");
+    assert_eq!(owner_sends(&w, "turn/start", &owner).len(), 1);
+    w.fake(0).complete("completed");
+    w.wait_settled(&[&owner], SETTLE);
+    wait_note_way_out(&w, &notice);
+    note_retry_not_taken_can_be_dismissed(&w, &notice);
+    w.finish(LOOSE);
+}
+both!(a_note_whose_carrier_went_alone_gets_its_own_retry, note_after_carrier_went_alone, green);
+
+fn note_after_carrier_dismissed(kind: Kind) {
+    let (w, _turn, notice, owner) = carried_steer("note-dismiss", kind);
+    carrier_failed(&w, &owner);
+    let record = w.input_record(0, &owner);
+    w.daemon.cutex(w.sid(0), "cutex/input/dismiss", json!({"inputId": owner, "expectedRev": record["rev"]})).expect("dismiss owner");
+    let note = wait_note_way_out(&w, &notice);
+    w.daemon.cutex(w.sid(0), "cutex/input/dismiss", json!({"inputId": notice, "expectedRev": note["rev"]})).expect("dismiss note");
+    let gone = w.input_record(0, &notice);
+    assert_eq!(gone["state"], "discarded", "{gone}");
+    assert_eq!(gone["reason"], "ownerDiscarded", "{gone}");
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(w.fake(0).calls_of("thread/externalInput/submit").iter().filter(|call| call.params["message"]["id"] == notice).count(), 0, "dismissed, never sent");
+    assert_eq!(note_occurrences(&w, &notice), 0);
+    w.finish(LOOSE);
+}
+both!(a_note_whose_carrier_was_dismissed_can_be_dismissed, note_after_carrier_dismissed, green);
+
+fn note_after_interrupt_send(kind: Kind) {
+    let (w, turn, notice, owner) = carried_steer("note-isend", kind);
+    let ready = w.wait(T, |t| t.records("session", &owner).last().is_some_and(|r| r["state"] == "accepted"
+        && r["actions"].as_array().is_some_and(|a| a.iter().any(|a| a == "interruptSend"))));
+    assert!(ready, "{:?}", w.trace().path(&owner));
+    let record = w.input_record(0, &owner);
+    let list = w.recorder.read_input_list(&w.daemon, w.sid(0)).expect("input/list");
+    w.daemon.cutex(w.sid(0), "cutex/input/interruptSend", json!({"inputId": owner, "expectedRev": record["rev"],
+        "expectedTurnId": turn, "expectedRuntimeGeneration": list["delivery"]["runtimeGeneration"]})).expect("interruptSend");
+    w.wait_settled(&[&owner], SETTLE);
+    if w.fake(0).active_turn().is_some() {
+        w.fake(0).complete("completed");
+    }
+    wait_note_way_out(&w, &notice);
+    note_retry_goes_once(&w, &notice);
+    w.finish(LOOSE);
+}
+both!(a_note_whose_carrier_was_settled_by_interrupt_send_gets_its_own_retry, note_after_interrupt_send, green);
+
+// A delegation result a steer carried: the asks store gives it its way out when
+// the carrier's turn ends. The retry is answered honestly and the row stays
+// dismissible, whatever the runtime does with it.
+fn result_after_carrier_dismissed(kind: Kind) {
+    let script = Script { pending_steer: true, claude_soon: true, ..Script::default() };
+    let mut spec = WorldSpec::new(&[kind, Kind::Claude]).bus().persistent(0).persistent(1).script(0, script).script(1, auto(300)).owner_carries(0);
+    spec.options.wake_busy_wait_secs = Some(60);
+    let w = World::start(&name("result-left", kind), spec);
+    w.fake(0).begin_turn();
+    w.daemon.wait_active_turn(w.sid(0), true, T);
+    let result = delegation_result(&w, 0, 1);
+    let owner = "result-left-owner";
+    w.submit(0, owner, "auto", json!({})).expect("busy owner steer");
+    assert!(w.wait(T, |_| w.input_record(0, owner)["carries"] == json!([result.clone()])), "{} path {:?}", w.input_record(0, owner), w.trace().path(&result));
+    assert_eq!(w.input_record(0, &result)["details"]["carriedByOwner"], owner, "the rule reads this");
+    carrier_failed(&w, owner);
+    let record = w.input_record(0, owner);
+    w.daemon.cutex(w.sid(0), "cutex/input/dismiss", json!({"inputId": owner, "expectedRev": record["rev"]})).expect("dismiss owner");
+    let left = wait_note_way_out(&w, &result);
+    assert_eq!(left["kind"], "delegationResult");
+    assert_eq!(left["reason"], "turnInterrupted", "{left}");
+    let retried = resend(&w, &result);
+    assert_eq!(retried["redelivery"]["ok"], true, "{retried}");
+    assert_eq!(retried["redelivery"]["path"], "delegationResultRequeue", "{retried}");
+    assert_eq!(retried["redelivery"]["mayArriveTwice"], true, "{retried}");
+    let row = w.input_record(0, &result);
+    assert!(row["actions"].as_array().is_some_and(|actions| actions.iter().any(|action| action == "dismiss")), "{row}");
+    w.daemon.cutex(w.sid(0), "cutex/input/dismiss", json!({"inputId": result, "expectedRev": row["rev"]})).expect("dismiss result");
+    assert_eq!(w.input_record(0, &result)["state"], "discarded");
+    w.finish(LOOSE);
+}
+both!(a_delegation_result_whose_carrier_was_dismissed_gets_its_own_retry, result_after_carrier_dismissed, green);

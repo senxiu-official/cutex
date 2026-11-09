@@ -309,6 +309,30 @@ pub(crate) fn process_start_ticks(pid: u32) -> Result<u64, JobError> {
         .map_err(|_| JobError::Invalid("invalid proc start time".into()))
 }
 
+/// Read birth and scheduling state from one proc record so PID reuse cannot
+/// attribute a different process's pause to this job.
+pub(crate) fn observed_process_state(pid: u32, expected_start: u64) -> Option<crate::model::ProcessObservation> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let state = parse_process_state(&stat, expected_start)?;
+    Some(crate::model::ProcessObservation {
+        state: state.into(),
+        observed_at_epoch_millis: epoch_millis(SystemTime::now())?,
+    })
+}
+
+fn parse_process_state(stat: &str, expected_start: u64) -> Option<&'static str> {
+    let close = stat.rfind(')')?;
+    let fields: Vec<_> = stat.get(close + 2..)?.split_whitespace().collect();
+    if fields.get(19)?.parse::<u64>().ok()? != expected_start { return None; }
+    match *fields.first()? {
+        "T" | "t" => Some("stopped"),
+        "R" => Some("running"),
+        "S" | "D" | "I" => Some("sleeping"),
+        "Z" | "X" | "x" => Some("exited"),
+        _ => None,
+    }
+}
+
 fn signal_group(pgid: u32, signal: i32) -> Result<(), JobError> {
     let result = unsafe { libc::kill(-(pgid as i32), signal) };
     if result != 0 {
@@ -344,6 +368,16 @@ use std::os::unix::fs::OpenOptionsExt;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observation_checks_process_birth_and_preserves_stopped_as_nonterminal() {
+        let record = |state: &str, birth: u64| format!("123 (name with ) parentheses) {state} {} {birth} 0", vec!["0"; 18].join(" "));
+        assert_eq!(super::parse_process_state(&record("T", 42), 42), Some("stopped"));
+        assert_eq!(super::parse_process_state(&record("t", 42), 42), Some("stopped"));
+        assert_eq!(super::parse_process_state(&record("S", 42), 42), Some("sleeping"));
+        assert_eq!(super::parse_process_state(&record("R", 42), 43), None);
+        assert_eq!(super::parse_process_state("broken", 42), None);
+        assert!(!crate::model::JobState::Running.terminal());
+    }
     use super::*;
 
     #[test]

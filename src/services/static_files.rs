@@ -108,6 +108,7 @@ fn user_homes() -> Vec<PathBuf> {
 
 /// Check `root` for `caller` without deciding about approval.
 pub fn check_root(root: &str, services_dir: &Path, caller: &Caller) -> ServicesResult<CheckedRoot> {
+    crate::artifacts::paths::validate_local_path(Path::new(root)).map_err(|_|ServicesError::new(403,"static_root_forbidden","unsafe root path"))?;
     let path = Path::new(root);
     if !path.is_absolute() {
         return Err(ServicesError::bad_request(format!(
@@ -248,6 +249,7 @@ fn decode_path(target: &str) -> Option<String> {
 }
 
 pub fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
+    crate::artifacts::paths::validate_resolved_local_path(root).ok()?;
     let path = decode_path(target)?;
     // The stored canonical root cannot silently turn into a symlink to a new root.
     let real_root = root.canonicalize().ok()?;
@@ -260,6 +262,7 @@ pub fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
     } else {
         base.join(path.trim_start_matches('/'))
     };
+    crate::artifacts::paths::validate_resolved_local_path(&candidate).ok()?;
     candidate = candidate.canonicalize().ok()?;
     if !candidate.starts_with(base) {
         return None;
@@ -280,6 +283,8 @@ pub fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
     {
         return None;
     }
+    // The shared classifier already includes the relay directory and aliases.
+    if crate::management::v2::host_files::is_owner_local_secret_file(&candidate) {return None;}
     if crate::config::paths::config_dir()
         .ok()
         .and_then(|p| p.canonicalize().ok())
@@ -323,6 +328,15 @@ pub fn serve(
     target: &str,
     stream: &mut TcpStream,
 ) -> io::Result<()> {
+    serve_with_headers(record,method,target,stream,"")
+}
+pub(crate) fn serve_with_headers(
+    record: &ServiceRecord,
+    method: &str,
+    target: &str,
+    stream: &mut TcpStream,
+    headers: &str,
+) -> io::Result<()> {
     let allowed = matches!(method, "GET" | "HEAD");
     let file = allowed
         .then(|| {
@@ -335,7 +349,7 @@ pub fn serve(
         .and_then(|path| std::fs::File::open(&path).ok().map(|file| (path, file)));
     if let Some((path, mut file)) = file {
         let len = file.metadata()?.len();
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {len}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", content_type(&path))?;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {len}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n{headers}Connection: close\r\n\r\n", content_type(&path))?;
         super::traffic::touch(&record.slug);
         if method != "HEAD" {
             let mut buffer = [0; 16384];
@@ -357,7 +371,7 @@ pub fn serve(
         } else {
             ("405 Method Not Allowed", "method_not_allowed")
         };
-        write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nAllow: GET, HEAD\r\nX-Cutex-Service-Error: {error}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")?;
+        write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nAllow: GET, HEAD\r\nX-Cutex-Service-Error: {error}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n{headers}Connection: close\r\n\r\n")?;
     }
     stream.flush()
 }

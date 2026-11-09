@@ -313,6 +313,30 @@ fn online_submit_snapshot(record: &CutexSessionRecord, status: Option<&AppServer
     }))
 }
 
+/// Project already-read catalog records without re-reading the session store.
+pub(super) fn catalog_resources(
+    records: &[std::sync::Arc<CutexSessionRecord>], registry: &ImRegistry,
+    load: RuntimeStatusLoader, repository: &EventRepository,
+) -> anyhow::Result<Vec<Value>> {
+    let management = management_identity(repository)?;
+    let context = ProjectionContext::default();
+    let projects = load_agent_management_snapshot_best_effort();
+    let host = crate::platform::host::current_host_name();
+    records.iter().map(|record| {
+        if !crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, &host)
+            || !is_durable_management_session(record) { return Ok(Value::Null); }
+        let activity = load_activity_best_effort(&record.cutex_session_id);
+        if record.is_retired() {
+            let mut value = retired_session_resource_value_with(record, activity.as_ref(), &context);
+            annotate_retired_session_project(&mut value, record, projects.as_deref());
+            return Ok(value);
+        }
+        let prepared = prepare_session_projection(record, session_is_visible(registry, record),
+            load(&record.cutex_session_id)?, activity.as_ref(), &management, &context)?;
+        with_projection_entry(&record.cutex_session_id, |entry| apply_session_projection(prepared, entry))
+    }).collect()
+}
+
 pub fn session_resource(
     cutex_session_id: &str,
     registry: &ImRegistry,

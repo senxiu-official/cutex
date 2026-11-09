@@ -113,6 +113,39 @@ fn await_terminal(service: &JobService, id: &str) -> JobRecord {
 }
 
 #[test]
+fn running_job_observes_sigstop_without_becoming_terminal() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let service = JobService::open(config(root.path())).unwrap();
+    // This test owns the runner PID returned by its private JobService.
+    let request = job_request(cwd.path(), "process-observation", "sleep 1");
+    let receipt = service.submit(API, request.clone(), issue(&request)).unwrap();
+    let id = receipt.job.job_id;
+    let until = Instant::now() + Duration::from_secs(5);
+    let running = loop {
+        let job = service.query(API, &id).unwrap();
+        if job.state == JobState::Running { break job; }
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let pid = running.process_id.unwrap();
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+    let observed = loop {
+        let job = service.query(API, &id).unwrap();
+        if job.observed_process_state.as_ref().is_some_and(|o| o.state == "stopped") { break job; }
+        if Instant::now() >= until {
+            unsafe { libc::kill(pid as i32, libc::SIGCONT); }
+            panic!("stopped runner was not observed");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGCONT) }, 0);
+    assert_eq!(observed.state, JobState::Running);
+    assert!(!observed.state.terminal());
+    assert_eq!(await_terminal(&service, &id).state, JobState::Exited);
+}
+
+#[test]
 fn configured_completion_waits_for_terminal_and_normalizes_legacy_queue() {
     let root = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
@@ -691,6 +724,7 @@ fn persisted_launch_pending_recovers_as_unknown_without_launch() {
         updated_at_epoch_secs: now(),
         process_id: None,
         process_start_ticks: None,
+        observed_process_state: None,
         exit_code: None,
         terminal_reason: None,
         execution: None,

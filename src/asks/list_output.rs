@@ -1,6 +1,26 @@
 //! Tool-only projections. Communication authority and HTTP/peer rows stay unchanged.
 use super::*;
 
+pub(super) fn pending_notices(state: &AskState, authorized: &[&DeliveryRecord]) -> Value {
+    let mut counts = json!({"answer":0,"question":0,"state":0});
+    for delivery in authorized {
+        let kind = match delivery.kind { DeliveryKind::Answer => "answer", DeliveryKind::Question => "question", DeliveryKind::State => "state" };
+        counts[kind] = json!(counts[kind].as_u64().unwrap_or(0) + 1);
+    }
+    let mut ordered = authorized.to_vec();
+    ordered.sort_by_key(|d| (&d.created_at, &d.delivery_id));
+    let entries: Vec<_> = ordered.into_iter().take(50).map(|delivery| json!({
+        "delivery_id":delivery.delivery_id, "delegation":delivery.ask_id, "kind":delivery.kind,
+        "ref_id":delivery.ref_id, "passive":delivery.passive, "created_at":delivery.created_at,
+        "title":state.asks.get(&delivery.ask_id).map(|ask| ask.title.chars().take(512).collect::<String>()),
+        "read_action":{"tool":"delegation_read","arguments":{"delegation":delivery.ask_id}},
+        "claim_action":{"tool":"delegation_wait","arguments":{"delegations":[delivery.ask_id],"timeout_ms":1}}
+    })).collect();
+    json!({"total":authorized.len(), "counts":counts, "entries":entries,
+        "more":authorized.len() > 50,
+        "detail":"Pending notices include answers, questions and state changes. unclaimed_results is the total of all three kinds. Read a delegation with delegation_read; delegation_wait claims pending notices."})
+}
+
 #[cfg(test)]
 pub(super) fn resolve_name(directory: &super::super::directory::Directory, caller: &str,
     name: &str, project: Option<&str>) -> Result<String, AskError> {
@@ -126,6 +146,28 @@ pub(super) fn local_page(rows: Vec<(bool, bool, String, Value)>, args: &ListArgs
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_notice_projection_classifies_and_bounds_without_claiming() {
+        let mut state = AskState::default();
+        let now = chrono::Utc::now();
+        let mut new = crate::asks::store::tests::new_ask("notices", "visible title");
+        new.requester = Requester::Agent { cutex_session_id:"requester".into(), name:None };
+        let (ask, _) = state.create_ask(new, now).unwrap();
+        crate::asks::delivery::record_answer_delivery(&mut state, &ask, "answer", now);
+        crate::asks::delivery::record_question_delivery(&mut state, &ask, "question", now);
+        for index in 0..53 {
+            crate::asks::delivery::record_state_delivery(&mut state, &ask, &format!("state-{index}"), now);
+        }
+        let deliveries: Vec<_> = state.deliveries.values().collect();
+        let projected = pending_notices(&state, &deliveries);
+        assert_eq!(projected["total"], 55);
+        assert_eq!(projected["counts"], json!({"answer":1,"question":1,"state":53}));
+        assert_eq!(projected["entries"].as_array().unwrap().len(), 50);
+        assert_eq!(projected["more"], true);
+        assert_eq!(projected["entries"][0]["read_action"]["arguments"]["delegation"], ask.ask_id);
+        assert!(state.deliveries.values().all(|row| row.state == DeliveryState::Pending));
+    }
 
     #[test]
     fn agent_list_keeps_pending_reviews_and_unknown_future_states() {

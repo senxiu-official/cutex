@@ -41,11 +41,13 @@ const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
 /// paths, drive prefixes, `..`, `.git` components and anything whose
 /// canonical form (symlinks/junctions resolved) lies outside the root.
 pub fn resolve_rel(root: &ResolvedRoot, raw: &str) -> WorkspaceResult<(PathBuf, String)> {
+    crate::artifacts::paths::validate_resolved_local_path(&root.canonical).map_err(|_|WorkspaceError::new(403,"path_forbidden","unsafe workspace root"))?;
     let components = normalize_rel(raw)?;
     let mut joined = root.canonical.clone();
     for component in &components {
         joined.push(component);
     }
+    crate::artifacts::paths::validate_resolved_local_path(&joined).map_err(|_|WorkspaceError::new(403,"path_forbidden","unsafe workspace path"))?;
     let canonical = std::fs::canonicalize(&joined).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             WorkspaceError::new(404, "path_not_found", format!("no such path: {raw}"))
@@ -53,6 +55,7 @@ pub fn resolve_rel(root: &ResolvedRoot, raw: &str) -> WorkspaceResult<(PathBuf, 
             WorkspaceError::internal(error)
         }
     })?;
+    super::host_files::refuse_root_credential_file(&canonical)?;
     let inside = canonical.strip_prefix(&root.canonical).map_err(|_| {
         WorkspaceError::new(
             403,
@@ -135,6 +138,7 @@ pub fn dir_resource(
     let read = std::fs::read_dir(&dir).map_err(WorkspaceError::internal)?;
     let mut entries = Vec::new();
     for entry in read.flatten() {
+        if super::host_files::refuse_root_credential_file(&entry.path()).is_err(){continue;}
         let name = entry.file_name().to_string_lossy().into_owned();
         if is_git_dir_name(&name) {
             continue;
@@ -145,7 +149,7 @@ pub fn dir_resource(
         let kind = kind_label(&link_meta.file_type());
         // Symlinks report their target only when it stays inside the root.
         let (target_kind, meta) = if kind == "symlink" {
-            match std::fs::canonicalize(entry.path()) {
+            match crate::artifacts::paths::validate_resolved_local_path(&entry.path()).and_then(|_|std::fs::canonicalize(entry.path()).map_err(|e|crate::artifacts::paths::PathError::Invalid(e.to_string()))) {
                 Ok(target) if target.starts_with(&root.canonical) => match target.metadata() {
                     Ok(meta) => (Some(if meta.is_dir() { "dir" } else { "file" }), Some(meta)),
                     Err(_) => (None, None),
@@ -278,6 +282,7 @@ pub fn file_content_value(
     meta: &std::fs::Metadata,
     max_bytes: u64,
 ) -> WorkspaceResult<Value> {
+    super::host_files::refuse_root_credential_file(file)?;
     let mut bytes = Vec::with_capacity(meta.len().min(max_bytes) as usize);
     std::fs::File::open(file)
         .and_then(|handle| handle.take(max_bytes).read_to_end(&mut bytes))
@@ -364,6 +369,7 @@ pub fn file_list(root: &ResolvedRoot) -> Arc<Vec<String>> {
 }
 
 fn walk_files(root: &Path) -> Vec<String> {
+    if crate::artifacts::paths::validate_resolved_local_path(root).is_err(){return vec![];}
     let mut files = Vec::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, rel)) = stack.pop() {
@@ -371,6 +377,7 @@ fn walk_files(root: &Path) -> Vec<String> {
             continue;
         };
         for entry in read.flatten() {
+            if super::host_files::refuse_root_credential_file(&entry.path()).is_err(){continue;}
             let name = entry.file_name().to_string_lossy().into_owned();
             if is_git_dir_name(&name) {
                 continue;
@@ -418,7 +425,8 @@ pub fn search_resource(
     };
     let files = file_list(root);
     let results = fuzzy_search(&files, &query, limit, |path| {
-        root.canonical.join(path).exists()
+        let file=root.canonical.join(path);
+        file.exists() && super::host_files::refuse_root_credential_file(&file).is_ok()
     });
     Ok(json!({
         "query": query,
@@ -570,6 +578,7 @@ fn watch_hub() -> &'static Mutex<HashMap<PathBuf, Arc<RootWatch>>> {
 /// with the first subscriber and stops once every receiver is dropped and
 /// `prune_watch` runs.
 pub fn subscribe_watch(root: &Path) -> WorkspaceResult<mpsc::Receiver<WatchBatch>> {
+    crate::artifacts::paths::validate_resolved_local_path(root).map_err(|_|WorkspaceError::new(403,"path_forbidden","unsafe watch root"))?;
     let (sender, receiver) = mpsc::sync_channel(64);
     let mut hub = watch_hub()
         .lock()
@@ -665,6 +674,7 @@ fn debounce_loop(
         if batch.paths.is_empty() && !batch.git_changed && !batch.overflow {
             continue;
         }
+        super::workspace_git::invalidate_status(&root);
         if !batch.paths.is_empty() || batch.overflow {
             invalidate_file_list(&root);
         }
@@ -755,6 +765,9 @@ fn prune_watch(root: &Path) {
 /// `ready` `{scope, rootId, root}` once, then `changed`
 /// `{scope, rootId, paths[], gitChanged, overflow}`; `: keepalive` comments.
 pub fn watch_stream(stream: &mut TcpStream, root: &ResolvedRoot) -> anyhow::Result<()> {
+    if let Err(error)=super::host_files::refuse_private_tree(&root.canonical) {
+        return super::workspace::write_error(stream,&error);
+    }
     let receiver = match subscribe_watch(&root.canonical) {
         Ok(receiver) => receiver,
         Err(error) => return super::workspace::write_error(stream, &error),

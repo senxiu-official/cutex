@@ -234,7 +234,7 @@ pub fn instructions(record: &CutexSessionRecord) -> (Option<String>, Vec<PathBuf
 
 fn instructions_with_snapshot(record: &CutexSessionRecord) -> (Option<String>, Vec<PathBuf>, Option<crate::memory::idle_note::Snapshot>) {
     let cwd = Path::new(&record.cwd);
-    let memory = crate::memory::launch_memory_context_or_warn(&record.cutex_session_id);
+    let memory = crate::memory::cached_launch_memory_context_or_warn(&record.cutex_session_id);
     let root = memory.as_ref().map(|memory| memory.file_reference_root(cwd)).unwrap_or(cwd);
     let user = crate::memory::harness::user_agents_md();
     let mut sources = user.as_ref().map(|user| user.files.clone()).unwrap_or_default();

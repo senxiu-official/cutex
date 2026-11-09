@@ -813,7 +813,7 @@ pub fn allocate_port(
 ) -> Option<u16> {
     (settings.port_range_start..=settings.port_range_end)
         .filter(|port| *port != 0 && !used.contains(port))
-        .find(|port| is_free(*port))
+        .find(|port| !super::control_ports::forbidden(*port) && is_free(*port))
 }
 
 /// Free on this host: nothing accepts on loopback and the IPv4 loopback
@@ -895,6 +895,7 @@ fn ensure_unchanged(
 }
 
 fn port_conflict(registry: &Registry, slug: &str, host: &str, port: u16) -> ServicesResult<()> {
+    super::control_ports::check(port)?;
     if port == 0 {
         return Ok(());
     }

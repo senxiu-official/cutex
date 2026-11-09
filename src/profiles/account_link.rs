@@ -401,6 +401,7 @@ pub fn put_secret_with_policy(
     let after: [u8; 32] = bytes.as_slice().try_into().unwrap();
     if changed {
         crate::config::atomic::write_private_bytes_atomic(&path, &bytes)?;
+        crate::management::v2::host_files::refresh_secret_path_cache();
     }
     // Clear off intent LAST: a crash after writing the secret stays disabled.
     if was_disabled {

@@ -1,5 +1,5 @@
 //! Optional stored-image dimensions, from bounded headers only. No pixel decode,
-//! entropy scan, EXIF orientation, allocation, or claim that the image is decodable.
+//! entropy scan, EXIF orientation, pixel allocation, or claim that the image is decodable.
 //!
 //! Wire references: W3C PNG (IHDR), ITU T.81 B.2 (JPEG frame headers),
 //! https://developers.google.com/speed/webp/docs/riff_container and RFC 6386,
@@ -11,8 +11,24 @@ pub(super) fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     dimensions_in(bytes, bytes.len())
 }
 
-pub(super) fn header_len() -> usize {
-    MAX_HEADER_BYTES
+/// Bounded local header inspection, without decoding pixels or consuming special files.
+/// History callers must first validate the stored-attachment directory boundary.
+pub(super) fn from_path(path: &std::path::Path) -> Option<(u32, u32)> {
+    use std::io::Read;
+    if !std::fs::metadata(path).ok()?.is_file() { return None; }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() { return None; }
+    let total = usize::try_from(metadata.len()).ok()?;
+    let mut header = Vec::with_capacity(MAX_HEADER_BYTES.min(total));
+    file.take(MAX_HEADER_BYTES as u64).read_to_end(&mut header).ok()?;
+    dimensions_in(&header, total)
 }
 
 /// `total`: the whole file's length when `bytes` is only its header (webp needs it).
@@ -275,6 +291,21 @@ fn gif(bytes: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_file_headers_are_optional_bounded_and_never_decode_pixels() {
+        let dir = std::env::temp_dir().join(format!("image-header-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("large.png");
+        std::fs::write(&path, ONE_PNG).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(128 * 1024 * 1024).unwrap();
+        assert_eq!(from_path(&path), Some((1, 1)));
+        assert_eq!(from_path(&dir), None);
+        assert_eq!(from_path(&dir.join("absent")), None);
+        std::fs::write(&path, b"not an image").unwrap();
+        assert_eq!(from_path(&path), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     // A real 1x1 RGBA IHDR, including its independent published CRC.
     const ONE_PNG: &[u8] = &[

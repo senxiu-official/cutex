@@ -1,5 +1,6 @@
 use super::*;
 use crate::services::store::{Caller, RegisterRequest};
+use super::head::Body;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
@@ -65,6 +66,7 @@ fn connect(store: ServiceStore) -> (TcpStream, std::thread::JoinHandle<()>) {
             },
             &store,
             "demo",
+            None,
         );
     });
     (client, handle)
@@ -76,6 +78,24 @@ fn request(store: ServiceStore, request: &str) -> String {
     client.read_to_string(&mut out).unwrap();
     handle.join().unwrap();
     out
+}
+
+fn accept_backend(listener: &TcpListener) -> TcpStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // Windows accepted sockets inherit the listener's mode.
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                return stream;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline =>
+                std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => panic!("backend accept did not arrive: {e}"),
+        }
+    }
 }
 
 #[test]
@@ -101,7 +121,7 @@ fn authenticated_proxy_waits_for_one_idle_start_and_respects_manual_stop() {
         let s = supervisor.clone(); let store = store.clone();
         let handler = std::thread::spawn(move || {
             let (mut server, peer) = listener.accept().unwrap();
-            serve_with_supervisor(&mut server, &mut Vec::new(), &ConnectionInfo { peer, remote: false }, &store, "demo", Some(&s));
+            serve_with_supervisor(&mut server, &mut Vec::new(), &ConnectionInfo { peer, remote: false }, &store, "demo", Some(&s), None);
         });
         client.write_all(format!("GET / HTTP/1.1\r\nHost: demo.svc.localhost:24870\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
         let mut out = String::new(); client.read_to_string(&mut out).unwrap(); handler.join().unwrap(); out
@@ -159,9 +179,9 @@ fn streams_framed_bodies_and_rechecks_host_on_keepalive() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
     let up = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut buffer = Vec::new();
         for expected in [b"hello".as_slice(), b"3\r\nabc\r\n0\r\n\r\n".as_slice()] {
+            let mut stream = accept_backend(&listener);
+            let mut buffer = Vec::new();
             let raw = read_head(&mut stream, &mut buffer).unwrap().unwrap();
             let head = Head::parse(&raw).unwrap();
             assert!(!String::from_utf8_lossy(&raw).contains("cutex_svc_"));
@@ -181,6 +201,10 @@ fn streams_framed_bodies_and_rechecks_host_on_keepalive() {
             )
             .unwrap();
             assert_eq!(body, expected);
+            // Exercise completed uploads here, not the separate early-response
+            // cancellation path (the backend may read the last byte before the
+            // upload thread has returned from its final write on Windows).
+            std::thread::sleep(Duration::from_millis(100));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .unwrap();
@@ -188,9 +212,86 @@ fn streams_framed_bodies_and_rechecks_host_on_keepalive() {
     });
     let raw=format!("POST /one HTTP/1.1\r\nHost: demo.svc.localhost:40000\r\nCookie: {cookie}; cutex_svc_other=secret; app=yes\r\nX-Forwarded-For: spoof\r\nContent-Length: 5\r\n\r\nhelloPOST /two HTTP/1.1\r\nHost: demo.svc.localhost:40000\r\nCookie: {cookie}; app=yes\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /v2 HTTP/1.1\r\nHost: localhost:24870\r\nCookie: {cookie}\r\n\r\n");
     let out = request(store, &raw);
+    assert_eq!(out.matches("HTTP/1.1 200").count(), 2, "{out}");
     up.join().unwrap();
-    assert_eq!(out.matches("HTTP/1.1 200").count(), 2);
     assert!(out.contains("HTTP/1.1 421"));
+}
+
+#[test]
+fn idle_upstream_close_does_not_fail_next_request_on_same_client() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
+    let (closed, after_idle) = std::sync::mpsc::channel();
+    let backend = std::thread::spawn(move || {
+        for n in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let raw = read_head(&mut stream, &mut Vec::new()).unwrap().unwrap();
+            assert!(raw.starts_with(b"GET /"));
+            // No Connection:close: the browser may keep its proxy connection.
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
+            if n == 0 {
+                std::thread::sleep(Duration::from_secs(2));
+                let _ = stream.shutdown(Shutdown::Both);
+                closed.send(()).unwrap();
+            }
+        }
+    });
+    let (mut client, proxy) = connect(store);
+    for n in 0..2 {
+        client.write_all(format!("GET /{n} HTTP/1.1\r\nHost: demo.svc.localhost\r\nCookie: {cookie}\r\n\r\n").as_bytes()).unwrap();
+        let mut buffer = Vec::new();
+        let raw = read_head(&mut client, &mut buffer).unwrap().unwrap();
+        assert!(raw.starts_with(b"HTTP/1.1 200"), "request {n}: {}", String::from_utf8_lossy(&raw));
+        let mut body = Vec::new();
+        forward::copy_body(&mut client, &mut body, &mut buffer, Body::Length(2), "demo").unwrap();
+        assert_eq!(body, b"ok");
+        if n == 0 { after_idle.recv_timeout(Duration::from_secs(4)).unwrap(); }
+    }
+    drop(client);
+    proxy.join().unwrap();
+    backend.join().unwrap();
+}
+
+#[test]
+fn consumed_post_without_response_is_never_replayed() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
+    let backend = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buffer = Vec::new();
+        let raw = read_head(&mut stream, &mut buffer).unwrap().unwrap();
+        let head = Head::parse(&raw).unwrap();
+        assert_eq!(head.request().unwrap().0, "POST");
+        let mut body = Vec::new();
+        forward::copy_body(&mut stream, &mut body, &mut buffer, head.body(false).unwrap(), "demo").unwrap();
+        assert_eq!(body, b"one-write");
+        drop(stream); // The write happened, but no response can prove it.
+        listener.set_nonblocking(true).unwrap();
+        let until = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < until {
+            match listener.accept() {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
+                other => panic!("proxy replayed a consumed POST: {other:?}"),
+            }
+        }
+    });
+    let out = request(store, &format!("POST /write HTTP/1.1\r\nHost: demo.svc.localhost\r\nCookie: {cookie}\r\nContent-Length: 9\r\n\r\none-write"));
+    assert!(out.starts_with("HTTP/1.1 502"));
+    assert!(out.contains("X-Cutex-Service-Error: upstream_unreachable"));
+    backend.join().unwrap();
+}
+
+#[test]
+fn proxy_error_event_omits_request_content_and_error_text() {
+    let cause = io::Error::new(io::ErrorKind::ConnectionReset, "secret-ticket /private?q=secret-token");
+    let event = failure_event("demo", "secret-custom-method", "response_head", &cause, Some(false), Duration::from_millis(7));
+    assert_eq!(event["method"], "OTHER");
+    assert_eq!(event["errorKind"], "ConnectionReset");
+    assert_eq!(event["responseStarted"], false);
+    assert_eq!(event["elapsedMs"], 7);
+    assert!(!event.to_string().contains("secret"));
 }
 #[test]
 fn sse_delivers_bytes_before_upstream_finishes() {
@@ -391,6 +492,7 @@ fn ticket_route_settings_and_export_contract() {
         supervisor: None,
         owner_check: |_| Ok(()),
         caller: "root".into(),
+        load_runtime_status: |_| Ok(None),
     };
     let route = Route::ViewTicket("demo".into());
     let (status, ticket) = route_json(
@@ -585,6 +687,7 @@ fn static_proxy_and_reclaimed_ticket_contract() {
         supervisor: None,
         owner_check: |_| Ok(()),
         caller: "root".into(),
+        load_runtime_status: |_| Ok(None),
     };
     assert_eq!(
         route_json(

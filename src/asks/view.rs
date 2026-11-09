@@ -354,7 +354,8 @@ pub fn requester_view_with_receipts(
 pub fn await_summary(ask: &AskRecord) -> Value {
     match &ask.awaiting {
         Some(wait) => json!({"jobs": wait.jobs, "until": wait.until, "resume": wait.resume, "since": wait.since,
-            "timeoutAt": wait.timeout_at, "note": wait.note, "attempt": wait.attempt}),
+            "timeoutAt": wait.timeout_at, "note": wait.note, "attempt": wait.attempt,
+            "canResume": ask.remote.is_none() && ask.is_waiting()}),
         None => Value::Null,
     }
 }
@@ -514,7 +515,12 @@ pub(crate) fn requester_view_with_control(state: &AskState, ask: &AskRecord, con
         "target_reverted": ask.target_reverted,
         "closed": ask.closed,
         "approval_id": ask.gate.as_ref().and_then(|gate| gate.approval_id.clone()),
-        "waiting": ask.awaiting.as_ref().filter(|_| ask.is_waiting()).map(|wait| json!({"jobs": wait.jobs, "since": wait.since, "timeout_at": wait.timeout_at, "note": wait.note})),
+        "waiting": ask.awaiting.as_ref().filter(|_| ask.is_waiting()).map(|wait| json!({
+            "jobs": wait.jobs, "since": wait.since, "timeout_at": wait.timeout_at, "note": wait.note,
+            "can_resume": true,
+            "resume_action": {"tool":"delegation_resume", "arguments":{"delegation":ask.ask_id}},
+            "detail": "delegation_resume ends this wait and schedules the handler to continue. A wake or revision alone does not end it."
+        })),
         "resuming": ask.resume_pending(),
         "jobs": jobs_summary(ask),
         "revisions": revisions_summary(ask),

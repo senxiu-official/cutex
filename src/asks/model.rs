@@ -653,6 +653,10 @@ pub struct RevisionRecord {
     pub wake: bool,
     pub sent_at: String,
     pub level: RevisionLevel,
+    /// New sends opt in; upgrading must not wake requesters for historical
+    /// unacknowledged revisions on already closed delegations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub report_closed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -693,6 +693,7 @@ fn revision_adapter_preserves_ack_and_rejects_a_different_message_link() {
         wake: false,
         sent_at: at().to_rfc3339(),
         level: RevisionLevel::Acknowledged,
+        report_closed: false,
         delivered_at: None,
         in_context_at: None,
         turn_id: None,

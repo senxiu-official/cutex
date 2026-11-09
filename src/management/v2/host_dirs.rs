@@ -91,6 +91,10 @@ fn is_hidden(name: &str, _meta: Option<&std::fs::Metadata>) -> bool {
 }
 
 pub fn list_dirs(raw: Option<&str>, home: Option<&Path>, max_entries: usize) -> Result<Value, DirError> {
+    if let Some(path) = raw.map(Path::new) {
+        crate::artifacts::paths::validate_local_path(path).map_err(|_|DirError::new(403,"Forbidden","path_forbidden","unsafe directory path"))?;
+    }
+    if let Some(home)=home {crate::artifacts::paths::validate_resolved_local_path(home).map_err(|_|DirError::new(403,"Forbidden","path_forbidden","unsafe home path"))?;}
     let home_display = home.map(|home| {
         std::fs::canonicalize(home)
             .map(|path| display(&path))
@@ -123,6 +127,7 @@ pub fn list_dirs(raw: Option<&str>, home: Option<&Path>, max_entries: usize) -> 
         }
         _ => DirError::new(400, "Bad Request", "invalid_path", format!("the path cannot be resolved: {error}")),
     })?;
+    super::host_files::refuse_root_credential_file(&canonical).map_err(|e|DirError::new(e.status,"Forbidden",e.code,e.message))?;
     if !canonical.is_dir() {
         return Err(DirError::new(400, "Bad Request", "not_a_directory", "the path is not a directory"));
     }
@@ -136,6 +141,8 @@ pub fn list_dirs(raw: Option<&str>, home: Option<&Path>, max_entries: usize) -> 
     let mut entries = Vec::new();
     let mut truncated = false;
     for entry in read.flatten() {
+        // The shared guard performs the A1 preflight too; do not walk it twice.
+        if super::host_files::refuse_root_credential_file(&entry.path()).is_err(){continue;}
         let Ok(kind) = entry.file_type() else {
             continue;
         };

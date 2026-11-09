@@ -655,6 +655,9 @@ mod tests {
 
     #[test]
     fn real_resources_match_their_schemas() {
+        let asks=SCHEMAS.iter().find(|s|s.name=="asks").unwrap();
+        assert!(!asks.text.contains('\r'));
+        { use sha2::{Digest,Sha256}; assert_eq!(format!("{:x}",Sha256::digest(asks.text.as_bytes())),"b8fd54a16fabc69b5939fe4606f9f6c79ebab166465581f46e6f9e4e91d19e6b"); }
         use crate::management::v2::model::{
             EventCorrelation, EventEnvelope, EventSource, NativeMessage, NativeMessageKind,
         };

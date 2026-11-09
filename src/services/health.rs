@@ -122,6 +122,7 @@ pub fn compute_health(
 }
 
 fn connect(port: u16) -> Option<TcpStream> {
+    if super::control_ports::forbidden(port){return None;}
     [
         SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
