@@ -84,8 +84,8 @@
     },
     {
       "path": ".github/ci/release-meta/0.2.2.json",
-      "sha256": "3d43a10e2c8eeca889afd1c8f4b2e18033bd3048f6c56aff5f9bc90871d0d285",
-      "size": 1335
+      "sha256": "cb098d31413e1e1afbab1d8c5c7fac307c204bf5d7b31c22995e6d4cee599b0d",
+      "size": 1399
     },
     {
       "path": ".github/ci/release-meta/capabilities-0.1.0.json",
@@ -194,8 +194,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "8b594f55564284b11ddd3870123490675e8c59222605d0dd2def0296847590c6",
-      "size": 9177
+      "sha256": "aa41c9f2d12d55bd595bd0319283b452f406586bbea5555f247f682e25842a96",
+      "size": 9321
     },
     {
       "path": "Cargo.lock",
