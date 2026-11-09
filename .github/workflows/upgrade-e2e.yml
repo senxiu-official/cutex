@@ -1,18 +1,18 @@
-# Manual debug upgrade drill: public 0.2.0 source -> exported 0.2.1 source .
+# Manual debug upgrade drill: public 0.2.1 source -> exported 0.2.2 source .
 # Both versions are rebuilt as DEBUG binaries with release identity. The helper uses a
 # throwaway key, marked private HOME and drill service names (systemd user units on Linux;
 # scheduled task/supervisor and temporary HKCU environment changes on Windows).
-# The target manifest uses committed release metadata, including asks format v2 one-way
-# migration and declared capability removals. The workflow explicitly confirms the target
-# release. A separate synthetic release has no new migrations and tests rollback TO 0.2.1;
-# there is no automatic rollback across the 0.2.0 -> 0.2.1 one-way boundary.
+# The target manifest uses committed release metadata, including asks format v2 historical
+# migration metadata and declared capability removals. The workflow explicitly confirms the target
+# release. A separate synthetic release has no new migrations and tests rollback TO 0.2.2;
+# Historical one-way migrations remain declared; this drill starts from public 0.2.1.
 # Component builders use Node >=24.9 and the public three-argument build.sh contract.
 # new_native defaults to this set's native; use stub to exercise staging in isolation or a published
 # cute-codex-v<version> tag for its archive. Natives are hashed/selected, never executed.
-# The public 0.2.0 assets are independently signature-verified before the debug drill.
+# The public 0.2.1 assets are independently signature-verified before the debug drill.
 # Debug mode is NOT formal signed-binary upgrade acceptance: public builds ignore the debug key,
 # HOME and service-name overrides. formal-assets uses a fresh hosted runner with embedded release trust;
-# see upgrade-e2e.py signed-asset-preflight --help. Signed 0.2.1 artifacts/channel only exist
+# see upgrade-e2e.py signed-asset-preflight --help. Signed 0.2.2 artifacts/channel only exist
 # after the public signing workflow. Nothing is published and no signing secret is used.
 # formal-assets mode uses original release binaries and retained official dry-run signatures.
 # It runs only on a fresh hosted runner; no signing key or test-key override is used.
@@ -48,14 +48,14 @@ on:
         default: senxiu-official/cutex
         type: string
       from_ref:
-        description: "Tag / commit of the installed release (0.2.0 = tag cutex-0.2.0 of senxiu-official/cutex)"
+        description: "Tag / commit of the installed release (0.2.1 = tag cutex-0.2.1 of senxiu-official/cutex)"
         required: false
-        default: cutex-0.2.0
+        default: cutex-0.2.1
         type: string
       from_release:
         description: "Release label of the installed build"
         required: false
-        default: "0.2.0"
+        default: "0.2.1"
         type: string
       to_ref:
         description: "Ref of the new release in this repository (empty = the dispatched ref)"
@@ -65,17 +65,17 @@ on:
       to_release:
         description: "Release label of the new build"
         required: false
-        default: "0.2.1"
+        default: "0.2.2"
         type: string
       new_native_version:
-        description: "Native BUILD-INFO/archive version, independent of the release tag (r58 embeds 0.164.0-r59)"
+        description: "Native BUILD-INFO/archive version, independent of the release tag (version is checked against native BUILD-INFO)"
         required: false
-        default: "0.164.0-r59"
+        default: "0.167.0-r60"
         type: string
       new_native:
         description: "Native the new release brings: stub, none, or a published cute-codex release tag (cute-codex-v<version> of senxiu-official/cute-codex)"
         required: false
-        default: cute-codex-v0.164.0-r59
+        default: cute-codex-v0.167.0-r60
         type: string
 
 permissions:
@@ -234,8 +234,10 @@ jobs:
               if [ "$RUNNER_OS" = Windows ]; then d="$(cygpath -u "$RUNNER_TEMP")/new-native"; fi
               mkdir -p "$d"
               base="https://github.com/$NATIVE_REPO/releases/download/$NEW_NATIVE"
+              # Compile the drill while canonical native CI runs. Wait at most one hour
+              # for its public signed assets; the preflight below still verifies every byte.
               for file in "$name" "$name.minisig" SHA256SUMS SHA256SUMS.minisig; do
-                curl -fsSL --retry 3 -o "$d/$file" "$base/$file"
+                curl -fsSL --retry 120 --retry-delay 30 --retry-max-time 3600 --retry-all-errors -o "$d/$file" "$base/$file"
               done
               arg="$d"
               if [ "$RUNNER_OS" = Windows ]; then arg="$(cygpath -w "$d")"; fi
@@ -418,7 +420,7 @@ jobs:
           if core_platforms != {"linux-x64", "windows-x64"}:
               raise SystemExit("Both product platform BUILD-INFO records are required")
           PY
-      - name: Original published 0.2.0 and native signed assets
+      - name: Original published 0.2.1 and native signed assets
         env:
           FROM_REPO: ${{ inputs.from_repo }}
           FROM_RELEASE: ${{ inputs.from_release }}
@@ -463,12 +465,13 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          [ "$FROM_RELEASE" = 0.2.0 ] && [ "$TO_RELEASE" = 0.2.1 ] || { echo 'Formal mode tests only 0.2.0 to 0.2.1' >&2; exit 1; }
+          [ "$FROM_RELEASE" = 0.2.1 ] && [ "$TO_RELEASE" = 0.2.2 ] || { echo 'Formal mode tests only 0.2.1 to 0.2.2' >&2; exit 1; }
           "$E2E_PYTHON" .github/ci/upgrade-e2e.py formal-assets \
             --build-assets "$RUNNER_TEMP/formal-build" --signed-assets "$RUNNER_TEMP/formal-sign" \
             --old-assets "$RUNNER_TEMP/formal-old" --native-assets "$RUNNER_TEMP/formal-native" \
+            --from-release "$FROM_RELEASE" --to-release "$TO_RELEASE" \
             --public-key .github/ci/cutex-release.pub --expected-commit "$FORMAL_PRODUCT_COMMIT" \
-            --expected-native-version "$NATIVE_VERSION" --confirm-one-way "$TO_RELEASE" \
+            --expected-native-version "$NATIVE_VERSION" --confirm-release "$TO_RELEASE" \
             --management-port 24391 --bus-port 24392 --work "$RUNNER_TEMP/formal upgrade"
       - name: Keep scrubbed verification receipt and logs
         if: always()
