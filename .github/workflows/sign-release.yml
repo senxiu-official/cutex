@@ -110,6 +110,8 @@ jobs:
           printf '%s\n' "$pw" | minisign -S -s "$t/t.key" -m "$t/f" > /dev/null
           minisign -V -q -p "$t/t.pub" -m "$t/f"
           rm -rf "$t"
+      - name: Immutable Native publication regression tests
+        run: python3 .github/ci/test-native-reuse.py
       - name: Check inputs
         env:
           RUN_ID: ${{ inputs.run_id }}

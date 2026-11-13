@@ -5,7 +5,7 @@
   "sourceCommit": null,
   "sourceCommitNote": "withheld: kept in the private export record next to the export directory",
   "license": "Apache-2.0",
-  "fileCount": 1612,
+  "fileCount": 1613,
   "files": [
     {
       "path": ".cargo/config.toml",
@@ -139,8 +139,8 @@
     },
     {
       "path": ".github/ci/sign-and-upload.sh",
-      "sha256": "f627eec11dfeeaf5c4a6e341b8e04ba771bc0f286bc66290991327a3d5a63413",
-      "size": 31189
+      "sha256": "8fa5cb496a25840b5bbbb88be36c41dff36680c8e4a6bbb37b5846592b92be06",
+      "size": 31875
     },
     {
       "path": ".github/ci/sign-component-kit.py",
@@ -159,8 +159,8 @@
     },
     {
       "path": ".github/ci/upgrade-e2e.py",
-      "sha256": "82103c967487aa5b4c3ed5533e2fc6bda2db4c19f2304ea493e70af7e03c6466",
-      "size": 115827
+      "sha256": "2d3464d00f6fa1dd1c97f1c57e94e1dd77f27426253c9c945d976ac9f4582b17",
+      "size": 116994
     },
     {
       "path": ".github/ci/upgrade-manifest.py",
@@ -189,13 +189,13 @@
     },
     {
       "path": ".github/workflows/sign-release.yml",
-      "sha256": "1a0a68d31fb8bcb35580ed00ff0a2bdeb7aa13c6cde18cca52983a1d1302166b",
-      "size": 11901
+      "sha256": "8052737ad24cc275caff190e3a8a659eecc1fce07a0d66f45d3c61fed2990787",
+      "size": 12014
     },
     {
       "path": ".github/workflows/upgrade-e2e.yml",
-      "sha256": "36840899a223de9832707c848bcffa1e4862d4a7127422e1ec078b1a9352c31e",
-      "size": 25201
+      "sha256": "475e768ae7ce0ed059ab741c7774266f01398b208c0754cf114bfc3ce8707729",
+      "size": 25071
     },
     {
       "path": ".gitignore",
@@ -8066,6 +8066,13 @@
       "path": "tools/test_upgrade_online_kit.py",
       "sha256": "44a3c625adfd6b342fc79400843997e2dc1868b9278ba105e6f1e7dd391c97b7",
       "size": 18245
+    },
+    {
+      "path": ".github/ci/test-native-reuse.py",
+      "sha256": "87deaf6c2f83c56e06e3aed2f212ecb48dd55e42d34c9f5aa317d70303c41a5d",
+      "size": 4799
     }
-  ]
+  ],
+  "publicProductCommit": "f8bbfe056dcfaf4fdac21325b1f47bcdf9f43dd6",
+  "ciFollowup": "Native publication preserves existing signed assets; formal upgrade uses validated public release inputs; product build/tag unchanged."
 }

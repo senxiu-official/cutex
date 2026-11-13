@@ -420,7 +420,7 @@ jobs:
           if core_platforms != {"linux-x64", "windows-x64"}:
               raise SystemExit("Both product platform BUILD-INFO records are required")
           PY
-      - name: Original published 0.2.1 and native signed assets
+      - name: Original published backend and native signed assets
         env:
           FROM_REPO: ${{ inputs.from_repo }}
           FROM_RELEASE: ${{ inputs.from_release }}
@@ -465,7 +465,6 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          [ "$FROM_RELEASE" = 0.2.1 ] && [ "$TO_RELEASE" = 0.2.2 ] || { echo 'Formal mode tests only 0.2.1 to 0.2.2' >&2; exit 1; }
           "$E2E_PYTHON" .github/ci/upgrade-e2e.py formal-assets \
             --build-assets "$RUNNER_TEMP/formal-build" --signed-assets "$RUNNER_TEMP/formal-sign" \
             --old-assets "$RUNNER_TEMP/formal-old" --native-assets "$RUNNER_TEMP/formal-native" \

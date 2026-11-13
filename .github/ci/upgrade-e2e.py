@@ -1362,7 +1362,7 @@ def verify_formal_artifact(path: Path, artifact: dict) -> None:
     require(ce.sha256(path) == artifact.get("sha256"), f"signed artifact hash mismatch: {path.name}")
 
 
-def formal_expected_class(target: dict) -> str:
+def formal_expected_class(target: dict, from_release: str = FORMAL_FROM_RELEASE, to_release: str = FORMAL_TO_RELEASE) -> str:
     def version(label):
         require(isinstance(label, str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", label) is not None,
                 "formal migration requires a stable public version")
@@ -1373,7 +1373,7 @@ def formal_expected_class(target: dict) -> str:
         value = migration.get("class")
         require(value in classes, "unknown formal migration class")
         since = version(migration.get("since"))
-        if version(FORMAL_FROM_RELEASE) < since <= version(FORMAL_TO_RELEASE) and classes[value] > classes[selected]:
+        if version(from_release) < since <= version(to_release) and classes[value] > classes[selected]:
             selected = value
     return selected
 
@@ -1385,7 +1385,7 @@ def prepare_formal_mirror(args: argparse.Namespace, work: Path) -> dict:
     mirror = work / "mirror"
     docs = {}
     # Do not mix old/new manifests with the same filename during lookup.
-    for release, roots in ((FORMAL_FROM_RELEASE, [args.old_assets]), (FORMAL_TO_RELEASE, [args.signed_assets])):
+    for release, roots in ((args.from_release, [args.old_assets]), (args.to_release, [args.signed_assets])):
         dest = mirror / f"cutex-{release}"
         manifest_path = copy_formal_signed("manifest.json", roots, dest, args.public_key)
         doc = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1397,7 +1397,7 @@ def prepare_formal_mirror(args: argparse.Namespace, work: Path) -> dict:
         copy_formal_signed("SHA256SUMS", roots, dest, args.public_key)
         artifact = doc["cutex"]["artifacts"][PLATFORM]
         require(artifact["name"] == f"cutex-{release}-{PLATFORM}.tar.gz", "unexpected cutex archive name")
-        artifact_roots = roots if release == FORMAL_FROM_RELEASE else [*args.build_assets, args.signed_assets]
+        artifact_roots = roots if release == args.from_release else [*args.build_assets, args.signed_assets]
         archive = copy_formal_signed(artifact["name"], [*artifact_roots, *roots],
                                      mirror / formal_label(artifact.get("tag", f"cutex-{release}")), args.public_key)
         verify_formal_artifact(archive, artifact)
@@ -1406,16 +1406,16 @@ def prepare_formal_mirror(args: argparse.Namespace, work: Path) -> dict:
         require(sums == [artifact["sha256"]], f"signed release SHA256SUMS mismatch: {release}")
         docs[release] = {"manifest": doc, "archive": archive, "dir": dest,
                          "caps": json.loads(caps.read_text(encoding="utf-8"))}
-    target = docs[FORMAL_TO_RELEASE]["manifest"]
+    target = docs[args.to_release]["manifest"]
     require(target["cutex"]["commit"] == args.expected_commit, "signed target commit differs from expected Build/Sign SHA")
-    require(target["sequence"] > docs[FORMAL_FROM_RELEASE]["manifest"]["sequence"], "target sequence must increase")
-    require(target.get("mode") == "full", "formal 0.2.2 must request full restart")
-    docs["expectedClass"] = formal_expected_class(target)
+    require(target["sequence"] > docs[args.from_release]["manifest"]["sequence"], "target sequence must increase")
+    require(target.get("mode") == "full", "formal target must request full restart")
+    docs["expectedClass"] = formal_expected_class(target, args.from_release, args.to_release)
     channel_path = copy_formal_signed("channel.json", [args.signed_assets], mirror / "channel-release", args.public_key)
     channel = json.loads(channel_path.read_text(encoding="utf-8"))
     require(channel.get("schema") == "cutex/channel/v1" and channel.get("channel") == "release"
-            and channel.get("release") == FORMAL_TO_RELEASE and channel.get("sequence") == target["sequence"]
-            and channel.get("manifestSha256") == ce.sha256(docs[FORMAL_TO_RELEASE]["dir"] / "manifest.json"),
+            and channel.get("release") == args.to_release and channel.get("sequence") == target["sequence"]
+            and channel.get("manifestSha256") == ce.sha256(docs[args.to_release]["dir"] / "manifest.json"),
             "signed channel does not bind the supplied target manifest")
     native = target.get("native") or {}
     require(native.get("version") == args.expected_native_version, "signed manifest native version differs from requested version")
@@ -1426,7 +1426,7 @@ def prepare_formal_mirror(args: argparse.Namespace, work: Path) -> dict:
         artifact = part.get("artifacts", {}).get(PLATFORM)
         if artifact is None:
             continue
-        tag = formal_label(artifact.get("tag", "cutex-0.2.2"))
+        tag = formal_label(artifact.get("tag", f"cutex-{args.to_release}"))
         archive = copy_formal_signed(formal_label(artifact["name"]), roots, mirror / tag, args.public_key)
         verify_formal_artifact(archive, artifact)
         if part is native:
@@ -1443,7 +1443,10 @@ def formal_runner_home(args: argparse.Namespace, environ: dict | None = None) ->
             "formal-assets runs only on fresh GitHub-hosted runners; never a developer/live host")
     require(sys.platform in ("linux", "win32"), "formal-assets supports Linux/Windows only")
     require(re.fullmatch(r"[0-9a-f]{40}", args.expected_commit) is not None, "expected commit must be a full SHA")
-    require(args.confirm_one_way == FORMAL_TO_RELEASE, "formal-assets requires --confirm-release 0.2.2")
+    require(args.confirm_one_way == args.to_release, "formal-assets requires explicit target release confirmation")
+    require(all(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", v) for v in (args.from_release, args.to_release))
+            and tuple(map(int, args.from_release.split("."))) < tuple(map(int, args.to_release.split("."))),
+            "formal-assets requires increasing stable public versions")
     require(args.management_port != args.bus_port and all(1024 <= p <= 65535 and p not in FORMAL_RESERVED_PORTS
             for p in (args.management_port, args.bus_port)), "invalid, colliding or reserved service ports")
     profile = env.get("USERPROFILE" if WINDOWS else "HOME", "")
@@ -1654,14 +1657,14 @@ def formal_cli_json(output: str) -> dict | None:
 
 
 def verify_formal_selection(host: "FormalHost", target: dict) -> dict:
-    bundle_path, bundle = verified_selected_bundle(host, FORMAL_TO_RELEASE)
+    bundle_path, bundle = verified_selected_bundle(host, host.args.to_release)
     native = target["native"]
     require(bundle.get("upstream_commit") == native["commit"], "selected native commit differs from signed manifest")
     native_dir = host.base / "natives" / native["version"]
     for field, path in (("executable", native_dir / f"codex-app-server{EXE}"),
                         ("code_mode_host", native_dir / f"codex-code-mode-host{EXE}"),
                         ("schema", native_dir / "codex_app_server_protocol.schemas.json"),
-                        ("facade", host.base / f"releases/{FORMAL_TO_RELEASE}" / f"cutex-mcp{EXE}")):
+                        ("facade", host.base / f"releases/{host.args.to_release}" / f"cutex-mcp{EXE}")):
         pin = bundle.get(field) or {}
         require(same_path(pin.get("path"), path) and pin.get("sha256") == ce.sha256(path),
                 f"selected {field} does not pin the actual formal files")
@@ -1764,7 +1767,7 @@ class FormalHost(Host):
             time.sleep(1)
         if WINDOWS:
             self.command("service", "install", "--channel", "release", "--base", str(self.base),
-                         exe=self.base / f"releases/{FORMAL_TO_RELEASE}" / f"cutex{EXE}")
+                         exe=self.base / f"releases/{self.args.to_release}" / f"cutex{EXE}")
         else:
             started = self.systemctl("start", self.bus_unit, self.management_unit)
             require(started.returncode == 0, "systemd start failed")
@@ -1812,7 +1815,7 @@ def formal_assert_api(host: FormalHost, fixture: dict, blobs: dict[str, bytes], 
 
 
 def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: dict[str, bytes]) -> dict:
-    old, target = docs[FORMAL_FROM_RELEASE], docs[FORMAL_TO_RELEASE]
+    old, target = docs[host.args.from_release], docs[host.args.to_release]
     old_dir, target_dir = host.work / "old-release", host.work / "target-reference"
     extract_formal_release(old["archive"], old_dir)
     target_hashes = extract_formal_release(target["archive"], target_dir)
@@ -1822,14 +1825,14 @@ def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: d
     host.initialize(docs["mirror"], fixture, blobs)
     _, _, line = host.command("--version", exe=old_dir / f"cutex{EXE}")
     match = VERSION_LINE.search(line)
-    require(match is not None and match["label"] == FORMAL_FROM_RELEASE and match["commit7"] == old["manifest"]["cutex"]["commit"][:7],
-            "original public 0.2.1 binary identity mismatch")
+    require(match is not None and match["label"] == host.args.from_release and match["commit7"] == old["manifest"]["cutex"]["commit"][:7],
+            "original published binary identity mismatch")
     host.install_attempted = True
     host.command("service", "install", "--channel", "release", "--base", str(host.base), exe=old_dir / f"cutex{EXE}")
-    old_ready = host.wait_ready(FORMAL_FROM_RELEASE)
+    old_ready = host.wait_ready(host.args.from_release)
     require(old_ready is not None and (old_ready.get("cutexBuild") or {}).get("profile") == "release"
             and (old_ready.get("cutexBuild") or {}).get("commit") == old["manifest"]["cutex"]["commit"],
-            "original production 0.2.1 did not start as a release build")
+            "original production release did not start as a release build")
     host.assert_services()
     formal_assert_api(host, fixture, blobs, immutable_only=True)
     baseline = wait_formal_baseline(host, fixture, blobs)
@@ -1840,26 +1843,35 @@ def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: d
     host.command("upgrade", "config", "--source", str(docs["mirror"]), "--package-run", "none")
     _, available, _ = host.command("upgrade", "check")
     target_doc = target["manifest"]
-    require(isinstance(available, dict) and available.get("release") == FORMAL_TO_RELEASE and available.get("class") == docs["expectedClass"]
+    require(isinstance(available, dict) and available.get("release") == host.args.to_release and available.get("class") == docs["expectedClass"]
             and available.get("sequence") == target_doc["sequence"] and available.get("nativeVersion") == host.args.expected_native_version,
             "embedded release trust/check did not offer exact formal target")
     _, staged, _ = host.command("upgrade", "stage")
     require((staged or {}).get("preflightOk", (staged or {}).get("preflight_ok")) is True, "formal preflight failed")
-    require(all(ce.sha256(host.base / f"releases/{FORMAL_TO_RELEASE}" / name) == digest for name, digest in target_hashes.items()),
+    require(all(ce.sha256(host.base / f"releases/{host.args.to_release}" / name) == digest for name, digest in target_hashes.items()),
             "production staged binaries differ from signed archive")
     if docs["expectedClass"] == "one-way":
         code, _, refusal = host.command("upgrade", "apply", "--max-wait", "600", allow_failure=True)
         require(code != 0 and "one_way_unconfirmed" in refusal, "production updater did not refuse missing one-way consent")
     host.command(*apply_arguments(available, host.args.confirm_one_way), "--package-run", "none")
     host.upgrade_executed = True
-    ready = host.wait_ready(FORMAL_TO_RELEASE)
+    ready = host.wait_ready(host.args.to_release)
     require(ready is not None and (ready.get("cutexBuild") or {}).get("commit") == host.args.expected_commit
             and (ready.get("cutexBuild") or {}).get("profile") == "release",
             "formal target service commit mismatch")
     state = json.loads((host.base / "upgrade/state.json").read_text(encoding="utf-8"))
     run = state.get("run") or {}
-    require(run.get("phase") == "committed" and run.get("fromRelease") == FORMAL_FROM_RELEASE and run.get("toRelease") == FORMAL_TO_RELEASE
+    require(run.get("phase") == "committed" and run.get("fromRelease") == host.args.from_release and run.get("toRelease") == host.args.to_release
             and run.get("class") == docs["expectedClass"], "formal upgrade did not commit exact declared transition")
+    backup = Path(run.get("backupDir") or "")
+    require(backup.is_absolute() and backup.resolve().is_relative_to(host.base.resolve()), "formal backup is missing or outside install base")
+    backup_manifest = json.loads((backup / "home-manifest.json").read_text(encoding="utf-8"))
+    require(bool(backup_manifest.get("files")), "formal state backup has no files")
+    for record in backup_manifest["files"]:
+        path = (backup / "home" / record["path"]).resolve()
+        require(path.is_relative_to((backup / "home").resolve()) and path.is_file()
+                and path.stat().st_size == record["bytes"] and ce.sha256(path) == record["sha256"],
+                "formal state backup file does not match committed manifest")
     host.assert_services()
     first_state = verify_formal_state(host.home / ".cutex", baseline, blobs)
     formal_assert_api(host, baseline, blobs)
@@ -1868,7 +1880,7 @@ def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: d
     require(status == 200 and not unexpected_capability_losses(features(before_caps), features(after_caps), removed),
             "formal upgrade lost undeclared capabilities")
     host.restart_services()
-    restarted = host.wait_ready(FORMAL_TO_RELEASE)
+    restarted = host.wait_ready(host.args.to_release)
     require(restarted is not None and (restarted.get("cutexBuild") or {}).get("commit") == host.args.expected_commit
             and (restarted.get("cutexBuild") or {}).get("profile") == "release", "formal services failed exact-release restart")
     host.assert_services()
@@ -1877,10 +1889,10 @@ def execute_formal_upgrade(host: FormalHost, docs: dict, fixture: dict, blobs: d
     selection = verify_formal_selection(host, target_doc)
     require(all(ce.sha256(host.installed_cli.parent / name) == digest for name, digest in target_hashes.items()),
             "running install bytes differ from formal signed target")
-    return {"evidence": "formal-signed-managed-upgrade", "from": FORMAL_FROM_RELEASE, "to": FORMAL_TO_RELEASE, "commit": host.args.expected_commit,
+    return {"evidence": "formal-signed-managed-upgrade", "from": host.args.from_release, "to": host.args.to_release, "commit": host.args.expected_commit,
             "selectionAfterRestart": selection, "nativeVersion": selection["nativeVersion"], "runId": run.get("runId"), "phase": run["phase"], "class": run["class"],
             "stateAfterApply": first_state, "stateAfterRestart": restarted_state, "upgradeExecuted": True,
-            "productionServices": True, "testTrustOverrides": False, "rollbackAttempted": False}
+            "productionServices": True, "backupVerifiedFiles": len(backup_manifest["files"]), "testTrustOverrides": False, "rollbackAttempted": False}
 
 
 def formal_assets(argv: list[str]) -> int:
@@ -1899,8 +1911,8 @@ def formal_assets(argv: list[str]) -> int:
     parser.add_argument("--old-assets", required=True, type=Path)
     parser.add_argument("--native-assets", required=True, type=Path)
     parser.add_argument("--public-key", required=True, type=Path)
-    parser.add_argument("--from-release", choices=(FORMAL_FROM_RELEASE,), default=FORMAL_FROM_RELEASE)
-    parser.add_argument("--to-release", choices=(FORMAL_TO_RELEASE,), default=FORMAL_TO_RELEASE)
+    parser.add_argument("--from-release", default=FORMAL_FROM_RELEASE)
+    parser.add_argument("--to-release", default=FORMAL_TO_RELEASE)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-native-version", default=FORMAL_NATIVE_VERSION)
     parser.add_argument("--work", required=True, type=Path)
