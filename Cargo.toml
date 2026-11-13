@@ -1,6 +1,6 @@
 [package]
 name = "cutex"
-version = "0.2.1"
+version = "0.2.3"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/senxiu-official/cutex"
@@ -44,7 +44,8 @@ crossterm = "0.29"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 tui-input = { version = "0.15", default-features = false }
 unicode-width = "0.2"
-rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "limits"] }
+unicode-segmentation = "1.13"
+rusqlite = { version = "0.41.0", features = ["bundled", "hooks", "limits", "backup"] }
 portable-pty = "0.9"
 ring = { version = "0.17", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

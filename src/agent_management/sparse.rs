@@ -43,9 +43,12 @@ pub const SPARSE_SCHEMA: &str = "cutex/agent-management-sparse/v1";
 
 /// The agent a sparse create / replace asks for; every field but `name` is
 /// optional and defaults as described in the module docs.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SparseAgentSpec {
+    /// Project-memory prompt injection and idle reminders at the next launch (default true).
+    #[serde(default = "crate::session::model::default_memory_injection", rename = "memoryInjection", alias = "memory_injection", skip_serializing_if = "crate::session::model::is_memory_injection_default")]
+    pub memory_injection: bool,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -74,6 +77,17 @@ pub struct SparseAgentSpec {
     /// show (`profiles::model_check`). Absent from the wire when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_unlisted: bool,
+}
+
+impl Default for SparseAgentSpec {
+    fn default() -> Self {
+        Self {
+            memory_injection: true,
+            name: String::new(), profile: None, model: None, reasoning: None,
+            sandbox: None, approval_policy: None, cwd: None,
+            expose_to_im: false, pin: false, variant: None, allow_unlisted: false,
+        }
+    }
 }
 
 /// How a sparse create / replace hands over its `task`.
@@ -441,6 +455,7 @@ pub fn resolve_spec(
         groups.push(format!("project:{}", &hash[..8.min(hash.len())]));
     }
     Ok(ManagedAgentSpec {
+        memory_injection: agent.memory_injection,
         name: agent.name.clone(),
         cwd,
         profile: Some(facts.name),
@@ -600,6 +615,9 @@ fn reviewed_request(
         _ => return Err(conflict("operation")),
     };
     let agent = sparse.operation.agent();
+    if agent.memory_injection != spec.memory_injection {
+        return Err(conflict("memoryInjection"));
+    }
     if agent.name != spec.name {
         return Err(conflict("name"));
     }
@@ -1073,6 +1091,25 @@ fn live_profile_facts_variant(requested: &str, variant: Option<&str>) -> Result<
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn memory_injection_sparse_defaults_true_and_false_is_creation_intent() {
+        for enabled in [true,false] {
+            let mut input = json!({"operation":"create","agent":{"name":"reviewer"}});
+            if !enabled {input["agent"]["memoryInjection"]=json!(false);}
+            let request = resolve_request(&sparse(input),&caller(),codex).unwrap();
+            let AgentOperation::Create {spec,..} = request.operation else {panic!("create")};
+            assert_eq!(spec.memory_injection,enabled);
+        }
+        assert!(SparseAgentSpec::default().memory_injection);
+        let legacy=sparse(json!({"operation":"create","agent":{"name":"reviewer"}}));
+        let explicit=sparse(json!({"operation":"create","agent":{"name":"reviewer","memoryInjection":true}}));
+        let disabled=sparse(json!({"operation":"create","agent":{"name":"reviewer","memoryInjection":false}}));
+        assert_eq!(legacy.digest().unwrap(),explicit.digest().unwrap());
+        assert_ne!(legacy.digest().unwrap(),disabled.digest().unwrap());
+    }
+
+
     #[test]
     fn dsh_sparse_creation_is_refused_by_name_when_dsh_is_not_installed() {
         // r265: agent tools create DSH agents; without the dsh-runtime component

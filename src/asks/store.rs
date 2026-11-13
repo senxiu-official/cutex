@@ -2001,6 +2001,17 @@ impl AskStore {
         self.with_selection(&[],None,mutate)
     }
 
+    /// Candidate pending notices via the hot-row requester/time and ask indexes.
+    /// Routing, closure and exact time are revalidated by the keyed mutation.
+    pub(crate) fn pending_notice_keys(&self, requester: &str, role_asks: &[String], before: Option<chrono::DateTime<Utc>>) -> anyhow::Result<Vec<String>> {
+        let database = self.database_path();
+        crate::management::v2::hot_store::prepare(&database)?;
+        let cutoff = before.map(|time| time.to_rfc3339());
+        Ok(crate::management::v2::hot_store::verified_snapshot(&database, "asks", |db,_| {
+            crate::management::v2::hot_store::pending_notice_keys(db,requester,role_asks,cutoff.as_deref())
+        })?.unwrap_or_default())
+    }
+
     /// Promotion and mutation share ONE file lock, so the incremental mover
     /// cannot cold-move a closed predecessor between lookup and update.
     #[track_caller]

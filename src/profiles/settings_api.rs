@@ -1389,19 +1389,17 @@ pub fn claude_effective_model(config: &CodezConfig, account: &StoredAccount) -> 
 /// Remove the profile's `newSessionDefaults` model (name and id keys); an
 /// entry left without model or reasoning goes.
 fn clear_new_session_model(account: &StoredAccount) -> anyhow::Result<()> {
-    let mut config = crate::config::store::load_codez_config_checked()?;
-    let mut changed = false;
+    crate::config::store::update_codez_config(|config| {
     for key in [&account.name, &account.id] {
         if let Some(defaults) = config.new_session_defaults.get_mut(key.as_str()) {
-            changed |= defaults.model.take().is_some();
+            defaults.model = None;
             if defaults.reasoning.is_none() {
                 config.new_session_defaults.remove(key.as_str());
             }
         }
     }
-    if changed {
-        crate::config::store::save_codez_config(&config)?;
-    }
+    Ok(())
+    })?;
     Ok(())
 }
 

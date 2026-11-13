@@ -698,6 +698,31 @@ fn unsent_event_open(store:&AskStore,session:&str,event_id:&str)->anyhow::Result
     }))? {super::pause_admission::Admission::Ready(open)=>open,super::pause_admission::Admission::Deferred=>false})
 }
 
+fn same_event_reservation(state: &AskState, snapshot: &AskState, lease: &AdmissionLease, event: &EventOutboxRecord) -> bool {
+    state.leases.get(&lease.cutex_session_id).into_iter()
+        .chain(state.next_step_leases.get(&lease.cutex_session_id))
+        .any(|current| current == lease)
+        && state.events.get(&event.event_id) == Some(event)
+        && !event.acknowledged
+        && event.native_message_id == lease.native_message_id
+        && event.cutex_session_id == lease.cutex_session_id
+        && event.delivery_ids.iter().all(|id| state.deliveries.get(id).is_some_and(|d|
+            Some(d) == snapshot.deliveries.get(id)
+                && d.state == DeliveryState::QueuedAsEvent && d.event_id.as_deref() == Some(event.event_id.as_str())))
+}
+
+fn abandon_owner_event(store: &AskStore, snapshot: &AskState, lease: &AdmissionLease,
+    event: &EventOutboxRecord, now: DateTime<Utc>) -> anyhow::Result<bool> {
+    store.with_state(|current| {
+        if !same_event_reservation(current, snapshot, lease, event) { return false; }
+        current.events.remove(&event.event_id);
+        remove_event_lease(current, &lease.cutex_session_id, &event.event_id);
+        make_passive_with(current, &lease.cutex_session_id, &event.delivery_ids, event_asks(snapshot,event),
+            super::RESULTS_OUTCOME_UNKNOWN, "owner carry runtime lost; context unconfirmed".into(), now);
+        true
+    })
+}
+
 /// Admit coalesced ANSWER/QUESTION events for idle requesters (§5.7).
 pub fn admit_events(
     world: &dyn SchedulerWorld,
@@ -742,7 +767,10 @@ pub fn admit_events(
             // Claude inboxes reconcile the existing key on the new generation.
             let target = runtime.target_status(&lease.cutex_session_id);
             if target.online && target.runtime_generation != lease.runtime_generation {
-                if is_owner_note(&event.native_message_id) || runtime.durable_next_step(&lease.cutex_session_id) {
+                if is_owner_note(&event.native_message_id) {
+                    // Owner envelopes are occurrence-bound. Reconcile their
+                    // original durable evidence, never a replacement's claim.
+                } else if runtime.durable_next_step(&lease.cutex_session_id) {
                     reconcile_generation = target.runtime_generation;
                 } else {
                     let (session, event_id) = (lease.cutex_session_id.clone(), event_id.clone());
@@ -762,20 +790,38 @@ pub fn admit_events(
                 }
             }
         }
+        let owner_carry = event.delivery_ids.iter().any(|id|
+            state.deliveries.get(id).is_some_and(|d| d.owner_input_id.is_some()));
         let Some(text) = event
             .event_artifact
             .as_deref()
             .and_then(|artifact| store.read_artifact(artifact, None).ok().flatten())
             .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
         else {
+            if owner_carry && runtime.target_status(&lease.cutex_session_id).runtime_generation > lease.runtime_generation
+                && abandon_owner_event(store,&state,lease,event,now)? {
+                forget_next_step(event_id);
+                forget_unavailable(event_id);
+                report.released.push(lease.cutex_session_id.clone());
+            }
             continue;
         };
         let submission = event_submission(&state, event, text);
         let session = lease.cutex_session_id.clone();
         let event_id = event_id.clone();
-        let owner_carry = event.delivery_ids.iter().any(|id|
-            state.deliveries.get(id).is_some_and(|d| d.owner_input_id.is_some()));
         let status = runtime.message_status(&session, reconcile_generation, &submission);
+        if owner_carry && runtime.target_status(&session).runtime_generation > lease.runtime_generation
+            && !matches!(status, NativeMessageStatus::Persisted { .. }) {
+            // A lost occurrence cannot finish its owner RPC. Missing evidence
+            // is uncertainty, not permission to deliver the text again.
+            let settled = abandon_owner_event(store,&state,lease,event,now)?;
+            if settled {
+                forget_next_step(&event_id);
+                forget_unavailable(&event_id);
+                report.released.push(session.clone());
+            }
+            continue;
+        }
         // 057 §6: its carrier steer proven never read, the runtime gave it
         // back. The owner's lane is free: no send of this owner is under way.
         if owner_carry && !matches!(status, NativeMessageStatus::Persisted { .. } | NativeMessageStatus::Held { turn_id: Some(_), .. }) {
@@ -802,18 +848,20 @@ pub fn admit_events(
                 | NativeMessageStatus::Held { turn_id: None, .. } if owner_carry => {},
             NativeMessageStatus::Persisted { turn_id } | NativeMessageStatus::Held { turn_id: Some(turn_id), .. } => {
                 let rows = result_rows(&state, &event.delivery_ids, now);
-                let freed = store.with_state(|state| {
-                    super::delivery::acknowledge_event(state, &event_id, &turn_id, now);
+                let freed = store.with_state(|current| {
+                    if !same_event_reservation(current, &state, lease, event) { return None; }
+                    super::delivery::acknowledge_event(current, &event_id, &turn_id, now);
                     if next_step {
                         // Read inside a turn the event did not start:
                         // nothing to hold the requester's admission for (a
                         // running turn's own lease beside it stays).
-                        remove_event_lease(state, &session, &event_id);
-                    } else if let Some(lease) = state.leases.get_mut(&session) {
+                        remove_event_lease(current, &session, &event_id);
+                    } else if let Some(lease) = current.leases.get_mut(&session) {
                         lease.turn_id = Some(turn_id.clone());
                     }
-                    !state.leases.contains_key(&session)
+                    Some(!current.leases.contains_key(&session))
                 })?;
+                let Some(freed) = freed else { continue; };
                 let path = if next_step { next_step_path(&event_id, &turn_id) } else { exclusive_path(&session) };
                 log_results(&rows, &event.native_message_id, &session, busy_wait(), path, &turn_id, now);
                 if next_step && freed {
@@ -1126,6 +1174,113 @@ mod tests {
     use super::*;
     use crate::asks::scheduler::tests::{finish_turn, world, FakeRuntime};
     use crate::asks::store::tests::{new_ask, temp_store, REQUESTER, TARGET};
+
+    #[test]
+    fn abandoned_owner_carry_source_rebuilds_after_unreconcilable_or_manual_release_crash() {
+        use crate::management::v2::input_ledger::{InputLedger, InputState};
+        for manual in [false,true] {
+            let (world,world_dir)=world("carry-source-crash");
+            let (store,dir)=temp_store("carry-source-crash");
+            let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);
+            let now=Utc::now();
+            answered(&world,&runtime,&store,now);
+            let bundle=crate::asks::owner_carries::reserve_owner_results(&store,REQUESTER,"crash-owner",1,
+                crate::app_server::external_input::size::ReceiverLimit::Off,world.documents(),now).unwrap().unwrap();
+            let before=store.snapshot().unwrap();
+            let ledger=InputLedger::open(dir.join("crash-ledger.sqlite3"));
+            for job in super::super::ledger::submitted_jobs_in(&before,REQUESTER,&bundle.input_ids,&bundle.event_id,
+                Some(&bundle.submission.message_id),Some("owner-turn"),false) {
+                super::super::ledger::apply_job(&ledger,&job);
+            }
+            if manual {
+                // Exercise an existing slot-held owner-note record (the
+                // manual lease API releases the primary slot only).
+                store.with_state(|state| {
+                    let lease=state.next_step_leases.remove(REQUESTER).unwrap();
+                    state.leases.insert(REQUESTER.into(),lease);
+                }).unwrap();
+                let lease=store.snapshot().unwrap().leases[REQUESTER].clone();
+                super::super::lease_reconcile::force_stale(store.dir(),&lease);
+                let expected=super::super::ledger::lease_view(&store,REQUESTER).unwrap().unwrap();
+                super::super::ledger::lease_release(&store,REQUESTER,&expected,now).unwrap();
+            } else {
+                settle_unreconcilable_event(&store,REQUESTER,&bundle.event_id,&bundle.input_ids,
+                    bundle.submission.asks.clone(),"missing receipt",now).unwrap();
+            }
+            drop(store);
+            drop(ledger);
+            let ledger=InputLedger::open(dir.join("crash-ledger.sqlite3"));
+            let store=AskStore::at(&dir); let reopened=store.snapshot().unwrap();
+            for record in ledger.get(REQUESTER,&bundle.input_ids).unwrap().records {
+                assert_eq!(record.state,InputState::Accepted,"source committed, writer did not run");
+                let job=super::super::ledger::drift_job(&reopened,&record).unwrap();
+                super::super::ledger::apply_job(&ledger,&job);
+                let uncertain=ledger.get(REQUESTER,&[record.input_id.clone()]).unwrap().records.pop().unwrap();
+                assert_eq!(uncertain.state,InputState::Uncertain);
+                assert_eq!(uncertain.reason.as_deref(),Some("outcomeUnknown"));
+                assert_eq!(uncertain.preview,record.preview);
+                assert!(super::super::ledger::apply_job(&ledger,&job).is_empty());
+                assert!(reopened.deliveries[&record.input_id].passive);
+            }
+            admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+            assert!(runtime.steered.borrow().is_empty());
+            assert_eq!(runtime.submitted.borrow().len(),1,"only the original target ask ran");
+            drop(ledger); drop(store);
+            for path in [dir,world_dir] { let _=std::fs::remove_dir_all(path); }
+        }
+    }
+
+    #[test]
+    fn explicit_result_retry_retires_empty_event_and_unblocks_scheduler() {
+        for (next_step, sibling) in [(false,false),(true,false),(false,true),(true,true)] {
+            let (world, world_dir) = world("result-retry-admission");
+            let (store, dir) = temp_store("result-retry-admission");
+            let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+            let now = Utc::now();
+            answered(&world, &runtime, &store, now);
+            let (old, id) = store.with_state(|state| {
+                let old = super::super::delivery::coalesce_into_event(state, REQUESTER, "old-native", now).unwrap();
+                let id = state.events[&old].delivery_ids[0].clone();
+                if sibling {
+                    let mut other = state.deliveries[&id].clone();
+                    other.delivery_id = "dlv-sibling".into();
+                    state.deliveries.insert(other.delivery_id.clone(), other);
+                    state.events.get_mut(&old).unwrap().delivery_ids.push("dlv-sibling".into());
+                }
+                let lease = AdmissionLease { cutex_session_id: REQUESTER.into(), holder: LeaseHolder::Event { event_id: old.clone() },
+                    native_message_id: "old-native".into(), runtime_generation: 7, turn_id: None, since: now_rfc3339(now) };
+                if next_step {
+                    state.leases.insert(REQUESTER.into(), AdmissionLease {
+                        cutex_session_id: REQUESTER.into(), holder: LeaseHolder::Owner,
+                        native_message_id: "owner-input".into(), runtime_generation: 7,
+                        turn_id: Some("owner-turn".into()), since: now_rfc3339(now),
+                    });
+                    state.next_step_leases.insert(REQUESTER.into(), lease);
+                } else { state.leases.insert(REQUESTER.into(), lease); }
+                (old, id)
+            }).unwrap();
+            assert_eq!(results_admissible(&store.snapshot().unwrap(), REQUESTER), None);
+            store.with_state(|state| super::super::ledger::retry_result(state, REQUESTER, &id, now).unwrap()).unwrap();
+            let state = store.snapshot().unwrap();
+            assert_eq!(state.events.contains_key(&old), sibling);
+            if sibling { assert_eq!(state.deliveries["dlv-sibling"].state, DeliveryState::QueuedAsEvent); }
+            if next_step {
+                assert!(matches!(state.leases[REQUESTER].holder, LeaseHolder::Owner), "retry never removes the owner's primary lease");
+                assert_eq!(results_admissible(&state, REQUESTER), Some(Some("owner-turn".into())));
+                // The owner turn ends normally; the old next-step event must
+                // not be promoted into its place or block this retry.
+                store.with_state(|state| { state.leases.remove(REQUESTER); }).unwrap();
+            } else { assert_eq!(results_admissible(&state, REQUESTER), Some(None)); }
+            let before = runtime.submitted.borrow().len();
+            admit_events(&world, &runtime, &store, &mut TickReport::default(), now).unwrap();
+            assert_eq!(runtime.submitted.borrow().len(), before + 1);
+            let state = store.snapshot().unwrap();
+            assert_eq!(state.deliveries[&id].state, DeliveryState::Acknowledged);
+            assert_ne!(state.deliveries[&id].event_id.as_deref(), Some(old.as_str()));
+            let _ = std::fs::remove_dir_all(world_dir);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 
     #[test]
     fn final_result_reservation_deferred_keeps_budget_deliveries_and_events_unchanged() {

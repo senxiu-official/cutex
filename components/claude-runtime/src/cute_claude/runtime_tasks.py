@@ -201,7 +201,8 @@ class RuntimeTasks:
             return
         subagents = getattr(self.engine, 'subagents', None)
         ref = f'claude:{self.sid}:task:{row["taskId"]}' if subagents is not None else None
-        row['notifyParent'] = notice(row, row['status'], summary, transcript=ref, reason=row.get('_reason'))
+        row['notifyParent'] = notice(row, row['status'], summary, transcript=ref, reason=row.get('_reason'),
+                                     notice_id=row.get('_noticeId'))
 
     async def _late_notice(self, task_id):
         self.timers.pop(task_id, None)
@@ -293,7 +294,35 @@ class RuntimeTasks:
             row = {'taskId': task_id, 'turnId': active_turn_id if subtype == 'task_started' else None,
                    'taskType': field(message, 'task_type'), 'status': 'running'}
             self.rows[task_id] = row
+        restarted = False
+        if subtype == 'task_started' and not first and row['status'] in TERMINAL and row.get('background'):
+            # CLI can finish a child while its background shell runs, then start
+            # the same spawn again when the shell completes. Only a fresh SDK
+            # start tied to that proven spawn may restore its original binding.
+            start_uuid = field(message, 'uuid')
+            starts = row.get('_startUuids', set())
+            bridge = self._bridge()
+            if (not isinstance(start_uuid, str) or not start_uuid or start_uuid in starts or len(starts) >= 4096
+                    or field(message, 'tool_use_id') != row.get('toolUseId')
+                    or field(message, 'task_type') not in AGENT_TYPES
+                    or field(message, 'is_backgrounded') is not True or bridge is None
+                    or not bridge.resume_background(task_id, row.get('_originBinding'))):
+                return True
+            timer = self.timers.pop(task_id, None)
+            if timer is not None:
+                timer.cancel()
+            for key in ('_closed', '_notified', '_reason', 'notifyParent'):
+                row.pop(key, None)
+            row['status'] = 'running'
+            row['_noticeId'] = f'{task_id}:run:{start_uuid}'
+            restarted = True
+            subagents = getattr(self.engine, 'subagents', None)
+            if subagents is not None:
+                await subagents.background_restarted(self.sid, task_id, row['toolUseId'])
         if subtype == 'task_started':
+            start_uuid = field(message, 'uuid')
+            if isinstance(start_uuid, str) and start_uuid and len(row.setdefault('_startUuids', set())) < 4096:
+                row['_startUuids'].add(start_uuid)
             description = field(message, 'description')
             if isinstance(description, str):
                 row['description'] = description[:2048]
@@ -311,6 +340,7 @@ class RuntimeTasks:
                     origin = bridge.adopt_background(task_id, call_id, backgrounded is not False)
                     subagents = getattr(self.engine, 'subagents', None)
                     if origin is not None:
+                        row['_originBinding'] = origin
                         row['background'] = True
                         row['turnId'] = row.get('turnId') or origin[0]
                     if subagents is not None and backgrounded is False:
@@ -341,7 +371,7 @@ class RuntimeTasks:
         if isinstance(usage, dict):
             row['usage'] = {key: value for key, value in usage.items()
                             if key in {'total_tokens', 'tool_uses', 'duration_ms'} and type(value) is int and value >= 0}
-        if subtype == 'task_started' and first:
+        if subtype == 'task_started' and (first or restarted):
             await self.activity(row, 'started')
         if subtype == 'task_started' and row.get('toolUseId') and row.get('taskType') in AGENT_TYPES:
             await self._transcript_seen(task_id, row.get('turnId'), row['toolUseId'])

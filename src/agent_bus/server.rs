@@ -170,6 +170,28 @@ pub enum RegistrationDisposition {
     Deferred,
 }
 
+fn authenticated_pan_caller(
+    request: &crate::agent_bus::agent_auth::BusRequest,
+    state: &Arc<Mutex<AgentBusState>>,
+) -> Option<crate::pan::Caller> {
+    let principal = request.agent()?;
+    let sender = agent_management_sender(request, state).ok()?;
+    // The authenticated principal already binds the durable session ID. Read
+    // that row directly and check its current runtime/protocol occurrence;
+    // resolving a thread against every session adds no authority here.
+    let record = crate::session::store::shared_session_row(&principal.cutex_session_id).ok()??;
+    let roster = state.lock().ok()?.agents.get(&principal.runtime_agent_id)?.clone();
+    (record.cutex_session_id == principal.cutex_session_id
+        && record.archive_state == crate::session::model::CutexSessionArchiveState::Active
+        && record.current_runtime_agent_id.as_deref() == Some(sender.runtime_agent_id.as_str())
+        && (record.app_server_thread_id() == Some(sender.roster_session_id.as_str())
+            || (record.claude_session.is_none() && record.cutex_session_id == sender.roster_session_id))
+        && record.runtime_generation > 0
+        && !crate::agent_management::agent_execution_blocked(&record)
+        && persistent_agent_occurrence(&record, &roster))
+        .then(|| crate::pan::Caller::agent(&principal.cutex_session_id))
+}
+
 pub fn handle_agent_bus_request(
     stream: &mut TcpStream,
     state: &Arc<Mutex<AgentBusState>>,
@@ -222,6 +244,14 @@ pub fn handle_agent_bus_request(
         .split('?')
         .next()
         .unwrap_or(request.path.as_str());
+    if request.method == "POST" && path_only == crate::pan::api::BUS_PATH {
+        let caller = authenticated_pan_caller(&request, state);
+        let result = match caller {
+            Some(caller) => crate::pan::Service::host().and_then(|s| crate::pan::api::cli(&s, caller, &request.body)),
+            None => Err(crate::pan::Error::new("unauthorized", "Pan CLI requires a current authenticated agent", false)),
+        };
+        return match result { Ok(v) => write_json_response(stream, 200, "OK", &v), Err(e) => crate::pan::api::error_response(stream, &e) };
+    }
     match (request.method.as_str(), path_only) {
         ("GET", "/") => write_http_response(stream, 200, "OK", "text/plain", b"ok"),
         ("GET", "/api/diagnostics/control") => {
@@ -462,11 +492,28 @@ pub fn handle_agent_bus_request(
             };
             write_json_response(stream, 200, "OK", &result)
         }
+        ("POST", super::claude_occurrence::PATH) => {
+            if token.is_none_or(|token| token.trim().is_empty()) {
+                return write_json_response(stream, 403, "Forbidden", &serde_json::json!({"error":"service_token_required"}));
+            }
+            require_service_bridge_token(&request, token, "Agent Bus")?;
+            let payload: super::claude_occurrence::Request = serde_json::from_slice(&request.body)?;
+            let outcome = super::claude_occurrence::update(state, &payload)?;
+            if outcome == "registered" {
+                if let Err(error) = timed_fanout(|| (handlers.redrive_ordinary_messages)(state)) {
+                    eprintln!("warning: Claude ordinary-message redrive failed: {error:#}");
+                }
+            }
+            write_json_response(stream, 200, "OK", &serde_json::json!({"outcome": outcome}))
+        }
         ("POST", "/api/agents/register") => {
             require_service_bridge_token(&request, token, "Agent Bus")?;
             let payload: crate::agent_bus::model::AgentBusRegisterRequest =
                 serde_json::from_slice(&request.body)
                     .context("Failed to parse agent register JSON")?;
+            // Claude owners require the full durable occurrence fence. Legacy
+            // ID-only observers must not overwrite the shared owner's roster.
+            anyhow::ensure!(!payload.id.starts_with("claude."), "Claude registration requires an exact occurrence");
             let now = now_epoch_secs();
             let agent = agent_from_register_request(payload, now);
             let refresh = state
@@ -557,8 +604,12 @@ pub fn handle_agent_bus_request(
                     .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
                 #[cfg(feature = "stock-launch-test-hook")]
                 crate::app_server::private_restart_phase("bus.unregister.lock.acquired");
-                state.messages.remove(&payload.id);
-                let removed = state.agents.remove(&payload.id).is_some();
+                let removed = if super::claude_occurrence::owned(&state, &payload.id) {
+                    false
+                } else {
+                    state.messages.remove(&payload.id);
+                    state.agents.remove(&payload.id).is_some()
+                };
                 if removed {
                     save_agent_bus_registry_locked(&state)?;
                 }
@@ -1626,6 +1677,31 @@ fn agent_launch_policy_refusal(
             );
         }
     }
+    let (creator_write, creator_exec) = match crate::agent_management::envelope::effective_tool_permissions(caller) {
+        Ok(tools) => tools,
+        Err(detail) => return no_write("creator_permissions_unknown", format!("Not created: {detail}. The owner can create this agent.")),
+    };
+    if !creator_write || !creator_exec {
+        if profile.trim().is_empty() {
+            return no_write("permission_exceeds_creator", "Not created: without a profile, the child would get full tools and exceed your effective Claude tool permissions. Choose a profile with the restricted tools disabled, or ask the owner to create this agent.".into());
+        }
+        let Some(account) = store.as_ref().and_then(|store| crate::profiles::settings_api::find(store, profile)) else {
+            return no_write("creator_permissions_unknown", "Not created: the target's tool permissions could not be verified. The owner can create this agent.".into());
+        };
+        // Claude credentials can launch only Claude; every other currently
+        // supported runtime has command and file tools. Do not trust a caller's
+        // runtime_backend string to claim the target has fewer powers.
+        let (child_write, child_exec) = if account.cli_kind == crate::profiles::model::CliKind::Claude {
+            (account.options.claude.write(), account.options.claude.exec())
+        } else { (true, true) };
+        let mut fields = Vec::new();
+        if child_write && !creator_write { fields.push("allow_write"); }
+        if child_exec && !creator_exec { fields.push("allow_exec"); }
+        if !fields.is_empty() {
+            return no_write("permission_exceeds_creator", format!(
+                "Not created: {} would exceed your effective Claude tool permissions. Choose a profile with these tools disabled, or ask the owner to create this agent.", fields.join(", ")));
+        }
+    }
     let needs_approval = store
         .as_ref()
         .and_then(|store| crate::profiles::settings_api::find(store, profile).cloned())
@@ -1769,7 +1845,10 @@ pub(crate) fn validate_mcp_caller_fence(
     request: &crate::agent_bus::agent_auth::BusRequest,
     state: &Arc<Mutex<AgentBusState>>,
 ) -> anyhow::Result<Option<AgentManagementInvocation>> {
-    validate_mcp_caller_fence_for(request, state, false)
+    validate_mcp_caller_fence_for(request, state, false).inspect_err(|error| {
+        // Fixed fence diagnostics contain no request bodies or credentials.
+        eprintln!("MCP current-runtime fence rejected: {error}");
+    })
 }
 
 /// [`validate_mcp_caller_fence`]; `owned_sessions` also admits the current
@@ -2878,6 +2957,59 @@ mod tests {
     }
 
     #[test]
+    fn pan_route_rejects_stale_disabled_and_nonpersistent_callers_before_service_access() {
+        let _lock = crate::config::paths::test_home_env_lock();
+        let previous = crate::config::instance::selected().unwrap();
+        let root = std::env::temp_dir().join(format!("pan-caller-audit-{}", uuid::Uuid::new_v4()));
+        crate::config::instance::set_test_selection(crate::config::instance::Selection::Custom(root.clone()));
+        let runtime = "pan-audit-runtime";
+        let session = "cutex.pan-audit";
+        let thread = "018e0000-0000-7000-8000-0000b0009ae4";
+        let state = route_state();
+        let mut roster = active_route_roster(runtime, thread);
+        roster.cutex_session_id = Some(session.into());
+        roster.registration_class = AgentRegistrationClass::Persistent;
+        state.lock().unwrap().agents.insert(runtime.into(), roster);
+        let credential = crate::agent_bus::agent_auth::agent_credential("route-token", runtime, session);
+        for case in ["stale", "disabled", "retired", "local-only", "thread-mismatch", "zero-generation"] {
+            let mut record = active_route_session(session, thread, runtime, 1, 7);
+            record.registration_class = AgentRegistrationClass::Persistent;
+            match case {
+                "stale" => record.current_runtime_agent_id = Some("replacement-runtime".into()),
+                "disabled" => record.agent_enabled = false,
+                "retired" => record.archive_state = crate::session::model::CutexSessionArchiveState::Retired,
+                "local-only" => record.registration_class = AgentRegistrationClass::LocalOnly,
+                "thread-mismatch" => record.codex_session_id = Some("different-thread".into()),
+                "zero-generation" => record.runtime_generation = 0,
+                _ => unreachable!(),
+            }
+            let mut sessions = crate::session::store::load_cutex_session_store().unwrap();
+            sessions.sessions.insert(session.into(), record);
+            crate::session::store::save_cutex_session_store(&sessions).unwrap();
+            let response = invoke_route(raw_route_request(crate::pan::api::BUS_PATH,
+                &credential, runtime, br#"{"operation":"status"}"#), state.clone());
+            assert!(response.starts_with(b"HTTP/1.1 401 "), "{case}: {}", String::from_utf8_lossy(&response));
+        }
+        let mut sessions = crate::session::store::load_cutex_session_store().unwrap();
+        let mut record = active_route_session(session,thread,runtime,1,7);
+        record.registration_class = AgentRegistrationClass::Persistent;
+        sessions.sessions.insert(session.into(),record);
+        crate::session::store::save_cutex_session_store(&sessions).unwrap();
+        let request = crate::agent_bus::agent_auth::BusRequest::authenticate(
+            crate::http::server::SimpleHttpRequest {
+                method:"POST".into(),path:crate::pan::api::BUS_PATH.into(),body:vec![],
+                headers:std::collections::HashMap::from([
+                    ("authorization".into(),format!("Bearer {credential}")),
+                    ("x-cutex-agent-id".into(),runtime.into()),
+                ]),
+            }, Some("route-token")).unwrap();
+        assert_eq!(authenticated_pan_caller(&request,&state),Some(crate::pan::Caller::agent(session)),
+            "a current persistent agent remains admitted without MCP-only headers");
+        crate::config::instance::set_test_selection(previous);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_management_sender_discards_project_chat_groups() {
         let runtime_id = "runtime-director-r10";
         let roster_session_id = "018e0000-0000-7000-8000-0000b0009ae4";
@@ -3344,6 +3476,69 @@ mod tests {
         control: &str,
     ) {
         assert_eq!(&route_no_write_observer(state), before, "{control}");
+    }
+
+    #[test]
+    fn claude_tool_limits_apply_to_agent_create_and_member_replace() {
+        use serde_json::json;
+        let _lock = crate::config::paths::test_home_env_lock();
+        let previous = crate::config::instance::selected().unwrap();
+        let root = std::env::temp_dir().join(format!("tool-envelope-audit-{}", uuid::Uuid::new_v4()));
+        crate::config::instance::set_test_selection(crate::config::instance::Selection::Custom(root.clone()));
+        let caller = "cutex.no-exec-director";
+        let mut record = active_route_session(caller, "thread", "runtime", 1, 1);
+        record.profile = None;
+        record.sandbox_mode = Some("danger-full-access".into());
+        record.approval_policy = Some("never".into());
+        record.runtime_backend = crate::session::model::CutexSessionRuntimeBackend::ClaudeSubscription;
+        record.claude_session = Some(serde_json::from_value(json!({
+            "deployment":{"python":"/unused","adapter_source":"/unused","claude_cli":"/unused","claude_home":"/unused","tui_binary":"/unused"},
+            "thread_id":"thread","state_dir":"/unused","model":"sonnet","instructions":"",
+            "allow_write":true,"allow_exec":false,"write_explicit":true,"exec_explicit":true
+        })).unwrap());
+        let mut sessions = CutexSessionStore::default();
+        sessions.sessions.insert(caller.into(), record.clone());
+        crate::session::store::save_cutex_session_store(&sessions).unwrap();
+        let mut accounts: crate::profiles::model::AccountsStore = Default::default();
+        accounts.accounts.push(serde_json::from_value(json!({"id":"target","name":"Target","cli_kind":"codex"})).unwrap());
+        let path = crate::config::paths::accounts_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&accounts).unwrap()).unwrap();
+        let invocation = AgentManagementInvocation {
+            caller_cutex_session: crate::role_revision::CutexSessionId::new(caller).unwrap(),
+            caller_runtime_agent_id:"runtime".into(),
+        };
+        let spec: crate::agent_management::ManagedAgentSpec = serde_json::from_value(json!({
+            "name":"child","cwd":root,"profile":"Target","runtime_backend":"host","model":"m","reasoning":"high",
+            "permissions":"danger-full-access","sandbox_mode":"danger-full-access","approval_policy":"never","groups":["g"]
+        })).unwrap();
+        for operation in [
+            crate::agent_management::AgentOperation::Create {spec:spec.clone(),bootstrap_intent:None,start_mode:crate::agent_management::AgentStartMode::BootstrapOnly,frozen_message:None},
+            crate::agent_management::AgentOperation::Replace {successor:spec.clone(),bootstrap_intent:None,predecessor_cutex_session_id:crate::role_revision::CutexSessionId::new("cutex.old").unwrap(),policy:crate::agent_management::AgentReplacePolicy::KeepOld,start_mode:crate::agent_management::AgentStartMode::BootstrapOnly,frozen_message:None},
+        ] {
+            let request = AgentManagementRequest {schema:AgentManagementSchema::V1,action_id:AgentActionId::new("tool-envelope-test").unwrap(),project_id:None,operation};
+            let refusal = agent_launch_policy_refusal(&invocation,&request,None,&mut None).expect("no-exec creator must not launch an exec-enabled child");
+            let value = serde_json::to_value(refusal).unwrap();
+            assert_eq!(value["outcome"]["code"],"permission_exceeds_creator");
+            assert!(value["outcome"]["detail"].as_str().unwrap().contains("allow_exec"));
+            assert!(value["outcome"]["detail"].as_str().unwrap().contains("owner"));
+            // Same restriction on the target's Claude profile permits it.
+            accounts.accounts[0].cli_kind = crate::profiles::model::CliKind::Claude;
+            accounts.accounts[0].options.claude.allow_exec = Some(false);
+            std::fs::write(&path, serde_json::to_vec(&accounts).unwrap()).unwrap();
+            assert!(agent_launch_policy_refusal(&invocation,&request,None,&mut None).is_none());
+            accounts.accounts[0].cli_kind = crate::profiles::model::CliKind::Codex;
+            std::fs::write(&path, serde_json::to_vec(&accounts).unwrap()).unwrap();
+        }
+        let mut implicit=spec; implicit.profile=None;
+        let request=AgentManagementRequest {schema:AgentManagementSchema::V1,action_id:AgentActionId::new("tool-default-profile").unwrap(),project_id:None,
+            operation:crate::agent_management::AgentOperation::Create {spec:implicit,bootstrap_intent:None,start_mode:crate::agent_management::AgentStartMode::BootstrapOnly,frozen_message:None}};
+        let refusal=agent_launch_policy_refusal(&invocation,&request,None,&mut None).unwrap();
+        let value=serde_json::to_value(refusal).unwrap();
+        assert_eq!(value["outcome"]["code"],"permission_exceeds_creator");
+        assert!(value["outcome"]["detail"].as_str().unwrap().contains("the child would get full tools"));
+        crate::config::instance::set_test_selection(previous);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn raw_route_request(path: &str, token: &str, sender: &str, body: &[u8]) -> Vec<u8> {

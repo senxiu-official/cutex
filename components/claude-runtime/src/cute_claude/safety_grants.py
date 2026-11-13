@@ -27,6 +27,7 @@ from .errors import RpcError, require, text
 from .store import dump, identifier
 
 GRANT_SECONDS = 30 * 60
+GRANT_HARD_CAP_SECONDS = 2 * 60 * 60
 METHODS = {'thread/safetyCheck/list', 'thread/safetyCheck/grant', 'thread/safetyCheck/dismiss'}
 BLOCKED_EVENT = 'thread/safetyCheck/blocked'
 UPDATED_EVENT = 'thread/safetyCheck/updated'
@@ -67,6 +68,11 @@ class SafetyGrants:
             command TEXT NOT NULL, reason TEXT NOT NULL, source TEXT,
             state TEXT NOT NULL, created REAL NOT NULL,
             decided REAL, decided_by TEXT, expires REAL, used REAL, used_call_id TEXT)''')
+        columns = {row[1] for row in self.db.execute('PRAGMA table_info(safety_blocks)')}
+        for name, kind in [('notice_input_id', 'TEXT'), ('notice_read', 'REAL'), ('hard_expires', 'REAL')]:
+            if name not in columns:
+                self.db.execute(f'ALTER TABLE safety_blocks ADD COLUMN {name} {kind}')
+        self.db.execute('CREATE INDEX IF NOT EXISTS safety_blocks_notices ON safety_blocks(thread_id,notice_input_id)')
         self.db.execute('CREATE INDEX IF NOT EXISTS safety_blocks_grants ON safety_blocks(thread_id, grant_key, state)')
 
     # ---------------------------------------------------------------- wire
@@ -83,7 +89,8 @@ class SafetyGrants:
                 'state': state, 'blockedAt': iso(row['created']), 'decidedAt': iso(row['decided']),
                 'decidedBy': json.loads(row['decided_by']) if row['decided_by'] else None,
                 'expiresAt': iso(row['expires']), 'usedAt': iso(row['used']),
-                'grantSeconds': GRANT_SECONDS}
+                'grantSeconds': GRANT_SECONDS, 'noticeInputId': row['notice_input_id'],
+                'noticeReadAt': iso(row['notice_read']), 'hardExpiresAt': iso(row['hard_expires'])}
 
     def row(self, tid: str, block_id: str):
         row = self.db.execute('SELECT * FROM safety_blocks WHERE id=? AND thread_id=?', (block_id, tid)).fetchone()
@@ -116,6 +123,22 @@ class SafetyGrants:
                             (now, call_id, row['id']))
         return self.wire(self.row(tid, row['id']))
 
+    def record_notice_read(self, tid: str, message_id: str) -> dict | None:
+        """Only the native external-input receipt path calls this. Offering is not reading."""
+        now = time.time()
+        with self.server.store.transaction():
+            row = self.db.execute("SELECT * FROM safety_blocks WHERE thread_id=? AND notice_input_id=? AND state='granted' AND notice_read IS NULL AND hard_expires>?", (tid, message_id, now)).fetchone()
+            if row is None:
+                return
+            self.db.execute('UPDATE safety_blocks SET notice_read=?,expires=? WHERE id=?',
+                            (now, min(now + GRANT_SECONDS, row['hard_expires']), row['id']))
+        return self.wire(self.row(tid, row['id']))
+
+    async def notice_read(self, tid: str, message_id: str) -> None:
+        block = self.record_notice_read(tid, message_id)
+        if block is not None:
+            await self.server.engine.emit(tid, UPDATED_EVENT, {'threadId': tid, 'block': block})
+
     # ----------------------------------------------------------- protocol
 
     async def dispatch(self, peer, method: str, params: dict) -> dict:
@@ -128,7 +151,7 @@ class SafetyGrants:
             rows = self.db.execute('SELECT * FROM safety_blocks WHERE thread_id=? ORDER BY created DESC LIMIT 200', (tid,)).fetchall()
             blocks = [self.wire(r) for r in rows]
             return {'data': [b for b in blocks if state is None or b['state'] == state]}
-        require(set(params) <= {'threadId', 'blockId', 'decidedBy'}, 'only threadId, blockId and decidedBy are accepted')
+        require(set(params) <= {'threadId', 'blockId', 'decidedBy', 'noticeInputId'}, 'only threadId, blockId, decidedBy and noticeInputId are accepted')
         block_id = text(params.get('blockId'), 'blockId', limit=128)
         decided_by = params.get('decidedBy')
         # Only a controller that relays human decisions, and only for the owner.
@@ -137,6 +160,9 @@ class SafetyGrants:
                            {'code': 'owner_required'})
         require(set(decided_by) <= {'kind', 'id'} and (decided_by.get('id') is None or isinstance(decided_by['id'], str)),
                 'decidedBy must be {kind: "owner", id?}')
+        notice = params.get('noticeInputId')
+        require(notice is None or (isinstance(notice, str) and notice.startswith('alarm-approval-') and len(notice) <= 200),
+                'noticeInputId must name an approval notice')
         with self.server.store.transaction():
             row = self.row(tid, block_id)
             if row['state'] != 'blocked':
@@ -144,8 +170,9 @@ class SafetyGrants:
                                {'code': 'safety_block_closed', 'block': self.wire(row)})
             now = time.time()
             if method == 'thread/safetyCheck/grant':
-                self.db.execute("UPDATE safety_blocks SET state='granted',decided=?,decided_by=?,expires=? WHERE id=?",
-                                (now, dump(decided_by), now + GRANT_SECONDS, block_id))
+                cap = now + GRANT_HARD_CAP_SECONDS if notice else None
+                self.db.execute("UPDATE safety_blocks SET state='granted',decided=?,decided_by=?,expires=?,notice_input_id=?,hard_expires=? WHERE id=?",
+                                (now, dump(decided_by), cap or now + GRANT_SECONDS, notice, cap, block_id))
             else:
                 self.db.execute("UPDATE safety_blocks SET state='dismissed',decided=?,decided_by=? WHERE id=?",
                                 (now, dump(decided_by), block_id))

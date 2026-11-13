@@ -1305,7 +1305,7 @@ fn send_user_input_native_request(
     let result = send_user_input_native_request_inner(command, method, params, disposition, generation);
     if let Some(carries) = &carries {
         match &result {
-            Ok(execution) => carries.accepted(execution.turn_id.as_deref()),
+            Ok(execution) => carries.accepted(execution.turn_id.as_deref(), execution.disposition == UserInputDisposition::Started),
             Err(error) if error.outcome_unknown => carries.unknown(),
             Err(_) => carries.release_unsent(),
         }

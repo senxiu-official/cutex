@@ -686,7 +686,7 @@ fn fork_record(source: &CutexSessionRecord, id: &str, name: &str, thread: &str, 
             Some(binding.deployment_version.clone()),
         )
     });
-    cutex::session::fork::inherit_fork_avatar(source, &mut record);
+    cutex::session::fork::inherit_fork_preferences(source, &mut record);
     record.stamp_created_by_at_creation(Some(&cutex::session::model::SessionCreatedBy::Owner))?;
     Ok(record)
 }

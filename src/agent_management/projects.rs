@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::management::control_plane::{
@@ -27,6 +28,8 @@ use super::{
 };
 
 mod director;
+#[cfg(test)]
+mod icon_tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectPaletteColor {
@@ -125,11 +128,83 @@ impl<'de> Deserialize<'de> for ProjectPaletteColor {
     }
 }
 
+/// Non-authoritative icon shared by desktop and mobile.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectIcon {
+    pub kind: ProjectIconKind,
+    pub value: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectIconKind {
+    Emoji,
+    Icon,
+    Text,
+}
+
+impl ProjectIcon {
+    fn normalized(&self) -> Self {
+        Self {
+            kind: self.kind,
+            value: self.value.trim().to_string(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), AgentManagementError> {
+        let value = self.value.trim();
+        let valid = !value.is_empty()
+            && !value.chars().any(char::is_control)
+            && match self.kind {
+                ProjectIconKind::Emoji => value.len() <= 32 && value.graphemes(true).count() == 1,
+                ProjectIconKind::Icon => value.len() <= 32
+                    && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                ProjectIconKind::Text => (1..=2).contains(&value.chars().count()),
+            };
+        if valid {
+            Ok(())
+        } else {
+            Err(AgentManagementError::InvalidRequest(match self.kind {
+                ProjectIconKind::Emoji => "invalid_project_icon_emoji_expected_one_grapheme_max_32_bytes",
+                ProjectIconKind::Icon => "invalid_project_icon_id_expected_lowercase_alphanumeric_hyphen_max_32",
+                ProjectIconKind::Text => "invalid_project_icon_text_expected_one_or_two_characters",
+            }))
+        }
+    }
+}
+
+// Present null must produce Some(None); the field default handles omission.
+fn deserialize_project_icon_patch<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<ProjectIcon>>, D::Error> {
+    Option::<ProjectIcon>::deserialize(deserializer).map(Some)
+}
+
+// Creation receipts are durable roster rows. r281 strictly decodes their
+// embedded presentation input, so keep the icon only in presentation settings.
+// The digest still covers the complete original request, including its icon.
+fn mutation_receipt_operation(
+    operation: &HumanManagementProjectMutationKind,
+) -> HumanManagementProjectMutationKind {
+    let mut operation = operation.clone();
+    match &mut operation {
+        HumanManagementProjectMutationKind::Create { presentation, .. }
+        | HumanManagementProjectMutationKind::CreateProject { presentation, .. } => {
+            presentation.icon = None;
+        }
+        _ => {}
+    }
+    operation
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectPresentationSettings {
     pub display_name: String,
     pub badge_label: String,
     pub color: ProjectPaletteColor,
+    #[serde(default)]
+    pub icon: Option<ProjectIcon>,
     pub revision: u64,
     pub updated_at: Rfc3339,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,10 +223,27 @@ pub struct ProjectPresentationInput {
     pub display_name: String,
     pub badge_label: String,
     pub color: ProjectPaletteColor,
+    /// Missing = retain current icon; null = clear; object = replace.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_project_icon_patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub icon: Option<Option<ProjectIcon>>,
 }
 
 impl ProjectPresentationInput {
+    fn resolved_icon(&self, current: Option<&ProjectPresentationSettings>) -> Option<ProjectIcon> {
+        match &self.icon {
+            Some(value) => value.as_ref().map(ProjectIcon::normalized),
+            None => current.and_then(|settings| settings.icon.clone()),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), AgentManagementError> {
+        if let Some(Some(icon)) = &self.icon {
+            icon.validate()?;
+        }
         let display_name = self.display_name.trim();
         if display_name.is_empty()
             || display_name.chars().count() > 80
@@ -185,6 +277,8 @@ pub struct EffectiveProjectPresentation {
     pub display_name: String,
     pub badge_label: String,
     pub color: ProjectPaletteColor,
+    #[serde(default)]
+    pub icon: Option<ProjectIcon>,
     pub revision: u64,
     pub stored: bool,
 }
@@ -472,6 +566,7 @@ impl AgentManagementProvider {
                 if current.display_name == request.presentation.display_name.trim()
                     && current.badge_label == request.presentation.badge_label.trim()
                     && current.color == request.presentation.color
+                    && current.icon == request.presentation.resolved_icon(Some(current))
                 {
                     let current = current.clone();
                     return Ok((state, current, false));
@@ -492,6 +587,7 @@ impl AgentManagementProvider {
                 display_name: request.presentation.display_name.trim().to_string(),
                 badge_label: request.presentation.badge_label.trim().to_string(),
                 color: request.presentation.color,
+                icon: request.presentation.resolved_icon(state.project_presentations.get(&request.project_id)),
                 revision,
                 updated_at: now(),
                 updated_by_director_session: Some(invocation.caller_cutex_session.clone()),
@@ -626,6 +722,7 @@ impl AgentManagementProvider {
                 if current.display_name == request.presentation.display_name.trim()
                     && current.badge_label == request.presentation.badge_label.trim()
                     && current.color == request.presentation.color
+                    && current.icon == request.presentation.resolved_icon(Some(current))
                 {
                     let current = current.clone();
                     return Ok((state, current, false));
@@ -646,6 +743,7 @@ impl AgentManagementProvider {
                 display_name: request.presentation.display_name.trim().to_string(),
                 badge_label: request.presentation.badge_label.trim().to_string(),
                 color: request.presentation.color,
+                icon: request.presentation.resolved_icon(state.project_presentations.get(&request.project_id)),
                 revision,
                 updated_at: now(),
                 updated_by_director_session: None,
@@ -1154,7 +1252,7 @@ impl AgentManagementProvider {
                 action_id: request.action_id.clone(),
                 request_sha256: digest.clone(),
                 project_id: request.project_id.clone(),
-                operation: request.operation.clone(),
+                operation: mutation_receipt_operation(&request.operation),
                 previous_project_revision: previous_revision,
                 project_revision: revision,
                 project_state: Some(project_state),
@@ -1258,6 +1356,7 @@ impl AgentManagementProvider {
                 display_name: presentation.display_name.trim().to_string(),
                 badge_label: presentation.badge_label.trim().to_string(),
                 color: presentation.color,
+                icon: presentation.resolved_icon(None),
                 revision: 1,
                 updated_at: committed_at.clone(),
                 updated_by_director_session: None,
@@ -1281,7 +1380,7 @@ impl AgentManagementProvider {
                 action_id: request.action_id.clone(),
                 request_sha256: digest.clone(),
                 project_id: request.project_id.clone(),
-                operation: request.operation.clone(),
+                operation: mutation_receipt_operation(&request.operation),
                 previous_project_revision: 0,
                 project_revision: 1,
                 project_state: Some(project_state.clone()),
@@ -1898,6 +1997,7 @@ pub fn effective_presentation(
             display_name: settings.display_name.clone(),
             badge_label: settings.badge_label.clone(),
             color: settings.color,
+            icon: settings.icon.clone(),
             revision: settings.revision,
             stored: true,
         },
@@ -1906,6 +2006,7 @@ pub fn effective_presentation(
             EffectiveProjectPresentation {
                 badge_label: default_badge(&display_name),
                 color: default_color(project_id),
+                icon: None,
                 display_name,
                 revision: 0,
                 stored: false,
@@ -1966,7 +2067,7 @@ mod tests {
         Rfc3339::new("2026-09-03T00:00:00Z").unwrap()
     }
 
-    fn invocation(value: &str) -> AgentManagementInvocation {
+    pub(super) fn invocation(value: &str) -> AgentManagementInvocation {
         AgentManagementInvocation {
             caller_cutex_session: session(value),
             caller_runtime_agent_id: format!("runtime-{value}"),
@@ -1981,6 +2082,7 @@ mod tests {
             cutex_session_id: session(value),
             native_session_id: format!("native-{value}"),
             spec: ManagedAgentSpec {
+                memory_injection: true,
                 name: value.to_string(),
                 cwd: format!("/tmp/{value}"),
                 profile: Some("default".to_string()),
@@ -1999,7 +2101,7 @@ mod tests {
         }
     }
 
-    fn provider_with_project() -> (AgentManagementProvider, std::path::PathBuf, ProjectId) {
+    pub(super) fn provider_with_project() -> (AgentManagementProvider, std::path::PathBuf, ProjectId) {
         let root =
             std::env::temp_dir().join(format!("cutex-project-projection-{}", uuid::Uuid::new_v4()));
         let provider = AgentManagementProvider::open(&root).unwrap();
@@ -2029,7 +2131,7 @@ mod tests {
         (provider, root, project_id)
     }
 
-    fn observation(id: &CutexSessionId) -> Result<AgentRuntimeObservation, AgentManagementError> {
+    pub(super) fn observation(id: &CutexSessionId) -> Result<AgentRuntimeObservation, AgentManagementError> {
         Ok(AgentRuntimeObservation {
             cutex_session_id: id.clone(),
             native_session_id: format!("native-{}", id.as_str()),
@@ -2197,6 +2299,7 @@ mod tests {
                 display_name: "Alpha Team".to_string(),
                 badge_label: "AT".to_string(),
                 color: ProjectPaletteColor::Green,
+                icon: None,
             },
         };
         assert_eq!(
@@ -2228,6 +2331,7 @@ mod tests {
             display_name: display_name.to_string(),
             badge_label: badge_label.to_string(),
             color: ProjectPaletteColor::Magenta,
+            icon: None,
         };
         assert!(valid("Alpha", "A").validate().is_ok());
         assert!(valid("Alpha", "界").validate().is_ok());
@@ -2289,6 +2393,7 @@ mod tests {
                 display_name: "Control Plane".to_string(),
                 badge_label: "CX".to_string(),
                 color: ProjectPaletteColor::Magenta,
+                icon: None,
             },
         };
         assert_eq!(
@@ -2445,6 +2550,7 @@ mod tests {
                         display_name: "Old".to_string(),
                         badge_label: "O".to_string(),
                         color: ProjectPaletteColor::Cyan,
+                        icon: None,
                         revision: 3,
                         updated_at: timestamp(),
                         updated_by_director_session: Some(session("cutex.director")),
@@ -2472,6 +2578,7 @@ mod tests {
                         display_name: "New".to_string(),
                         badge_label: "N".to_string(),
                         color: ProjectPaletteColor::Yellow,
+                        icon: None,
                     },
                 },
             )
@@ -2549,6 +2656,7 @@ mod tests {
                         display_name: "Forbidden".to_string(),
                         badge_label: "F".to_string(),
                         color: ProjectPaletteColor::Red,
+                        icon: None,
                     },
                 }
             ),
@@ -2691,6 +2799,7 @@ mod tests {
                         display_name: "Archived write".to_string(),
                         badge_label: "AW".to_string(),
                         color: ProjectPaletteColor::Green,
+                        icon: None,
                     },
                 },
             ),
@@ -2910,6 +3019,7 @@ mod tests {
                     display_name: "New Project".to_string(),
                     badge_label: "NP".to_string(),
                     color: ProjectPaletteColor::Rgb(0x12, 0x34, 0x56),
+                    icon: Some(Some(ProjectIcon { kind: ProjectIconKind::Text, value: " 中 ".into() })),
                 },
             },
         };
@@ -2937,6 +3047,13 @@ mod tests {
             .list_cutex_projects_for_management(&principal)
             .unwrap();
         assert_eq!(listed.projects.len(), 1);
+        assert_eq!(listed.projects[0].presentation.icon.as_ref().unwrap().value, "中");
+        super::icon_tests::assert_r281_mutation_records(&root);
+        let mut changed_icon = request.clone();
+        if let HumanManagementProjectMutationKind::Create { presentation, .. } = &mut changed_icon.operation {
+            presentation.icon = Some(None);
+        }
+        assert!(matches!(provider.execute_project_mutation_for_management(&principal, &changed_icon), Err(AgentManagementError::Conflict("action_id_payload_conflict"))));
         // The Director sees its project through the authority alone.
         assert_eq!(
             provider
@@ -3169,6 +3286,7 @@ mod tests {
                             display_name: "WS".to_string(),
                             badge_label: "WS".to_string(),
                             color: ProjectPaletteColor::Rgb(1, 2, 3),
+                            icon: None,
                         },
                     },
                 },

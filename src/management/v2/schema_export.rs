@@ -21,6 +21,26 @@ pub struct ExportedSchema {
 }
 
 pub const SCHEMAS: &[ExportedSchema] = &[
+    ExportedSchema {
+        name: "baidu-pan", title: "Host Baidu Pan connection and downloads",
+        routes: &["GET|PUT|DELETE /v2/pan/connection", "POST /v2/pan/auth", "GET /v2/pan/auth/{id}", "POST /v2/pan/auth/code", "GET /v2/pan/files", "GET /v2/pan/search", "GET /v2/pan/meta", "GET|POST /v2/pan/downloads", "GET /v2/pan/downloads/{id}", "POST /v2/pan/downloads/{id}/{action}", "GET /v2/pan/events", "POST /api/pan/v1"],
+        text: include_str!("schema/export/baidu-pan.json"),
+    },
+    ExportedSchema {
+        name: "session-paths", title: "Owner session path reapproval",
+        routes: &["POST /v2/sessions/{id}/reapprove-paths", "creator_paths_changed error details"],
+        text: include_str!("schema/export/session-paths.json"),
+    },
+    ExportedSchema {
+        name: "project-presentation", title: "Shared project presentation",
+        routes: &["POST /v2/agent-management/project-presentation", "GET /v2/agent-management/projects", "GET /v2/agent-management/projects/{id}"],
+        text: include_str!("schema/export/project-presentation.json"),
+    },
+    ExportedSchema {
+        name: "quick-chat-promote", title: "Promote an offline quick chat",
+        routes: &["POST /v2/human/sessions/{id}/promote"],
+        text: include_str!("schema/export/quick-chat-promote.json"),
+    },
     super::archive::api::EXPORTED_SCHEMA,
     ExportedSchema {
         name: "host-session", title: "Exact host session catalog row",
@@ -112,7 +132,7 @@ pub const SCHEMAS: &[ExportedSchema] = &[
     ExportedSchema {
         name: "sessions",
         title: "Sessions",
-        routes: &["GET /v2/sessions", "GET /v2/sessions/{id}"],
+        routes: &["GET /v2/sessions", "GET /v2/sessions/{id}", "POST /v2/human/agents memoryInjection"],
         text: include_str!("schema/export/sessions.json"),
     },
     ExportedSchema {
@@ -427,9 +447,12 @@ mod tests {
 
     #[test]
     fn background_work_schema_hashes_and_ephemeral_status_contract() {
+        assert_valid("sessions", "newAgentMemoryInjection", &json!({"memoryInjection":false}));
+        assert_valid("sessions", "newAgentMemoryInjection", &json!({}));
+        assert!(!validator("sessions", "newAgentMemoryInjection").unwrap().is_valid(&json!({"memoryInjection":null})));
         use sha2::{Digest,Sha256};
         for (name,expected) in [
-            ("sessions","5c04d9f931e4b33c411b6c9ac60dbf6cfdf4c6742a0342b4ee7ba6d35e269950".to_string()),
+            ("sessions","6d6330acac5674c0abdcb70802f366db75e3c84373ba2a87c7e9967f409df957".to_string()),
             ("events","aaacd6fffa8fbd4d082d64c0409efe0f2f4a0e736e4b0f14c67c8aac8fe1753c".to_string()),
         ] {
             let text=SCHEMAS.iter().find(|s|s.name==name).unwrap().text;

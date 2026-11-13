@@ -61,6 +61,30 @@ pub fn launch_memory_context(
     let Some(scope) = super::memory_scope_for_session(&snapshot, cutex_session_id)? else {
         return Ok(None);
     };
+    let enabled = crate::session::store::shared_session_row(cutex_session_id)?
+        .is_none_or(|record| record.memory_injection);
+    let project_workspace_root = snapshot
+        .project_states
+        .get(&scope.project_id)
+        .and_then(|state| state.workspace_root.as_deref())
+        .filter(|root| !root.trim().is_empty())
+        .map(PathBuf::from);
+    launch_memory_context_for_scope(scope, project_workspace_root, enabled)
+}
+
+fn launch_memory_context_for_scope(
+    scope: ProjectMemoryScope,
+    project_workspace_root: Option<PathBuf>,
+    enabled: bool,
+) -> anyhow::Result<Option<LaunchMemoryContext>> {
+    if !enabled {
+        return Ok(Some(LaunchMemoryContext {
+            index_snapshot: None,
+            instructions: format!("Project memory is off for this agent; do not read or change it ({}) unless the owner personally and explicitly asks.\n", scope.dir.display()),
+            scope,
+            project_workspace_root,
+        }));
+    }
     let store = super::MemoryStore::new(scope.dir.clone());
     store.ensure_dir()?;
     let index = store
@@ -68,12 +92,6 @@ pub fn launch_memory_context(
         .map_err(|error| anyhow::anyhow!("{error}"))?
         .map(|document| document.content);
     let instructions = render_memory_instructions(&scope, index.as_deref());
-    let project_workspace_root = snapshot
-        .project_states
-        .get(&scope.project_id)
-        .and_then(|state| state.workspace_root.as_deref())
-        .filter(|root| !root.trim().is_empty())
-        .map(PathBuf::from);
     Ok(Some(LaunchMemoryContext {
         index_snapshot: Some(super::idle_note::Snapshot::new(&scope, index.as_deref().unwrap_or(""))),
         scope,
@@ -716,5 +734,40 @@ mod tests {
         );
         let roots = context.runtime_workspace_roots(Path::new("/work"));
         assert_eq!(roots, vec![PathBuf::from("/work"), scope().dir]);
+    }
+}
+
+
+#[cfg(test)]
+mod memory_injection_switch_tests {
+    use super::*;
+    #[test]
+    fn memory_injection_disabled_codex_skips_index_and_idle_snapshot() {
+        let fixture = crate::memory::switch_test_support::disabled();
+        let augmentation = launch_augmentation_for_session(&fixture.record);
+        let context = augmentation.memory.as_ref().unwrap();
+        assert!(context.index_snapshot.is_none());
+        assert_eq!(context.instructions.lines().count(), 1);
+        assert!(context.instructions.contains(&fixture.memory_dir.display().to_string()));
+        let text = compose_launch_instructions(None, None, &fixture.cwd, Some(context));
+        crate::memory::switch_test_support::assert_disabled(&text.developer_instructions);
+        // No memory directory creation is needed either.
+        let absent = ProjectMemoryScope { project_id: context.scope.project_id.clone(), dir: fixture.cwd.join("absent") };
+        let disabled = launch_memory_context_for_scope(absent.clone(), None, false).unwrap().unwrap();
+        assert!(disabled.index_snapshot.is_none());
+        assert!(!absent.dir.exists());
+        // Enabling reads the index and retains the existing launch contract.
+        assert!(launch_memory_context_for_scope(context.scope.clone(), None, true).is_err());
+    }
+    #[test]
+    fn memory_injection_enabled_still_includes_index_and_snapshot() {
+        let dir = std::env::temp_dir().join(format!("memory-enabled-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("MEMORY.md"), "- [Keep](keep.md) — marker").unwrap();
+        let scope = ProjectMemoryScope {project_id: crate::agent_management::ProjectId::new("enabled").unwrap(),dir:dir.clone()};
+        let context = launch_memory_context_for_scope(scope, None, true).unwrap().unwrap();
+        assert!(context.instructions.contains("marker"));
+        assert!(context.index_snapshot.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -208,6 +208,8 @@ fn the_non_owner_surface_is_exactly_the_reviewed_table() {
         ("POST", "/v2/approvals/apr-1/approve"),
         ("GET", "/v2/alarms"),
         ("GET", "/v2/owner-notifications"),
+        ("GET", "/v2/owner-pins"),
+        ("PATCH", "/v2/owner-pins/pin-1"),
         ("GET", "/v2/services"),
         ("POST", "/v2/services/web/view-ticket"),
         ("GET", "/v2/services/web/tile"),
@@ -585,4 +587,16 @@ fn workflow_events_stay_with_the_owner() {
     assert!(owner_only_event("cutex/workflow/log"));
     assert!(!owner_only_event("cutex/userInput/routeAccepted"));
     assert!(!owner_only_event("cutex/ask/changed"));
+}
+
+#[test]
+fn narrowed_tokens_cannot_obtain_static_service_browser_channels() {
+    use crate::management::client_tokens::DeviceScope;
+    for path in ["/v2/services/fixture/open", "/v2/services/fixture/view-ticket", "/v2/service-relay/tickets", "/v2/service-relay/channel"] {
+        let need = scope_need("POST", path, &json!({}), Some("fixture"), |_, _| None);
+        assert_eq!(need, ScopeNeed::Full, "{path}");
+        assert!(!scope_allows(DeviceScope::Read, need), "{path}");
+        assert!(!scope_allows(DeviceScope::Chat, need), "{path}");
+        assert!(scope_allows(DeviceScope::Full, need), "{path}");
+    }
 }

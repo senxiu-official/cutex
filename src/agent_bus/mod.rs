@@ -6,7 +6,9 @@
 pub mod agent_auth;
 pub mod audit;
 pub mod boundary;
+pub mod busy_delivery;
 pub mod client;
+pub mod claude_occurrence;
 pub mod delivery;
 pub mod groups;
 pub mod identity;

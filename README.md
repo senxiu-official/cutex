@@ -6,7 +6,7 @@
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
-**0.2.2 — Beautiful World**: management requests remain responsive while Git status runs in a separate worker pool; repeated reads for the same repository share one request, and filesystem identity checks are cached. Includes native 0.167.0-r60 and retains Claude claude-r40, DSH dsh-r3 and Kimi kimi-r3. Existing agents keep their selected runtimes until explicitly upgraded. Upgrades from 0.2.0 still cross the durable-state migration and require explicit one-way confirmation. See [CHANGELOG.md](CHANGELOG.md).
+**0.2.3 — Beautiful World** improves Claude recovery, exact delivery and restart readiness. It provides Claude claude-r46 with Agent SDK 0.2.180 and bundled CLI 2.1.321, while retaining Native 0.167.0-r60 and unchanged components. Existing agents keep their runtime pins. The new worker service records cannot be read by older releases: keep a backup and explicitly confirm this one-way update; do not downgrade a store containing worker services. See [CHANGELOG.md](CHANGELOG.md) and [Known issues](docs/KNOWN-ISSUES.md).
 
 > **Current limitations:**
 > - **Phone push / pairing a phone**: there is no public phone app yet.

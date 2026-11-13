@@ -11,7 +11,7 @@ use cutex::config::global_settings::{
 use cutex::config::proxy::*;
 use cutex::config::store::load_codez_config;
 use cutex::config::store::load_codez_config_checked;
-use cutex::config::store::save_codez_config;
+use cutex::config::store::update_codez_config;
 use cutex::profiles::inspect::session_config_label;
 use cutex::profiles::lookup::find_account;
 use cutex::profiles::lookup::resolve_configured_default_profile_name;
@@ -185,7 +185,6 @@ pub(crate) fn cmd_global_set(options: GlobalSetOptions) -> anyhow::Result<()> {
                 );
     }
 
-    let mut config = load_codez_config_checked()?;
     let proxy = if proxy_clear {
         ConfigValueUpdate::Clear
     } else if let Some(url) = proxy_url {
@@ -227,8 +226,8 @@ pub(crate) fn cmd_global_set(options: GlobalSetOptions) -> anyhow::Result<()> {
     } else {
         ConfigValueUpdate::Unchanged
     };
-    let changed = apply_global_config_patch(
-        &mut config,
+    let (config, changed) = update_codez_config(|config| apply_global_config_patch(
+        config,
         &GlobalConfigPatch {
             docker_use_sudo,
             session_enabled: session_enable,
@@ -255,10 +254,9 @@ pub(crate) fn cmd_global_set(options: GlobalSetOptions) -> anyhow::Result<()> {
             agent_bus_token: agent_bus_token_update,
             ..GlobalConfigPatch::default()
         },
-    )?;
+    ))?;
 
     if changed {
-        save_codez_config(&config)?;
         println!("{GREEN}Updated{RESET} global settings");
     } else {
         println!("{YELLOW}No changes{RESET} global settings already match requested values");
@@ -298,9 +296,7 @@ pub(crate) fn cmd_proxy_set(
     url: String,
     no_proxy: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut config = load_codez_config_checked()?;
-    set_global_proxy_config(&mut config, url, no_proxy)?;
-    save_codez_config(&config)?;
+    let (config, _) = update_codez_config(|config| set_global_proxy_config(config, url, no_proxy))?;
     println!(
         "{GREEN}Updated{RESET} global proxy: {}",
         proxy_config_label(config.proxy.as_ref())
@@ -309,9 +305,7 @@ pub(crate) fn cmd_proxy_set(
 }
 
 pub(crate) fn cmd_proxy_clear() -> anyhow::Result<()> {
-    let mut config = load_codez_config_checked()?;
-    clear_global_proxy_config(&mut config);
-    save_codez_config(&config)?;
+    update_codez_config(|config| { clear_global_proxy_config(config); Ok(()) })?;
     println!("{YELLOW}Cleared{RESET} global proxy");
     Ok(())
 }

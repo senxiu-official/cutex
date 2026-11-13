@@ -827,6 +827,13 @@ pub fn request_is_owner_local() -> bool {
     }
 }
 
+/// Reading credentials that grant control of the host must also respect the
+/// token's scope. GET requests otherwise pass the read/chat device gate.
+pub fn request_has_owner_local_secret_access() -> bool {
+    request_is_owner_local()
+        && crate::management::listeners::current_client_token().is_none_or(|token| token.scope.is_full())
+}
+
 /// 403 `owner_local_only` for a root-identity action (owner-local-only;
 /// cutex-desktop docs/research/host-ownership-20261019.md §5 limit 2).
 pub fn owner_local_only(action: &str) -> UserError {

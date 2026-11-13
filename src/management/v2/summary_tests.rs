@@ -523,6 +523,7 @@ fn system_notices_are_records_not_needs_or_phone_messages() {
 fn bench_context() -> ManagementRequestContext {
     ManagementRequestContext {
         explicit_launch_action: |_, _| panic!("unexpected runtime action"),
+        promote_quick_chat: |_, _, _| panic!("unexpected quick chat promotion"),
         adopt_saved_native: |_, _| panic!("unexpected native adoption"),
         review_agent_archive: |_, _| panic!("unexpected archive review"),
         owner_archive_action: |_, _| panic!("unexpected permanent archive"),

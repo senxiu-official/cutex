@@ -18,7 +18,9 @@ pub const RANGES: &[(&str, u64, u64)] = &[
 pub const MAX_PATTERNS: usize = 64;
 pub const MAX_PATTERN_CHARS: usize = 256;
 
-pub const DEFAULT_PATTERNS: &[&str] = &["reports/**", "figures/**", "results/**", "output/**", "outputs/**", "handoff/**"];
+/// An explicit handover directory, rather than general work/build output.
+pub const DEFAULT_PATTERNS: &[&str] = &["deliverables/**"];
+const LEGACY_PATTERNS: &[&str] = &["reports/**", "figures/**", "results/**", "output/**", "outputs/**", "handoff/**"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -84,7 +86,7 @@ impl ArtifactSettings {
     /// Invalid hand-edited values fall back to the defaults field by field.
     pub fn effective(&self) -> Self {
         let defaults = Self::default();
-        let patterns: Vec<String> = self
+        let mut patterns: Vec<String> = self
             .auto_capture
             .patterns
             .iter()
@@ -92,6 +94,11 @@ impl ArtifactSettings {
             .take(MAX_PATTERNS)
             .map(|pattern| pattern.trim().replace('\\', "/"))
             .collect();
+        // Old defaults were often persisted along with unrelated settings.
+        // Migrate only that exact set; retain intentional custom selections.
+        if patterns.len() == LEGACY_PATTERNS.len() && LEGACY_PATTERNS.iter().all(|old| patterns.iter().any(|p| p == old)) {
+            patterns = DEFAULT_PATTERNS.iter().map(|p| p.to_string()).collect();
+        }
         Self {
             max_blob_bytes: if in_range("maxBlobBytes", self.max_blob_bytes) { self.max_blob_bytes } else { defaults.max_blob_bytes },
             hash_external_max_bytes: if in_range("hashExternalMaxBytes", self.hash_external_max_bytes) {
@@ -179,7 +186,12 @@ mod tests {
         assert_eq!(settings.hash_external_max_bytes, GIB);
         assert_eq!(settings.quota_bytes, 10 * GIB);
         assert!(settings.auto_capture.enabled);
-        assert_eq!(settings.auto_capture.patterns.len(), 6);
+        assert_eq!(settings.auto_capture.patterns, vec!["deliverables/**"]);
+        let mut legacy = settings.clone();
+        legacy.auto_capture.patterns = LEGACY_PATTERNS.iter().rev().map(|p| p.to_string()).collect();
+        assert_eq!(legacy.effective(), settings);
+        legacy.auto_capture.patterns = vec!["reports/final.md".into()];
+        assert_eq!(legacy.effective().auto_capture.patterns, vec!["reports/final.md"]);
         let patched = settings
             .patched(&serde_json::json!({"quotaBytes": 209715200u64, "autoCapture": {"enabled": false, "patterns": ["out\\**", "out/**"]}}))
             .unwrap();
@@ -196,7 +208,7 @@ mod tests {
         let broken = ArtifactSettings { max_blob_bytes: 1, ..settings.clone() };
         assert_eq!(broken.effective().max_blob_bytes, 64 * MIB);
         let view = settings.view();
-        assert_eq!(view["artifacts"]["autoCapture"]["patterns"][0], "reports/**");
+        assert_eq!(view["artifacts"]["autoCapture"]["patterns"][0], "deliverables/**");
         assert_eq!(view["artifactsDefault"]["maxBlobBytes"], 64 * MIB);
         assert!(view["artifactsRange"]["quotaBytes"].is_array());
     }

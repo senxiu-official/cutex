@@ -30,6 +30,11 @@ impl Queue {
         assert!(capacity > 0);
         Self { state: Mutex::new(State::default()), changed: Condvar::new(), capacity }
     }
+    fn for_restart(capacity: usize, since_ms: i64) -> Self {
+        let queue = Self::new(capacity);
+        queue.retry_recovery(since_ms);
+        queue
+    }
     fn submit(&self, project: String, at_ms: i64) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.closed { return; }
@@ -76,7 +81,9 @@ impl Queue {
 pub(super) struct Worker { queue: Arc<Queue> }
 impl Worker {
     pub(super) fn start() -> std::io::Result<Self> {
-        let queue = Arc::new(Queue::new(MAX_PENDING));
+        // A crash can occur after the turn/cursor commit but before schedule.
+        // Recover those durable scan-request markers before taking new work.
+        let queue = Arc::new(Queue::for_restart(MAX_PENDING, Utc::now().timestamp_millis() - super::WINDOW_RETENTION_MS));
         let receiver = Arc::clone(&queue);
         std::thread::Builder::new().name("cutex-artifact-scan".into()).spawn(move || run(&receiver))?;
         Ok(Self { queue })
@@ -163,6 +170,21 @@ mod tests {
     use super::super::{record, AgentFacts, TurnEvent};
     use crate::artifacts::host::tests::TestHost;
     use std::sync::mpsc;
+
+    #[test]
+    fn restart_recovers_a_committed_completion_that_was_never_scheduled() {
+        let host = TestHost::new("capture-before-schedule-crash");
+        let store = host.store().unwrap();
+        let event = TurnEvent { session: "s".into(), runtime_generation: 1, started: false, turn_id: Some("t".into()), thread_id: None, at_ms: 100 };
+        let facts = AgentFacts { project: Some("p".into()), ..Default::default() };
+        assert_eq!(record(&store, &event, &facts).unwrap().as_deref(), Some("p"));
+        // No schedule call survives the crash; the new worker has only disk state.
+        let queue = Queue::for_restart(2, 99);
+        let Some(Task::Recover { since_ms }) = queue.take() else { panic!("restart did not request durable recovery") };
+        assert_eq!(store.capture_projects_since(since_ms, None, RECOVERY_PAGE).unwrap(), ["p"]);
+        assert!(store.project_windows("p", 0).unwrap().is_empty());
+        queue.close();
+    }
 
     #[test]
     fn queue_coalesces_projects_and_overflow_keeps_a_durable_recovery_bound() {

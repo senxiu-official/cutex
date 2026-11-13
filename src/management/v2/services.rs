@@ -305,6 +305,10 @@ fn current_caller() -> String {
         .unwrap_or_else(|| crate::management::persons::ROOT_TOKEN_ID.to_owned())
 }
 
+fn tile_cache_scope(dir: &std::path::Path) -> String {
+    format!("{}:narrowed={}", dir.display(), super::host_files::narrowed_credential_read())
+}
+
 impl ServicesContext {
     pub fn default_context(load_runtime_status: crate::management::server::ManagementRuntimeStatusLoader) -> ServicesResult<Self> {
         match crate::services::supervisor::global() {
@@ -358,7 +362,9 @@ impl ServicesContext {
     fn tile(&self, slug: &str) -> ServicesResult<(ServiceRecord, Value)> {
         let record = self.store.get(slug)?;
         let fetchable = crate::services::tile::fetchable(&record, self.snapshots().get(slug));
-        let scope = self.store.dir().display().to_string();
+        // A full caller may have fetched a static tile from a credential
+        // namespace. Narrowed readers must resolve it under their own policy.
+        let scope = tile_cache_scope(self.store.dir());
         let answer = crate::services::tile::global().answer(
             &scope,
             &record,
@@ -484,6 +490,7 @@ pub fn route_json(
                 ));
             }
             let record = context.store.get(slug)?;
+            record.require_view()?;
             if request.start == Some(true)
                 && record.runtime == crate::services::ServiceRuntime::Managed
             {
@@ -1569,5 +1576,50 @@ mod tests {
             "service_not_found"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod credential_cache_tests {
+    #[test]
+    fn static_tile_cache_separates_narrowed_and_full_readers() {
+        use crate::management::{client_tokens::{DeviceScope, VerifiedClientToken}, listeners};
+        let previous = listeners::current_client_token();
+        struct Restore(Option<VerifiedClientToken>);
+        impl Drop for Restore { fn drop(&mut self) { listeners::set_current_client_token(self.0.take()); } }
+        let _restore = Restore(previous);
+        let home = crate::profiles::lifecycle::tests::TestHome::new();
+        std::fs::write(home.root().join(crate::config::paths::PRIVATE_HOME_MARKER), "").unwrap();
+        let public = home.root().join("public");
+        std::fs::create_dir_all(&public).unwrap();
+        let credential = home.root().join("_netrc");
+        std::fs::write(&credential, r#"{"title":"synthetic credential","image":"/logo.png"}"#).unwrap();
+        std::fs::hard_link(&credential, public.join("tile.json")).unwrap();
+        let image_secret = home.root().join(".gemini/image");
+        std::fs::create_dir_all(image_secret.parent().unwrap()).unwrap();
+        std::fs::write(&image_secret, b"\x89PNG\r\n\x1a\nsynthetic credential image").unwrap();
+        std::fs::hard_link(&image_secret, public.join("logo.png")).unwrap();
+        let context = super::ServicesContext {
+            store: crate::services::store::ServiceStore::new(crate::config::paths::config_dir().unwrap().join("services"), "credential-fixture"),
+            supervisor: None, owner_check: |_| Ok(()), caller: "root".into(), load_runtime_status: |_| Ok(None),
+        };
+        let full = VerifiedClientToken::test_token("full");
+        listeners::set_current_client_token(Some(full.clone()));
+        let body = serde_json::json!({"slug":"credential-fixture", "runtime":"static", "root":public, "tilePath":"/tile.json"});
+        super::route_json(&context, "POST", "/v2/services", &super::Route::Collection, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let full_scope = super::tile_cache_scope(context.store.dir());
+        assert_eq!(context.tile("credential-fixture").unwrap().1["tile"]["title"], "synthetic credential");
+        assert!(context.tile_image("credential-fixture").is_ok());
+        super::super::host_files::refresh_secret_path_cache();
+        for scope in [DeviceScope::Read, DeviceScope::Chat] {
+            let mut token = full.clone(); token.scope = scope;
+            listeners::set_current_client_token(Some(token));
+            assert_ne!(full_scope, super::tile_cache_scope(context.store.dir()));
+            assert!(context.tile("credential-fixture").unwrap().1["tile"].is_null());
+            assert!(context.tile_image("credential-fixture").is_err());
+        }
+        listeners::set_current_client_token(Some(full));
+        assert_eq!(context.tile("credential-fixture").unwrap().1["tile"]["title"], "synthetic credential");
+        assert!(context.tile_image("credential-fixture").is_ok());
     }
 }

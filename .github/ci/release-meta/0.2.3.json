@@ -1,0 +1,29 @@
+{
+  "_comment": "Public 0.2.3: c77 backend with accepted Claude runtime projected under a fresh immutable public identity. Existing component identities are never relabeled.",
+  "mode": "full",
+  "packageRunRecommended": true,
+  "migrations": [
+    {
+      "id": "durable-state-sqlite",
+      "class": "one-way",
+      "since": "0.2.1",
+      "notes": {
+        "en": "Moves durable session, communication and usage state to SQLite-backed stores. Retain an offline backup; automatic rollback across this migration is unavailable.",
+        "zh-CN": "会话、通信及用量的持久状态迁入 SQLite。请保留离线备份；无法跨过本次迁移自动回退。"
+      }
+    },
+    {
+      "id": "background-service-records",
+      "class": "one-way",
+      "since": "0.2.3",
+      "notes": {
+        "en": "Adds persisted worker service records that older cutex versions cannot read. Keep a backup and do not downgrade a store containing worker services to an older release.",
+        "zh-CN": "新增旧版 cutex 无法读取的 worker 服务持久记录。请保留备份，不要把包含后台应用记录的数据退回旧版。"
+      }
+    }
+  ],
+  "notes": {
+    "en": "Improves runtime recovery, exact delivery and restart readiness; includes Claude claude-r46 with SDK 0.2.180 and CLI 2.1.321. Existing agents retain their runtime pins.",
+    "zh-CN": "改进运行时恢复、精确投递及重启就绪检查；提供包含 SDK 0.2.180 和 CLI 2.1.321 的 Claude claude-r46，已有智能体保留运行时固定版本。"
+  }
+}

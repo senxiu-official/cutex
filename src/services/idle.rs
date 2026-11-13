@@ -38,7 +38,7 @@ impl IdleStopPreset {
     }
 }
 pub fn eligible(record: &ServiceRecord) -> bool {
-    record.runtime == ServiceRuntime::Managed && record.lifetime == ServiceLifetime::Persistent
+    record.runtime.supervised() && record.lifetime == ServiceLifetime::Persistent
 }
 pub fn policy(
     runtime: ServiceRuntime,
@@ -46,10 +46,10 @@ pub fn policy(
     requested: Option<&str>,
     previous: Option<&ServiceRecord>,
 ) -> ServicesResult<IdleStopPreset> {
-    if runtime != ServiceRuntime::Managed || lifetime != ServiceLifetime::Persistent {
+    if !runtime.supervised() || lifetime != ServiceLifetime::Persistent {
         if requested.is_some() {
             return Err(ServicesError::bad_request(
-                "idleStopPreset applies only to persistent managed services",
+                "idleStopPreset applies only to persistent managed or worker services",
             ));
         }
         return Ok(IdleStopPreset::Forever);
@@ -57,7 +57,7 @@ pub fn policy(
     requested.map(IdleStopPreset::parse).unwrap_or_else(|| {
         Ok(previous
             .filter(|r| eligible(r))
-            .map_or(IdleStopPreset::Day, |r| r.idle_stop_preset))
+            .map_or(if runtime == ServiceRuntime::Worker { IdleStopPreset::Forever } else { IdleStopPreset::Day }, |r| r.idle_stop_preset))
     })
 }
 

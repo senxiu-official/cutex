@@ -509,6 +509,7 @@ impl RotationEffects for DaemonEffects {
             ..Default::default()
         };
         let request = super::human_agents::HumanCreateAgentRequest {
+            memory_injection: true,
             request_id: format!("owner-rotation-{}-successor", rotation.rotation_id),
             name: spec.name.clone(),
             project_id: Some(rotation.project_id.clone()),

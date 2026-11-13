@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -50,6 +51,7 @@ struct PendingThread {
 
 #[derive(Default)]
 struct SessionLineage {
+    epoch: Arc<()>,
     root: String,
     /// Verified child -> parent edges; every chain ends at `root`.
     parents: HashMap<String, String>,
@@ -113,6 +115,14 @@ fn with_session<R>(
     let mut lineages = lineages
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !lineages.contains_key(cutex_session_id) {
+        drop(lineages);
+        // A cache miss can consult storage; never do that under the map lock.
+        if !super::session_cache_lifecycle::may_retain(cutex_session_id) {
+            return action(&mut SessionLineage { root:root_thread_id.to_string(), ..Default::default() });
+        }
+        lineages = LINEAGES.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+    }
     let entry = lineages
         .entry(cutex_session_id.to_string())
         .or_default();
@@ -125,11 +135,37 @@ fn with_session<R>(
     action(entry)
 }
 
+pub(super) fn cached_sessions() -> Vec<String> {
+    LINEAGES.get().map(|map| map.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()).unwrap_or_default()
+}
+
+pub(super) fn forget_session(session: &str) {
+    if let Some(map) = LINEAGES.get() {
+        let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(session);
+        super::session_cache_lifecycle::shrink(&mut map);
+    }
+}
+
+fn with_current<R>(session: &str, root: &str, epoch: &Arc<()>, action: impl FnOnce(&mut SessionLineage) -> R) -> Option<R> {
+    let mut map = LINEAGES.get()?.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.get_mut(session)?;
+    if entry.root != root || !Arc::ptr_eq(&entry.epoch, epoch) { return None; }
+    Some(action(entry))
+}
+
 /// Whether `thread_id` is a verified (transitive) sub-agent of the root.
 pub fn is_descendant(cutex_session_id: &str, root_thread_id: &str, thread_id: &str) -> bool {
-    with_session(cutex_session_id, root_thread_id, |lineage| {
-        lineage.is_descendant(thread_id)
-    })
+    let Some(map) = LINEAGES.get() else { return false; };
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    if map.get(cutex_session_id).is_some_and(|lineage| lineage.root != root_thread_id) {
+        // Observing a new binding invalidates the old root, but a lookup must
+        // not create a new empty entry after lifecycle cleanup.
+        map.remove(cutex_session_id);
+        super::session_cache_lifecycle::shrink(&mut map);
+        return false;
+    }
+    map.get(cutex_session_id).is_some_and(|lineage| lineage.is_descendant(thread_id))
 }
 
 /// Records `child -> parent` when `parent` is the root or a known descendant.
@@ -178,11 +214,13 @@ pub fn verify_descendant(
     if thread_id.is_empty() || thread_id == root_thread_id {
         return Ok(false);
     }
+    let epoch = with_session(cutex_session_id, root_thread_id, |lineage| lineage.epoch.clone());
     let mut chain: Vec<(String, String)> = Vec::new();
     let mut current = thread_id.to_string();
     for _ in 0..MAX_LINEAGE_DEPTH {
-        if current == root_thread_id || is_descendant(cutex_session_id, root_thread_id, &current) {
-            let recorded = with_session(cutex_session_id, root_thread_id, |lineage| {
+        let Some(trusted) = with_current(cutex_session_id, root_thread_id, &epoch, |lineage| lineage.is_trusted(&current)) else { return Ok(false); };
+        if trusted {
+            let recorded = with_current(cutex_session_id, root_thread_id, &epoch, |lineage| {
                 for (child, parent) in chain.iter().rev() {
                     if !lineage.record_edge(child, parent) {
                         return false;
@@ -190,7 +228,7 @@ pub fn verify_descendant(
                 }
                 true
             });
-            return Ok(recorded);
+            return Ok(recorded.unwrap_or(false));
         }
         let Some(thread) = read_thread(&current)? else {
             break;
@@ -207,7 +245,12 @@ pub fn verify_descendant(
         chain.push((current.clone(), parent.clone()));
         current = parent;
     }
-    mark_rejected(cutex_session_id, root_thread_id, thread_id);
+    with_current(cutex_session_id, root_thread_id, &epoch, |lineage| {
+        if lineage.is_descendant(thread_id) { return; }
+        lineage.rejected.insert(thread_id.to_string());
+        lineage.pending.remove(thread_id);
+        lineage.buffered.retain(|_, (thread, _)| thread != thread_id);
+    });
     Ok(false)
 }
 
@@ -384,10 +427,13 @@ pub fn take_ready_events(
 /// Drops buffered (unresolved) events, e.g. after a runtime disconnect.
 /// Verified edges are kept: lineage is immutable for a thread id.
 pub fn clear_pending(cutex_session_id: &str, root_thread_id: &str) {
-    with_session(cutex_session_id, root_thread_id, |lineage| {
+    if let Some(map) = LINEAGES.get() {
+        let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lineage) = map.get_mut(cutex_session_id).filter(|lineage| lineage.root == root_thread_id) {
         lineage.pending.clear();
         lineage.buffered.clear();
-    });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +442,48 @@ mod tests {
 
     use super::*;
     use crate::app_server::protocol::RpcNotification;
+
+    #[test]
+    fn evicted_lineage_cannot_be_repopulated_by_a_late_resolver_or_disconnect() {
+        let session = session();
+        record_edge(&session, "root", "old", "root");
+        assert!(!verify_descendant(&session, "root", "late-child", |id| {
+            forget_session(&session);
+            // Restore/new reader uses the same root but a different cache epoch.
+            record_edge(&session, "root", "new", "root");
+            Ok(Some(json!({"id":id,"parentThreadId":"root"})))
+        }).unwrap());
+        assert!(is_descendant(&session, "root", "new"));
+        assert!(!is_descendant(&session, "root", "late-child"));
+        forget_session(&session);
+        clear_pending(&session, "root");
+        assert!(!is_descendant(&session, "root", "new"));
+        assert!(!cached_sessions().contains(&session));
+    }
+
+    #[test]
+    fn evicted_negative_resolver_cannot_reject_a_new_lineage_epoch() {
+        let session = session();
+        assert!(!verify_descendant(&session, "root", "late-child", |_| {
+            forget_session(&session);
+            record_edge(&session, "root", "new", "root");
+            Ok(None)
+        }).unwrap());
+        with_session(&session, "root", |lineage| assert!(!lineage.rejected.contains("late-child")));
+        forget_session(&session);
+    }
+
+    #[test]
+    fn a_failed_resolver_does_not_reject_an_edge_learned_concurrently() {
+        let session = session();
+        assert!(!verify_descendant(&session, "root", "child", |id| {
+            record_edge(&session, "root", id, "root");
+            Ok(None)
+        }).unwrap());
+        assert!(is_descendant(&session, "root", "child"));
+        with_session(&session, "root", |lineage| assert!(!lineage.rejected.contains("child")));
+        forget_session(&session);
+    }
 
     fn session() -> String {
         format!("lineage-test-{}", uuid::Uuid::new_v4())

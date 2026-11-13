@@ -22,6 +22,8 @@ pub enum Canonical {
     /// Logical store in `management-state.sqlite3` (`hot_store_rows`).
     HotStore { logical: &'static str },
     Json { path: &'static str },
+    /// Opaque bytes (for example an encrypted credential envelope or key).
+    File { path: &'static str },
     JsonDir { path: &'static str },
     Jsonl { path: &'static str },
     Markdown { path: &'static str },
@@ -304,6 +306,25 @@ pub static MANIFEST: &[StoreSpec] = &[
         Sqlite { file: "runtime/management-v2/request-idempotency.sqlite3", tables: &["requests"] },
         MutableState, &domain::REQUEST_IDEMPOTENCY)
         .key("request_id", &[K::Host]).grows(0, 0, "idempotent requests"),
+    // Preserve all pan/ metadata across upgrades, including SQLite WAL/SHM
+    // and the encrypted credential envelope together with its local key.
+    base("pan-downloads", &["src/pan/repository.rs"],
+        Sqlite { file: "pan/pan.sqlite", tables: &["pan_downloads"] }, MutableState, &domain::PAN)
+        .key("id; unique caller,request_id", &[K::Host, K::Session])
+        .indexes(&["id", "caller,request_id"])
+        .grows(0, 0, "download tasks; bounded recent lists and keyed control"),
+    base("pan-download-log", &["src/pan/repository.rs"],
+        Sqlite { file: "pan/pan.sqlite", tables: &["pan_log"] }, AppendLog, &domain::PAN)
+        .key("seq", &[K::Host, K::Session]).append()
+        .grows(0, 0, "initial task and every state transition; retained audit evidence"),
+    base("pan-credentials", &["src/pan/store.rs"],
+        File { path: "pan/credentials" }, SmallConfig, &domain::OWN_FILE)
+        .config(SMALL),
+    base("pan-key", &["src/pan/store.rs"],
+        File { path: "pan/key" }, SmallConfig, &domain::OWN_FILE).config(32),
+    base("launch-credential-custody", &["src/management/v2/launch_credentials.rs"],
+        Json { path: "runtime/credential-custody.json" }, SmallConfig, &domain::OWN_FILE)
+        .key("launch source", &[K::Host]).config(SMALL),
     base("name-target-pins", &["src/name_target_pins.rs"],
         Sqlite {file:"runtime/name-target-pins.sqlite3",tables:&["name_target_pins"]},
         MutableState,&domain::NAME_TARGET_PINS)
@@ -345,6 +366,10 @@ pub static MANIFEST: &[StoreSpec] = &[
         Sqlite { file: "notes/notes.sqlite3", tables: &["notes", "note_pins", "note_nonces"] },
         MutableState, &domain::NOTES)
         .key("note_id", &[K::Host]),
+    base("owner-pins", &["src/owner_pins/store.rs", "src/owner_pins/mod.rs"],
+        Sqlite { file: "runtime/owner-pins/owner-pins.sqlite3", tables: &["pins", "pin_actions"] },
+        MutableState, &domain::OWNER_PINS)
+        .key("pin_id", &[K::Host]),
     base("notify-state", &["src/notify/state.rs"],
         Sqlite { file: "notifications/states.sqlite3", tables: &["state", "meta"] },
         MutableState, &domain::NOTIFY_STATES)
@@ -411,6 +436,9 @@ pub static MANIFEST: &[StoreSpec] = &[
     base("activity-projector", &["src/app_server/activity_bridge.rs"],
         Json { path: "runtime/management-v2/activity-projector-state.json" }, MutableState, &domain::OWN_FILE)
         .key("session cursor", &[K::Session]).whole("B2 (mgmt-incident)"),
+    base("busy-wake-capabilities", &["src/agent_bus/busy_delivery.rs"],
+        JsonDir { path: "runtime/busy-wake-capabilities" }, Cache, &domain::OWN_FILE)
+        .key("session,generation", &[K::Session]).config(SMALL),
     base("event-owners", &["src/app_server/single_writer.rs"],
         Json { path: "runtime/management-v2/event-owners.json" }, MutableState, &domain::OWN_FILE)
         .key("session", &[K::Session]).config(SMALL),

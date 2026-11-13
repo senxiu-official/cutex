@@ -15,6 +15,7 @@ fn provider() -> &'static AgentManagementProvider {
 fn context() -> crate::management::server::ManagementRequestContext {
     crate::management::server::ManagementRequestContext {
         explicit_launch_action: |_, _| panic!("unused"),
+        promote_quick_chat: |_, _, _| panic!("unexpected quick chat promotion"),
         adopt_saved_native: |_, _| panic!("unused"),
         review_agent_archive: |_, _| panic!("unused"),
         owner_archive_action: |_, _| panic!("unexpected permanent archive"),
@@ -66,6 +67,7 @@ fn the_owner_rotation_rebind_effect_prepares_finalizes_notifies_and_hands_over()
             display_name: "P1".into(),
             badge_label: "P".into(),
             color: crate::agent_management::ProjectPaletteColor::Green,
+            icon: None,
         },
         workspace_root: None,
         director_cutex_session_id: Some(fx::sid("a")),

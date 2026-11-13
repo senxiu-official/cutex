@@ -1020,11 +1020,6 @@ fn drive_once(runtime: &ManagementAskRuntime) -> anyhow::Result<()> {
 /// resolution of those questions. Errors are logged, never fatal.
 pub(crate) fn on_runtime_event(cutex_session_id: &str, runtime_generation: u64, event: &cutex::app_server::client::AppServerEvent) {
     use cutex::app_server::client::AppServerEvent;
-    if let AppServerEvent::Notification(notification) = event {
-        // Artifact auto capture: turn windows + scan on a member turn end
-        // (handed to its worker; nothing else on this path).
-        cutex::artifacts::capture::on_runtime_event(cutex_session_id, runtime_generation, &notification.method, notification.params.as_ref());
-    }
     let Ok(store) = AskStore::open_default() else {
         return;
     };

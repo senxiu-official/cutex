@@ -55,11 +55,15 @@ tomlkit==0.15.1
 trove-classifiers==2026.9.21.13
 """
 SDK_SDIST_SHA256 = {
+    "0.2.180": "1c0935c881a1b5232e6b6b894078ee79b315d75d449408af2202bddfa990a16c",
     "0.2.175": "cb4739bd91ace43b9a52810a6f1821b9043f1964a40e154b28f6c39c6700337c",
 }
 SOURCE_DATE_EPOCH = "1735689600"
 # sha256 of Anthropic's platform wheels on PyPI. A new SDK pin needs all three wheels reviewed.
 SDK_WHEEL_SHA256 = {
+    ("0.2.180", "windows-x64"): "77c8186cf29c928bd424b5803caf4c69ac91ad00c058bddc86b7bb4e7893c551",
+    ("0.2.180", "linux-x64"): "0e5237ce189ae316ffbdfbb205277ea9387222b9c3cb6668ce533335ce7c759d",
+    ("0.2.180", "darwin-arm64"): "a4177b29a877f820abfd1b7862e61bcea14e1cd7f16c75fcee364b4d95f4c7c4",
     ("0.2.175", "windows-x64"): "6ba57680f57b340b007f0c735e747d7361373866c1966a104b7517e510140bde",
     ("0.2.175", "linux-x64"): "5f7401b9057face095334e0858ef98ed5b458c2a1852f63df515d5edd49c1ffd",
     ("0.2.175", "darwin-arm64"): "5f1fa909d9885a8af2992e1146c7d1cfc2947602d64f0d3ee0275e8465a9a7a9",

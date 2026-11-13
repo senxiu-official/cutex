@@ -14,7 +14,9 @@ use crate::config::agent_security::{
     AgentSecurityConfig, CrossProjectAccess, DomainLink, ExternalAgentGrant,
 };
 use crate::config::global_settings::{apply_global_config_patch, ConfigValueUpdate, GlobalConfigPatch};
-use crate::config::store::{load_codez_config_checked, save_codez_config};
+use crate::config::store::{load_codez_config_checked, update_codez_config};
+#[cfg(test)]
+use crate::config::store::save_codez_config;
 use crate::http::server::write_json_response;
 use crate::http::server::SimpleHttpRequest;
 use crate::notify::session::Level;
@@ -1038,7 +1040,7 @@ fn apply(request: SettingsRequest) -> anyhow::Result<(CodezConfig, bool)> {
             anyhow::bail!("newSessionDefaults: unknown profile name {missing}");
         }
     }
-    let mut config = load_codez_config_checked()?;
+    let (config, (changed, cors_changed)) = update_codez_config(|config| {
     patch.proxy = match &request.proxy {
         None => ConfigValueUpdate::Unchanged,
         Some(None) => ConfigValueUpdate::Clear,
@@ -1079,7 +1081,7 @@ fn apply(request: SettingsRequest) -> anyhow::Result<(CodezConfig, bool)> {
     if let Some(documents) = &request.documents {
         patch.documents = Some(config.documents.patched(documents).map_err(|message| anyhow::anyhow!(message))?);
     }
-    let mut changed = apply_global_config_patch(&mut config, &patch)?;
+    let mut changed = apply_global_config_patch(config, &patch)?;
     if let Some(listen) = request.listen {
         changed |= config.management_listen != listen;
         config.management_listen = listen;
@@ -1152,9 +1154,8 @@ fn apply(request: SettingsRequest) -> anyhow::Result<(CodezConfig, bool)> {
         changed |= next != config.peers;
         config.peers = next;
     }
-    if changed {
-        save_codez_config(&config)?;
-    }
+    Ok((changed, cors_changed))
+    })?;
     if cors_changed {
         crate::management::listeners::configure_cors_origins(config.management_cors_origins.clone());
     }
@@ -1297,6 +1298,9 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
                     view["restartRequired"] = json!(restart_required);
                     write_json_response(stream, 200, "OK", &view)
                 }
+                Err(error) if crate::config::store::is_config_busy(&error) => super::server::write_v2_error(
+                    stream, 503, "Service Unavailable", "config_busy", &error.to_string(), true, json!({}),
+                ),
                 Err(error) => bad_request(stream, &format!("{error:#}")),
             }
         }
@@ -1446,6 +1450,59 @@ mod tests {
     }
 
     #[test]
+    fn settings_patch_config_busy_is_retryable_503_and_invalid_input_stays_400() {
+        let _guard = crate::config::paths::test_home_env_lock();
+        struct Home(std::path::PathBuf, Option<std::ffi::OsString>);
+        impl Drop for Home {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.1 {
+                        Some(previous) => std::env::set_var("HOME", previous),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!("settings-busy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(crate::config::paths::PRIVATE_HOME_MARKER), b"settings test").unwrap();
+        let _home = Home(root.clone(), std::env::var_os("HOME"));
+        unsafe { std::env::set_var("HOME", &root); }
+        save_codez_config(&CodezConfig::default()).unwrap();
+        let path = crate::config::paths::config_path().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let held = crate::config::store::config_write_lock(&path).unwrap();
+        let patch = |body: &[u8]| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let reader = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut stream = std::net::TcpStream::connect(address).unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                response
+            });
+            let (mut stream, _) = listener.accept().unwrap();
+            handle(&mut stream, &SimpleHttpRequest {
+                method: "PATCH".into(), path: PATH.into(), headers: Default::default(), body: body.to_vec(),
+            }).unwrap();
+            drop(stream);
+            reader.join().unwrap()
+        };
+        let response = patch(br#"{"promptCacheKey":{"enabled":true}}"#);
+        assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
+        let body: Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["error"]["code"], "config_busy");
+        assert_eq!(body["error"]["retryable"], true);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(patch(br#"{"promptCacheKey":{"enabled":"invalid"}}"#).starts_with("HTTP/1.1 400 "));
+        drop(held);
+        assert!(patch(br#"{"promptCacheKey":{"enabled":true}}"#).starts_with("HTTP/1.1 200 "));
+    }
+
+    #[test]
     fn browser_get_reports_missing_config_ask_and_saved_default_off() {
         let _guard = crate::config::paths::test_home_env_lock();
         struct Home(std::path::PathBuf, Option<std::ffi::OsString>);
@@ -1505,7 +1562,7 @@ mod tests {
         assert_eq!(view["artifacts"]["hashExternalMaxBytes"], 1024 * 1024 * 1024);
         assert_eq!(view["artifacts"]["quotaBytes"], 10u64 * 1024 * 1024 * 1024);
         assert_eq!(view["artifacts"]["autoCapture"]["enabled"], true);
-        assert_eq!(view["artifacts"]["autoCapture"]["patterns"][5], "handoff/**");
+        assert_eq!(view["artifacts"]["autoCapture"]["patterns"], json!(["deliverables/**"]));
         assert_eq!(view["artifactsDefault"], view["artifacts"]);
         assert!(view["artifactsRange"]["quotaBytes"].is_array());
         assert!(!RESTART_REQUIRED.contains(&"artifacts") && !NEW_RUNTIMES_ONLY.contains(&"artifacts"));

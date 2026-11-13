@@ -78,6 +78,7 @@ struct Fixture {
     device: String,
     key: KeyPair,
     cert: CertificateDer<'static>,
+    setup_listener: TcpListener,
 }
 impl Fixture {
     fn new() -> Self {
@@ -92,10 +93,11 @@ impl Fixture {
             .tokens
             .issue_device("relay test", "android", "android")
             .unwrap();
-        // Reserve no real listener or deployment port at setup time.
+        // Keep the OS-allocated reservation alive through setup and the test.
+        let setup_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         store
-            .setup(
-                "127.0.0.1:39481".parse().unwrap(),
+            .setup_with_bound_listener(
+                &setup_listener,
                 vec!["home.relay.test".into()],
             )
             .unwrap();
@@ -114,6 +116,7 @@ impl Fixture {
             device: device.token_id,
             key,
             cert,
+            setup_listener,
         }
     }
     fn client(
@@ -249,6 +252,21 @@ impl Fixture {
         }
         (key, cert.der().clone())
     }
+}
+#[test]
+fn fixtures_own_distinct_ports_and_normal_setup_still_refuses_occupied_ports() {
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let bind = first.setup_listener.local_addr().unwrap();
+    assert_ne!(bind, second.setup_listener.local_addr().unwrap());
+    assert_eq!(first.store.identity().unwrap().bind, bind);
+    let other = Store::at(
+        first.root.join("other-relay"),
+        ClientTokenStore::at(first.root.join("other-tokens")),
+    );
+    let error = other.setup(bind, vec!["home.relay.test".into()]).unwrap_err();
+    assert!(error.to_string().contains("relay bind is occupied"), "{error}");
+    assert!(!other.dir.join("identity.json").exists());
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -929,15 +947,16 @@ fn review_partial_empty_setup_and_server_leaf_rotation_have_real_tools() {
     )
     .unwrap();
     let store = Store::at(newdir, f.store.tokens.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     assert!(store
-        .setup(
-            "127.0.0.1:39486".parse().unwrap(),
+        .setup_with_bound_listener(
+            &listener,
             vec!["recovered.test".into()]
         )
         .is_ok());
     for name in ["a..b", "1.2.3.4", "a.-bad", "a.bad-", "A.test"] {
         assert!(store
-            .setup("127.0.0.1:39486".parse().unwrap(), vec![name.into()])
+            .setup(listener.local_addr().unwrap(), vec![name.into()])
             .is_err());
     }
 }

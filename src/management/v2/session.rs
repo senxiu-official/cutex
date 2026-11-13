@@ -654,6 +654,7 @@ fn retired_session_resource_fields(
             "runtimeAgentId": Value::Null,
             "pendingServerRequests": [],
         },
+        "memoryInjection": record.memory_injection,
         "runtimeDefaults": runtime_defaults_resource(record),
         "activity": activity_resource(activity),
         "createdAt": record.created_at,
@@ -692,6 +693,7 @@ pub fn focus_resource(cutex_session_id: &str) -> anyhow::Result<Value> {
 
 pub fn runtime_defaults_resource(record: &CutexSessionRecord) -> Value {
     let mut defaults = json!({
+        "memoryInjection": record.memory_injection,
         "backend": runtime_backend_name(record.runtime_backend),
         "managedCwd": record.managed_cwd,
         "permissions": record.permission_defaults,
@@ -1213,6 +1215,7 @@ fn prepare_session_projection(
             "lastError": if expected_stop { None } else { runtime_status.as_ref().and_then(|status| status.last_error.clone()) },
             "pendingServerRequests": context.pending_server_requests(&record.cutex_session_id, record.runtime_generation),
         },
+        "memoryInjection": record.memory_injection,
         "runtimeDefaults": runtime_defaults_resource(record),
         "activity": activity_resource(activity),
         "management": management,
@@ -1645,6 +1648,7 @@ mod tests {
         assert_eq!(
             runtime_defaults_resource(&record),
             json!({
+                "memoryInjection": true,
                 "backend": "host_foreground",
                 "managedCwd": null,
                 "permissions": "full-access",

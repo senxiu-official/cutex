@@ -197,7 +197,7 @@ fn claude_task(stored: &StoredAgentBusMessage) -> bool {
         && stored.snapshot.delivery_mode == "after_turn"
         && envelope.version == 2
         && envelope.owner_id == stored.owner_cutex_session_id
-        && envelope.message.id == message.id
+        && crate::management::v2::agent_bus_state::native_id_matches_source(&message.id, &envelope.message.id)
         && envelope.message.source.kind == SourceKind::Service
         && envelope.message.source.id == task::SOURCE_ID
         && envelope.message.event_type == task::EVENT_TYPE
@@ -255,7 +255,7 @@ fn stale_candidate(stored: &StoredAgentBusMessage, now: DateTime<Utc>) -> Option
     let status = stored.snapshot.external_input_last_observed.as_ref()?;
     if envelope.validate().is_err()
         || envelope.owner_id != stored.owner_cutex_session_id
-        || envelope.message.id != stored.snapshot.message_id
+        || !crate::management::v2::agent_bus_state::native_id_matches_source(&stored.snapshot.message_id, &envelope.message.id)
         || local["durable"] != true
         || local["receiptScope"] != "local-inbox"
         || local["threadId"] != envelope.thread_id
@@ -373,7 +373,7 @@ fn evidence_bound(stored: &StoredAgentBusMessage, evidence: &Evidence) -> bool {
         && evidence.recipient_id == envelope.owner_id
         && evidence.thread_id == envelope.thread_id
         && evidence.runtime_generation == envelope.runtime_generation
-        && evidence.message_id == stored.snapshot.message_id
+        && crate::management::v2::agent_bus_state::native_id_matches_source(&stored.snapshot.message_id, &evidence.message_id)
         && evidence.message_id == envelope.message.id
         && evidence.semantic_sha256 == envelope.semantic_sha256
         && local["threadId"] == evidence.thread_id
@@ -459,7 +459,7 @@ pub(super) fn validate_settlement_record(
     }
     anyhow::ensure!(
         record.evidence.schema_version == 1
-            && record.evidence.message_id == stored.snapshot.message_id
+            && crate::management::v2::agent_bus_state::native_id_matches_source(&stored.snapshot.message_id, &record.evidence.message_id)
             && record.evidence.recipient_id == stored.owner_cutex_session_id
             && record.evidence.thread_id == envelope.thread_id
             && record.evidence.semantic_sha256 == envelope.semantic_sha256
@@ -619,7 +619,7 @@ impl AgentBusMessageRepository {
                     && row.record.request.is_none()
                     && row.record.audit.is_none()
                     && row.record.pending_sessions.is_empty()
-                    && row.record.evidence.message_id == *message
+                    && crate::management::v2::agent_bus_state::native_id_matches_source(message, &row.record.evidence.message_id)
                     && row.record.evidence.schema_version == 1
                     && uuid::Uuid::parse_str(&row.record.evidence_token).is_ok(),
                 "invalid observation-only settlement namespace"

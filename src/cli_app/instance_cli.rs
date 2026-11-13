@@ -44,10 +44,11 @@ fn init(options: InitOptions) -> anyhow::Result<()> {
     // existing one; then the guard must pass.
     cutex::management::client_tokens::ensure_private_dir(&home)?;
     instance::verify_private_home(&home)?;
-    let existing = cutex::config::store::load_codez_config_checked()?;
-    let had_section = existing.instance.is_some();
-    let config = instance::init_config(existing, &options)?;
-    cutex::config::store::save_codez_config(&config)?;
+    let (_, had_section) = cutex::config::store::update_codez_config(|config| {
+        let had_section = config.instance.is_some();
+        *config = instance::init_config(config.clone(), &options)?;
+        Ok(had_section)
+    })?;
     println!(
         "{} instance {:?} at {}",
         if had_section { "checked" } else { "initialized" },

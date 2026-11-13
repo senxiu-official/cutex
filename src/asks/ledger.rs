@@ -179,6 +179,19 @@ fn apply_job_with(ledger: &InputLedger, job: &Job, committed: &mut dyn FnMut(&Tr
             if job.source_version.zip(applied).is_some_and(|(version, applied)| version < applied) {
                 return out;
             }
+            // Fence a newer source snapshot while an earlier request is uncertain,
+            // even when the new attempt has no applicable state edge yet.
+            // Otherwise a delayed older positive job could still rebind it.
+            if let (Some(record), Some(version)) = (&current, job.source_version) {
+                if record.kind == InputKind::DelegationRequest && record.state == InputState::Uncertain
+                    && applied.is_none_or(|old| old < version) {
+                    match ledger.note_ask_source_version(&job.session, &job.input_id, Expect::rev(record.rev), version) {
+                        Ok(change) => { committed(&change); out.push(change); continue 'read; }
+                        Err(LedgerError::Conflict { .. }) => continue 'read,
+                        Err(error) => { eprintln!("cutex asks source fence: {error}"); return out; }
+                    }
+                }
+            }
             if step.from.as_ref().is_some_and(|from| !from.contains(&current.as_ref().map(|record| record.state))) {
                 continue 'steps;
             }
@@ -473,7 +486,9 @@ fn submitted(ask: &AskRecord) -> bool {
 
 /// The ASK reached a turn (the turn started with it as its input).
 fn ran(before: Option<&AskRecord>, ask: &AskRecord) -> bool {
-    before.is_some_and(|before| before.execution == ExecutionState::Running)
+    before.is_some_and(|before| before.execution == ExecutionState::Running
+            && before.current_attempt().zip(ask.current_attempt()).is_some_and(|(old, new)|
+                old.n == new.n && old.native_message_id == new.native_message_id && old.turn_id == new.turn_id))
         || ask.current_attempt().is_some_and(|attempt| {
             attempt.started_at.is_some() || matches!(attempt.state, AttemptState::Running | AttemptState::Answered | AttemptState::Yielded)
         })
@@ -503,7 +518,9 @@ pub fn request_job(before_state: &AskState, after_state: &AskState, before: Opti
     if ask.remote.is_some() {
         return None;
     }
-    if before.is_some_and(|before| request_signature(before_state, before) == request_signature(after_state, ask)) {
+    if before.is_some_and(|before| request_signature(before_state, before) == request_signature(after_state, ask)
+        && before.current_attempt().map(|a| (a.n, &a.native_message_id, &a.turn_id, a.runtime_generation))
+            == ask.current_attempt().map(|a| (a.n, &a.native_message_id, &a.turn_id, a.runtime_generation))) {
         return None;
     }
     let input = request_input(ask);
@@ -571,6 +588,14 @@ pub fn request_job(before_state: &AskState, after_state: &AskState, before: Opti
         ExecutionState::Answered | ExecutionState::Failed | ExecutionState::Interrupted => {}
         ExecutionState::Rejected => steps.push(step(n(Next::rejected("askRejected")), &[ABSENT, WAITING])),
         ExecutionState::Cancelled => steps.push(step(n(Next::discarded("askCancelled")), &[WAITING])),
+    }
+    // Positive facts of the current attempt also heal a timed-out send. An
+    // old row/attempt is never proof for the current one; the job carries the
+    // same store revision as this binding and apply_job rejects older jobs.
+    if matches!(ask.execution, ExecutionState::Running | ExecutionState::Answered | ExecutionState::Failed | ExecutionState::Interrupted)
+        && ran(before, ask)
+        && ask.current_attempt().is_some_and(|attempt| attempt.turn_id.as_ref().is_some_and(|turn| !turn.is_empty()) && !attempt.native_message_id.is_empty()) {
+        steps.push(step(in_context(), &[UNCERTAIN]));
     }
     (!steps.is_empty()).then(|| Job {
         session: ask.target_cutex_session_id.clone(),
@@ -665,6 +690,15 @@ pub fn delivery_job(
     let read_by_tool = if delivery.passive { created.clone().surface(il::Surface::None) } else { created.clone() };
     let mut steps = Vec::new();
     match delivery.state {
+        // An abandoned owner reservation: unreconcilable native outcome or
+        // explicit lease release. Normal carries remain QueuedAsEvent; a
+        // proven-unsent release/retry clears owner_input_id. This source fact
+        // survives a crash before the ledger writer runs. It says unknown,
+        // never that a runtime was lost or that the content was read.
+        DeliveryState::Pending if delivery.passive && delivery.owner_input_id.is_some()
+            && delivery.event_id.is_none() => {
+            steps.push(step(n(Next::uncertain("outcomeUnknown")), &[SENDING, ACCEPTED]));
+        }
         DeliveryState::Pending if before.is_none() && delivery.passive => {}
         DeliveryState::Pending if before.is_none() => steps.push(step(created, &[ABSENT])),
         // Over budget / unfit / unreconcilable: read with delegation_wait or
@@ -724,6 +758,12 @@ pub fn delivery_job(
                 steps.push(step(n(Next::in_context(Evidence::ReadByTool)), &[WAITING, UNCERTAIN, SENDING, ACCEPTED]));
             }
             Some("closed") => steps.push(step(n(Next::discarded("settlementClosed")), &[WAITING, UNCERTAIN])),
+            Some("notices_read") => {
+                // A pending source can outpace a prior native projection in
+                // another process. Retire it without claiming model context.
+                steps.push(step(n(Next::uncertain("outcomeUnknown")), &[SENDING, ACCEPTED]));
+                steps.push(step(n(Next::discarded("settlementClosed")), &[WAITING, UNCERTAIN]));
+            }
             Some(super::delivery::SUPERSEDED) => {
                 // Another process may project this settlement before the
                 // creation writer. Establish its newer source version off
@@ -734,8 +774,10 @@ pub fn delivery_job(
             Some(super::delivery::HANDOVER_UNKNOWN) => {
                 steps.push(step(n(Next::uncertain("outcomeUnknown")), &[SENDING, ACCEPTED]));
             }
-            // `dismissed` (the owner, below) and anything newer: the ledger
-            // was written by whoever settled it.
+            // Source settlement is durable before the owner's ledger write.
+            // Recover that decision after a competing projection or a crash;
+            // the source version also fences older queued retry metadata.
+            Some(DISMISSED) => steps.push(step(n(Next::discarded("ownerDiscarded")), &[WAITING, UNCERTAIN])),
             Some(_) => {}
         },
     }
@@ -1321,6 +1363,16 @@ pub fn retry_result(state: &mut AskState, session: &str, delivery_id: &str, now:
     let event_id = state.deliveries.get(delivery_id).and_then(|delivery| delivery.event_id.clone());
     if let Some(event) = event_id.as_deref().and_then(|event_id| state.events.get_mut(event_id)) {
         event.delivery_ids.retain(|id| id != delivery_id);
+    }
+    // Explicit retry authorizes a fresh native attempt despite this event's
+    // unknown outcome. Its lease must not block that attempt, even when other
+    // unknown deliveries remain. They stay queued in the old event for late
+    // receipts; retrying one item never resends its siblings.
+    if let Some(event_id) = event_id.as_deref() {
+        super::returns::remove_event_lease(state, session, event_id);
+        if state.events.get(event_id).is_some_and(|event| event.delivery_ids.is_empty()) {
+            state.events.remove(event_id);
+        }
     }
     let delivery = state.deliveries.get_mut(delivery_id).expect("checked above");
     delivery.state = DeliveryState::Pending;

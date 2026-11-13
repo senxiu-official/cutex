@@ -473,3 +473,10 @@ fn session_takeover_command_parses() {
         }) if id == "019e-session"
     ));
 }
+
+
+#[test]
+fn session_reapprove_paths_command_parses() {
+    let cli = Cli::try_parse_from(["cutex", "session", "reapprove-paths", "cutex.child"]).unwrap();
+    assert!(matches!(cli.command, Some(CommandKind::Session { command: SessionCommand::ReapprovePaths { id } }) if id == "cutex.child"));
+}

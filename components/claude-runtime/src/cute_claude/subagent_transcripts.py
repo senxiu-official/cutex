@@ -300,11 +300,22 @@ class SubagentTranscripts:
         if row is not None:
             await self._close(row, {'completed': 'completed', 'failed': 'failed'}.get(status, 'interrupted'), note=note)
 
+    async def background_restarted(self, sid: str, task_id: str, call_id: str) -> None:
+        """A verified SDK start continues the same background spawn transcript."""
+        row = self.store.db.execute('SELECT * FROM subagent_runs WHERE session_id=? AND task_id=? '
+                                    'AND call_id=? AND background=1', (sid, task_id, call_id)).fetchone()
+        if row is None or row['status'] not in TERMINAL:
+            return
+        self.store.db.execute("UPDATE subagent_runs SET status='running',completed=NULL WHERE call_id=?", (call_id,))
+        row = self._row(call_id)
+        await self._view(row, 'turn/started', {'threadId': reference(sid, task_id),
+                                             'turn': self._turn(row, include_items=False)})
+
     def take_usage(self, sid: str, task_id: str) -> dict | None:
-        """Summed model usage of a background run's messages (taken once)."""
+        """Cumulative model usage, retained across restarted phases of one spawn."""
         row = self.store.db.execute('SELECT call_id FROM subagent_runs WHERE session_id=? AND task_id=?',
                                     (sid, task_id)).fetchone()
-        seen = self.usage.pop(row[0], None) if row else None
+        seen = self.usage.get(row[0]) if row else None
         streamed, written = summed(seen or {}), summed(self.transcript_usage(sid, task_id))
         total = {key: max(streamed.get(key, 0), written.get(key, 0)) for key in streamed.keys() | written.keys()}
         return total or None

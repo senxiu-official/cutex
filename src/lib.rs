@@ -31,11 +31,13 @@ pub mod launch;
 pub mod management;
 pub mod memory;
 pub mod peers;
+pub mod pan;
 pub mod notes;
 pub mod notification_levels;
 pub mod notify;
 pub mod observability;
 pub mod owner_notify;
+pub mod owner_pins;
 pub mod platform;
 pub mod profiles;
 /// One-time r219 on-load migration: archives Task Service / Release rotation /

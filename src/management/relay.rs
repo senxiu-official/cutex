@@ -426,6 +426,27 @@ impl Store {
         names: Vec<String>,
         tailnet: Option<SocketAddr>,
     ) -> anyhow::Result<serde_json::Value> {
+        self.setup_with_binding(bind, names, tailnet, || {
+            Ok(std::net::TcpListener::bind(bind).map_err(|_| {
+                ApiError(409, "Conflict", "relay_bind_unavailable", "relay bind is occupied or unavailable")
+            })?)
+        })
+    }
+    #[cfg(test)]
+    fn setup_with_bound_listener(
+        &self,
+        listener: &std::net::TcpListener,
+        names: Vec<String>,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.setup_with_binding(listener.local_addr()?, names, None, || Ok(listener))
+    }
+    fn setup_with_binding<T>(
+        &self,
+        bind: SocketAddr,
+        names: Vec<String>,
+        tailnet: Option<SocketAddr>,
+        reserve: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<serde_json::Value> {
         if !bind.ip().is_loopback()
             || bind.port() == 0
             || !valid_server_names(&names)
@@ -444,7 +465,7 @@ impl Store {
         crate::config::instance::ensure_port_allowed(bind.port())?;
         self.locked(|| {
             if self.dir.join("identity.json").exists() || (self.dir.join("certificates.json").exists() && !self.registry()?.certificates.is_empty()) { bail!(ApiError(409, "Conflict", "relay_already_initialized", "relay is already initialized; never replace trust implicitly")); }
-            let _bind_check=std::net::TcpListener::bind(bind).map_err(|_|ApiError(409,"Conflict","relay_bind_unavailable","relay bind is occupied or unavailable"))?;
+            let _bind_check = reserve()?;
             let key = KeyPair::generate()?;
             let mut ca = CertificateParams::default();
             ca.distinguished_name.push(DnType::CommonName, "cutex dedicated home relay CA");

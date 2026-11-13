@@ -386,6 +386,112 @@ mod tests {
     }
 
     #[test]
+    fn lost_generation_owner_carries_settle_both_results_without_replay() {
+        use crate::management::v2::input_ledger::{InputLedger, InputState};
+        for persisted in [true, false] {
+            let (world, world_dir) = world("owner-carry-lost-generation");
+            let (store, dir) = temp_store("owner-carry-lost-generation");
+            let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+            let now = Utc::now();
+            let ids = [pending(&store, "lost-one", now), pending(&store, "lost-two", now)];
+            let bundle = reserve(&store, "owner-lost", now).unwrap();
+            let before = store.snapshot().unwrap();
+            let ledger = InputLedger::open(dir.join("private-ledger.sqlite3"));
+            for job in super::super::ledger::submitted_jobs_in(&before, REQUESTER, &ids,
+                &bundle.event_id, Some(&bundle.submission.message_id), Some("interrupted-owner-turn"), false) {
+                super::super::ledger::apply_job(&ledger, &job);
+            }
+            let originals = ledger.get(REQUESTER, &ids).unwrap();
+            runtime.set(REQUESTER, |status| status.runtime_generation = 36);
+            runtime.native.borrow_mut().insert(bundle.submission.message_id.clone(), if persisted {
+                NativeMessageStatus::Persisted { turn_id: "interrupted-owner-turn".into() }
+            } else { NativeMessageStatus::Unavailable("old receipt missing".into()) });
+            let frozen_text = bundle.submission.text.clone();
+            super::super::returns::admit_events(&world, &runtime, &store, &mut TickReport::default(), now).unwrap();
+            let after = store.snapshot().unwrap();
+            drop(ledger);
+            let ledger = InputLedger::open(dir.join("private-ledger.sqlite3"));
+            assert!(!after.next_step_leases.contains_key(REQUESTER));
+            assert!(!after.leases.contains_key(REQUESTER));
+            for id in &ids {
+                if persisted {
+                    assert_eq!(after.deliveries[id].state, DeliveryState::Acknowledged);
+                    let job = super::super::ledger::delivery_job(&before, &after,
+                        before.deliveries.get(id), &after.deliveries[id]).unwrap();
+                    super::super::ledger::apply_job(&ledger, &job);
+                } else {
+                    assert_eq!(after.deliveries[id].state, DeliveryState::Pending);
+                    assert!(after.deliveries[id].passive);
+                    // Model a crash after source commit but before projection:
+                    // reopen the store and rebuild using only durable facts.
+                    let reopened = AskStore::at(&dir).snapshot().unwrap();
+                    let record = ledger.get(REQUESTER,std::slice::from_ref(id)).unwrap().records.pop().unwrap();
+                    let job = super::super::ledger::drift_job(&reopened,&record).unwrap();
+                    super::super::ledger::apply_job(&ledger, &job);
+                    assert!(super::super::ledger::apply_job(&ledger,&job).is_empty());
+                }
+            }
+            for (old, record) in originals.records.iter().zip(ledger.get(REQUESTER, &ids).unwrap().records) {
+                assert_eq!(record.preview, old.preview, "original answer stays intact");
+                assert_eq!(record.state, if persisted { InputState::InContext } else { InputState::Uncertain });
+                if persisted {
+                    assert_eq!(record.timeline_item_id.as_deref(), Some(bundle.submission.message_id.as_str()));
+                    assert_eq!(record.turn_id.as_deref(), Some("interrupted-owner-turn"));
+                } else { assert!(!record.actions.is_empty()); }
+            }
+            if persisted {
+                assert!(after.events[&bundle.event_id].acknowledged);
+                assert_eq!(super::bundle(&store, &after, &after.events[&bundle.event_id]).unwrap().submission.text, frozen_text);
+            }
+            super::super::returns::admit_events(&world, &runtime, &store, &mut TickReport::default(), now).unwrap();
+            assert!(runtime.submitted.borrow().is_empty());
+            assert!(runtime.steered.borrow().is_empty());
+            drop(ledger); drop(store);
+            for path in [dir, world_dir] { let _ = std::fs::remove_dir_all(path); }
+        }
+    }
+
+    #[test]
+    fn owner_carry_reconcile_cas_preserves_replacement_lease_and_newer_deliveries() {
+        for persisted in [false, true] {
+            for change_delivery in [false, true] {
+                let (world, world_dir) = world("owner-carry-cas");
+                let (store, dir) = temp_store("owner-carry-cas");
+                let now = Utc::now();
+                let id = pending(&store, "cas-answer", now);
+                let bundle = reserve(&store, "owner-cas", now).unwrap();
+                let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+                runtime.set(REQUESTER, |status| status.runtime_generation = 36);
+                runtime.native.borrow_mut().insert(bundle.submission.message_id.clone(), if persisted {
+                    NativeMessageStatus::Persisted { turn_id: "old-turn".into() }
+                } else { NativeMessageStatus::Unavailable("missing".into()) });
+                let copy = dir.clone(); let changed_id = id.clone();
+                *runtime.status_hook.borrow_mut() = Some(Box::new(move || {
+                    AskStore::at(copy).with_state(|state| {
+                        if change_delivery {
+                            state.deliveries.get_mut(&changed_id).unwrap().owner_input_id = Some("new-owner".into());
+                        } else {
+                            let lease = state.leases.get_mut(REQUESTER).or_else(|| state.next_step_leases.get_mut(REQUESTER)).unwrap();
+                            lease.runtime_generation = 36;
+                            lease.native_message_id = "new-native".into();
+                        }
+                    }).unwrap();
+                }));
+                super::super::returns::admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+                let state=store.snapshot().unwrap();
+                assert!(!state.events[&bundle.event_id].acknowledged);
+                assert_eq!(state.deliveries[&id].state,DeliveryState::QueuedAsEvent);
+                let lease=state.leases.get(REQUESTER).or_else(||state.next_step_leases.get(REQUESTER)).unwrap();
+                if change_delivery { assert_eq!(state.deliveries[&id].owner_input_id.as_deref(),Some("new-owner")); }
+                else { assert_eq!(lease.native_message_id,"new-native"); assert_eq!(lease.runtime_generation,36); }
+                assert!(runtime.submitted.borrow().is_empty());
+                drop(store);
+                for path in [dir,world_dir] { let _=std::fs::remove_dir_all(path); }
+            }
+        }
+    }
+
+    #[test]
     fn stale_blocked_notice_owner_carry_and_resume_both_commit_orders() {
         for reserve_first in [false, true] {
             let (store, dir) = temp_store("stale-notice-owner-carry-race");
@@ -677,7 +783,6 @@ mod tests {
         let store = AskStore::at(&dir);
         assert_eq!(reserve(&store, "owner-receipt", now).unwrap(), bundle);
         runtime.set(REQUESTER, |status| {
-            status.runtime_generation = 2;
             status.active_turn_id = Some("actual-owner-turn".into());
         });
         let submitted = runtime.submitted.borrow().len();
@@ -708,6 +813,7 @@ mod tests {
             assert_eq!(reserve(&store, "owner-receipt", now).unwrap(), bundle);
         }
         let before = store.snapshot().unwrap();
+        runtime.set(REQUESTER, |status| status.runtime_generation = 2);
         runtime.native.borrow_mut().insert(
             bundle.submission.message_id.clone(),
             NativeMessageStatus::Persisted {

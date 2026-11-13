@@ -29,6 +29,7 @@ pub(crate) use super::sqlite::FormalName as FormalNameReceipts;
 pub(crate) use super::sqlite::HumanAdoption as HumanAdoptionReceipts;
 pub(crate) use super::sqlite::LaunchTombstone as ExplicitLaunchTombstones;
 pub(crate) use super::sqlite::NativeStop as NativeStopReceipts;
+pub(crate) use super::sqlite::QuickChatPromotion as QuickChatPromotionReceipts;
 
 /// The store as seen by one row-level writer: the committed snapshot at
 /// [`SessionRows::revision`] plus the rows this writer changed since its last
@@ -51,6 +52,12 @@ impl<'a> SessionRows<'a> {
     /// compare-and-swap) is at.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// A narrow typed repair can change known fields without reserializing
+    /// unrelated/default/forward-compatible JSON fields in the stored row.
+    pub(crate) fn preserve_unmodified_json(&mut self, key: &str) {
+        self.touched.preserve_json.insert(key.to_owned());
     }
 
     /// The committed store at [`Self::revision`], without this writer's
@@ -148,7 +155,7 @@ impl<'a> SessionRows<'a> {
     /// missing ones are deleted. Receipts cannot be changed this way.
     pub fn replace_sessions(&mut self, store: &CutexSessionStore) -> anyhow::Result<()> {
         anyhow::ensure!(
-            store.native_stop_receipts.is_empty()
+            store.quick_chat_promotion_receipts.is_empty() && store.native_stop_receipts.is_empty()
                 && store.explicit_launch_receipts.is_empty()
                 && store.human_adoption_receipts.is_empty()
                 && store.agent_archive_receipts.is_empty()

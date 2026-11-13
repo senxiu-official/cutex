@@ -94,6 +94,18 @@ pub struct PermissionEnvelope {
     pub writable_roots: Vec<String>,
 }
 
+/// Effective tool switches also constrain powers an agent hands to another
+/// process. A Claude tool snapshot that cannot be read is not full authority.
+pub fn effective_tool_permissions(record: &CutexSessionRecord) -> Result<(bool, bool), String> {
+    match &record.claude_session {
+        Some(session) => crate::runtime::claude::effective_tools(record, session)
+            .map_err(|_| "the creator's effective Claude tool permissions are unavailable".to_string()),
+        None if record.runtime_backend == crate::session::model::CutexSessionRuntimeBackend::ClaudeSubscription =>
+            Err("the creator's Claude tool permissions are unknown".into()),
+        None => Ok((true, true)),
+    }
+}
+
 impl PermissionEnvelope {
     /// The envelope of a durable session from its persisted launch settings.
     pub fn from_record(record: &CutexSessionRecord) -> Result<Self, String> {
@@ -157,7 +169,7 @@ impl PermissionEnvelope {
             SandboxLevel::WorkspaceWrite => self
                 .writable_roots
                 .iter()
-                .any(|root| path_within(path, root)),
+                .any(|root| path_within(path, root) && resolved_path_within(path, root)),
         }
     }
 }
@@ -379,9 +391,85 @@ pub fn path_within(path: &str, root: &str) -> bool {
     }
 }
 
+pub(crate) fn resolve_path(path: &Path) -> Option<std::path::PathBuf> {
+    let mut ancestor = path.to_path_buf();
+    let mut suffix = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for part in suffix.iter().rev() {
+                    resolved.push(part);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink is not an absent child directory.
+                if ancestor.symlink_metadata().is_ok() {
+                    return None;
+                }
+                suffix.push(ancestor.file_name()?.to_os_string());
+                if !ancestor.pop() {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Resolve existing ancestors too: a child cwd beneath a workspace symlink
+/// must not give the child write access outside its creator's writable root.
+/// New child directories are allowed, but an unreadable ancestor fails closed.
+fn resolved_path_within(path: &str, root: &str) -> bool {
+    match (resolve_path(Path::new(path)), resolve_path(Path::new(root))) {
+        (Some(path), Some(root)) => path.to_str().zip(root.to_str())
+            .is_some_and(|(path, root)| path_within(path, root)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn creator_envelope_rejects_symlink_escape_for_create_and_replace_specs() {
+        let temp = std::env::temp_dir().join(format!("creator-path-audit-{}", uuid::Uuid::new_v4()));
+        let workspace = temp.join("workspace");
+        let outside = temp.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+        std::os::unix::fs::symlink(temp.join("missing"), workspace.join("dangling")).unwrap();
+        let creator = PermissionEnvelope {
+            sandbox: SandboxLevel::WorkspaceWrite,
+            approval: ApprovalStrictness::OnRequest,
+            network_access: false,
+            writable_roots: vec![workspace.to_string_lossy().into_owned()],
+        };
+        for suffix in ["escape", "escape/new-child", "dangling/new-child"] {
+            let path = workspace.join(suffix).to_string_lossy().into_owned();
+            assert!(path_within(&path, &creator.writable_roots[0]), "lexical check accepted the exploit");
+            let error = clamp_or_refuse(&creator,
+                &request("workspace-write", "on-request", &path)).unwrap_err();
+            assert!(error.violations.iter().any(|v| v.field == "cwd"));
+            let error = clamp_or_refuse(&creator, &RequestedPermissions {
+                cwd: workspace.to_string_lossy().into_owned(),
+                writable_roots: Some(vec![path]), ..RequestedPermissions::default()
+            }).unwrap_err();
+            assert!(error.violations.iter().any(|v| v.field == "writable_roots"));
+        }
+        let new_child = workspace.join("new/child").to_string_lossy().into_owned();
+        assert!(creator.may_write(&new_child));
+        std::os::unix::fs::symlink(&workspace, temp.join("alias")).unwrap();
+        let aliased_creator = PermissionEnvelope {
+            writable_roots: vec![temp.join("alias").to_string_lossy().into_owned()],
+            ..creator
+        };
+        assert!(aliased_creator.may_write(&temp.join("alias/new-child").to_string_lossy()));
+        std::fs::remove_dir_all(temp).unwrap();
+    }
 
     fn abs(path: &str) -> String {
         if cfg!(windows) {

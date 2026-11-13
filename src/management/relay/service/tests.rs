@@ -27,6 +27,7 @@ struct Fixture {
     services: ServiceStore,
     token: VerifiedClientToken,
     certificate_id: String,
+    _setup_listener: TcpListener,
 }
 impl Fixture {
     fn new(port: u16) -> Self {
@@ -45,8 +46,9 @@ impl Fixture {
         UserStore::beside(&relay.tokens)
             .bind_token(&issued.token_id, Some(OWNER), "root")
             .unwrap();
+        let setup_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         relay
-            .setup("127.0.0.1:39489".parse().unwrap(), vec!["view.test".into()])
+            .setup_with_bound_listener(&setup_listener, vec!["view.test".into()])
             .unwrap();
         let key = KeyPair::generate().unwrap();
         let csr = CertificateParams::default()
@@ -86,6 +88,7 @@ impl Fixture {
             services,
             token,
             certificate_id,
+            _setup_listener: setup_listener,
         };
         f.context();
         f

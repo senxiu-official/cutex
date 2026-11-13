@@ -21,9 +21,9 @@
 //!   and profile-link storage (`<cutex home>/runtime/profile-link/`, including
 //!   atomic-write staging files)
 //!   are owner-local-only secrets: a paired device's token
-//!   or a remote listener gets 403 `owner_local_only`; only owner-local
-//!   requests (`users::request_is_owner_local`: the root credential, or an
-//!   owner token issued by `client-token issue` on the host, on loopback)
+//!   or a remote listener gets 403 `owner_local_only`; only full-scope owner-local
+//!   requests (`users::request_has_owner_local_secret_access`: the root credential, or an
+//!   full-scope owner token issued by `client-token issue` on the host, on loopback)
 //!   read it.
 //!
 //! Never reachable with per-agent Agent Bus credentials or the ordinary
@@ -99,16 +99,62 @@ pub fn read_host_file(params: &HashMap<String, String>) -> WorkspaceResult<Value
 /// workspace file read (`workspace_fs::file_resource`): a workspace rooted
 /// at the home directory must not hand it out either.
 pub(crate) fn refuse_root_credential_file(path: &std::path::Path) -> WorkspaceResult<()> {
+    refuse_credential_path(path, false)
+}
+/// Listings keep entries whose identity is unresolved; a later content read
+/// reports the pending/limited-index reason. Known credentials stay hidden.
+pub(crate) fn refuse_root_credential_entry(path: &std::path::Path) -> WorkspaceResult<()> {
+    #[cfg(unix)]
+    if narrowed_credential_read() {
+        if let Ok(metadata) = path.symlink_metadata() { return refuse_credential_entry_metadata(path, &metadata); }
+    }
+    refuse_credential_path(path, true)
+}
+pub(crate) fn refuse_credential_entry_metadata(path: &std::path::Path, metadata: &std::fs::Metadata) -> WorkspaceResult<()> {
+    #[cfg(unix)]
+    if narrowed_credential_read() {
+        // The listing already obtained this metadata for size/type. Names and
+        // cached identities need no second open; actual reads use final handles.
+        if secret_path_cache::credential_entry(path, metadata) { return Err(credential_read_denied()); }
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    let _ = metadata;
+    refuse_credential_path(path, true)
+}
+pub(crate) fn credential_request() -> impl Drop { secret_path_cache::pin_credential_request() }
+fn refuse_credential_path(path: &std::path::Path, listing: bool) -> WorkspaceResult<()> {
     crate::artifacts::paths::validate_resolved_local_path(path).map_err(|_|WorkspaceError::new(403,"path_forbidden","network, device and alternate-stream paths are unavailable"))?;
-    // Owner-local reads are already allowed. Still validate path transport above,
-    // but do not classify every file in an owner-local tree/status request.
-    if crate::management::users::request_is_owner_local() { return Ok(()); }
+    if narrowed_credential_read() {
+        use secret_path_cache::CredentialDecision;
+        match secret_path_cache::credential_decision(path, false) {
+            CredentialDecision::Credential => return Err(credential_read_denied()),
+            CredentialDecision::Unverified(reason) if !listing => return Err(WorkspaceError::new(403, "credential_read_denied", format!("{reason}; connect with the full owner token to read this file"))),
+            _ => {}
+        }
+    }
+    // Only full-scope owner-local reads are exempt. GET alone does not protect
+    // a narrowed token from recovering a more powerful credential.
+    if crate::management::users::request_has_owner_local_secret_access() { return Ok(()); }
     if secret_path_cache::classify_validated(path, false)
     {
         let refused = crate::management::users::owner_local_only("readRootCredential");
-        return Err(WorkspaceError::new(403, refused.code, refused.message));
+        return Err(WorkspaceError::new(403, refused.code,
+            "host control credentials require a full-scope owner-local connection"));
     }
     Ok(())
+}
+
+pub(crate) fn is_narrowed_credential_file(path: &std::path::Path) -> bool {
+    narrowed_credential_read() && secret_path_cache::narrowed_credential(path, false)
+}
+
+pub(crate) fn narrowed_credential_read() -> bool {
+    crate::management::listeners::current_client_token().is_some_and(|token| !token.scope.is_full())
+}
+fn credential_read_denied() -> WorkspaceError {
+    WorkspaceError::new(403,"credential_read_denied",
+        "read/chat tokens cannot read credential locations; connect with the full owner token to read this file")
 }
 
 // Cached IDs only add denials: reuse of a retired ID can conservatively deny
@@ -147,8 +193,16 @@ fn record_identity_read(path: &std::path::Path) {
     });
 }
 
+#[path = "launch_credentials.rs"]
+mod launch_credentials;
+
+/// Record a launch-selected secret file without persisting its contents.
+pub fn register_launch_credential_file(source: &str, path: &std::path::Path) -> anyhow::Result<()> { launch_credentials::register(source, path) }
+
 #[path = "secret_path_cache.rs"]
 mod secret_path_cache;
+#[path = "credential_locations.rs"]
+mod credential_locations;
 
 pub(crate) fn prime_secret_path_cache() { secret_path_cache::prime(); }
 pub(crate) fn refresh_secret_path_cache() { secret_path_cache::refresh(); }
@@ -161,11 +215,15 @@ pub(crate) fn validate_path(path: &std::path::Path) -> WorkspaceResult<()> {
     crate::artifacts::paths::validate_local_path(path).map_err(|_|WorkspaceError::new(403,"path_forbidden","network, device and alternate-stream paths are unavailable"))
 }
 pub(crate) fn refuse_private_tree(path: &std::path::Path) -> WorkspaceResult<()> {
+    crate::artifacts::paths::validate_resolved_local_path(path).map_err(|_|WorkspaceError::new(403,"path_forbidden","network, device and alternate-stream paths are unavailable"))?;
+    if narrowed_credential_read() && secret_path_cache::narrowed_credential(path, true) {
+        return Err(credential_read_denied());
+    }
     refuse_root_credential_file(path)?;
-    if !crate::management::users::request_is_owner_local() {
-        let canonical=std::fs::canonicalize(path).unwrap_or_else(|_|path.to_path_buf());
-        if crate::config::paths::config_dir().ok().map(|p|p.join("management-relay")).and_then(|p|std::fs::canonicalize(p).ok()).is_some_and(|secret|secret.starts_with(&canonical)) {
-            let e=crate::management::users::owner_local_only("readRelayPrivateTree");return Err(WorkspaceError::new(403,e.code,e.message));
+    if !crate::management::users::request_has_owner_local_secret_access() {
+        if secret_path_cache::tree_contains_private(path) {
+            return Err(WorkspaceError::new(403,"owner_local_only",
+                "aggregate reads of host credential directories require a full-scope owner-local connection"));
         }
     }
     Ok(())
@@ -413,6 +471,403 @@ mod tests {
             )
             .is_ok());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_credentials_do_not_block_workspaces_or_rescan_per_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::management::{client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken}, listeners};
+        use super::super::workspace::{ResolvedRoot, Scope, ScopeKind};
+        let (home, _) = secret_fixture();
+        let context = RequestContextGuard::new();
+        context.request(false, Some(IssuedVia::HostCli));
+        let blocked = home.root().join(".ssh/unreadable");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0)).unwrap();
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) { let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)); }
+        }
+        let _restore = Restore(blocked.clone());
+        assert!(std::fs::read_dir(&blocked).is_err(), "fixture must run without root privileges");
+        let dir = home.root().join("ordinary-workspace");
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        std::fs::write(dir.join("report.txt"), "old report").unwrap();
+        for args in [vec!["init", "-q"], vec!["add", "."], vec!["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]] {
+            assert!(super::super::workspace_git::run_git(&dir, &args, None).unwrap().status.success());
+        }
+        std::fs::write(dir.join("report.txt"), "new report").unwrap();
+        let secret = home.root().join(".ssh/key");
+        std::fs::write(&secret, "synthetic key").unwrap();
+        std::fs::hard_link(&secret, dir.join("secret-alias.txt")).unwrap();
+        std::fs::write(dir.join("ordinary.txt"), "ordinary").unwrap();
+        std::fs::hard_link(dir.join("ordinary.txt"), dir.join("ordinary-alias.txt")).unwrap();
+        // Thousands of multi-link regular files exercise identity-cache reuse;
+        // directory links exercise the original Linux nlink regression.
+        for index in 0..3000 {
+            std::fs::hard_link(dir.join("ordinary.txt"), dir.join(format!("entry-{index}.txt"))).unwrap();
+        }
+        let mut token = VerifiedClientToken::test_token("read-workspace");
+        token.scope = DeviceScope::Read;
+        listeners::set_current_client_token(Some(token));
+        refresh_secret_path_cache();
+        let builds = secret_path_cache::wait_for_credentials();
+        let started = std::time::Instant::now();
+        let root = ResolvedRoot::from_dir(Scope { kind: ScopeKind::Project, id: "ordinary".into() }, &dir).unwrap();
+        assert!(!secret_path_cache::narrowed_credential(&dir.join("subdir"), false));
+        let listing = super::super::workspace_fs::dir_resource(&root, &std::collections::HashMap::new()).unwrap();
+        assert_eq!(listing["entries"].as_array().unwrap().len(), 3004);
+        assert!(!listing["entries"].as_array().unwrap().iter().any(|entry| entry["name"] == "secret-alias.txt"));
+        assert_eq!(secret_path_cache::wait_for_credentials(), builds, "listing must not rebuild the background index");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(read_host_file(&params(dir.join("ordinary-alias.txt").to_str().unwrap(), None)).unwrap()["content"], "ordinary");
+        assert!(super::super::workspace_git::diff_resource(&root, &std::collections::HashMap::from([("path".into(), "report.txt".into())])).is_ok());
+        assert!(super::super::workspace_git::diff_resource(&root, &std::collections::HashMap::new()).is_ok());
+        assert_eq!(read_host_file(&params(dir.join("secret-alias.txt").to_str().unwrap(), None)).unwrap_err().code, "credential_read_denied");
+        let home_workspace = ResolvedRoot::from_dir(Scope { kind: ScopeKind::Project, id: "home".into() }, home.root()).unwrap();
+        assert!(super::super::workspace_fs::dir_resource(&home_workspace, &std::collections::HashMap::new()).is_ok());
+        assert!(super::super::workspace_fs::file_resource(&home_workspace, &params("ordinary-workspace/ordinary.txt", None)).is_ok());
+        assert_eq!(refuse_private_tree(&home_workspace.canonical).unwrap_err().code, "credential_read_denied");
+        // Explicit invalidation discovers newly created credential identities.
+        let newer = home.root().join(".ssh/new-key");
+        std::fs::write(&newer, "new synthetic key").unwrap();
+        std::fs::hard_link(&newer, dir.join("new-alias.txt")).unwrap();
+        refresh_secret_path_cache();
+        secret_path_cache::wait_for_credentials();
+        assert_eq!(read_host_file(&params(dir.join("new-alias.txt").to_str().unwrap(), None)).unwrap_err().code, "credential_read_denied");
+    }
+
+    #[test]
+    fn credential_worker_starts_only_for_narrowed_reads_and_stops_when_idle() {
+        use crate::management::{client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken}, listeners};
+        let (home, _) = secret_fixture();
+        let context = RequestContextGuard::new();
+        context.request(false, Some(IssuedVia::HostCli));
+        let report = home.root().join("ordinary.txt"); std::fs::write(&report, "ordinary").unwrap();
+        prime_secret_path_cache();
+        crate::config::store::save_codez_config(&crate::profiles::model::CodezConfig::default()).unwrap();
+        assert!(read_host_file(&params(report.to_str().unwrap(), None)).is_ok());
+        assert!(secret_path_cache::credential_test_state().is_none(), "startup, config saves and full reads must not start the index");
+        struct Idle;
+        impl Drop for Idle { fn drop(&mut self) { secret_path_cache::CREDENTIAL_IDLE_MS.with(|value| value.set(600_000)); } }
+        let _idle = Idle;
+        secret_path_cache::CREDENTIAL_IDLE_MS.with(|value| value.set(500));
+        let mut token = VerifiedClientToken::test_token("read-lazy"); token.scope = DeviceScope::Read;
+        listeners::set_current_client_token(Some(token));
+        assert!(read_host_file(&params(report.to_str().unwrap(), None)).is_ok());
+        secret_path_cache::wait_for_credentials();
+        assert_eq!(secret_path_cache::credential_test_state().unwrap().0, 1);
+        let start = std::time::Instant::now();
+        while secret_path_cache::credential_test_state().unwrap().2 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(read_host_file(&params(report.to_str().unwrap(), None)).is_ok());
+        let state = secret_path_cache::credential_test_state().unwrap();
+        assert_eq!(state.0, 2); assert!(state.3, "idle resume must retain the ready index");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_transcript_churn_does_not_rebuild_and_config_save_has_no_building_gap() {
+        use crate::management::{client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken}, listeners};
+        let (home, _) = secret_fixture();
+        let context = RequestContextGuard::new(); context.request(false, Some(IssuedVia::HostCli));
+        let bulk = home.root().join(".ssh/bulk"); std::fs::create_dir_all(&bulk).unwrap();
+        for index in 0..60_000 { std::fs::write(bulk.join(index.to_string()), "synthetic").unwrap(); }
+        let config = crate::config::paths::config_dir().unwrap();
+        let tools = [home.root().join(".claude"), config.join("profiles/p"), config.join("claude-accounts/a"), config.join("kimi-accounts/a")];
+        for tool in &tools { std::fs::create_dir_all(tool).unwrap(); std::fs::write(tool.join("auth.json"), "synthetic credential").unwrap(); }
+        let ordinary = home.root().join("ordinary.txt"); std::fs::write(&ordinary, "ordinary").unwrap();
+        let alias = home.root().join("ordinary-alias.txt"); std::fs::hard_link(&ordinary, &alias).unwrap();
+        let mut token = VerifiedClientToken::test_token("read-churn"); token.scope = DeviceScope::Read;
+        listeners::set_current_client_token(Some(token));
+        let builds = secret_path_cache::wait_for_credentials();
+        let started = std::time::Instant::now();
+        for round in 0..13 {
+            for tool in &tools {
+                let output = tool.join(format!("projects/session-{round}"));
+                std::fs::create_dir_all(&output).unwrap(); std::fs::write(output.join("transcript.jsonl"), "synthetic tool output").unwrap();
+                let transient = tool.join(format!("tool-output-{round}.tmp")); std::fs::write(&transient, "output").unwrap(); std::fs::remove_file(transient).unwrap();
+            }
+            assert_eq!(read_host_file(&params(alias.to_str().unwrap(), None)).unwrap()["content"], "ordinary");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        assert_eq!(secret_path_cache::credential_test_state().unwrap().1, builds, "transcripts must not schedule a credential rebuild");
+        eprintln!("credential-churn entries=60000 elapsed={:?} rebuilds=0", started.elapsed());
+        let start = std::time::Instant::now();
+        for _ in 0..3 {
+            crate::config::store::save_codez_config(&crate::profiles::model::CodezConfig::default()).unwrap();
+            assert!(secret_path_cache::credential_test_state().unwrap().3);
+            assert_eq!(read_host_file(&params(alias.to_str().unwrap(), None)).unwrap()["content"], "ordinary", "config save must preserve ready identities");
+        }
+        secret_path_cache::wait_for_credentials();
+        let after = secret_path_cache::credential_test_state().unwrap().1;
+        assert_eq!(after, builds + 1, "three config saves must be debounced into one rebuild");
+        eprintln!("credential-config-save gap=none saves=3 rebuilds=1 refresh={:?}", start.elapsed());
+        for (index, tool) in tools.iter().enumerate() {
+            let protected_alias = home.root().join(format!("credential-alias-{index}.txt"));
+            std::fs::hard_link(tool.join("auth.json"), &protected_alias).unwrap();
+            assert_eq!(read_host_file(&params(protected_alias.to_str().unwrap(), None)).unwrap_err().code, "credential_read_denied");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_credential_index_keeps_large_listing_fast_and_intact_at_cap() {
+        use crate::management::{client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken}, listeners};
+        use super::super::workspace::{ResolvedRoot, Scope, ScopeKind};
+        let (home, _) = secret_fixture();
+        let context = RequestContextGuard::new();
+        context.request(false, Some(IssuedVia::HostCli));
+        let credentials = home.root().join(".ssh/bulk");
+        std::fs::create_dir_all(&credentials).unwrap();
+        for index in 0..60_000 { std::fs::write(credentials.join(index.to_string()), "synthetic").unwrap(); }
+        let public = home.root().join("public");
+        std::fs::create_dir_all(&public).unwrap();
+        let original = public.join("original.txt");
+        std::fs::write(&original, "ordinary").unwrap();
+        for index in 0..3000 { std::fs::hard_link(&original, public.join(format!("entry-{index}.txt"))).unwrap(); }
+        let root = ResolvedRoot::from_dir(Scope { kind: ScopeKind::Project, id: "performance".into() }, &public).unwrap();
+        refresh_secret_path_cache();
+        let builds = secret_path_cache::wait_for_credentials();
+        let mut read = VerifiedClientToken::test_token("read-perf"); read.scope = DeviceScope::Read;
+        let mut worst_full = std::time::Duration::ZERO;
+        let mut worst_read = std::time::Duration::ZERO;
+        for round in 0..3 {
+            context.request(false, Some(IssuedVia::HostCli));
+            let start = std::time::Instant::now();
+            let full = super::super::workspace_fs::dir_resource(&root, &HashMap::new()).unwrap();
+            let full_time = start.elapsed(); worst_full = worst_full.max(full_time);
+            listeners::set_current_client_token(Some(read.clone()));
+            let start = std::time::Instant::now();
+            let narrowed = super::super::workspace_fs::dir_resource(&root, &HashMap::new()).unwrap();
+            let read_time = start.elapsed(); worst_read = worst_read.max(read_time);
+            assert_eq!(full["entries"].as_array().unwrap().len(), 3001);
+            assert_eq!(narrowed["entries"].as_array().unwrap().len(), 3001);
+            eprintln!("credential-index round={round} full={full_time:?} narrowed={read_time:?}");
+            if round == 0 { std::thread::sleep(std::time::Duration::from_millis(2100)); }
+        }
+        assert!(worst_read <= worst_full * 3 + std::time::Duration::from_millis(30), "full={worst_full:?} narrowed={worst_read:?}");
+        assert_eq!(secret_path_cache::wait_for_credentials(), builds, "unchanged directories must not rebuild after a timer");
+        // A normal credential-directory mtime change schedules background work.
+        let new_secret = credentials.join("new-key");
+        std::fs::write(&new_secret, "synthetic new key").unwrap();
+        let alias = public.join("secret-alias.txt"); std::fs::hard_link(&new_secret, &alias).unwrap();
+        let start = std::time::Instant::now();
+        while secret_path_cache::wait_for_credentials() == builds {
+            assert!(start.elapsed() < std::time::Duration::from_secs(30));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(read_host_file(&params(alias.to_str().unwrap(), None)).unwrap_err().code, "credential_read_denied");
+        std::fs::remove_file(&alias).unwrap();
+        // Force the real budget path without manufacturing a million files.
+        struct Limit;
+        impl Drop for Limit { fn drop(&mut self) { secret_path_cache::CREDENTIAL_LIMIT.with(|limit| limit.set(1_000_000)); } }
+        let _limit = Limit;
+        secret_path_cache::CREDENTIAL_LIMIT.with(|limit| limit.set(500));
+        refresh_secret_path_cache(); secret_path_cache::wait_for_credentials();
+        let listed = super::super::workspace_fs::dir_resource(&root, &HashMap::new()).unwrap();
+        assert_eq!(listed["entries"].as_array().unwrap().len(), 3001, "capacity must not hide ordinary hardlinks");
+        let denied = read_host_file(&params(original.to_str().unwrap(), None)).unwrap_err();
+        assert!(denied.message.contains("entry limit"), "{}", denied.message);
+        assert_eq!(denied.code, "credential_read_denied");
+        let found = super::super::workspace_fs::search_resource(&root, &HashMap::from([("q".into(), "entry-1".into())])).unwrap();
+        assert!(!found["results"].as_array().unwrap().is_empty(), "capacity must not empty file search either");
+    }
+
+    #[test]
+    fn launch_time_token_files_survive_cross_process_registration() {
+        const CHILD: &str = "CUTEX_CREDENTIAL_CUSTODY_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let resolved = crate::agent_bus::service::resolve_serve_token(None, Some(std::path::Path::new(&path)), None, None).unwrap();
+            assert_eq!(resolved.source, crate::agent_bus::service::ServeTokenSource::File);
+            return;
+        }
+        use crate::management::{client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken}, listeners};
+        let (home, _) = secret_fixture();
+        let context = RequestContextGuard::new(); context.request(false, Some(IssuedVia::HostCli));
+        let source = home.root().join("input.txt");
+        let value = "synthetic-startup-token-0123456789";
+        crate::config::atomic::write_private_bytes_atomic(&source, value.as_bytes()).unwrap();
+        let alias = home.root().join("ordinary.txt"); std::fs::hard_link(&source, &alias).unwrap();
+        #[cfg(unix)]
+        let launch_path = { let link = home.root().join("systemd-credential"); std::os::unix::fs::symlink(&source, &link).unwrap(); link };
+        #[cfg(not(unix))]
+        let launch_path = source.clone();
+        let mut token = VerifiedClientToken::test_token("read-launch"); token.scope = DeviceScope::Read;
+        listeners::set_current_client_token(Some(token));
+        secret_path_cache::wait_for_credentials();
+        assert_eq!(read_host_file(&params(alias.to_str().unwrap(), None)).unwrap()["content"], value, "fixture must start outside the existing inventory");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "management::v2::host_files::tests::launch_time_token_files_survive_cross_process_registration", "--nocapture"])
+            .env(CHILD, &launch_path).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        // The Management process already has a ready old index. It must see a
+        // separate bus process's registration immediately, without a rebuild.
+        for scope in [DeviceScope::Read, DeviceScope::Chat] {
+            let mut token = VerifiedClientToken::test_token("read-launch"); token.scope = scope;
+            listeners::set_current_client_token(Some(token));
+            for file in [&source, &alias, &launch_path] { assert_eq!(read_host_file(&params(file.to_str().unwrap(), None)).unwrap_err().code, "credential_read_denied"); }
+        }
+        let manifest = crate::config::paths::config_dir().unwrap().join(launch_credentials::MANIFEST);
+        assert!(!std::fs::read_to_string(&manifest).unwrap().contains(value), "custody metadata must never contain the token");
+        // Registration itself does not activate the heavyweight index.
+        context.request(false, Some(IssuedVia::HostCli));
+        assert_eq!(read_host_file(&params(source.to_str().unwrap(), None)).unwrap()["content"], value);
+        assert_eq!(read_host_file(&params(alias.to_str().unwrap(), None)).unwrap()["content"], value);
+    }
+
+    #[test]
+    fn every_private_credential_writer_is_denied_by_path_and_inode_without_hiding_runtime_artifacts() {
+        use crate::management::{client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken}, listeners};
+        let (home, _) = secret_fixture();
+        let context = RequestContextGuard::new(); context.request(false, Some(IssuedVia::HostCli));
+        let config = crate::config::paths::config_dir().unwrap();
+        let mut paths = Vec::new();
+        for (index, (writer, relative)) in credential_locations::PRIVATE_WRITER_CASES.iter().enumerate() {
+            let file = config.join(relative);
+            crate::config::atomic::write_private_bytes_atomic(&file, b"synthetic credential").unwrap();
+            let alias = home.root().join(format!("ordinary-writer-alias-{index}.txt"));
+            std::fs::hard_link(&file, &alias).unwrap(); paths.push((*writer, file, alias));
+        }
+        let ordinary = ["projects/p/memory/MEMORY.md", "runtime/artifacts/blobs/ab/hash", "runtime/artifacts/rpc-token", "runtime/documents/doc.txt", "runtime/attachments/session/upload.txt", "runtime/management-v2/status.json"];
+        for relative in ordinary { crate::config::atomic::write_private_bytes_atomic(&config.join(relative), b"ordinary preview").unwrap(); }
+        let temporary = config.join(".scoped-mcp.json.tmp-1-fixture");
+        crate::config::atomic::write_private_bytes_atomic(&temporary, b"synthetic credential").unwrap();
+        refresh_secret_path_cache(); secret_path_cache::wait_for_credentials();
+        for scope in [DeviceScope::Read, DeviceScope::Chat] {
+            for (remote, via) in [(false, IssuedVia::HostCli), (false, IssuedVia::Pairing), (true, IssuedVia::HostCli), (true, IssuedVia::Pairing)] {
+                context.request(remote, Some(via));
+                let mut token = VerifiedClientToken::test_token("credential-writer"); token.scope = scope; token.issued_via = via;
+                listeners::set_current_client_token(Some(token));
+                for (writer, file, alias) in &paths {
+                    for path in [file, alias] {
+                        assert!(secret_path_cache::credential_decision(path, false) == secret_path_cache::CredentialDecision::Credential, "writer={writer} path={path:?}");
+                        assert_eq!(read_host_file(&params(path.to_str().unwrap(), None)).unwrap_err().code, "credential_read_denied", "writer={writer}");
+                    }
+                }
+                assert_eq!(read_host_file(&params(temporary.to_str().unwrap(), None)).unwrap_err().code, "credential_read_denied");
+                for relative in ordinary { assert_eq!(read_host_file(&params(config.join(relative).to_str().unwrap(), None)).unwrap()["content"], "ordinary preview", "{relative}"); }
+            }
+        }
+        context.request(false, Some(IssuedVia::HostCli));
+        for (_, file, alias) in paths { for path in [file, alias] { assert_eq!(read_host_file(&params(path.to_str().unwrap(), None)).unwrap()["content"], "synthetic credential"); } }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_private_socket_paths_are_refused_without_connecting() {
+        use crate::management::{client_tokens::{DeviceScope, IssuedVia, VerifiedClientToken}, listeners};
+        let (_home, _) = secret_fixture();
+        let context = RequestContextGuard::new(); context.request(false, Some(IssuedVia::HostCli));
+        let config = crate::config::paths::config_dir().unwrap();
+        // Keep the actual Unix socket short enough on all test hosts.
+        let socket = config.join("runtime/app-server/s"); std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut token = VerifiedClientToken::test_token("read-socket"); token.scope = DeviceScope::Read;
+        listeners::set_current_client_token(Some(token));
+        assert_eq!(read_host_file(&params(socket.to_str().unwrap(), None)).unwrap_err().code, "credential_read_denied");
+    }
+
+    #[test]
+    fn narrowed_tokens_refuse_credential_locations_and_aliases_but_keep_memory_previews() {
+        use crate::management::{client_tokens::{DeviceScope,IssuedVia,VerifiedClientToken},listeners};
+        use super::super::workspace::{ResolvedRoot,Scope,ScopeKind};
+        let (home,_) = secret_fixture();
+        let context = RequestContextGuard::new();
+        let root=home.root();
+        let config=crate::config::paths::config_dir().unwrap();
+        let secret=root.join(".ssh/id_ed25519");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret,"synthetic credential").unwrap();
+        let alias=root.join("ordinary-alias.txt");
+        std::fs::hard_link(&secret,&alias).unwrap();
+        let report=config.join("projects/p/memory/MEMORY.md");
+        std::fs::create_dir_all(report.parent().unwrap()).unwrap();
+        std::fs::write(&report,"ordinary memory").unwrap();
+        let known=config.join("kimi-accounts/.login/a/credentials/token.json");
+        std::fs::create_dir_all(known.parent().unwrap()).unwrap();
+        std::fs::write(&known,"synthetic credential").unwrap();
+        let samples=[
+            root.join(".config/google-chrome/Default/IndexedDB/session.leveldb"),
+            root.join(".config/google-chrome/Default/blob_storage/token"),
+            root.join(".config/gh/hosts.yml"), root.join("AppData/Roaming/GitHub CLI/hosts.yml"),
+            root.join(".cargo/credentials"), root.join(".cargo/credentials.toml"),
+            root.join(".gemini/settings.json"), root.join(".config/git/credentials"),
+            root.join(".config/rclone/rclone.conf"), root.join("_netrc"),
+            root.join("AppData/Roaming/Cutex/host-tokens.json"),
+            root.join("AppData/Roaming/cutex-desktop/profile-link/secret-v1.json"),
+            root.join(".netrc"),root.join(".aws/credentials"),root.join(".config/gcloud/credentials.db"),
+            root.join(".docker/config.json"),root.join(".gnupg/private-keys-v1.d/test.key"),
+            root.join(".codex/auth.json"),root.join(".config/google-chrome/Default/Network/Cookies"),
+            root.join("AppData/Roaming/Microsoft/Protect/test.key"),
+            config.join("profiles/test/auth.json"),config.join("claude-accounts/test/.credentials.json"),
+            config.join("profile-keys/test.json"),config.join("accounts.v2.backup.json"),
+            config.join("claude-home/.credentials.json"),
+        ];
+        for file in &samples {std::fs::create_dir_all(file.parent().unwrap()).unwrap();std::fs::write(file,"synthetic credential").unwrap();}
+        for (source, name) in [("IndexedDB/session.leveldb", "indexeddb-alias.txt"), ("blob_storage/token", "blob-alias.txt")] {
+            std::fs::hard_link(root.join(".config/google-chrome/Default").join(source), root.join(name)).unwrap();
+        }
+
+        let artifact=config.join("artifacts/test.html");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();std::fs::write(&artifact,"ordinary artifact").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(secret.parent().unwrap(),root.join("linked-credentials")).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let status=std::process::Command::new("cmd").args(["/c","mklink","/J"])
+                .arg(root.join("linked-credentials")).arg(secret.parent().unwrap())
+                .creation_flags(0x08000000).status().unwrap();
+            assert!(status.success());
+        }
+        struct LinkGuard(std::path::PathBuf);
+        impl Drop for LinkGuard {fn drop(&mut self){
+            #[cfg(windows)] let _=std::fs::remove_dir(&self.0);
+            #[cfg(not(windows))] let _=std::fs::remove_file(&self.0);
+        }}
+        let _link=LinkGuard(root.join("linked-credentials"));
+        std::fs::write(root.join("ordinary-preview.txt"), "ordinary preview").unwrap();
+        refresh_secret_path_cache();
+        secret_path_cache::wait_for_credentials();
+        for scope in [DeviceScope::Read,DeviceScope::Chat] {
+            for (remote,via) in [(false,IssuedVia::HostCli),(false,IssuedVia::Pairing),(true,IssuedVia::HostCli),(true,IssuedVia::Pairing)] {
+                context.request(remote,Some(via));
+                let mut token=VerifiedClientToken::test_token("narrowed-test"); token.scope=scope;token.issued_via=via;
+                listeners::set_current_client_token(Some(token));
+                for file in [&secret,&alias,&known,&root.join("linked-credentials/id_ed25519"),&root.join("indexeddb-alias.txt"),&root.join("blob-alias.txt")] {
+                    let denied=read_host_file(&params(file.to_str().unwrap(),None)).unwrap_err();
+                    assert_eq!(denied.code,"credential_read_denied");
+                    assert!(denied.message.contains("full owner token"));
+                }
+                for file in &samples {assert_eq!(read_host_file(&params(file.to_str().unwrap(),None)).unwrap_err().code,"credential_read_denied");}
+                let static_root = std::fs::canonicalize(root).unwrap();
+                for name in ["_netrc", "ordinary-alias.txt", "AppData/Roaming/Cutex/host-tokens.json"] {
+                    assert!(crate::services::static_files::resolve(&static_root, &format!("/{name}")).is_none(), "static {name}");
+                }
+                assert!(crate::services::static_files::resolve(&static_root, "/ordinary-preview.txt").is_some());
+
+                assert_eq!(read_host_file(&params(report.to_str().unwrap(),None)).unwrap()["content"],"ordinary memory");
+                assert_eq!(read_host_file(&params(artifact.to_str().unwrap(),None)).unwrap()["content"],"ordinary artifact");
+            }
+        }
+        for (remote,via) in [(false,IssuedVia::HostCli),(false,IssuedVia::Pairing),(true,IssuedVia::HostCli),(true,IssuedVia::Pairing)] {
+            context.request(remote,Some(via));
+            for file in samples.iter().chain([&secret,&alias]) {assert_eq!(read_host_file(&params(file.to_str().unwrap(),None)).unwrap()["content"],"synthetic credential");}
+            let static_root = std::fs::canonicalize(root).unwrap();
+            for name in ["_netrc", "ordinary-alias.txt", "AppData/Roaming/Cutex/host-tokens.json"] {
+                assert!(crate::services::static_files::resolve(&static_root, &format!("/{name}")).is_some(), "full static {name}");
+            }
+
+        }
+        context.request(false,Some(IssuedVia::HostCli));
+        let workspace=ResolvedRoot::from_dir(Scope{kind:ScopeKind::Session,id:"test".into()},root).unwrap();
+        let mut token=VerifiedClientToken::test_token("read-workspace");token.scope=DeviceScope::Read;
+        listeners::set_current_client_token(Some(token));
+        assert_eq!(super::super::workspace_fs::file_resource(&workspace,&params("ordinary-alias.txt",None)).unwrap_err().code,"credential_read_denied");
     }
 
     #[test]

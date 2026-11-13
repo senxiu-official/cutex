@@ -494,13 +494,26 @@ fn explicit_recipient_retry_releases_unknown_owner_reservation_only_when_request
             .owner_carry_ids(SESSION, "owner-unknown")
             .unwrap()
             .is_empty());
-        assert_eq!(
-            f.repository
-                .snapshot_by_message_id("explicit-retry")
-                .unwrap()
-                .unwrap()
-                .external_input,
-            Some(frozen)
-        );
+        let retried = f.repository.snapshot_by_message_id("explicit-retry").unwrap().unwrap().external_input.unwrap();
+        assert_ne!(retried.message.id, frozen.message.id, "retry gets a new native attempt");
+        assert_eq!(retried.message.text, frozen.message.text);
+        assert_eq!(retried.message.source, frozen.message.source);
+        assert_eq!(retried.message.delivery, frozen.message.delivery);
+        retried.validate().unwrap();
+        assert_eq!(f.repository.source_id_for_native(SESSION, &retried.message.id).unwrap().as_deref(), Some("explicit-retry"));
+        assert!(f.repository.source_id_for_native(SESSION, &frozen.message.id).unwrap().is_none());
+        assert!(f.repository.source_id_for_native(SENDER, &retried.message.id).unwrap().is_none());
+        let same = f.repository.freeze_external_input(SESSION,"explicit-retry", |_| panic!("already frozen retry")).unwrap();
+        assert_eq!(same,retried,"automatic redrive reuses the retry attempt");
+        let old_receipt = json!({"messageId":frozen.message.id,"durable":true,"receiptScope":"local-inbox"});
+        assert!(f.repository.record_local_inbox(SESSION,"explicit-retry",&old_receipt).is_err());
+        let new_receipt = json!({"messageId":retried.message.id,"durable":true,"receiptScope":"local-inbox"});
+        f.repository.record_local_inbox(SESSION,"explicit-retry",&new_receipt).unwrap();
+        assert_eq!(f.repository.canonical_message("explicit-retry").unwrap().id,"explicit-retry");
+        assert!(!f.repository.record_native_context_injected(SESSION,"explicit-retry",&frozen,"old-turn").unwrap(),"late original attempt cannot settle the retry");
+        assert!(f.repository.record_native_context_injected(SESSION,"explicit-retry",&retried,"retry-turn").unwrap());
+        let delivered = f.repository.snapshot_by_message_id("explicit-retry").unwrap().unwrap();
+        assert_eq!(delivered.state,"delivered");
+        assert_eq!(f.ledger.get(SESSION,&["explicit-retry".into()]).unwrap().records.len(),1,"source identity stays stable");
     });
 }

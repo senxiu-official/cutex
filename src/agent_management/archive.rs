@@ -293,7 +293,7 @@ mod tests {
         let managed=|id:CutexSessionId,native:&str| ManagedAgentRecord {
             project_id:None,created_by_director_session:None,created_by_operator_session:None,
             cutex_session_id:id,native_session_id:native.into(),created_at:super::super::store::now(),retired_at:None,
-            spec:ManagedAgentSpec {name:"Formal Agent".into(),cwd:f.root.to_string_lossy().into_owned(),
+            spec:ManagedAgentSpec {memory_injection: true,name:"Formal Agent".into(),cwd:f.root.to_string_lossy().into_owned(),
                 profile:Some("test".into()),runtime_backend:"host".into(),model:"test".into(),reasoning:"low".into(),
                 permissions:"read-only".into(),approval_policy:"never".into(),sandbox_mode:"read-only".into(),
                 groups:vec![],expose_to_im:false,pin:false},

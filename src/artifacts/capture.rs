@@ -12,7 +12,8 @@
 //! process). A separate bounded scan worker coalesces project requests, so
 //! workspace traversal/hashing does not occupy the turn-window recorder. Turn ends
 //! arriving together are scanned once per project. The boundary channel remains
-//! lossless/unbounded; its batches are bounded and never do workspace I/O.
+//! a single bounded wakeup hint. Turn windows replay from the durable Management
+//! journal; a delayed consumer does not retain every turn in memory.
 //! Bounded: [`Budget`] (entries visited, wall time; the walk and the
 //! processing of what it found each get the time budget); a hit is logged,
 //! what was found is still processed, and the next scan resumes the walk
@@ -41,8 +42,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -78,7 +77,15 @@ const ROOT_KEY_PREFIX: &str = "captureRoot:";
 /// Meta key prefix: the baseline cutoff (ms) of a pass that started over
 /// after a root change (absent = the project's earliest turn window).
 const BASELINE_KEY_PREFIX: &str = "captureBaselineBefore:";
-const FORBIDDEN_DIR_NAMES: &[&str] = &[".git", ".cutex"];
+const FORBIDDEN_DIR_NAMES: &[&str] = &[
+    ".git", ".cutex", "node_modules", "__pycache__", ".cache", "cache", "caches",
+    "cache_data", "code cache", "gpucache", "shadercache", "dawncache", "grshadercache",
+    ".vite", ".next", ".nuxt", ".turbo", "target", ".venv", "venv",
+    "browser-profile", "browser-profiles", "chrome-profile", "chromium-profile",
+    "user-data", "user_data", "userdata", "user data", "profile", "profiles",
+    "session storage", "local storage", "indexeddb", "service worker", "blob_storage",
+    "crashpad", "crash reports", "extensions", "default",
+];
 
 /// Limits of one project scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,107 +149,10 @@ pub struct AgentFacts {
 #[path = "capture_worker.rs"]
 mod scan_worker;
 
-// --- hot path ---------------------------------------------------------------
-
-/// Runtime notification hook (management process, every runtime): only
-/// turn starts / ends are passed on, to the capture worker.
-pub fn on_runtime_event(session: &str, runtime_generation: u64, method: &str, params: Option<&Value>) {
-    if method != "turn/started" && method != "turn/completed" {
-        return;
-    }
-    let Some(event) = TurnEvent::from_notification(session, runtime_generation, method, params, Utc::now().timestamp_millis()) else {
-        return;
-    };
-    if let Some(sender) = worker() {
-        let _ = sender.send(event);
-    }
-}
-
-fn worker() -> Option<&'static mpsc::Sender<TurnEvent>> {
-    static WORKER: OnceLock<Option<mpsc::Sender<TurnEvent>>> = OnceLock::new();
-    WORKER
-        .get_or_init(|| {
-            if crate::config::paths::in_test_harness() {
-                return None;
-            }
-            let (sender, receiver) = mpsc::channel();
-            match std::thread::Builder::new().name("cutex-artifact-capture".into()).spawn(move || run(receiver)) {
-                Ok(_) => Some(sender),
-                Err(error) => {
-                    eprintln!("artifacts: auto capture worker not started: {error}");
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-// --- worker -----------------------------------------------------------------
-
-/// A full queue must not turn the 500 ms coalescing deadline into an unlimited
-/// drain (recv_timeout(0) still receives queued messages). Preserve order while
-/// bounding both this batch and the wait for its first durable turn window.
-fn event_batch<T>(receiver: &mpsc::Receiver<T>, first: T, coalesce: Duration, max_events: usize) -> Vec<T> {
-    let mut events = vec![first];
-    let deadline = Instant::now() + coalesce;
-    while events.len() < max_events {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() { break; }
-        match receiver.recv_timeout(remaining) {
-            Ok(event) => events.push(event),
-            Err(_) => break,
-        }
-    }
-    events
-}
-
-fn run(receiver: mpsc::Receiver<TurnEvent>) {
-    let host = ManagementHost;
-    let scans = match scan_worker::Worker::start() {
-        Ok(worker) => Some(worker),
-        Err(error) => {
-            eprintln!("artifacts: auto capture scan worker not started: {error}; turn windows will still be recorded");
-            None
-        }
-    };
-    let mut last_prune_ms = 0;
-    while let Ok(first) = receiver.recv() {
-        let events = event_batch(&receiver, first, COALESCE, 256);
-        if !host.settings().auto_capture.enabled {
-            continue;
-        }
-        let store = match host.store() {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("artifacts: auto capture: store unavailable: {error:#}");
-                continue;
-            }
-        };
-        let directory = crate::asks::directory::Directory::load().ok();
-        let asks = crate::asks::store::AskStore::open_default().ok().and_then(|store| store.peek().ok().flatten());
-        let mut projects = BTreeMap::<String, i64>::new();
-        for event in &events {
-            let facts = facts_of(&host, directory.as_ref(), asks.as_ref(), &event.session);
-            match record(&store, event, &facts) {
-                Ok(Some(project)) => {
-                    projects.entry(project).and_modify(|since| *since = (*since).min(event.at_ms)).or_insert(event.at_ms);
-                }
-                Ok(None) => {}
-                Err(error) => eprintln!("artifacts: auto capture: turn window of {}: {error:#}", event.session),
-            }
-        }
-        if let Some(scans) = &scans {
-            for (project, at_ms) in projects { scans.schedule(project, at_ms); }
-        }
-        let now_ms = Utc::now().timestamp_millis();
-        if now_ms - last_prune_ms >= PRUNE_EVERY_MS {
-            last_prune_ms = now_ms;
-            if let Err(error) = store.prune_windows(now_ms - WINDOW_RETENTION_MS) {
-                eprintln!("artifacts: auto capture: pruning turn windows: {error:#}");
-            }
-        }
-    }
-}
+#[path = "capture_replay.rs"]
+mod replay;
+pub use replay::{on_durable_event, start};
+pub(crate) const REPLAY_CURSOR_KEY: &str = "captureEventCursor";
 
 fn facts_of(
     host: &dyn ArtifactHost,
@@ -271,34 +181,7 @@ fn facts_of(
 /// Record a turn start / end. Returns the project to scan after a member
 /// turn ended.
 pub fn record(store: &ArtifactStore, event: &TurnEvent, facts: &AgentFacts) -> anyhow::Result<Option<String>> {
-    // Sub-agent threads report their own turns; only the main thread's
-    // turns open and close the member's window.
-    if let (Some(thread), Some(main)) = (&event.thread_id, &facts.thread_id) {
-        if thread != main {
-            return Ok(None);
-        }
-    }
-    if event.started {
-        let Some(project) = facts.project.clone() else {
-            return Ok(None);
-        };
-        store.window_started(&TurnWindow {
-            session_id: event.session.clone(),
-            turn_id: event.turn_id.clone(),
-            project_id: Some(project),
-            display_name: facts.display_name.clone(),
-            ask_id: facts.ask_id.clone(),
-            runtime_generation: Some(event.runtime_generation).filter(|generation| *generation > 0),
-            profile: facts.profile.clone(),
-            model: facts.model.clone(),
-            started_at_ms: event.at_ms,
-            ended_at_ms: None,
-        })?;
-        return Ok(None);
-    }
-    let project = store.window_ended(&event.session, event.at_ms)?.or_else(|| facts.project.clone());
-    if let Some(project) = &project { store.note_capture_requested(project, event.at_ms)?; }
-    Ok(project)
+    store.record_capture_event(event, facts, None)
 }
 
 /// Who most likely wrote a file last changed at `mtime_ms`.
@@ -425,6 +308,10 @@ pub fn scan_project(host: &dyn ArtifactHost, store: &ArtifactStore, project: &st
     let mut last_done: Option<String> = None;
     while let Some((path, rel, expand)) = stack.pop() {
         if expand {
+            // Browser profiles may have arbitrary directory names.
+            if is_browser_profile(&path) {
+                continue;
+            }
             // A walk base or a directory entry already counted.
             let Ok(entries) = std::fs::read_dir(&path) else {
                 continue;
@@ -468,7 +355,14 @@ pub fn scan_project(host: &dyn ArtifactHost, store: &ArtifactStore, project: &st
         } else {
             continue;
         };
-        if globs.matches(&rel) && !ignore.is_ignored(&rel, false) {
+        if globs.matches(&rel) && !ignore.is_ignored(&rel, false) && capture_file_allowed(&rel) {
+            // A file symlink must not bypass exclusions on its real target.
+            if !paths::relative(&real, &root).is_some_and(|target| capture_file_allowed(&target)) {
+                continue;
+            }
+            if real.ancestors().skip(1).take_while(|parent| paths::within(parent, &root)).any(is_browser_profile) {
+                continue;
+            }
             found.push((rel, real));
         }
     }
@@ -659,6 +553,32 @@ fn is_forbidden_dir(name: &str) -> bool {
     FORBIDDEN_DIR_NAMES.iter().any(|forbidden| forbidden.eq_ignore_ascii_case(name))
 }
 
+fn is_browser_profile(path: &std::path::Path) -> bool {
+    path.join("Local State").is_file()
+        || (path.join("Preferences").is_file() && (path.join("History").is_file() || path.join("Network").is_dir()))
+        || (path.join("prefs.js").is_file() && path.join("places.sqlite").is_file())
+}
+
+/// Hard exclusions apply even when a configured glob explicitly matches.
+fn capture_file_allowed(rel: &str) -> bool {
+    let path = rel.replace('\\', "/").to_ascii_lowercase();
+    let mut parts = path.split('/').collect::<Vec<_>>();
+    let name = parts.pop().unwrap_or_default();
+    if parts.iter().any(|part| is_forbidden_dir(part)) {
+        return false;
+    }
+    if matches!(name, "lock" | "current" | "log" | "log.old" | "local state" | "preferences" | "secure preferences" | "cookies" | "history" | "web data" | "login data" | "visited links")
+        || name.starts_with("manifest-") || name.starts_with("singleton")
+        || name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
+        || name.ends_with(".lock") || name.ends_with(".lockb") || name.ends_with(".lock.yaml")
+        || name.ends_with(".lock.json") || name == "pnpm-lock.yaml" || name == "package-lock.json" || name == "npm-shrinkwrap.json"
+    {
+        return false;
+    }
+    !matches!(name.rsplit('.').next().unwrap_or_default(),
+        "db" | "sqlite" | "sqlite3" | "ldb" | "sst" | "log" | "tmp" | "temp" | "pyc" | "pyo" | "cache")
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -670,6 +590,41 @@ mod tests {
     use crate::management::v2::schema_export::assert_valid;
     use serde_json::json;
     use std::path::Path;
+
+    fn capture_host(label: &str) -> TestHost {
+        let host = TestHost::new(label);
+        host.settings.borrow_mut().auto_capture.patterns =
+            ["reports/**", "figures/**", "results/**", "output/**", "outputs/**", "handoff/**"]
+                .iter().map(|p| p.to_string()).collect();
+        host
+    }
+
+    #[test]
+    fn narrow_default_and_hard_exclusions() {
+        let host = TestHost::new("capture-narrow");
+        let root = host.workspace("proj");
+        host.set_project_root("p", &root);
+        let store = host.store().unwrap();
+        let now = Utc::now();
+        let ms = now.timestamp_millis();
+        store.window_started(&window("cutex.a", "t1", ms - 60_000, Some(ms))).unwrap();
+        write(&root, "output/playwright/profile/cache.txt", b"junk", ms - 30_000);
+        write(&root, "reports/work.md", b"work", ms - 30_000);
+        write(&root, "deliverables/report.html", b"<p>report</p>", ms - 30_000);
+        let junk = [".cache/asset.png", "node_modules/readme.md", "profile/file.png",
+            "user-data/Local State", "Default/Preferences", "Cache_Data/data_0", "foo.sqlite",
+            "db.sqlite-wal", "db.sqlite-shm", "LOCK", "MANIFEST-000001", "000003.ldb",
+            "Cargo.lock", "pnpm-lock.yaml", "package-lock.json", "unit.log", "temp.tmp"];
+        for file in junk { write(&root, &format!("deliverables/{file}"), b"junk", ms - 30_000); }
+        write(&root, "deliverables/random-user-dir/Local State", b"{}", ms - 30_000);
+        write(&root, "deliverables/random-user-dir/config.json", b"{}", ms - 30_000);
+        assert_eq!(scan_project(&host, &store, "p", now, Budget::default()).unwrap().captured, vec!["deliverables/report.html"]);
+        host.settings.borrow_mut().auto_capture.patterns = vec!["deliverables/**".into(), "deliverables/node_modules/**".into()];
+        assert!(scan_project(&host, &store, "p", now, Budget::default()).unwrap().captured.is_empty());
+        for file in junk { assert!(!capture_file_allowed(&format!("deliverables/{file}")), "{file}"); }
+        assert!(!capture_file_allowed("deliverables/GPuCache/data_0"));
+        assert!(capture_file_allowed("deliverables/chart.png"));
+    }
 
     fn set_mtime(path: &Path, ms: i64) {
         let at = std::time::UNIX_EPOCH + Duration::from_millis(ms as u64);
@@ -712,20 +667,8 @@ mod tests {
     }
 
     #[test]
-    fn turn_event_batches_respect_capacity_and_expired_deadlines_without_reordering() {
-        let (sender, receiver) = mpsc::channel();
-        for value in 0..1000 { sender.send(value).unwrap(); }
-        let first = receiver.recv().unwrap();
-        let batch = event_batch(&receiver, first, Duration::from_secs(10), 256);
-        assert_eq!(batch, (0..256).collect::<Vec<_>>());
-        let first = receiver.recv().unwrap();
-        assert_eq!(event_batch(&receiver, first, Duration::ZERO, 256), vec![256]);
-        assert_eq!(receiver.recv().unwrap(), 257);
-    }
-
-    #[test]
     fn turn_events_open_and_close_member_windows() {
-        let host = TestHost::new("capture-turns");
+        let host = capture_host("capture-turns");
         let store = host.store().unwrap();
         assert!(TurnEvent::from_notification("s", 1, "item/completed", None, 0).is_none());
         let start = TurnEvent::from_notification("cutex.a", 3, "turn/started", Some(&json!({"threadId": "th-a", "turn": {"id": "turn-1"}})), 1_000).unwrap();
@@ -796,7 +739,7 @@ mod tests {
 
     #[test]
     fn scans_capture_changed_files_with_member_attribution() {
-        let host = TestHost::new("capture-scan");
+        let host = capture_host("capture-scan");
         let root = host.workspace("proj");
         let outside = host.workspace("outside");
         std::fs::write(outside.join("secret.md"), "s").unwrap();
@@ -890,7 +833,7 @@ mod tests {
 
     #[test]
     fn large_files_budget_and_switch() {
-        let host = TestHost::new("capture-limits");
+        let host = capture_host("capture-limits");
         let root = host.workspace("proj");
         host.set_project_root("p", &root);
         let store = host.store().unwrap();
@@ -934,7 +877,7 @@ mod tests {
 
     #[test]
     fn workspaces_over_the_entry_budget_are_covered_without_losing_the_baseline() {
-        let host = TestHost::new("capture-starve");
+        let host = capture_host("capture-starve");
         let root = host.workspace("proj");
         host.set_project_root("p", &root);
         let store = host.store().unwrap();
@@ -978,7 +921,7 @@ mod tests {
 
     #[test]
     fn a_new_workspace_root_starts_with_a_fresh_baseline() {
-        let host = TestHost::new("capture-root-change");
+        let host = capture_host("capture-root-change");
         let old_root = host.workspace("old");
         let new_root = host.workspace("new");
         host.set_project_root("p", &old_root);
@@ -1027,7 +970,7 @@ mod tests {
 
     #[test]
     fn a_rebaseline_pass_over_the_budget_keeps_its_cutoff() {
-        let host = TestHost::new("capture-root-budget");
+        let host = capture_host("capture-root-budget");
         let old_root = host.workspace("old");
         let new_root = host.workspace("new");
         host.set_project_root("p", &old_root);
@@ -1062,7 +1005,7 @@ mod tests {
 
     #[test]
     fn clearing_the_workspace_root_drops_the_capture_state() {
-        let host = TestHost::new("capture-root-clear");
+        let host = capture_host("capture-root-clear");
         let root = host.workspace("proj");
         host.set_project_root("p", &root);
         let store = host.store().unwrap();
@@ -1094,7 +1037,7 @@ mod tests {
 
     #[test]
     fn state_without_a_recorded_root_adopts_the_current_root() {
-        let host = TestHost::new("capture-root-legacy");
+        let host = capture_host("capture-root-legacy");
         let root = host.workspace("proj");
         host.set_project_root("p", &root);
         let store = host.store().unwrap();

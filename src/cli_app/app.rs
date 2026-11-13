@@ -34,9 +34,13 @@ pub(crate) fn run() -> anyhow::Result<()> {
     if should_open_session_tui(&cli) {
         return session_tui::run();
     }
+    if let Some(CommandKind::Pan { command, json }) = cli.command {
+        return super::pan::run(command, json);
+    }
     root_wizard::set_codez_codex_home(migrate)?;
 
     match cli.command {
+        Some(CommandKind::Pan { command, json }) => super::pan::run(command, json)?,
         Some(CommandKind::List) => profile::list()?,
         Some(CommandKind::Current) => profile::current()?,
         Some(CommandKind::Use { target }) => profile::use_profile(&target)?,
@@ -373,7 +377,7 @@ pub(crate) fn skips_startup_migrations(cli: &Cli) -> bool {
     use cutex::cli::args::{ServiceCommand, StorageCommand, UpgradeCommand};
     matches!(
         &cli.command,
-        Some(CommandKind::Upgrade {
+        Some(CommandKind::Pan { .. }) | Some(CommandKind::Upgrade {
             command: UpgradeCommand::Selftest { .. }
                 | UpgradeCommand::Run { .. }
                 | UpgradeCommand::Status { .. }

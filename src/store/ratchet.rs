@@ -80,7 +80,9 @@ fn production_source(text: &str) -> String {
         if line.trim() == "#[cfg(test)]" {
             if let Some(next) = lines.get(index + 1) {
                 let next = next.trim_start();
-                if next.starts_with("mod ") && next.trim_end().ends_with('{') {
+                let visible_tests = ["pub(crate) ", "pub(super) ", "pub "].iter()
+                    .any(|visibility| next.strip_prefix(*visibility).is_some_and(|module| module.trim() == "mod tests {"));
+                if (next.starts_with("mod ") && next.trim_end().ends_with('{')) || visible_tests {
                     break;
                 }
             }
@@ -295,4 +297,17 @@ fn production_source_cuts_only_test_modules() {
     assert!(production.contains("fn b()"));
     assert!(!production.contains("fn c()"));
     assert_eq!(unbounded_selects("\"SELECT a FROM t\"\n\"SELECT a FROM t WHERE k = ?1\"\n"), 1);
+}
+
+
+#[test]
+fn production_source_excludes_trailing_visible_tests_but_keeps_imports_and_helpers() {
+    for visibility in ["pub(crate) ", "pub(super) ", "pub "] {
+        let text = format!("fn a() {{}}\n#[cfg(test)]\nuse crate::fixture;\nfn b() {{}}\n#[cfg(test)]\n{visibility}mod tests {{\nfn c() {{}}\n}}\n");
+        let production = production_source(&text);
+        assert!(production.contains("fn a()") && production.contains("fn b()"));
+        assert!(!production.contains("fn c()"));
+    }
+    let helpers = "#[cfg(test)]\npub(crate) mod helpers;\nfn production_after_helper() {}\n";
+    assert!(production_source(helpers).contains("fn production_after_helper()"));
 }

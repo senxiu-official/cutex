@@ -801,13 +801,7 @@ impl ExternalInputClient {
         // deliveries, that list to include it.
         ensure!(
             *delivery != Delivery::Soon
-                || (self.artifacts.bundle.soon_ingress()
-                    && self
-                        .client
-                        .initialize_response()
-                        .get("externalInputDeliveries")
-                        .and_then(serde_json::Value::as_array)
-                        .is_none_or(|modes| modes.iter().any(|m| m.as_str() == Some("soon")))),
+                || crate::agent_bus::busy_delivery::native_soon(self.artifacts.bundle.soon_ingress(), self.client.initialize_response()),
             "native ingress does not support soon; explicit compatible activation required"
         );
         Ok(())

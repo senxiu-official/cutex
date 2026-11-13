@@ -1,7 +1,7 @@
 //! Reserved control capacity on the existing listener. Heavy reads have a
 //! bounded per-priority FIFO waits; control requests never join those queues.
 use crate::http::server::SimpleHttpRequest;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -194,6 +194,7 @@ pub struct Permit {
     counter: Option<&'static AtomicUsize>,
     heavy: Option<&'static HeavyPool>,
     background: bool,
+    session: Option<String>,
 }
 impl Drop for Permit {
     fn drop(&mut self) {
@@ -203,6 +204,9 @@ impl Drop for Permit {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.active -= 1;
+            if let Some(session) = &self.session {
+                state.sessions.remove(session);
+            }
             if self.background {
                 state.active_background -= 1;
             }
@@ -215,11 +219,61 @@ impl Drop for Permit {
     }
 }
 
+thread_local! {
+    static RESPONSE_PERMIT: std::cell::RefCell<Option<Permit>> = const { std::cell::RefCell::new(None) };
+}
+#[must_use]
+pub struct ResponsePermitScope {
+    previous: Option<Permit>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+pub fn response_permit_scope(permit: Permit) -> ResponsePermitScope {
+    let previous = RESPONSE_PERMIT.with(|slot| slot.replace(Some(permit)));
+    ResponsePermitScope { previous, _thread: std::marker::PhantomData }
+}
+/// Release only computation/native-reader capacity, once serialization is done.
+pub fn response_body_ready() {
+    let permit = RESPONSE_PERMIT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|permit| permit.heavy.is_some()) { slot.take() } else { None }
+    });
+    drop(permit);
+}
+#[cfg(test)]
+#[test]
+fn built_response_releases_its_heavy_permit_before_socket_delivery() {
+    let pool = Box::leak(Box::new(HeavyPool::new(2, 4)));
+    let scope = response_permit_scope(pool.acquire(Duration::from_millis(100)).unwrap());
+    assert_eq!(pool.counts().0, 1);
+    let nested = response_permit_scope(pool.acquire(Duration::from_millis(100)).unwrap());
+    assert_eq!(pool.counts().0, 2);
+    response_body_ready();
+    assert_eq!(pool.counts().0, 1);
+    drop(nested);
+    assert_eq!(pool.counts().0, 1);
+    response_body_ready();
+    assert_eq!(pool.counts().0, 0);
+    drop(scope);
+    assert_eq!(pool.counts().0, 0);
+}
+impl Drop for ResponsePermitScope {
+    fn drop(&mut self) {
+        let current = RESPONSE_PERMIT.with(|slot| slot.replace(self.previous.take()));
+        drop(current);
+    }
+}
+
 struct HeavyState {
     active: usize,
     active_background: usize,
-    tickets: VecDeque<(u64, bool)>,
+    tickets: VecDeque<HeavyTicket>,
+    sessions: BTreeSet<String>,
     next_ticket: u64,
+}
+struct HeavyTicket {
+    id: u64,
+    background: bool,
+    session: Option<String>,
 }
 struct HeavyPool {
     limit: usize,
@@ -240,6 +294,7 @@ impl HeavyPool {
                 active: 0,
                 active_background: 0,
                 tickets: VecDeque::new(),
+                sessions: BTreeSet::new(),
                 next_ticket: 0,
             }),
             ready: Condvar::new(),
@@ -265,32 +320,43 @@ impl HeavyPool {
     // Background work may occupy at most limit-1 slots. A queued background
     // reader also keeps one slot from being borrowed by more foreground work.
     // Thus neither priority can starve the other; running work is not preempted.
-    fn eligible(&self, state: &HeavyState, background: bool) -> bool {
-        if state.active >= self.limit {
+    fn session_available(state: &HeavyState, session: Option<&str>) -> bool {
+        session.is_none_or(|session| !state.sessions.contains(session))
+    }
+
+    fn eligible(&self, state: &HeavyState, background: bool, session: Option<&str>) -> bool {
+        if state.active >= self.limit || !Self::session_available(state, session) {
             return false;
         }
         if background {
             state.active_background < self.limit.saturating_sub(1)
         } else {
             !(state.active_background == 0
-                && state.tickets.iter().any(|(_, bg)| *bg)
+                && state.tickets.iter().any(|ticket| ticket.background && Self::session_available(state, ticket.session.as_deref()))
                 && state.active >= self.limit.saturating_sub(1))
         }
     }
 
     fn acquire_priority(&'static self, budget: Duration, background: bool) -> Result<Permit, AdmissionRefusal> {
+        self.acquire_session(budget, background, None)
+    }
+
+    fn acquire_session(&'static self, budget: Duration, background: bool, session: Option<String>) -> Result<Permit, AdmissionRefusal> {
         let started = Instant::now();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.eligible(&state, background) && !state.tickets.iter().any(|(_, bg)| *bg == background) {
+        if self.eligible(&state, background, session.as_deref())
+            && !state.tickets.iter().any(|ticket| ticket.background == background && Self::session_available(&state, ticket.session.as_deref())) {
             state.active += 1;
             state.active_background += usize::from(background);
+            if let Some(session) = &session { state.sessions.insert(session.clone()); }
             return Ok(Permit {
                 counter: None,
                 heavy: Some(self),
                 background,
+                session,
             });
         }
         let queue_limit = if background {
@@ -305,7 +371,7 @@ impl HeavyPool {
         }
         let ticket = state.next_ticket;
         state.next_ticket = state.next_ticket.wrapping_add(1);
-        state.tickets.push_back((ticket, background));
+        state.tickets.push_back(HeavyTicket { id: ticket, background, session: session.clone() });
         self.queued.fetch_add(1, Ordering::Relaxed);
         loop {
             let elapsed = started.elapsed();
@@ -315,7 +381,7 @@ impl HeavyPool {
                 let position = state
                     .tickets
                     .iter()
-                    .position(|(value, _)| *value == ticket)
+                    .position(|value| value.id == ticket)
                     .expect("queued heavy read keeps its ticket");
                 state.tickets.remove(position);
                 self.timed_out.fetch_add(1, Ordering::Relaxed);
@@ -329,13 +395,14 @@ impl HeavyPool {
                 self.ready.notify_all();
                 return Err(refusal);
             }
-            if self.eligible(&state, background)
-                && state.tickets.iter().find(|(_, bg)| *bg == background) == Some(&(ticket, background))
+            if self.eligible(&state, background, session.as_deref())
+                && state.tickets.iter().find(|value| value.background == background && Self::session_available(&state, value.session.as_deref())).is_some_and(|value| value.id == ticket)
             {
-                let position = state.tickets.iter().position(|(value, _)| *value == ticket).unwrap();
+                let position = state.tickets.iter().position(|value| value.id == ticket).unwrap();
                 state.tickets.remove(position);
                 state.active += 1;
                 state.active_background += usize::from(background);
+                if let Some(session) = &session { state.sessions.insert(session.clone()); }
                 self.wait_ns.fetch_add(
                     elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
                     Ordering::Relaxed,
@@ -348,6 +415,7 @@ impl HeavyPool {
                     counter: None,
                     heavy: Some(self),
                     background,
+                    session,
                 });
             }
             let (next, _) = self
@@ -404,12 +472,14 @@ fn admit_priority(class: WorkClass, background: bool) -> Result<Permit, Admissio
             counter: Some(counter),
             heavy: None,
             background: false,
+            session: None,
         })
     } else {
         Ok(Permit {
             counter: None,
             heavy: None,
             background: false,
+            session: None,
         })
     }
 }
@@ -423,7 +493,35 @@ pub fn admit_request(
 ) -> Result<Permit, AdmissionRefusal> {
     let class = classify(request);
     let background = request.headers.get(READ_PRIORITY_HEADER).is_some_and(|value| value == "background");
+    if class == WorkClass::HeavyRead {
+        if !slot.is_none_or(|slot| slot.restrict_to_bulk()) {
+            REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(AdmissionRefusal::new(RefusalReason::ControlConnectionReserve, HEAVY.counts()));
+        }
+        let permit = HEAVY.acquire_session(
+            if background { BACKGROUND_READ_WAIT } else { HEAVY_READ_WAIT },
+            background, heavy_session(request),
+        );
+        if permit.is_err() { REFUSED.fetch_add(1, Ordering::Relaxed); }
+        return permit;
+    }
     admit_with_bulk_priority(class, background, || slot.is_none_or(|slot| slot.restrict_to_bulk()))
+}
+
+/// Only native-reader routes share a session cap, using dispatch's parsers.
+/// Stored media/blobs/files and host collections retain global scheduling.
+fn heavy_session(request: &SimpleHttpRequest) -> Option<String> {
+    let path = request.path.split('?').next()?;
+    if request.method == "GET" {
+        return super::server::history_session_id_from_path(path)
+            .or_else(|| super::server::bootstrap_session_id_from_path(path))
+            .or_else(|| super::server::history_turn_path(path).map(|(session, _)| session));
+    }
+    if request.method == "POST" {
+        let encoded = path.strip_prefix("/v2/sessions/")?.strip_suffix("/app-server/requests")?;
+        return super::server::decode_path_segment(encoded);
+    }
+    None
 }
 
 fn admit_with_bulk(class: WorkClass, restrict: impl FnOnce() -> bool) -> Result<Permit, AdmissionRefusal> {

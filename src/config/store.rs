@@ -11,6 +11,7 @@ use crate::config::paths::quick_state_path;
 use crate::profiles::model::CodezConfig;
 use crate::profiles::model::QuickRunState;
 use anyhow::Context;
+use fs2::FileExt;
 
 pub fn load_quick_state() -> QuickRunState {
     let path = match quick_state_path() {
@@ -60,12 +61,115 @@ fn load_codez_config_from_path(path: &Path) -> anyhow::Result<CodezConfig> {
 
 pub fn save_codez_config(config: &CodezConfig) -> anyhow::Result<()> {
     let path = config_path()?;
-    save_codez_config_to_path(&path, config)
+    let guard = config_write_lock(&path)?;
+    save_codez_config_to_path(&path, config)?;
+    drop(guard);
+    crate::management::v2::host_files::refresh_secret_path_cache();
+    Ok(())
+}
+
+/// Apply a mutation to the latest checked config while holding its stable
+/// cross-process lock. Callbacks must only edit/validate config: do not call
+/// another config writer or acquire a profile/store lock here. Acquire those
+/// locks before entering this API, and do follow-up IO after it returns.
+/// Complete snapshot replacement (`save_codez_config`) is for initialization
+/// and fixtures; read/modify/write callers must use this entry point.
+pub fn update_codez_config<T>(change: impl FnOnce(&mut CodezConfig) -> anyhow::Result<T>) -> anyhow::Result<(CodezConfig, T)> {
+    begin_codez_config_update()?.commit(change)
+}
+
+/// Typed contention is distinct from invalid configuration or invalid PATCH
+/// input, and remains recognizable through anyhow context wrappers.
+#[derive(Debug)]
+pub struct ConfigBusy { timeout_ms: u128 }
+impl std::fmt::Display for ConfigBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "config_busy: global config writer lock timed out after {} ms; retry when the other writer finishes", self.timeout_ms)
+    }
+}
+impl std::error::Error for ConfigBusy {}
+
+pub fn is_config_busy(error: &anyhow::Error) -> bool { error.downcast_ref::<ConfigBusy>().is_some() }
+
+/// Cross-store profile operations acquire this after their lifecycle lock,
+/// before changing any profile/session state. Commit does not reacquire it.
+pub(crate) struct ConfigUpdate {
+    path: std::path::PathBuf,
+    guard: fs::File,
+    config: CodezConfig,
+    before: Vec<u8>,
+}
+
+pub(crate) fn begin_codez_config_update() -> anyhow::Result<ConfigUpdate> {
+    ConfigUpdate::open(&config_path()?)
+}
+
+impl ConfigUpdate {
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        let guard = config_write_lock(path)?;
+        let config = load_codez_config_from_path(path)?;
+        let before = serde_json::to_vec(&config)?;
+        Ok(Self { path: path.to_path_buf(), guard, config, before })
+    }
+
+    pub(crate) fn current(&self) -> &CodezConfig { &self.config }
+
+    pub(crate) fn commit<T>(self, change: impl FnOnce(&mut CodezConfig) -> anyhow::Result<T>) -> anyhow::Result<(CodezConfig, T)> {
+        let result = self.commit_inner(change)?;
+        crate::management::v2::host_files::refresh_secret_path_cache();
+        Ok(result)
+    }
+
+    fn commit_inner<T>(mut self, change: impl FnOnce(&mut CodezConfig) -> anyhow::Result<T>) -> anyhow::Result<(CodezConfig, T)> {
+        let result = change(&mut self.config)?;
+        if serde_json::to_vec(&self.config)? != self.before {
+            save_codez_config_to_path(&self.path, &self.config)?;
+        }
+        drop(self.guard);
+        Ok((self.config, result))
+    }
+}
+
+pub(crate) fn config_write_lock(path: &Path) -> anyhow::Result<fs::File> {
+    let parent = path.parent().context("config path has no parent")?;
+    crate::management::client_tokens::ensure_private_dir(parent)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // A separate, never-replaced inode locks the complete read/modify/write,
+    // not the config inode which atomic publication replaces underneath it.
+    let guard = options.open(path.with_extension("json.lock"))?;
+    acquire_config_lock(&guard, std::time::Duration::from_secs(2))?;
+    Ok(guard)
+}
+
+fn acquire_config_lock(file: &fs::File, timeout: std::time::Duration) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::WouldBlock || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(ConfigBusy { timeout_ms: timeout.as_millis() }.into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error).context("lock global config"),
+        }
+    }
+}
+
+#[cfg(test)]
+fn update_codez_config_at<T>(path: &Path, change: impl FnOnce(&mut CodezConfig) -> anyhow::Result<T>) -> anyhow::Result<(CodezConfig, T)> {
+    ConfigUpdate::open(path)?.commit_inner(change)
 }
 
 fn save_codez_config_to_path(path: &Path, config: &CodezConfig) -> anyhow::Result<()> {
     write_private_pretty_json_atomic(path, config, "config file")?;
-    crate::management::v2::host_files::refresh_secret_path_cache();
     Ok(())
 }
 
@@ -76,6 +180,132 @@ mod tests {
     use crate::profiles::model::ManagementApiToken;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn held_config_lock_times_out_without_changing_bytes_and_then_recovers() {
+        let path = temp_config_path();
+        save_codez_config_to_path(&path, &CodezConfig::default()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let held = config_write_lock(&path).unwrap();
+        let other = fs::OpenOptions::new().read(true).write(true).open(path.with_extension("json.lock")).unwrap();
+        let error = acquire_config_lock(&other, std::time::Duration::from_millis(25)).unwrap_err();
+        assert!(error.to_string().contains("config_busy"));
+        assert!(is_config_busy(&error.context("outer operation")));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(held);
+        acquire_config_lock(&other, std::time::Duration::from_millis(25)).unwrap();
+        drop(other);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    #[ignore = "owned subprocess fixture for config writer contention"]
+    fn private_config_mutator() {
+        let path = std::path::PathBuf::from(std::env::var_os("CUTEX_CONFIG_MUTATOR_FIXTURE").unwrap());
+        assert!(path.parent().unwrap().canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        let slot = std::env::var("CUTEX_CONFIG_MUTATOR_SLOT").unwrap();
+        fs::write(path.with_extension(format!("ready-{slot}")), []).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !path.with_extension("go").exists() {
+            assert!(std::time::Instant::now() < deadline, "config writer start timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for _ in 0..40 {
+            update_codez_config_at(&path, |config| {
+                let field = if slot == "0" { &mut config.agent_bus_port } else { &mut config.management_port };
+                *field = Some(field.unwrap_or(0) + 1);
+                Ok(())
+            }).unwrap();
+        }
+    }
+
+    #[test]
+    fn separate_process_config_writers_preserve_both_fields() {
+        let _env = crate::config::paths::test_home_env_lock();
+        let path = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut children = Vec::new();
+        for slot in 0..2 {
+            children.push(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::store::tests::private_config_mutator", "--ignored", "--test-threads=1"])
+                .env("CUTEX_CONFIG_MUTATOR_FIXTURE", &path)
+                .env("CUTEX_CONFIG_MUTATOR_SLOT", slot.to_string())
+                .stdout(std::process::Stdio::null())
+                .spawn().unwrap());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while (0..2).any(|slot| !path.with_extension(format!("ready-{slot}")).exists()) {
+            if std::time::Instant::now() >= deadline {
+                for child in &mut children { let _ = child.kill(); let _ = child.wait(); }
+                panic!("owned config writer did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        fs::write(path.with_extension("go"), []).unwrap();
+        for child in &mut children {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); break; }
+                if std::time::Instant::now() >= deadline {
+                    // Exact Child handles from the two spawns above; no tree traversal.
+                    let _ = child.kill(); let _ = child.wait();
+                    panic!("owned config writer timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let config = load_codez_config_from_path(&path).unwrap();
+        assert_eq!(config.agent_bus_port, Some(40));
+        assert_eq!(config.management_port, Some(40));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn concurrent_config_mutations_serialize_and_preserve_both_changes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let path = temp_config_path();
+        let first_path = path.clone();
+        let (entered, first_entered) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let first = std::thread::spawn(move || update_codez_config_at(&first_path, |config| {
+            config.agent_bus_port = Some(24910);
+            entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        }).unwrap());
+        first_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second_path = path.clone();
+        let (entered, second_entered) = mpsc::channel();
+        let second = std::thread::spawn(move || update_codez_config_at(&second_path, |config| {
+            entered.send(()).unwrap();
+            config.agent_bus_enabled = true;
+            Ok(())
+        }).unwrap());
+        let early = second_entered.recv_timeout(Duration::from_millis(150));
+        release.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(early.is_err(), "second callback must not read a stale config while the first owns the writer lock");
+        let config = load_codez_config_from_path(&path).unwrap();
+        assert_eq!(config.agent_bus_port, Some(24910));
+        assert!(config.agent_bus_enabled);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_config_mutation_preserves_original_and_releases_lock() {
+        let path = temp_config_path();
+        save_codez_config_to_path(&path, &CodezConfig::default()).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(update_codez_config_at::<()>(&path, |config| {
+            config.agent_bus_port = Some(24910);
+            anyhow::bail!("injected validation failure")
+        }).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        update_codez_config_at(&path, |config| { config.agent_bus_enabled = true; Ok(()) }).unwrap();
+        assert!(load_codez_config_from_path(&path).unwrap().agent_bus_enabled);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     fn temp_config_path() -> std::path::PathBuf {
         std::env::temp_dir()

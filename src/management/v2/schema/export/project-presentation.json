@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:project-presentation",
+  "title": "Project presentation",
+  "description": "Shared project presentation (capability project-icon). icon is optional: omitted on writes keeps it, null clears it. Values are trimmed before validation/storage. Emoji requires one extended grapheme of at most 32 UTF-8 bytes; text requires 1-2 Unicode scalar characters. The server enforces these Unicode limits.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/updateRequest"
+    },
+    {
+      "$ref": "#/$defs/settings"
+    },
+    {
+      "$ref": "#/$defs/effectivePresentation"
+    }
+  ],
+  "$defs": {
+    "icon": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "emoji",
+                "icon",
+                "text"
+              ]
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "const": "icon"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "pattern": "^[a-z0-9-]{1,32}$"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "const": "text"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "maxLength": 2
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "color": {
+      "type": "string",
+      "pattern": "^(cyan|blue|green|magenta|yellow|red|#[0-9A-Fa-f]{6})$"
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "display_name",
+        "badge_label",
+        "color"
+      ],
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "badge_label": {
+          "type": "string"
+        },
+        "color": {
+          "$ref": "#/$defs/color"
+        },
+        "icon": {
+          "$ref": "#/$defs/inputIcon"
+        }
+      }
+    },
+    "updateRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "project_id",
+        "presentation"
+      ],
+      "properties": {
+        "schema": {
+          "const": "cutex/human-management-project-presentation/v1"
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_authority_epoch": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "expected_presentation_revision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "presentation": {
+          "$ref": "#/$defs/input"
+        }
+      }
+    },
+    "settings": {
+      "type": "object",
+      "required": [
+        "display_name",
+        "badge_label",
+        "color",
+        "revision",
+        "updated_at"
+      ],
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "badge_label": {
+          "type": "string"
+        },
+        "color": {
+          "$ref": "#/$defs/color"
+        },
+        "icon": {
+          "$ref": "#/$defs/icon"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "updated_by_director_session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_by_human_management": {
+          "type": "boolean"
+        }
+      }
+    },
+    "effectivePresentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "display_name",
+        "badge_label",
+        "color",
+        "revision",
+        "stored"
+      ],
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "badge_label": {
+          "type": "string"
+        },
+        "color": {
+          "$ref": "#/$defs/color"
+        },
+        "icon": {
+          "$ref": "#/$defs/icon"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stored": {
+          "type": "boolean"
+        }
+      }
+    },
+    "inputIcon": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "emoji",
+                "icon",
+                "text"
+              ]
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ],
+      "description": "Values are trimmed before kind-specific validation; see the icon definition for normalized output limits."
+    }
+  }
+}

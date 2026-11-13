@@ -110,6 +110,7 @@ fn create(id: &str, project: &str) -> HumanManagementProjectMutationRequest {
                 display_name: project.into(),
                 badge_label: "CX".into(),
                 color: ProjectPaletteColor::Cyan,
+                icon: None,
             },
         },
     }

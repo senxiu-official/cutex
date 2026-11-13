@@ -36,10 +36,10 @@ const TOOLS: &str = "
 - owner_notify (if listed): only when the owner must know or decide something now.
 - alarm_set: remind yourself (or another agent) later.
 - workflow_start (if listed): only when the owner explicitly asks for a workflow; never because a task looks big. The owner approves the plan; the result comes as a `[workflow completion]` message from cutex (not from the owner).
-- artifact_publish: share a result file (report, figure, table, plan) with the owner and other agents.
+- artifact_publish: save files the owner will open/keep (reports, figures, pages, downloads). Use chat or paths for status, short answers, test summaries and logs. show defaults to false.
 - Cite it with the returned markdown link (`cutex:artifact/…`), not its text.
-- After changing it, publish again (same name = new version). artifact_list / artifact_read: project artifacts.
-- To show the owner something (a page, chart, image, drawing), publish it as one self-contained file with show: true; it opens beside the conversation. Dev servers, multi-file sites and pages that need a backend: service_register, cutex:service/<slug>.
+- Reuse the name for new versions. artifact_list / artifact_read: project artifacts.
+- To show a deliverable now, publish one self-contained file with show: true; it opens beside the conversation. Servers and multi-file sites use service_register, cutex:service/<slug>.
 ";
 
 const OUTPUT: &str = "
@@ -408,6 +408,10 @@ pub fn compose_claude_sections(
     }
     let mut sections = build(false, false, None);
     if let Some(memory) = &memory {
+        if memory.starts_with("Project memory is off for this agent;") {
+            sections.push(("memory", memory.clone()));
+            return sections;
+        }
         let pointer = memory.lines().find(|line| line.starts_with("Full index: "))
             .unwrap_or("Full index: MEMORY.md in the project's memory directory.");
         let note = format!("\n[# Memory cut here to fit the system prompt. Before relying on memory, read the full index; this excerpt is incomplete.]\n{pointer}\n");
@@ -723,5 +727,23 @@ mod tests {
         let text = render_with_browser(&f, Some(Surface::Legacy));
         assert!(text.contains("use browser_* tools") && !text.contains("## Cutex tools"));
         assert!(!render_with_browser(&f, None).contains("browser_*"));
+    }
+}
+
+
+#[cfg(test)]
+mod memory_injection_switch_tests {
+    use super::*;
+    #[test]
+    fn memory_injection_disabled_claude_keeps_agents_md_without_index_or_idle_snapshot() {
+        let fixture = crate::memory::switch_test_support::disabled();
+        let (sections, snapshot) = claude_system_append_with_snapshot(&fixture.record, true);
+        let text = join_sections(&sections);
+        crate::memory::switch_test_support::assert_disabled(&text);
+        assert!(text.contains("Keep this project instruction."));
+        assert!(snapshot.is_none());
+        let notice = sections.iter().find(|(key,_)| *key=="memory").unwrap().1.clone();
+        let tiny = compose_claude_sections(None,None,None,"file links".into(),Some(notice),1);
+        crate::memory::switch_test_support::assert_disabled(&join_sections(&tiny));
     }
 }

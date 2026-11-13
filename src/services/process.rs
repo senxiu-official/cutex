@@ -16,6 +16,7 @@ use std::sync::atomic::Ordering;
 
 use super::store::ServiceCommand;
 use super::store::ServiceRecord;
+use super::store::ServiceRuntime;
 
 /// Environment variables never passed to service processes.
 fn inherited_env_blocked(key: &str) -> bool {
@@ -34,11 +35,18 @@ pub fn build_command(record: &ServiceRecord, default_cwd: &Path) -> anyhow::Resu
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("service `{}` has no command", record.slug))?;
     let port = record.port;
+    let substitute_arg = |value: &str| {
+        if record.runtime == ServiceRuntime::Worker {
+            value.to_owned()
+        } else {
+            substitute(value, port)
+        }
+    };
     let mut builder = match command {
-        ServiceCommand::Shell(line) => shell_command(&substitute(line, port)),
+        ServiceCommand::Shell(line) => shell_command(&substitute_arg(line)),
         ServiceCommand::Argv(argv) => {
-            let mut builder = Command::new(substitute(&argv[0], port));
-            builder.args(argv[1..].iter().map(|arg| substitute(arg, port)));
+            let mut builder = Command::new(substitute_arg(&argv[0]));
+            builder.args(argv[1..].iter().map(|arg| substitute_arg(arg)));
             builder
         }
     };
@@ -49,12 +57,15 @@ pub fn build_command(record: &ServiceRecord, default_cwd: &Path) -> anyhow::Resu
             builder.env_remove(&key);
         }
     }
-    builder.env("PORT", port.to_string());
-    // Loopback by default (frameworks that honour HOST); a record env overrides.
-    builder.env("HOST", "127.0.0.1");
+    if record.runtime == ServiceRuntime::Worker {
+        builder.env_remove("PORT").env_remove("HOST");
+    } else {
+        builder.env("PORT", port.to_string());
+        builder.env("HOST", "127.0.0.1");
+    }
     builder.env("PYTHONUNBUFFERED", "1");
     for (key, value) in &record.env {
-        builder.env(key, substitute(value, port));
+        builder.env(key, substitute_arg(value));
     }
     builder
         .stdin(Stdio::null())
@@ -98,6 +109,11 @@ impl std::fmt::Debug for ProcessTree {
 }
 
 impl ProcessTree {
+    #[cfg(all(test, windows))]
+    pub(super) fn has_job_object(&self) -> bool {
+        self.job.is_some()
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }

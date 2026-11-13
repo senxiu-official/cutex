@@ -16,6 +16,13 @@ use cutex::management::v2::claude_observer::{candidate_identities, with_state, R
 static MANAGER: OnceLock<AppServerRuntimeManager> = OnceLock::new();
 static OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
 
+#[path = "claude_observed_connection.rs"]
+mod observed_connection;
+
+#[cfg(test)]
+#[path = "claude_occurrence_tests.rs"]
+mod occurrence_tests;
+
 #[path = "claude_busy_delivery.rs"]
 mod busy_delivery;
 
@@ -402,7 +409,8 @@ fn record_observation_result(id: &str, identity: Option<&RuntimeIdentity>, stage
             let detail = format!("{error:#}");
             let stage = if detail.starts_with("Claude bus registration pending:") { "registration" } else { stage };
             let changed = state.complete(id, identity, Some((stage, &detail)), Instant::now());
-            if error.downcast_ref::<cutex::runtime::claude::ClaudeObservationOffline>().is_some() {
+            if matches!(error.downcast_ref::<cutex::runtime::claude::ClaudeObservationOffline>(),
+                Some(cutex::runtime::claude::ClaudeObservationOffline::RuntimeOffline)) {
                 if state.suspend(id, identity, Instant::now()) {
                     eprintln!("Claude observer inactive for {id}: {detail}");
                 }
@@ -414,28 +422,86 @@ fn record_observation_result(id: &str, identity: Option<&RuntimeIdentity>, stage
 }
 
 fn observe_inner(id: &str) -> anyhow::Result<()> {
-    let _guard = OBSERVATION_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Claude observer lock poisoned"))?;
+    // Capture the exact tuple before probing: an old result must never act on
+    // the replacement which another CLI may have started in the meantime.
+    let prior = observed_connection::snapshot(id);
+    let current = cutex::session::store::shared_session_row(id)?;
+    let expected = current
+        .as_deref().and_then(cutex::agent_bus::claude_occurrence::Occurrence::from_record);
+    let bus = cutex::agent_bus::client::AgentBusHttpClient::from_config(
+        &cutex::config::store::load_codez_config(),
+    );
+    if let Some(record) = current.as_deref() {
+        if !observed_connection::eligible(record)? {
+            if let Some(prior) = prior.as_ref() { detach_observed_proof(id, prior)?; }
+            anyhow::ensure!(record.pending_launch_id.is_none() && record.app_server_launch_claim_id.is_none(),
+                "Claude observer admission waits for pending launch");
+            return Err(cutex::runtime::claude::ClaudeObservationOffline::RuntimeOffline.into());
+        }
+        if reuse_observed_connection(id, record, &bus)? { return Ok(()); }
+        // A new tuple or lost verified stream revokes the old observer before
+        // any replacement authentication (which may fail or take time).
+        if let Some(prior) = prior.as_ref() { detach_observed_proof(id, prior)?; }
+    }
+    // Authentication/status IO occurs before the manager-install mutex. A
+    // connected exact occurrence uses its existing handle above instead.
     let observation = match cutex::runtime::claude::observation(id) {
         Ok(observation) => observation,
         Err(error) => {
-            manager().disconnect(id)?;
+            // Transport/capability-read uncertainty does not prove native
+            // death. Keep both the existing stream and Bus occurrence owner.
+            if error.downcast_ref::<cutex::runtime::claude::ClaudeObservationOffline>().is_some() {
+                if let Some(occurrence) = expected {
+                    if let Some(prior) = prior.as_ref() { detach_observed_proof(id, prior)?; }
+                    // Cold/restarted observers have no connection ticket. Keep
+                    // terminal detection, but never report across a new proof.
+                    // This is only a request for Bus's fresh authenticated
+                    // owner-status verification, never authority to revoke.
+                    let fresh = cutex::session::store::shared_session_row(id).ok().flatten();
+                    if observed_connection::snapshot(id).is_none()
+                        && fresh.as_deref().is_some_and(|fresh|
+                            cutex::agent_bus::claude_occurrence::Occurrence::from_record(fresh).as_ref() == Some(&occurrence)
+                            && current.as_deref().is_some_and(|old|old.claude_session==fresh.claude_session && old.host_id==fresh.host_id)
+                            && observed_connection::eligible(fresh).unwrap_or(false)) {
+                        bus.claude_occurrence(&cutex::agent_bus::claude_occurrence::Request {
+                            occurrence, confirmed_offline: true,
+                        }).unwrap_or_else(|hint_error| eprintln!("Claude offline hint unavailable for {id}: {hint_error:#}"));
+                    }
+                }
+                if prior.is_none() {
+                    return Err(error.context("No captured observer proof: a possibly newer/unowned stream was retained; queued delivery requires its own exact proof"));
+                }
+            }
             return Err(error);
         }
     };
-    let connected = manager().status(id)?.is_some_and(|s| {
-        s.connected && s.runtime_generation == observation.record.runtime_generation
-    });
-    // A failed initial bus registration leaves the native stream connected.
-    // Retry only the missing bridge; an existing bridge retries its heartbeat.
-    if connected && manager().agent_bus_status(id)?.is_some_and(|bridge| bridge.running) {
+    let fresh = cutex::session::store::shared_session_row(id)?;
+    anyhow::ensure!(fresh.as_deref().is_some_and(|fresh| fresh.claude_session == observation.record.claude_session
+        && cutex::agent_bus::claude_occurrence::Occurrence::from_record(fresh) == expected),
+        "Claude occurrence changed during observer authentication");
+    anyhow::ensure!(observed_connection::eligible(fresh.as_deref().unwrap())?, "Claude observer admission changed during authentication");
+    let proof = observed_connection::prepare(&observation.record)?;
+    let guard = OBSERVATION_LOCK.lock().map_err(|_| anyhow::anyhow!("Claude observer lock poisoned"))?;
+    let connected = manager().status(id)?.is_some_and(|status|
+        status.connected && status.runtime_generation == observation.record.runtime_generation
+            && Some(status.thread_id.as_str()) == observation.record.app_server_thread_id())
+        && observed_connection::same_verified_process(&observation.record, &proof);
+    if connected {
+        // Another observer call installed this same tuple while we probed.
+        // It already owns the connection proof; never replace its ticket.
+        drop(guard);
+        let retry_binding = with_state(|state| state.registration_pending(id));
+        note_registration_hint(id, &observation.record, registration_hint(&bus, &observation.record, retry_binding));
         return Ok(());
     }
     let record = observation.record.clone();
     if !connected {
+        observed_connection::forget(id);
         manager().disconnect(id)?;
         manager().connect_adapter(observation)?;
+        observed_connection::remember(id, proof);
+        drop(guard);
+        note_status_probe(id, &record, None);
         // The stream may have missed its last turn/completed before losing
         // the socket. Recover that terminal fact before trying the owner queue,
         // even if Agent Bus registration is temporarily unavailable.
@@ -443,47 +509,122 @@ fn observe_inner(id: &str) -> anyhow::Result<()> {
             eprintln!("Claude completed turn for {id} was not reconciled: {error:#}");
         }
     }
-    cutex::runtime::claude::refresh_mcp_binding(id)?;
-    let name = cutex::session::service::cutex_session_display_name(&record);
+    // Start already writes the binding; reconnect repairs it before admitting
+    // the first queued turn. Bus registration is independent of this write.
+    let binding = cutex::runtime::claude::refresh_mcp_binding(id)
+        .map_err(|error| anyhow::anyhow!("Claude MCP binding refresh pending: {error:#}"));
     let thread = record.app_server_thread_id().unwrap().to_string();
-    let registration = cutex::agent_bus::model::AgentBusRegisterRequest {
-        id: record
-            .current_runtime_agent_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Claude runtime registration identity missing"))?,
-        name: name.clone(),
-        base_name: Some(name),
-        thread_name: record.thread_name.clone(),
-        path_key: None,
-        session_id: Some(thread.clone()),
-        profile: record.profile.clone().unwrap_or_else(||"Claude".into()),
-        cwd: record.cwd.clone(),
-        pid: record.runtime_pid.unwrap(),
-        host_id: Some(record.host_id.clone()),
-        groups: record.agent_groups.clone(),
-        registration_class: record.registration_class,
-    };
-    let mut options =
-        cutex::app_server::bus_bridge::AppServerAgentBusBridgeOptions::new(registration, thread.clone())
-            .with_cutex_session_id(id);
-    // Registration and heartbeat only until Claude's different ingress receipt
-    // semantics are mapped explicitly. Never invoke Codex's insertion methods.
-    options.registration_only = true;
-    manager().ensure_agent_bus_bridge(
-        id,
-        Arc::new(cutex::agent_bus::client::AgentBusHttpClient::from_config(
-            &cutex::config::store::load_codez_config(),
-        )),
-        options,
-    ).map_err(|error| anyhow::anyhow!("Claude bus registration pending: {error:#}"))?;
     // Safety blocks the adapter reported while nobody observed it.
     cutex::management::v2::safety_checks::reconcile(id, &thread);
     // Like a Codex connect: input queued while no observer was connected
     // (offline submit, daemon restart) goes out once the thread is idle.
-    if let Err(error) = super::app_server_user_input::flush_queued_if_idle(id) {
-        eprintln!("Claude queued input for {id} was not flushed: {error:#}");
+    if binding.is_ok() {
+        if let Err(error) = super::app_server_user_input::flush_queued_if_idle(id) {
+            eprintln!("Claude queued input for {id} was not flushed: {error:#}");
+        }
     }
+    let hint = registration_hint(&bus, &record, false);
+    let registration = binding.and(hint);
+    note_registration_hint(id, &record, registration);
     Ok(())
+}
+
+fn detach_observed_proof(id: &str, proof: &observed_connection::Proof) -> anyhow::Result<bool> {
+    let _guard = OBSERVATION_LOCK.lock().map_err(|_| anyhow::anyhow!("Claude observer lock poisoned"))?;
+    let detached=observed_connection::forget_if(id, proof);
+    if detached { manager().disconnect(id)?; }
+    Ok(detached)
+}
+
+fn note_status_probe(id: &str, record: &cutex::session::model::CutexSessionRecord, error: Option<&str>) {
+    let Some(pid) = record.runtime_pid else { return };
+    let identity = RuntimeIdentity { generation: record.runtime_generation, pid,
+        connection_id: record.claude_session.as_ref().and_then(|session| session.connection_id.clone()) };
+    if with_state(|state| state.probe_result(id, &identity, error, Instant::now())) {
+        if let Some(error) = error { eprintln!("Claude status probe unavailable for {id}: {error}"); }
+        else { eprintln!("Claude status probe recovered for {id}"); }
+    }
+}
+
+fn uncertain_status_transport(error: &anyhow::Error) -> bool {
+    use cutex::app_server::client::AppServerClientError::*;
+    matches!(error.downcast_ref::<cutex::app_server::client::AppServerClientError>(),
+        Some(Connect(_) | Transport(_) | Timeout { .. } | Disconnected(_) | Backpressure(_)))
+}
+
+fn reuse_observed_connection(id: &str, record: &cutex::session::model::CutexSessionRecord,
+    bus: &cutex::agent_bus::client::AgentBusHttpClient) -> anyhow::Result<bool> {
+    let Some(proof) = observed_connection::current_for_probe(record)? else { return Ok(false) };
+    if with_state(|state| state.probe_due(id, Instant::now())) {
+        let handle = manager().handle_for_generation(id, record.runtime_generation)?;
+        // No observation/store/Bus mutex is held across native IO.
+        let result = cutex::runtime::claude::observe_connected(record, &handle);
+        if let Err(error) = &result {
+            if error.downcast_ref::<cutex::runtime::claude::ClaudeObservationOffline>().is_some() {
+                // The ticket, not merely generation/thread, identifies which
+                // observer this old response may detach. Preserve its typed
+                // classification even if another reconciler already cleared it.
+                if detach_observed_proof(id, &proof)? {
+                    if let Some(occurrence) = cutex::agent_bus::claude_occurrence::Occurrence::from_record(record) {
+                        let _ = bus.claude_occurrence(&cutex::agent_bus::claude_occurrence::Request { occurrence, confirmed_offline: true });
+                    }
+                }
+                return result.map(|()| true);
+            }
+        }
+        let fresh = cutex::session::store::shared_session_row(id)?;
+        anyhow::ensure!(fresh.as_deref().is_some_and(|fresh|
+            observed_connection::still_current(fresh, &proof).unwrap_or(false)),
+            "Claude observer connection changed during status probe");
+        match result {
+            Ok(()) => {
+                observed_connection::block_delivery(id,&proof,false);
+                note_status_probe(id, record, None);
+            }
+            Err(error) if uncertain_status_transport(&error) => {
+                // Only this same authenticated, still-connected tuple can keep
+                // delivering. Native insertion retains its own receipt fences.
+                note_status_probe(id, record, Some(&format!("{error:#}")));
+            }
+            Err(error) if error.downcast_ref::<cutex::runtime::claude::ClaudeObservationRecovering>().is_some() => {
+                // Explicit SDK recovery is UNKNOWN, not native death or
+                // permission to insert. Preserve the stream to observe recovery.
+                observed_connection::block_delivery(id,&proof,true);
+                return Err(error);
+            }
+            Err(error) => {
+                // Explicit recovery, malformed or wrong-owner status is not
+                // transport uncertainty and must not leave a delivery proof.
+                detach_observed_proof(id, &proof)?;
+                return Err(error);
+            }
+        }
+    }
+    anyhow::ensure!(observed_connection::current(record)?.is_some(), "Claude native recovery has not been confirmed");
+    let retry_binding = with_state(|state| state.registration_pending(id));
+    note_registration_hint(id, record, registration_hint(bus, record, retry_binding));
+    Ok(true)
+}
+
+fn registration_hint(bus: &cutex::agent_bus::client::AgentBusHttpClient,
+    record: &cutex::session::model::CutexSessionRecord, refresh_binding: bool) -> anyhow::Result<()> {
+    let occurrence = cutex::agent_bus::claude_occurrence::Occurrence::from_record(record)
+        .ok_or_else(|| anyhow::anyhow!("Claude runtime registration identity missing"))?;
+    let binding = if refresh_binding { cutex::runtime::claude::refresh_mcp_binding(&record.cutex_session_id)
+        .map_err(|error| anyhow::anyhow!("Claude MCP binding refresh pending: {error:#}")) } else { Ok(()) };
+    let hint = bus.claude_occurrence(&cutex::agent_bus::claude_occurrence::Request { occurrence, confirmed_offline: false });
+    binding.and(hint)
+}
+
+fn note_registration_hint(id: &str, record: &cutex::session::model::CutexSessionRecord, result: anyhow::Result<()>) {
+    let Some(pid) = record.runtime_pid else { return };
+    let identity = RuntimeIdentity { generation: record.runtime_generation, pid,
+        connection_id: record.claude_session.as_ref().and_then(|session| session.connection_id.clone()) };
+    let error = result.err().map(|error| format!("{error:#}"));
+    if with_state(|state| state.registration_result(id, &identity, error.as_deref())) {
+        if let Some(error) = error { eprintln!("Claude bus registration pending for {id}: {error}"); }
+        else { eprintln!("Claude bus registration recovered for {id}"); }
+    }
 }
 
 fn reconcile_observed_completion(id: &str, generation: u64) -> anyhow::Result<()> {
@@ -652,6 +793,9 @@ fn deliver_messages_with(
     // against (`handle_for_generation`).
     let sessions = cutex::session::store::load_cutex_session_store_shared()?;
     let record = sessions.sessions.get(id).context("Claude session missing")?;
+    if record.claude_session.is_some() {
+        ensure!(observed_connection::current(record)?.is_some(), "Claude delivery has no exact authenticated observer connection");
+    }
     let runtime = record.current_runtime_agent_id.as_deref().context("Claude offline")?;
     let thread = record.app_server_thread_id().context("Claude thread missing")?;
     let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
@@ -1105,6 +1249,7 @@ pub(super) fn disconnect(id: &str) -> anyhow::Result<()> {
     let _guard = OBSERVATION_LOCK
         .lock()
         .map_err(|_| anyhow::anyhow!("Claude observer lock poisoned"))?;
+    observed_connection::forget(id);
     manager().disconnect(id)?;
     Ok(())
 }
@@ -1396,8 +1541,9 @@ pub(super) fn spawn_observer() -> anyhow::Result<()> {
                         store_failure = None;
                         // Probe the whole snapshot once. A PID claim alone is not a live runtime.
                         let pids = wanted.values().map(|identity| identity.pid).collect::<Vec<_>>();
-                        let live = cutex::platform::process::running_process_ids(&pids);
-                        wanted.retain(|_, identity| live.contains(&identity.pid));
+                        let live = pids.into_iter().map(|pid| (pid, cutex::platform::process::process_liveness(pid)))
+                            .collect::<HashMap<_, _>>();
+                        wanted.retain(|_, identity| live.get(&identity.pid).copied().flatten() != Some(false));
                         // sync_candidates reactivates changed occurrences but
                         // returns only removed IDs. Invalidate the old evidence
                         // before observing a replacement generation/connection.
@@ -1534,9 +1680,10 @@ fn record_agent_message_item(
     let Some(params) = notification.params.as_ref() else { return Ok(()) };
     if notification.method == "thread/externalInput/statusChanged" {
         let Some(message) = params["messageId"].as_str() else { return Ok(()) };
-        if let Some(envelope) = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?
-            .snapshot_by_message_id(message)?.and_then(|snapshot| snapshot.external_input)
-        {
+        let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
+        let source = repository.source_id_for_native(id, message)?;
+        let snapshot = source.as_deref().map(|source| repository.snapshot_by_message_id(source)).transpose()?.flatten();
+        if let Some(envelope) = snapshot.and_then(|snapshot| snapshot.external_input) {
             ensure_native_event_binding(id, &params["threadId"], &envelope)?;
             reconcile_native_message(id, generation, &envelope)?;
         }
@@ -1553,7 +1700,9 @@ fn record_agent_message_item(
         return Ok(());
     };
     let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
-    let snapshot = repository.snapshot_by_message_id(message)?;
+    let source = repository.source_id_for_native(id, message)?;
+    let source_id = source.as_deref().unwrap_or(message);
+    let snapshot = repository.snapshot_by_message_id(source_id)?;
     if let Some(envelope) = snapshot.as_ref().and_then(|snapshot| snapshot.external_input.as_ref()) {
         // Native r8 timeline items are an audit projection at claim time:
         // the bus waits for the separately validated native context-persisted
@@ -1561,8 +1710,9 @@ fn record_agent_message_item(
         // (`accepted`, this turn, this item), any view and delivery mode
         // (notes, alarms, notices, Claude Tasks, peer tells; claude-r35 also
         // emits busy `soon` items at claim time).
-        if envelope.owner_id == id && params["threadId"].as_str() == Some(envelope.thread_id.as_str()) {
-            repository.input_ledger_native_item(id, message, turn)?;
+        if envelope.message.id == message && envelope.owner_id == id
+            && params["threadId"].as_str() == Some(envelope.thread_id.as_str()) {
+            repository.input_ledger_native_attempt_item(id, source_id, message, turn)?;
         }
         return Ok(());
     }
@@ -1600,16 +1750,19 @@ fn reconcile_native_message(id: &str, generation: u64, envelope: &cutex::app_ser
         // Fence again after the response before publishing delivery.
         manager().handle_for_generation(id, generation)?;
         let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
-        if repository.record_context_injected(id, &envelope.message.id, turn)? {
-            let local = repository.snapshot_by_message_id(&envelope.message.id)?.and_then(|snapshot| snapshot.local_inbox_receipt);
-            busy_delivery::read(id, &envelope.message.id, turn, local.as_ref());
+        let Some(source) = repository.source_id_for_native(id, &envelope.message.id)? else { return Ok(()) };
+        if repository.record_native_context_injected(id, &source, envelope, turn)? {
+            let local = repository.snapshot_by_message_id(&source)?.and_then(|snapshot| snapshot.local_inbox_receipt);
+            busy_delivery::read(id, &source, turn, local.as_ref());
         }
     } else {
         // Preserve validated native uncertainty for diagnostics, including
         // output-observed without an SDK acknowledgement after a restart.
         manager().handle_for_generation(id, generation)?;
-        cutex::management::v2::agent_bus_state::agent_bus_message_repository()?
-            .observe_external_input(&envelope.message.id, envelope, &status)?;
+        let repository = cutex::management::v2::agent_bus_state::agent_bus_message_repository()?;
+        if let Some(source) = repository.source_id_for_native(id, &envelope.message.id)? {
+            repository.observe_external_input(&source, envelope, &status)?;
+        }
     }
     Ok(())
 }
@@ -1712,12 +1865,14 @@ mod tests {
     /// activity item, then publish with their own thread id; others never do.
     #[test]
     fn subagent_transcript_frames_publish_after_the_parent_names_them() {
+        let home = crate::cli_app::test_home::IsolatedTestHome::new("claude-lineage").unwrap();
         let context = AppServerRuntimeEventContext {
             cutex_session_id: format!("cutex-claude-sub-{}", uuid::Uuid::new_v4()),
             thread_id: "root".into(), runtime_generation: 1, runtime_backend: "claude_subscription".into(),
             full_text_item_terminal: false, launched_profile: None, launched_profile_id: None, usage: Default::default(),
             schema: cutex::app_server::journal::AppServerSchemaIdentity { version: "0.3.0+cutex".into(), sha256: "a".repeat(64) },
         };
+        home.register_active_session(&context.cutex_session_id, cutex::session::model::CutexSessionRuntimeBackend::ClaudeSubscription, context.runtime_generation);
         let child = "claude:sid:task:task-a";
         let frame = claude_event("turn/started", serde_json::json!({"threadId": child, "turn": {"id": "subagent:c", "items": [], "status": "inProgress"}}));
         assert!(frames_for(&context, &frame).is_empty(), "buffered until the parent names it");

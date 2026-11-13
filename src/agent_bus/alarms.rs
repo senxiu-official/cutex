@@ -248,6 +248,8 @@ fn create(
             .context("time overflow")?
     };
     ensure!(due > now, "alarm time must be in the future");
+    let safety_id = (owner == APPROVAL_NOTICE_OWNER && a.alarm_id.starts_with("safety-grant:"))
+        .then(|| safety_notice_message_id(&a.to, &a.alarm_id));
     let alarm = Alarm {
         alarm_id: a.alarm_id,
         owner: owner.into(),
@@ -256,7 +258,7 @@ fn create(
         at: due.to_rfc3339(),
         delay_seconds: a.delay_seconds,
         message_id: if owner == APPROVAL_NOTICE_OWNER {
-            format!("{APPROVAL_NOTICE_MESSAGE_PREFIX}{}", uuid::Uuid::new_v4())
+            safety_id.unwrap_or_else(|| format!("{APPROVAL_NOTICE_MESSAGE_PREFIX}{}", uuid::Uuid::new_v4()))
         } else {
             format!("alarm-{}", uuid::Uuid::new_v4())
         },
@@ -359,6 +361,13 @@ pub fn set_system_notice(owner: &str, notice_id: &str, to: &str, message: &str) 
 /// Owner of the owner-approval decision notices (cutex `approval-decision-notice`).
 pub const APPROVAL_NOTICE_OWNER: &str = "cutex.approvals";
 
+/// Bound before granting, so only this notice's persisted context starts its window.
+pub fn safety_notice_key(block: &str) -> String { format!("safety-grant:{block}") }
+pub fn safety_notice_message_id(to: &str, key: &str) -> String {
+    format!("{APPROVAL_NOTICE_MESSAGE_PREFIX}{}", crate::asks::sha256_hex(
+        &serde_json::to_vec(&(APPROVAL_NOTICE_OWNER, to, key)).expect("string tuple")))
+}
+
 /// Bus message id prefix of an approval decision notice (023): the Agent Bus
 /// reads it at a busy recipient's next step with no wait, while every other
 /// alarm stays after-turn. Still an `alarm-` id, so a release before 023
@@ -382,7 +391,14 @@ fn set_system_notice_at(
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let args = SetArgs { alarm_id: notice_id.into(), to: to.into(), message: message.into(), at: Some(at.clone()), delay_seconds: None };
-        match locked(path, |data| create(data, owner, args, now)) {
+        match locked(path, |data| {
+            let key = serde_json::to_string(&(owner, notice_id))?;
+            if let Some(old) = data.get(&key) {
+                ensure!(old.to == to && old.message == message, "system notice id reused with different contents");
+                return Ok(old.clone());
+            }
+            create(data, owner, args, now)
+        }) {
             Ok(alarm) => return Ok(alarm),
             Err(error) if format!("{error:#}").contains("Alarm store busy") => last = Some(error),
             Err(error) => return Err(error),
@@ -992,4 +1008,19 @@ mod role_pruning_tests {
         assert_eq!(store.snapshot().unwrap().alarm_roles[&id],intent("owner"));
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn safety_notices_are_stable_deduped_across_time_and_keep_urgent_identity() {
+        let dir = std::env::temp_dir().join(format!("safety-alarm-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap(); let path=dir.join("alarms.json");
+        let to="cutex.11111111-1111-4111-8111-111111111111";
+        let key=safety_notice_key("sb-1"); let now=Utc::now();
+        let first=set_system_notice_at(&path,APPROVAL_NOTICE_OWNER,&key,to,"approved",now).unwrap();
+        let later=set_system_notice_at(&path,APPROVAL_NOTICE_OWNER,&key,to,"approved",now+chrono::Duration::minutes(10)).unwrap();
+        assert_eq!(first.message_id,later.message_id);
+        assert_eq!(first.message_id,safety_notice_message_id(to,&key));
+        assert!(first.message_id.starts_with(APPROVAL_NOTICE_MESSAGE_PREFIX));
+        assert!(set_system_notice_at(&path,APPROVAL_NOTICE_OWNER,&key,to,"different",now).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
 }

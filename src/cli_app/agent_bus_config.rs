@@ -1,6 +1,8 @@
 use uuid::Uuid;
 
 use cutex::agent_bus::service::{validate_agent_bus_port, DEFAULT_AGENT_BUS_PORT};
+use cutex::config::store::update_codez_config;
+#[cfg(test)]
 use cutex::config::store::{load_codez_config, save_codez_config};
 use cutex::profiles::model::CodezConfig;
 
@@ -8,7 +10,7 @@ pub(crate) fn ensure_agent_bus_config(
     enabled: bool,
     port: Option<u16>,
 ) -> anyhow::Result<CodezConfig> {
-    let mut config = load_codez_config();
+    let (config, ()) = update_codez_config(|config| {
     config.agent_bus_enabled = enabled;
     if let Some(port) = port {
         validate_agent_bus_port(port)?;
@@ -40,7 +42,8 @@ pub(crate) fn ensure_agent_bus_config(
     {
         config.agent_bus_token = Some(format!("cutex-agent-{}", Uuid::new_v4()));
     }
-    save_codez_config(&config)?;
+    Ok(())
+    })?;
     Ok(config)
 }
 

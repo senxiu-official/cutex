@@ -1145,3 +1145,34 @@ fn the_restart_refresh_leaves_later_pages_to_be_judged_and_scans_a_session_once(
     assert!(restart_refresh_sessions(&second, Some("s1")).is_empty(), "no second scan");
     assert_eq!(restart_refresh_sessions(&second, Some("s0")), ["s1"]);
 }
+
+
+#[test]
+fn late_old_turn_end_does_not_interrupt_a_new_unbound_native_attempt() {
+    let f=Fixture::new();
+    accepted_note(&f,"source",None);
+    let mut runtime=FakeRuntime::connected(Some("new-turn")).answer("thread/externalInput/status",Ok(status("pending","claimed",None)));
+    runtime.external.insert("source".into(),("s1".into(),"thread-1".into(),json!({"messageId":"bus-retry:new:source"})));
+    let (changed, _)=il::capture_events(||turn_ended(&f.ledger,&runtime,"s1","old-turn","interrupted",t0()));
+    assert_eq!(changed,0);
+    assert_eq!(f.get("source").state,InputState::Accepted);
+    assert!(f.get("source").turn_id.is_none());
+    assert_eq!(runtime.calls.borrow().len(),1,"one check of the current native attempt");
+}
+
+#[test]
+fn late_terminal_check_binds_the_proven_native_retry_item_and_receipt_turn() {
+    let f=Fixture::new();
+    accepted_note(&f,"source",None);
+    let native="bus-retry:11111111111141118111111111111111:source";
+    let reply=json!({"statuses":[{"deliveryState":"context_persisted","messageId":native,
+        "processing":{"state":"none"},"receipt":{"turnId":"new-turn","messageId":native,"responseItemId":native}}]});
+    let mut runtime=FakeRuntime::connected(Some("new-turn")).answer("thread/externalInput/status",Ok(reply));
+    runtime.external.insert("source".into(),("s1".into(),"thread-1".into(),json!({"messageId":native})));
+    let (changed, _)=il::capture_events(||turn_ended(&f.ledger,&runtime,"s1","old-turn","interrupted",t0()));
+    assert_eq!(changed,1);
+    let row=f.get("source");
+    assert_eq!(row.state,InputState::InContext);
+    assert_eq!(row.timeline_item_id.as_deref(),Some(native));
+    assert_eq!(row.turn_id.as_deref(),Some("new-turn"));
+}

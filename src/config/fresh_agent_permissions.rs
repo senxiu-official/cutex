@@ -149,6 +149,9 @@ pub fn run_on_startup(component: &str, quiet: bool) -> anyhow::Result<()> {
 
 /// Decides and records once for the cutex dir `cutex_dir`.
 pub fn run_at(cutex_dir: &Path, legacy_exists: bool, now: DateTime<Utc>) -> anyhow::Result<Outcome> {
+    // This one-time raw-JSON migration preserves unknown fields; share the
+    // normal config writer fence across its decision and exact-byte update.
+    let _config_guard = super::store::config_write_lock(&cutex_dir.join("config.json"))?;
     let archive = cutex_dir.join(ARCHIVE_ROOT);
     let record_path = archive.join(RECORD_FILE);
     if record_path.exists() {

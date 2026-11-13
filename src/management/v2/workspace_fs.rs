@@ -10,6 +10,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -30,6 +31,9 @@ pub const MAX_FILE_BYTES_LIMIT: u64 = 10 * 1024 * 1024;
 const SEARCH_DEFAULT_LIMIT: usize = 50;
 const SEARCH_MAX_LIMIT: usize = 500;
 const FILE_LIST_TTL: Duration = Duration::from_secs(15);
+const FILE_LIST_MAX_ROOTS: usize = 32;
+const FILE_LIST_MAX_BYTES: usize = 32 * 1024 * 1024;
+const RAW_WATCH_CAPACITY: usize = 1024;
 const WALK_FILE_CAP: usize = 200_000;
 const WATCH_DEBOUNCE_QUIET: Duration = Duration::from_millis(250);
 const WATCH_DEBOUNCE_MAX: Duration = Duration::from_millis(1000);
@@ -126,6 +130,7 @@ pub fn dir_resource(
     root: &ResolvedRoot,
     params: &HashMap<String, String>,
 ) -> WorkspaceResult<Value> {
+    let _credentials = super::host_files::credential_request();
     let raw = params.get("path").map(String::as_str).unwrap_or("");
     let (dir, rel) = resolve_rel(root, raw)?;
     if !dir.is_dir() {
@@ -138,7 +143,6 @@ pub fn dir_resource(
     let read = std::fs::read_dir(&dir).map_err(WorkspaceError::internal)?;
     let mut entries = Vec::new();
     for entry in read.flatten() {
-        if super::host_files::refuse_root_credential_file(&entry.path()).is_err(){continue;}
         let name = entry.file_name().to_string_lossy().into_owned();
         if is_git_dir_name(&name) {
             continue;
@@ -146,6 +150,7 @@ pub fn dir_resource(
         let Ok(link_meta) = entry.path().symlink_metadata() else {
             continue;
         };
+        if super::host_files::refuse_credential_entry_metadata(&entry.path(), &link_meta).is_err() { continue; }
         let kind = kind_label(&link_meta.file_type());
         // Symlinks report their target only when it stays inside the root.
         let (target_kind, meta) = if kind == "symlink" {
@@ -330,6 +335,7 @@ pub fn file_content_value(
 struct CachedList {
     at: Instant,
     files: Arc<Vec<String>>,
+    bytes: usize,
 }
 
 fn file_list_cache() -> &'static Mutex<HashMap<PathBuf, CachedList>> {
@@ -343,8 +349,24 @@ pub fn invalidate_file_list(root: &Path) {
     }
 }
 
+// Sweep roots which are never read again and bound retained string allocations.
+// Oversized roots remain searchable without retaining the result after the call.
+fn cache_file_list(cache: &mut HashMap<PathBuf, CachedList>, root: PathBuf, files: Arc<Vec<String>>, now: Instant) {
+    cache.retain(|key, value| key != &root && now.duration_since(value.at) < FILE_LIST_TTL);
+    let bytes = files.capacity().saturating_mul(std::mem::size_of::<String>())
+        .saturating_add(files.iter().map(String::capacity).sum::<usize>());
+    if bytes > FILE_LIST_MAX_BYTES { return; }
+    let mut retained: usize = cache.values().map(|value| value.bytes).sum();
+    while cache.len() >= FILE_LIST_MAX_ROOTS || retained.saturating_add(bytes) > FILE_LIST_MAX_BYTES {
+        let Some(oldest) = cache.iter().min_by_key(|(_, value)| value.at).map(|(key, _)| key.clone()) else { break; };
+        if let Some(old) = cache.remove(&oldest) { retained -= old.bytes; }
+    }
+    cache.insert(root, CachedList { at: now, files, bytes });
+}
+
 /// Non-ignored files under the root (root-relative, forward slashes).
 pub fn file_list(root: &ResolvedRoot) -> Arc<Vec<String>> {
+    let _credentials = super::host_files::credential_request();
     if let Ok(cache) = file_list_cache().lock() {
         if let Some(cached) = cache.get(&root.canonical) {
             if cached.at.elapsed() < FILE_LIST_TTL {
@@ -357,13 +379,7 @@ pub fn file_list(root: &ResolvedRoot) -> Arc<Vec<String>> {
             .unwrap_or_else(|| walk_files(&root.canonical)),
     );
     if let Ok(mut cache) = file_list_cache().lock() {
-        cache.insert(
-            root.canonical.clone(),
-            CachedList {
-                at: Instant::now(),
-                files: files.clone(),
-            },
-        );
+        cache_file_list(&mut cache, root.canonical.clone(), files.clone(), Instant::now());
     }
     files
 }
@@ -377,7 +393,7 @@ fn walk_files(root: &Path) -> Vec<String> {
             continue;
         };
         for entry in read.flatten() {
-            if super::host_files::refuse_root_credential_file(&entry.path()).is_err(){continue;}
+            if super::host_files::refuse_root_credential_entry(&entry.path()).is_err(){continue;}
             let name = entry.file_name().to_string_lossy().into_owned();
             if is_git_dir_name(&name) {
                 continue;
@@ -407,6 +423,7 @@ pub fn search_resource(
     root: &ResolvedRoot,
     params: &HashMap<String, String>,
 ) -> WorkspaceResult<Value> {
+    let _credentials = super::host_files::credential_request();
     let query: String = params
         .get("q")
         .map(|query| query.chars().filter(|ch| !ch.is_whitespace()).collect())
@@ -426,7 +443,7 @@ pub fn search_resource(
     let files = file_list(root);
     let results = fuzzy_search(&files, &query, limit, |path| {
         let file=root.canonical.join(path);
-        file.exists() && super::host_files::refuse_root_credential_file(&file).is_ok()
+        file.exists() && super::host_files::refuse_root_credential_entry(&file).is_ok()
     });
     Ok(json!({
         "query": query,
@@ -592,14 +609,16 @@ pub fn subscribe_watch(root: &Path) -> WorkspaceResult<mpsc::Receiver<WatchBatch
         return Ok(receiver);
     }
     use notify::Watcher;
-    let (raw_tx, raw_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let (raw_tx, raw_rx) = mpsc::sync_channel(RAW_WATCH_CAPACITY);
+    let overflow = Arc::new(AtomicBool::new(false));
+    let callback_overflow = overflow.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         if event.as_ref().is_ok_and(|event| {
             !is_content_change(&event.kind) || is_directory_metadata_touch(event)
         }) {
             return;
         }
-        let _ = raw_tx.send(event);
+        enqueue_watch_event(&raw_tx, &callback_overflow, event);
     })
     .map_err(|error| WorkspaceError::new(503, "watch_unavailable", error.to_string()))?;
     watcher
@@ -614,7 +633,7 @@ pub fn subscribe_watch(root: &Path) -> WorkspaceResult<mpsc::Receiver<WatchBatch
     let weak = Arc::downgrade(&entry);
     std::thread::Builder::new()
         .name("cutex-fs-watch".to_string())
-        .spawn(move || debounce_loop(root, raw_rx, weak))
+        .spawn(move || debounce_loop(root, raw_rx, weak, overflow))
         .map_err(WorkspaceError::internal)?;
     Ok(receiver)
 }
@@ -650,17 +669,36 @@ fn is_directory_metadata_touch(event: &notify::Event) -> bool {
         && event.paths.iter().all(|path| path.is_dir())
 }
 
+// The OS callback must neither block nor accumulate an unlimited backlog.
+// Overflow asks clients to rescan instead of silently losing changes.
+fn enqueue_watch_event(sender: &mpsc::SyncSender<notify::Result<notify::Event>>, overflow: &AtomicBool, mut event: notify::Result<notify::Event>) {
+    if let Ok(event) = &mut event {
+        if event.paths.len() > WATCH_MAX_PATHS {
+            event.paths.truncate(WATCH_MAX_PATHS);
+            overflow.store(true, Ordering::Release);
+        }
+    }
+    if event.is_err() { overflow.store(true, Ordering::Release); }
+    if matches!(sender.try_send(event), Err(mpsc::TrySendError::Full(_))) {
+        overflow.store(true, Ordering::Release);
+    }
+}
+
 fn debounce_loop(
     root: PathBuf,
     raw: mpsc::Receiver<notify::Result<notify::Event>>,
     entry: std::sync::Weak<RootWatch>,
+    overflow: Arc<AtomicBool>,
 ) {
     while let Ok(first) = raw.recv() {
         let started = Instant::now();
         let mut events = vec![first];
+        let mut dropped = false;
         while started.elapsed() < WATCH_DEBOUNCE_MAX {
-            match raw.recv_timeout(WATCH_DEBOUNCE_QUIET) {
-                Ok(event) => events.push(event),
+            let remaining = WATCH_DEBOUNCE_MAX.saturating_sub(started.elapsed());
+            match raw.recv_timeout(WATCH_DEBOUNCE_QUIET.min(remaining)) {
+                Ok(event) if events.len() < RAW_WATCH_CAPACITY => events.push(event),
+                Ok(_) => dropped = true,
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
@@ -670,7 +708,12 @@ fn debounce_loop(
             .filter_map(Result::ok)
             .flat_map(|event| event.paths)
             .collect::<Vec<_>>();
-        let batch = batch_from_paths(&root, &paths);
+        let mut batch = batch_from_paths(&root, &paths);
+        dropped |= overflow.swap(false, Ordering::AcqRel);
+        if dropped {
+            batch.overflow = true;
+            batch.git_changed = true;
+        }
         if batch.paths.is_empty() && !batch.git_changed && !batch.overflow {
             continue;
         }
@@ -720,10 +763,11 @@ pub fn batch_from_paths(root: &Path, paths: &[PathBuf]) -> WatchBatch {
             continue;
         }
         let rel = parts.join("/");
-        if seen.insert(rel.clone()) {
+        if !seen.contains(&rel) {
             if batch.paths.len() >= WATCH_MAX_PATHS {
                 batch.overflow = true;
             } else {
+                seen.insert(rel.clone());
                 batch.paths.push(rel);
             }
         }
@@ -845,6 +889,99 @@ mod tests {
     use super::super::workspace::Scope;
     use super::super::workspace::ScopeKind;
     use super::*;
+
+    #[test]
+    fn event_cap_preserves_debounce_window_and_only_drops_signal_git_change() {
+        let (dir, root) = temp_root("debounce-storm");
+        let (sender, raw) = mpsc::sync_channel(RAW_WATCH_CAPACITY);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(64);
+        let entry = Arc::new(RootWatch { subscribers: Mutex::new(vec![tx]), _watcher: Mutex::new(None) });
+        let weak = Arc::downgrade(&entry);
+        let path = dir.join("same-file");
+        // Exactly reaching capacity must not claim dropped events.
+        for _ in 0..RAW_WATCH_CAPACITY { sender.send(Ok(notify::Event::new(notify::EventKind::Any).add_path(path.clone()))).unwrap(); }
+        let worker = std::thread::spawn(move || debounce_loop(root.canonical, raw, weak, overflow));
+        let batch = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!batch.overflow && !batch.git_changed);
+        let start = Instant::now();
+        let producer = sender.clone();
+        let storm = std::thread::spawn(move || {
+            for _ in 0..RAW_WATCH_CAPACITY * 3 { producer.send(Ok(notify::Event::new(notify::EventKind::Any).add_path(path.clone()))).unwrap(); }
+            while start.elapsed() < Duration::from_millis(1200) {
+                producer.send(Ok(notify::Event::new(notify::EventKind::Any).add_path(path.clone()))).unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let batch = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(850), "the cap must not terminate the one-second storm window");
+        assert!(batch.overflow && batch.git_changed);
+        storm.join().unwrap();
+        // Let the trailing quiet batch flush before closing the raw channel.
+        let _ = rx.recv_timeout(Duration::from_secs(1));
+        drop(sender);
+        worker.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn file_list_cache_releases_expired_roots_and_bounds_count_and_bytes() {
+        let mut cache = HashMap::new();
+        let now = Instant::now();
+        let old = Arc::new(vec!["expired".to_string()]);
+        let weak = Arc::downgrade(&old);
+        cache_file_list(&mut cache, "expired".into(), old, now - FILE_LIST_TTL);
+        for index in 0..100 {
+            cache_file_list(&mut cache, format!("root-{index}").into(), Arc::new(vec!["file".into()]), now);
+            assert!(cache.len() <= FILE_LIST_MAX_ROOTS);
+        }
+        assert!(weak.upgrade().is_none(), "an expired root must release its listing");
+        assert!(!cache.contains_key(Path::new("expired")));
+        for index in 0..40 {
+            cache_file_list(&mut cache, format!("large-{index}").into(), Arc::new(vec!["x".repeat(1024 * 1024)]), now);
+            assert!(cache.values().map(|value| value.bytes).sum::<usize>() <= FILE_LIST_MAX_BYTES);
+        }
+        let huge = Arc::new(vec!["x".repeat(FILE_LIST_MAX_BYTES + 1)]);
+        let weak = Arc::downgrade(&huge);
+        cache_file_list(&mut cache, "huge".into(), huge, now);
+        assert!(weak.upgrade().is_none(), "oversized listings are served without caching");
+        assert!(!cache.contains_key(Path::new("huge")));
+    }
+
+    #[test]
+    fn raw_watch_backlog_is_bounded_and_reports_rescan() {
+        let (dir, root) = temp_root("raw-overflow");
+        let (sender, raw) = mpsc::sync_channel(RAW_WATCH_CAPACITY);
+        let overflow = Arc::new(AtomicBool::new(false));
+        for index in 0..RAW_WATCH_CAPACITY + 100 {
+            enqueue_watch_event(&sender, &overflow, Ok(notify::Event::new(notify::EventKind::Any).add_path(dir.join(format!("f-{index}")))));
+        }
+        assert!(overflow.load(Ordering::Acquire));
+        let (tx, rx) = mpsc::sync_channel(64);
+        let entry = Arc::new(RootWatch { subscribers: Mutex::new(vec![tx]), _watcher: Mutex::new(None) });
+        let weak = Arc::downgrade(&entry);
+        let handle = std::thread::spawn(move || debounce_loop(root.canonical, raw, weak, overflow));
+        let batch = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(batch.paths.len(), WATCH_MAX_PATHS);
+        assert!(batch.overflow);
+        assert!(batch.git_changed, "overflow must also invalidate git state");
+        drop(sender);
+        handle.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn raw_watch_large_events_and_errors_request_rescan() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let overflow = AtomicBool::new(false);
+        let mut event = notify::Event::new(notify::EventKind::Any);
+        event.paths = (0..1000).map(|i| PathBuf::from(format!("f-{i}"))).collect();
+        enqueue_watch_event(&sender, &overflow, Ok(event));
+        assert_eq!(receiver.try_recv().unwrap().unwrap().paths.len(), WATCH_MAX_PATHS);
+        assert!(overflow.swap(false, Ordering::AcqRel));
+        enqueue_watch_event(&sender, &overflow, Err(notify::Error::generic("OS overflow")));
+        assert!(overflow.load(Ordering::Acquire));
+    }
 
     fn temp_root(name: &str) -> (PathBuf, ResolvedRoot) {
         let dir = std::env::temp_dir().join(format!(

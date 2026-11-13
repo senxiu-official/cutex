@@ -180,7 +180,7 @@ pub fn bus_tell_read<'a>(
         confirmed_level
     };
     if let Some(envelope) = &snapshot.external_input {
-        if envelope.message.id != snapshot.message_id
+        if !crate::management::v2::agent_bus_state::native_id_matches_source(&snapshot.message_id, &envelope.message.id)
             || envelope.owner_id != snapshot.to_cutex_session_id
         {
             return without_native(

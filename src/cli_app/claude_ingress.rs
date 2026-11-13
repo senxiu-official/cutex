@@ -33,8 +33,7 @@ pub(crate) fn offers_controls(capabilities: &Value) -> bool {
 }
 
 pub(crate) fn offers_soon(capabilities: &Value) -> bool {
-    offers_native(capabilities) && capabilities["externalInputDeliveries"].as_array()
-        .is_some_and(|modes| modes.iter().any(|mode| mode == "soon"))
+    cutex::agent_bus::busy_delivery::claude_soon(capabilities)
 }
 
 pub(crate) fn binding_params(owner: &str, thread: &str, generation: u64) -> Value {

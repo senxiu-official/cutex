@@ -1,4 +1,5 @@
 mod account_store;
+mod pan;
 mod upgrade_cli;
 mod agent;
 mod agent_bus_config;

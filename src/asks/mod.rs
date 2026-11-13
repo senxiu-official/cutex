@@ -54,6 +54,7 @@ pub mod shared;
 pub mod store;
 pub mod short_ids;
 pub mod tools;
+pub(crate) mod tell_busy_detail;
 pub mod view;
 pub mod views;
 pub mod waits;

@@ -16,6 +16,55 @@ use std::{
 };
 
 const ROOT: &str = "access-http-test-root-credential";
+
+#[test]
+fn path_reapproval_requires_full_owner_and_persists_a_fresh_snapshot() {
+    use crate::management::client_tokens::DeviceScope;
+    use crate::session::model::{CutexSessionRecord, CutexSessionStore, SessionCreatedBy};
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let cwd = instance.root.join("workspace"); std::fs::create_dir_all(&cwd).unwrap();
+    let mut child = CutexSessionRecord::new("cutex.reapprove".into(), None, "test".into(), cwd.to_str().unwrap().into(), None).unwrap();
+    child.created_by = Some(SessionCreatedBy::Agent { cutex_session_id: crate::role_revision::CutexSessionId::new("cutex.creator").unwrap(), role: None });
+    let id = child.cutex_session_id.clone();
+    let mut sessions = CutexSessionStore::default(); sessions.sessions.insert(id.clone(), child);
+    crate::session::store::save_cutex_session_store(&sessions).unwrap();
+    let path = format!("/v2/sessions/{id}/reapprove-paths");
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    for scope in [DeviceScope::Read, DeviceScope::Chat] {
+        let token = tokens.issue_scoped("reapprove-narrowed", scope).unwrap();
+        users.bind_token(&token.token_id, Some(OWNER), "root").unwrap();
+        assert_eq!(exchange("POST", &path, Some(&token.token), &json!({})).0, 403);
+    }
+    let member = users.create_user("Reapprove member", None, Grant::default(), "root").unwrap();
+    let token = tokens.issue("reapprove-member").unwrap();
+    users.bind_token(&token.token_id, Some(&member.id), "root").unwrap();
+    assert_eq!(exchange("POST", &path, Some(&token.token), &json!({})).0, 403);
+    assert!(matches!(exchange("POST", &path, Some("ordinary-agent-bus-credential"), &json!({})).0, 401 | 403));
+    // A valid ordinary Management/Agent Bus bridge bearer is insufficient,
+    // even though that same bearer can read a normal bridge resource.
+    const BUS: &str = "valid-agent-bus-bridge-credential";
+    let bus_call = |method: &str, path: &str| exchange_with_tokens(context(), method, path, Some(BUS), b"{}".to_vec(), "application/json", "", Some(BUS));
+    assert_eq!(bus_call("GET", "/v2/capabilities").0, 200);
+    assert_eq!(bus_call("POST", &path).0, 403);
+    assert!(crate::session::store::load_cutex_session_store().unwrap().sessions[&id].creator_path_snapshot.is_none());
+    let (status, result) = exchange("POST", &path, Some(ROOT), &json!({}));
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["cutexSessionId"], id);
+    assert_eq!(result["ownerApproved"], true);
+    crate::management::v2::schema_export::assert_valid("session-paths", "response", &result);
+    assert_eq!(result["creatorPathSnapshot"]["owner_approved"], true);
+    let saved = crate::session::store::load_cutex_session_store().unwrap().sessions[&id].clone();
+    assert!(saved.creator_path_snapshot.unwrap().owner_approved);
+    let owner = tokens.issue("reapprove-full-owner").unwrap();
+    users.bind_token(&owner.token_id, Some(OWNER), "root").unwrap();
+    assert_eq!(exchange("POST", &path, Some(&owner.token), &json!({})).0, 200);
+    assert_eq!(exchange("POST", &path, Some(ROOT), &json!({"ownerApproved":true})).0, 400);
+    assert_eq!(exchange("GET", &path, Some(ROOT), &json!({})).0, 405);
+    let capabilities = crate::management::v2::capabilities::capabilities_resource();
+    assert!(capabilities["featureList"].as_array().unwrap().iter().any(|value| value == "session-path-reapproval"));
+}
 #[path = "archive_api_http_tests.rs"]
 mod archive_api_http_tests;
 #[path = "user_layout_http_tests.rs"]
@@ -225,6 +274,42 @@ struct PrivateInstance {
     previous: Selection,
 }
 
+#[test]
+fn scoped_collection_read_failure_never_falls_through_to_owner_handler() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static READS: AtomicUsize = AtomicUsize::new(0);
+    let _lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let user = users.create_user("No project grants", None, Grant::default(), "root").unwrap();
+    let token = tokens.issue("filter-failure-audit").unwrap();
+    users.bind_token(&token.token_id, Some(&user.id), "root").unwrap();
+    let mut context = p2_context();
+    READS.store(0, Ordering::SeqCst);
+    context.list_management_projects = |_| {
+        if READS.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(crate::agent_management::AgentManagementError::PersistenceUnavailable);
+        }
+        // A retry of the owner handler sees the recovered, host-wide collection.
+        Ok(crate::management::control_plane::HumanManagementProjectCollection {
+            schema: crate::management::control_plane::HumanManagementProjectSchema::V1,
+            projects: vec![], archived_projects: vec![],
+            available_agents: vec![crate::agent_management::ProjectAgentChoice {
+                cutex_session_id: crate::role_revision::CutexSessionId::new("cutex.hidden-agent").unwrap(),
+                name: "Hidden agent in another project".into(),
+                current_project_id: Some(crate::agent_management::ProjectId::new("hidden-project").unwrap()),
+            }],
+        })
+    };
+    let (status, _, bytes) = exchange_with(context, "GET", "/v2/agent-management/projects",
+        Some(&token.token), vec![], "application/json", "");
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, 503, "transient scope-filter failure exposed owner data: {value}");
+    assert_eq!(READS.load(Ordering::SeqCst), 1, "the unfiltered owner handler must not run");
+    assert!(!String::from_utf8_lossy(&bytes).contains("hidden-agent"));
+}
+
 impl PrivateInstance {
     fn new() -> Self {
         let root = crate::config::paths::home_dir()
@@ -257,6 +342,7 @@ fn context() -> ManagementRequestContext {
     // Denied and gate-answered requests never reach native runtime callbacks.
     ManagementRequestContext {
         explicit_launch_action: |_, _| panic!("unexpected runtime action"),
+        promote_quick_chat: |_, _, _| panic!("unexpected quick chat promotion"),
         adopt_saved_native: |_, _| panic!("unexpected native adoption"),
         review_agent_archive: |_, _| panic!("unexpected archive review"),
         owner_archive_action: |_, _| panic!("unexpected permanent archive"),
@@ -295,6 +381,57 @@ fn context() -> ManagementRequestContext {
     }
 }
 
+#[test]
+fn quick_chat_promote_http_is_owner_only_strict_and_replayable() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let guest = users.create_user("Chat reader", None, Grant::default(), "root").unwrap();
+    let guest_token = tokens.issue("reader-device").unwrap();
+    users.bind_token(&guest_token.token_id, Some(&guest.id), "root").unwrap();
+    let owner = tokens.issue("owner-device").unwrap();
+    users.bind_token(&owner.token_id, Some(OWNER), "root").unwrap();
+    let mut record = crate::session::model::CutexSessionRecord::new(
+        "cutex.promote-http".into(), Some(uuid::Uuid::new_v4().to_string()),
+        crate::platform::host::current_host_name(), crate::config::paths::config_dir().unwrap().to_string_lossy().into_owned(), None,
+    ).unwrap();
+    record.registration_class = crate::agent_bus::model::AgentRegistrationClass::LocalOnly;
+    record.agent_enabled = false;
+    let mut store = crate::session::model::CutexSessionStore::default();
+    store.sessions.insert(record.cutex_session_id.clone(), record.clone());
+    crate::session::store::save_cutex_session_store(&store).unwrap();
+    let path = "/v2/human/sessions/cutex.promote-http/promote";
+    let body = json!({"requestId":"upgrade","expectedRevision":record.revision,"name":"HTTP Agent"});
+    assert_eq!(exchange("POST", path, None, &body).0, 401);
+    assert_eq!(exchange("POST", path, Some(&guest_token.token), &body).0, 403);
+    let mut ctx = context();
+    ctx.promote_quick_chat = |principal, session, payload| {
+        crate::agent_management::AgentManagementProvider::open_default()?.promote_quick_chat(
+            principal, &crate::session::store::cutex_sessions_path()?, session, payload)
+    };
+    let call = |body: &Value| {
+        let (status, _, bytes) = exchange_with(ctx, "POST", path, Some(&owner.token), body.to_string().into_bytes(), "application/json", "");
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+    };
+    crate::management::v2::schema_export::assert_valid("quick-chat-promote", "request", &body);
+    let mut invalid = body.clone(); invalid["start"] = json!(true);
+    let (status, error) = call(&invalid);
+    assert_eq!((status, code(&error)), (400, "invalid_request"));
+    let (status, result) = call(&body);
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["complete"], true, "{result}");
+    let tools = crate::agent_bus::tool_policy::tools_list_for_session("cutex.promote-http");
+    assert!(tools["tools"].as_array().unwrap().iter().any(|t| t["name"] == "agent_list"), "{tools}");
+    crate::management::v2::schema_export::assert_valid("quick-chat-promote", "response", &result);
+    assert_eq!(call(&body), (200, result));
+    let mut changed = body.clone(); changed["name"] = json!("Changed");
+    let (status, error) = call(&changed);
+    assert_eq!((status, code(&error)), (409, "request_id_payload_conflict"));
+    let caps = crate::management::v2::capabilities::capabilities_resource();
+    assert!(caps.to_string().contains("quick-chat-promote-v1"));
+}
+
 fn exchange(method: &str, path: &str, bearer: Option<&str>, body: &Value) -> (u16, Value) {
     let (status, _, body) = exchange_raw(method, path, bearer, body, "");
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
@@ -314,6 +451,19 @@ fn exchange_with(
     body: Vec<u8>,
     content_type: &str,
     extra: &str,
+) -> (u16, String, Vec<u8>) {
+    exchange_with_tokens(context, method, path, bearer, body, content_type, extra, None)
+}
+
+fn exchange_with_tokens(
+    context: ManagementRequestContext,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: Vec<u8>,
+    content_type: &str,
+    extra: &str,
+    bridge_token: Option<&str>,
 ) -> (u16, String, Vec<u8>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -345,7 +495,7 @@ fn exchange_with(
     crate::http::server::set_keep_alive(crate::http::server::KeepAlive::Off);
     crate::http::server::set_extra_response_headers(String::new());
     crate::http::server::set_accept_gzip(false);
-    let handled = handle_management_request(&mut server, None, Some(ROOT), context);
+    let handled = handle_management_request(&mut server, bridge_token, Some(ROOT), context);
     listeners::set_current_connection(None);
     listeners::set_current_client_token(None);
     crate::management::users::set_current_principal(None);
@@ -1004,6 +1154,42 @@ fn person_identity_claims_and_owner_key_management() {
     });
     let (status, value) = exchange("DELETE", "/v2/users/token-persons/mct-missing/previous", Some(ROOT), &json!({}));
     assert_eq!((status, code(&value)), (404, "client_token_not_found"));
+}
+
+#[test]
+fn narrowed_host_cli_owner_tokens_cannot_read_host_control_credentials() {
+    use crate::management::client_tokens::DeviceScope;
+    let _lock = crate::config::paths::test_home_env_lock();
+    let instance = PrivateInstance::new();
+    let tokens = ClientTokenStore::open_default().unwrap();
+    let users = UserStore::open_default().unwrap();
+    let full = tokens.issue("secret-full-owner").unwrap();
+    users.snapshot().unwrap();
+    let mut config = crate::config::store::load_codez_config();
+    config.agent_bus_token = Some("synthetic-control-secret-audit".into());
+    crate::config::store::save_codez_config(&config).unwrap();
+    let config = crate::config::paths::config_path().unwrap();
+    let link = crate::config::paths::config_dir().unwrap().join("runtime/profile-link/secret-v1");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::fs::write(&link,"synthetic-control-secret-audit").unwrap();
+    let report = instance.root.join("report.txt");
+    std::fs::write(&report,"ordinary report").unwrap();
+    let url = |path: &std::path::Path| format!("/v2/fs/file?path={}", url::form_urlencoded::byte_serialize(path.to_string_lossy().as_bytes()).collect::<String>());
+    for scope in [DeviceScope::Read, DeviceScope::Chat] {
+        let token = tokens.issue_scoped("narrowed-secret-owner",scope).unwrap();
+        users.bind_token(&token.token_id,Some(OWNER),"root").unwrap();
+        let caps = exchange("GET","/v2/capabilities",Some(&token.token),&json!({})).1;
+        assert_eq!(caps["user"]["ownerLocal"],true,"location semantics remain unchanged");
+        for secret in [&config,&link] {
+            let (status,value) = exchange("GET",&url(secret),Some(&token.token),&json!({}));
+            assert_eq!(status,403,"a narrowed token could recover a control credential");
+            assert!(!value.to_string().contains("synthetic-control-secret-audit"));
+        }
+        assert_eq!(exchange("GET",&url(&report),Some(&token.token),&json!({})).0,200);
+    }
+    for bearer in [ROOT,full.token.as_str()] {
+        assert_eq!(exchange("GET",&url(&config),Some(bearer),&json!({})).0,200);
+    }
 }
 
 /// A context whose session lookups work on the private instance (empty
@@ -2308,7 +2494,8 @@ fn review_relay_private_directory_never_reaches_non_owner_local_file_reads() {
             REMOTE.with(|r|r.set(remote));
             let (status,value)=exchange("GET",&format!("/v2/fs/file?path={}",file.display()),Some(&token.token),&json!({}));
             REMOTE.with(|r|r.set(false));
-            assert_eq!((status,code(&value)),(403,"owner_local_only"),"scope={scope:?} remote={remote}: {value}");
+            let expected=if scope.is_full(){"owner_local_only"}else{"credential_read_denied"};
+            assert_eq!((status,code(&value)),(403,expected),"scope={scope:?} remote={remote}: {value}");
         }
     }
     let mut proof=crate::management::client_tokens::VerifiedClientToken::test_token("paired");proof.issued_via=crate::management::client_tokens::IssuedVia::Pairing;
@@ -2321,6 +2508,46 @@ fn review_relay_private_directory_never_reaches_non_owner_local_file_reads() {
     listeners::set_current_client_token(None);
     let (_,value)=exchange("GET",&format!("/v2/fs/file?path={}",file.display()),Some(ROOT),&json!({}));
     assert_eq!(value["content"],"private-ca-fixture","owner-local access remains possible");
+}
+
+#[test]
+fn credential_locations_are_denied_for_read_chat_on_all_owner_token_transports() {
+    use crate::management::client_tokens::DeviceScope;
+    let home=crate::profiles::lifecycle::tests::TestHome::new();
+    std::fs::write(home.root().join(crate::config::paths::PRIVATE_HOME_MARKER),b"").unwrap();
+    let instance=PrivateInstance::new();
+    let tokens=ClientTokenStore::open_default().unwrap();let users=UserStore::beside(&tokens);
+    let secret=home.root().join(".ssh/id_ed25519");
+    std::fs::create_dir_all(secret.parent().unwrap()).unwrap();std::fs::write(&secret,"synthetic credential").unwrap();
+    let alias=instance.root.join("ordinary-alias.txt");std::fs::hard_link(&secret,&alias).unwrap();
+    let config=crate::config::paths::config_dir().unwrap();
+    let key=config.join("profile-keys/test.json");std::fs::create_dir_all(key.parent().unwrap()).unwrap();std::fs::write(&key,"synthetic credential").unwrap();
+    let report=config.join("projects/p/memory/MEMORY.md");let artifact=config.join("runtime/artifacts/blobs/ab/hash");
+    for file in [&report,&artifact] {std::fs::create_dir_all(file.parent().unwrap()).unwrap();std::fs::write(file,"ordinary preview").unwrap();}
+    let mut runtime_cases = Vec::new();
+    for relative in ["runtime/claude/sessions/s/claude-api-key.bound.json", "runtime/claude/sessions/s/rpc-token", "runtime/app-server/native/capability-token", "runtime/dsh/s/launch.json", "profiles/p/claude/.credentials.json", "profiles/p/claude/api_key"] {
+        let file = config.join(relative); std::fs::create_dir_all(file.parent().unwrap()).unwrap(); std::fs::write(&file, "synthetic credential").unwrap(); runtime_cases.push(file);
+    }
+    for scope in DeviceScope::ALL {
+        for paired in [false,true] {
+            let token=if paired {tokens.issue_device_scoped("credential-device","fixture","other",scope).unwrap().0}
+                else {tokens.issue_scoped("credential-cli",scope).unwrap()};
+            users.bind_token(&token.token_id,Some(OWNER),"root").unwrap();
+            for remote in [false,true] {
+                let read=|file:&std::path::Path| {
+                    REMOTE.with(|r|r.set(remote));
+                    let out=exchange("GET",&format!("/v2/fs/file?path={}",file.display()),Some(&token.token),&json!({}));
+                    REMOTE.with(|r|r.set(false));out
+                };
+                for file in [&secret,&alias,&key].into_iter().chain(runtime_cases.iter()) {
+                    let (status,value)=read(file);
+                    if scope.is_full() {assert_eq!(status,200,"{value}");assert_eq!(value["content"],"synthetic credential");}
+                    else {assert_eq!((status,code(&value)),(403,"credential_read_denied"),"{scope:?} paired={paired} remote={remote}: {value}");assert!(value["error"]["message"].as_str().unwrap().contains("full owner token"));}
+                }
+                for file in [&report,&artifact] {let(status,value)=read(file);assert_eq!(status,200,"{value}");assert_eq!(value["content"],"ordinary preview");}
+            }
+        }
+    }
 }
 
 #[test]
@@ -2357,4 +2584,19 @@ fn relay_enrollment_and_early_renewal_bind_csr_to_device_without_widening_read_s
     let(status,value)=exchange("POST","/v2/relay-certificate/renew",Some(&b.token),&json!({"csrPem":new_csr}));assert_eq!((status,code(&value)),(403,"relay_device_mismatch"));
     crate::management::relay::set_peer(None);assert_eq!(exchange("POST","/v2/relay-certificate/renew",Some(&a.token),&json!({"csrPem":new_csr})).0,403);
     let(status,rotated)=exchange("POST","/v2/relay/rotate-server",Some(ROOT),&json!({}));assert_eq!(status,201,"{rotated}");assert_eq!(rotated["serverCaSha256"],setup["serverCaSha256"]);assert!(!rotated.to_string().contains("PRIVATE KEY"));
+}
+
+
+#[test]
+fn creator_path_refusal_has_a_stable_code_and_session_id_on_the_wire() {
+    let _home_lock = crate::config::paths::test_home_env_lock();
+    let _instance = PrivateInstance::new();
+    let mut ctx = context();
+    ctx.explicit_launch_action = |_, _| Err(crate::agent_management::AgentManagementError::CreatorPathsChanged("cutex.refused".into()));
+    let request = json!({"operation":"runtime_status","action_id":"path-refusal-test"});
+    let (status, _, bytes) = exchange_with(ctx, "POST", "/v2/agent-management/explicit-launch", Some(ROOT), request.to_string().into_bytes(), "application/json", "");
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(code(&body), "creator_paths_changed");
+    assert_eq!(body["error"]["details"]["cutexSessionId"], "cutex.refused");
 }

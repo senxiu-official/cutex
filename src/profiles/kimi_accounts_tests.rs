@@ -385,3 +385,72 @@ fn login_without_a_cli_is_refused_and_release_builds_ignore_test_overrides() {
     assert!(matches!(start_login(&account.id, Duration::from_millis(10)), Err(StartLoginError::CliUnavailable(_))));
     assert!(matches!(start_login("ka-missing", Duration::from_millis(10)), Err(StartLoginError::NotFound)));
 }
+
+#[test]
+fn login_staging_guard_cleans_early_errors_and_nested_browser_cache() {
+    let tools = TempDir::new();
+    let staging = tools.path().join("kl-private");
+    let cache = staging.join("tmp/chrome/Default/Cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("cache.db"), b"temporary").unwrap();
+    drop(LoginStaging(staging.clone()));
+    assert!(!staging.exists());
+    assert!(tools.path().exists(), "only this invocation's directory is removed");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_login_job_releases_browser_locks_before_scratch_cleanup() {
+    let _home = TestHome::new();
+    let tools = TempDir::new();
+    let account = add("Job cleanup", KimiRegion::MainlandCn).unwrap();
+    let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let helper = tools.path().join("browser.ps1");
+    std::fs::write(&helper, r#"
+param([string]$Ready)
+$lockPath=Join-Path $env:TEMP 'browser.db'
+$file=[System.IO.File]::Open($lockPath,'Create','ReadWrite','None')
+[System.IO.File]::WriteAllText($Ready,'ready')
+Start-Sleep -Seconds 60
+$file.Dispose()
+"#).unwrap();
+    let root = tools.path().join("login.ps1");
+    std::fs::write(&root, r#"
+param([string]$Helper,[string]$Ready,[string]$Mode)
+$ErrorActionPreference='Stop'
+$psi=[System.Diagnostics.ProcessStartInfo]::new()
+$psi.FileName=Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+$psi.Arguments='-NoProfile -ExecutionPolicy Bypass -File "'+$Helper+'" -Ready "'+$Ready+'"'
+$psi.UseShellExecute=$false
+$psi.CreateNoWindow=$true
+$p=[System.Diagnostics.Process]::Start($psi)
+$until=[DateTime]::UtcNow.AddSeconds(15)
+while (!(Test-Path -LiteralPath $Ready)) {
+ if ([DateTime]::UtcNow -gt $until) { exit 2 }
+ Start-Sleep -Milliseconds 20
+}
+if ($Mode -eq 'pending') { Start-Sleep -Seconds 60 }
+exit 0
+"#).unwrap();
+    for mode in ["pending", "exited"] {
+        let ready = tools.path().join(format!("{mode}.ready"));
+        let staging = homes_root().unwrap().join(STAGING_DIR).join(format!("kl-{mode}"));
+        let cli = crate::profiles::kimi::KimiCli { program: powershell.clone(), args: vec![
+            "-NoProfile".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-File".into(), root.display().to_string(),
+            "-Helper".into(), helper.display().to_string(), "-Ready".into(), ready.display().to_string(), "-Mode".into(), mode.into(),
+        ], env: Vec::new() };
+        let mut process = spawn_login(&cli, &account, LoginStaging(staging.clone())).unwrap();
+        let until = Instant::now() + Duration::from_secs(20);
+        while !ready.exists() && Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
+        assert!(ready.exists(), "browser helper holds a real file lock");
+        assert!(OpenOptions::new().write(true).open(staging.join("tmp/browser.db")).is_err());
+        if mode == "exited" {
+            while process.child.try_wait().unwrap().is_none() && Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
+            assert!(process.child.try_wait().unwrap().unwrap().success());
+        }
+        assert!(crate::platform::windows_job::active_processes(&process.job).unwrap() >= 1);
+        drop(process);
+        assert!(!staging.exists(), "cleanup also works when a descendant outlived the CLI ({mode})");
+        assert!(account_home(&account.id).unwrap().is_dir(), "installed account stays intact");
+    }
+}

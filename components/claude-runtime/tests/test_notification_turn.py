@@ -67,6 +67,9 @@ async def test_its_text_is_not_a_reply_and_reaches_no_timeline(ph):
 
 
 async def test_the_model_is_told_in_the_system_prompt(ph):
+    assert "This Claude runtime does not expose cutex Job Service tools." in RUNTIME_LIMITS
+    assert "cannot be resumed after it restarts" in RUNTIME_LIMITS
+    assert "prefer cutex's job service" not in RUNTIME_LIMITS
     for phrase in ('"Claude Task"', 'cannot use tools and the user does not see it',
                    'reply in one line and use no tools', 'act on it then'):
         assert phrase in RUNTIME_LIMITS

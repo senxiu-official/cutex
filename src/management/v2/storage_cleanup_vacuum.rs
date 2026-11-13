@@ -65,7 +65,7 @@ pub(super) fn compact(home: &Path, relative: &Path) -> anyhow::Result<u64> {
     let _path_guard = super::storage_cleanup_fs::pin_regular(home, relative)?;
     let path = home.join(relative);
     let before = size(&path);
-    let db = exclusive(&path)?;
+    let mut db = exclusive(&path)?;
     let started = std::time::Instant::now();
     db.progress_handler(
         1_000,

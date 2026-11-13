@@ -222,9 +222,7 @@ fn check_full(runtime: &dyn Runtime, record: &InputRecord, turn: Option<&str>) -
         };
         return (checked, item, None);
     }
-    let (checked, carrying_turn) = check_unbound(runtime, record, &view);
-    let item = (is_bus(record.kind) && matches!(checked, Check::Persisted(_))).then(|| record.input_id.clone());
-    (checked, item, carrying_turn)
+    check_unbound(runtime, record, &view)
 }
 
 /// `next` bound to the native item a check found (only an `inContext` one).
@@ -243,7 +241,7 @@ fn bind_receipt_turn(next: Option<Next>, turn: Option<String>) -> Option<Next> {
 }
 
 /// [`check_bound`] of a record that is not the owner's.
-fn check_unbound(runtime: &dyn Runtime, record: &InputRecord, view: &RuntimeView) -> (Check, Option<String>) {
+fn check_unbound(runtime: &dyn Runtime, record: &InputRecord, view: &RuntimeView) -> (Check, Option<String>, Option<String>) {
     let session = &record.cutex_session_id;
     if is_bus(record.kind) {
         return match runtime.bus_external_key(&record.input_id) {
@@ -255,27 +253,32 @@ fn check_unbound(runtime: &dyn Runtime, record: &InputRecord, view: &RuntimeView
                         let checked = parse_external_status(&response);
                         let turn = matches!(checked, Check::Persisted(_)).then(|| response.pointer("/statuses/0/receipt/turnId")
                             .and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)).flatten();
-                        (checked, turn)
+                        // The queried native key can differ from the stable
+                        // ledger id after explicit retry. Bind that exact item.
+                        let item = matches!(checked, Check::Persisted(_)).then(|| key["messageId"].as_str()
+                            .filter(|id| !id.is_empty()).map(str::to_string)).flatten();
+                        (checked, item, turn)
                     }
-                    Err(_) => (Check::Unavailable, None),
+                    Err(_) => (Check::Unavailable, None, None),
                 }
             }
             None => {
-                let Some(thread) = view.thread_id.as_deref() else { return (Check::Unavailable, None) };
+                let Some(thread) = view.thread_id.as_deref() else { return (Check::Unavailable, None, None) };
                 match runtime.request(session, "claude/input/status", json!({"threadId": thread, "messageId": record.input_id})) {
                     Ok(response) => {
                         let checked = parse_local_status(&response);
                         let turn = matches!(checked, Check::Persisted(_)).then(|| response.get("turnId")
                             .and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)).flatten();
-                        (checked, turn)
+                        let item = matches!(checked, Check::Persisted(_)).then(|| record.input_id.clone());
+                        (checked, item, turn)
                     }
-                    Err(error) if error.contains("-32004") || error.contains("not found") => (Check::Absent, None),
-                    Err(_) => (Check::Unavailable, None),
+                    Err(error) if error.contains("-32004") || error.contains("not found") => (Check::Absent, None, None),
+                    Err(_) => (Check::Unavailable, None, None),
                 }
             }
         };
     }
-    (Check::Unavailable, None)
+    (Check::Unavailable, None, None)
 }
 
 /// Why a check runs.
@@ -608,7 +611,14 @@ pub fn turn_ended(ledger: &InputLedger, runtime: &dyn Runtime, session: &str, tu
                 if !carried && record.turn_id.is_some() {
                     continue;
                 }
-                let (result, item) = check_bound(runtime, &record, Some(turn));
+                let (result, item, receipt_turn) = check_full(runtime, &record, Some(turn));
+                // A late terminal event is not proof that an unbound bus
+                // input belongs to that old turn. Its current native claim
+                // may be in the different turn that is still running.
+                if !carried && is_bus(record.kind) && result == Check::Unpersisted
+                    && runtime.view(session).active_turn.as_deref().is_some_and(|active| active != turn) {
+                    continue;
+                }
                 // Held for another reason (plan mode, size policy) was never
                 // in this turn: the bus projection keeps that record.
                 if !carried && matches!(&result, Check::Held(reason) if reason.as_deref() != Some("interrupted")) {
@@ -623,7 +633,7 @@ pub fn turn_ended(ledger: &InputLedger, runtime: &dyn Runtime, session: &str, tu
                     Some(_) if interrupted_hold => Some(
                         Next::accepted().turn(turn).deadline(Some(after(now, INTERRUPTED_RECHECK))),
                     ),
-                    Some(next) => bind_checked(Some(next), item),
+                    Some(next) => bind_receipt_turn(bind_checked(Some(next), item), receipt_turn.clone()),
                     // Unreachable now: the receipt deadline decides.
                     None if carried && result == Check::Unavailable => Some(
                         Next::accepted().deadline(Some(after(now, ledger.deadlines().receipt_grace))),
@@ -635,7 +645,7 @@ pub fn turn_ended(ledger: &InputLedger, runtime: &dyn Runtime, session: &str, tu
                     // step): it was read in, so it belongs to the timeline.
                     let taken = matches!(result, Check::Persisted(_) | Check::Held(_) | Check::Unpersisted);
                     if !carried && taken && next.state != InputState::Accepted {
-                        next = next.turn(turn);
+                        next = next.turn(receipt_turn.as_deref().unwrap_or(turn));
                         // An owner record moves by the ledger rule (only once
                         // read, r274.2): an uncertain one keeps its surface.
                         if record.kind != InputKind::Owner && matches!(record.surface, Surface::NextUp | Surface::PendingNotes) {
@@ -1237,7 +1247,13 @@ impl Engine {
         }
         if let Some(cutex) = &event.cutex {
             match cutex.method.as_str() {
-                il::STATE_CHANGED_EVENT | il::DELIVERY_CHANGED_EVENT | "cutex/stream/reset" => {}
+                il::STATE_CHANGED_EVENT => {
+                    let record = &cutex.params["record"];
+                    if matches!(record["kind"].as_str(), Some("agentMessage" | "peerMessage"))
+                        && matches!(record["state"].as_str(), Some("waiting" | "held"))
+                        && record["wakeSchedule"].is_null() { dirty.insert(session.to_string()); }
+                }
+                il::DELIVERY_CHANGED_EVENT | "cutex/stream/reset" => {}
                 "cutex/runtime/onlineRequested" => {
                     self.starting.insert(session.to_string(), Instant::now());
                     dirty.insert(session.to_string());
@@ -1303,6 +1319,7 @@ impl Engine {
         let mut facts = delivery_facts(ledger, session, view.clone());
         facts.starting = starting;
         let delivery = session_delivery(&facts, now);
+        super::input_ledger_wake::refresh(ledger, session, &delivery);
         self.stall(ledger, session, delivery["state"] == "idle", now);
         self.stuck_owner(ledger, session, &view, facts.lease.as_ref(), now);
         match ledger.delivery_changed(session, &delivery) {

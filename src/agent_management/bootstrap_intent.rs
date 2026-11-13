@@ -112,6 +112,7 @@ impl BootstrapExecutionPermit<'_> {
                 .get_mut(&adopted.key)
                 .ok_or_else(|| anyhow::anyhow!("bootstrap adoption missing"))?;
             record.stamp_created_by_at_creation(creator.as_ref())?;
+            record.memory_injection = spec.memory_injection;
             record.formal_agent_name = Some(spec.name.clone());
             // Existing Bus routing metadata, explicitly included in review;
             // this is not Cutex Project membership or an identity inference.

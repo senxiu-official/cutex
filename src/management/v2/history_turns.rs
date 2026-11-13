@@ -26,7 +26,7 @@
 //! references too.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use serde_json::{Map, Value};
 
@@ -81,7 +81,7 @@ pub struct TurnShaper<'a> {
 struct Scope {
     key: Key,
     live: bool,
-    fence: u64,
+    fence: Arc<()>,
 }
 
 struct CachedTurn {
@@ -105,7 +105,15 @@ impl<'a> TurnShaper<'a> {
 
     /// Start a page read for `key` (`live`: the runtime's own reader).
     pub(super) fn begin(&mut self, key: &Key, live: bool) {
-        let fence = cache().fences.get(self.session).copied().unwrap_or(0);
+        let retain = super::session_cache_lifecycle::may_retain(self.session);
+        if !retain { invalidate(self.session); }
+        let fence = {
+            let mut cache = cache();
+            cache.fences.retain(|_, token| token.strong_count() > 0);
+            let fence = cache.fences.get(self.session).and_then(Weak::upgrade).unwrap_or_else(|| Arc::new(()));
+            if retain { cache.fences.insert(self.session.to_string(), Arc::downgrade(&fence)); }
+            fence
+        };
         self.scope = Some(Scope { key: key.clone(), live, fence });
         self.refs = 0;
         self.shaped = false;
@@ -137,6 +145,7 @@ impl<'a> TurnShaper<'a> {
         let meta = meta(turn);
         let now = std::time::Instant::now();
         let mut cache = cache();
+        if !current_fence(&cache, self.session, &scope.fence) { return false; }
         match cache.settling.get(&scope.key) {
             Some(seen) if seen.id == id && seen.meta == meta => now.duration_since(seen.since) >= settle(),
             _ => {
@@ -250,7 +259,7 @@ struct Slot {
 struct Cache {
     turns: HashMap<(Key, bool, String), Slot>,
     /// Bumped by `invalidate`; a read that began before it does not publish.
-    fences: HashMap<String, u64>,
+    fences: HashMap<String, Weak<()>>,
     bytes: usize,
     /// Per live binding: its newest finished turn and since when it is
     /// listed so (`TurnShaper::cacheable`).
@@ -277,7 +286,7 @@ fn next_clock() -> u64 {
 
 fn put(session: &str, scope: &Scope, compact: bool, id: String, turn: CachedTurn) {
     let mut cache = cache();
-    if cache.fences.get(session).copied().unwrap_or(0) != scope.fence {
+    if !current_fence(&cache, session, &scope.fence) {
         return;
     }
     cache.bytes += turn.bytes;
@@ -299,7 +308,7 @@ fn put(session: &str, scope: &Scope, compact: bool, id: String, turn: CachedTurn
 /// reads in flight.
 pub fn invalidate(session: &str) {
     let mut cache = cache();
-    *cache.fences.entry(session.to_string()).or_insert(0) += 1;
+    cache.fences.remove(session);
     let mut freed = 0;
     cache.turns.retain(|_, slot| {
         let keep = slot.session != session;
@@ -310,6 +319,19 @@ pub fn invalidate(session: &str) {
     });
     cache.bytes -= freed;
     cache.settling.retain(|_, seen| seen.session != session);
+    super::session_cache_lifecycle::shrink(&mut cache.fences);
+    super::session_cache_lifecycle::shrink(&mut cache.turns);
+    super::session_cache_lifecycle::shrink(&mut cache.settling);
+}
+
+fn current_fence(cache: &Cache, session: &str, token: &Arc<()>) -> bool {
+    cache.fences.get(session).and_then(Weak::upgrade).is_some_and(|current| Arc::ptr_eq(&current, token))
+}
+
+pub(super) fn cached_sessions() -> Vec<String> {
+    let cache = cache();
+    cache.fences.keys().cloned().chain(cache.turns.values().map(|slot| slot.session.clone()))
+        .chain(cache.settling.values().map(|slot| slot.session.clone())).collect()
 }
 
 #[cfg(test)]

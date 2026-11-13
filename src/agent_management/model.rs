@@ -215,6 +215,9 @@ pub struct AgentOperatorAuditEvent {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedAgentSpec {
+    /// Project-memory prompt injection and idle reminders at the next launch (default true).
+    #[serde(default = "crate::session::model::default_memory_injection", rename = "memoryInjection", alias = "memory_injection", skip_serializing_if = "crate::session::model::is_memory_injection_default")]
+    pub memory_injection: bool,
     pub name: String,
     /// Normalized on input (`session::metadata::normalize_session_cwd`).
     #[serde(deserialize_with = "crate::session::metadata::deserialize_session_cwd")]
@@ -1082,6 +1085,7 @@ pub struct AgentReservationReconciliationResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentManagementError {
+    CreatorPathsChanged(String),
     InvalidRequest(&'static str),
     /// A deterministic, pre-effect request rejection with an actionable detail.
     InvalidRequestDetail(String),
@@ -1129,6 +1133,7 @@ the project Director is the Agent Management authority only.";
 impl AgentManagementError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::CreatorPathsChanged(_) => "creator_paths_changed",
             Self::InvalidRequest(_) | Self::InvalidRequestDetail(_) => "invalid_request",
             Self::Unauthorized => "unauthorized",
             Self::NotAuthorizedDirector => "not_authorized_director",
@@ -1161,6 +1166,7 @@ impl AgentManagementError {
     pub fn wire(&self) -> (String, String) {
         let class = self.code();
         match self {
+            Self::CreatorPathsChanged(id) => (self.code().into(), format!("{}: {}", id, super::creator_paths::CHANGED)),
             Self::NameConflict(error) => (error.code.to_string(), error.message.clone()),
             Self::InvalidRequest(reason) | Self::NotFound(reason) | Self::Conflict(reason)
                 if is_reason_token(reason) =>
@@ -1202,6 +1208,7 @@ fn is_reason_token(value: &str) -> bool {
 impl fmt::Display for AgentManagementError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CreatorPathsChanged(id) => write!(formatter, "{}: {}: {}", self.code(), id, super::creator_paths::CHANGED),
             Self::NameConflict(error) => fmt::Display::fmt(error, formatter),
             Self::InvalidRequest(reason)
             | Self::NotFound(reason)

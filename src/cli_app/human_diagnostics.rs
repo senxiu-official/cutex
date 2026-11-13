@@ -1,7 +1,7 @@
 //! Local diagnostics remain available when Management or Bus cannot start.
 use serde_json::json;
 
-pub(super) fn run(selector: Option<&str>, check: bool, fix: bool, yes: bool) -> anyhow::Result<()> {
+pub(super) fn run(selector: Option<&str>, check: bool, fix: bool, yes: bool, finding_id: Option<&str>) -> anyhow::Result<()> {
     if check || fix {
         let selected = selector.map(super::human::resolve_id).transpose()?;
         let mut report = cutex::management::v2::health::scan()?;
@@ -12,7 +12,7 @@ pub(super) fn run(selector: Option<&str>, check: bool, fix: bool, yes: bool) -> 
         }
         if fix {
             report = cutex::management::v2::health::fix(&cutex::management::v2::health::FixRequest {
-                finding_ids: Some(report["findings"].as_array().unwrap().iter().filter_map(|f| f["id"].as_str().map(str::to_owned)).collect()),
+                finding_ids: Some(selected_findings(&report, finding_id)?),
                 dry_run: !yes,
             }, super::management_context::management_request_context()).map_err(anyhow::Error::new)?;
         }
@@ -52,6 +52,17 @@ pub(super) fn run(selector: Option<&str>, check: bool, fix: bool, yes: bool) -> 
     });
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn selected_findings(report: &serde_json::Value, finding_id: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let findings = report["findings"].as_array().ok_or_else(|| anyhow::anyhow!("health report missing findings"))?;
+    if let Some(id) = finding_id {
+        anyhow::ensure!(findings.iter().any(|finding| finding["id"] == id),
+            "finding_changed: exact finding is absent from the selected session; scan again");
+        Ok(vec![id.to_owned()])
+    } else {
+        Ok(findings.iter().filter_map(|finding| finding["id"].as_str().map(str::to_owned)).collect())
+    }
 }
 
 fn process_executable(pid: u32) -> Option<std::path::PathBuf> {
@@ -94,4 +105,27 @@ fn running_cutex_executables() -> Vec<serde_json::Value> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod occurrence_recovery_selection_tests {
+    use super::*;
+    #[test]
+    fn occurrence_exact_finding_selection_cannot_expand_to_new_or_other_session_findings() {
+        let report=json!({"findings":[{"id":"health-exact"},{"id":"health-new-unrelated"}]});
+        assert_eq!(selected_findings(&report,Some("health-exact")).unwrap(),vec!["health-exact"]);
+        assert!(selected_findings(&report,Some("health-stale")).unwrap_err().to_string().starts_with("finding_changed:"));
+        let selected_session=json!({"findings":[{"id":"health-target-only"}]});assert!(selected_findings(&selected_session,Some("health-exact")).is_err());
+        assert_eq!(selected_findings(&report,None).unwrap().len(),2);
+    }
+    #[test]
+    fn occurrence_doctor_parser_requires_fix_for_exact_finding_and_keeps_dry_run_default() {
+        use clap::Parser;
+        use cutex::cli::args::Cli;
+        assert!(Cli::try_parse_from(["cutex","human","doctor","cutex.private","--finding-id","health-exact"]).is_err());
+        for suffix in [vec!["--fix","--finding-id","health-exact"],vec!["--fix","--finding-id","health-exact","--yes"]] {
+            let mut args=vec!["cutex","human","doctor","cutex.private"];args.extend(suffix);
+            let parsed=Cli::try_parse_from(args).unwrap();let debug=format!("{parsed:?}");assert!(debug.contains("finding_id: Some(\"health-exact\")"));
+        }
+    }
 }

@@ -359,3 +359,17 @@ mod tests {
         assert!(require_session(&record).unwrap_err().to_string().contains("runtime file missing"));
     }
 }
+
+
+#[cfg(test)]
+mod memory_injection_switch_tests {
+    use super::*;
+    #[test]
+    fn memory_injection_disabled_dsh_keeps_agents_source_without_index_or_idle_snapshot() {
+        let fixture = crate::memory::switch_test_support::disabled();
+        let (text, sources, snapshot) = instructions_with_snapshot(&fixture.record);
+        crate::memory::switch_test_support::assert_disabled(&text.unwrap());
+        assert!(sources.contains(&fixture.cwd.join("AGENTS.md")));
+        assert!(snapshot.is_none());
+    }
+}

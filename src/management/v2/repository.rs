@@ -245,12 +245,25 @@ pub struct EventSubscription {
     _live: Arc<()>,
 }
 
-type Subscriber = (mpsc::SyncSender<QueuedEvent>, Arc<AtomicBool>, Weak<()>, Arc<super::live_deltas::StreamWake>);
+type Subscriber = (mpsc::SyncSender<QueuedEvent>, Arc<AtomicBool>, Weak<()>, Arc<super::live_deltas::StreamWake>, Arc<AtomicU64>, Weak<ReceiverQueue>);
+
+// Event-count limits alone allow image/tool payloads to retain gigabytes per
+// slow reader. These encoded-byte budgets complement the bounded channel.
+const SUBSCRIBER_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const SUBSCRIBERS_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Default)]
 struct SubscriptionMetrics {
     events: AtomicU64,
     bytes: AtomicU64,
+    queues: Mutex<Vec<QueueRegistration>>,
+}
+
+struct QueueRegistration {
+    queue: Weak<ReceiverQueue>,
+    bytes: Weak<AtomicU64>,
+    lagged: Weak<AtomicBool>,
+    wake: Weak<super::live_deltas::StreamWake>,
 }
 
 /// Charge follows the channel item, including after its sender is removed on lag.
@@ -259,12 +272,14 @@ struct QueuedEvent {
     event: Option<EventEnvelope>,
     bytes: u64,
     metrics: Arc<SubscriptionMetrics>,
+    subscriber_bytes: Arc<AtomicU64>,
 }
 impl QueuedEvent {
-    fn new(event: EventEnvelope, bytes: usize, metrics: &Arc<SubscriptionMetrics>) -> Self {
+    fn new(event: EventEnvelope, bytes: usize, metrics: &Arc<SubscriptionMetrics>, subscriber_bytes: &Arc<AtomicU64>) -> Self {
         metrics.events.fetch_add(1, Ordering::Relaxed);
         metrics.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-        Self { event: Some(event), bytes: bytes as u64, metrics: metrics.clone() }
+        subscriber_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        Self { event: Some(event), bytes: bytes as u64, metrics: metrics.clone(), subscriber_bytes: subscriber_bytes.clone() }
     }
     fn into_event(mut self) -> EventEnvelope { self.event.take().expect("queued event") }
 }
@@ -272,16 +287,52 @@ impl Drop for QueuedEvent {
     fn drop(&mut self) {
         self.metrics.events.fetch_sub(1, Ordering::Relaxed);
         self.metrics.bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.subscriber_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 
-pub struct EventReceiver(mpsc::Receiver<QueuedEvent>);
+struct ReceiverQueue {
+    receiver: Mutex<mpsc::Receiver<QueuedEvent>>,
+    ready: std::sync::Condvar,
+    closed: AtomicBool,
+}
+
+impl ReceiverQueue {
+    fn notify(&self) {
+        let _guard = self.receiver.lock().unwrap_or_else(|e| e.into_inner());
+        self.ready.notify_all();
+    }
+
+    fn discard(&self) {
+        self.closed.store(true, Ordering::Release);
+        let receiver = self.receiver.lock().unwrap_or_else(|e| e.into_inner());
+        // Global pressure disconnects the largest holder and releases its
+        // queued copies immediately. Durable journal replay supplies them.
+        for event in receiver.try_iter() { drop(event); }
+        self.ready.notify_all();
+    }
+}
+
+pub struct EventReceiver(Arc<ReceiverQueue>);
 impl EventReceiver {
     pub fn try_recv(&self) -> Result<EventEnvelope, mpsc::TryRecvError> {
-        self.0.try_recv().map(QueuedEvent::into_event)
+        let result = self.0.receiver.lock().unwrap_or_else(|e| e.into_inner()).try_recv().map(QueuedEvent::into_event);
+        if matches!(result, Err(mpsc::TryRecvError::Empty)) && self.0.closed.load(Ordering::Acquire) { Err(mpsc::TryRecvError::Disconnected) } else { result }
     }
     pub fn recv_timeout(&self, timeout: std::time::Duration) -> Result<EventEnvelope, mpsc::RecvTimeoutError> {
-        self.0.recv_timeout(timeout).map(QueuedEvent::into_event)
+        let deadline = std::time::Instant::now() + timeout;
+        let mut receiver = self.0.receiver.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => return Ok(event.into_event()),
+                Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvTimeoutError::Disconnected),
+                Err(mpsc::TryRecvError::Empty) if self.0.closed.load(Ordering::Acquire) => return Err(mpsc::RecvTimeoutError::Disconnected),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { return Err(mpsc::RecvTimeoutError::Timeout); }
+            receiver = self.0.ready.wait_timeout(receiver, remaining).unwrap_or_else(|e| e.into_inner()).0;
+        }
     }
     pub fn try_iter(&self) -> impl Iterator<Item = EventEnvelope> + '_ {
         std::iter::from_fn(|| self.try_recv().ok())
@@ -512,6 +563,7 @@ impl EventRepository {
                 "queuedEvents":self.subscription_metrics.events.load(Ordering::Relaxed),
                 "queuedEncodedBytes":self.subscription_metrics.bytes.load(Ordering::Relaxed),
                 "byteDefinition":"compact_json_envelope_excluding_newline_per_queued_copy",
+                "maxSubscriberEncodedBytes":SUBSCRIBER_MAX_BYTES,"maxQueuedEncodedBytes":SUBSCRIBERS_MAX_BYTES,
                 "excludesReplayAndDequeued":true}),
             Err(_) => serde_json::json!({"available":false}),
         };
@@ -671,6 +723,9 @@ impl EventRepository {
             }
             for (envelope, _, _, _, bytes) in &staged {
                 repository.publish(envelope, Some(*bytes));
+                // Already fsynced, still in commit order. Capture sends only
+                // a bounded in-memory hint; it never does IO under this lock.
+                crate::artifacts::capture::on_durable_event(envelope);
             }
             Ok((results, staged))
         });
@@ -808,7 +863,7 @@ impl EventRepository {
         let Ok(mut subscribers) = self.subscribers.lock() else {
             return false;
         };
-        subscribers.retain(|(_, lagged, live, _)| live.strong_count() > 0 && !lagged.load(Ordering::SeqCst));
+        subscribers.retain(|(_, lagged, live, _, _, _)| live.strong_count() > 0 && !lagged.load(Ordering::SeqCst));
         !subscribers.is_empty()
     }
 
@@ -834,9 +889,16 @@ impl EventRepository {
                 *repository.live_checkpoint.lock().unwrap_or_else(|e| e.into_inner()) = Some(page.checkpoint.clone());
             }
             let (sender, receiver) = mpsc::sync_channel(capacity);
+            let receiver = Arc::new(ReceiverQueue { receiver: Mutex::new(receiver), ready: std::sync::Condvar::new(), closed: AtomicBool::new(false) });
             let lagged = Arc::new(AtomicBool::new(false));
             let live = Arc::new(());
             let wake = Arc::new(super::live_deltas::StreamWake::default());
+            let subscriber_bytes = Arc::new(AtomicU64::new(0));
+            {
+                let mut queues = repository.subscription_metrics.queues.lock().unwrap_or_else(|e| e.into_inner());
+                queues.retain(|entry| entry.queue.strong_count() > 0);
+                queues.push(QueueRegistration { queue: Arc::downgrade(&receiver), bytes: Arc::downgrade(&subscriber_bytes), lagged: Arc::downgrade(&lagged), wake: Arc::downgrade(&wake) });
+            }
             repository
                 .subscribers
                 .lock()
@@ -845,7 +907,7 @@ impl EventRepository {
                         "management v2 subscriber lock was poisoned"
                     ))
                 })?
-                .push((sender, lagged.clone(), Arc::downgrade(&live), wake.clone()));
+                .push((sender, lagged.clone(), Arc::downgrade(&live), wake.clone(), subscriber_bytes, Arc::downgrade(&receiver)));
             Ok(EventSubscription {
                 page,
                 receiver: EventReceiver(receiver),
@@ -888,7 +950,7 @@ impl EventRepository {
                     // Retention overtook the follower. Reconnect/resync rather
                     // than silently skip the missing prefix for any reader.
                     let mut subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
-                    for (_, lagged, _, wake) in subscribers.iter() { lagged.store(true, Ordering::SeqCst); wake.notify(); }
+                    for (_, lagged, _, wake, _, _) in subscribers.iter() { lagged.store(true, Ordering::SeqCst); wake.notify(); }
                     subscribers.clear();
                     *self.live_checkpoint.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     return Ok(count);
@@ -2439,13 +2501,37 @@ impl EventRepository {
         let bytes = if subscribers.is_empty() { 0 } else {
             encoded_bytes.unwrap_or_else(|| super::event_blobs::encoded_len(envelope))
         };
-        subscribers.retain(|(sender, lagged, live, wake)| {
-            if live.strong_count() == 0 { return false; }
-            match sender.try_send(QueuedEvent::new(envelope.clone(), bytes, &self.subscription_metrics)) {
-                Ok(()) => { wake.notify(); true },
+        // Make room by retiring holders of existing bytes, not whichever
+        // healthy subscriber happens to be visited when the budget fills.
+        subscribers.retain(|(_, _, live, _, _, _)| live.strong_count() > 0);
+        loop {
+            let admissions = subscribers.iter().filter(|sub| !sub.1.load(Ordering::SeqCst) && sub.4.load(Ordering::Relaxed).saturating_add(bytes as u64) <= SUBSCRIBER_MAX_BYTES).count();
+            if self.subscription_metrics.bytes.load(Ordering::Relaxed).saturating_add((bytes as u64).saturating_mul(admissions as u64)) <= SUBSCRIBERS_MAX_BYTES { break; }
+            let mut queues = self.subscription_metrics.queues.lock().unwrap_or_else(|e| e.into_inner());
+            queues.retain(|entry| entry.queue.strong_count() > 0);
+            let Some(holder) = queues.iter().max_by_key(|entry| entry.bytes.upgrade().map_or(0, |bytes| bytes.load(Ordering::Relaxed))) else { break; };
+            if holder.bytes.upgrade().map_or(0, |bytes| bytes.load(Ordering::Relaxed)) == 0 { break; }
+            if let Some(lagged) = holder.lagged.upgrade() { lagged.store(true, Ordering::SeqCst); }
+            if let Some(queue) = holder.queue.upgrade() { queue.discard(); }
+            if let Some(wake) = holder.wake.upgrade() { wake.notify(); }
+        }
+        subscribers.retain(|(sender, lagged, live, wake, subscriber_bytes, queue)| {
+            if live.strong_count() == 0 || lagged.load(Ordering::SeqCst) { return false; }
+            // This mutex serializes all enqueues; concurrent dequeue/drop only
+            // reduces the charges. Test the budget before cloning the payload.
+            if subscriber_bytes.load(Ordering::Relaxed).saturating_add(bytes as u64) > SUBSCRIBER_MAX_BYTES
+                || self.subscription_metrics.bytes.load(Ordering::Relaxed).saturating_add(bytes as u64) > SUBSCRIBERS_MAX_BYTES {
+                lagged.store(true, Ordering::SeqCst);
+                wake.notify();
+                if let Some(queue) = queue.upgrade() { queue.closed.store(true, Ordering::Release); queue.notify(); }
+                return false;
+            }
+            match sender.try_send(QueuedEvent::new(envelope.clone(), bytes, &self.subscription_metrics, subscriber_bytes)) {
+                Ok(()) => { wake.notify(); if let Some(queue) = queue.upgrade() { queue.notify(); } true },
                 Err(mpsc::TrySendError::Full(_)) => {
                     lagged.store(true, Ordering::SeqCst);
                     wake.notify();
+                    if let Some(queue) = queue.upgrade() { queue.closed.store(true, Ordering::Release); queue.notify(); }
                     false
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => false,
@@ -2935,6 +3021,94 @@ mod tests {
     }
 
     #[test]
+    fn subscription_byte_budget_lags_before_count_limit_and_releases_charges() {
+        let root = test_root("subscription-byte-budget");
+        let repo = EventRepository::open(&root, "devbox").unwrap();
+        let mut envelope = repo.append(pending("s", 1)).unwrap();
+        envelope.cutex.as_mut().unwrap().params = json!({"text":"x".repeat(1024 * 1024)});
+        let sub = repo.page_and_subscribe(ReplayQuery::default(), 1024).unwrap();
+        for _ in 0..10 { repo.publish(&envelope, None); }
+        assert!(sub.lagged.load(Ordering::SeqCst));
+        let metrics = repo.queue_diagnostics();
+        assert!(metrics["durableSubscriptions"]["queuedEvents"].as_u64().unwrap() < 10);
+        assert!(repo.subscription_metrics.bytes.load(Ordering::Relaxed) <= SUBSCRIBER_MAX_BYTES);
+        assert!(!repo.has_live_subscribers());
+        while sub.receiver.try_recv().is_ok() {}
+        assert_eq!(repo.subscription_metrics.bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(repo.subscription_metrics.events.load(Ordering::Relaxed), 0);
+        drop(sub);
+        drop(repo);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subscriptions_share_a_global_byte_budget_even_after_senders_lag() {
+        let root = test_root("subscription-global-budget");
+        let repo = EventRepository::open(&root, "devbox").unwrap();
+        let envelope = repo.append(pending("s", 1)).unwrap();
+        let mut subs = Vec::new();
+        for _ in 0..64 { subs.push(repo.page_and_subscribe(ReplayQuery::default(), 1024).unwrap()); }
+        // Charge large envelopes without allocating 64 MiB of test payloads.
+        for _ in 0..7 { repo.publish(&envelope, Some(1024 * 1024)); }
+        assert!(subs.iter().any(|sub| sub.lagged.load(Ordering::SeqCst)));
+        assert!(subs.iter().any(|sub| !sub.lagged.load(Ordering::SeqCst)));
+        assert!(repo.subscription_metrics.bytes.load(Ordering::Relaxed) <= SUBSCRIBERS_MAX_BYTES);
+        assert!(repo.has_live_subscribers());
+        drop(subs);
+        assert_eq!(repo.subscription_metrics.bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(repo.subscription_metrics.events.load(Ordering::Relaxed), 0);
+        drop(repo);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn global_byte_pressure_evicts_largest_holders_and_keeps_draining_reader() {
+        let root = test_root("subscription-largest-holder");
+        let repo = EventRepository::open(&root, "devbox").unwrap();
+        let event = repo.append(pending("s", 1)).unwrap();
+        let mut holders = Vec::new();
+        for _ in 0..8 { holders.push(repo.page_and_subscribe(ReplayQuery::default(), 1024).unwrap()); }
+        let healthy = repo.page_and_subscribe(ReplayQuery::default(), 1024).unwrap();
+        // This client drains each event, while the others retain almost 8 MiB.
+        for _ in 0..7 {
+            repo.publish(&event, Some(1024 * 1024));
+            assert_eq!(healthy.receiver.try_recv().unwrap(), event);
+        }
+        repo.publish(&event, Some(1024 * 1024));
+        assert!(holders.iter().any(|sub| sub.lagged.load(Ordering::SeqCst)));
+        assert!(!healthy.lagged.load(Ordering::SeqCst));
+        assert_eq!(healthy.receiver.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), event);
+        assert!(repo.subscription_metrics.bytes.load(Ordering::Relaxed) <= SUBSCRIBERS_MAX_BYTES);
+        for sub in &holders {
+            if sub.lagged.load(Ordering::SeqCst) {
+                assert!(matches!(sub.receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+            }
+        }
+        drop((holders, healthy, repo));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn byte_budget_lag_preserves_durable_replay() {
+        let root = test_root("subscription-oversize-replay");
+        let repo = EventRepository::open(&root, "devbox").unwrap();
+        let first = repo.append(pending("s", 1)).unwrap();
+        let sub = repo.page_and_subscribe(ReplayQuery::default(), 1024).unwrap();
+        // Fill the byte charge without needing a giant test journal payload.
+        repo.publish(&first, Some(SUBSCRIBER_MAX_BYTES as usize));
+        let event = repo.append(pending("s", 2)).unwrap();
+        assert!(sub.lagged.load(Ordering::SeqCst));
+        let page = repo.page(ReplayQuery { stream_id:Some(first.stream_id.clone()), after:Some(first.cursor.clone()), ..ReplayQuery::default() }).unwrap();
+        assert_eq!(page.events, vec![event]);
+        assert_eq!(sub.receiver.try_recv().unwrap(), first);
+        assert_eq!(repo.subscription_metrics.bytes.load(Ordering::Relaxed), 0);
+        drop(page);
+        drop(sub);
+        drop(repo);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     #[ignore = "manual diagnostic overhead probe; prints timings, no timing assertions"]
     fn subscription_diagnostics_overhead_probe() {
         let root = test_root("diagnostics-overhead");
@@ -2948,6 +3122,7 @@ mod tests {
         }
         eprintln!("diagnostics_count_writer bytes={bytes} iterations=128 elapsed_us={}", started.elapsed().as_micros());
         let metrics = Arc::new(SubscriptionMetrics::default());
+        let subscriber_bytes = Arc::new(AtomicU64::new(0));
         let (raw_tx, raw_rx) = mpsc::sync_channel(1);
         let (tx, rx) = mpsc::sync_channel(1);
         // Interleave the two paths to reduce allocator/thermal order effects.
@@ -2958,7 +3133,7 @@ mod tests {
             std::hint::black_box(raw_rx.try_recv().unwrap());
             raw_ns += started.elapsed().as_nanos();
             let started = std::time::Instant::now();
-            assert!(tx.try_send(QueuedEvent::new(event.clone(), bytes, &metrics)).is_ok());
+            assert!(tx.try_send(QueuedEvent::new(event.clone(), bytes, &metrics, &subscriber_bytes)).is_ok());
             std::hint::black_box(rx.try_recv().unwrap().into_event());
             measured_ns += started.elapsed().as_nanos();
         }

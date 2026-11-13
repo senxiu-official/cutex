@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:quick-chat-promote",
+  "title": "Promote an offline quick chat",
+  "description": "Root Human only. Keeps session/native identity, cwd and history. Requires no runtime or launch claim. Idempotency is scoped to sessionId + requestId; repeat identical payload to recover. 200 complete=false means the durable promotion committed but roster import/project assignment is incomplete; retry the same request. Startup resumes unfinished receipts. Formal names retain the existing host-wide current-name uniqueness guard; scoped old-name reservations also apply. Errors: 400 invalid_request/agent_name_invalid; 404 session_not_found/project_not_found; 409 revision_conflict/not_quick_chat/quick_chat_running/project_not_active/agent_name_conflict/agent_name_reserved/ambiguous_native_identity/promotion_in_progress/request_id_payload_conflict/unsupported_quick_chat; 503 admission_busy/persistence_unavailable.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/response"
+    }
+  ],
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedRevision",
+        "name"
+      ],
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740990
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "projectId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "cutexSessionId",
+        "name",
+        "projectId",
+        "revision",
+        "complete",
+        "error"
+      ],
+      "properties": {
+        "requestId": {
+          "type": "string"
+        },
+        "cutexSessionId": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

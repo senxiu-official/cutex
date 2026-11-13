@@ -134,6 +134,10 @@ pub enum ManagementNativeForwardError {
 
 #[derive(Clone, Copy)]
 pub struct ManagementRequestContext {
+    pub promote_quick_chat: fn(
+        &crate::management::control_plane::HumanManagementPrincipal, &str,
+        &crate::agent_management::QuickChatPromoteRequest,
+    ) -> anyhow::Result<crate::agent_management::QuickChatPromoteResult>,
     pub owner_archive_action: crate::management::v2::archive::api::Handler,
     pub explicit_launch_action:
         fn(
@@ -287,6 +291,7 @@ pub fn run_management_server_on(
     if let Err(error) = crate::management::v2::summary::start(context) {
         eprintln!("host summary unavailable: {error:#}");
     }
+    crate::artifacts::capture::start();
     if let Err(error) = crate::management::v2::project_events::start() {
         eprintln!("project events unavailable: {error:#}");
     }
@@ -321,6 +326,11 @@ fn serve_management_connection(mut stream: TcpStream, info: ConnectionInfo, slot
     let Some(shared) = SERVER.get() else {
         return;
     };
+    // SSE/raw writers bypass write_http_response, but must also release their
+    // stream/connection permits when the receiver stops draining the socket.
+    if stream.set_write_timeout(Some(crate::http::server::RESPONSE_WRITE_TIMEOUT)).is_err() {
+        return;
+    }
     let peer = info.peer;
     crate::management::listeners::set_current_connection(Some(info.clone()));
     let mut slot = Some(slot);
@@ -453,6 +463,7 @@ pub fn handle_admitted_management_request(
             return write_capacity_refusal(stream, &refusal);
         }
     };
+    let _work = crate::management::v2::control_capacity::response_permit_scope(_work);
     handle_parsed_management_request(
         stream, request, token, agent_management_admin_token, context, peer,
     )

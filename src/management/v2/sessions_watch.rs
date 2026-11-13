@@ -222,12 +222,24 @@ fn projects_stamp() -> anyhow::Result<Option<crate::agent_management::RosterStam
 
 static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
 
+fn inactive_cached_sessions(watch: &Watch, cached: impl IntoIterator<Item = String>) -> Vec<String> {
+    cached.into_iter().filter(|id| !watch.sessions.get(id).is_some_and(|row| row.archive_state == "active")).collect()
+}
+
 fn poll() -> anyhow::Result<()> {
     let projects = projects_stamp()?;
-    let changes = {
+    let cached = super::session_cache_lifecycle::cached_sessions();
+    let (changes, forgotten) = {
         let mut guard = WATCH.lock().unwrap_or_else(|e| e.into_inner());
-        keyed_step(guard.get_or_insert_with(Watch::default), projects)?
+        let watch = guard.get_or_insert_with(Watch::default);
+        let changes = keyed_step(watch, projects)?;
+        let forgotten = inactive_cached_sessions(watch, cached);
+        (changes, forgotten)
     };
+    // A budgeted delta page may not have reached a newly cached session yet.
+    // Resolve candidates against the authoritative row after dropping WATCH;
+    // both a stale page and a transient read error must preserve active caches.
+    for session in forgotten { forget_confirmed_inactive(&session); }
     if changes.is_empty() {
         return Ok(());
     }
@@ -239,6 +251,16 @@ fn poll() -> anyhow::Result<()> {
         SESSIONS_CHANGED_EVENT,
         event_params(&changes, &crate::platform::host::current_host_name()),
     )
+}
+
+fn confirmed_inactive<E>(state: Result<Option<bool>, E>) -> bool {
+    matches!(state, Ok(None | Some(false)))
+}
+
+fn forget_confirmed_inactive(session: &str) {
+    if confirmed_inactive(crate::session::store::shared_session_row(session).map(|row| row.map(|row| row.is_active()))) {
+        super::session_cache_lifecycle::forget(session);
+    }
 }
 
 fn watch_row(watch: &mut Watch, record: &Arc<CutexSessionRecord>) {
@@ -389,6 +411,61 @@ pub fn start_watcher() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_change_page_does_not_evict_an_active_or_unknown_session() {
+        let watch = Watch::default();
+        let candidates = inactive_cached_sessions(&watch, ["new-active-session".to_string()]);
+        assert_eq!(candidates.len(), 1);
+        assert!(!confirmed_inactive::<()>(Ok(Some(true))));
+        assert!(!confirmed_inactive::<()>(Err(())));
+        assert!(confirmed_inactive::<()>(Ok(None)));
+        assert!(confirmed_inactive::<()>(Ok(Some(false))));
+    }
+
+    #[test]
+    fn session_beyond_the_watch_page_keeps_its_lineage_until_durable_deletion() {
+        let id = format!("cutex.page-tail-{}", uuid::Uuid::new_v4());
+        let path = crate::session::store::cutex_sessions_path().unwrap();
+        crate::session::store::with_locked_session_rows(&path, |rows| {
+            rows.insert_session(id.clone(), record(&id, "tail"));
+            rows.commit()?;
+            Ok(())
+        }).unwrap();
+        super::super::subagent_lineage::record_edge(&id, "root", "child", "root");
+        let watch = Watch::default(); // its budgeted page has not reached id
+        for candidate in inactive_cached_sessions(&watch, [id.clone()]) { forget_confirmed_inactive(&candidate); }
+        assert!(super::super::subagent_lineage::is_descendant(&id, "root", "child"));
+        crate::session::store::with_locked_session_rows(&path, |rows| {
+            rows.remove_session(&id);
+            rows.commit()?;
+            Ok(())
+        }).unwrap();
+        forget_confirmed_inactive(&id);
+        assert!(!super::super::session_cache_lifecycle::cached_sessions().contains(&id));
+    }
+
+    #[test]
+    fn cache_reclamation_keeps_active_sessions_and_forgets_retired_and_deleted() {
+        let prefix = uuid::Uuid::new_v4().to_string();
+        let active = format!("cutex.active-{prefix}");
+        let retired = format!("cutex.retired-{prefix}");
+        let deleted = format!("cutex.deleted-{prefix}");
+        for id in [&active, &retired, &deleted] {
+            super::super::subagent_lineage::record_edge(id, "root", "child", "root");
+        }
+        let mut archived = record(&retired, "retired");
+        archived.archive_state = crate::session::model::CutexSessionArchiveState::Retired;
+        let mut watch = Watch::default();
+        watch.sessions = fingerprints(&store(&[record(&active, "active"), archived]));
+        let forgotten = inactive_cached_sessions(&watch, [active.clone(), retired.clone(), deleted.clone()]);
+        assert_eq!(forgotten, [retired.clone(), deleted.clone()]);
+        for id in forgotten { super::super::session_cache_lifecycle::forget(&id); }
+        assert!(super::super::subagent_lineage::is_descendant(&active, "root", "child"));
+        let cached = super::super::session_cache_lifecycle::cached_sessions();
+        assert!(!cached.contains(&retired) && !cached.contains(&deleted));
+        super::super::session_cache_lifecycle::forget(&active);
+    }
 
     fn record(id: &str, name: &str) -> CutexSessionRecord {
         let mut record = CutexSessionRecord::new_at(

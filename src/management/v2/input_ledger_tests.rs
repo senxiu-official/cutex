@@ -1,6 +1,9 @@
 use super::*;
 use chrono::TimeZone;
 
+#[path = "input_ledger_wake_tests.rs"]
+mod wake_schedule_tests;
+
 struct Fixture {
     root: PathBuf,
     ledger: InputLedger,
@@ -1104,6 +1107,48 @@ fn new_note(ledger: &InputLedger, session: &str, id: &str) -> Transition {
 }
 
 #[test]
+fn outbox_writers_queue_before_sqlite_without_spending_the_busy_timeout() {
+    let p = TwoProcesses::new(journal_append);
+    let session = session_name();
+    new_note(p.a, &session, "first");
+    p.b.epoch().unwrap();
+    let reader = InputLedger::open(p.a.path());
+    reader.epoch().unwrap();
+    {
+        let mut guard = p.b.lock().unwrap();
+        assert!(guard.writer.is_none(), "an established reader does not take the writer lock");
+        guard.connection.as_mut().unwrap().busy_timeout(Duration::ZERO).unwrap();
+    }
+    let (waiting, queued) = std::sync::mpsc::channel();
+    *p.b.writer_waiting.lock().unwrap() = Some(waiting);
+    let mut held = p.a.lock_write().unwrap();
+    let tx = held.connection.as_mut().unwrap().transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+    let (done, result) = std::sync::mpsc::channel();
+    let other = p.b;
+    let other_session = session.clone();
+    let writer = std::thread::spawn(move || {
+        done.send(other.transition(&other_session, "second", Expect::NEW,
+            Next::waiting("afterTurn").create(note(InputKind::AgentMessage, Timing::AfterTurn)))).unwrap();
+    });
+    // This event is emitted only after the real cross-process try-lock has
+    // reported contention. No sleep or race over whether the writer ran.
+    queued.recv_timeout(Duration::from_secs(10)).expect("second writer must queue before entering SQLite");
+    assert!(matches!(result.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    let revision = std::thread::scope(|threads| {
+        threads.spawn(|| reader.get(&session, &[]).unwrap().state_revision).join().unwrap()
+    });
+    assert_eq!(revision, 1, "WAL readers still proceed");
+    tx.commit().unwrap();
+    drop(held);
+    assert!(result.recv_timeout(Duration::from_secs(10)).unwrap().unwrap().changed);
+    writer.join().unwrap();
+    p.a.drain_outbox().unwrap();
+    assert_eq!(revisions(&session), vec![1, 2]);
+    assert!(!p.b.outbox_pending().unwrap());
+    let _ = std::fs::remove_dir_all(&p.root);
+}
+
+#[test]
 fn outbox_interleaved_commits_of_two_processes_reach_the_journal_in_revision_order() {
     let p = TwoProcesses::new(journal_append);
     let session = session_name();
@@ -1365,4 +1410,61 @@ fn refresh_open_actions_fixes_stored_actions_and_writes_nothing_otherwise() {
     // Done: a second pass does nothing. A session with no row or no delivery neither.
     assert!(!f.ledger.refresh_open_actions("s1").unwrap().changed);
     assert!(!f.ledger.refresh_open_actions("nobody").unwrap().changed);
+}
+
+
+#[test]
+fn dismiss_finishes_when_retry_projection_lands_after_source_settlement() {
+    let f = Fixture::new();
+    let before = f.go("result", Next::waiting("ownerRetry")
+        .create(note(InputKind::DelegationResult, Timing::AfterTurn))).unwrap().record;
+    let dismissed = dismiss_one_with(&f.ledger, "s1", "result", before.rev, |_| {
+        // The source settlement has completed. Its older, queued retry job
+        // now restores hold metadata before the owner's final ledger commit.
+        f.go("result", Next::waiting("ownerRetry")
+            .details(json!({"ownerHold": false, "askSourceVersion": 23}))).unwrap();
+        Ok(true)
+    });
+    eprintln!("deterministic dismiss reply failed[]: {:?}", dismissed.as_ref().err());
+    assert_eq!(dismissed.unwrap().record.state, InputState::Discarded);
+}
+
+
+#[test]
+fn dismiss_keeps_conflicts_for_native_progress_or_owner_hold_decision() {
+    for advance in [Next::sending(), Next::waiting("ownerRetry").details(json!({"ownerHold": true}))] {
+        let f = Fixture::new();
+        let before = f.go("result", Next::waiting("ownerRetry")
+            .create(note(InputKind::DelegationResult, Timing::AfterTurn))).unwrap().record;
+        let failure = dismiss_one_with(&f.ledger, "s1", "result", before.rev, |_| {
+            f.go("result", advance).unwrap();
+            Ok(true)
+        }).unwrap_err();
+        assert_eq!(failure["code"], "revision_conflict");
+        assert_ne!(f.ledger.get("s1", &["result".into()]).unwrap().records[0].state, InputState::Discarded);
+    }
+    let f = Fixture::new();
+    let before = f.go("result", Next::waiting("ownerRetry")
+        .create(note(InputKind::DelegationResult, Timing::AfterTurn))).unwrap().record;
+    let done = dismiss_one_with(&f.ledger, "s1", "result", before.rev, |_| {
+        f.go("result", Next::discarded("ownerDiscarded")).unwrap();
+        Ok(true)
+    }).unwrap();
+    assert_eq!(done.record.state, InputState::Discarded);
+    assert!(!done.changed, "source projection already published this decision");
+}
+
+
+#[test]
+fn dismiss_does_not_relax_revision_when_the_source_has_not_settled() {
+    let f = Fixture::new();
+    let before = f.go("result", Next::waiting("ownerRetry")
+        .create(note(InputKind::DelegationResult, Timing::AfterTurn))).unwrap().record;
+    let failure = dismiss_one_with(&f.ledger, "s1", "result", before.rev, |_| {
+        f.go("result", Next::waiting("ownerRetry")
+            .details(json!({"ownerHold": false, "askSourceVersion": 23}))).unwrap();
+        Ok(false)
+    }).unwrap_err();
+    assert_eq!(failure["code"], "revision_conflict");
+    assert_eq!(f.ledger.get("s1", &["result".into()]).unwrap().records[0].state, InputState::Waiting);
 }

@@ -565,11 +565,15 @@ pub fn native_item(session: &str, id: &str, input: &NewInput, turn: &str) -> Opt
 }
 
 pub(super) fn native_item_with_carry(session: &str, id: &str, input: &NewInput, turn: &str, carried: bool) -> Option<InputRecord> {
+    native_item_attempt(session, id, input, turn, carried, id)
+}
+
+pub(super) fn native_item_attempt(session: &str, id: &str, input: &NewInput, turn: &str, carried: bool, native_id: &str) -> Option<InputRecord> {
     if !active() {
         return None;
     }
     let record = current(session, id);
-    let mut read = Next::accepted().turn(turn).timeline_item(id);
+    let mut read = Next::accepted().turn(turn).timeline_item(native_id);
     if carried || record.as_ref().is_some_and(|record| record.reason.as_deref() == Some("carriedByOwner")) {
         read = read.reason("carriedByOwner");
     }

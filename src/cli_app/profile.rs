@@ -8,7 +8,7 @@ use cutex::config::atomic::{write_private_bytes_atomic, write_private_pretty_jso
 use cutex::config::global_settings::ConfigValueUpdate;
 use cutex::config::proxy::{effective_proxy_config, proxy_config_from_parts};
 use cutex::config::store::{
-    load_codez_config, load_quick_state, save_codez_config, save_quick_state,
+    load_codez_config, load_quick_state, update_codez_config, save_quick_state,
 };
 use cutex::config::text::{read_optional_text, write_optional_text_if_changed};
 use cutex::launch::docker::{
@@ -1309,9 +1309,14 @@ pub(crate) fn remove_profile(target: &str) -> anyhow::Result<ProfileRemoveResult
 
 struct ProfileReferencePersistence {
     state: QuickRunState,
-    config: CodezConfig,
+    config_change: ProfileConfigChange,
     sessions: CutexSessionStore,
     changes: ProfileReferenceChanges,
+}
+
+enum ProfileConfigChange {
+    Rename(String, String),
+    Remove(String),
 }
 
 impl ProfileReferencePersistence {
@@ -1319,9 +1324,13 @@ impl ProfileReferencePersistence {
         for key in &self.changes.session_keys {
             persist_cutex_session_store_and_im_record(&self.sessions, key)?;
         }
-        if self.changes.global_config_changed {
-            save_codez_config(&self.config)?;
-        }
+        update_codez_config(|config| {
+            match &self.config_change {
+                ProfileConfigChange::Rename(old, new) => { cutex::profiles::references::rename_global_profile_references(config, old, new); }
+                ProfileConfigChange::Remove(name) => { cutex::profiles::references::remove_global_profile_references(config, name); }
+            }
+            Ok(())
+        })?;
         if self.changes.quick_state_changed {
             save_quick_state(&self.state)?;
         }
@@ -1340,7 +1349,7 @@ fn prepare_renamed_profile_references(
         rename_all_profile_references(&mut state, &mut config, &mut sessions, old_name, new_name)?;
     Ok(ProfileReferencePersistence {
         state,
-        config,
+        config_change: ProfileConfigChange::Rename(old_name.to_owned(), new_name.to_owned()),
         sessions,
         changes,
     })
@@ -1356,7 +1365,7 @@ fn prepare_removed_profile_references(
         remove_all_profile_references(&mut state, &mut config, &mut sessions, removed_name)?;
     Ok(ProfileReferencePersistence {
         state,
-        config,
+        config_change: ProfileConfigChange::Remove(removed_name.to_owned()),
         sessions,
         changes,
     })

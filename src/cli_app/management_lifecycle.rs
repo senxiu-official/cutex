@@ -293,6 +293,13 @@ fn start_cutex_session_online_under_lane(
         .get_or_init(OperationLane::new)
         .lock()
         .map_err(|_| anyhow!("session online start lock was poisoned"))?;
+    // Legacy backfill writes internal path metadata. Do it before loading the
+    // store revision used for the native launch claim, so this start's own
+    // snapshot cannot invalidate that CAS or be overwritten by a stale store.
+    let path = cutex::session::store::cutex_sessions_path()?;
+    if let Some((_, record)) = cutex::session::store::load_session_row(&path, &reserved_key)? {
+        cutex::agent_management::creator_paths::before_start(&record)?;
+    }
     let mut store = load_cutex_session_store()?;
     let key = cutex_session_key_for_user_id(&store, &entry.session_id)
         .ok_or_else(|| anyhow!("cutex session is not known: {}", entry.session_id))?;

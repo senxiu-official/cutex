@@ -4,7 +4,7 @@ The open adapter owns RPC, FIFO inbox and host tool execution. The unmodified
 selected official runtime owns inference/authentication/native context. Local history
 is an audit projection, never replayed as a native Claude transcript.
 
-Public SDK API target: claude-agent-sdk 0.2.175. No credentials are extracted.
+Public SDK API target: claude-agent-sdk 0.2.180. No credentials are extracted.
 """
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ from .tool_gate import ENDED as GATE_ENDED, EXPIRED as GATE_EXPIRED, HOOK_TIMEOU
 # Largest single message read from Claude Code (SDK `max_buffer_size`; its default is 1 MiB).
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
-SDK_TARGET = '0.2.175'
+SDK_TARGET = '0.2.180'
 SERVER_NAME = 'cutex'
 CALL_FIELD = '_cutex_invocation'
 # Tools a subagent may use in plan mode (besides MCP tools).
@@ -606,6 +606,15 @@ class SdkToolBridge:
         self.children.pop(agent_id, None)
         return origin
 
+    def resume_background(self, agent_id: str, origin: tuple[str, str] | None) -> bool:
+        """Restore an original binding after a verified SDK task restart."""
+        if not isinstance(origin, tuple) or len(origin) != 2 or not all(isinstance(v, str) and v for v in origin):
+            return False
+        if len(self.background) >= MAX_BACKGROUND:
+            return False
+        self.background[agent_id] = origin
+        return True
+
     def background_agent(self, call_id: Any, agent_id: Any) -> str | None:
         """The background child a permission request belongs to, if any."""
         if isinstance(agent_id, str) and agent_id in self.background:
@@ -681,6 +690,15 @@ class SdkToolBridge:
     async def subagent_stop(self, data, tool_use_id, context):
         agent_id = data.get('agent_id')
         if isinstance(agent_id, str) and agent_id in self.background and data.get('session_id') == self.sid:
+            # CLI 2.1.321 can stop the child's model loop while its task is
+            # still running (e.g. a shell will wake it again). Its authenticated
+            # in-flight inventory outweighs this hook; the task's terminal
+            # event closes admission and sends the completion notice instead.
+            work = data.get('background_tasks')
+            if isinstance(work, list) and any(
+                    isinstance(task, dict) and task.get('id') == agent_id
+                    and task.get('status') in {'running', 'pending'} for task in work):
+                return {}
             # Kept until its task ends: a late tool hook of the child stays admitted.
             owner = getattr(self.engine.driver, 'owners', {}).get(self.tid)
             if owner:
@@ -928,7 +946,7 @@ class SubscriptionEngine(Engine):
         if row is None:
             return
         if row[0] == 'inProgress':
-            self.pending_task_usage.setdefault(turn_id, []).append(entry)
+            self._merge_task_usage(self.pending_task_usage.setdefault(turn_id, []), entry)
             return
         await self._append_turn_usage(tid, turn_id, [entry])
 
@@ -941,9 +959,21 @@ class SubscriptionEngine(Engine):
     async def _append_turn_usage(self, tid: str, turn_id: str, entries: list[dict]) -> None:
         row = self.store.db.execute('SELECT usage FROM turns WHERE id=?', (turn_id,)).fetchone()
         record = json.loads(row[0]) if row and row[0] else {}
-        calls = list(record.get('modelRequests') or []) + entries
+        calls = list(record.get('modelRequests') or [])
+        for entry in entries:
+            self._merge_task_usage(calls, entry)
         usage_totals.write_turn_usage(self.store, turn_id, {**record, 'modelRequests': calls})
         await self._emit_usage(tid, turn_id, calls, keep_last=True)
+
+    @staticmethod
+    def _merge_task_usage(calls: list[dict], entry: dict) -> None:
+        # Each restarted phase reports cumulative per-message usage for one task.
+        for old in calls:
+            if old.get('kind') == 'background-task' and old.get('taskId') == entry['taskId']:
+                counts = old.get('usage') or {}
+                old['usage'] = {**counts, **{k: max(v, counts.get(k, 0)) for k, v in entry['usage'].items()}}
+                return
+        calls.append(entry)
 
     def ensure_launch_thread(self, tid: str, model: str, cwd: str, instructions: str) -> bool:
         """Apply changed host launch defaults only while the native owner is offline.

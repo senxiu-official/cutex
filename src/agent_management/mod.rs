@@ -12,8 +12,11 @@ mod bootstrap_intent;
 mod create_abandon;
 mod durable_adoption;
 mod durable_import;
+mod quick_chat_promote;
+pub use quick_chat_promote::*;
 /// Child ⊆ creator permission check for agent-initiated launches.
 pub mod envelope;
+pub mod creator_paths;
 mod explicit_launch;
 mod fence_first;
 mod host_hold;

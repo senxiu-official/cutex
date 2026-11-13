@@ -44,6 +44,8 @@ pub enum ServiceRuntime {
     /// cutex runs the command, restarts it with backoff and keeps logs.
     /// `open` starts a stopped one.
     Managed,
+    /// A supervised process without a web endpoint; readiness is process liveness.
+    Worker,
     Static,
 }
 
@@ -52,6 +54,7 @@ impl ServiceRuntime {
         match self {
             Self::External => "external",
             Self::Managed => "managed",
+            Self::Worker => "worker",
             Self::Static => "static",
         }
     }
@@ -60,13 +63,14 @@ impl ServiceRuntime {
         match value {
             "external" => Some(Self::External),
             "managed" => Some(Self::Managed),
+            "worker" => Some(Self::Worker),
             "static" => Some(Self::Static),
             _ => None,
         }
     }
 
     pub fn supervised(self) -> bool {
-        matches!(self, Self::Managed)
+        matches!(self, Self::Managed | Self::Worker)
     }
 }
 
@@ -302,7 +306,7 @@ pub struct ServiceProvenance {
 
 /// The ceiling of a runtime: managed commands run unrestricted.
 pub fn ceiling_for(runtime: ServiceRuntime) -> Option<String> {
-    (runtime == ServiceRuntime::Managed).then(|| "unrestricted".to_string())
+    runtime.supervised().then(|| "unrestricted".to_string())
 }
 
 fn provenance_for(caller: &Caller) -> ServiceProvenance {
@@ -327,6 +331,13 @@ fn provenance_for(caller: &Caller) -> ServiceProvenance {
 }
 
 impl ServiceRecord {
+    pub fn require_view(&self) -> ServicesResult<()> {
+        if self.runtime == ServiceRuntime::Worker {
+            return Err(ServicesError::new(409, "service_has_no_view", "This worker has no web view."));
+        }
+        Ok(())
+    }
+
     /// What a supervised process depends on; a change restarts it.
     pub fn launch_fingerprint(&self) -> String {
         serde_json::to_string(&json!([self.command, self.cwd, self.env, self.port]))
@@ -768,6 +779,12 @@ fn validate_project_id(id: &str) -> ServicesResult<String> {
 
 /// Supervised runtimes need a command; external ones must not have one.
 fn validate_runtime_fields(record: &ServiceRecord) -> ServicesResult<()> {
+    if record.runtime == ServiceRuntime::Worker
+        && (record.port != 0 || record.path.is_some() || record.root.is_some()
+            || record.tile_path.is_some() || record.login_link_command.is_some())
+    {
+        return Err(ServicesError::bad_request("worker forbids port, path, root, tilePath and loginLinkCommand"));
+    }
     if record.runtime == ServiceRuntime::Static {
         if record.root.is_none()
             || record.port != 0
@@ -977,7 +994,8 @@ impl ServiceStore {
         let registry = self.load()?;
         Ok(registry.settings.ephemeral_idle_minutes == 0
             || registry.services.values().any(|record| {
-                record.purpose.is_some()
+                record.runtime == ServiceRuntime::Worker
+                    || record.purpose.is_some()
                     || record.purpose_owner_set
                     || record.idle_ttl_minutes.is_some()
                     || record.pinned
@@ -1121,9 +1139,15 @@ impl ServiceStore {
         let runtime = match request.runtime.as_deref() {
             None => ServiceRuntime::External,
             Some(value) => ServiceRuntime::parse(value).ok_or_else(|| {
-                ServicesError::bad_request("runtime must be external, managed or static")
+                ServicesError::bad_request("runtime must be external, managed, worker or static")
             })?,
         };
+        if runtime == ServiceRuntime::Worker
+            && (request.port.is_some() || request.path.is_some() || request.root.is_some()
+                || request.tile_path.is_some() || request.login_link_command.is_some() || request.reveal)
+        {
+            return Err(ServicesError::bad_request("worker forbids port, path, root, tilePath, loginLinkCommand and reveal"));
+        }
         if runtime == ServiceRuntime::Static
             && (request.port.is_some()
                 || request.command.is_some()
@@ -1221,6 +1245,9 @@ impl ServiceStore {
         let apply = |registry: &mut Registry| {
             let existing = registry.services.get(&request.slug).cloned();
             ensure_unchanged(existing.as_ref(), expected)?;
+            if existing.as_ref().is_some_and(|before| (before.runtime == ServiceRuntime::Worker) != (runtime == ServiceRuntime::Worker)) {
+                return Err(ServicesError::bad_request("worker runtime cannot be changed in place; unregister and register a new service"));
+            }
             validate_idle_ttl(request.idle_ttl_minutes, &registry.settings)?;
             if let Some(existing) = &existing {
                 match caller {
@@ -1249,7 +1276,7 @@ impl ServiceStore {
                     format!("at most {MAX_SERVICES} services per host"),
                 ));
             }
-            let (port, port_allocated) = if runtime == ServiceRuntime::Static {
+            let (port, port_allocated) = if matches!(runtime, ServiceRuntime::Static | ServiceRuntime::Worker) {
                 (0, false)
             } else {
                 match (request.port, &existing) {
@@ -1404,10 +1431,10 @@ impl ServiceStore {
                 cwd: cwd.clone(),
                 env: env.clone(),
                 login_link_command: request.login_link_command.clone(),
-                stopped: existing.as_ref().is_some_and(|r| r.archived),
+                stopped: existing.as_ref().is_some_and(|r| r.archived || (runtime == ServiceRuntime::Worker && r.stopped)),
                 idle_stop_preset: super::idle::policy(runtime, lifetime, request.idle_stop_preset.as_deref(), existing.as_ref())?,
-                stopped_idle_at: existing.as_ref().filter(|_| runtime == ServiceRuntime::Managed && lifetime == ServiceLifetime::Persistent).and_then(|r| r.stopped_idle_at.clone()),
-                idle_wake_failed_at: existing.as_ref().filter(|_| runtime == ServiceRuntime::Managed && lifetime == ServiceLifetime::Persistent).and_then(|r| r.idle_wake_failed_at.clone()),
+                stopped_idle_at: existing.as_ref().filter(|_| runtime.supervised() && lifetime == ServiceLifetime::Persistent).and_then(|r| r.stopped_idle_at.clone()),
+                idle_wake_failed_at: existing.as_ref().filter(|_| runtime.supervised() && lifetime == ServiceLifetime::Persistent).and_then(|r| r.idle_wake_failed_at.clone()),
                 restart_requested_at: existing
                     .as_ref()
                     .and_then(|record| record.restart_requested_at.clone()),
@@ -1653,7 +1680,7 @@ impl ServiceStore {
             }
             if let Some(runtime) = &request.runtime {
                 record.runtime = ServiceRuntime::parse(runtime).ok_or_else(|| {
-                    ServicesError::bad_request("runtime must be external, managed or static")
+                    ServicesError::bad_request("runtime must be external, managed, worker or static")
                 })?;
             }
             if let Some(command) = &request.command {
@@ -1719,6 +1746,9 @@ impl ServiceStore {
                 }
                 record.port = 0;
                 record.port_allocated = false;
+            }
+            if (record.runtime == ServiceRuntime::Worker) != (before.runtime == ServiceRuntime::Worker) {
+                return Err(ServicesError::bad_request("worker runtime cannot be changed in place; unregister and register a new service"));
             }
             if record.archived {
                 record.stopped = true;
@@ -1826,7 +1856,7 @@ impl ServiceStore {
                 .get_mut(slug)
                 .ok_or_else(|| ServicesError::not_found(slug))?;
             ensure_owns(record, caller)?;
-            if record.runtime != ServiceRuntime::Managed {
+            if !record.runtime.supervised() {
                 return Err(ServicesError::new(
                     409,
                     "not_managed",
@@ -2131,6 +2161,11 @@ pub fn service_view(record: &ServiceRecord, state: Option<&RuntimeSnapshot>) -> 
     view["archived"] = json!(record.archived);
     view["archivedAt"] = json!(record.archived_at);
     view["link"] = json!(service_link(record));
+    if record.runtime == ServiceRuntime::Worker {
+        for field in ["port", "url", "localUrl", "proxyHost", "link"] {
+            view[field] = Value::Null;
+        }
+    }
     if record.tile.is_some() {
         view["tile"] = json!(record.tile);
     }

@@ -280,7 +280,7 @@ class Server:
             native = {"imageInput", "reasoning", "commandItems", "fileChangeItems", "turnDiff", "approvals",
                       "userInputRequests", "userInputOptions", "agentTurnQuestions", "planMode", "planChecklist", "compact", "effort", "rateLimits",
                       "historyRevert", "fork", "threadDelete", "subagents", "subagentTranscripts", "backgroundSubagents", "autoReconnect", "backgroundTerminals", "mcpStatus", "fileRewind",
-                      "versionedModelCatalog", "modelObservation", "safetyGrants", "fastMode", "sideChat", "forkWhileBusy",
+                      "versionedModelCatalog", "modelObservation", "safetyGrants", "safetyGrantReadWindow", "fastMode", "sideChat", "forkWhileBusy",
                       "turnSteer", "permissionRules"}
             features.update({name: False for name in native})
             features["permissionPresets"] = ["full"]
@@ -908,6 +908,10 @@ class Server:
             text(params.get('clientUserMessageId'), 'clientUserMessageId', limit=256)
             payload['metadata']['ownerCarries'] = carries
         with self.store.transaction():
+            # The turn this steer waited for was stopped and nothing read it.
+            if self.store.steer_dropped_unread(tid, mid):
+                self.external_inputs.return_carrier_notes(tid, mid)
+                self.store.forget_dropped_steer(tid, mid)
             receipt = self.store.enqueue(tid, mid, payload, self.settings.max_pending)
             self.external_inputs.reserve_owner_carries(tid, mid, carries)
             if not attachments:

@@ -412,3 +412,20 @@ fn a_lost_carrier_reply_and_daemon_reconnect_do_not_duplicate_the_native_note() 
         worker.join().unwrap();
     }
 }
+
+#[test]
+fn memory_injection_disabled_installs_no_idle_hook_and_sends_no_memory_note() {
+    let fixture = crate::memory::switch_test_support::disabled();
+    let state = Arc::new(Mutex::new(PeerState::default()));
+    let (client, worker) = peer(Route::Native,state.clone());
+    let handle = client.handle();
+    transport::install(&handle,&fixture.record.cutex_session_id,"t",0);
+    let store = NoteStore::open(&crate::config::paths::config_dir().unwrap()).unwrap();
+    assert!(store.get(&fixture.record.cutex_session_id).unwrap().is_none());
+    handle.request("turn/start",json!({"threadId":"t","input":[]})).unwrap();
+    assert_eq!(state.lock().unwrap().note_submits,0);
+    assert!(state.lock().unwrap().contexts.is_empty());
+    drop(handle);
+    drop(client);
+    worker.join().unwrap();
+}

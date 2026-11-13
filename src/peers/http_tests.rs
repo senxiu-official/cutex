@@ -58,6 +58,7 @@ fn context() -> ManagementRequestContext {
     // Peer and authentication routes must never invoke native runtime callbacks.
     ManagementRequestContext {
         explicit_launch_action: |_, _| panic!("unexpected runtime action"),
+        promote_quick_chat: |_, _, _| panic!("unexpected quick chat promotion"),
         adopt_saved_native: |_, _| panic!("unexpected native adoption"),
         review_agent_archive: |_, _| panic!("unexpected archive review"),
         owner_archive_action: |_, _| panic!("unexpected permanent archive"),

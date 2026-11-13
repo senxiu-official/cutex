@@ -215,6 +215,18 @@ fn record(id: &str) -> CutexSessionRecord {
     row.registration_class = crate::agent_bus::model::AgentRegistrationClass::Persistent;
     row
 }
+
+#[test]
+fn quick_chat_promote_discovery_does_not_decode_sessions_or_completed_receipts() {
+    let f = fixture(1);
+    let connection = open_connection(&database_path(&f.path), false).unwrap();
+    // Either row would fail a whole-store snapshot parse. The startup lookup
+    // needs neither session bodies nor completed promotion payloads.
+    connection.execute("UPDATE sessions SET record_json='{}' WHERE key='cutex.active-0000'", []).unwrap();
+    connection.execute("INSERT INTO receipts(map,key,rev,json) VALUES('quick_chat_promotion','done',1,?1)",
+        [r#"{"result":{"complete":true}}"#]).unwrap();
+    assert!(pending_quick_chat_promotions_at(&f.path).unwrap().is_empty());
+}
 fn fixture(history: usize) -> Fixture {
     fixture_shape(166, history)
 }

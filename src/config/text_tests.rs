@@ -19,6 +19,19 @@ fn temp_dir() -> TempDir {
     TempDir(path)
 }
 
+#[cfg(windows)]
+#[test]
+fn private_atomic_text_accepts_long_unprefixed_windows_paths() {
+    let root = temp_dir();
+    let path = root.0.join("a".repeat(90)).join("b".repeat(90)).join("c".repeat(60)).join("config.toml");
+    assert!(path.as_os_str().len() > 260);
+    write_optional_text(&path, Some("old configuration")).unwrap();
+    write_optional_text(&path, Some("new configuration")).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "new configuration");
+    assert_private(&path);
+    assert!(leftovers(path.parent().unwrap()).is_empty());
+}
+
 /// Owner-only: mode 0600 on Unix, a protected owner-only DACL on Windows.
 fn assert_private(path: &Path) {
     #[cfg(unix)]

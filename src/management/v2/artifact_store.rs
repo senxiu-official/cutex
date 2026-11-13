@@ -5,6 +5,10 @@
 //! - `GET /v2/artifact-store?project|session|forSession&q&kind&producer&archived&limit&cursor`
 //!   → `{scope, items, nextCursor}` (newest `updatedAt` first; `scope: null`
 //!   when no scope parameter is given: every scope).
+//!   Capability `artifact-library` adds latest-version `publisher` (session ID
+//!   or owner), `source=all|published|collected`, `sort=updated|name|publisher|kind`
+//!   and `order=asc|desc`. Default order: updated desc, other sorts asc.
+//!   Filters and ordering apply in SQL before pagination; cursors bind sort/order.
 //! - `GET /v2/artifact-store/{artifactId}` → `{artifact, versions}`.
 //! - `GET /v2/artifact-store/{artifactId}/versions/{n|latest}/content?offset&maxBytes`.
 //! - `GET /v2/artifact-store/{artifactId}/diff?from&to`.
@@ -209,6 +213,10 @@ fn list(host: &dyn ArtifactHost, store: &ArtifactStore, params: &HashMap<String,
         q: non_empty(params, "q"),
         kind,
         producer: non_empty(params, "producer"),
+        publisher: non_empty(params, "publisher"),
+        source: non_empty(params, "source"),
+        sort: non_empty(params, "sort"),
+        order: non_empty(params, "order"),
         archived,
         limit,
         cursor: non_empty(params, "cursor"),
@@ -259,6 +267,10 @@ fn content(store: &ArtifactStore, id: &str, which: Which, params: &HashMap<Strin
         }
         return Ok(value);
     };
+    if super::host_files::narrowed_credential_read() {
+        super::host_files::refuse_root_credential_file(&path)
+            .map_err(|denied|error(denied.status,denied.code,denied.message))?;
+    }
     let (bytes, total) = crate::artifacts::read::window(&path, offset, max_bytes).map_err(|read_error| unavailable(read_error))?;
     let more = offset + (bytes.len() as u64) < total;
     value["totalBytes"] = json!(total);
@@ -502,6 +514,35 @@ mod tests {
     }
 
     #[test]
+    fn narrowed_artifact_reads_refuse_external_credential_aliases() {
+        use crate::management::{client_tokens::{DeviceScope,VerifiedClientToken},listeners};
+        let home=crate::profiles::lifecycle::tests::TestHome::new();
+        std::fs::write(home.root().join(crate::config::paths::PRIVATE_HOME_MARKER),b"").unwrap();
+        struct TokenGuard(Option<VerifiedClientToken>);
+        impl Drop for TokenGuard {fn drop(&mut self){listeners::set_current_client_token(self.0.take());}}
+        let _guard=TokenGuard(listeners::current_client_token());
+        listeners::set_current_client_token(None);
+        let host=TestHost::new("credential-alias");
+        host.settings.borrow_mut().max_blob_bytes=1;
+        let workspace=host.workspace("proj");host.set_project_root("p",&workspace);
+        let secret=home.root().join(".ssh/id_ed25519");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();std::fs::write(&secret,"synthetic credential").unwrap();
+        std::fs::hard_link(&secret,workspace.join("report.txt")).unwrap();
+        std::fs::write(workspace.join("ordinary.txt"),"ordinary report").unwrap();
+        let publish=|name:&str|ok(&host,"POST",PATH,json!({"requestId":name,"project":"p","path":name}));
+        let credential=publish("report.txt");let ordinary=publish("ordinary.txt");
+        assert_eq!(credential["version"]["storage"],"external");
+        let target=|item:&Value|format!("{PATH}/{}/versions/1/content",item["artifact"]["artifactId"].as_str().unwrap());
+        for scope in [DeviceScope::Read,DeviceScope::Chat] {
+            let mut token=VerifiedClientToken::test_token("artifact-read");token.scope=scope;listeners::set_current_client_token(Some(token));
+            assert_eq!(fails(&host,"GET",&target(&credential),Value::Null).code,"credential_read_denied");
+            assert_eq!(ok(&host,"GET",&target(&ordinary),Value::Null)["content"],"ordinary report");
+        }
+        listeners::set_current_client_token(Some(VerifiedClientToken::test_token("artifact-full")));
+        assert_eq!(ok(&host,"GET",&target(&credential),Value::Null)["content"],"synthetic credential");
+    }
+
+    #[test]
     fn routes_match_the_contract_and_the_schema() {
         let host = TestHost::new("routes");
         let workspace = host.workspace("proj");
@@ -567,6 +608,14 @@ mod tests {
         assert_eq!(fails(&host, "GET", &format!("{PATH}?project=a&session=b"), Value::Null).status, 400);
         assert_eq!(fails(&host, "GET", &format!("{PATH}?limit=0"), Value::Null).status, 400);
         assert_eq!(fails(&host, "GET", &format!("{PATH}?archived=maybe"), Value::Null).status, 400);
+        for query in ["sort=wrong", "order=wrong", "source=wrong"] {
+            assert_eq!(fails(&host, "GET", &format!("{PATH}?{query}"), Value::Null).status, 400);
+        }
+        let owner = ok(&host, "GET", &format!("{PATH}?publisher=owner&source=published&sort=name&order=asc"), Value::Null);
+        let owner_items = owner["items"].as_array().unwrap();
+        assert!(!owner_items.is_empty());
+        assert!(owner_items.iter().all(|item| item["latest"]["producer"]["kind"] == "owner"));
+        assert!(ok(&host, "GET", &format!("{PATH}?source=collected"), Value::Null)["items"].as_array().unwrap().is_empty());
 
         // Detail, content, diff.
         let detail = ok(&host, "GET", &format!("{PATH}/{id}"), Value::Null);

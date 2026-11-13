@@ -1,6 +1,68 @@
 use super::*;
 use std::sync::mpsc;
 
+#[test]
+fn stalled_session_waiters_leave_capacity_for_other_sessions() {
+    let pool: &'static HeavyPool = Box::leak(Box::new(HeavyPool::new(2, 64)));
+    let held = pool.acquire_session(Duration::ZERO, false, Some("stuck".into())).unwrap();
+    let follower = std::thread::spawn(move || pool.acquire_session(Duration::from_secs(5), false, Some("stuck".into())).unwrap());
+    wait(pool, 1);
+    assert_eq!(pool.counts(), (1, 1));
+    let healthy = pool.acquire_session(Duration::ZERO, false, Some("healthy".into())).unwrap();
+    assert_eq!(pool.counts(), (2, 1));
+    drop(healthy);
+    assert_eq!(pool.acquire_session(Duration::ZERO, false, Some("stuck".into())).err().unwrap().reason, RefusalReason::HeavyReadWaitTimeout);
+    drop(held);
+    drop(follower.join().unwrap());
+    assert_eq!(pool.counts(), (0, 0));
+    assert!(pool.state.lock().unwrap().sessions.is_empty());
+}
+
+#[test]
+fn blocked_background_session_does_not_reserve_the_other_slot() {
+    let pool: &'static HeavyPool = Box::leak(Box::new(HeavyPool::new(2, 64)));
+    let held = pool.acquire_session(Duration::ZERO, false, Some("stuck".into())).unwrap();
+    let follower = std::thread::spawn(move || pool.acquire_session(Duration::from_secs(5), true, Some("stuck".into())).unwrap());
+    wait(pool, 1);
+    let healthy = pool.acquire_session(Duration::ZERO, false, Some("healthy".into())).unwrap();
+    drop(healthy);
+    drop(held);
+    drop(follower.join().unwrap());
+    assert_eq!(pool.counts(), (0, 0));
+}
+
+#[test]
+fn session_read_identity_matches_dispatch_decoding() {
+    let request = |path: &str| SimpleHttpRequest { method: "GET".into(), path: path.into(), headers: Default::default(), body: vec![] };
+    for path in ["/v2/sessions/cutex.a/history", "/v2/sessions/cutex%2Ea/history/turns/t", "/v2/sessions/cutex.a/bootstrap?turnLimit=10"] {
+        assert_eq!(heavy_session(&request(path)).as_deref(), Some("cutex.a"), "{path}");
+    }
+    for path in ["/v2/sessions", "/v2/sessions/page", "/v2/sessions/cutex%2Fa/history", "/v2/sessions/%zz/history"] {
+        assert!(heavy_session(&request(path)).is_none(), "{path}");
+    }
+}
+
+#[test]
+fn stored_media_blobs_and_files_do_not_share_the_native_reader_cap() {
+    let pool = Box::leak(Box::new(HeavyPool::new(2, 64)));
+    let request = |path: &str| SimpleHttpRequest { method: "GET".into(), path: path.into(), headers: Default::default(), body: vec![] };
+    let held = pool.acquire_session(Duration::ZERO, false, heavy_session(&request("/v2/sessions/a/history"))).unwrap();
+    let media = format!("/v2/sessions/a/media/{}", "a".repeat(64));
+    let blob = format!("/v2/sessions/a/blobs/{}", "b".repeat(64));
+    assert!(super::super::media_refs::parse_path(&media).is_some());
+    assert!(super::super::event_blobs::parse_path(&blob).is_some());
+    for path in [media.as_str(), blob.as_str(), "/v2/sessions/a/fs/read", "/v2/sessions/a/app-server/requests", "/v2/sessions/a/cutex/requests"] {
+        assert!(heavy_session(&request(path)).is_none(), "{path}");
+        let independent = pool.acquire_session(Duration::ZERO, false, heavy_session(&request(path))).unwrap();
+        drop(independent);
+    }
+    let mut native = request("/v2/sessions/a/app-server/requests");
+    native.method = "POST".into();
+    assert_eq!(heavy_session(&native).as_deref(), Some("a"));
+    assert!(pool.acquire_session(Duration::ZERO, false, heavy_session(&native)).is_err());
+    drop(held);
+}
+
 fn wait(pool: &HeavyPool, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while pool.counts().1 != count {

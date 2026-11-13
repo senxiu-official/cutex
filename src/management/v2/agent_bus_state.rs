@@ -399,6 +399,12 @@ fn owner_holdable(stored: &StoredAgentBusMessage, session: &str) -> bool {
 #[path = "agent_bus_owner_carry_tests.rs"]
 mod owner_carry_tests;
 
+/// A retry attempt belongs to exactly one durable source identity.
+pub fn native_id_matches_source(source: &str, native: &str) -> bool {
+    native == source || native.strip_prefix("bus-retry:").and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(attempt, original)| uuid::Uuid::parse_str(attempt).is_ok() && original == source)
+}
+
 impl AgentBusMessageRepository {
     /// Prefetch the builder's sender/view sidecars by recipient, before reserve
     /// acquires the non-reentrant source lock. No whole-host metadata walk.
@@ -1325,19 +1331,42 @@ impl AgentBusMessageRepository {
         .and_then(|event| emit_both(event))
     }
 
-    /// Claude: the adapter emitted the message's timeline item in `turn_id`
-    /// (read into context). Idempotent; emits `messageDelivered` once.
+    /// Resolve a native attempt back to its stable source id, without scanning.
+    /// The encoded id is only a lookup hint; the frozen identity must match.
+    pub fn source_id_for_native(&self, owner: &str, native_id: &str) -> anyhow::Result<Option<String>> {
+        let retry_source = native_id.strip_prefix("bus-retry:").and_then(|rest| rest.split_once(':')).map(|(_, source)| source);
+        for source in std::iter::once(native_id).chain(retry_source) {
+            if self.get(source)?.is_some_and(|row| row.snapshot.to_cutex_session_id == owner
+                && row.snapshot.external_input.as_ref().is_some_and(|e| e.owner_id == owner && e.message.id == native_id)) {
+                return Ok(Some(source.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn record_native_context_injected(&self, owner: &str, message_id: &str,
+        envelope: &crate::app_server::external_input::Envelope, turn_id: &str) -> anyhow::Result<bool> {
+        self.record_context_injected_checked(owner, message_id, turn_id, Some(envelope))
+    }
+
+    /// Claude context insertion. Idempotent; emits `messageDelivered` once.
     pub fn record_context_injected(
         &self,
         owner: &str,
         message_id: &str,
         turn_id: &str,
     ) -> anyhow::Result<bool> {
+        self.record_context_injected_checked(owner, message_id, turn_id, None)
+    }
+
+    fn record_context_injected_checked(&self, owner: &str, message_id: &str, turn_id: &str,
+        expected: Option<&crate::app_server::external_input::Envelope>) -> anyhow::Result<bool> {
         let event = self.mutate_checked_message(message_id, |store| {
             let Some(stored) = store.messages.get_mut(message_id) else {
                 return Ok(None);
             };
-            anyhow::ensure!(stored.owner_cutex_session_id == owner, "agent-bus message owner mismatch");
+            if expected.is_some_and(|e| stored.snapshot.external_input.as_ref() != Some(e)) { return Ok(None); }
+            anyhow::ensure!(stored.snapshot.to_cutex_session_id == owner, "agent-bus message owner mismatch");
             if !matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted") {
                 return Ok(None);
             }
@@ -1623,7 +1652,7 @@ impl AgentBusMessageRepository {
 
     /// Claude's durable inbox acceptance is not native context insertion/A4.
     pub fn record_local_inbox(&self, owner: &str, message: &str, receipt: &Value) -> anyhow::Result<()> {
-        anyhow::ensure!(receipt["messageId"] == message && receipt["durable"] == true
+        anyhow::ensure!(receipt["durable"] == true
             && receipt["receiptScope"] == "local-inbox", "invalid local inbox receipt");
         let mut stable = receipt.clone();
         stable.as_object_mut().context("receipt must be an object")?.remove("duplicate");
@@ -1632,6 +1661,8 @@ impl AgentBusMessageRepository {
         self.mutate_message(message, |store| {
             let stored = store.messages.get_mut(message).context("message not found")?;
             anyhow::ensure!(stored.snapshot.to_cutex_session_id == owner, "message owner mismatch");
+            let native_id = stored.snapshot.external_input.as_ref().map(|e|e.message.id.as_str()).unwrap_or(message);
+            anyhow::ensure!(receipt["messageId"] == native_id, "local inbox receipt native attempt mismatch");
             if let Some(previous) = &stored.snapshot.local_inbox_receipt {
                 anyhow::ensure!(previous == &stable, "local inbox receipt changed");
             } else {
@@ -3408,6 +3439,7 @@ fn ledger_item(stored: &StoredAgentBusMessage) -> Option<String> {
     }
     snapshot.external_input_receipt.as_ref().map(|receipt| receipt.response_item_id.clone())
         .or_else(|| snapshot.a4_receipt.as_ref().map(|receipt| receipt.response_item_id.clone()))
+        .or_else(|| snapshot.external_input.as_ref().map(|e| e.message.id.clone()))
         .or_else(|| Some(snapshot.message_id.clone()))
         .filter(|item| !item.is_empty())
 }
@@ -3432,6 +3464,9 @@ fn redeliverable(stored: &StoredAgentBusMessage, owner: &str) -> Result<(), (&'s
     }
     if settlement_closed(stored) {
         return Err(("bus_message_settled", format!("agent-bus message {id} was settled")));
+    }
+    if stored.snapshot.external_input.is_some() && format!("bus-retry:{}:{}", "0".repeat(32), id).len() > 256 {
+        return Err(("bus_message_not_redeliverable", "message id is too long for a new native attempt".into()));
     }
     if stored.canonical_envelope.is_none() {
         return Err(("bus_message_not_redeliverable", format!("agent-bus message {id} has no durable envelope")));
@@ -3540,6 +3575,14 @@ impl AgentBusMessageRepository {
     /// ([`super::input_ledger_bus::native_item`]: `accepted` on the
     /// timeline); the bus row keeps waiting for the validated receipt.
     pub fn input_ledger_native_item(&self, owner: &str, message_id: &str, turn: &str) -> anyhow::Result<()> {
+        self.input_ledger_native_item_checked(owner, message_id, turn, None)
+    }
+
+    pub fn input_ledger_native_attempt_item(&self, owner: &str, message_id: &str, native_id: &str, turn: &str) -> anyhow::Result<()> {
+        self.input_ledger_native_item_checked(owner, message_id, turn, Some(native_id))
+    }
+
+    fn input_ledger_native_item_checked(&self, owner: &str, message_id: &str, turn: &str, expected_native: Option<&str>) -> anyhow::Result<()> {
         if !super::input_ledger_bus::active() {
             return Ok(());
         }
@@ -3547,7 +3590,9 @@ impl AgentBusMessageRepository {
         if stored.snapshot.to_cutex_session_id != owner || !matches!(stored.snapshot.state.as_str(), "pending" | "inbox_accepted") {
             return Ok(());
         }
-        super::input_ledger_bus::native_item_with_carry(owner, message_id, &ledger_input(&stored), turn, stored.owner_carry.is_some());
+        let native_id = stored.snapshot.external_input.as_ref().map(|e| e.message.id.as_str()).unwrap_or(message_id);
+        if expected_native.is_some_and(|expected| expected != native_id) { return Ok(()); }
+        super::input_ledger_bus::native_item_attempt(owner, message_id, &ledger_input(&stored), turn, stored.owner_carry.is_some(), native_id);
         Ok(())
     }
 
@@ -3576,6 +3621,15 @@ impl AgentBusMessageRepository {
             if redeliverable(stored, owner).is_err() {
                 return Ok((false, false));
             }
+            // A source/ledger id is durable, but an explicit resend is a new
+            // native attempt: runtimes deduplicate even unread reserved ids.
+            if let Some(envelope) = &mut stored.snapshot.external_input {
+                envelope.message.id = format!("bus-retry:{}:{}", uuid::Uuid::new_v4().simple(), message_id);
+                envelope.semantic_sha256 = envelope.digest();
+                envelope.validate()?;
+            }
+            stored.snapshot.external_input_receipt = None;
+            stored.snapshot.external_input_commit_generation = None;
             stored.snapshot.state = "pending".into();
             stored.snapshot.local_inbox_receipt = None;
             stored.snapshot.a2_submission_id = None;
@@ -4445,7 +4499,11 @@ fn bus_admission_timing(
         return ("nextStep".into(), None);
     }
     let Some(wait) = wait else { return ("afterTurn".into(), None); };
-    let due = message.created_at_epoch_secs.saturating_add(wait.as_secs()).min(i64::MAX as u64) as i64;
+    // Runtime bridges compare this Duration against whole-second message age.
+    // A fractional wait therefore becomes eligible on the next whole second;
+    // truncating it advertised nextStep before either runtime could take it.
+    let wait_secs = wait.as_secs().saturating_add(u64::from(wait.subsec_nanos() != 0));
+    let due = message.created_at_epoch_secs.saturating_add(wait_secs).min(i64::MAX as u64) as i64;
     if now.timestamp() >= due {
         ("nextStep".into(), None)
     } else {
@@ -5441,6 +5499,23 @@ mod tests {
         message.sender_kind = crate::agent_bus::model::AgentMessageKind::AlarmSystem;
         assert_eq!(bus_admission_timing(&message, None, due, Some(Duration::ZERO)),
             ("afterTurn".into(), None));
+    }
+
+    #[test]
+    fn fractional_wake_deadline_matches_runtime_whole_second_age() {
+        use crate::agent_bus::delivery::{wake_timing, WakeTiming};
+        use std::time::Duration;
+        let mut message = system_queued_message("fractional").canonical_envelope;
+        message.created_at_epoch_secs = 100;
+        for (wait, seconds) in [(Duration::from_nanos(1), 1), (Duration::from_millis(1500), 2), (Duration::from_secs(120), 120)] {
+            let due = DateTime::<Utc>::from_timestamp(100 + seconds, 0).unwrap();
+            let before = DateTime::<Utc>::from_timestamp(100 + seconds - 1, 999_999_999).unwrap();
+            assert_eq!(bus_admission_timing(&message, None, before, Some(wait)),
+                ("afterTurn".into(), Some(due.to_rfc3339())));
+            assert_eq!(wake_timing(Duration::from_secs((before.timestamp() - 100) as u64), Some(wait), || Some(true)), WakeTiming::Hold);
+            assert_eq!(bus_admission_timing(&message, None, due, Some(wait)), ("nextStep".into(), None));
+            assert_eq!(wake_timing(Duration::from_secs(seconds as u64), Some(wait), || Some(true)), WakeTiming::NextStep);
+        }
     }
 
     #[test]

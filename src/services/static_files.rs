@@ -284,7 +284,8 @@ pub fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
         return None;
     }
     // The shared classifier already includes the relay directory and aliases.
-    if crate::management::v2::host_files::is_owner_local_secret_file(&candidate) {return None;}
+    if crate::management::v2::host_files::is_owner_local_secret_file(&candidate)
+        || crate::management::v2::host_files::is_narrowed_credential_file(&candidate) { return None; }
     if crate::config::paths::config_dir()
         .ok()
         .and_then(|p| p.canonicalize().ok())

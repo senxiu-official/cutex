@@ -119,6 +119,7 @@ macro_rules! receipt_map {
     };
 }
 
+receipt_map!(QuickChatPromotion, "quick_chat_promotion", quick_chat_promotion_receipts, crate::agent_management::QuickChatPromoteReceipt);
 receipt_map!(
     NativeStop,
     "native_stop",
@@ -159,6 +160,7 @@ receipt_map!(
 /// Runs `$call::<Map>($args)?` for every receipt map.
 macro_rules! each_receipt_map {
     ($call:ident ( $($arg:expr),* )) => {{
+        $call::<QuickChatPromotion>($($arg),*)?;
         $call::<NativeStop>($($arg),*)?;
         $call::<ExplicitLaunch>($($arg),*)?;
         $call::<HumanAdoption>($($arg),*)?;
@@ -793,6 +795,7 @@ pub(super) fn commit_locked(
 /// holding only those rows); a touched key missing from `values` is a delete.
 #[derive(Default)]
 pub(super) struct TouchedRows {
+    pub preserve_json: std::collections::BTreeSet<String>,
     pub values: CutexSessionStore,
     pub sessions: std::collections::BTreeSet<String>,
     pub receipts: std::collections::BTreeSet<(&'static str, String)>,
@@ -830,8 +833,16 @@ fn write_touched_sessions(
         }
         match new {
             Some(record) => {
-                let json = serde_json::to_string(record)
-                    .with_context(|| format!("failed to serialize cutex session {key}"))?;
+                let json = if touched.preserve_json.contains(key) {
+                    let original: String = connection.query_row("SELECT record_json FROM sessions WHERE key=?1", [key], |row| row.get(0))?;
+                    let mut raw: serde_json::Value = serde_json::from_str(&original)?;
+                    let before = serde_json::to_value(base.sessions.get(key).context("original session missing for narrow repair")?)?;
+                    let after = serde_json::to_value(record)?;
+                    apply_known_delta(&mut raw, &before, &after);
+                    serde_json::to_string(&raw)?
+                } else {
+                    serde_json::to_string(record).with_context(|| format!("failed to serialize cutex session {key}"))?
+                };
                 name_ledger::validate_session_change(connection,base.sessions.get(key),record)?;
                 upsert.execute(params![
                     key,
@@ -861,6 +872,25 @@ fn write_touched_sessions(
         changes.sessions.push(key.clone());
     }
     Ok(())
+}
+
+/// Apply only the typed before/after delta to original JSON. Unknown fields
+/// (including nested fields) remain intact; ordinary writers are unchanged.
+fn apply_known_delta(raw: &mut serde_json::Value, before: &serde_json::Value, after: &serde_json::Value) {
+    if before == after { return; }
+    match (raw, before.as_object(), after.as_object()) {
+        (serde_json::Value::Object(raw), Some(before), Some(after)) => {
+            for key in before.keys() { if !after.contains_key(key) { raw.remove(key); } }
+            for (key, next) in after {
+                match before.get(key) {
+                    Some(previous) if previous == next => {},
+                    Some(previous) => apply_known_delta(raw.entry(key.clone()).or_insert(serde_json::Value::Null), previous, next),
+                    None => { raw.insert(key.clone(), next.clone()); },
+                }
+            }
+        }
+        (raw, _, _) => *raw = after.clone(),
+    }
 }
 
 fn write_touched_map<M: ReceiptMap>(
@@ -1498,7 +1528,7 @@ fn import(json_path: &Path, db: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let sha = sha256_hex(bytes);
     let revision = store.store_revision.get();
     let reference = pre_sqlite_name(json_path)?;
-    let receipts = store.native_stop_receipts.len()
+    let receipts = store.quick_chat_promotion_receipts.len() + store.native_stop_receipts.len()
         + store.explicit_launch_receipts.len()
         + store.human_adoption_receipts.len()
         + store.agent_archive_receipts.len()

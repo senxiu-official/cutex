@@ -4,6 +4,8 @@ Capability `claude-safety-grants` (Management v2). Code: `components/claude-runt
 (adapter), `src/management/v2/safety_checks.rs` (routes, observer hook), `src/owner_notify/store.rs`
 (`SafetyBlock` on owner notices). Adapter feature flag: `safetyGrants` in `features.json` (claude-r14).
 
+See [safety-grant-delivery.md](safety-grant-delivery.md) for the system-notice channel, ledger stages and the `safetyGrantReadWindow` policy. The approval-time 30-minute description below is the legacy adapter/controller contract.
+
 ## Why
 
 Full access (`bypassPermissions`) lets a Claude agent run any tool without asking. Claude Code still calls

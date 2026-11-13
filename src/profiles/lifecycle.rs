@@ -20,8 +20,10 @@ use serde_json::json;
 
 use crate::config::atomic::write_private_pretty_json_atomic;
 use crate::config::store::{
-    load_codez_config_checked, load_quick_state, save_codez_config, save_quick_state,
+    load_codez_config_checked, load_quick_state, update_codez_config, save_quick_state,
 };
+#[cfg(test)]
+use crate::config::store::save_codez_config;
 use crate::config::text::{read_optional_text, write_optional_text_if_changed};
 use crate::profiles::appearance::{ProfileOptions, Provider};
 use crate::profiles::materialize::{
@@ -565,11 +567,14 @@ pub fn delete_profile_with(
     archived: ArchivedReferences,
 ) -> Result<DeleteOutcome, LifecycleError> {
     let _guard = lock();
+    // Establish the bounded config writer lease before detaching sessions,
+    // changing the profile store or touching its materialized directory.
+    let config_update = crate::config::store::begin_codez_config_update()?;
     let mut store = load_store()?;
     let account = find(&store, target)
         .cloned()
         .ok_or(LifecycleError::NotFound)?;
-    let mut config = load_codez_config_checked()?;
+    let mut config = config_update.current().clone();
     if config.default_profile.as_deref() == Some(account.name.as_str()) {
         return Err(LifecycleError::IsDefault(account.name));
     }
@@ -582,15 +587,14 @@ pub fn delete_profile_with(
         store.active_account_id = store.accounts.first().map(|next| next.id.clone());
     }
     let mut state = load_quick_state();
-    let references = ProfileReferenceChanges {
+    let mut references = ProfileReferenceChanges {
         quick_state_changed: remove_profile_references(&mut state, &account.name),
         global_config_changed: remove_global_profile_references(&mut config, &account.name),
         session_keys: detached_sessions.clone(),
     };
     save_store(&store)?;
-    if references.global_config_changed {
-        save_codez_config(&config)?;
-    }
+    let (_, changed) = config_update.commit(|config| Ok(remove_global_profile_references(config, &account.name)))?;
+    references.global_config_changed = changed;
     if references.quick_state_changed {
         save_quick_state(&state)?;
     }
@@ -761,7 +765,7 @@ pub(crate) fn rename_profile_locked(target: &str, new_name: &str) -> Result<Rena
     ensure_available(&store, &new_name, Some(&profile_id))?;
 
     // 1. Session records (CAS on the whole session store, retried).
-    let (sessions, references, mut state, mut config) =
+    let (sessions, mut references, mut state, _config) =
         rename_in_session_store(&old_name, &new_name)?;
 
     // 2. Profile store.
@@ -773,9 +777,8 @@ pub(crate) fn rename_profile_locked(target: &str, new_name: &str) -> Result<Rena
 
     // 3. Global config + quick-run state.
     let global = (|| -> anyhow::Result<()> {
-        if references.global_config_changed {
-            save_codez_config(&config)?;
-        }
+        let (_, changed) = update_codez_config(|config| Ok(crate::profiles::references::rename_global_profile_references(config, &old_name, &new_name)))?;
+        references.global_config_changed = changed;
         if references.quick_state_changed {
             save_quick_state(&state)?;
         }
@@ -784,13 +787,8 @@ pub(crate) fn rename_profile_locked(target: &str, new_name: &str) -> Result<Rena
     if let Err(error) = global {
         store.accounts[index].name = old_name.clone();
         let _ = save_store(&store);
-        crate::profiles::references::rename_global_profile_references(
-            &mut config,
-            &new_name,
-            &old_name,
-        );
         crate::profiles::references::rename_profile_references(&mut state, &new_name, &old_name);
-        let _ = save_codez_config(&config);
+        let _ = update_codez_config(|config| Ok(crate::profiles::references::rename_global_profile_references(config, &new_name, &old_name)));
         let _ = save_quick_state(&state);
         revert_sessions(&new_name, &old_name, &references);
         return Err(error.into());
@@ -1258,6 +1256,42 @@ pub(crate) mod tests {
                 Some(*manual)
             );
         }
+    }
+
+    #[test]
+    fn delete_config_timeout_leaves_profile_and_archived_references_untouched() {
+        let _home = TestHome::new();
+        create_profile(&api_key("keep", "zai", Some("sk-test-only"))).unwrap();
+        let gone = create_profile(&api_key("gone", "moonshot", Some("sk-test-only"))).unwrap();
+        let mut config = load_codez_config_checked().unwrap();
+        config.default_profile = Some("keep".into());
+        config.quick_chat_default_profile = Some("gone".into());
+        save_codez_config(&config).unwrap();
+        let mut sessions = CutexSessionStore::default();
+        let mut archived = session("cutex.archived", "gone");
+        archived.archive_state = crate::session::model::CutexSessionArchiveState::Retired;
+        sessions.sessions.insert("cutex.archived".into(), archived);
+        crate::session::store::save_cutex_session_store(&sessions).unwrap();
+        let store_before = serde_json::to_value(load_store().unwrap()).unwrap();
+        let sessions_before = serde_json::to_value(crate::session::store::load_cutex_session_store().unwrap()).unwrap();
+        let state_before = serde_json::to_value(load_quick_state()).unwrap();
+        let path = crate::config::paths::config_path().unwrap();
+        let config_before = std::fs::read(&path).unwrap();
+        let held = crate::config::store::config_write_lock(&path).unwrap();
+        match delete_profile_with("gone", ArchivedReferences::Detach) {
+            Err(LifecycleError::Store(error)) => assert!(crate::config::store::is_config_busy(&error)),
+            other => panic!("expected config_busy, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(load_store().unwrap()).unwrap(), store_before);
+        assert_eq!(serde_json::to_value(crate::session::store::load_cutex_session_store().unwrap()).unwrap(), sessions_before);
+        assert_eq!(serde_json::to_value(load_quick_state()).unwrap(), state_before);
+        assert_eq!(std::fs::read(&path).unwrap(), config_before);
+        assert!(profile_dir(&gone).unwrap().join("auth.json").exists());
+        drop(held);
+        let outcome = delete_profile_with("gone", ArchivedReferences::Detach).unwrap();
+        assert_eq!(outcome.detached_sessions, ["cutex.archived"]);
+        assert!(find(&load_store().unwrap(), "gone").is_none());
+        assert_eq!(load_codez_config_checked().unwrap().quick_chat_default_profile, None);
     }
 
     #[test]

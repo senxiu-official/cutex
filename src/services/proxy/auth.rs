@@ -65,6 +65,7 @@ pub fn safe_next(path: &str) -> &str {
     }
 }
 pub fn issue(store: &ServiceStore, slug: &str, path: &str) -> ServicesResult<Value> {
+    store.get(slug)?.require_view()?;
     let mut vault = vault().lock().unwrap();
     let now = Instant::now();
     vault.tickets.retain(|_, grant| grant.expires > now);
@@ -228,6 +229,7 @@ mod tests {
     fn a_tossed_sibling_cookie_does_not_lock_out_the_valid_one() {
         let dir = std::env::temp_dir().join(format!("cutex-svc-auth-{}", uuid::Uuid::new_v4()));
         let store = ServiceStore::new(dir.join("services"), "auth-test");
+        store.register(serde_json::from_value(json!({"slug":"a","port":31481})).unwrap(), &crate::services::store::Caller::Owner).unwrap();
         let ticket = issue(&store, "a", "/").unwrap()["ticket"]
             .as_str()
             .unwrap()

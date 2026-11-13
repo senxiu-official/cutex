@@ -151,7 +151,7 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
             let spec: serde_json::Value = serde_json::from_slice(&bytes)?;
             let animation = cutex::launch::status_animation::compile(&spec)?;
             if install {
-                let mut config = cutex::config::store::load_codez_config_checked()?;
+                cutex::config::store::update_codez_config(|config| {
                 config.custom_status_items =
                     cutex::profiles::materialize::normalize_custom_status_items(
                         &config.custom_status_items,
@@ -162,7 +162,8 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
                     .find(|i| i.id == "cutex_welcome")
                     .context("Welcome item missing")?;
                 item.animation = Some(spec);
-                cutex::config::store::save_codez_config(&config)?;
+                Ok(())
+                })?;
                 eprintln!("Saved Cutex Welcome animation; reopen the foreground TUI to apply.");
             }
             println!(
@@ -234,7 +235,8 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
             check,
             fix,
             yes,
-        } => super::human_diagnostics::run(id.as_deref(), check, fix, yes)?,
+            finding_id,
+        } => super::human_diagnostics::run(id.as_deref(), check, fix, yes, finding_id.as_deref())?,
         HumanCommand::New { name, cwd } => {
             let cwd = cwd.unwrap_or(std::env::current_dir()?);
             let result = super::light_new::create(&name, &cwd.to_string_lossy())?;

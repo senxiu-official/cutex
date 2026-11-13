@@ -581,6 +581,62 @@ fn result_unprovable_is_uncertain_and_accepted_never_returns_to_waiting() {
 }
 
 #[test]
+fn abandoned_carry_drift_preserves_prior_reason_and_excludes_active_reservations() {
+    for shape in ["abandoned","no-owner","has-event","normal-reserved","lease-released"] {
+        let mut run=Run::new();
+        let (_,id)=answered(&mut run,shape);
+        let event=coalesce(&mut run,"native-carry");
+        run.write(|state|state.deliveries.get_mut(&id).unwrap().owner_input_id=Some("owner".into()));
+        run.apply(submitted_jobs_in(&run.state,REQUESTER,&[id.clone()],&event,Some("native-carry"),Some("turn"),false));
+        if shape=="lease-released" {
+            run.apply(release_jobs(REQUESTER,vec![(id.clone(),false,delivery_input(&run.state,&run.state.deliveries[&id]))],
+                Evidence::HistoryRead,None,None));
+        }
+        let original=run.record(REQUESTER,&id);
+        let _lost_writer=run.commit(|state| {
+            let delivery=state.deliveries.get_mut(&id).unwrap();
+            if shape!="normal-reserved" { delivery.state=DeliveryState::Pending; delivery.passive=true; }
+            if shape!="has-event" && shape!="normal-reserved" { delivery.event_id=None; }
+            if shape=="no-owner" { delivery.owner_input_id=None; }
+        });
+        let job=drift_job(&run.state,&original);
+        if let Some(job)=job {
+            run.apply(vec![job.clone()]);
+            let settled=run.record(REQUESTER,&id);
+            assert!(apply_job(&run.ledger,&job).is_empty());
+            if shape=="abandoned" {
+                assert_eq!(settled.state,InputState::Uncertain);
+                assert_eq!(settled.reason.as_deref(),Some("outcomeUnknown"));
+            } else { assert_eq!(settled,original,"{shape}"); }
+        } else { assert_ne!(shape,"abandoned"); }
+    }
+}
+
+#[test]
+fn delayed_abandoned_carry_projection_cannot_replace_a_new_source_attempt() {
+    let mut run=Run::new();
+    let (_,id)=answered(&mut run,"carry-source-version");
+    let event=coalesce(&mut run,"native-old");
+    run.write(|state|state.deliveries.get_mut(&id).unwrap().owner_input_id=Some("owner-old".into()));
+    run.apply(submitted_jobs_in(&run.state,REQUESTER,&[id.clone()],&event,Some("native-old"),Some("old-turn"),false));
+    let stale=run.commit(|state| {
+        let delivery=state.deliveries.get_mut(&id).unwrap();
+        delivery.state=DeliveryState::Pending;delivery.passive=true;delivery.event_id=None;
+    });
+    // Explicit retry already wrote its waiting row before the source mutation.
+    run.ledger.transition(REQUESTER,&id,Expect::ANY,Next::uncertain("outcomeUnknown")).unwrap();
+    run.ledger.transition(REQUESTER,&id,Expect::ANY,Next::waiting("ownerRetry")).unwrap();
+    run.write(|state| { retry_result(state,REQUESTER,&id,now()).unwrap(); });
+    let fresh=coalesce(&mut run,"native-new");
+    run.apply(submitted_jobs_in(&run.state,REQUESTER,&[id.clone()],&fresh,Some("native-new"),Some("new-turn"),false));
+    let record=run.record(REQUESTER,&id);
+    run.apply(stale);
+    assert_eq!(run.record(REQUESTER,&id),record);
+    assert_eq!(record.state,InputState::Accepted);
+    assert_eq!(record.batch_id.as_deref(),Some(fresh.as_str()));
+}
+
+#[test]
 fn result_claimed_by_wait_is_in_context_with_no_surface() {
     let mut run = Run::new();
     let (ask, id) = answered(&mut run, "w");
@@ -646,10 +702,12 @@ fn result_dismissed_by_the_owner_is_settled_and_never_sent() {
     assert_eq!(after.deliveries[&id].state, DeliveryState::Acknowledged);
     assert_eq!(after.deliveries[&id].settled_by.as_deref(), Some(DISMISSED));
     assert!(crate::asks::delivery::requesters_with_pending(&after).is_empty());
-    // The hook leaves the record to the dismiss route (discarded{ownerDiscarded}).
+    // The durable source repairs the ledger even if the route did not finish.
     let before = run.state.clone();
     let changes = crate::asks::store::ask_state_changes(&before, &after).unwrap();
-    assert!(store_jobs(&before, &after, &changes).iter().all(|job| job.input_id != id));
+    run.apply(store_jobs(&before, &after, &changes));
+    assert_eq!(run.record(REQUESTER, &id).state, InputState::Discarded);
+    assert_eq!(run.record(REQUESTER, &id).reason.as_deref(), Some("ownerDiscarded"));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -826,7 +884,7 @@ fn result_retry_resends_the_same_delivery_in_a_new_event() {
     assert_eq!(run.paths[&id], path_before, "restoring hold actions never changes the state path");
     let delivery = &run.state.deliveries[&id];
     assert_eq!((delivery.state.clone(), delivery.event_id.clone(), delivery.passive), (DeliveryState::Pending, None, false));
-    assert!(!run.state.events[&event].delivery_ids.contains(&id), "the old event no longer carries it");
+    assert!(!run.state.events.contains_key(&event), "empty old event retired");
     // The scheduler sends it again under the same deliveryId.
     let next = coalesce(&mut run, "m2");
     assert_ne!(next, event);
@@ -1473,4 +1531,57 @@ fn startup_discards_existing_passive_records_once_and_keeps_the_asks_item() {
     }
     assert_eq!((again.found, again.settled), (0, 0));
     assert_eq!(run.record(REQUESTER, &held).rev, rev);
+}
+
+
+#[test]
+fn notices_read_retires_pending_input_without_fabricating_context_receipt() {
+    for progress in 0..4 {
+        let mut run = Run::new();
+        let (_, id) = answered(&mut run, "notice-read");
+        for next in [Next::sending(), Next::accepted(), Next::uncertain("outcomeUnknown")].into_iter().take(progress) {
+            run.ledger.transition(REQUESTER, &id, Expect::ANY, next).unwrap();
+        }
+        run.write(|state| {
+            let delivery = state.deliveries.get_mut(&id).unwrap();
+            delivery.state = DeliveryState::Acknowledged;
+            delivery.settled_by = Some("notices_read".into());
+        });
+        let retired = run.record(REQUESTER, &id);
+        assert_eq!(retired.state, InputState::Discarded);
+        assert_eq!(retired.reason.as_deref(), Some("settlementClosed"));
+        assert!(retired.turn_id.is_none());
+        assert!(retired.timeline_item_id.is_none());
+    }
+}
+
+#[path = "ledger_request_evidence_tests.rs"]
+mod request_evidence_tests;
+
+
+#[test]
+fn dismissed_result_recovers_after_late_retry_metadata_and_on_rebuild() {
+    let mut run = Run::new();
+    let (_, id) = answered(&mut run, "dismiss-retry-order");
+    let event = coalesce(&mut run, "m1");
+    run.apply(submitted_jobs(&run.state, REQUESTER, &[id.clone()], &event, Some("turn-1")));
+    run.apply(turn_ended_jobs(&run.state, REQUESTER, "turn-1", "turnInterrupted"));
+    run.ledger.transition(REQUESTER, &id, Expect::ANY, Next::waiting("ownerRetry")).unwrap();
+    let delayed = run.commit(|state| retry_result(state, REQUESTER, &id, now()).unwrap());
+    let dismissed = run.commit(|state| {
+        let delivery = state.deliveries.get_mut(&id).unwrap();
+        delivery.state = DeliveryState::Acknowledged;
+        delivery.settled_by = Some(DISMISSED.into());
+    });
+    run.apply(delayed.clone());
+    let waiting = run.record(REQUESTER, &id);
+    assert_eq!(waiting.state, InputState::Waiting);
+    // A restart only has the committed source and persisted waiting row.
+    let rebuilt = drift_job(&run.state, &waiting).expect("dismissed source repairs drift");
+    run.apply(vec![rebuilt]);
+    let done = run.record(REQUESTER, &id);
+    assert_eq!((done.state, done.reason.as_deref()), (InputState::Discarded, Some("ownerDiscarded")));
+    run.apply(dismissed);
+    run.apply(delayed);
+    assert_eq!(run.record(REQUESTER, &id), done, "replay cannot resurrect the dismissed attempt");
 }

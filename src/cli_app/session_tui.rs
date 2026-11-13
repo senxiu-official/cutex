@@ -26,7 +26,7 @@ use cutex::agent_management::{
 use cutex::config::global_settings::apply_global_config_patch;
 use cutex::config::store::load_codez_config;
 use cutex::config::store::load_codez_config_checked;
-use cutex::config::store::save_codez_config;
+use cutex::config::store::update_codez_config;
 use cutex::management::v2::activity::session_activity;
 use cutex::management::v2::activity::SessionActivityState;
 use cutex::observability::{SafeToolCallClass, SafeToolCallStatus};
@@ -7438,10 +7438,8 @@ fn apply_global_settings(
         request.profile_names.clone()
     };
     request.draft.validate_profile_catalog(&profile_names)?;
-    let mut config = load_codez_config_checked()?;
-    let changed = apply_global_settings_to_config(&mut config, request)?;
+    let (config, changed) = update_codez_config(|config| apply_global_settings_to_config(config, request))?;
     if changed {
-        save_codez_config(&config)?;
         super::identity_styles::refresh();
     }
     Ok(GlobalSettingsApplyResult {
@@ -11421,6 +11419,7 @@ mod tests {
             cutex_session_id: cutex_session_id.clone(),
             native_session_id: "native-worker".to_string(),
             spec: ManagedAgentSpec {
+                memory_injection: true,
                 name: "worker-zeta".to_string(),
                 cwd: "/tmp/canonical-worker".to_string(),
                 profile: Some("default".to_string()),
@@ -11479,6 +11478,7 @@ mod tests {
             display_name: "Nova Operations".to_string(),
             badge_label: "NX".to_string(),
             color: ProjectPaletteColor::Green,
+            icon: None,
             revision: 4,
             updated_at: Rfc3339::new("2026-09-03T00:00:00Z").unwrap(),
             updated_by_director_session: Some(CutexSessionId::new("cutex.director").unwrap()),

@@ -84,7 +84,10 @@ fn write_bytes_atomic_with_privacy(
         // file owner-private instead; the rename keeps its DACL.
         #[cfg(windows)]
         let created = if owner_only {
-            crate::platform::private_fs::create_new_private_file(&tmp_path)
+            // Normalize only the raw Win32 boundary. Keep the logical temp
+            // identity for std::fs, diagnostics and interruption observers.
+            let api_path = windows_api_path(&tmp_path)?;
+            crate::platform::private_fs::create_new_private_file(&api_path)
                 .map_err(|error| anyhow!("{error}"))
         } else {
             options.open(&tmp_path).map_err(anyhow::Error::from)
@@ -133,13 +136,28 @@ fn atomic_write_temp_path(path: &Path) -> PathBuf {
     ))
 }
 
+#[cfg(windows)]
+fn windows_api_path(path: &Path) -> io::Result<PathBuf> {
+    // Resolve the existing parent, not the destination: an atomic write
+    // replaces a symlink's directory entry rather than following its target.
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "atomic replacement requires a file name"))?;
+    // Some virtual filesystems and volumes have no DOS canonical name. The
+    // ordinary spelling can still be accepted by Win32; do not turn optional
+    // long-path normalization into a failure for every short-path write.
+    Ok(match fs::canonicalize(parent) {
+        Ok(parent) => parent.join(name),
+        Err(_) => path.to_path_buf(),
+    })
+}
+
 #[cfg(unix)]
-fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
 }
 
 #[cfg(windows)]
-fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::time::Duration;
 
@@ -166,8 +184,10 @@ fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
             .collect()
     }
 
-    let from = wide_null(from);
-    let to = wide_null(to);
+    // std::fs creates temp files with extended-length Windows paths, but
+    // passing the original spelling directly to Win32 loses that support.
+    let from = wide_null(&windows_api_path(from)?);
+    let to = wide_null(&windows_api_path(to)?);
     let mut delay_ms = 1;
     for attempt in 0..MAX_ATTEMPTS {
         let ok = unsafe {
@@ -195,7 +215,7 @@ fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
     if to.exists() {
         fs::remove_file(to)?;
     }
@@ -256,5 +276,44 @@ pub(crate) mod test_hook {
                 hook(stage, tmp_path);
             }
         });
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn missing_canonical_parent_keeps_the_original_windows_spelling() {
+        let path = std::env::temp_dir().join(format!("no-canonical-name-{}", Uuid::new_v4())).join("config.json");
+        assert!(!path.parent().unwrap().exists());
+        assert_eq!(windows_api_path(&path).unwrap(), path);
+    }
+
+    #[test]
+    fn atomic_replacement_accepts_long_unprefixed_windows_paths() {
+        let root = std::env::temp_dir().join(format!("cutex-atomic-long-{}", Uuid::new_v4()));
+        let parent = root.join("a".repeat(90)).join("b".repeat(90)).join("c".repeat(60));
+        let path = parent.join("settings.json");
+        assert!(path.as_os_str().len() > 260);
+        write_bytes_atomic(&path, b"old settings").unwrap();
+        write_bytes_atomic(&path, b"new settings").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new settings");
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1, "no leftover temp files");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn denied_atomic_replacement_preserves_existing_bytes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("cutex-atomic-locked-{}", Uuid::new_v4()));
+        let path = root.join("settings.json");
+        write_bytes_atomic(&path, b"old settings").unwrap();
+        let held = OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        assert!(write_bytes_atomic(&path, b"new settings").is_err());
+        drop(held);
+        assert_eq!(fs::read(&path).unwrap(), b"old settings");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1, "failed replacement cleans its temp");
+        fs::remove_dir_all(root).unwrap();
     }
 }

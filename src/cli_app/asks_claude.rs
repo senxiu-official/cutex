@@ -32,6 +32,9 @@ use cutex::session::model::CutexSessionRecord;
 use super::app_server_user_input;
 use super::claude_runtime;
 
+#[path = "asks_claude/owner_note_evidence.rs"]
+mod owner_note_evidence;
+
 /// The adapter's exclusive admission value (input capability `admissions`).
 pub(crate) const ADMISSION: &str = "exclusive_turn";
 /// Source id of events cutex itself submits (owner asks, ANSWER events).
@@ -402,6 +405,33 @@ pub(crate) fn stage_owner_results_locked(session: &str, store: &cutex::asks::sto
 }
 
 fn owner_note_status(session: &str, generation: u64, submission: &Submission) -> NativeMessageStatus {
+    let Some(record) = super::asks_runtime::record(session) else {
+        return NativeMessageStatus::Unavailable("session missing".into());
+    };
+    let durable = (|| -> anyhow::Result<Option<String>> {
+        let thread = record.app_server_thread_id().ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+        let envelope = owner_note_envelope(session, thread, generation, submission)?;
+        let adapter = record.claude_session.as_ref().ok_or_else(|| anyhow::anyhow!("Claude binding missing"))?;
+        anyhow::ensure!(adapter.thread_id == thread, "Claude persisted thread binding mismatch");
+        let source = cutex::asks::store::AskStore::open_default()?.shared()?;
+        let owners = source.events.values()
+            .find(|event| event.cutex_session_id == session && event.native_message_id == submission.message_id)
+            .map(|event| event.delivery_ids.iter().filter_map(|id| source.deliveries.get(id)
+                .and_then(|delivery| delivery.owner_input_id.clone())).collect::<std::collections::BTreeSet<_>>())
+            .unwrap_or_default();
+        let owner = (owners.len() == 1).then(|| owners.first().expect("one owner").as_str());
+        let proof = owner_note_evidence::persisted_turn(&adapter.state_dir.join("state.sqlite3"), &envelope, owner)?;
+        let current = super::asks_runtime::record(session).ok_or_else(|| anyhow::anyhow!("session removed"))?;
+        anyhow::ensure!(current.claude_session == record.claude_session
+            && current.app_server_thread_id() == record.app_server_thread_id()
+            && current.runtime_generation == record.runtime_generation, "Claude binding changed during evidence read");
+        Ok(proof)
+    })();
+    if let Ok(Some(turn_id)) = durable { return NativeMessageStatus::Persisted { turn_id }; }
+    if record.runtime_generation != generation {
+        // Never ask a current adapter to attest to an old generation's key.
+        return NativeMessageStatus::Unavailable("old owner carry has no verified durable context evidence".into());
+    }
     let result = (|| -> anyhow::Result<_> {
         let record = super::asks_runtime::record(session).ok_or_else(|| anyhow::anyhow!("session missing"))?;
         let thread = record.app_server_thread_id().ok_or_else(|| anyhow::anyhow!("thread missing"))?;

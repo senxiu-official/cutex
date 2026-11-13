@@ -47,6 +47,7 @@ pub(super) fn endpoint() -> anyhow::Result<Option<Endpoint>> {
         .context("cannot read runtime-host token")?
         .trim()
         .to_owned();
+    cutex::management::v2::host_files::register_launch_credential_file("runtime-host", std::path::Path::new(token_file))?;
     Ok(Some(Endpoint { url: url.to_owned(), token }))
 }
 

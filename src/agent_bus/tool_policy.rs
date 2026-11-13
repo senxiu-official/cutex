@@ -71,6 +71,7 @@ pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
     rule("delegation_stop", Audience::Everyone),
     rule("delegation_close", Audience::Everyone),
     rule("delegation_read", Audience::Everyone),
+    rule("delegation_notices_read", Audience::Everyone),
     rule("delegation_progress", Audience::Everyone),
     rule("question_answer", Audience::Everyone),
     rule("agent_tell", Audience::Everyone),
@@ -112,6 +113,9 @@ pub const CUTEX_TOOL_RULES: &[ToolRule] = &[
     rule("member_replace", Audience::ProjectManagers),
     // Agent → owner messages (docs/research/owner-notify.md).
     rule("owner_notify", Audience::OwnerFacing),
+    // 备忘: the same agents as owner_notify, behind the same setting.
+    rule("owner_pin", Audience::OwnerFacing),
+    rule("owner_pins", Audience::OwnerFacing),
 ];
 
 /// The caller's roles, as far as tool listing is concerned.
@@ -845,9 +849,10 @@ mod tests {
         assert!(has(child, "everyone"));
         assert!(!has(owner_created, "directors") && has(director_child, "directors"));
         assert!(!has(director_child, "none"));
-        // Other tools do not depend on the knob.
+        // owner_pin / owner_pins follow the same knob; other tools do not depend on it.
+        assert!(has(owner_created, "ownerFacing") && tool_names_for(owner_created).contains(&"owner_pin") && !tool_names_for(child).contains(&"owner_pins"));
         assert_eq!(
-            tool_names_for_audience(child, "none").len() + 1,
+            tool_names_for_audience(child, "none").len() + 3,
             tool_names_for_audience(child, "everyone").len()
         );
     }

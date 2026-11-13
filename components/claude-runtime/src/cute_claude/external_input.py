@@ -12,12 +12,13 @@ import json
 import re
 import time
 import uuid
+from collections import OrderedDict
 
 from . import asks
 from .errors import RpcError, require, text
 from .store import dump
 
-METHODS = frozenset('thread/externalInput/' + action for action in ('submit', 'status', 'retry', 'resume', 'interrupt'))
+METHODS = frozenset('thread/externalInput/' + action for action in ('submit', 'status', 'retry', 'resume', 'interrupt', 'returnCarries'))
 BINDING_FIELDS = {'version', 'ownerId', 'threadId', 'runtimeGeneration'}
 
 
@@ -98,6 +99,10 @@ class ExternalInputService:
             message_id TEXT NOT NULL, envelope TEXT NOT NULL, receipt TEXT,
             attempt_id TEXT, output_observed INTEGER NOT NULL DEFAULT 0,
             last_status TEXT, PRIMARY KEY(thread_id,message_id));
+          CREATE TABLE IF NOT EXISTS returned_carries(
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+            message_id TEXT NOT NULL, semantic_sha256 TEXT NOT NULL,
+            PRIMARY KEY(thread_id,message_id));
           CREATE TABLE IF NOT EXISTS external_input_retries(
             thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
             retry_id TEXT NOT NULL, request TEXT NOT NULL,
@@ -109,6 +114,11 @@ class ExternalInputService:
             self.store.db.execute('CREATE INDEX IF NOT EXISTS external_inputs_uncompacted ON external_inputs(thread_id,message_id) WHERE compacted=0')
             self.store.db.execute('CREATE INDEX IF NOT EXISTS external_notes_turn ON notes(thread_id,turn_id,message_id)')
         self._maintenance_at = time.monotonic()
+        self._recovery_cache = OrderedDict()
+        self.store.db.execute('''CREATE TABLE IF NOT EXISTS external_input_recovery(
+            thread_id TEXT NOT NULL, message_id TEXT NOT NULL, native_session_id TEXT NOT NULL,
+            request_id TEXT NOT NULL, output_uuid TEXT NOT NULL, turn_id TEXT NOT NULL,
+            PRIMARY KEY(thread_id,message_id))''')
         if self.enabled:
             self.bind({'ownerId': self.settings.external_owner_id, 'runtimeGeneration': self.runtime_generation})
             self.compact_history()
@@ -176,7 +186,7 @@ class ExternalInputService:
         return {'externalInputVersion': 1, 'externalInputVersions': [1, 2],
                 'externalInputDeliveries': ['after_turn', 'passive'] + (['soon'] if self.settings.backend == 'subscription' else []),
                 'externalInputControlVersion': 1,
-                **({'ownerInputCarries': 1} if self.settings.backend == 'subscription' else {})}
+                **({'ownerInputCarries': 1, 'ownerCarryReturn': 1} if self.settings.backend == 'subscription' else {})}
 
     def _binding(self, params: dict, *, submit=False) -> str:
         require(self.enabled, 'native external input requires a trusted host owner/runtime binding', -32011)
@@ -219,7 +229,7 @@ class ExternalInputService:
                     return {**dict(note), 'state': owner[0]}
         return note
 
-    def _status(self, tid: str, mid: str, digest: str) -> dict:
+    def _status(self, tid: str, mid: str, digest: str, *, recover: bool = False) -> dict:
         result = {'messageId': mid, 'semanticSha256': digest, 'deliveryState': 'unknown', 'receipt': None,
                   'processing': {'state': 'none', 'attemptId': None, 'reason': None}}
         row = self._row(tid, mid)
@@ -240,9 +250,14 @@ class ExternalInputService:
             # proves that the selected model context contains this input.
             result['processing'] = {'state': 'held', 'attemptId': row['attempt_id'], 'reason': 'context_missing'}
             return result
+        if recover and row['receipt'] is None and inbox['state'] in {'failed', 'interrupted', 'uncertain', 'completed', 'injected'}:
+            self._recover_receipts(tid, mid)
+            row = self._row(tid, mid)
         result['receipt'] = json.loads(row['receipt']) if row['receipt'] else None
         result['deliveryState'] = 'context_persisted' if row['receipt'] else 'pending'
         if inbox['passive']:
+            if not row['receipt'] and inbox['state'] in {'failed', 'interrupted', 'uncertain', 'completed'}:
+                result['processing'] = {'state':'held', 'attemptId':row['attempt_id'], 'reason':'request_uncertain'}
             if not row['receipt'] and json.loads(inbox['payload']).get('metadata', {}).get('ownerCarrier'):
                 state = inbox['state']
                 result['processing'] = {'state': 'pending' if state == 'reserved' else ('claimed' if state == 'injected' else 'held'),
@@ -266,6 +281,140 @@ class ExternalInputService:
         result['processing'] = {'state': processing, 'attemptId': attempt, 'reason': reason}
         return result
 
+    def _return_carries(self, tid: str, keys: list[dict]) -> list[str]:
+        """Give back the notes whose carrier steer is proven never read: they
+        leave this runtime in one transaction, so no later claim can read them
+        beside the copy cutex sends on its own. Anything else stays and is not
+        listed. The proof outlives the note: a lost answer gets the same answer."""
+        returned = []
+        with self.store.transaction():
+            for key in keys:
+                mid = text(key['messageId'], 'messageId', limit=256)
+                digest = _digest(key['semanticSha256'])
+                row = self._row(tid, mid)
+                if row is None:
+                    proof = self.store.db.execute('SELECT semantic_sha256 FROM returned_carries WHERE thread_id=? AND message_id=?', (tid, mid)).fetchone()
+                    if proof and proof[0] == digest and self._inbox(tid, mid) is None:
+                        returned.append(mid)
+                    continue
+                if json.loads(row['envelope'])['semanticSha256'] != digest or row['receipt'] is not None:
+                    continue
+                note = self.store.db.execute("SELECT payload FROM notes WHERE thread_id=? AND message_id=? AND state='reserved'", (tid, mid)).fetchone()
+                carrier = json.loads(note[0]).get('metadata', {}).get('ownerCarrier') if note else None
+                if carrier and self.store.steer_dropped_unread(tid, carrier):
+                    self._take_back(tid, mid, digest)
+                    returned.append(mid)
+        return returned
+
+    def _take_back(self, tid: str, mid: str, digest: str) -> None:
+        self.store.db.execute('DELETE FROM notes WHERE thread_id=? AND message_id=?', (tid, mid))
+        self.store.db.execute('DELETE FROM external_inputs WHERE thread_id=? AND message_id=?', (tid, mid))
+        self.store.db.execute('INSERT OR REPLACE INTO returned_carries VALUES(?,?,?)', (tid, mid, digest))
+
+    def return_carrier_notes(self, tid: str, carrier: str) -> None:
+        """The caller proved `carrier` dropped and sends it again without them."""
+        rows = self.store.db.execute("""SELECT n.message_id,e.envelope FROM notes n
+            JOIN external_inputs e ON e.thread_id=n.thread_id AND e.message_id=n.message_id
+            WHERE n.thread_id=? AND n.state='reserved' AND e.receipt IS NULL
+              AND json_extract(n.payload,'$.metadata.ownerCarrier')=?""", (tid, carrier)).fetchall()
+        for row in rows:
+            self._take_back(tid, row['message_id'], json.loads(row['envelope'])['semanticSha256'])
+
+    def _recover_receipts(self, tid: str, wanted: str) -> None:
+        """One bounded native scan per file/mapping version, without replay."""
+        if self.settings.backend != 'subscription':
+            return
+        if tid in self.store.history_mutations:
+            return
+        inspect = getattr(self.server.engine, 'inspect_session', None)
+        if inspect is None:
+            return
+        session = inspect(tid)
+        if not session:
+            return
+        try:
+            from .session_ops import NativeSessionApi
+            from .receipt_recovery import recover
+            path = NativeSessionApi(self.server.engine).transcript(session['session_id'])
+            if path is None:
+                return
+            metadata = path.stat()
+            mapped = {r['native_uuid']: r['turn_id'] for r in self.store.db.execute('''
+                SELECT m.native_uuid,m.turn_id FROM sdk_turn_messages m JOIN turns t ON t.id=m.turn_id
+                WHERE m.thread_id=? AND m.role='assistant' AND t.reverted=0''', (tid,))}
+            key = (session['session_id'], metadata.st_size, metadata.st_mtime_ns, tuple(mapped.items()))
+            cached = self._recovery_cache.get(tid)
+            if cached and cached[0] == key and wanted in cached[1]:
+                return
+            expected, duplicates, bindings = {}, set(), {}
+            rows = self.store.db.execute('''SELECT message_id,envelope FROM external_inputs
+                    WHERE thread_id=? AND receipt IS NULL ORDER BY (message_id=?) DESC,message_id LIMIT 200''', (tid, wanted)).fetchall()
+            for row in rows:
+                mid = row['message_id']
+                inbox = self._inbox(tid, mid)
+                if not inbox or inbox['state'] not in {'failed', 'interrupted', 'uncertain', 'completed', 'injected'}:
+                    continue
+                payload = json.loads(inbox['payload'])
+                envelope = json.loads(row['envelope'])
+                if (envelope.get('threadId') != tid or envelope.get('ownerId') != self.settings.external_owner_id
+                        or envelope.get('message', {}).get('id') != mid
+                        or semantic_digest(envelope) != envelope.get('semanticSha256')):
+                    continue
+                canonical = self.payload(envelope)
+                if any(payload.get(k) != canonical.get(k) for k in ('source', 'eventType', 'text', 'view')):
+                    continue
+                message = envelope['message']
+                identical = self.store.db.execute('''SELECT count(*) FROM external_inputs WHERE thread_id=?
+                    AND json_extract(envelope,'$.message.source.kind')=?
+                    AND json_extract(envelope,'$.message.source.id')=?
+                    AND json_extract(envelope,'$.message.type')=? AND json_extract(envelope,'$.message.text')=?''',
+                    (tid, message['source']['kind'], message['source']['id'], message['type'], message['text'])).fetchone()[0]
+                if identical != 1:
+                    continue
+                user_uuids = {r[0] for r in self.store.db.execute('''SELECT native_uuid FROM sdk_turn_messages
+                    WHERE thread_id=? AND turn_id=? AND role='user' ''', (tid, inbox['turn_id']))}
+                context_turn = inbox['turn_id'] if inbox['passive'] and inbox['state'] == 'injected' else None
+                if getattr(self.server, 'busy_delivery', None):
+                    busy = self.store.db.execute('''SELECT context_turn_id,offered FROM busy_inputs
+                        WHERE thread_id=? AND message_id=?''', (tid, mid)).fetchone()
+                    if busy is not None:
+                        if not busy['offered']:
+                            continue
+                        context_turn = busy['context_turn_id']
+                        user_uuids = set()
+                bindings[mid] = {'user_uuids':user_uuids, 'context_turn':context_turn}
+                frame = {'source':payload['source'], 'eventType':payload['eventType'], 'text':payload['text']}
+                ref = asks.ask_ref(payload)
+                if ref is not None:
+                    frame['ask'] = ref
+                encoded = dump(frame)
+                if encoded in duplicates:
+                    continue
+                matches = [other for other, value in expected.items() if value == frame]
+                if matches:
+                    for other in matches:
+                        del expected[other]
+                    duplicates.add(encoded)
+                else:
+                    expected[mid] = frame
+            proofs = recover(path, session['session_id'], expected, mapped, bindings) if expected else {}
+            after = path.stat()
+            if (after.st_size, after.st_mtime_ns) != (metadata.st_size, metadata.st_mtime_ns):
+                return
+            for mid, (turn_id, request_id, output_uuid) in proofs.items():
+                with self.store.transaction():
+                    self._persisted(tid, mid, turn_id, native_proof=True)
+                    if self._row(tid, mid)['receipt'] is not None:
+                        self.store.db.execute('''INSERT OR IGNORE INTO external_input_recovery
+                            VALUES(?,?,?,?,?,?)''', (tid, mid, session['session_id'], request_id, output_uuid, turn_id))
+            self._recovery_cache[tid] = (key, {row['message_id'] for row in rows})
+            self._recovery_cache.move_to_end(tid)
+            while len(self._recovery_cache) > 16:
+                self._recovery_cache.popitem(last=False)
+        except (OSError, ValueError, KeyError, TypeError, RpcError):
+            # Missing/truncated history is unproven, never a success or resend.
+            return
+
     async def _changed(self, tid: str, mid: str) -> None:
         row = self._row(tid, mid)
         if row is None:
@@ -276,11 +425,11 @@ class ExternalInputService:
             self.store.db.execute('UPDATE external_inputs SET last_status=? WHERE thread_id=? AND message_id=?', (status, tid, mid))
             await self.server.engine.emit(tid, 'thread/externalInput/statusChanged', {'threadId': tid, 'messageId': mid})
 
-    def _persisted(self, tid: str, mid: str, turn_id: str) -> None:
+    def _persisted(self, tid: str, mid: str, turn_id: str, *, native_proof: bool = False) -> dict | None:
         row = self._row(tid, mid)
         if row is None or row['receipt'] is not None:
             return
-        if getattr(self.server, 'busy_delivery', None):
+        if not native_proof and getattr(self.server, 'busy_delivery', None):
             busy = self.store.db.execute('SELECT context_turn_id,offered FROM busy_inputs WHERE thread_id=? AND message_id=?', (tid, mid)).fetchone()
             if busy and busy[0] and not busy[1]:
                 return
@@ -289,6 +438,10 @@ class ExternalInputService:
             ordinal = self.store.db.execute('SELECT count(*) FROM external_inputs WHERE thread_id=? AND receipt IS NOT NULL', (tid,)).fetchone()[0] + 1
             receipt = make_receipt(json.loads(row['envelope']), turn_id, ordinal)
             self.store.db.execute('UPDATE external_inputs SET receipt=? WHERE thread_id=? AND message_id=?', (dump(receipt), tid, mid))
+            # The receipt and its grant window commit together, including
+            # transcript recovery. A crash cannot lose the first-read clock.
+            grants = getattr(self.server, 'safety_grants', None)
+            return grants.record_notice_read(tid, mid) if grants else None
 
     # Timeline items of a turn's inputs; any other item is the model's own
     # (its prompt, with the notes read at its start, reached the model).
@@ -365,11 +518,14 @@ class ExternalInputService:
             inbox = self._inbox(tid, mid)
             if inbox is None:
                 continue
+            grant_read = None
             if turn_id and inbox['turn_id'] == turn_id:
                 if acknowledged or (self.settings.backend != 'subscription' and inbox['state'] not in {'queued', 'pending'}):
-                    self._persisted(tid, mid, turn_id)
+                    grant_read = self._persisted(tid, mid, turn_id)
                 if output and not inbox['passive']:
                     self.store.db.execute('UPDATE external_inputs SET output_observed=1 WHERE thread_id=? AND message_id=?', (tid, mid))
+            if grant_read is not None:
+                await self.server.engine.emit(tid, 'thread/safetyCheck/updated', {'threadId': tid, 'block': grant_read})
             await self._changed(tid, mid)
         if method == 'turn/completed' and time.monotonic() - self._maintenance_at >= self.MAINTENANCE_INTERVAL_SECONDS:
             self.compact_history()
@@ -378,7 +534,7 @@ class ExternalInputService:
     async def dispatch(self, peer, method: str, params: dict):
         require(method in METHODS, 'unsupported native external input method')
         action = method.rsplit('/', 1)[-1]
-        extra = {'submit': {'message', 'view', 'semanticSha256', 'admission'}, 'status': {'messages'},
+        extra = {'submit': {'message', 'view', 'semanticSha256', 'admission'}, 'status': {'messages'}, 'returnCarries': {'messages'},
                  'retry': {'messageId', 'semanticSha256', 'expectedAttemptId', 'retryId'},
                  'resume': set(), 'interrupt': {'turnId'}}[action]
         require(not set(params) - BINDING_FIELDS - extra, 'unsupported external input fields')
@@ -393,9 +549,15 @@ class ExternalInputService:
             statuses = []
             for key in keys:
                 require(isinstance(key, dict) and set(key) == {'messageId', 'semanticSha256'}, 'invalid message key')
-                statuses.append(self._status(tid, text(key['messageId'], 'messageId', limit=256), _digest(key['semanticSha256'])))
+                statuses.append(self._status(tid, text(key['messageId'], 'messageId', limit=256), _digest(key['semanticSha256']), recover=True))
             peer.subscriptions.add(tid)
             return {**self._response(tid), 'statuses': statuses}, None
+        if action == 'returnCarries':
+            keys = params.get('messages')
+            require(isinstance(keys, list) and 1 <= len(keys) <= 100, 'returnCarries requires 1..100 message keys')
+            for key in keys:
+                require(isinstance(key, dict) and set(key) == {'messageId', 'semanticSha256'}, 'invalid message key')
+            return {**self._response(tid), 'returned': self._return_carries(tid, keys)}, None
         if action == 'retry':
             return self._retry(tid, params)
         require(not self.store.thread(tid)['archived'], 'thread is archived', -32009)
@@ -476,6 +638,7 @@ class ExternalInputService:
             self.store.enqueue_note(tid, mid, payload, self.settings.max_pending)
             self.store.db.execute("UPDATE notes SET state='reserved' WHERE thread_id=? AND message_id=?", (tid, mid))
             self.store.db.execute('INSERT INTO external_inputs(thread_id,message_id,envelope) VALUES(?,?,?)', (tid, mid, dump(envelope)))
+            self.store.db.execute('DELETE FROM returned_carries WHERE thread_id=? AND message_id=?', (tid, mid))
 
     async def _submit(self, peer, tid: str, params: dict):
         envelope = self.validate_envelope(tid, {k: v for k, v in params.items() if k != 'admission'})
@@ -500,6 +663,7 @@ class ExternalInputService:
         with self.store.transaction():
             enqueue = self.store.enqueue_note if message['delivery'] == 'passive' else self.store.enqueue
             receipt = enqueue(tid, mid, payload, self.settings.max_pending)
+            self.store.db.execute('DELETE FROM returned_carries WHERE thread_id=? AND message_id=?', (tid, mid))
             if message['delivery'] == 'soon':
                 self.server.busy_delivery.register(tid, mid, receipt)
             self.store.db.execute('INSERT INTO external_inputs(thread_id,message_id,envelope) VALUES(?,?,?)', (tid, mid, dump(envelope)))

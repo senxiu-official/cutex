@@ -39,6 +39,17 @@ fn returned_details(details: &Value) -> Value {
     details
 }
 
+fn accepted_next(owner: &str, turn: &str, starts_turn: bool, mut details: Value) -> Next {
+    details["carriedByOwner"] = json!(owner);
+    if starts_turn { details[il::READ_SIGNAL] = json!("turnStart"); }
+    Next::accepted().reason("carriedByOwner").turn(turn).details(details)
+}
+
+fn owns_reservation(record: &il::InputRecord, owner: &str) -> bool {
+    matches!(record.state, InputState::Sending | InputState::Accepted)
+        && record.details.get("carriedByOwner").and_then(Value::as_str) == Some(owner)
+}
+
 fn canonical_policy(
     session: &str,
     record: &cutex::session::model::CutexSessionRecord,
@@ -314,7 +325,7 @@ impl OwnerCarries {
         }
     }
 
-    pub(crate) fn accepted(&self, turn: Option<&str>) {
+    pub(crate) fn accepted(&self, turn: Option<&str>, starts_turn: bool) {
         let Some(turn) = turn else {
             self.unknown();
             return;
@@ -326,21 +337,16 @@ impl OwnerCarries {
             return;
         };
         for record in records.records {
-            if !matches!(record.state, InputState::Sending | InputState::Accepted) {
+            if !owns_reservation(&record, &self.owner) {
                 continue;
             }
-            let mut details = record.details.clone();
-            details["carriedByOwner"] = json!(self.owner);
-            // Merely accepting the RPC does not prove a steer was read. The
-            // ordinary native item/receipt projection decides its surface.
+            // A start's first inputs may enter history immediately (054).
+            // Steers still wait for native item/receipt evidence.
             il::record(
                 &self.session,
                 &record.input_id,
                 Expect::rev(record.rev),
-                Next::accepted()
-                    .reason("carriedByOwner")
-                    .turn(turn)
-                    .details(details),
+                accepted_next(&self.owner, turn, starts_turn, record.details),
             );
         }
     }
@@ -353,7 +359,7 @@ impl OwnerCarries {
             return;
         };
         for record in records.records {
-            if matches!(record.state, InputState::Sending | InputState::Accepted) {
+            if owns_reservation(&record, &self.owner) {
                 il::record(
                     &self.session,
                     &record.input_id,
@@ -423,6 +429,33 @@ impl OwnerCarries {
             .collect::<Vec<_>>();
         if !batch.is_empty() {
             il::record_batch(&self.session, batch);
+        }
+    }
+}
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::*;
+    #[test]
+    fn only_a_carrier_start_moves_accepted_results_to_history_and_preserves_details() {
+        for starts in [false, true] {
+            let root=std::env::temp_dir().join(format!("carry-accept-{}",uuid::Uuid::new_v4()));
+            let ledger=il::InputLedger::open(root.join("ledger.sqlite3"));
+            let input=il::NewInput { kind: il::InputKind::DelegationResult,
+                sender: il::InputSender { kind: il::SenderKind::Owner,id:"owner".into(),name:"owner".into(),host:None,cutex_session_id:None },
+                intent: il::InputIntent { strategy:None,delivery_mode:None,timing:il::Timing::NextStep },
+                preview:"exact original answer".into(),ask_id:Some("delegation-answer".into()),remote:None };
+            ledger.transition("cutex.private","dlv-one",Expect::NEW,Next::waiting("afterTurn").create(input)).unwrap();
+            ledger.transition("cutex.private","dlv-one",Expect::ANY,Next::sending().details(json!({"futureField":{"keep":true}}))).unwrap();
+            let record=ledger.transition("cutex.private","dlv-one",Expect::ANY,
+                accepted_next("carrier","turn",starts,json!({"futureField":{"keep":true}}))).unwrap().record;
+            assert_eq!(record.surface,if starts {il::Surface::Timeline} else {il::Surface::NextUp});
+            assert_eq!(record.details["futureField"],json!({"keep":true}));
+            assert_eq!(record.details.get(il::READ_SIGNAL).is_some(),starts);
+            assert_eq!(record.preview,"exact original answer");
+            assert!(owns_reservation(&record,"carrier"));
+            assert!(!owns_reservation(&record,"old-carrier"),"a late callback cannot adopt a newer reservation");
+            drop(ledger); let _=std::fs::remove_dir_all(root);
         }
     }
 }

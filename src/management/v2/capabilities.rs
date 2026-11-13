@@ -6,6 +6,8 @@ use serde_json::Value;
 /// Additive Management features beyond the frozen v2 baseline. Clients
 /// feature-detect on these strings (and the boolean `features` map).
 pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
+    (super::session_paths::CAPABILITY, "sessionPathReapproval"),
+    ("agent-memory-injection", "agentMemoryInjection"),
     // 2026-11-03: design 056 phase 1 (r275), opaque per-person layout sections.
     ("user-layout", "userLayout"),
     // 2026-11-04: session resources carry `activity.lastTurnError {turnId,
@@ -51,6 +53,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     ("project-workspace-root", "projectWorkspaceRoot"),
     // POST /v2/human/agents.
     ("human-create-agent", "humanCreateAgent"),
+    ("quick-chat-promote-v1", "quickChatPromoteV1"),
     // POST /v2/human/sessions (quick chats: owned sessions, scratch cwd) and the
     // optional `launch` overrides object on POST /v2/human/{agents,sessions}.
     ("human-create-session", "humanCreateSession"),
@@ -181,6 +184,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // block deleting it (the delete clears the registrant).
     ("services-project-scope", "servicesProjectScope"),
     ("service-idle-presets-v1", "serviceIdlePresetsV1"),
+    ("services-workers-v1", "servicesWorkersV1"),
     // Owner Management GET /v2/services/{slug}/eligible-owners: all known
     // non-archived sessions, including hidden, unnamed and offline sessions.
     ("services-eligible-owners", "servicesEligibleOwners"),
@@ -495,6 +499,8 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // Codex background terminals, Jobs) with the existing stop request.
     // Members see their agents' rows; no stop requests.
     ("project-events", "projectEvents"),
+    // Shared presentation icon; omission keeps it, explicit null clears it.
+    ("project-icon", "projectIcon"),
     // ?compact=1 on bootstrap / history: tool item strings > 2 KB cut, item
     // gets truncated: true (full text = same request without compact).
     ("compact-history", "compactHistory"),
@@ -537,6 +543,13 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // ownerNotify; summary needs ownerMessage / ownerReply and
     // cutex/summary/messageToOwner.
     ("owner-messages", "ownerMessages"),
+    // 备忘 (cutex-desktop .claude/reports/owner-pins-design-20261110.md):
+    // agent tools owner_pin / owner_pins (same audience as owner_notify);
+    // GET /v2/owner-pins?state=open|all&agentId=&limit=, PATCH
+    // /v2/owner-pins/{id} {state, expectedRevision?}, DELETE
+    // /v2/owner-pins/{id}; host event cutex/ownerPin/changed {pin} |
+    // {pinId, deleted}. Never needs-you, never delivered.
+    ("owner-pins", "ownerPins"),
     // Owner-notify records carry origin agent | system (system = cutex's own
     // notices: delivery failures, delegation reminders); root-only session
     // method cutex/ownerNotify/delete {notificationId} removes a record
@@ -699,6 +712,8 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // artifact_publish / artifact_list / artifact_read, project auto capture,
     // events cutex/artifact/published|updated, settings artifacts.*.
     ("artifacts", "artifacts"),
+    // Whole-library source/latest-publisher filters and stable sorted pages.
+    ("artifact-library", "artifactLibrary"),
     // MCP artifact_publish {show: true}: after the publish, host event
     // cutex/artifact/showRequested {artifactId, version, ref, scope, name,
     // kind, mediaType, cutexSessionId, displayName, hostId, newVersion,
@@ -1263,6 +1278,7 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // .agents/skills + .claude/skills, account cutex-skills, host
     // ~/.cutex/claude-skills), read without the runtime; Codex agents 409
     // unsupported_runtime. Clients send the listed paths as `skill` inputs.
+    ("baidu-pan", "baiduPan"),
     ("claude-session-skills", "claudeSessionSkills"),
     // 2026-10-17: cutex/session/history/revert accepts `rewindFiles: true`
     // for Claude agents (the adapter restores files from Claude Code's
@@ -1862,6 +1878,7 @@ mod tests {
             "profilePlanLabel",
             "profilePlanLabelOverride",
             "artifacts",
+            "artifactLibrary",
             "artifactShow",
             "claudeQuotaStaleCredentials",
             "peers",

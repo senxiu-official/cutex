@@ -12,6 +12,10 @@ use super::*;
 mod archive_operations;
 pub use archive_operations::ManagedAgentArchiveRequest;
 
+#[path = "readiness.rs"]
+mod readiness;
+pub use readiness::wait_for_claude_registration_with;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LifecycleFailure {
     pub code: String,
@@ -299,6 +303,19 @@ pub trait AgentLifecycle: Send + Sync {
         &self,
         cutex_session_id: &CutexSessionId,
     ) -> Result<AgentRuntimeObservation, LifecycleFailure>;
+    /// Creation/recovery barrier. Other backends retain their existing observation.
+    /// Callers release the host fence and recheck their action before publishing Ready.
+    fn observe_ready(
+        &self,
+        cutex_session_id: &CutexSessionId,
+    ) -> Result<AgentRuntimeObservation, LifecycleFailure> {
+        self.observe(cutex_session_id)
+    }
+    /// Cheap durable-only claim used to fence a readiness wait across releasing
+    /// the host fence. No native request, process probe or endpoint IO here.
+    fn readiness_claim(&self, _id: &CutexSessionId) -> Result<Option<RuntimeOccurrenceFence>, LifecycleFailure> {
+        Ok(None)
+    }
     fn send_message(
         &self,
         system: &crate::agent_bus::identity::AgentManagementSystemPrincipal,
@@ -450,6 +467,7 @@ fn project_current_names(
         agent.spec.cwd =
             crate::session::metadata::cutex_session_launch_cwd(record).into();
         agent.spec.profile = record.profile.clone();
+        agent.spec.memory_injection = record.memory_injection;
         agent.spec.model = record.model_defaults.clone().unwrap_or_default();
         agent.spec.reasoning = record.reasoning_defaults.clone().unwrap_or_default();
         agent.spec.permissions = record.permission_defaults.clone().unwrap_or_default();
@@ -1946,6 +1964,7 @@ impl AgentManagementProvider {
             }
             AgentOperation::Restart { cutex_session_id, .. } => {
                 let agent = self.active_agent(&request.project_id, cutex_session_id)?;
+                let ready_sequence = self.action_phase_sequence(request)?;
                 let (before, after) = match action.historical_runtime_occurrence_fence.as_ref() {
                     Some(fence) => lifecycle
                         .restart_managed_if_occurrence(
@@ -1982,6 +2001,10 @@ impl AgentManagementProvider {
                         (before, after)
                     }
                 };
+                let after = self.ready_observation_for_action(
+                    request, cutex_session_id, ready_sequence, lifecycle, Some(&after),
+                )?;
+                let agent = self.active_agent(&request.project_id, cutex_session_id)?;
                 validate_ready(&agent, &after)?;
                 validate_identity_preserved(&before, &after)?;
                 if after.runtime_generation <= before.runtime_generation {
@@ -2312,9 +2335,10 @@ impl AgentManagementProvider {
             }
             self.ensure_action_unchanged(request, registered_sequence)?;
         }
-        let observation = lifecycle
-            .observe(&cutex_session_id)
-            .map_err(lifecycle_error)?;
+        let ready_sequence = Some(action.phase_sequence);
+        let observation = self.ready_observation_for_action(
+            request, &cutex_session_id, ready_sequence, lifecycle, None,
+        )?;
         let agent = self.active_agent(&request.project_id, &cutex_session_id)?;
         if let Some(permit) = &permit {
             validate_ready_with_groups(&agent, &observation, &permit.intent.runtime_groups)?;
@@ -2387,7 +2411,7 @@ impl AgentManagementProvider {
             .known_successor_cutex_session
             .as_ref()
             .ok_or(AgentManagementError::InvalidStore)?;
-        let agent = self.active_agent(&request.project_id, successor)?;
+        self.active_agent(&request.project_id, successor)?;
         let state = self.store.snapshot()?;
         let intent = state.bootstrap_intents.get(&request.action_id);
         if let Some(intent) = intent {
@@ -2405,7 +2429,10 @@ impl AgentManagementProvider {
                 )
                 .map_err(lifecycle_error)?;
         }
-        let observation = lifecycle.observe(successor).map_err(lifecycle_error)?;
+        let observation = self.ready_observation_for_action(
+            request, successor, Some(action.phase_sequence), lifecycle, None,
+        )?;
+        let agent = self.active_agent(&request.project_id, successor)?;
         if let Some(intent) = intent {
             validate_ready_with_groups(&agent, &observation, &intent.runtime_groups)?;
         } else {
@@ -2482,10 +2509,10 @@ impl AgentManagementProvider {
         // The online wait may have run outside the fence: compare the action
         // and re-read the agent (an archive may have landed) before readiness.
         self.ensure_action_unchanged(request, registered_sequence)?;
+        let after = self.ready_observation_for_action(
+            request, cutex_session_id, registered_sequence, lifecycle, None,
+        )?;
         let agent = self.active_agent(&request.project_id, cutex_session_id)?;
-        let after = lifecycle
-            .observe(cutex_session_id)
-            .map_err(lifecycle_error)?;
         validate_identity_preserved(&before, &after)?;
         validate_ready(&agent, &after)?;
         Ok((agent, after))
@@ -2871,6 +2898,42 @@ impl AgentManagementProvider {
         request: &AuthorizedAgentManagementRequest<'_>,
     ) -> Result<Option<u64>, AgentManagementError> {
         Ok(self.store.snapshot()?.actions.get(&request.action_id).map(|action| action.phase_sequence))
+    }
+
+    fn ready_observation_for_action(
+        &self,
+        request: &AuthorizedAgentManagementRequest<'_>,
+        id: &CutexSessionId,
+        sequence: Option<u64>,
+        lifecycle: &dyn AgentLifecycle,
+        expected: Option<&AgentRuntimeObservation>,
+    ) -> Result<AgentRuntimeObservation, AgentManagementError> {
+        let claim = lifecycle.readiness_claim(id).map_err(lifecycle_error)?;
+        let result = if claim.is_some() {
+            outside_host_fence("Agent occurrence readiness", || lifecycle.observe_ready(id))?
+        } else {
+            // Non-Claude providers retain their existing synchronous observe
+            // under authority; do not introduce a new release window for them.
+            lifecycle.observe_ready(id)
+        };
+        // Reacquiring authority cannot turn an old wait into permission to
+        // finish another action or operate on its replacement occurrence.
+        self.ensure_action_unchanged(request, sequence)?;
+        if lifecycle.readiness_claim(id).map_err(lifecycle_error)? != claim {
+            return Err(lifecycle_error(LifecycleFailure::outcome_unknown(
+                "claude_readiness_occurrence_changed", "Runtime claim changed while reacquiring readiness authority; this readiness wait dispatched no input; inspect the original action for any earlier delivery")));
+        }
+        let observed = result.map_err(lifecycle_error)?;
+        if expected.is_some_and(|expected|
+            expected.cutex_session_id != observed.cutex_session_id
+                || expected.native_session_id != observed.native_session_id
+                || expected.runtime_generation != observed.runtime_generation
+                || expected.runtime_agent_ids != observed.runtime_agent_ids)
+        {
+            return Err(lifecycle_error(LifecycleFailure::outcome_unknown(
+                "claude_readiness_occurrence_changed", "The newly started occurrence changed before readiness; this readiness wait dispatched no input; inspect the original action for any earlier delivery")));
+        }
+        Ok(observed)
     }
 
     fn set_phase(
@@ -4810,6 +4873,7 @@ mod tests {
     use super::*;
     include!("provider_archive_tests.rs");
     include!("provider_host_hold_tests.rs");
+    include!("provider_readiness_tests.rs");
 
     const REAL_LEGACY_NO_SID_DETAIL: &str =
         "owner_action_required: native_session_unknown: native exec exited exit status: 1 without one captured SID";
@@ -4834,6 +4898,9 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        readiness_scenario: Option<ReadinessScenario>,
+        readiness_gate: Option<std::sync::Arc<OnlineGate>>,
+        readiness_pid: Option<u32>,
         archive_path: Option<std::path::PathBuf>,
         resolved_backend: Option<String>,
         creator_calls: Vec<(String, Option<crate::session::model::SessionCreatedBy>)>,
@@ -5674,6 +5741,54 @@ mod tests {
                 .ok_or_else(|| LifecycleFailure::definite("not_found", "missing fake Agent"))
         }
 
+        fn observe_ready(&self, id: &CutexSessionId) -> Result<AgentRuntimeObservation, LifecycleFailure> {
+            let gate = self.state.lock().unwrap().readiness_gate.take();
+            if let Some(gate) = gate { gate.pass(); }
+            let scenario = self.state.lock().unwrap().readiness_scenario;
+            let Some(scenario) = scenario else { return self.observe(id) };
+            let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+            wait_for_claude_registration_with(
+                std::time::Duration::from_secs(5),
+                || {
+                    let mut observed = self.observe(id)?;
+                    let seconds = clock.get().as_secs();
+                    if seconds < 3 || matches!(scenario, ReadinessScenario::Never) {
+                        observed.agent_bus_endpoint_ids.clear();
+                    } else {
+                        match scenario {
+                            ReadinessScenario::Replaced => observed.runtime_generation += 1,
+                            ReadinessScenario::Duplicate => observed.agent_bus_endpoint_ids.push("foreign".into()),
+                            ReadinessScenario::WrongEndpoint => observed.agent_bus_endpoint_ids = vec!["foreign".into()],
+                            ReadinessScenario::NativeError => return Err(LifecycleFailure::definite("native_failed", "native failure")),
+                            ReadinessScenario::Stopped => observed.active = false,
+                            _ => {}
+                        }
+                    }
+                    Ok(observed)
+                },
+                || clock.get(),
+                |duration| clock.set(clock.get() + duration),
+            )
+        }
+
+        fn readiness_claim(&self, id: &CutexSessionId) -> Result<Option<RuntimeOccurrenceFence>, LifecycleFailure> {
+            if self.state.lock().unwrap().readiness_scenario.is_none() { return Ok(None); }
+            let observed = self.observe(id)?;
+            Ok(Some(RuntimeOccurrenceFence {
+                runtime_generation: observed.runtime_generation,
+                current_runtime_agent_id: observed.runtime_agent_ids.first().cloned(),
+                agent_bus_endpoint_ids: Vec::new(),
+                pending_launch_id: None,
+                app_server_launch_claim_id: None,
+                alden_session_name: None,
+                alden_pid: None,
+                runtime_pid: Some(self.state.lock().unwrap().readiness_pid.unwrap_or(100)),
+                app_server_pid: None,
+                app_server_endpoint: None,
+                app_server_connected: false,
+            }))
+        }
+
         fn send_message(
             &self,
             _system: &crate::agent_bus::identity::AgentManagementSystemPrincipal,
@@ -5725,6 +5840,7 @@ mod tests {
 
     fn spec(name: &str) -> ManagedAgentSpec {
         ManagedAgentSpec {
+            memory_injection: true,
             name: name.to_string(),
             cwd: test_agent_cwd(name),
             profile: Some("orchid".to_string()),

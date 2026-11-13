@@ -17,10 +17,10 @@ pub(super) fn busy() -> WorkspaceError {
     WorkspaceError::new(503, "git_status_busy", "git status is busy; retry shortly")
 }
 #[derive(Clone, Hash, PartialEq, Eq)]
-struct Key { root: Vec<String>, owner_local: bool }
+struct Key { root: Vec<String>, owner_local: bool, narrowed: bool }
 impl Key {
     fn new(root: &Path, owner_local: bool) -> Self {
-        Self { root: crate::artifacts::paths::key(root), owner_local }
+        Self { root: crate::artifacts::paths::key(root), owner_local, narrowed: false }
     }
 }
 type Shared = Result<Arc<Value>, Arc<WorkspaceError>>;
@@ -155,7 +155,10 @@ impl Coordinator {
 }
 fn global() -> &'static Coordinator { static GLOBAL: OnceLock<Coordinator> = OnceLock::new(); GLOBAL.get_or_init(Coordinator::new) }
 pub(super) fn get(root: &Path, load: impl FnMut() -> WorkspaceResult<Value>) -> WorkspaceResult<Arc<Value>> {
-    global().get(Key::new(root, crate::management::users::request_is_owner_local()), load)
+    let full=crate::management::listeners::current_client_token().is_none_or(|token|token.scope.is_full());
+    let mut key=Key::new(root, crate::management::users::request_has_owner_local_secret_access());
+    key.narrowed=!full;
+    global().get(key, load)
 }
 pub(super) fn invalidate(root: &Path) { global().invalidate(root); }
 pub(super) fn diagnostics() -> Value { global().diagnostics() }

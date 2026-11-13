@@ -199,6 +199,7 @@
           "enum": [
             "external",
             "managed",
+            "worker",
             "static"
           ]
         },
@@ -279,10 +280,10 @@
           ]
         },
         "link": {
-          "type": "string"
+          "type": ["string", "null"]
         },
         "proxyHost": {
-          "type": "string"
+          "type": ["string", "null"]
         },
         "root": {
           "type": [

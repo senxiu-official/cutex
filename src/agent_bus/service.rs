@@ -74,6 +74,7 @@ pub fn resolve_serve_token(
         (Some(token), ServeTokenSource::CommandLine)
     } else if let Some(path) = token_file {
         let (token, file_warnings) = read_serve_token_file(path)?;
+        crate::management::v2::host_files::register_launch_credential_file("agent-bus-serve", path)?;
         warnings.extend(file_warnings);
         (Some(token), ServeTokenSource::File)
     } else if let Some(token) = non_empty(env_token) {
@@ -266,6 +267,8 @@ mod tests {
 
     #[test]
     fn token_file_is_read_trimmed_and_validated() {
+        let _home = crate::profiles::lifecycle::tests::TestHome::new();
+        std::fs::write(_home.root().join(crate::config::paths::PRIVATE_HOME_MARKER), b"").unwrap();
         let dir = temp_dir("file");
         let path = dir.join("agent-bus-token");
         write_private(&path, "\n  file-token-0123456789  \nignored\n");

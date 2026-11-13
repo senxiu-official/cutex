@@ -109,6 +109,14 @@ impl AgentBusHttpClient {
         require_ok_response(&response, "agent heartbeat")
     }
 
+    pub fn claude_occurrence(&self, request: &super::claude_occurrence::Request) -> anyhow::Result<()> {
+        let body = serde_json::to_vec(request)?;
+        let response = self.request("POST", super::claude_occurrence::PATH, Some(&body))?;
+        anyhow::ensure!(request.confirmed_offline || matches!(response["outcome"].as_str(), Some("registered" | "unchanged")),
+            "Claude occurrence registration is stale or unavailable");
+        Ok(())
+    }
+
     pub fn unregister(&self, agent_id: &str) -> anyhow::Result<bool> {
         let body = serde_json::to_vec(&AgentBusUnregisterRequest {
             id: agent_id.to_string(),

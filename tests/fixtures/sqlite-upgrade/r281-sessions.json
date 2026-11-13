@@ -1,0 +1,30 @@
+{
+  "source_commit": "7f9b6a2bee246d8fcc950b9ae2ef1d7813c9b605",
+  "binary_sha256": "b92fc137fa6c9c5bea414601c66db4bf88ebbc6825369d640f2383b61f01ab43",
+  "fixture_sha256": "80cb858dc2167af6fe8235b51b04ee756008c5d3d4ba5508495be76ffd8af9da",
+  "seed": {
+    "storeRevision": 42,
+    "sessions": {
+      "cutex.sqlite-upgrade-fixture": {
+        "cutex_session_id": "cutex.sqlite-upgrade-fixture",
+        "host_id": "fixture-host",
+        "cwd": "/tmp/cutex-sqlite-upgrade-fixture",
+        "created_at": "2026-11-09T00:00:00Z",
+        "updated_at": "2026-11-09T00:00:00Z",
+        "revision": 7,
+        "note": "r281 persisted row: SQLite upgrade 中文",
+        "formal_agent_name": "sqlite-fixture",
+        "model_defaults": "fixture-model"
+      }
+    },
+    "native_stop_receipts": {
+      "cutex.sqlite-upgrade-fixture": {
+        "native_id": "fixture-native",
+        "generation": 3,
+        "binding": null
+      }
+    }
+  },
+  "binary_version": "cutex 0.1.5 (r281, 7f9b6a2)",
+  "generator": "r281 binary: session show cutex.sqlite-upgrade-fixture; seeded JSON imported into SQLite in a marker-fenced private HOME"
+}

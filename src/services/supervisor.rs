@@ -302,7 +302,7 @@ impl Entry {
 fn wants_running(record: &ServiceRecord) -> bool {
     match record.runtime {
         ServiceRuntime::External | ServiceRuntime::Static => false,
-        ServiceRuntime::Managed => !record.stopped && !record.archived && record.stopped_idle_at.is_none(),
+        ServiceRuntime::Managed | ServiceRuntime::Worker => !record.stopped && !record.archived && record.stopped_idle_at.is_none(),
     }
 }
 
@@ -472,7 +472,7 @@ impl Supervisor {
         };
         for slug in pending {
             match self.store.get(&slug) {
-                Ok(record) if record.runtime == ServiceRuntime::Managed && !record.stopped => {
+                Ok(record) if record.runtime.supervised() && !record.stopped => {
                     if let Ok(logs) = self.ring(&slug) {
                         logs.note("restart requested by the owning agent");
                     }
@@ -607,7 +607,7 @@ impl Supervisor {
                 // A runtime switch forces fresh health (e.g. external -> managed).
                 inner.last_health = None;
             }
-            if record.runtime == ServiceRuntime::Managed && record.stopped {
+            if record.runtime.supervised() && record.stopped {
                 inner.entries.get_mut(&slug).unwrap().next_restart = None;
             }
             if let Some(reason) = reason {
@@ -715,11 +715,11 @@ impl Supervisor {
             }
         };
         let tree = Arc::new(tree);
-        entry.logs.note(&format!(
-            "started pid {} on port {}",
-            tree.pid(),
-            record.port
-        ));
+        entry.logs.note(&if record.runtime == ServiceRuntime::Worker {
+            format!("started worker pid {}", tree.pid())
+        } else {
+            format!("started pid {} on port {}", tree.pid(), record.port)
+        });
         entry
             .logs
             .publish_state(json!({"event": "started", "pid": tree.pid()}));
@@ -739,7 +739,7 @@ impl Supervisor {
         entry.snapshot.pid = Some(tree.pid());
         entry.snapshot.started_at = Some(now_rfc3339());
         entry.snapshot.next_restart_at = None;
-        entry.snapshot.health = ServiceHealth::Starting;
+        entry.snapshot.health = if record.runtime == ServiceRuntime::Worker { ServiceHealth::Reachable } else { ServiceHealth::Starting };
         events.push(ServiceEvent {
             reason: "started",
             slug: Some(record.slug.clone()),
@@ -759,7 +759,7 @@ impl Supervisor {
     }
 
     fn schedule_restart(&self, record: &ServiceRecord, entry: &mut Entry) {
-        if record.runtime != ServiceRuntime::Managed || record.stopped || record.stopped_idle_at.is_some() {
+        if !record.runtime.supervised() || record.stopped || record.stopped_idle_at.is_some() {
             entry.next_restart = None;
             entry.snapshot.next_restart_at = None;
             return;
@@ -849,11 +849,11 @@ impl Supervisor {
                 .records
                 .values()
                 .filter(|record| {
-                    !record.runtime.supervised()
+                    record.runtime != ServiceRuntime::Worker && (!record.runtime.supervised()
                         || inner
                             .entries
                             .get(&record.slug)
-                            .is_some_and(|entry| entry.running.is_some())
+                            .is_some_and(|entry| entry.running.is_some()))
                 })
                 .map(|record| {
                     (
@@ -1282,7 +1282,7 @@ impl Supervisor {
                 })
             })
         };
-        if killed {
+        if killed && record.runtime != ServiceRuntime::Worker {
             // Let the old tree release the port before the new one binds it.
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline && probe(record.port, None) {
@@ -1314,6 +1314,7 @@ impl Supervisor {
 
     pub fn open_service(self: &Arc<Self>, slug: &str) -> ServicesResult<Value> {
         let record = self.store.get(slug)?;
+        record.require_view()?;
         if super::idle::eligible(&record) && record.stopped {
             return Err(ServicesError::new(503, "service_manually_stopped", "Stopped by the owner; use Start in the service menu."));
         }
@@ -1636,6 +1637,10 @@ pub fn start_global(sink: EventSink) -> anyhow::Result<Arc<Supervisor>> {
     supervisor.start()?;
     Ok(supervisor)
 }
+
+#[cfg(test)]
+#[path = "worker_tests.rs"]
+mod worker_tests;
 
 #[cfg(test)]
 mod tests {

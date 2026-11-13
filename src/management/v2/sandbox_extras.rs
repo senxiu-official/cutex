@@ -184,6 +184,12 @@ pub fn apply_patch_at(
                 changed = true;
             }
         }
+        // Saving the same roots is also an explicit owner re-approval after a
+        // folder replacement; persist that snapshot refresh even without a diff.
+        if matches!(target.created_by,Some(crate::session::model::SessionCreatedBy::Agent{..})) {
+            crate::agent_management::creator_paths::owner_reapprove(target)?;
+            changed=true;
+        }
         if changed {
             target.bump_durable_revision()?;
             target.updated_at = chrono::Utc::now().to_rfc3339();

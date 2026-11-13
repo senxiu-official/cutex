@@ -33,6 +33,77 @@ const SETTLE: Duration = Duration::from_secs(90);
 const STRICT: AssertOptions = AssertOptions { require_settled_at_end: true };
 const LOOSE: AssertOptions = AssertOptions { require_settled_at_end: false };
 
+/// Production HTTP promotion + runtime reconnect + Bus + real cutex-mcp child.
+/// The app-server endpoint is the existing fake Codex fixture, not a model call.
+#[test]
+fn quick_chat_promote_runtime_reconnect_registers_persistent_bus_and_mcp_tools() {
+    use daemon::{PrivateHome, SeededAgentSpec, Sleeper, Daemon, DaemonOptions, seed_sessions};
+    use cutex::session::store::with_locked_session_rows;
+    let home = PrivateHome::create("promote-runtime");
+    let fake = FakeRuntime::start_with(Kind::Codex, &home.workspace.to_string_lossy(), Script::default());
+    #[cfg(windows)]
+    let sleeper = Sleeper::forwarding(fake.port);
+    #[cfg(unix)]
+    let sleeper = Sleeper::forwarding_in(fake.port, home.config_dir.join("runtime/app-server/il-e2e-0-codex"));
+    let runtime_agent_id = format!("promote-runtime-{}", uuid::Uuid::new_v4());
+    let spec = SeededAgentSpec { kind: Kind::Codex, runtime_agent_id: runtime_agent_id.clone(),
+        thread_name: Some("Original quick chat".into()), persistent: false, profile: None };
+    let sid = seed_sessions(&home, &[(&spec, &fake, &sleeper)]).remove(0);
+    let path = home.config_dir.join("cutex-sessions.json");
+    // Seed the chat offline. Restore this exact endpoint only after promotion,
+    // while Management is stopped; no live store edits or real-home access.
+    let bound = with_locked_session_rows(&path, |rows| {
+        let record = rows.session_mut(&sid).unwrap();
+        let bound = record.clone();
+        record.app_server_runtime = None; record.runtime_pid = None; record.current_runtime_agent_id = None;
+        record.agent_groups.clear();
+        rows.commit()?;
+        Ok(bound)
+    }).unwrap();
+    let mut daemon = Daemon::configure(home, DaemonOptions { bus: true, fake_external_input: true, ..DaemonOptions::default() });
+    daemon.start();
+    let revision = record_revision(&path, &sid);
+    let request = json!({"requestId":"promote-runtime","expectedRevision":revision,"name":"Promoted runtime"});
+    let (status, promoted) = daemon.http("POST", &format!("/v2/human/sessions/{sid}/promote"), Some(&request)).unwrap();
+    assert_eq!(status, 200, "{promoted}");
+    assert_eq!(promoted["complete"], true, "{promoted}");
+    daemon.stop_management();
+    with_locked_session_rows(&path, |rows| {
+        let record = rows.session_mut(&sid).unwrap();
+        assert_eq!(record.app_server_thread_id(), Some(fake.thread.as_str()));
+        record.app_server_runtime = bound.app_server_runtime;
+        record.runtime_pid = bound.runtime_pid;
+        record.current_runtime_agent_id = bound.current_runtime_agent_id;
+        rows.commit()?;
+        Ok(())
+    }).unwrap();
+    daemon.start();
+    daemon.wait_connected(&sid, Duration::from_secs(60));
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        let result = daemon.mcp_call(&runtime_agent_id, 1, &fake.thread, "agent_list", json!({"name":sid}));
+        if let Ok(value) = &result {
+            let found = value["agents"].as_array().is_some_and(|agents| agents.iter().any(|agent| {
+                let same_id = agent["id"].as_str().is_some_and(|id| id == sid
+                    || id.split_once('…').is_some_and(|(head, tail)| !tail.is_empty() && sid.starts_with(head) && sid.ends_with(tail)));
+                same_id && agent["name"] == "Promoted runtime"
+            }));
+            if value["ok"] == true && found { break; }
+        }
+        assert!(Instant::now() < until, "promoted runtime could not use agent_list: {result:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (_, bus) = daemon::http_request(daemon.bus_port, &daemon.bus_token_from_config(), "GET", "/api/agents", None).unwrap();
+    let agent = bus.as_array().unwrap().iter().find(|a| a["id"] == runtime_agent_id).unwrap_or_else(|| panic!("{bus}"));
+    assert_eq!(agent["registration_class"], "persistent", "{agent}");
+    assert_eq!(agent["cutex_session_id"], sid, "{agent}");
+    daemon.stop_all();
+}
+
+fn record_revision(path: &std::path::Path, sid: &str) -> u64 {
+    cutex::session::store::load_session_row(path, sid).unwrap().unwrap().1.revision
+}
+
 #[test]
 fn agent_tell_message_id_matches_sent_event_and_replays() {
     let w = World::start("tell-message-id", WorldSpec::new(&[Kind::Codex, Kind::Codex])
@@ -1438,7 +1509,9 @@ fn s15(kind: Kind) {
     let w = World::start(&name("s15", kind), spec);
     let a = delegation_turn(&w, 0, 1);
     let b = delegation_turn(&w, 0, 2);
-    let ids = wait_kind(&w, 0, "delegationResult", 1, SETTLE);
+    // Both targets must return before closing the strict trace. The first
+    // result can settle before the second target has completed its turn.
+    let ids = wait_kind(&w, 0, "delegationResult", 2, SETTLE);
     w.recorder.mark("delegations", json!({"a": a, "b": b}));
     let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
     w.wait_settled(&id_refs, SETTLE);
@@ -1899,6 +1972,9 @@ fn s24(kind: Kind) {
     tell("s24-note", false);
     let note = wait_kind(&b, 0, "peerMessage", 1, T).remove(0);
     b.wait_state(&note, "waiting{passive}", T);
+    // As in S11, the next-turn promise starts at native acceptance, not
+    // when the source first appears in the bus projection.
+    b.wait_state(&note, "accepted", T);
     b.fake(0).complete("completed");
     b.daemon.wait_active_turn(b.sid(0), false, T);
     b.submit(0, "s24-owner", "auto", json!({})).expect("submit");
@@ -3231,9 +3307,34 @@ fn wait_returned(w: &World, notice: &str) -> Value {
     (*records.iter().find(|r| r["state"] == "waiting" && r["reason"] == "returned").unwrap()).clone()
 }
 
+// Count actual runtime items across EVERY attempt of this stable source.
+// Deliberately decode the public attempt format here, not via production's
+// lookup helper: the assertion must detect duplicate old/new native items.
 fn note_occurrences(w: &World, notice: &str) -> usize {
     w.fake(0).turns().iter().flat_map(|turn| turn["items"].as_array().unwrap().clone())
-        .filter(|item| item["id"] == notice).count()
+        .filter(|item| item["id"].as_str().is_some_and(|id| id == notice ||
+            id.strip_prefix("bus-retry:").and_then(|rest| rest.split_once(':'))
+                .is_some_and(|(attempt,source)| uuid::Uuid::parse_str(attempt).is_ok() && source == notice)))
+        .inspect(|item| {
+            assert_eq!(item["type"], "functionCallOutput", "actual note item: {item}");
+            assert_eq!(item["name"], "external_event", "actual note item: {item}");
+        }).count()
+}
+
+fn source_note_envelope(w: &World, notice: &str) -> cutex::app_server::external_input::Envelope {
+    let root=w.daemon.home.config_dir.join("runtime/management-v2");
+    let snapshot=cutex::management::v2::agent_bus_state::AgentBusMessageRepository::open_read_only(root)
+        .snapshot_by_message_id(notice).expect("private bus source").expect("stable source exists");
+    assert_eq!(snapshot.message_id,notice,"native retries never rename the source");
+    snapshot.external_input.expect("frozen native attempt")
+}
+
+fn note_status(w: &World, envelope: &cutex::app_server::external_input::Envelope) -> Value {
+    Client::connect(&w.fake(0).url).request("thread/externalInput/status",json!({
+        "version":1,"ownerId":envelope.owner_id,"threadId":envelope.thread_id,
+        "runtimeGeneration":envelope.runtime_generation,
+        "messages":[{"messageId":envelope.message.id,"semanticSha256":envelope.semantic_sha256}]
+    })).expect("native status")["statuses"][0].clone()
 }
 
 // Stopped by interrupt and send: the message goes out alone, and the note it
@@ -3530,32 +3631,61 @@ fn retry_note(w: &World, notice: &str) {
     assert!(!w.source_owner_blocked(0, notice), "the retry leaves the bundle");
 }
 
-// The runtime never had it: the retry reaches the model, once, and is not undone.
-fn note_retry_goes_once(w: &World, notice: &str) {
-    w.fake(0).forget_input(notice);
+// A missing original attempt and a retained unread original both permit the
+// explicit fresh-id retry. Only its genuine receipt may settle the stable row.
+fn note_retry_goes_once(w: &World, notice: &str, forget_original: bool) {
+    let original=source_note_envelope(w,notice);
+    let before=w.input_record(0,notice);
+    let old_turn=w.fake(0).turns().into_iter().find(|turn| turn["status"] == "interrupted")
+        .expect("original carrier ended interrupted");
+    assert_eq!(note_occurrences(w,notice),0,"no original native read");
+    if forget_original { w.fake(0).forget_input(&original.message.id); }
     retry_note(w, notice);
-    // The debug delivery repeats a pending submit every sweep; the runtime
-    // holds one input per id, so what counts is what the model reads.
-    let read = w.wait(SETTLE, |_| {
-        if w.fake(0).active_turn().is_some() {
-            w.fake(0).complete("completed");
-        }
-        w.input_record(0, notice)["state"] == "inContext"
-    });
-    assert!(read, "{} path {:?}", w.input_record(0, notice), w.trace().path(notice));
+    let retry=source_note_envelope(w,notice);
+    assert_ne!(retry.message.id,original.message.id,"explicit retry must bypass retained native dedup");
+    assert_eq!(retry.message.text,original.message.text,"same note content");
+    assert_eq!(retry.message.source,original.message.source,"same provenance");
+    assert_eq!(retry.view,original.view,"same structured note");
+    assert_eq!(w.input_record(0,notice)["attempt"].as_u64(),before["attempt"].as_u64().map(|n|n+1));
+    let claimed=w.wait(SETTLE, |_| w.fake(0).inbox().iter().any(|entry|
+        entry.id == retry.message.id && entry.turn.is_some()) && w.input_record(0,notice)["state"] == "accepted");
+    assert!(claimed,"{} path {:?}",w.input_record(0,notice),w.trace().path(notice));
+    let current=w.fake(0).inbox().into_iter().find(|entry|entry.id == retry.message.id).unwrap();
+    let native_turn=current.turn.unwrap();
+    assert!(!current.persisted,"claim is not a receipt");
+    assert!(note_status(w,&retry)["receipt"].is_null());
+    let old_status=note_status(w,&original);
+    assert!(old_status["receipt"].is_null(),"old attempt was never read: {old_status}");
+    if forget_original { assert_eq!(old_status["deliveryState"],"unknown"); }
+    else { assert_eq!(old_status["deliveryState"],"pending","old id stays retained and unread: {old_status}"); }
+    assert_eq!(note_occurrences(w,notice),1,"one actual old-or-new native occurrence before receipt");
+    // A late terminal notification about the earlier carrier, plus an old-key
+    // status notification, cannot end or acknowledge this new attempt.
+    w.fake(0).emit("turn/completed",json!({"threadId":w.fake(0).thread,"turn":old_turn}));
+    w.fake(0).emit("thread/externalInput/statusChanged",json!({"threadId":w.fake(0).thread,"messageId":original.message.id}));
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(w.input_record(0,notice)["state"],"accepted","old signals are not a new receipt");
+    assert!(note_status(w,&retry)["receipt"].is_null());
+    assert_eq!(w.fake(0).active_turn().unwrap()["id"],native_turn,"old completion cannot end the retry turn");
+    w.fake(0).complete("completed");
+    assert!(w.wait(SETTLE, |_| w.input_record(0,notice)["state"] == "inContext"),
+        "{} path {:?}",w.input_record(0,notice),w.trace().path(notice));
+    let receipt=note_status(w,&retry)["receipt"].clone();
+    assert_eq!(receipt["messageId"],retry.message.id);
+    assert_eq!(receipt["responseItemId"],retry.message.id);
+    assert_eq!(receipt["turnId"],native_turn);
+    let row=w.input_record(0,notice);
+    assert_eq!(row["inputId"],notice);
+    assert_eq!(row["timelineItemId"],retry.message.id);
+    assert_eq!(row["turnId"],receipt["turnId"]);
+    assert!(note_status(w,&original)["receipt"].is_null(),"the new receipt never belongs to the old key");
+    let alias=w.daemon.cutex(w.sid(0),"cutex/input/get",json!({"inputIds":[retry.message.id]})).expect("native alias lookup");
+    assert!(alias["records"].as_array().unwrap().is_empty(),"only the stable source has a ledger row: {alias}");
     std::thread::sleep(Duration::from_secs(40));
-    assert_eq!(w.input_record(0, notice)["state"], "inContext");
-    assert_eq!(note_occurrences(w, notice), 1, "one native occurrence");
-}
-
-// The runtime holds it as interrupted and does not run the same id again: the
-// row does not sit at accepted with no action, the owner can still dismiss it.
-fn note_retry_not_taken_can_be_dismissed(w: &World, notice: &str) {
-    retry_note(w, notice);
-    let note = wait_note_way_out(w, notice);
-    w.daemon.cutex(w.sid(0), "cutex/input/dismiss", json!({"inputId": notice, "expectedRev": note["rev"]})).expect("dismiss note");
-    assert_eq!(w.input_record(0, notice)["state"], "discarded");
-    assert_eq!(note_occurrences(w, notice), 0);
+    let done=w.input_record(0,notice);
+    assert_eq!(done["state"],"inContext");
+    assert_eq!(done["timelineItemId"],retry.message.id);
+    assert_eq!(note_occurrences(w, notice), 1, "one actual old-or-new occurrence, no automatic duplicate");
 }
 
 fn carrier_failed(w: &World, owner: &str) {
@@ -3575,8 +3705,8 @@ fn note_after_carrier_went_alone(kind: Kind) {
     w.fake(0).complete("completed");
     w.wait_settled(&[&owner], SETTLE);
     wait_note_way_out(&w, &notice);
-    note_retry_not_taken_can_be_dismissed(&w, &notice);
-    w.finish(LOOSE);
+    note_retry_goes_once(&w, &notice, false);
+    w.finish(STRICT);
 }
 both!(a_note_whose_carrier_went_alone_gets_its_own_retry, note_after_carrier_went_alone, green);
 
@@ -3611,8 +3741,8 @@ fn note_after_interrupt_send(kind: Kind) {
         w.fake(0).complete("completed");
     }
     wait_note_way_out(&w, &notice);
-    note_retry_goes_once(&w, &notice);
-    w.finish(LOOSE);
+    note_retry_goes_once(&w, &notice, true);
+    w.finish(STRICT);
 }
 both!(a_note_whose_carrier_was_settled_by_interrupt_send_gets_its_own_retry, note_after_interrupt_send, green);
 
@@ -3637,13 +3767,22 @@ fn result_after_carrier_dismissed(kind: Kind) {
     let left = wait_note_way_out(&w, &result);
     assert_eq!(left["kind"], "delegationResult");
     assert_eq!(left["reason"], "turnInterrupted", "{left}");
+    // Exercise dismissing the requeued result, rather than racing a second
+    // native delivery (whose revision conflict is a correct refusal).
+    w.daemon.cutex(w.sid(0), "cutex/asks/pause", json!({})).expect("pause result delivery");
     let retried = resend(&w, &result);
     assert_eq!(retried["redelivery"]["ok"], true, "{retried}");
     assert_eq!(retried["redelivery"]["path"], "delegationResultRequeue", "{retried}");
     assert_eq!(retried["redelivery"]["mayArriveTwice"], true, "{retried}");
+    // Retry commits the source before its asynchronous hold-metadata job.
+    // Observe that specific projection once; never retry the dismiss action.
+    assert!(w.wait(T, |_| w.input_record(0, &result)["details"]["ownerHold"] == false),
+        "retry hold metadata did not project: {}", w.input_record(0, &result));
     let row = w.input_record(0, &result);
     assert!(row["actions"].as_array().is_some_and(|actions| actions.iter().any(|action| action == "dismiss")), "{row}");
-    w.daemon.cutex(w.sid(0), "cutex/input/dismiss", json!({"inputId": result, "expectedRev": row["rev"]})).expect("dismiss result");
+    let dismiss = w.daemon.cutex(w.sid(0), "cutex/input/dismiss", json!({"inputId": result, "expectedRev": row["rev"]})).expect("dismiss result");
+    eprintln!("result dismiss evidence: expectedRev={} reply={dismiss}", row["rev"]);
+    assert_eq!(dismiss["failed"], json!([]), "result dismiss failed: expectedRev={} reply={dismiss}", row["rev"]);
     assert_eq!(w.input_record(0, &result)["state"], "discarded");
     w.finish(LOOSE);
 }

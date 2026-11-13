@@ -26,19 +26,38 @@ mod status_capacity;
 pub(crate) fn invalidate_status(root: &Path) { status_capacity::invalidate(root); }
 pub(crate) fn status_diagnostics() -> Value { status_capacity::diagnostics() }
 
+fn fixed_git_config() -> Vec<(String,String)> {
+    let mut config=[
+        ("core.quotepath","false"),("color.ui","false"),("core.fsmonitor","false"),
+        ("protocol.allow","never"),("log.showSignature","false"),
+        ("core.hooksPath","/dev/null"),("credential.helper",""),("core.askPass",""),
+        ("diff.external",""),("submodule.recurse","false"),
+    ].into_iter().map(|(key,value)|(key.to_string(),value.to_string())).collect::<Vec<_>>();
+    for protocol in ["file","ext","ssh","git","http","https"] {
+        config.push((format!("protocol.{protocol}.allow"),"never".into()));
+    }
+    config
+}
+
+// Config keys may contain '=' inside a subsection. argv `-c key=value`
+// cannot encode those keys; use Git's separate key/value environment fields.
+fn git_config(command: &mut Command, config: &[(String,String)]) {
+    command.env_remove("GIT_CONFIG_PARAMETERS").env("GIT_CONFIG_COUNT",config.len().to_string());
+    for (index,(key,value)) in config.iter().enumerate() {
+        command.env(format!("GIT_CONFIG_KEY_{index}"),key).env(format!("GIT_CONFIG_VALUE_{index}"),value);
+    }
+}
+
 fn git_command(dir: &Path) -> Command {
     let mut command = Command::new("git");
-    command
-        .current_dir(dir)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        .args(["-c", "core.quotepath=false", "-c", "color.ui=false"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
+    command.current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS","0").env("GIT_TERMINAL_PROMPT","0")
+        .env("GIT_NO_LAZY_FETCH","1").env("GIT_PAGER","").env("PAGER","")
+        .env("GIT_ASKPASS","").env("SSH_ASKPASS","").env("LC_ALL","C")
+        .arg("--no-pager")
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    git_config(&mut command,&fixed_git_config());
+    #[cfg(windows)] {
         use std::os::windows::process::CommandExt;
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
@@ -50,6 +69,31 @@ pub(super) fn run_git(dir: &Path, args: &[&str], input: Option<&[u8]>) -> std::i
     crate::artifacts::paths::validate_resolved_local_path(dir).map_err(|_|std::io::ErrorKind::PermissionDenied)?;
     crate::artifacts::paths::validate_resolved_local_path(&dir.join(".git")).map_err(|_|std::io::ErrorKind::PermissionDenied)?;
     let mut command = git_command(dir);
+    // These reads execute in the daemon, outside the agent's sandbox. Git
+    // status/diff may otherwise run repository-defined clean/process filters.
+    // Config inspection itself invokes no filters or hooks. Override every
+    // driver, including drivers brought in through config includes.
+    let config = git_command(dir).args([
+        "config", "--null", "--show-scope", "--name-only", "--get-regexp",
+        r"^filter\..*\.(clean|smudge|process|required)$",
+    ]).output()?;
+    if !config.status.success() && config.status.code() != Some(1) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            "cannot inspect Git filter configuration"));
+    }
+    let records=config.stdout.split(|byte|*byte==0).filter(|field|!field.is_empty()).collect::<Vec<_>>();
+    if records.len()%2!=0 {return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"invalid scoped Git configuration"));}
+    let mut overrides=fixed_git_config();
+    for record in records.chunks_exact(2) {
+        // Global/system filters (e.g. owner-installed LFS) are trusted. Included
+        // files inherit their including scope; local/worktree includes are blocked.
+        if record[0]!=b"local" && record[0]!=b"worktree" {continue;}
+        let key=std::str::from_utf8(record[1]).map_err(|_|std::io::Error::new(
+            std::io::ErrorKind::InvalidData,"invalid Git filter configuration key"))?;
+        let value=if key.ends_with(".required"){"false"}else{""};
+        overrides.push((key.to_string(),value.to_string()));
+    }
+    git_config(&mut command,&overrides);
     command.args(args);
     if input.is_none() {
         return command.output();
@@ -159,7 +203,8 @@ fn status_label(code: char) -> &'static str {
 }
 
 fn numstat(root: &Path, cached: bool) -> HashMap<String, (Option<u64>, Option<u64>)> {
-    let mut args = vec!["diff", "--numstat", "-z", "--relative", "--no-renames"];
+    let mut args = vec!["diff", "--numstat", "-z", "--relative", "--no-renames",
+        "--no-ext-diff", "--no-textconv", "--ignore-submodules=all"];
     if cached {
         args.push("--cached");
     }
@@ -195,6 +240,7 @@ fn count_lines(path: &Path) -> Option<u64> {
 
 /// `GET {scope}/git/status`.
 pub fn status_resource(root: &ResolvedRoot) -> WorkspaceResult<std::sync::Arc<Value>> {
+    let _credentials = super::host_files::credential_request();
     status_capacity::get(&root.canonical, || status_uncached(root))
 }
 
@@ -219,6 +265,7 @@ fn status_uncached(root: &ResolvedRoot) -> WorkspaceResult<Value> {
             "-b",
             "-z",
             "--untracked-files=all",
+            "--ignore-submodules=all",
             "--",
             ".",
         ],
@@ -257,7 +304,7 @@ fn status_uncached(root: &ResolvedRoot) -> WorkspaceResult<Value> {
         })
         .collect();
     let head = match &parsed.oid {
-        Some(_) => run_git(dir, &["log", "-1", "--format=%H%x00%s"], None)
+        Some(_) => run_git(dir, &["log", "--no-show-signature", "-1", "--format=%H%x00%s"], None)
             .ok()
             .filter(|output| output.status.success())
             .and_then(|output| {
@@ -408,12 +455,47 @@ fn parse_porcelain_v2(bytes: &[u8], prefix: &str) -> PorcelainStatus {
     status
 }
 
+// The caller joins an already validated root-relative path to the
+// canonical workspace root. Windows canonicalize adds a local-drive verbatim
+// prefix; it is not raw client input. The resolved validator still refuses
+// UNC/device/ADS forms and unsafe existing path components.
+fn validate_resolved_diff_file(file: &Path) -> WorkspaceResult<()> {
+    crate::artifacts::paths::validate_resolved_local_path(file)
+        .map_err(|_| WorkspaceError::new(403, "path_forbidden", "network, device and alternate-stream paths are unavailable"))?;
+    super::host_files::refuse_root_credential_file(file)
+}
+
+fn validate_diff_secret_paths(dir: &Path, raw: Option<&String>, staged: bool) -> WorkspaceResult<()> {
+    if crate::management::users::request_has_owner_local_secret_access() { return Ok(()); }
+    let rel = raw.filter(|path| !path.is_empty()).map(|path| lexical_rel(path)).transpose()?;
+    if let Some(path) = &rel {
+        let file = dir.join(path);
+        validate_resolved_diff_file(&file)?;
+    }
+    // A regular-looking tracked file can be a hard link to a host control
+    // credential. Check changed files, not just the repository root.
+    let mut names = vec!["diff", "--name-only", "-z", "--relative", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all"];
+    if staged { names.push("--cached"); }
+    names.extend(["--", rel.as_deref().unwrap_or(".")]);
+    let output = run_git(dir, &names, None)
+        .map_err(|error| WorkspaceError::new(503, "git_unavailable", error.to_string()))?;
+    if !output.status.success() {
+        return Err(WorkspaceError::new(503, "git_unavailable", "cannot validate the diff's file paths"));
+    }
+    for path in split_nul(&output.stdout) {
+        let file = dir.join(lexical_rel(&path)?);
+        validate_resolved_diff_file(&file)?;
+    }
+    Ok(())
+}
+
 /// `GET {scope}/git/diff?path=&staged=`. Without `path`, the whole root.
 /// An untracked `path` is diffed against /dev/null.
 pub fn diff_resource(
     root: &ResolvedRoot,
     params: &HashMap<String, String>,
 ) -> WorkspaceResult<Value> {
+    let _credentials = super::host_files::credential_request();
     super::host_files::refuse_private_tree(&root.canonical)?;
     let staged = match params.get("staged").map(String::as_str) {
         None | Some("false") | Some("0") => false,
@@ -428,12 +510,14 @@ pub fn diff_resource(
             "the workspace root is not in a git work tree",
         ));
     }
+    validate_diff_secret_paths(dir, params.get("path"), staged)?;
     let rel = match params.get("path").filter(|path| !path.is_empty()) {
         // Deleted files no longer exist, so only validate the lexical form.
         Some(raw) => Some(lexical_rel(raw)?),
         None => None,
     };
-    let mut args = vec!["diff", "--relative", "--no-ext-diff", "--no-color"];
+    let mut args = vec!["diff", "--relative", "--no-ext-diff", "--no-textconv",
+        "--ignore-submodules=all", "--no-color"];
     if staged {
         args.push("--cached");
     }
@@ -472,7 +556,7 @@ pub fn diff_resource(
                 // Exit status 1 means "differences found" for --no-index.
                 if let Ok(output) = run_git(
                     dir,
-                    &["diff", "--no-index", "--no-color", "--", "/dev/null", rel],
+                    &["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--", "/dev/null", rel],
                     None,
                 ) {
                     diff = output.stdout;
@@ -532,6 +616,100 @@ mod tests {
     use super::super::workspace::ScopeKind;
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    #[cfg(unix)]
+    fn status_never_verifies_a_repository_supplied_signature() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir,root)=temp_repo("signature-exec");
+        std::fs::write(dir.join("a.txt"),"before\n").unwrap();
+        git(&dir,&["add","a.txt"]);git(&dir,&["commit","-q","-m","fixture"]);
+        let raw=run_git(&dir,&["cat-file","commit","HEAD"],None).unwrap();
+        let text=String::from_utf8(raw.stdout).unwrap().replacen("\n\n","\ngpgsig -----BEGIN PGP SIGNATURE-----\n fake signature\n -----END PGP SIGNATURE-----\n\n",1);
+        let hashed=run_git(&dir,&["hash-object","-t","commit","-w","--stdin"],Some(text.as_bytes())).unwrap();
+        assert!(hashed.status.success());
+        git(&dir,&["update-ref","HEAD",String::from_utf8_lossy(&hashed.stdout).trim()]);
+        let marker=dir.join("gpg-executed");let script=dir.join("fake-gpg");
+        std::fs::write(&script,format!("#!/bin/sh\ntouch '{}'\nexit 1\n",marker.display())).unwrap();
+        std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
+        git(&dir,&["config","log.showSignature","true"]);
+        git(&dir,&["config","gpg.program",script.to_str().unwrap()]);
+        assert_eq!(status_resource(&root).unwrap()["head"]["subject"],"fixture");
+        assert!(!marker.exists(),"status launched repository gpg.program");
+        let output=run_git(&dir,&["log","-1","--format=%s"],None).unwrap();
+        assert!(output.status.success());assert!(!marker.exists(),"shared command guard must suppress signature display too");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn filter_subsections_containing_equals_are_disabled_in_local_worktree_and_included_config() {
+        for scope in ["local","worktree","include"] {
+            let (dir,root)=temp_repo(scope);
+            std::fs::write(dir.join("a.txt"),"before\n").unwrap();
+            git(&dir,&["add","a.txt"]);git(&dir,&["commit","-q","-m","fixture"]);
+            let marker=dir.join("filter-executed");let command=format!("touch '{}'; cat",marker.display());
+            if scope=="include" {
+                let include=dir.join("included.cfg");
+                std::fs::write(&include,format!("[filter \"a=b\"]\nclean = {command}\nrequired = true\n")).unwrap();
+                git(&dir,&["config","include.path",include.to_str().unwrap()]);
+            } else {
+                if scope=="worktree" {git(&dir,&["config","extensions.worktreeConfig","true"]);}
+                let flag=if scope=="worktree" {"--worktree"}else{"--local"};
+                git(&dir,&["config",flag,"filter.a=b.clean",&command]);
+                git(&dir,&["config",flag,"filter.a=b.required","true"]);
+            }
+            std::fs::write(dir.join(".gitattributes"),"*.txt filter=a=b\n").unwrap();
+            std::fs::write(dir.join("a.txt"),"after\n").unwrap();
+            assert!(status_resource(&root).unwrap()["files"].as_array().unwrap().iter().any(|file|file["path"]=="a.txt"));
+            assert!(diff_resource(&root,&HashMap::new()).unwrap()["diff"].as_str().unwrap().contains("+after"));
+            assert!(!marker.exists(),"{scope} filter with '=' in its name ran in the daemon");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owner_global_filters_are_preserved() {
+        let home=crate::profiles::lifecycle::tests::TestHome::new();
+        let (dir,root)=temp_repo("global-filter");
+        std::fs::write(dir.join("a.txt"),"before\n").unwrap();
+        git(&dir,&["add","a.txt"]);git(&dir,&["commit","-q","-m","fixture"]);
+        let marker=dir.join("owner-filter-executed");
+        std::fs::write(home.root().join(".gitconfig"),format!("[filter \"owner-audit\"]\nclean = touch '{}'; cat\nrequired = true\n",marker.display())).unwrap();
+        std::fs::write(dir.join(".gitattributes"),"*.txt filter=owner-audit\n").unwrap();
+        std::fs::write(dir.join("a.txt"),"after\n").unwrap();
+        assert!(status_resource(&root).unwrap()["isRepo"].as_bool().unwrap());
+        assert!(marker.exists(),"the owner's global filter must remain usable");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_reads_do_not_execute_repository_commands() {
+        let (dir, root) = temp_repo("security");
+        std::fs::write(dir.join("a.txt"), "before\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "fixture"]);
+        std::fs::write(dir.join("a.txt"), "after\n").unwrap();
+        // A shell fragment is a valid Git fsmonitor/filter/textconv command.
+        // It only creates a marker in this private fixture.
+        let marker = dir.join("executed");
+        let command = format!("touch '{}'; cat", marker.display());
+        git(&dir, &["config", "core.fsmonitor", &command]);
+        git(&dir, &["config", "filter.audit.clean", &command]);
+        git(&dir, &["config", "filter.audit.process", &command]);
+        git(&dir, &["config", "filter.audit.required", "true"]);
+        git(&dir, &["config", "diff.audit.textconv", &command]);
+        std::fs::write(dir.join(".gitattributes"), "*.txt filter=audit diff=audit\n").unwrap();
+        let status = status_resource(&root).unwrap();
+        assert!(status["files"].as_array().unwrap().iter().any(|v| v["path"] == "a.txt"));
+        assert!(!marker.exists(), "status ran a repository command outside the sandbox");
+        let diff = diff_resource(&root, &HashMap::from([("path".into(), "a.txt".into())])).unwrap();
+        assert!(diff["diff"].as_str().unwrap().contains("+after"));
+        assert!(!marker.exists(), "diff ran a repository command outside the sandbox");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn git_available() -> bool {
         Command::new("git").arg("--version").output().is_ok()
@@ -608,6 +786,68 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn narrowed_diffs_read_normal_files_under_a_canonical_workspace_root() {
+        use crate::management::{client_tokens::{DeviceScope, VerifiedClientToken}, listeners};
+        if !git_available() { return; }
+        let home = crate::profiles::lifecycle::tests::TestHome::new();
+        std::fs::write(home.root().join(crate::config::paths::PRIVATE_HOME_MARKER), b"").unwrap();
+        struct TokenGuard(Option<VerifiedClientToken>);
+        impl Drop for TokenGuard { fn drop(&mut self) { listeners::set_current_client_token(self.0.take()); } }
+        let _token = TokenGuard(listeners::current_client_token());
+        let (dir, mut root) = temp_repo("canonical-narrowed-diff");
+        // Preserve the OS result: on Windows this deliberately includes the
+        // local-drive verbatim prefix which raw client input may not supply.
+        root.canonical = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(dir.join("tracked.txt"), "before\n").unwrap();
+        git(&dir, &["add", "tracked.txt"]);
+        git(&dir, &["commit", "-q", "-m", "fixture"]);
+        std::fs::write(dir.join("tracked.txt"), "ordinary tracked change\n").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "ordinary new file\n").unwrap();
+        for scope in [DeviceScope::Read, DeviceScope::Chat] {
+            let mut token = VerifiedClientToken::test_token("canonical-narrowed-diff");
+            token.scope = scope;
+            listeners::set_current_client_token(Some(token));
+            for path in [None, Some("tracked.txt"), Some("untracked.txt")] {
+                let params = path.map(|path| HashMap::from([("path".into(), path.into())])).unwrap_or_default();
+                let diff = diff_resource(&root, &params).unwrap();
+                assert!(diff["diff"].as_str().unwrap().contains("ordinary"), "{path:?}: {diff}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn narrowed_git_diffs_refuse_credential_hardlinks_and_full_tokens_keep_access() {
+        use crate::management::{client_tokens::{DeviceScope,VerifiedClientToken},listeners};
+        if !git_available() {return;}
+        let home=crate::profiles::lifecycle::tests::TestHome::new();
+        std::fs::write(home.root().join(crate::config::paths::PRIVATE_HOME_MARKER),b"").unwrap();
+        let old= listeners::current_client_token();
+        struct TokenGuard(Option<VerifiedClientToken>);
+        impl Drop for TokenGuard {fn drop(&mut self){listeners::set_current_client_token(self.0.take());}}
+        let _guard=TokenGuard(old);
+        let secret=home.root().join(".ssh/id_ed25519");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret,"synthetic-ssh-credential\n").unwrap();
+        let (dir,root)=temp_repo("credential-link");
+        std::fs::write(dir.join("tracked.txt"),"before\n").unwrap();
+        git(&dir,&["add","tracked.txt"]);git(&dir,&["commit","-q","-m","fixture"]);
+        std::fs::remove_file(dir.join("tracked.txt")).unwrap();
+        for name in ["tracked.txt","untracked.txt"] {std::fs::hard_link(&secret,dir.join(name)).unwrap();}
+        for scope in [DeviceScope::Read,DeviceScope::Chat] {
+            let mut token=VerifiedClientToken::test_token("narrowed-diff");token.scope=scope;
+            listeners::set_current_client_token(Some(token));
+            for path in [None,Some("tracked.txt"),Some("untracked.txt")] {
+                let params=path.map(|path|HashMap::from([("path".into(),path.into())])).unwrap_or_default();
+                assert_eq!(diff_resource(&root,&params).unwrap_err().code,"credential_read_denied","{path:?}");
+            }
+        }
+        listeners::set_current_client_token(Some(VerifiedClientToken::test_token("full-diff")));
+        assert!(diff_resource(&root,&HashMap::new()).unwrap()["diff"].as_str().unwrap().contains("synthetic-ssh-credential"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -704,5 +944,46 @@ mod tests {
             assert!(list_files(&dir).is_none());
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn git_diffs_cannot_bypass_secret_file_guards_through_paths_or_hard_links() {
+        use crate::management::{client_tokens::{DeviceScope,IssuedVia,VerifiedClientToken},listeners};
+        let _lock = crate::config::paths::test_home_env_lock();
+        let previous = crate::config::instance::selected().unwrap();
+        let (dir, root) = temp_repo("secret-read");
+        let config_home = dir.join("control");
+        crate::config::instance::set_test_selection(crate::config::instance::Selection::Custom(config_home.clone()));
+        std::fs::create_dir_all(&config_home).unwrap();
+        let config = config_home.join("config.json");
+        std::fs::write(&config,"before\n").unwrap();
+        git(&dir,&["add","control/config.json"]);
+        git(&dir,&["commit","-q","-m","fixture"]);
+        std::fs::write(&config,"synthetic-control-secret-diff\n").unwrap();
+        let mut token = VerifiedClientToken::test_token("synthetic-paired-owner");
+        token.issued_via = IssuedVia::Pairing;
+        token.scope = DeviceScope::Full;
+        listeners::set_current_client_token(Some(token));
+        assert_eq!(diff_resource(&root,&HashMap::new()).unwrap_err().status,403,
+            "aggregate diff must refuse a tree containing config even without relay credentials");
+        // The protected home itself is outside this second repository; an
+        // ordinary file name can still alias a secret inode.
+        let (alias_dir, alias_root) = temp_repo("secret-link");
+        std::fs::write(alias_dir.join("tracked.txt"),"before\n").unwrap();
+        git(&alias_dir,&["add","tracked.txt"]);
+        git(&alias_dir,&["commit","-q","-m","fixture"]);
+        std::fs::remove_file(alias_dir.join("tracked.txt")).unwrap();
+        std::fs::hard_link(&config,alias_dir.join("tracked.txt")).unwrap();
+        std::fs::hard_link(&config,alias_dir.join("untracked.txt")).unwrap();
+        for path in [None,Some("tracked.txt"),Some("untracked.txt")] {
+            let params = path.map(|path| HashMap::from([("path".into(),path.into())])).unwrap_or_default();
+            assert_eq!(diff_resource(&alias_root,&params).unwrap_err().status,403,"path {path:?}");
+        }
+        // The full local owner retains the same access.
+        listeners::set_current_client_token(None);
+        assert!(diff_resource(&root,&HashMap::new()).unwrap()["diff"].as_str().unwrap().contains("synthetic-control-secret-diff"));
+        crate::config::instance::set_test_selection(previous);
+        std::fs::remove_dir_all(alias_dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

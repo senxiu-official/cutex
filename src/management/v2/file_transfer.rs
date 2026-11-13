@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{File, Metadata},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     net::TcpStream,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
@@ -437,8 +437,6 @@ fn handle_inner(
         Err(error) if error.status == 499 => return Ok(()),
         Err(error) => return super::workspace::write_error(stream, &error),
     };
-    let timeout = stream.write_timeout()?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut extra = crate::http::server::extra_response_headers();
     if extra
         .to_ascii_lowercase()
@@ -446,20 +444,8 @@ fn handle_inner(
     {
         extra.push_str("Access-Control-Expose-Headers: X-Cutex-File-Offset, X-Cutex-File-Bytes, X-Cutex-File-Total-Bytes, X-Cutex-File-Next-Offset, X-Cutex-File-Eof\r\n");
     }
-    let result = (|| -> std::io::Result<()> {
-        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nContent-Length: {}\r\nETag: \"{}\"\r\nX-Cutex-File-Offset: {}\r\nX-Cutex-File-Bytes: {}\r\nX-Cutex-File-Total-Bytes: {}\r\nX-Cutex-File-Next-Offset: {}\r\nX-Cutex-File-Eof: {}\r\n{}Connection: close\r\n\r\n",chunk.bytes.len(),chunk.revision,chunk.offset,chunk.bytes.len(),chunk.total,chunk.next(),chunk.eof(),extra)?;
-        for block in chunk.bytes.chunks(BLOCK) {
-            if started.elapsed() > REQUEST_BUDGET || disconnected(stream) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "transfer canceled",
-                ));
-            }
-            stream.write_all(block)?;
-        }
-        stream.flush()
-    })();
-    let restored = stream.set_write_timeout(timeout);
+    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nContent-Length: {}\r\nETag: \"{}\"\r\nX-Cutex-File-Offset: {}\r\nX-Cutex-File-Bytes: {}\r\nX-Cutex-File-Total-Bytes: {}\r\nX-Cutex-File-Next-Offset: {}\r\nX-Cutex-File-Eof: {}\r\n{}Connection: close\r\n\r\n",chunk.bytes.len(),chunk.revision,chunk.offset,chunk.bytes.len(),chunk.total,chunk.next(),chunk.eof(),extra);
+    let result = crate::http::server::write_response_parts(stream, &[header.as_bytes(), &chunk.bytes], Duration::from_secs(30));
     // Never let the generic Management error wrapper append a second HTTP
     // response to an advertised binary body, even after partial headers/data.
     crate::http::server::set_keep_alive(crate::http::server::KeepAlive::Off);
@@ -467,7 +453,6 @@ fn handle_inner(
     if let Err(error) = result {
         eprintln!("file transfer response interrupted: {}", error.kind());
     }
-    restored?;
     Ok(())
 }
 

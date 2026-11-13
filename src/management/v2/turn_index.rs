@@ -146,10 +146,25 @@ pub fn invalidate(session: &str) {
     let mut cache = cache();
     // Removing the token also fences in-flight pre-mutation reads.
     cache.entries.retain(|key, _| key.session != session);
+    super::session_cache_lifecycle::shrink(&mut cache.entries);
+}
+
+pub(super) fn cached_sessions() -> Vec<String> {
+    cache().entries.keys().map(|key| key.session.clone()).collect()
 }
 
 fn get(key: &Key) -> (Option<Arc<Index>>, Arc<()>) {
     let mut cache = cache();
+    if !cache.entries.contains_key(key) {
+        drop(cache);
+        if !super::session_cache_lifecycle::may_retain(&key.session) {
+            invalidate(&key.session);
+            // Return a request-owned identity without an entry that could
+            // accept publication after an archived/deleted history read.
+            return (None, Arc::new(()));
+        }
+        cache = self::cache();
+    }
     // Rebinding (including a new runtime generation) drops the previous binding.
     cache.entries.retain(|other, _| {
         other.session != key.session
@@ -549,5 +564,38 @@ mod tests {
             local.evict();
         }
         assert_eq!(local.entries.len(), CAPACITY);
+    }
+
+    #[test]
+    fn archived_history_indices_stay_request_owned_after_lifecycle_cleanup() {
+        let key = key();
+        let path = crate::session::store::cutex_sessions_path().unwrap();
+        let record = crate::session::model::CutexSessionRecord::new(key.session.clone(), Some(key.thread.clone()),
+            crate::platform::host::current_host_name(), std::env::temp_dir().display().to_string(), None).unwrap();
+        crate::session::store::with_locked_session_rows(&path, |rows| {
+            rows.insert_session(key.session.clone(), record);
+            rows.commit()?;
+            Ok(())
+        }).unwrap();
+        let token = get(&key).1;
+        put(key.clone(), Index::new(turns(2), false).unwrap(), token);
+        assert!(cached(&key).is_some());
+        crate::session::store::update_session_row(&path, &key.session, |record| {
+            let revision = record.durable_revision();
+            let generation = record.runtime_generation;
+            crate::session::archive::commit_retire(record, revision, generation, true, "2026-11-11T10:00:00Z".into())?;
+            Ok(())
+        }).unwrap();
+        super::super::session_cache_lifecycle::forget(&key.session);
+        let (cached, token) = get(&key);
+        assert!(cached.is_none());
+        let transient = put(key.clone(), Index::new(turns(2), false).unwrap(), token);
+        assert_eq!(transient.turns.len(), 2, "the caller still receives a usable index");
+        assert!(!cached_sessions().contains(&key.session));
+        crate::session::store::with_locked_session_rows(&path, |rows| {
+            rows.remove_session(&key.session);
+            rows.commit()?;
+            Ok(())
+        }).unwrap();
     }
 }

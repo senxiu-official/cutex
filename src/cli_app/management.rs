@@ -619,6 +619,13 @@ pub(crate) fn cmd_management_serve(
         }
         Err(error) => eprintln!("startup runtime reconciliation warning: {error:#}"),
     }
+    // Complete interrupted cross-store promotions before accepting new work.
+    match cutex::agent_management::AgentManagementProvider::open_default().and_then(|p| {
+        p.recover_quick_chat_promotions(&cutex::session::store::cutex_sessions_path()?)
+    }) {
+        Ok(failures) => for failure in failures { eprintln!("quick-chat promotion recovery: {failure}"); },
+        Err(error) => eprintln!("quick-chat promotion recovery unavailable: {error:#}"),
+    }
     // Runtimes that were intended online but did not survive the previous
     // stop (reboot, crash): offer them for restore (never started here).
     cutex::session::runtime_intent::detect_unclean_stop_at_startup();

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Real SDK175 + CLI314 + adapter stdio, loopback provider and dummy key only.
+"""Real SDK180 + CLI321 + adapter stdio, loopback provider and dummy key only.
 
-Run with the SDK175 virtualenv Python; --runtime-root names components/claude-runtime.
+Run with the SDK180 virtualenv Python; --runtime-root names components/claude-runtime.
 No inherited account/provider environment, real credentials, or daemon are used.
 Each invocation owns a new isolated directory beside this script (or --output-root).
 """
@@ -213,7 +213,7 @@ class Rpc:
 
 async def run(args):
     import sys
-    require(importlib.metadata.version('claude-agent-sdk') == '0.2.175', 'requires installed SDK 0.2.175')
+    require(importlib.metadata.version('claude-agent-sdk') == '0.2.180', 'requires installed SDK 0.2.180')
     bundled = Path(importlib.util.find_spec('claude_agent_sdk').origin).parent / '_bundled'
     cli = bundled / ('claude.exe' if os.name == 'nt' else 'claude')
     require(cli.is_file(), 'bundled CLI missing')
@@ -247,12 +247,12 @@ async def run(args):
     version_proc = await asyncio.create_subprocess_exec(str(cli), '--version', env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     version_bytes, _ = await asyncio.wait_for(version_proc.communicate(), 30)
-    require(version_proc.returncode == 0 and version_bytes.decode().split()[0] == '2.1.314', 'requires bundled CLI 2.1.314')
+    require(version_proc.returncode == 0 and version_bytes.decode().split()[0] == '2.1.321', 'requires bundled CLI 2.1.321')
     command = [sys.executable, '-B', '-m', 'cute_claude', '--backend', 'subscription',
                '--claude-cli', str(cli), '--claude-config-dir', str(dirs['config']),
                '--api-account-config', str(account), '--workspace', str(dirs['workspace']),
                '--state-dir', str(dirs['state']), '--model', 'claude-sonnet-4-6', '--thinking', 'disabled']
-    report = {'sdk': '0.2.175', 'cli': '2.1.314', 'adapterPid': None, 'cases': [], 'success': False,
+    report = {'sdk': '0.2.180', 'cli': '2.1.321', 'adapterPid': None, 'cases': [], 'success': False,
               'scope': 'real SDK/CLI/adapter; loopback API fixture only, not claude.ai account quota'}
     process = rpc = None
     try:

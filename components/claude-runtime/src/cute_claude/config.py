@@ -74,8 +74,11 @@ RUNTIME_LIMITS = (
     "each such notification: that turn cannot use tools and the user does not see it, so reply in one line "
     "and use no tools. A background subagent cannot use cutex tools, start subagents, ask the user, or get "
     "approval for a tool call; work that needs these belongs in the main agent or a foreground subagent "
-    "(run_in_background: false). For long commands whose output you need, prefer cutex's job service over "
-    "background shell commands."
+    "(run_in_background: false). This Claude runtime does not expose cutex Job Service tools. "
+    "For a long command, use a background shell command or a background subagent when appropriate, "
+    "and handle the visible Claude Task completion message. These tasks are tied to the Claude runtime "
+    "and cannot be resumed after it restarts. If durable Job Service execution is needed, ask an "
+    "authorized Codex agent on a Linux host with the Job Service configured to run it."
 )
 # Claude Code's own environment block names the OS shell ("Shell: PowerShell
 # (primary); Bash tool also available") even when the profile turned command

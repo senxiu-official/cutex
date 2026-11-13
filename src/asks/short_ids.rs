@@ -249,6 +249,12 @@ fn normalize_inner(ctx: &ToolContext<'_>, tool: &str, mut args: Value, preflight
     for field in ["delegations","attachments"] {
         if let Some(inputs)=args[field].as_array() {resources.extend(inputs.iter().filter_map(Value::as_str));}
     }
+    if tool == super::tools::DELEGATION_PROGRESS {
+        if let Some(children) = args.pointer("/continuation/wake/children").and_then(Value::as_array) {
+            resources.extend(children.iter().filter(|child| child["kind"] == "delegation")
+                .filter_map(|child| child["id"].as_str()));
+        }
+    }
     // Keep canonical IDs before the receipt/business digests. Moving this to
     // a worker would change alias replay semantics. Only these slow tools opt
     // into bounded lock waiting before no-write refusal; their business handler
@@ -308,6 +314,23 @@ fn normalize_inner(ctx: &ToolContext<'_>, tool: &str, mut args: Value, preflight
                 vec![Kind::Ask]
             };
             args[field] = json!(resolve(ctx, &state, input, &kinds, None)?);
+        }
+    }
+    if tool == super::tools::DELEGATION_PROGRESS {
+        if let Some(input) = args.pointer("/continuation/expectedAttemptId").and_then(Value::as_str) {
+            // Exact occurrence tokens are never shortened/resolved as IDs.
+            // Normalize only the public delegation prefix, before action digests.
+            let canonical = crate::short_ids::stored_id(input);
+            args["continuation"]["expectedAttemptId"] = json!(canonical);
+        }
+        if let Some(children) = args.pointer_mut("/continuation/wake/children").and_then(Value::as_array_mut) {
+            for child in children {
+                if child["kind"] == "delegation" {
+                    if let Some(input) = child["id"].as_str() {
+                        child["id"] = json!(resolve(ctx, &state, input, &[Kind::Ask], None)?);
+                    }
+                }
+            }
         }
     }
     if let Some(inputs) = args.get_mut("delegations").and_then(Value::as_array_mut) {

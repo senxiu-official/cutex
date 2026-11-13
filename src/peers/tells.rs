@@ -340,6 +340,7 @@ pub(crate) fn receive_with(
             "recipientState": recipient_state,
             "target": {"cutexSessionId": target.cutex_session_id, "name": target.name.as_deref().map(super::wire::sanitize_name)},
         });
+        if wake && recipient_state == "busy" { response["busyWake"] = crate::asks::tell_busy_detail::policy_hint(&target.cutex_session_id); }
         if downgraded {
             response["wakeDowngraded"] = json!(true);
             response["reason"] = json!("rate_limited");
@@ -516,6 +517,7 @@ pub fn send(
                 let outcome = crate::asks::tools::tell_detail_for(
                     &address, state, woke, false, ctx.facade, false,
                 );
+                let outcome = crate::asks::tell_busy_detail::from_hint(state, woke, outcome, &response["busyWake"]);
                 let mut detail = match &downgrade {
                     Some(reason) => format!("Delivered to host {} as a note, not a wake ({reason}: that host's hourly limit of wakes from your host was reached). {outcome}", peer.label),
                     None => format!("Delivered to host {}. {outcome}", peer.label),

@@ -59,7 +59,6 @@ struct Kernel {
     epoch: u64,
     runs: u64,
     last_used: Instant,
-    turn_ended: Option<Instant>,
     busy: bool,
 }
 impl Drop for Kernel {
@@ -72,9 +71,19 @@ impl Drop for Kernel {
 
 #[derive(Default)]
 struct Registry {
-    kernels: HashMap<String, Arc<Mutex<Kernel>>>,
+    kernels: HashMap<String, Arc<KernelSlot>>,
     epochs: HashMap<String, u64>,
     reaper: bool,
+}
+struct KernelSlot {
+    epoch: u64,
+    ready: OnceLock<std::result::Result<Arc<Mutex<Kernel>>, &'static str>>,
+    turn_ended: Mutex<Option<Instant>>,
+}
+impl KernelSlot {
+    fn kernel(&self) -> Option<&Arc<Mutex<Kernel>>> {
+        self.ready.get().and_then(|result| result.as_ref().ok())
+    }
 }
 fn registry() -> &'static Mutex<Registry> {
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -83,22 +92,26 @@ fn registry() -> &'static Mutex<Registry> {
 
 /// The trusted end of an agent turn: the kernel stops being kept warm.
 pub fn turn_completed(session: &str) {
-    let kernel = registry().lock().ok().and_then(|registry| registry.kernels.get(session).cloned());
-    if let Some(kernel) = kernel {
-        if let Ok(mut kernel) = kernel.try_lock() {
-            kernel.turn_ended = Some(Instant::now());
-        }
+    let slot = registry().lock().ok().and_then(|registry| registry.kernels.get(session).cloned());
+    if let Some(slot) = slot {
+        *slot.turn_ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     }
 }
 
 /// Reclaim idle kernels. Busy kernels (a script call is running) are kept.
 fn reap(now: Instant) {
     let Ok(mut registry) = registry().lock() else { return; };
-    registry.kernels.retain(|_, kernel| match kernel.try_lock() {
-        Ok(kernel) => kernel.busy || !(kernel.turn_ended.is_some_and(|at| now.duration_since(at) >= IDLE_AFTER_TURN)
-            || now.duration_since(kernel.last_used) >= MAX_IDLE),
-        Err(_) => true,
-    });
+    let expired: Vec<_> = registry.kernels.iter().filter_map(|(session, slot)| {
+        let kernel = slot.kernel()?;
+        if Arc::strong_count(slot) != 1 || Arc::strong_count(kernel) != 1 { return None; }
+        let kernel = kernel.try_lock().ok()?;
+        let ended = *slot.turn_ended.lock().unwrap_or_else(|e| e.into_inner());
+        (!kernel.busy && (ended.is_some_and(|at| now.saturating_duration_since(at) >= IDLE_AFTER_TURN)
+            || now.saturating_duration_since(kernel.last_used) >= MAX_IDLE)).then(|| session.clone())
+    }).collect();
+    let retired: Vec<_> = expired.into_iter().filter_map(|session| registry.kernels.remove(&session)).collect();
+    drop(registry);
+    drop(retired); // Child kill/wait never holds the host registry.
 }
 
 fn start_reaper(registry: &mut Registry) {
@@ -186,7 +199,7 @@ fn spawn(node: &Path, epoch: u64) -> anyhow::Result<Kernel> {
             }
         }
     })?;
-    let kernel = Kernel { child, stdin, lines, epoch, runs: 0, last_used: Instant::now(), turn_ended: None, busy: false };
+    let kernel = Kernel { child, stdin, lines, epoch, runs: 0, last_used: Instant::now(), busy: false };
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
         let left = deadline.checked_duration_since(Instant::now()).ok_or_else(|| anyhow::anyhow!("kernel start timeout"))?;
@@ -196,40 +209,75 @@ fn spawn(node: &Path, epoch: u64) -> anyhow::Result<Kernel> {
 }
 
 /// This session's kernel, started if needed; `fresh` = no earlier variables.
-fn kernel_for(session: &str) -> Result<(Arc<Mutex<Kernel>>, bool)> {
-    let mut registry = registry().lock().map_err(|_| RelayError::new("browser_unavailable"))?;
-    if let Some(kernel) = registry.kernels.get(session) {
-        return Ok((kernel.clone(), false));
-    }
-    if registry.kernels.len() >= MAX_KERNELS {
-        let idle = registry.kernels.iter()
-            .filter_map(|(key, kernel)| kernel.try_lock().ok().filter(|k| !k.busy).map(|k| (key.clone(), k.last_used)))
-            .min_by_key(|(_, used)| *used)
-            .map(|(key, _)| key);
-        let Some(idle) = idle else { return Err(RelayError::new("busy")); };
-        registry.kernels.remove(&idle);
-    }
-    let node = node().ok_or(RelayError::new("script_runtime_unavailable"))?;
-    let epoch = registry.epochs.get(session).copied().unwrap_or(0) + 1;
-    registry.epochs.insert(session.to_string(), epoch);
-    let kernel = Arc::new(Mutex::new(spawn(&node, epoch).map_err(|_| RelayError::new("script_runtime_unavailable"))?));
-    registry.kernels.insert(session.to_string(), kernel.clone());
-    start_reaper(&mut registry);
-    Ok((kernel, true))
+fn kernel_for(session: &str) -> Result<(Arc<Mutex<Kernel>>, bool, Arc<KernelSlot>)> {
+    kernel_for_with(session, |epoch| {
+        let node = node().ok_or(RelayError::new("script_runtime_unavailable"))?;
+        spawn(&node, epoch).map_err(|_| RelayError::new("script_runtime_unavailable"))
+    })
+}
+
+fn kernel_for_with(session: &str, start: impl FnOnce(u64) -> Result<Kernel>) -> Result<(Arc<Mutex<Kernel>>, bool, Arc<KernelSlot>)> {
+    let (slot, fresh, retired) = {
+        let mut registry = registry().lock().map_err(|_| RelayError::new("browser_unavailable"))?;
+        if let Some(slot) = registry.kernels.get(session) {
+            (slot.clone(), false, None)
+        } else {
+            let mut retired = None;
+            if registry.kernels.len() >= MAX_KERNELS {
+                let idle = registry.kernels.iter().filter_map(|(key, slot)| {
+                    let kernel = slot.kernel()?;
+                    if Arc::strong_count(slot) != 1 || Arc::strong_count(kernel) != 1 { return None; }
+                    kernel.try_lock().ok().filter(|k| !k.busy).map(|k| (key.clone(), k.last_used))
+                }).min_by_key(|(_, used)| *used).map(|(key, _)| key);
+                let Some(idle) = idle else { return Err(RelayError::new("busy")); };
+                retired = registry.kernels.remove(&idle);
+            }
+            let epoch = registry.epochs.get(session).copied().unwrap_or(0) + 1;
+            registry.epochs.insert(session.to_string(), epoch);
+            let slot = Arc::new(KernelSlot { epoch, ready: OnceLock::new(), turn_ended: Mutex::new(None) });
+            registry.kernels.insert(session.to_string(), slot.clone());
+            start_reaper(&mut registry);
+            (slot, true, retired)
+        }
+    };
+    drop(retired);
+    // Same-session callers share startup; unrelated sessions never wait on it.
+    let result = slot.ready.get_or_init(|| start(slot.epoch).map(|kernel| Arc::new(Mutex::new(kernel))).map_err(|error| error.code));
+    let kernel = match result {
+        Ok(kernel) => kernel.clone(),
+        Err(code) => {
+            detach_slot(session, &slot);
+            return Err(RelayError::new(code));
+        }
+    };
+    let current = registry().lock().map_err(|_| RelayError::new("browser_unavailable"))?
+        .kernels.get(session).is_some_and(|known| Arc::ptr_eq(known, &slot));
+    if !current { return Err(RelayError::new("busy")); }
+    Ok((kernel, fresh, slot))
+}
+
+fn detach_slot(session: &str, slot: &Arc<KernelSlot>) {
+    let retired = registry().lock().ok().and_then(|mut registry| {
+        if registry.kernels.get(session).is_some_and(|known| Arc::ptr_eq(known, slot)) {
+            registry.kernels.remove(session)
+        } else { None }
+    });
+    drop(retired);
 }
 
 fn reset(session: &str) -> u64 {
-    let Ok(mut registry) = registry().lock() else { return 0; };
-    registry.kernels.remove(session);
-    registry.epochs.get(session).copied().unwrap_or(0)
+    let (retired, epoch) = {
+        let Ok(mut registry) = registry().lock() else { return 0; };
+        (registry.kernels.remove(session), registry.epochs.get(session).copied().unwrap_or(0))
+    };
+    drop(retired);
+    epoch
 }
 
 fn drop_kernel(session: &str, kernel: &Arc<Mutex<Kernel>>) {
-    if let Ok(mut registry) = registry().lock() {
-        if registry.kernels.get(session).is_some_and(|current| Arc::ptr_eq(current, kernel)) {
-            registry.kernels.remove(session);
-        }
-    }
+    let slot = registry().lock().ok().and_then(|registry| registry.kernels.get(session).cloned())
+        .filter(|slot| slot.kernel().is_some_and(|current| Arc::ptr_eq(current, kernel)));
+    if let Some(slot) = slot { detach_slot(session, &slot); }
 }
 
 /// The agent's own transport identity, for the steps it runs.
@@ -377,7 +425,7 @@ pub struct RunResult {
 /// Run `code` in `session`'s kernel. `send` performs one wire command (as
 /// the agent). Public for tests with a fake wire.
 pub fn run(session: &str, request: &str, title: &str, code: &str, send: &mut dyn FnMut(&str, &str, &Value) -> Value) -> Result<RunResult> {
-    let (kernel, fresh) = kernel_for(session)?;
+    let (kernel, fresh, slot) = kernel_for(session)?;
     let deadline = Instant::now() + SCRIPT_BUDGET;
     let mut guard = loop {
         match kernel.try_lock() {
@@ -388,7 +436,7 @@ pub fn run(session: &str, request: &str, title: &str, code: &str, send: &mut dyn
     };
     guard.busy = true;
     guard.runs += 1;
-    guard.turn_ended = None;
+    *slot.turn_ended.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let run_id = guard.runs;
     let epoch = guard.epoch;
     let started = json!({"t":"run","run":run_id,"title":title,"code":code,"syncBudgetMs":SCRIPT_BUDGET.as_millis() as u64});
@@ -547,6 +595,103 @@ fn step(request: &str, message: &Value, steps: &mut Vec<Value>, images: &mut Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stalled_startup_does_not_block_other_sessions_or_turn_bookkeeping() {
+        let session = format!("startup-stalled-{}", uuid::Uuid::new_v4());
+        let (began, ready) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let slow_session = session.clone();
+        let slow = std::thread::spawn(move || kernel_for_with(&slow_session, |_| {
+            began.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(5));
+            Err(RelayError::new("script_runtime_unavailable"))
+        }).err().unwrap().code);
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done, completed) = mpsc::sync_channel(1);
+        let fast_session = session.clone();
+        let fast = std::thread::spawn(move || {
+            turn_completed(&fast_session);
+            let other = format!("startup-other-{}", uuid::Uuid::new_v4());
+            assert_eq!(kernel_for_with(&other, |_| Err(RelayError::new("script_runtime_unavailable"))).err().unwrap().code, "script_runtime_unavailable");
+            reset(&other);
+            done.send(()).unwrap();
+        });
+        let result = completed.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        assert_eq!(slow.join().unwrap(), "script_runtime_unavailable");
+        fast.join().unwrap();
+        assert!(result.is_ok(), "startup held the global kernel registry");
+        assert!(!registry().lock().unwrap().kernels.contains_key(&session));
+    }
+
+    #[cfg(unix)]
+    fn fake_kernel(epoch: u64) -> Result<Kernel> {
+        let mut child = Command::new("/bin/sh").args(["-c", "exec cat"]).stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let (_sender, lines) = mpsc::channel();
+        Ok(Kernel { child, stdin, lines, epoch, runs: 0, last_used: Instant::now(), busy: false })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn simultaneous_same_session_callers_share_one_startup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let session = format!("startup-shared-{}", uuid::Uuid::new_v4());
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (began, ready) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let (first_session, first_starts) = (session.clone(), starts.clone());
+        let first = std::thread::spawn(move || kernel_for_with(&first_session, |epoch| {
+            first_starts.fetch_add(1, Ordering::SeqCst);
+            began.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(5));
+            fake_kernel(epoch)
+        }));
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (second_session, second_starts) = (session.clone(), starts.clone());
+        let second = std::thread::spawn(move || kernel_for_with(&second_session, |epoch| {
+            second_starts.fetch_add(1, Ordering::SeqCst);
+            fake_kernel(epoch)
+        }));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(registry().lock().unwrap().kernels.get(&session).unwrap()) < 3 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        release.send(()).unwrap();
+        let (a, _, a_slot) = first.join().unwrap().unwrap();
+        let (b, _, b_slot) = second.join().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        reset(&session);
+        drop((a, b, a_slot, b_slot));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_during_startup_cannot_replace_a_new_epoch() {
+        let session = format!("startup-reset-{}", uuid::Uuid::new_v4());
+        let (began, ready) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let slow_session = session.clone();
+        let slow = std::thread::spawn(move || kernel_for_with(&slow_session, |epoch| {
+            began.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(5));
+            fake_kernel(epoch)
+        }).err().unwrap().code);
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(reset(&session), 1);
+        let (new_kernel, fresh, new_slot) = kernel_for_with(&session, fake_kernel).unwrap();
+        assert!(fresh);
+        assert_eq!(new_kernel.lock().unwrap().epoch, 2);
+        release.send(()).unwrap();
+        assert_eq!(slow.join().unwrap(), "busy");
+        assert!(Arc::ptr_eq(registry().lock().unwrap().kernels.get(&session).unwrap(), &new_slot));
+        reset(&session);
+        drop(new_slot);
+        drop(new_kernel);
+    }
 
     fn node_or_skip() -> bool {
         if node().is_some() { return true; }

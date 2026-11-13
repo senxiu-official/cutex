@@ -305,8 +305,6 @@ pub fn check_overlap(
 
 // ------------------------------------------------------------------ config
 
-static CONFIG_LOCK: Mutex<()> = Mutex::new(());
-
 pub fn configured_sources() -> Vec<ExtraUsageSource> {
     crate::config::store::load_codez_config().usage.extra_sources
 }
@@ -338,17 +336,24 @@ pub fn source_labels() -> std::collections::HashMap<String, super::query::UsageS
         .collect()
 }
 
-/// Read-modify-write of `usage.extraSources` under one process lock.
+/// Read-modify-write of `usage.extraSources` under the shared config lock.
 pub fn update_sources<T>(
     change: impl FnOnce(&mut Vec<ExtraUsageSource>) -> Result<T, SourceError>,
 ) -> Result<T, SourceError> {
-    let _guard = CONFIG_LOCK.lock().map_err(|_| SourceError::Internal("config lock poisoned".into()))?;
-    let mut config = crate::config::store::load_codez_config_checked()
-        .map_err(|error| SourceError::Internal(format!("{error:#}")))?;
-    let result = change(&mut config.usage.extra_sources)?;
-    crate::config::store::save_codez_config(&config)
-        .map_err(|error| SourceError::Internal(format!("{error:#}")))?;
-    Ok(result)
+    let mut rejected = None;
+    let result = crate::config::store::update_codez_config(|config| {
+        match change(&mut config.usage.extra_sources) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                rejected = Some(error);
+                anyhow::bail!("usage source mutation rejected")
+            }
+        }
+    });
+    match result {
+        Ok((_, result)) => Ok(result),
+        Err(error) => Err(rejected.unwrap_or_else(|| SourceError::Internal(format!("{error:#}")))),
+    }
 }
 
 #[derive(Debug)]

@@ -738,17 +738,14 @@ pub fn start_login(account_id: &str, wait: Duration) -> Result<(LoginSnapshot, b
         error: None,
     };
     let entry = Arc::new((Mutex::new(LoginEntry { snapshot, cancel: false, committing: false, finished: None }), Condvar::new()));
-    let staging = homes_root().and_then(|root| Ok(root.join(STAGING_DIR).join(&login_id))).map_err(StartLoginError::Other)?;
-    let child = spawn_login(&cli, &account, &staging).map_err(|error| {
-        let _ = std::fs::remove_dir_all(&staging);
-        StartLoginError::Other(error)
-    })?;
+    let staging = LoginStaging(homes_root().map(|root| root.join(STAGING_DIR).join(&login_id)).map_err(StartLoginError::Other)?);
+    let child = spawn_login(&cli, &account, staging).map_err(StartLoginError::Other)?;
     logins().lock().unwrap_or_else(|e| e.into_inner()).insert(account_id.to_string(), entry.clone());
     let driver_entry = entry.clone();
     let account_id_owned = account_id.to_string();
     std::thread::Builder::new()
         .name(format!("kimi-login-{account_id}"))
-        .spawn(move || drive_login(child, driver_entry, account_id_owned, staging))
+        .spawn(move || drive_login(child, driver_entry, account_id_owned))
         .map_err(|error| StartLoginError::Other(error.into()))?;
     let (lock, signal) = &*entry;
     let deadline = Instant::now() + wait;
@@ -781,7 +778,50 @@ fn shim_dir(staging: &Path) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-fn spawn_login(cli: &super::kimi::KimiCli, account: &KimiAccount, staging: &Path) -> anyhow::Result<Child> {
+// These guards also run if spawning the driver thread fails or it unwinds.
+// Only this invocation's disposable home and owned processes are cleaned.
+struct LoginStaging(PathBuf);
+
+impl Drop for LoginStaging {
+    fn drop(&mut self) {
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) if Instant::now() < until => std::thread::sleep(Duration::from_millis(100)),
+                Err(error) => {
+                    eprintln!("cutex: Kimi login temporary home cleanup failed: {} ({})", self.0.display(), error.kind());
+                    break;
+                }
+            }
+        }
+    }
+}
+
+struct LoginProcess {
+    child: Child,
+    #[cfg(windows)]
+    job: std::os::windows::io::OwnedHandle,
+    // Fields drop after LoginProcess::drop has stopped the owned processes.
+    staging: LoginStaging,
+}
+
+impl Drop for LoginProcess {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            // A browser helper can outlive the login CLI and hold its SQLite
+            // files open. End only this login's kernel-owned job before cleanup.
+            let _ = crate::platform::windows_job::terminate_job(&self.job);
+            let _ = crate::platform::windows_job::wait_for_job_empty(&self.job, Duration::from_secs(3));
+        }
+        kill_login(&mut self.child);
+    }
+}
+
+fn spawn_login(cli: &super::kimi::KimiCli, account: &KimiAccount, staging_home: LoginStaging) -> anyhow::Result<LoginProcess> {
+    let staging = &staging_home.0;
     ensure_private_dir(&staging.parent().context("staging parent")?.to_path_buf())?;
     ensure_private_dir(staging)?;
     let home = account_home(&account.id)?;
@@ -841,16 +881,50 @@ fn spawn_login(cli: &super::kimi::KimiCli, account: &KimiAccount, staging: &Path
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    command.spawn().map_err(|error| anyhow::anyhow!("start kimi login: {}", error.kind()))
+    #[cfg(windows)]
+    let job = {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+        crate::platform::windows_job::create_agent_job(&format!("cutex-kimi-login-{}", uuid::Uuid::new_v4().simple()))?
+    };
+    let child = command.spawn().map_err(|error| anyhow::anyhow!("start kimi login: {}", error.kind()))?;
+    let process = LoginProcess { child, #[cfg(windows)] job, staging: staging_home };
+    #[cfg(windows)]
+    crate::platform::windows_job::adopt_suspended_child(&process.job, &process.child)?;
+    Ok(process)
 }
 
 fn kill_login(child: &mut Child) {
+    // try_wait caches/reaps the child's status. Its old numeric PID/PGID is
+    // no longer an ownership token once that happens; it may have been reused.
+    if !matches!(child.try_wait(), Ok(None)) { return; }
     #[cfg(unix)]
     unsafe {
+        #[cfg(test)]
+        LOGIN_GROUP_KILLS.with(|count| count.set(count.get() + 1));
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(all(test, unix))]
+thread_local! { static LOGIN_GROUP_KILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(all(test, unix))]
+mod login_process_reap_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn reaped_login_child_never_signals_its_old_process_group() {
+        let mut child = Command::new("/bin/sh").args(["-c", "exit 0"]).process_group(0).spawn().unwrap();
+        assert!(child.wait().unwrap().success());
+        let before = LOGIN_GROUP_KILLS.with(|count| count.get());
+        kill_login(&mut child);
+        assert_eq!(LOGIN_GROUP_KILLS.with(|count| count.get()), before);
+    }
 }
 
 /// What a line of `kimi login` stderr tells cutex.
@@ -911,7 +985,8 @@ fn classify_failure(message: &str) -> (LoginState, &'static str) {
     }
 }
 
-fn drive_login(mut child: Child, entry: Arc<(Mutex<LoginEntry>, Condvar)>, account_id: String, staging: PathBuf) {
+fn drive_login(mut process: LoginProcess, entry: Arc<(Mutex<LoginEntry>, Condvar)>, account_id: String) {
+    let child = &mut process.child;
     let (lock, signal) = &*entry;
     let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut reader = child.stderr.take().map(|stderr| {
@@ -957,15 +1032,22 @@ fn drive_login(mut child: Child, entry: Arc<(Mutex<LoginEntry>, Condvar)>, accou
     let outcome: (LoginState, Option<(&'static str, String)>) = loop {
         let cancel = lock.lock().unwrap_or_else(|e| e.into_inner()).cancel;
         if cancel {
-            kill_login(&mut child);
+            kill_login(child);
             break (LoginState::Cancelled, None);
         }
         if started.elapsed() > LOGIN_DEADLINE {
-            kill_login(&mut child);
+            kill_login(child);
             break (LoginState::Expired, Some(("kimi_login_timeout", "the device code was not confirmed in time".into())));
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                #[cfg(windows)]
+                {
+                    // Close descendant-held stderr and browser database handles
+                    // before joining the reader or removing the temporary home.
+                    let _ = crate::platform::windows_job::terminate_job(&process.job);
+                    let _ = crate::platform::windows_job::wait_for_job_empty(&process.job, Duration::from_secs(3));
+                }
                 if let Some(reader) = reader.take() {
                     let _ = reader.join();
                 }
@@ -980,7 +1062,7 @@ fn drive_login(mut child: Child, entry: Arc<(Mutex<LoginEntry>, Condvar)>, accou
                         guard.committing = true;
                     }
                     let home = account_home(&account_id);
-                    match home.and_then(|home| install_login(&home, &staging)) {
+                    match home.and_then(|home| install_login(&home, &process.staging.0)) {
                         Ok(()) => {
                             let _ = update_registry(|registry| {
                                 if let Some(account) = registry.accounts.iter_mut().find(|account| account.id == account_id) {
@@ -999,12 +1081,12 @@ fn drive_login(mut child: Child, entry: Arc<(Mutex<LoginEntry>, Condvar)>, accou
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(error) => {
-                kill_login(&mut child);
+                kill_login(child);
                 break (LoginState::Failed, Some(("kimi_login_failed", format!("wait for kimi login: {}", error.kind()))));
             }
         }
     };
-    let _ = std::fs::remove_dir_all(&staging);
+    drop(process);
     let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     // A login cancelled meanwhile stays cancelled (`finish` is first-wins).
     guard.finish(outcome.0, outcome.1);

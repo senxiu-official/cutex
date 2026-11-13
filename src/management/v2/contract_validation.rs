@@ -86,6 +86,20 @@ fn validate_semantic_event_contract(message: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn memory_injection_defaults_update_contract_is_boolean_for_all_runtimes() {
+        for value in [serde_json::json!(true),serde_json::json!(false)] {
+            validate_cutex_request(&serde_json::json!({"requestId":"memory","method":"cutex/session/defaults/update",
+                "params":{"expectedRevision":1,"patch":{"memoryInjection":value}}})).unwrap();
+        }
+        for value in [Value::Null,serde_json::json!("false"),serde_json::json!(1)] {
+            assert!(validate_cutex_request(&serde_json::json!({"requestId":"memory","method":"cutex/session/defaults/update",
+                "params":{"patch":{"memoryInjection":value}}})).is_err());
+        }
+    }
+
+
     use serde_json::json;
 
     use super::*;

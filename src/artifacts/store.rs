@@ -18,6 +18,34 @@ pub const OPEN_WINDOW_CAP_MS: i64 = 24 * 60 * 60 * 1000;
 const ACTION_RETENTION_DAYS: i64 = 30;
 const CAPTURE_REQUESTED_PREFIX: &str = "captureRequestedAt:";
 
+#[cfg(test)]
+#[test]
+#[ignore = "requires an explicitly marked release business copy"]
+fn release_data_copy_capture_metadata_validate_and_reopen() {
+    let home = PathBuf::from(std::env::var_os("CUTEX_RELEASE_DATA_COPY").expect("explicit copy"));
+    assert!(home.is_absolute() && home.join(".cutex-release-data-copy").is_file());
+    assert_eq!(crate::config::paths::config_dir().unwrap().canonicalize().unwrap(), home.canonicalize().unwrap());
+    let root = home.join("runtime/artifacts");
+    if !root.join("artifacts-v1.sqlite3").exists() { eprintln!("RELEASE DATA COPY capture metadata absent"); return; }
+    for pass in 0..2 {
+        let store = ArtifactStore::at(&root);
+        let connection = store.connection().unwrap();
+        let mut metadata = connection.prepare("SELECT key,value FROM meta").unwrap();
+        let mut count = 0;
+        for row in metadata.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).unwrap() {
+            let (key, value) = row.unwrap();
+            if matches!(key.as_str(), "captureEventCursor" | "captureEventReplayGap" | "captureEventReplayFailure") {
+                let _: serde_json::Value = serde_json::from_str(&value).unwrap();
+                count += 1;
+            } else if key.starts_with(CAPTURE_REQUESTED_PREFIX) {
+                value.parse::<i64>().unwrap();
+                count += 1;
+            }
+        }
+        eprintln!("RELEASE DATA COPY capture metadata pass={pass} markers={count}");
+    }
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     NotFound,
@@ -140,6 +168,12 @@ pub struct ListFilter {
     pub kind: Option<String>,
     /// Artifacts with a version produced by (or attributed to) this session.
     pub producer: Option<String>,
+    /// Latest version's publisher (session ID, or `owner`).
+    pub publisher: Option<String>,
+    /// Latest version's source: `collected` or `published`.
+    pub source: Option<String>,
+    pub sort: Option<String>,
+    pub order: Option<String>,
     pub archived: Archived,
     pub limit: usize,
     pub cursor: Option<String>,
@@ -456,7 +490,7 @@ impl ArtifactStore {
             if !path.exists() {
                 crate::management::client_tokens::ensure_private_dir(path.parent().context("blob dir")?)?;
                 crate::config::atomic::write_private_bytes_atomic(&path, bytes)?;
-                wrote_blob = Some(path);
+                wrote_blob = Some(sha256.clone());
             }
         }
         let (storage, sha256) = match &new.content {
@@ -528,8 +562,8 @@ impl ArtifactStore {
         let artifact_id = match result.and_then(|id| transaction.commit().map(|()| id).map_err(StoreError::from)) {
             Ok(id) => id,
             Err(error) => {
-                if let Some(path) = wrote_blob {
-                    let _ = std::fs::remove_file(path);
+                if let Some(sha) = wrote_blob {
+                    let _ = self.remove_unreferenced_blobs(&mut connection, &[sha]);
                 }
                 return Err(error);
             }
@@ -588,6 +622,20 @@ impl ArtifactStore {
 
     /// Newest `updatedAt` first; `(items, nextCursor)`.
     pub fn list(&self, filter: &ListFilter) -> Result<(Vec<ArtifactSummary>, Option<String>), StoreError> {
+        let sort = filter.sort.as_deref().unwrap_or("updated");
+        let key_column = match sort {
+            "updated" => "a.updated_at",
+            "name" => "a.name",
+            "kind" => "a.kind",
+            "publisher" => "COALESCE(json_extract(v.producer, '$.displayName'), v.producer_session, v.producer_kind)",
+            _ => return Err(StoreError::Invalid("sort: updated, name, publisher or kind".into())),
+        };
+        let order = filter.order.as_deref().unwrap_or(if sort == "updated" { "desc" } else { "asc" });
+        let (direction, compare) = match order {
+            "asc" => ("ASC", ">"),
+            "desc" => ("DESC", "<"),
+            _ => return Err(StoreError::Invalid("order: asc or desc".into())),
+        };
         let mut clauses: Vec<String> = Vec::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
         let bind = |value: rusqlite::types::Value, values: &mut Vec<rusqlite::types::Value>| {
@@ -621,36 +669,67 @@ impl ArtifactStore {
                 "EXISTS (SELECT 1 FROM artifact_versions p WHERE p.artifact_id = a.artifact_id AND p.producer_session = {producer})"
             ));
         }
+        if let Some(publisher) = &filter.publisher {
+            if publisher == "owner" {
+                clauses.push("v.producer_kind = 'owner'".into());
+            } else {
+                let publisher = bind(publisher.clone().into(), &mut values);
+                clauses.push(format!("v.producer_session = {publisher}"));
+            }
+        }
+        match filter.source.as_deref() {
+            None | Some("all") => {},
+            Some("collected") => clauses.push("v.producer_kind = 'auto'".into()),
+            Some("published") => clauses.push("v.producer_kind IN ('agent', 'owner')".into()),
+            _ => return Err(StoreError::Invalid("source: all, collected or published".into())),
+        }
         match filter.archived {
             Archived::No => clauses.push("a.archived_at IS NULL".into()),
             Archived::Yes => clauses.push("a.archived_at IS NOT NULL".into()),
             Archived::All => {}
         }
         if let Some(cursor) = &filter.cursor {
-            let (updated_at, artifact_id) = decode_cursor(cursor).ok_or_else(|| StoreError::Invalid("cursor: not a cursor of this list".into()))?;
-            let updated = bind(updated_at.into(), &mut values);
+            let decoded = if sort == "updated" && order == "desc" {
+                decode_cursor(cursor)
+            } else {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cursor).ok()
+                    .and_then(|bytes| serde_json::from_slice::<(String, String, String, String)>(&bytes).ok())
+                    .filter(|(s, o, _, id)| s == sort && o == order && super::is_artifact_id(id))
+                    .map(|(_, _, key, id)| (key, id))
+            };
+            let (key, artifact_id) = decoded.ok_or_else(|| StoreError::Invalid("cursor: not a cursor of this sort/order".into()))?;
+            let updated = bind(key.into(), &mut values);
             let id = bind(artifact_id.into(), &mut values);
-            clauses.push(format!("(a.updated_at < {updated} OR (a.updated_at = {updated} AND a.artifact_id < {id}))"));
+            clauses.push(format!("({key_column} {compare} {updated} OR ({key_column} = {updated} AND a.artifact_id {compare} {id}))"));
         }
         let limit = filter.limit.clamp(1, 200);
         let limit_param = bind(((limit + 1) as i64).into(), &mut values);
         let where_clause = if clauses.is_empty() { String::new() } else { format!("WHERE {}", clauses.join(" AND ")) };
         let sql = format!(
-            "SELECT {ARTIFACT_COLUMNS}, {VERSION_COLUMNS} FROM artifacts a
+            "SELECT {ARTIFACT_COLUMNS}, {VERSION_COLUMNS}, {key_column} FROM artifacts a
              JOIN artifact_versions v ON v.artifact_id = a.artifact_id AND v.version = a.latest_version
-             {where_clause} ORDER BY a.updated_at DESC, a.artifact_id DESC LIMIT {limit_param}"
+             {where_clause} ORDER BY {key_column} {direction}, a.artifact_id {direction} LIMIT {limit_param}"
         );
         let connection = self.connection()?;
         let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), summary_of)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            Ok((summary_of(row)?, row.get::<_, String>(row.as_ref().column_count() - 1)?))
+        })?;
         let mut items = rows.collect::<Result<Vec<_>, _>>()?;
         let next = if items.len() > limit {
             items.truncate(limit);
-            items.last().map(|last| encode_cursor(&last.updated_at, &last.artifact_id))
+            items.last().map(|(last, key)| {
+                if sort == "updated" && order == "desc" {
+                    encode_cursor(key, &last.artifact_id)
+                } else {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        serde_json::to_vec(&(sort, order, key, &last.artifact_id)).expect("cursor strings"))
+                }
+            })
         } else {
             None
         };
-        Ok((items, next))
+        Ok((items.into_iter().map(|(item, _)| item).collect(), next))
     }
 
     /// Change metadata under compare-and-swap. Returns the artifact and the
@@ -774,10 +853,32 @@ impl ArtifactStore {
             }
         }
         transaction.commit()?;
-        for sha in orphaned {
-            let _ = std::fs::remove_file(self.blob_path(&sha));
-        }
+        // Another process may have published these same bytes since commit.
+        // Cleanup is best effort; a failure must leave extra blobs, not turn
+        // an already committed deletion into a reported transaction failure.
+        let _ = self.remove_unreferenced_blobs(&mut connection, &orphaned);
         Ok(current)
+    }
+
+    fn remove_unreferenced_blobs(&self, connection: &mut Connection, candidates: &[String]) -> anyhow::Result<()> {
+        // Publish holds this same database writer lock from its existence
+        // check through its metadata commit. Recheck under a fresh lock after
+        // the original transaction commits/rolls back, and keep the lock until
+        // unlink completes. Never unlink before the metadata deletion commits:
+        // a crash could otherwise resurrect rows pointing at a missing blob.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for sha in candidates {
+            let used: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifact_versions WHERE storage = 'blob' AND sha256 = ?1)",
+                [sha],
+                |row| row.get(0),
+            )?;
+            if !used {
+                let _ = std::fs::remove_file(self.blob_path(sha));
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn usage(&self) -> anyhow::Result<Usage> {
@@ -849,11 +950,17 @@ impl ArtifactStore {
     pub fn window_started(&self, window: &TurnWindow) -> anyhow::Result<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
+        Self::window_started_in(&transaction, window)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn window_started_in(connection: &rusqlite::Connection, window: &TurnWindow) -> anyhow::Result<()> {
+        connection.execute(
             "UPDATE turn_windows SET ended_at_ms = MAX(started_at_ms, ?2) WHERE session_id = ?1 AND ended_at_ms IS NULL",
             params![window.session_id, window.started_at_ms],
         )?;
-        transaction.execute(
+        connection.execute(
             &format!("INSERT OR REPLACE INTO turn_windows ({WINDOW_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)"),
             params![
                 window.session_id,
@@ -867,13 +974,16 @@ impl ArtifactStore {
                 window.started_at_ms,
             ],
         )?;
-        transaction.commit()?;
         Ok(())
     }
 
     /// The session's open turn ended. Returns the closed window's project.
     pub fn window_ended(&self, session_id: &str, ended_at_ms: i64) -> anyhow::Result<Option<String>> {
         let connection = self.connection()?;
+        Self::window_ended_in(&connection, session_id, ended_at_ms)
+    }
+
+    fn window_ended_in(connection: &rusqlite::Connection, session_id: &str, ended_at_ms: i64) -> anyhow::Result<Option<String>> {
         let project: Option<Option<String>> = connection
             .query_row(
                 "SELECT project_id FROM turn_windows WHERE session_id = ?1 AND ended_at_ms IS NULL ORDER BY started_at_ms DESC LIMIT 1",
@@ -888,10 +998,44 @@ impl ArtifactStore {
         Ok(project.flatten())
     }
 
-    /// A completion without a matching start still requests a scan, but must
-    /// not invent an attribution window. Keep one durable marker per project.
-    pub(crate) fn note_capture_requested(&self, project: &str, at_ms: i64) -> anyhow::Result<()> {
-        self.set_meta(&format!("{CAPTURE_REQUESTED_PREFIX}{project}"), Some(&at_ms.to_string()))
+    /// A turn window and the durable replay position advance in one commit.
+    /// Failed persistence therefore leaves the source event eligible to retry.
+    pub(crate) fn record_capture_event(
+        &self,
+        event: &super::capture::TurnEvent,
+        facts: &super::capture::AgentFacts,
+        checkpoint: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(checkpoint) = checkpoint {
+            let known: Option<String> = tx.query_row("SELECT value FROM meta WHERE key = ?1", [super::capture::REPLAY_CURSOR_KEY], |row| row.get(0)).optional()?;
+            if known.as_deref() == Some(checkpoint) { return Ok(None); }
+        }
+        let mut project = None;
+        let main_thread = !matches!((&event.thread_id, &facts.thread_id), (Some(thread), Some(main)) if thread != main);
+        if main_thread {
+            if event.started {
+                if let Some(project) = &facts.project {
+                    Self::window_started_in(&tx, &TurnWindow {
+                        session_id: event.session.clone(), turn_id: event.turn_id.clone(),
+                        project_id: Some(project.clone()), display_name: facts.display_name.clone(),
+                        ask_id: facts.ask_id.clone(), runtime_generation: Some(event.runtime_generation).filter(|generation| *generation > 0),
+                        profile: facts.profile.clone(), model: facts.model.clone(), started_at_ms: event.at_ms, ended_at_ms: None,
+                    })?;
+                }
+            } else {
+                project = Self::window_ended_in(&tx, &event.session, event.at_ms)?.or_else(|| facts.project.clone());
+                if let Some(project) = &project {
+                    tx.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)", params![format!("{CAPTURE_REQUESTED_PREFIX}{project}"), event.at_ms.to_string()])?;
+                }
+            }
+        }
+        if let Some(checkpoint) = checkpoint {
+            tx.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)", params![super::capture::REPLAY_CURSOR_KEY, checkpoint])?;
+        }
+        tx.commit()?;
+        Ok(project)
     }
 
     /// Bounded recovery of scan requests after the in-memory scan queue fills.
@@ -982,6 +1126,26 @@ impl ArtifactStore {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn capture_cursor_failure_rolls_back_the_turn_window() {
+        let (store, root) = temp_store("capture-cursor-atomic");
+        let connection = store.connection().unwrap();
+        connection.execute_batch("CREATE TRIGGER refuse_capture_cursor BEFORE INSERT ON meta WHEN NEW.key = 'captureEventCursor' BEGIN SELECT RAISE(FAIL, 'test cursor failure'); END;").unwrap();
+        let event = super::super::capture::TurnEvent { session: "s".into(), runtime_generation: 1, started: true, turn_id: Some("t".into()), thread_id: None, at_ms: 100 };
+        let facts = super::super::capture::AgentFacts { project: Some("p".into()), ..Default::default() };
+        assert!(store.record_capture_event(&event, &facts, Some("checkpoint")).is_err());
+        assert!(store.project_windows("p", 0).unwrap().is_empty());
+        assert_eq!(store.meta(super::super::capture::REPLAY_CURSOR_KEY).unwrap(), None);
+        connection.execute_batch("DROP TRIGGER refuse_capture_cursor").unwrap();
+        store.record_capture_event(&event, &facts, Some("checkpoint")).unwrap();
+        store.record_capture_event(&event, &facts, Some("checkpoint")).unwrap();
+        let windows = store.project_windows("p", 0).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert!(windows[0].ended_at_ms.is_none(), "replaying a committed start must not close and reopen it");
+        drop(connection);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     pub fn temp_store(label: &str) -> (ArtifactStore, PathBuf) {
         let dir = std::env::temp_dir().join(format!("cutex-artifacts-{label}-{}", uuid::Uuid::new_v4().simple()));
         (ArtifactStore::at(&dir), dir)
@@ -1005,6 +1169,44 @@ pub(crate) mod tests {
             producer,
             git: None,
         }
+    }
+
+    #[test]
+    fn delayed_blob_cleanup_preserves_a_newly_committed_reference() {
+        let (store, dir) = temp_store("delayed-cleanup");
+        let scope = Scope::project("project");
+        let sha = crate::asks::sha256_hex(b"shared bytes");
+        let first = store.publish(blob(&scope, "old.md", "shared bytes", agent("cutex.a")), u64::MAX, Utc::now()).unwrap();
+        let mut connection = store.connection().unwrap();
+        // Pause deletion after its metadata commit, before physical cleanup.
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        tx.execute("DELETE FROM artifact_versions WHERE artifact_id = ?1", [&first.artifact.artifact_id]).unwrap();
+        tx.execute("DELETE FROM artifacts WHERE artifact_id = ?1", [&first.artifact.artifact_id]).unwrap();
+        tx.commit().unwrap();
+        let next = store.publish(blob(&scope, "new.md", "shared bytes", agent("cutex.b")), u64::MAX, Utc::now()).unwrap();
+        store.remove_unreferenced_blobs(&mut connection, &[sha.clone()]).unwrap();
+        assert!(store.get(&next.artifact.artifact_id).unwrap().is_some());
+        assert_eq!(store.read_blob(&sha).unwrap(), b"shared bytes");
+        drop(connection);
+        store.delete(&next.artifact.artifact_id).unwrap();
+        assert!(!store.blob_path(&sha).exists(), "unreferenced bytes are still removed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_publish_rolls_back_metadata_and_cleans_only_unreferenced_bytes() {
+        let (store, dir) = temp_store("failed-publish");
+        let connection = store.connection().unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_version BEFORE INSERT ON artifact_versions BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+        let sha = crate::asks::sha256_hex(b"new bytes");
+        assert!(store.publish(blob(&Scope::project("project"), "failed.md", "new bytes", agent("cutex.a")), u64::MAX, Utc::now()).is_err());
+        assert_eq!(store.usage().unwrap().artifacts, 0);
+        assert!(!store.blob_path(&sha).exists());
+        connection.execute_batch("DROP TRIGGER reject_version").unwrap();
+        store.publish(blob(&Scope::project("project"), "retry.md", "new bytes", agent("cutex.a")), u64::MAX, Utc::now()).unwrap();
+        assert_eq!(store.read_blob(&sha).unwrap(), b"new bytes");
+        drop(connection);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1122,6 +1324,52 @@ pub(crate) mod tests {
         assert!(matches!(store.list(&ListFilter { cursor: Some("junk".into()), ..all }), Err(StoreError::Invalid(_))));
         assert!(store.explicit_has_sha(&project, &crate::asks::sha256_hex(b"12345")).unwrap());
         assert!(!store.explicit_has_sha(&Scope::project("proj-b"), &crate::asks::sha256_hex(b"12345")).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn library_filters_and_sorted_pages_cover_whole_library() {
+        let (store, dir) = temp_store("library");
+        let scope = Scope::project("p");
+        let now = Utc::now();
+        let auto = Producer { kind: "auto".into(), session_id: Some("cutex.a".into()), ..Producer::default() };
+        for (index, name) in ["z.md", "a.md", "m.md", "b.md", "c.md"].iter().enumerate() {
+            store.publish(blob(&scope, name, name, auto.clone()), u64::MAX, now + chrono::Duration::seconds(index as i64)).unwrap();
+        }
+        // Latest publisher differs from the historical producer.
+        store.publish(blob(&scope, "a.md", "final", agent("cutex.b")), u64::MAX, now + chrono::Duration::seconds(6)).unwrap();
+        store.publish(blob(&scope, "owner.md", "owner", Producer::owner()), u64::MAX, now).unwrap();
+        let published = ListFilter { source: Some("published".into()), sort: Some("name".into()), limit: 1, ..ListFilter::default() };
+        let (first, next) = store.list(&published).unwrap();
+        assert_eq!(first[0].name, "a.md");
+        let (second, end) = store.list(&ListFilter { cursor: next.clone(), ..published.clone() }).unwrap();
+        assert_eq!(second[0].name, "owner.md");
+        assert!(end.is_none());
+        assert!(store.list(&ListFilter { cursor: next, sort: Some("kind".into()), ..published.clone() }).is_err());
+        let names = |filter: ListFilter| store.list(&filter).unwrap().0.into_iter().map(|a| a.name).collect::<Vec<_>>();
+        assert_eq!(names(ListFilter { publisher: Some("cutex.a".into()), source: Some("published".into()), limit: 50, ..ListFilter::default() }), Vec::<String>::new());
+        assert_eq!(names(ListFilter { publisher: Some("cutex.b".into()), limit: 50, ..ListFilter::default() }), vec!["a.md"]);
+        assert_eq!(names(ListFilter { publisher: Some("owner".into()), limit: 50, ..ListFilter::default() }), vec!["owner.md"]);
+        assert_eq!(names(ListFilter { producer: Some("cutex.a".into()), source: Some("published".into()), limit: 50, ..ListFilter::default() }), vec!["a.md"]);
+        for sort in ["updated", "name", "publisher", "kind"] {
+            for order in ["asc", "desc"] {
+                let filter = ListFilter { sort: Some(sort.into()), order: Some(order.into()), source: Some("collected".into()), limit: 2, ..ListFilter::default() };
+                let expected = names(ListFilter { limit: 100, ..filter.clone() });
+                let mut actual = Vec::new();
+                let mut page_filter = filter;
+                loop {
+                    let (page, cursor) = store.list(&page_filter).unwrap();
+                    actual.extend(page.into_iter().map(|a| a.name));
+                    if cursor.is_none() { break; }
+                    page_filter.cursor = cursor;
+                }
+                assert_eq!(actual, expected, "{sort}/{order}");
+                assert_eq!(actual.len(), 4);
+            }
+        }
+        for filter in [ListFilter { source: Some("oops".into()), ..ListFilter::default() }, ListFilter { sort: Some("oops".into()), ..ListFilter::default() }, ListFilter { order: Some("oops".into()), ..ListFilter::default() }] {
+            assert!(store.list(&filter).is_err());
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

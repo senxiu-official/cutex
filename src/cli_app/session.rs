@@ -9,6 +9,11 @@ use cutex::session::projection::CutexSessionListFilter;
 
 pub(crate) fn run_command(command: SessionCommand) -> anyhow::Result<()> {
     match command {
+        SessionCommand::ReapprovePaths { id } => {
+            let value = super::management_control_plane::ManagementControlClient::connect()?.reapprove_paths(&id)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
         SessionCommand::Stock {
             request,
             management_url,

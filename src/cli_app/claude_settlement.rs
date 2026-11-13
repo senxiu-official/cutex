@@ -279,7 +279,8 @@ fn collect_read_binding_with_deadline_qualified(
 }
 
 fn eligible(snapshot: &AgentBusMessageSnapshot, envelope: &Envelope) -> bool {
-    snapshot.message_id == envelope.message.id
+    snapshot.external_input.as_ref() == Some(envelope)
+        && cutex::management::v2::agent_bus_state::native_id_matches_source(&snapshot.message_id, &envelope.message.id)
         && snapshot.to_cutex_session_id == envelope.owner_id
         && matches!(snapshot.state.as_str(), "pending" | "inbox_accepted")
         && snapshot.a4_receipt.is_none()
@@ -1598,6 +1599,23 @@ mod tests {
                 || Ok(()),
             ));
         }
+    }
+
+    #[test]
+    fn retry_native_attempt_preserves_source_identity_and_rejects_prior_snapshot() {
+        let f = Fixture::new(false, "failed", false);
+        let mut retried = f.e.clone();
+        retried.message.id = format!("bus-retry:11111111111141118111111111111111:{}", f.e.message.id);
+        retried.semantic_sha256 = retried.digest();
+        let snapshot: AgentBusMessageSnapshot = serde_json::from_value(json!({
+            "messageId":f.e.message.id,"toCutexSessionId":f.e.owner_id,"deliveryMode":"after-turn",
+            "content":f.e.message.text,"state":"inbox_accepted","externalInput":retried
+        })).unwrap();
+        assert!(eligible(&snapshot,&retried));
+        assert!(!eligible(&snapshot,&f.e));
+        let mut other = snapshot.clone();
+        other.message_id = "unrelated".into();
+        assert!(!eligible(&other,&retried));
     }
 
     #[test]

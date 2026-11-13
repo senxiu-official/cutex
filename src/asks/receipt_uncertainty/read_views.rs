@@ -98,7 +98,7 @@ fn terminal_bound(input: &ReceiptReadInput) -> Option<TerminalEvidence> {
     if envelope.message.source.kind != SourceKind::Agent
         || envelope.message.event_type != "agent_message"
         || envelope.message.delivery == Delivery::Passive
-        || snapshot.message_id != envelope.message.id
+        || !crate::management::v2::agent_bus_state::native_id_matches_source(&snapshot.message_id, &envelope.message.id)
         || snapshot.to_cutex_session_id != envelope.owner_id
         || evidence.message_id != envelope.message.id
         || evidence.recipient_id != envelope.owner_id

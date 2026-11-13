@@ -112,6 +112,7 @@ pub fn compute_health(
     match process {
         ProcessFacts::Down => ServiceHealth::Stopped,
         ProcessFacts::RestartPending => ServiceHealth::Unreachable,
+        ProcessFacts::Running { .. } if runtime == ServiceRuntime::Worker => ServiceHealth::Reachable,
         ProcessFacts::Running { .. } if probe_ok => ServiceHealth::Reachable,
         ProcessFacts::Running {
             since_spawn,

@@ -41,6 +41,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum CommandKind {
+    /// Browse and download Baidu Pan through the local daemon (agent context)
+    Pan {
+        #[command(subcommand)]
+        command: PanCommand,
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Schedule, list or cancel durable one-shot Agent messages
     Alarm {
         #[command(subcommand)]
@@ -511,6 +518,8 @@ pub enum UsageResetWindowArg {
 
 #[derive(Subcommand, Debug)]
 pub enum SessionCommand {
+    /// Reapprove the current resolved folders of an agent-created session (owner only)
+    ReapprovePaths { id: String },
     /// Private Linux stock-U opt-in: submit an explicit root-Human review/action JSON file
     Stock {
         #[arg(long)]
@@ -1631,6 +1640,9 @@ pub enum HumanCommand {
         fix: bool,
         #[arg(long, requires = "fix")]
         yes: bool,
+        /// Apply only this exact health finding from a previous --check.
+        #[arg(long, requires = "fix")]
+        finding_id: Option<String>,
     },
     /// Create a persistent native agent without sending a model prompt
     New {
@@ -2452,3 +2464,16 @@ mod relay_args_tests {
 
 #[derive(Debug,clap::Subcommand)]
 pub enum RelayPairingCommand {On,Off,Status}
+
+
+#[derive(Subcommand, Debug)]
+pub enum PanCommand {
+    Ls { #[arg(default_value = "/")] dir: String },
+    Search { key: String, #[arg(long, default_value = "/")] dir: String },
+    Meta { remote: String },
+    Download { remote: String, local_dir: std::path::PathBuf, #[arg(long)] request_id: Option<String> },
+    Status { id: Option<String> },
+    Pause { id: String },
+    Resume { id: String },
+    Cancel { id: String },
+}

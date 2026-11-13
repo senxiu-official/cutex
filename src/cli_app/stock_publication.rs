@@ -373,7 +373,8 @@ mod tests {
         let evidence: serde_json::Value = loop {
             let mut line = String::new();
             assert!(output.read_line(&mut line).unwrap() > 0);
-            if let Some(json) = line.strip_prefix("PUBLICATION ") {
+            // Serial libtest prints `test <name> ... ` on this same line.
+            if let Some((_, json)) = line.split_once("PUBLICATION ") {
                 break serde_json::from_str(json).unwrap();
             }
         };

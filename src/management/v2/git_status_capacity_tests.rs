@@ -75,6 +75,10 @@ fn git_status_cache_is_separate_for_owner_local_and_remote_and_invalidates_on_ch
     let owner = coordinator.get(key("root", true), || Ok(serde_json::json!({"lineCount":42}))).unwrap();
     let remote = coordinator.get(key("root", false), || Ok(serde_json::json!({"lineCount":null}))).unwrap();
     assert_eq!(owner["lineCount"], 42); assert!(remote["lineCount"].is_null());
+    let mut narrowed=key("root",false); narrowed.narrowed=true;
+    let narrowed=coordinator.get(narrowed,||Ok(serde_json::json!({"credentialLines":null}))).unwrap();
+    assert!(narrowed["credentialLines"].is_null());
+    assert!(narrowed.get("lineCount").is_none(),"a narrowed request must run its own filtered scan");
     coordinator.invalidate(Path::new("root"));
     let next = coordinator.get(key("root", true), || Ok(serde_json::json!({"lineCount":43}))).unwrap();
     assert_eq!(next["lineCount"], 43);

@@ -2143,6 +2143,9 @@ pub fn compaction_reminder_text(ask: &AskRecord) -> String {
         ask.title,
         ask.requester.label()
     );
+    if let Some(attempt) = ask.current_attempt() {
+        text.push_str(&render::continuation_hint(ask, attempt.n));
+    }
     // A brief without an artifact is at most 4 KiB: shown whole.
     let shown = match ask.body.text_artifact {
         Some(_) => crate::app_server::external_input::size::preview(&ask.body.text, 2048),
@@ -2175,7 +2178,7 @@ pub fn compaction_reminder_text(ask: &AskRecord) -> String {
             .render(),
         );
     }
-    text.push_str("\nYour final message in this turn is the result of this delegation.");
+    text.push_str("\nYour final message in this turn is the result of this delegation, unless you declare continuation or call delegation_await for this turn.");
     text
 }
 

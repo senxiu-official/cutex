@@ -69,7 +69,7 @@ fn native_turn_scale() {
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     while if class == WorkClass::HeavyRead {
-        HEAVY.counts() != (2, 30) || active.load(Ordering::SeqCst) != 2
+        HEAVY.counts() != (1, 31) || active.load(Ordering::SeqCst) != 1
     } else {
         active.load(Ordering::SeqCst) != 32
     } {

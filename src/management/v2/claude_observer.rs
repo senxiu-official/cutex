@@ -49,6 +49,10 @@ struct Entry {
     retry_at: Instant,
     changed_at: Instant,
     error: Option<(String, String)>,
+    registration_error: Option<String>,
+    probe_error: Option<String>,
+    probe_failures: u32,
+    probe_retry_at: Instant,
 }
 
 #[derive(Default)]
@@ -107,6 +111,10 @@ impl ObserverState {
             retry_at: now,
             changed_at: now,
             error: None,
+            registration_error: None,
+            probe_error: None,
+            probe_failures: 0,
+            probe_retry_at: now,
         });
         if !entry.active || entry.identity != identity {
             entry.identity = identity;
@@ -117,6 +125,10 @@ impl ObserverState {
             entry.retry_at = now;
             entry.changed_at = now;
             entry.error = None;
+            entry.registration_error = None;
+            entry.probe_error = None;
+            entry.probe_failures = 0;
+            entry.probe_retry_at = now;
         }
     }
 
@@ -194,11 +206,40 @@ impl ObserverState {
         }
         changed
     }
+    /// Bus presence is independent of event-stream health and retry cadence.
+    pub fn registration_result(&mut self, id: &str, identity: &RuntimeIdentity, error: Option<&str>) -> bool {
+        let Some(entry) = self.entries.get_mut(id).filter(|entry| entry.active && &entry.identity == identity) else { return false };
+        let next = error.map(str::to_owned);
+        let changed = entry.registration_error != next;
+        entry.registration_error = next;
+        changed
+    }
+    pub fn registration_pending(&self, id: &str) -> bool {
+        self.entries.get(id).is_some_and(|entry| entry.active && entry.registration_error.is_some())
+    }
+    pub fn probe_due(&self, id: &str, now: Instant) -> bool {
+        self.entries.get(id).is_some_and(|entry| entry.active && now >= entry.probe_retry_at)
+    }
+    /// Diagnostic transport backoff must never become delivery backoff.
+    pub fn probe_result(&mut self, id: &str, identity: &RuntimeIdentity, error: Option<&str>, now: Instant) -> bool {
+        let Some(entry) = self.entries.get_mut(id).filter(|entry| entry.active && &entry.identity == identity) else { return false };
+        let next = error.map(str::to_owned);
+        let changed = entry.probe_error != next;
+        entry.probe_error = next;
+        entry.probe_failures = if error.is_some() { entry.probe_failures.saturating_add(1) } else { 0 };
+        let seconds = if entry.probe_failures == 0 { 5 } else { (5u64 << entry.probe_failures.saturating_sub(1).min(6)).min(300) };
+        entry.probe_retry_at = now + Duration::from_secs(seconds);
+        changed
+    }
     pub fn snapshot(&self, now: Instant) -> Value {
         json!({"sessions": self.entries.iter().map(|(id,e)| json!({
             "cutexSessionId": id, "runtimeGeneration": e.identity.generation,
             "state": if !e.active { "inactive" } else if e.error.is_some() { "backoff" } else if e.observing { "observing" } else { "pending" },
             "attempts": e.attempts, "failures": e.failures, "consecutiveFailures": e.consecutive,
+            "registrationError": e.registration_error,
+            "probeError": e.probe_error,
+            "probeFailures": e.probe_failures,
+            "probeRetryAfterMs": e.probe_retry_at.saturating_duration_since(now).as_millis() as u64,
             "retryAfterMs": if e.active { e.retry_at.saturating_duration_since(now).as_millis() as u64 } else { 0 },
             "lastErrorStage": e.error.as_ref().map(|e| &e.0),
             "lastError": e.error.as_ref().map(|e| &e.1),
@@ -376,5 +417,35 @@ mod tests {
             state.snapshot(now)["sessions"].as_array().unwrap().len(),
             512
         );
+    }
+}
+
+#[cfg(test)]
+mod registration_occurrence_tests {
+    use super::*;
+    #[test]
+    fn occurrence_status_probe_backoff_never_becomes_delivery_backoff_or_crosses_generation() {
+        let now=Instant::now();
+        let identity=RuntimeIdentity{generation:1,pid:7,connection_id:Some("one".into())};
+        let mut state=ObserverState::default();state.activate("s",identity.clone(),now);
+        state.complete("s",&identity,None,now);
+        for _ in 0..8 { state.probe_result("s",&identity,Some("native status timed out"),now); }
+        let report=state.snapshot(now);
+        assert_eq!(report["sessions"][0]["state"],"observing");
+        assert_eq!(report["sessions"][0]["probeRetryAfterMs"],300000);
+        assert!(state.due("s",now+Duration::from_secs(5)));
+        assert!(!state.probe_due("s",now+Duration::from_secs(5)));
+        let replacement=RuntimeIdentity{generation:2,..identity.clone()};state.activate("s",replacement,now);
+        assert!(!state.probe_result("s",&identity,Some("old timed out"),now));
+        assert!(state.probe_due("s",now));assert!(state.snapshot(now)["sessions"][0]["probeError"].is_null());
+    }
+    #[test]
+    fn registration_diagnostics_do_not_gate_stream_health_or_cross_generations() {
+        let now=Instant::now();let identity=RuntimeIdentity{generation:1,pid:7,connection_id:Some("one".into())};let mut state=ObserverState::default();state.activate("s",identity.clone(),now);
+        assert!(state.registration_result("s",&identity,Some("Bus unavailable")));state.complete("s",&identity,None,now);
+        let report=state.snapshot(now);assert_eq!(report["sessions"][0]["state"],"observing");assert_eq!(report["sessions"][0]["registrationError"],"Bus unavailable");
+        let replacement=RuntimeIdentity{generation:2,..identity.clone()};state.activate("s",replacement.clone(),now);
+        assert!(!state.registration_result("s",&identity,Some("stale")));assert!(!state.registration_pending("s"));
+        assert!(state.registration_result("s",&replacement,Some("pending")));assert!(state.registration_result("s",&replacement,None));assert!(!state.registration_pending("s"));
     }
 }

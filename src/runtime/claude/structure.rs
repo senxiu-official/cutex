@@ -337,7 +337,7 @@ pub fn fork_record_with_creator(
     binding.connection_id = None;
     binding.state_dir = target;
     record.claude_session = Some(binding);
-    crate::session::fork::inherit_fork_avatar(source, &mut record);
+    crate::session::fork::inherit_fork_preferences(source, &mut record);
     record.stamp_created_by_at_creation(creator.as_ref())?;
     Ok(record)
 }

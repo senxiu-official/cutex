@@ -26,6 +26,9 @@ pub const AGENT_BUS_PID_PRUNE_GRACE_SECS: u64 = 15;
 
 #[derive(Debug, Default)]
 pub struct AgentBusState {
+    /// Runtime-only, owned by this Bus process rather than an observer CLI.
+    pub claude_occurrences: HashMap<String, super::claude_occurrence::Owner>,
+    pub(crate) claude_registered: Option<fn(&Arc<Mutex<AgentBusState>>) -> anyhow::Result<usize>>,
     pub agents: HashMap<String, AgentBusAgent>,
     pub messages: HashMap<String, VecDeque<AgentBusMessage>>,
     pub recent_sends: HashMap<String, AgentBusRecentSend>,
@@ -55,6 +58,8 @@ pub fn load_agent_bus_state_from_registry() -> anyhow::Result<AgentBusState> {
         agent.last_seen_epoch_secs = now;
     }
     Ok(AgentBusState {
+        claude_occurrences: HashMap::new(),
+        claude_registered: None,
         agents: registry.agents,
         messages: HashMap::new(),
         recent_sends: HashMap::new(),

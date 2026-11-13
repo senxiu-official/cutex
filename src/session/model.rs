@@ -227,6 +227,8 @@ pub fn parse_cutex_session_quick_action_mode(
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CutexSessionStore {
+    #[serde(default)]
+    pub quick_chat_promotion_receipts: SharedOrdRows<crate::agent_management::QuickChatPromoteReceipt>,
     /// Latest proven stopped native occurrence, saved with runtime clearing.
     #[serde(default)]
     pub native_stop_receipts: SharedOrdRows<NativeStopReceipt>,
@@ -471,8 +473,14 @@ pub fn validate_session_avatar(avatar: &CutexSessionAvatar) -> Result<(), &'stat
     }
 }
 
+pub fn default_memory_injection() -> bool { true }
+pub fn is_memory_injection_default(value: &bool) -> bool { *value }
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CutexSessionRecord {
+    /// Project-memory prompt injection and idle reminders at the next launch (default true).
+    #[serde(default = "crate::session::model::default_memory_injection", rename = "memoryInjection", alias = "memory_injection", skip_serializing_if = "crate::session::model::is_memory_injection_default")]
+    pub memory_injection: bool,
     /// Stable creation operation, captured before first publication. Names,
     /// titles and cwd must never substitute for this binding in recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -537,6 +545,9 @@ pub struct CutexSessionRecord {
     /// sessions and imports; it must never be backfilled from current roles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<SessionCreatedBy>,
+    /// Resolved creation paths; owner permission/path edits explicitly refresh this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_path_snapshot: Option<crate::agent_management::creator_paths::Snapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub badge: Option<CutexSessionBadge>,
     /// When `display_name_override` / `note` / `avatar` last changed (r252),
@@ -636,6 +647,9 @@ impl CutexSessionRecord {
         if let Some(existing) = &self.created_by {
             anyhow::ensure!(existing == creator, "session creator is immutable");
         } else {
+            if matches!(creator,SessionCreatedBy::Agent{..}) {
+                self.creator_path_snapshot=Some(crate::agent_management::creator_paths::Snapshot::capture(self,false)?);
+            }
             self.created_by = Some(creator.clone());
         }
         Ok(())
@@ -686,6 +700,7 @@ impl CutexSessionRecord {
             .map(|value| normalize_codex_session_id(&value))
             .transpose()?;
         Ok(Self {
+            memory_injection: true,
             explicit_launch: None,
             creation_action: crate::session::creation_identity::current_action(),
             claude_session: None,
@@ -707,6 +722,7 @@ impl CutexSessionRecord {
             avatar: None,
             avatar_mode: None,
             created_by: None,
+            creator_path_snapshot: None,
             badge: None,
             metadata_changes: Some(CutexSessionMetadataChanges::since(
                 default_durable_session_revision(),
@@ -1187,5 +1203,40 @@ mod created_by_tests {
         crate::session::fork::inherit_fork_avatar(&source,&mut fork);
         assert_eq!(fork.created_by,Some(SessionCreatedBy::Owner),"new fork's creator is the action actor, never its source's creator");
         assert_eq!(source.created_by,Some(director()));
+    }
+}
+
+
+#[cfg(test)]
+mod memory_injection_switch_tests {
+    use super::*;
+    #[test]
+    fn memory_injection_legacy_defaults_true_and_false_survives_storage_and_fork() {
+        let original = CutexSessionRecord::from_codex_session_id("memory-migration").unwrap();
+        let legacy = serde_json::to_value(&original).unwrap();
+        assert!(legacy.get("memoryInjection").is_none());
+        let mut migrated: CutexSessionRecord = serde_json::from_value(legacy).unwrap();
+        assert!(migrated.memory_injection);
+        migrated.memory_injection = false;
+        let serialized = serde_json::to_value(&migrated).unwrap();
+        assert_eq!(serialized["memoryInjection"],false);
+        let mut fork = original;
+        crate::session::fork::inherit_fork_preferences(&migrated,&mut fork);
+        assert!(!fork.memory_injection);
+        for profile in [Some("source"),Some("other"),None] {
+            fork.profile=profile.map(str::to_string);
+            crate::session::fork::inherit_fork_preferences(&migrated,&mut fork);
+            assert!(!fork.memory_injection);
+            assert_eq!(fork.profile.as_deref(),profile);
+        }
+        let root = std::env::temp_dir().join(format!("memory-migration-{}",uuid::Uuid::new_v4()));
+        let path = root.join("cutex-sessions.json");
+        let mut store = CutexSessionStore::default();
+        store.sessions.insert(migrated.cutex_session_id.clone(),migrated.clone());
+        crate::session::store::save_cutex_session_store_to_path(&path,&store).unwrap();
+        let reopened = crate::session::store::shared_session_row_at(&path,&migrated.cutex_session_id).unwrap().unwrap();
+        assert!(!reopened.memory_injection);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

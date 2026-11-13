@@ -73,6 +73,8 @@ pub struct HumanCreateAgentRequest {
     pub variant_id: Option<String>,
     #[serde(default)]
     pub start: bool,
+    #[serde(default = "crate::session::model::default_memory_injection", skip_serializing_if = "crate::session::model::is_memory_injection_default")]
+    pub memory_injection: bool,
     /// Optional per-thread launch overrides (sandbox, approval, network,
     /// writable roots, model, effort); absent fields use the agent defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -326,6 +328,20 @@ pub(super) fn run_idempotent_create(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn memory_injection_human_create_defaults_true_and_parses_false_strictly() {
+        assert!(request(json!({"requestId":"memory-on","name":"reviewer"})).unwrap().memory_injection);
+        let off=request(json!({"requestId":"memory-off","name":"reviewer","memoryInjection":false})).unwrap();
+        off.validate().unwrap();
+        assert!(!off.memory_injection);
+        assert_eq!(serde_json::to_value(off).unwrap()["memoryInjection"],false);
+        for value in [Value::Null,json!("false"),json!(0)] {
+            assert!(request(json!({"requestId":"memory-invalid","name":"reviewer","memoryInjection":value})).is_err());
+        }
+    }
+
+
     use super::*;
 
     fn request(value: Value) -> Result<HumanCreateAgentRequest, serde_json::Error> {

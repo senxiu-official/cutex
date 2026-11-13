@@ -326,6 +326,7 @@ pub fn start(id: &str) -> anyhow::Result<CutexSessionRecord> {
         .context("DSH session missing")?
         .clone();
     let session = record.dsh_session.as_ref().context("not a DSH session")?;
+    crate::agent_management::creator_paths::before_start(&record)?;
     let flavor = session.flavor;
     match flavor {
         AcpFlavor::Dsh => require_session(&record)?,

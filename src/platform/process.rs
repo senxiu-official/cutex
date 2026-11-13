@@ -465,6 +465,26 @@ $known | Sort-Object
     Ok(pids)
 }
 
+/// Direct, tri-state liveness for authority/lifecycle decisions. `None` is
+/// uncertainty, never proof of death. In particular this never spawns tasklist.
+pub fn process_liveness(pid: u32) -> Option<bool> {
+    if pid == 0 { return Some(false); }
+    #[cfg(windows)]
+    { windows_process_is_running_without_tasklist(pid) }
+    #[cfg(unix)]
+    {
+        if pid > i32::MAX as u32 { return Some(false); }
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 { return Some(true); }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(false),
+            Some(libc::EPERM) => Some(true),
+            _ => None,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    { None }
+}
+
 pub fn process_is_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -887,5 +907,16 @@ time.sleep(600)\n";
             assert!(family.contains(&pid));
         }
         assert!(!family.contains(&200));
+    }
+}
+
+#[cfg(test)]
+mod occurrence_liveness_tests {
+    use super::*;
+    #[test]
+    fn occurrence_direct_liveness_keeps_query_errors_unknown_without_tasklist() {
+        assert_eq!(process_liveness(std::process::id()),Some(true));assert_eq!(process_liveness(0),Some(false));
+        assert_eq!(open_process_failure_liveness(87),Some(false));
+        assert_eq!(open_process_failure_liveness(5),None);assert_eq!(open_process_failure_liveness(8),None);
     }
 }

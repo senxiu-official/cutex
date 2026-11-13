@@ -111,11 +111,25 @@ pub fn validate_target(target: &str) -> anyhow::Result<()> {
     rollback_target(target).map(|_| ())
 }
 
+/// None of this module's supported predecessor readers knows runtime=worker.
+/// Keep the registry intact rather than letting an older daemon reject it or
+/// a compatibility export silently discard an owner's background service.
+pub(super) fn preflight_worker_services(home: &Path) -> anyhow::Result<()> {
+    let store = crate::services::store::ServiceStore::new(home.join("services"), "rollback-preflight");
+    let registry = store.load().map_err(|e| anyhow::anyhow!(e.message))?;
+    anyhow::ensure!(
+        !registry.services.values().any(|record| record.runtime == crate::services::ServiceRuntime::Worker),
+        "the rollback target cannot read worker services; keep the current build or explicitly remove the worker registrations first (their data is retained)"
+    );
+    Ok(())
+}
+
 /// Read-only proof that every compatibility conversion can safely start.
 /// Standalone rollback export calls this before creating its backup tree;
 /// the stopped-writer prepare/export path repeats it immediately before any
 /// compatibility mutation.
 pub fn preflight(home: &Path, target: &str) -> anyhow::Result<()> {
+    preflight_worker_services(home)?;
     // No existing target reads the SQLite roster (058 S4): its R1 export runs first.
     crate::agent_management::ensure_roster_legacy_authoritative(&home.join("runtime/agent-management/v1"))?;
     if rollback_target(target)?.reads_current_stores() { return Ok(()); }
@@ -355,6 +369,7 @@ fn preflight_r260_state(home: &Path, target: &str) -> anyhow::Result<()> {
 
 /// `target`: the release label the rollback switches to.
 pub fn prepare(home: &Path, displaced: &Path, target: &str) -> anyhow::Result<Vec<String>> {
+    preflight_worker_services(home)?;
     let target_capabilities = rollback_target(target)?;
     if target_capabilities.reads_current_stores() { return Ok(Vec::new()); }
     preflight(home, target)?;
@@ -373,6 +388,7 @@ pub fn prepare(home: &Path, displaced: &Path, target: &str) -> anyhow::Result<Ve
 /// rollback runner calls this only after it has stopped the services; the
 /// standalone CLI requires the same condition to be acknowledged explicitly.
 pub fn export_hot_stores(home: &Path, target: &str, daemon_stopped: bool) -> anyhow::Result<Vec<String>> {
+    preflight_worker_services(home)?;
     if rollback_target(target)?.reads_current_stores() { return Ok(Vec::new()); }
     anyhow::ensure!(daemon_stopped, "stop cutex services, then repeat with --daemon-stopped");
     preflight(home, target)?;

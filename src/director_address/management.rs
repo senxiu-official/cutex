@@ -1735,6 +1735,7 @@ pub(crate) mod tests {
             cutex_session_id: sid(id),
             native_session_id: format!("native-{id}"),
             spec: ManagedAgentSpec {
+                memory_injection: true,
                 name: id.into(),
                 cwd: "D:\\work".into(),
                 profile: Some("p".into()),
@@ -2445,6 +2446,7 @@ pub(crate) mod tests {
                 display_name: "P1".into(),
                 badge_label: "P".into(),
                 color: crate::agent_management::ProjectPaletteColor::Green,
+                icon: None,
             },
             workspace_root: None,
             director_cutex_session_id: Some(sid("a")),
@@ -2510,6 +2512,7 @@ pub(crate) mod tests {
                 display_name: "P1".into(),
                 badge_label: "P".into(),
                 color: crate::agent_management::ProjectPaletteColor::Green,
+                icon: None,
             },
             workspace_root: None,
             director_cutex_session_id: Some(sid("a")),

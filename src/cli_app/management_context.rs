@@ -31,6 +31,7 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
     ManagementRequestContext {
         explicit_launch_action,
         adopt_saved_native,
+        promote_quick_chat,
         review_agent_archive,
         execute_agent_archive,
         owner_archive_action: super::management_archive::api::owner,
@@ -370,6 +371,9 @@ fn explicit_launch_action(
         _ => operation(),
     };
     result.map_err(|e| {
+        if let Some(id) = cutex::agent_management::creator_paths::changed_session_id(&e) {
+            return cutex::agent_management::AgentManagementError::CreatorPathsChanged(id.to_string());
+        }
         if let Some(cutex::agent_management::AgentManagementError::HostBusy(message)) =
             e.downcast_ref::<cutex::agent_management::AgentManagementError>()
         {
@@ -635,6 +639,14 @@ fn durable_agent_candidates(
             });
     }
     Ok(candidates)
+}
+
+fn promote_quick_chat(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    session: &str, request: &cutex::agent_management::QuickChatPromoteRequest,
+) -> anyhow::Result<cutex::agent_management::QuickChatPromoteResult> {
+    let path = cutex::session::store::cutex_sessions_path()?;
+    management_agent_provider()?.promote_quick_chat(principal, &path, session, request)
 }
 
 fn import_durable_agent(
@@ -1119,6 +1131,7 @@ fn create_human_agent_bound(
                 .sessions
                 .get(id)
                 .map(|record| CutexSessionRecordSnapshot {
+                    memory_injection: record.memory_injection,
                     revision: record.durable_revision(),
                     exposed: record.exposed_to_backend,
                     profile: record.profile.clone(),
@@ -1183,6 +1196,13 @@ fn create_human_agent_bound(
             },
         )
         .map_err(|error| incomplete("project membership", error.to_string()))?;
+    }
+
+    let snapshot = current(&id).map_err(|error| incomplete("memory injection", error))?;
+    if snapshot.memory_injection != request.memory_injection {
+        mutate_management_v2_session(&id, "cutex/session/defaults/update",
+            serde_json::json!({"expectedRevision":snapshot.revision,"patch":{"memoryInjection":request.memory_injection}}))
+            .map_err(|error| incomplete("memory injection", error.message))?;
     }
 
     // 6. Optional start (same path as `cutex human start` via Management).
@@ -1330,6 +1350,7 @@ fn create_human_session(
                 .sessions
                 .get(id)
                 .map(|record| CutexSessionRecordSnapshot {
+                    memory_injection: record.memory_injection,
                     revision: record.durable_revision(),
                     exposed: record.exposed_to_backend,
                     profile: record.profile.clone(),
@@ -1399,6 +1420,7 @@ fn create_human_session(
 }
 
 struct CutexSessionRecordSnapshot {
+    memory_injection: bool,
     revision: u64,
     exposed: bool,
     profile: Option<String>,
@@ -1737,7 +1759,7 @@ fn guard_dsh_session_mutation(
             // runtime's stored defaults. Reject unknown fields too, rather
             // than reporting success for a setting the DSH launcher ignores.
             let fields: Vec<&str> = patch.keys().map(String::as_str)
-                .filter(|field| !matches!(*field, "groups" | "sandboxMode" | "approvalPolicy" | "permissions")).collect();
+                .filter(|field| !matches!(*field, "groups" | "sandboxMode" | "approvalPolicy" | "permissions" | "memoryInjection")).collect();
             if fields.is_empty() { return Ok(()); }
             let mut error = unsupported("sessionDefaults", "DSH runtime, model and reasoning effort are fixed at creation");
             error.details["fields"] = serde_json::json!(fields);
@@ -1940,6 +1962,9 @@ fn apply_management_v2_session_mutation(
                 record.runtime_backend = parse_cutex_session_runtime_backend(backend)
                     .map_err(session_mutation_invalid_error)?;
             }
+            if let Some(value) = patch.get("memoryInjection") {
+                record.memory_injection = value.as_bool().ok_or_else(|| session_mutation_invalid("memoryInjection must be a boolean"))?;
+            }
             apply_optional_string(patch, "managedCwd", &mut record.managed_cwd)?;
             apply_optional_string(patch, "permissions", &mut record.permission_defaults)?;
             apply_optional_string(patch, "approvalPolicy", &mut record.approval_policy)?;
@@ -1983,6 +2008,11 @@ fn apply_management_v2_session_mutation(
                     claude.allow_exec = value;
                     claude.exec_explicit = true;
                 }
+            }
+            if ["managedCwd","permissions","approvalPolicy","sandboxMode","claudeAllowWrite","claudeAllowExec"]
+                .iter().any(|key|patch.contains_key(*key))
+                && cutex::management::users::current_principal().is_some_and(|principal|principal.is_owner()) {
+                cutex::agent_management::creator_paths::owner_reapprove(record).map_err(session_mutation_invalid_error)?;
             }
             serde_json::json!({})
         }
@@ -3293,6 +3323,13 @@ fn launch_profile_not_applied(
 fn runtime_mutation_error(
     error: anyhow::Error,
 ) -> cutex::management::v2::user_input::UserInputExecutionError {
+    if let Some(id) = cutex::agent_management::creator_paths::changed_session_id(&error) {
+        return cutex::management::v2::user_input::UserInputExecutionError {
+            stage: "runtime".into(), code: "creator_paths_changed".into(), message: format!("{error:#}"),
+            retryable: false, details: serde_json::json!({"cutexSessionId":id}), outcome_unknown: false,
+        };
+    }
+
     // r271: the launch claim check met a busy host fence under the lane;
     // r271.1: a fence-first start/review stayed busy for its budget.
     if cutex::asks::pause_admission::is_deferred(&error)
@@ -3468,6 +3505,13 @@ fn session_mutation_invalid(
 fn session_mutation_invalid_error(
     error: anyhow::Error,
 ) -> cutex::management::v2::user_input::UserInputExecutionError {
+    if let Some(id) = cutex::agent_management::creator_paths::changed_session_id(&error) {
+        return cutex::management::v2::user_input::UserInputExecutionError {
+            stage: "runtime".into(), code: "creator_paths_changed".into(), message: format!("{error:#}"),
+            retryable: false, details: serde_json::json!({"cutexSessionId":id}), outcome_unknown: false,
+        };
+    }
+
     session_mutation_invalid(&format!("{error:#}"))
 }
 
@@ -3729,6 +3773,44 @@ pub(crate) fn load_app_server_runtime_status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn creator_path_errors_keep_code_and_session_through_runtime_context() {
+        for mapper in [super::runtime_mutation_error, super::session_mutation_invalid_error] {
+            let error: anyhow::Error = cutex::agent_management::AgentManagementError::CreatorPathsChanged("cutex.changed".into()).into();
+            let error = mapper(error.context("start child runtime"));
+            assert_eq!(error.code, "creator_paths_changed");
+            assert_eq!(error.details["cutexSessionId"], "cutex.changed");
+            assert!(!error.retryable);
+        }
+    }
+
+
+    #[test]
+    fn memory_injection_defaults_update_persists_without_restarting_all_runtime_families() {
+        let _home = super::super::test_home::IsolatedTestHome::new("memory-injection-update").unwrap();
+        for backend in [CutexSessionRuntimeBackend::Host, CutexSessionRuntimeBackend::ClaudeSubscription,
+            CutexSessionRuntimeBackend::Dsh, CutexSessionRuntimeBackend::Kimi] {
+            let id=format!("cutex.{}",uuid::Uuid::new_v4());
+            let mut record=CutexSessionRecord::new(id.clone(),None,"test".into(),std::env::temp_dir().to_string_lossy().into_owned(),None).unwrap();
+            record.runtime_backend=backend;
+            record.runtime_generation=42;
+            let mut store=load_cutex_session_store().unwrap();
+            store.sessions.insert(id.clone(),record.clone());
+            cutex::session::store::save_cutex_session_store(&store).unwrap();
+            let revision=record.revision;
+            mutate_management_v2_session(&id,"cutex/session/defaults/update",serde_json::json!({"expectedRevision":revision,"patch":{"memoryInjection":false}})).unwrap();
+            let saved=cutex::session::store::shared_session_row(&id).unwrap().unwrap();
+            assert!(!saved.memory_injection);
+            assert_eq!(saved.runtime_generation,42);
+            assert_eq!(saved.runtime_backend,backend);
+            assert!(mutate_management_v2_session(&id,"cutex/session/defaults/update",serde_json::json!({"expectedRevision":revision,"patch":{"memoryInjection":true}})).is_err());
+            assert!(mutate_management_v2_session(&id,"cutex/session/defaults/update",serde_json::json!({"patch":{"memoryInjection":null}})).is_err());
+            mutate_management_v2_session(&id,"cutex/session/defaults/update",serde_json::json!({"expectedRevision":saved.revision,"patch":{"memoryInjection":true}})).unwrap();
+            assert!(cutex::session::store::shared_session_row(&id).unwrap().unwrap().memory_injection);
+        }
+    }
+
+
     /// r271.1: a dead start intent the record does not carry as a claim
     /// (`Prepared`, crashed before claiming) never makes ReviewRuntime wait or
     /// fail under fence contention: the claim check answers at once, the

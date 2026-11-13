@@ -207,6 +207,13 @@ pub fn managed_within_envelope(
     record: &crate::session::model::CutexSessionRecord,
     live_settings: Option<&Value>,
 ) -> bool {
+    // Disabling command execution is authority, even when the composer preset
+    // still says full access. A supervised process must then ask the owner.
+    if !crate::agent_management::envelope::effective_tool_permissions(record)
+        .is_ok_and(|(_, exec)| exec)
+    {
+        return false;
+    }
     match live_settings {
         Some(settings) => crate::browser_relay::owner::full_access(record, Some(settings)),
         None => PermissionEnvelope::from_record(record)
@@ -670,7 +677,7 @@ pub fn handle_with_policy(
                 Err(error) => return parse_error(error),
             };
             let managed = request.runtime.as_deref().and_then(ServiceRuntime::parse)
-                == Some(ServiceRuntime::Managed);
+                .is_some_and(ServiceRuntime::supervised);
             let registry = match store.load() {
                 Ok(registry) => registry,
                 Err(error) => return rejected(error),
@@ -780,7 +787,7 @@ pub fn handle_with_policy(
                 // the caller's own identical service changes nothing.
                 let existing = registry.services.get(&request.slug).cloned();
                 let skip = existing.is_some_and(|existing| {
-                    existing.runtime == ServiceRuntime::Managed
+                    existing.runtime.supervised()
                             && existing.command == request.command
                             && existing.cwd == request.cwd
                             && request.env.clone().unwrap_or_default() == existing.env
@@ -810,7 +817,7 @@ pub fn handle_with_policy(
                         &record,
                         service_view(&record, state.get(&record.slug)),
                     );
-                    let mut result = json!({"ok": true, "created": created, "service": view, "link": super::store::service_link(&record)});
+                    let mut result = json!({"ok": true, "created": created, "service": view, "link": view["link"]});
                     if reveal {
                         result["reveal"] = json!(super::reveal::request(&record, cutex_session_id));
                     }
@@ -864,7 +871,7 @@ pub fn handle_with_policy(
                 if downgrade {
                     if let Err(refusal) = pass(project_release_gate(
                         policy, caller, &existing, "update", &patch,
-                        preview.runtime == ServiceRuntime::Managed && changes_process,
+                        preview.runtime.supervised() && changes_process,
                         root_review.as_ref(),
                     ), &mut notes) {
                         return refusal;
@@ -877,7 +884,7 @@ pub fn handle_with_policy(
                         "update",
                         &slug,
                         &patch,
-                        runtime == Some(ServiceRuntime::Managed) && changes_process,
+                        runtime.is_some_and(ServiceRuntime::supervised) && changes_process,
                         root_review.as_ref(),
                     ), &mut notes) {
                         return refusal;
@@ -889,7 +896,7 @@ pub fn handle_with_policy(
                         return refusal;
                     }
                 }
-                if runtime == Some(ServiceRuntime::Managed) && changes_process && !needs_lifetime && !downgrade {
+                if runtime.is_some_and(ServiceRuntime::supervised) && changes_process && !needs_lifetime && !downgrade {
                     if let Err(refusal) = pass(managed_gate(
                         policy,
                         caller,
@@ -1535,6 +1542,36 @@ mod tests {
         record.sandbox_mode = None;
         record.approval_policy = None;
         assert!(!managed_within_envelope(&record, None));
+    }
+
+    #[test]
+    fn claude_without_command_tools_cannot_register_services_without_owner_approval() {
+        let mut record = crate::session::model::CutexSessionRecord::new(
+            S1.into(), None, "host".into(), if cfg!(windows) {"C:/work"} else {"/work"}.into(), None).unwrap();
+        record.sandbox_mode = Some("danger-full-access".into());
+        record.approval_policy = Some("never".into());
+        record.runtime_backend = crate::session::model::CutexSessionRuntimeBackend::ClaudeSubscription;
+        record.claude_session = Some(serde_json::from_value(json!({
+            "deployment":{"python":"/unused","adapter_source":"/unused","claude_cli":"/unused","claude_home":"/unused","tui_binary":"/unused"},
+            "thread_id":"thread","state_dir":"/unused","model":"sonnet","instructions":"",
+            "allow_write":true,"allow_exec":false,"write_explicit":true,"exec_explicit":true
+        })).unwrap());
+        let full = json!({"approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}});
+        for live in [None, Some(&full)] {
+            assert!(!managed_within_envelope(&record,live), "a full-access preset must not override disabled command tools");
+        }
+        record.claude_session.as_mut().unwrap().allow_exec = true;
+        assert!(managed_within_envelope(&record,None));
+        // The owner can always register a supervised service directly.
+        let dir = std::env::temp_dir().join(format!("service-tool-envelope-{}", uuid::Uuid::new_v4()));
+        let store = ServiceStore::new(&dir,"host");
+        // The desktop's owner path registers directly in the store, bypassing
+        // the agent-only policy dispatcher.
+        let made = store.register(serde_json::from_value(json!({
+            "slug":"owner-service","runtime":"managed","command":"unused"
+        })).unwrap(), &Caller::Owner).unwrap();
+        assert_eq!(made.0.slug,"owner-service");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// End to end through the live-settings file the runtime manager writes.

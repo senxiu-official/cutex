@@ -179,6 +179,57 @@ async def test_background_usage_is_added_to_the_origin_turn(ph):
     assert updates[-1]['turnId'] == run.turn and updates[-1]['tokenUsage']['total']['outputTokens'] >= entry['usage']['output_tokens']
 
 
+async def test_sdk_restarts_completed_background_spawn_with_original_binding(ph):
+    run = await replay(ph, 'default', mode='default')
+    await run.until()
+    task_id = 'aa335f43da4fb68e1'
+    call_id = 'toolu_01HfZyjifjDUHnbjVdQtNn7c'
+    tasks = run.owner.tasks
+    row = tasks.rows[task_id]
+    origin = row['_originBinding']
+    assert task_id not in run.bridge.background
+    start = {'type': 'system', 'subtype': 'task_started', 'task_id': task_id,
+             'tool_use_id': call_id, 'task_type': 'local_agent', 'is_backgrounded': True, 'uuid': 'phase-2'}
+    # Late progress, an old start, a changed call or missing background proof
+    # cannot restore tool admission for a closed child.
+    row['_startUuids'] = {'phase-1'}
+    await tasks.observe({**start, 'subtype': 'task_progress', 'status': 'running'}, 'unrelated-turn')
+    for patch in ({'uuid': 'phase-1'}, {'tool_use_id': 'other-call'}, {'is_backgrounded': False},
+                  {'uuid': None}, {'task_type': 'local_bash'}):
+        await tasks.observe({**start, **patch}, 'unrelated-turn')
+        assert task_id not in run.bridge.background and row['status'] == 'completed'
+    await tasks.observe(start, 'unrelated-turn')
+    assert row['status'] == 'running' and row['turnId'] == run.turn
+    assert run.bridge.background[task_id] == origin
+    transcript = ph.engine.subagents._row(call_id)
+    assert transcript['status'] == 'running' and transcript['completed'] is None
+    decision = await run.bridge.pre_tool({'session_id': run.owner.session_id, 'agent_id': task_id,
+                                         'tool_name': 'Read', 'tool_use_id': 'phase-2-read',
+                                         'tool_input': {'file_path': 'a.txt'}}, 'phase-2-read', {})
+    assert decision.get('hookSpecificOutput', {}).get('permissionDecision') != 'deny'
+    await tasks.observe({'type': 'system', 'subtype': 'task_notification', 'task_id': task_id,
+                         'status': 'completed', 'summary': 'second phase done'}, None)
+    assert task_id not in run.bridge.background
+    assert ph.engine.subagents._row(call_id)['status'] == 'completed'
+    assert [n['noticeId'] for n in notices(ph, run.tid)] == [task_id, f'{task_id}:run:phase-2']
+    # A duplicate of this start is stale once the second phase has ended.
+    await tasks.observe(start, None)
+    assert row['status'] == 'completed' and task_id not in run.bridge.background
+
+
+async def test_background_usage_replaces_cumulative_estimate_per_task(ph):
+    tid, turn, bridge = await begin(ph)
+    for count in (5, 8, 6):
+        await ph.engine.add_task_usage(tid, turn, 'task-x', {'output_tokens': count})
+    assert len(ph.engine.pending_task_usage[turn]) == 1
+    ph.store.finish(tid, turn, 'completed', None)
+    await ph.engine._flush_task_usage(tid, turn)
+    await ph.engine.add_task_usage(tid, turn, 'task-x', {'output_tokens': 11})
+    await ph.engine.add_task_usage(tid, turn, 'task-y', {'output_tokens': 3})
+    usage = json.loads(ph.store.db.execute('SELECT usage FROM turns WHERE id=?', (turn,)).fetchone()[0])
+    assert [(e['taskId'], e['usage']['output_tokens']) for e in usage['modelRequests']] == [('task-x', 11), ('task-y', 3)]
+
+
 async def test_background_output_comes_from_the_run_transcript(ph):
     # The stream copy of a child message carries the usage of its first blocks
     # (output_tokens as of message_start); the transcript line has the final count.
@@ -359,17 +410,61 @@ async def test_lost_in_process_when_the_claude_child_ends(ph):
     assert len(notices(ph, run.tid)) == 1
 
 
-async def test_notice_without_notification_after_grace_and_once_only(ph, monkeypatch):
+async def test_legacy_stop_without_inflight_inventory_notifies_after_grace_once_only(ph, monkeypatch):
     monkeypatch.setattr(runtime_tasks, 'NOTICE_GRACE_SECONDS', 0.05)
     run = await replay(ph, 'default', mode='bypassPermissions')
     await run.until(lambda e: e['kind'] == 'hook:SubagentStop')
-    await run.step(run.script[run.index])  # SubagentStop: completed, no summary yet
+    # Older hook responders may omit the in-flight inventory. Preserve that
+    # fallback separately from the affirmative running-task case below.
+    data = run.fix(run.script[run.index]['data'])
+    data.pop('background_tasks', None)
+    await run.bridge.subagent_stop(data, None, {})
     await until(lambda: notices(ph, run.tid))
     [notice] = notices(ph, run.tid)
     assert notice['status'] == 'completed' and notice['summary'] is None
     run.index += 1
     await run.until()  # The late task_notification adds no second notice.
     assert len(notices(ph, run.tid)) == 1
+
+
+async def test_stop_hook_keeps_a_proven_inflight_background_child_until_its_task_ends(ph, monkeypatch):
+    monkeypatch.setattr(runtime_tasks, 'NOTICE_GRACE_SECONDS', 0.05)
+    run = await replay(ph, 'default', mode='bypassPermissions')
+    await run.until(lambda e: e['kind'] == 'hook:SubagentStop')
+    data = run.fix(run.script[run.index]['data'])
+    agent = data['agent_id']
+    data['background_tasks'] = [{'id': agent, 'type': 'subagent', 'status': 'running'}]
+    assert run.bridge.binding is None and not run.bridge.accepting
+    await run.bridge.subagent_stop(data, None, {})
+    await asyncio.sleep(0.1)  # The legacy grace must not fabricate completion.
+    assert agent in run.bridge.background
+    assert run.owner.tasks.rows[agent]['status'] == 'running'
+    assert not notices(ph, run.tid)
+    # The same native child can finish its work after this stop hook. No
+    # parent turn is opened and the parent's pending input stays untouched.
+    ph.store.enqueue_note(run.tid, 'parent-only', {'source': {'kind': 'agent', 'id': 'cutex.a'},
+                          'eventType': 'agent_message', 'text': 'PARENT NOTE'}, 10)
+    late = {'session_id': run.owner.session_id, 'agent_id': agent, 'hook_event_name': 'PreToolUse',
+            'tool_name': 'Read', 'tool_input': {'file_path': '/w/a'}}
+    assert await run.bridge.pre_tool(late, 'late-child-read', {}) == {}
+    assert ph.store.pending_notes(run.tid) == 1 and run.bridge.binding is None
+    run.index += 1  # The modified hook above replaces this recorded hook.
+    await run.until()  # Actual terminal task notification, with its summary.
+    assert agent not in run.bridge.background
+    assert len(notices(ph, run.tid)) == 1
+    assert notices(ph, run.tid)[0]['status'] == 'completed'
+    assert notices(ph, run.tid)[0]['summary']
+    denied = await run.bridge.pre_tool(late, 'after-task-end', {})
+    assert denied['hookSpecificOutput']['permissionDecision'] == 'deny'
+
+
+async def test_another_inflight_task_does_not_keep_a_stopped_child_admitted(ph):
+    run = await replay(ph, 'default', mode='bypassPermissions')
+    await run.until(lambda e: e['kind'] == 'hook:SubagentStop')
+    data = run.fix(run.script[run.index]['data'])
+    data['background_tasks'] = [{'id': 'another-child', 'type': 'subagent', 'status': 'running'}]
+    await run.bridge.subagent_stop(data, None, {})
+    assert data['agent_id'] not in run.bridge.background
 
 
 async def test_background_shell_notices_are_rate_limited_and_coalesced(ph, monkeypatch):

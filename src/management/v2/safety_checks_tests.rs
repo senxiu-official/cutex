@@ -54,7 +54,7 @@ fn never_runtime(_: &SafetyBlock, _: &str, _: Value) -> Result<Value, RuntimeCal
     unreachable!("the runtime must not be called")
 }
 
-fn never_submit(_: &ValidatedCutexRequest) -> Result<Value, UserInputExecutionError> {
+fn never_submit(_: &SafetyBlock) -> Result<Value, UserInputExecutionError> {
     unreachable!("no owner input expected")
 }
 
@@ -119,23 +119,19 @@ fn grant_reaches_the_runtime_closes_the_item_and_tells_the_agent_once() {
         runtime_ok(&calls, "granted"),
         |input| {
             submitted = Some(input.clone());
-            Ok(json!({"disposition": "steered"}))
+            Ok(json!({"inputId": "alarm-approval-test"}))
         })
         .unwrap();
     let calls = calls.into_inner();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "thread/safetyCheck/grant");
-    assert_eq!(calls[0].1, json!({"threadId": "thread-1", "blockId": "sb-1", "decidedBy": {"kind": "owner"}}));
+    assert_eq!(calls[0].1, json!({"threadId": "thread-1", "blockId": "sb-1", "decidedBy": {"kind": "owner"},
+        "noticeInputId":crate::agent_bus::alarms::safety_notice_message_id(AGENT,&crate::agent_bus::alarms::safety_notice_key("sb-1"))}));
     assert_eq!(result["block"]["state"], "granted");
-    assert_eq!(result["submit"]["disposition"], "steered");
+    assert_eq!(result["notice"]["inputId"], "alarm-approval-test");
     let input = submitted.unwrap();
-    assert_eq!(input.method, "cutex/userInput/submit");
-    // Owner 2026-10-19: busy, the grant joins the running turn at its next
-    // step (`auto` steers), never 本回合结束后送达.
-    assert_eq!(input.params["strategy"], "auto", "busy: inserted at the next step");
-    assert_eq!(input.params["startIfOffline"], true);
-    assert_eq!(input.params["clientUserMessageId"], "safety-grant-sb-1");
-    assert_eq!(input.params["input"][0]["text"], "主人已批准一次：rm -rf $S/$v（30 分钟内有效，仅此一次）");
+    assert_eq!(input.block_id, "sb-1");
+    assert_eq!(grant_text(&input), "主人已批准一次：rm -rf $S/$v（30 分钟内有效，仅此一次）");
     let notice = record(&store, "sb-1");
     assert!(!notice.pending() && notice.is_final());
     assert_eq!(notice.state, State::Acknowledged);
@@ -229,4 +225,20 @@ fn a_reconnecting_observer_catches_up_from_the_runtime_list() {
         .with_state(|state| apply_snapshot(state, AGENT, None, "thread-1", &listed, &settings, &evaluator, Utc::now()))
         .unwrap());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn safety_notice_identity_binds_recipient_and_round_trips_read_window() {
+    use crate::agent_bus::alarms::*;
+    let key = safety_notice_key("sb-window");
+    assert_ne!(safety_notice_message_id("recipient-a", &key), safety_notice_message_id("recipient-b", &key));
+    let mut value = wire("sb-window", "granted");
+    value["noticeInputId"] = json!(safety_notice_message_id(AGENT, &key));
+    value["noticeReadAt"] = json!("2026-11-10T06:10:00Z");
+    value["hardExpiresAt"] = json!("2026-11-10T08:00:00Z");
+    let block = block_from_wire("claude", &value).unwrap();
+    let encoded = serde_json::to_value(&block).unwrap();
+    assert_eq!(encoded["noticeInputId"], value["noticeInputId"]);
+    assert_eq!(encoded["noticeReadAt"], value["noticeReadAt"]);
+    assert!(grant_text(&block).contains("读到后 30 分钟"));
 }

@@ -1176,6 +1176,7 @@ impl AppServerRuntimeManager {
             }
         }
         let bootstrap_observed_at = Utc::now().to_rfc3339();
+        crate::agent_bus::busy_delivery::record(cutex_session_id, &response_thread_id, runtime_generation, &initialize_response);
         // Q21: the Agent Bus judges managed services by the live permissions.
         crate::app_server::live_settings::record(
             cutex_session_id,

@@ -251,9 +251,10 @@ impl Store {
     }
     pub fn settings(&self, patch: &Value) -> Result<Settings> {
         if self.configured {
-            let mut config = crate::config::store::load_codez_config_checked()?;
-            config.peers = config.peers.patched(patch)?;
-            crate::config::store::save_codez_config(&config)?;
+            let (config, ()) = crate::config::store::update_codez_config(|config| {
+                config.peers = config.peers.patched(patch)?;
+                Ok(())
+            })?;
             super::worker::wake();
             Ok(config.peers)
         } else {

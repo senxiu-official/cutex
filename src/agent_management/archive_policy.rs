@@ -6,6 +6,12 @@ use super::*;
 /// The generic store has an empty-new-install fallback; lifecycle gates must
 /// distinguish that fallback from partially missing durable files.
 pub fn archive_authority_snapshot() -> Result<AgentManagementSnapshot, AgentManagementError> {
+    Ok((*archive_authority_snapshot_shared()?).clone())
+}
+
+/// Same fail-closed admission as the owned view, without copying the directory
+/// on hot runtime-controller reads.
+pub fn archive_authority_snapshot_shared() -> Result<std::sync::Arc<AgentManagementSnapshot>, AgentManagementError> {
     let store = super::super::AgentManagementStore::open_default()
         .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
     let has_data=(store.root().join("agent-management-v1.json").try_exists()
@@ -15,7 +21,7 @@ pub fn archive_authority_snapshot() -> Result<AgentManagementSnapshot, AgentMana
     let has_lock=store.root().join("agent-management-v1.lock").try_exists()
         .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
     if has_data && !has_lock { return Err(AgentManagementError::InvalidStore); }
-    store.directory_snapshot()
+    store.directory_snapshot_shared()
 }
 
 /// Authority failure is never permission to start/send/restore. Keep this

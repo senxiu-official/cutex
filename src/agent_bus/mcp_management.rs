@@ -24,6 +24,8 @@ struct ToolInput {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ManagedAgentSpec {
+    #[serde(default = "crate::session::model::default_memory_injection", rename = "memoryInjection", skip_serializing_if = "crate::session::model::is_memory_injection_default")]
+    memory_injection: bool,
     name: String,
     cwd: String,
     profile: String,
@@ -443,6 +445,7 @@ const LEGACY_FIELDS: &[&str] = &["spec", "start_mode", "frozen_message"];
 /// Agent fields of the sparse arguments (agent_create top level,
 /// member_replace `successor`).
 const AGENT_FIELDS: &[&str] = &[
+    "memoryInjection",
     "name",
     "profile",
     "model",
@@ -725,6 +728,7 @@ pub(super) fn legacy_call(args: &Value) -> Option<(&'static str, Value)> {
 fn agent_fields(name: &str) -> serde_json::Map<String, Value> {
     let string = |description: &str| json!({"type":"string","description":description});
     let mut fields = serde_json::Map::new();
+    fields.insert("memoryInjection".into(), json!({"type":"boolean","default":true,"description":"Inject project memory instructions, index and idle reminders. Default true. False supplies only a one-line instruction to leave project memory alone unless the owner personally and explicitly asks; AGENTS.md still applies. This is an instruction, not filesystem isolation."}));
     fields.insert("name".into(), string(name));
     fields.insert("profile".into(), string("Profile (name or id) it runs on, or \"auto:<provider>\" (e.g. auto:anthropic) to pick the opted-in profile of that provider with the most quota left. Default: yours."));
     fields.insert("model".into(), string("Model. Default: the profile's default model. A model the profile's model list does not show is refused (invalid_model) with the allowed models; a unique short form of a listed model (e.g. \"astra\" for gpt-6-astra) is used and reported as model_resolved, and a name that is also a profile or model here gets a name_warning."));
@@ -785,6 +789,21 @@ pub(super) fn tools() -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn memory_injection_mcp_schema_and_false_forwarding() {
+        let schema = tools().into_iter().find(|t| t["name"]==AGENT_CREATE).unwrap();
+        assert_eq!(schema["inputSchema"]["properties"]["memoryInjection"]["type"],"boolean");
+        let response = call(AGENT_CREATE,json!({"action_id":"memory-off","name":"reviewer","memoryInjection":false}),|body| {
+            assert_eq!(body["agent"]["memoryInjection"],false);
+            sparse_receipt(body,"create","created")
+        });
+        assert_eq!(response["outcome"]["status"],"complete","{response}");
+        let invalid = call(AGENT_CREATE,json!({"name":"reviewer","memoryInjection":"false"}),|_|panic!("invalid type forwarded"));
+        assert_ne!(invalid["outcome"]["status"],"complete");
+    }
+
+
     use super::*;
 
     fn spec() -> Value {

@@ -238,8 +238,8 @@ const OWNER_RULES: &[Rule] = owner_prefixes![
     "/v2/claude", "/v2/client-tokens", "/v2/clients", "/v2/codex", "/v2/components", "/v2/director-rotations",
     "/v2/diagnostics", "/v2/documents", "/v2/events", "/v2/experimental", "/v2/fs", "/v2/health", "/v2/host", "/v2/human", "/v2/identity",
     "/v2/inbound-mail", "/v2/items", "/v2/job-service", "/v2/kimi", "/v2/nci-verification", "/v2/notes",
-    "/v2/notification-levels", "/v2/notifications", "/v2/owner-notifications", "/v2/pair",
-    "/v2/peers", "/v2/profile-auto-pick", "/v2/profile-imports", "/v2/profile-link", "/v2/profile-presets", "/v2/profiles", "/v2/projects",
+    "/v2/notification-levels", "/v2/notifications", "/v2/owner-notifications", "/v2/owner-pins", "/v2/pair",
+    "/v2/pan", "/v2/peers", "/v2/profile-auto-pick", "/v2/profile-imports", "/v2/profile-link", "/v2/profile-presets", "/v2/profiles", "/v2/projects",
     "/v2/model-overload-retry", "/v2/quota-auto-continue", "/v2/record-archive", "/v2/release", "/v2/runtime-packages", "/v2/safety-checks",
     "/v2/runtimes", "/v2/services", "/v2/sessions", "/v2/settings", "/v2/side-chats",
     "/v2/storage", "/v2/summary", "/v2/task-service", "/v2/tasks", "/v2/terminals", "/v2/test", "/v2/upgrade", "/v2/usage",
@@ -724,7 +724,11 @@ fn scoped_gate(
                     filter_projects(&mut value, scope);
                     Gate::Handled(write_json_response(stream, 200, "OK", &value))
                 }
-                Err(_) => Gate::Continue,
+                // The ordinary handler answers the owner's unfiltered collection.
+                // A transient failure here must never fall through to it.
+                Err(_) => Gate::Handled(write_v2_error(stream, 503, "Service Unavailable",
+                    "projects_unavailable", "the filtered project collection could not be read",
+                    true, json!({}))),
             }
         }
         Scoped::ProjectRead => {
@@ -758,7 +762,9 @@ fn scoped_gate(
                     }
                     Gate::Handled(write_json_response(stream, 200, "OK", &value))
                 }
-                Err(_) => Gate::Continue,
+                Err(error) => Gate::Handled(write_v2_error(stream, error.status,
+                    super::server::http_reason_for(error.status), error.code, &error.message,
+                    error.status >= 500, json!({}))),
             }
         }
         // The handler answers for "me" only and checks who may see whom.

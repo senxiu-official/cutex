@@ -73,6 +73,12 @@ pub fn handle_v2_request(
     if path == "/v2/diagnostics/control" {
         return handle_control_diagnostics(stream, request, agent_management_admin_token);
     }
+    if crate::pan::api::is_path(path) {
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return crate::pan::api::error_response(stream, &crate::pan::Error::new("unauthorized", "Owner authentication is required", false));
+        }
+        return crate::pan::api::handle(stream, request);
+    }
     if crate::browser_relay::http::is_path(path) {
         return crate::browser_relay::http::handle(stream,request,agent_management_admin_token,context);
     }
@@ -455,6 +461,15 @@ pub fn handle_v2_request(
         }
         return super::session_skills::handle(stream, request);
     }
+    if let Some(id) = super::session_paths::session_id_from_path(path) {
+        if !authenticated_root_request(request, agent_management_admin_token)
+            || crate::management::users::current_principal().is_some_and(|p| !p.is_owner())
+            || crate::management::listeners::current_client_token().is_some_and(|token| token.scope != crate::management::client_tokens::DeviceScope::Full)
+        {
+            return write_v2_error(stream, 403, "Forbidden", "forbidden", "full-scope owner credential required to reapprove paths", false, json!({}));
+        }
+        return super::session_paths::handle(stream, request, &id);
+    }
     if super::sandbox_extras::is_path(path) {
         // Network / extra writable roots of one session (capability
         // session-sandbox-extras): the owner only (root, or an owner-bound
@@ -485,6 +500,14 @@ pub fn handle_v2_request(
                 "the Management root credential is required for safety checks", false, json!({}));
         }
         return super::safety_checks::handle(stream, request);
+    }
+    if super::owner_pins::is_path(path) {
+        // 备忘: the owner's view, like owner notifications (root incl. device / client tokens).
+        if !authenticated_root_request(request, agent_management_admin_token) {
+            return write_v2_error(stream, 401, "Unauthorized", "unauthorized",
+                "the Management root credential is required for owner pins", false, json!({}));
+        }
+        return super::owner_pins::handle(stream, request);
     }
     if super::owner_notify::is_path(path) {
         // Agent → owner messages are the owner's view: root (incl. device /
@@ -647,7 +670,7 @@ fn v2_required_token<'a>(
 }
 
 fn agent_management_admin_path(path: &str) -> bool {
-    if super::director::is_path(path) {return true}
+    if super::session_paths::session_id_from_path(path).is_some() || super::director::is_path(path) || super::quick_chat_promote::path_target(path).is_some() {return true}
     matches!(
         path,
         "/v2/agent-management/authority"
@@ -1001,6 +1024,9 @@ fn handle_v2_request_with_repository(
         }
         (_, path) if super::agent_names::path_target(path).is_some() => {
             super::agent_names::handle(stream,request,context,repository)
+        }
+        ("POST", path) if super::quick_chat_promote::path_target(path).is_some() => {
+            super::quick_chat_promote::handle(stream, request, context)
         }
         ("POST", super::human_sessions::PATH) => {
             super::human_sessions::handle_create(stream, request, context, repository)
@@ -1432,7 +1458,7 @@ pub(crate) fn write_agent_management_control_error(
         | AgentManagementError::ProjectNotAuthorized => (403, "Forbidden", false),
         AgentManagementError::NotFound(_) => (404, "Not Found", false),
         AgentManagementError::Removed(_) => (410, "Gone", false),
-        AgentManagementError::Conflict(_) | AgentManagementError::ConflictDetail(_) | AgentManagementError::NameConflict(_) => {
+        AgentManagementError::CreatorPathsChanged(_) | AgentManagementError::Conflict(_) | AgentManagementError::ConflictDetail(_) | AgentManagementError::NameConflict(_) => {
             (409, "Conflict", false)
         }
         AgentManagementError::PersistenceUnavailable => (503, "Service Unavailable", true),
@@ -1450,6 +1476,8 @@ pub(crate) fn write_agent_management_control_error(
     let details = if matches!(error, AgentManagementError::HostBusy(_)) {
         use crate::asks::pause_admission::{ADMISSION_BUSY_RETRY_AFTER_MS, HOST_BUSY_REASON};
         json!({ "reason": HOST_BUSY_REASON, "retryAfterMs": ADMISSION_BUSY_RETRY_AFTER_MS })
+    } else if let AgentManagementError::CreatorPathsChanged(ref id) = error {
+        json!({"cutexSessionId":id})
     } else if let AgentManagementError::NameConflict(ref error) = error {
         error.details.clone()
     } else {
@@ -3877,11 +3905,10 @@ pub(super) fn dispatch_runtime_mutation(
             .expect("validated runtime params object")
             .insert("launchProfile".to_string(), json!(profile));
     }
-    if online {
-        // The runtime is about to own the native home: stop any offline
-        // history reader still warm on it.
-        super::history::evict_offline_reader(cutex_session_id);
-    }
+    // Native home ownership must not overlap. Close admitted paging readers
+    // synchronously and prevent another offline reader from spawning until
+    // the runtime mutation (including its failure path) has completed.
+    let _offline_reader_fence = online.then(|| super::history::fence_offline_reader(cutex_session_id));
     let result = match mutate_session(cutex_session_id, &request.method, mutation_params) {
         Ok(result) => result,
         Err(error) => {
@@ -4137,6 +4164,7 @@ fn dispatch_session_defaults_update(
         .filter(|patch| !patch.is_empty())
         .ok_or_else(|| invalid_user_input_error("patch must be a non-empty object"))?;
     let allowed = [
+        "memoryInjection",
         "backend",
         "managedCwd",
         "permissions",
@@ -4154,6 +4182,9 @@ fn dispatch_session_defaults_update(
         return Err(invalid_user_input_error(
             "defaults patch contains a field outside registry version 2",
         ));
+    }
+    if patch.get("memoryInjection").is_some_and(|v| !v.is_boolean()) {
+        return Err(invalid_user_input_error("memoryInjection must be a boolean"));
     }
     validate_service_tier_patch(patch, session)?;
     mutate_session(cutex_session_id, &request.method, request.params.clone())?;
@@ -5405,7 +5436,7 @@ pub(super) fn cutex_operation_error_status(code: &str, outcome_unknown: bool) ->
     }
     match code {
         "invalid_request" => 400,
-        "plan_changed" | "revert_conflict" | "nothing_to_revert" | "thread_unbound" => 409,
+        "creator_paths_changed" | "plan_changed" | "revert_conflict" | "nothing_to_revert" | "thread_unbound" => 409,
         "turn_history_too_large" => 422,
         "codex_app_server_unavailable" => 503,
         "native_history_unavailable" => 502,
@@ -6125,10 +6156,11 @@ mod tests {
 
     use super::*;
 
-    fn safety_http_context() -> ManagementRequestContext {
+    pub(super) fn safety_http_context() -> ManagementRequestContext {
     // Denied and gate-answered requests never reach native runtime callbacks.
     ManagementRequestContext {
         explicit_launch_action: |_, _| panic!("unexpected runtime action"),
+        promote_quick_chat: |_, _, _| panic!("unexpected quick chat promotion"),
         adopt_saved_native: |_, _| panic!("unexpected native adoption"),
         review_agent_archive: |_, _| panic!("unexpected archive review"),
         owner_archive_action: |_, _| panic!("unexpected permanent archive"),
@@ -6815,6 +6847,7 @@ mod tests {
             "/v2/host/sessions",
             "/v2/human/agents",
             "/v2/human/sessions",
+            "/v2/human/sessions/cutex.test/promote",
             "/v2/profiles",
             "/v2/profiles/GLM",
             "/v2/profiles/GLM/models",
@@ -8091,6 +8124,48 @@ mod tests {
         assert_eq!(resolve_stop_requester("claude.alpha", None), json!({"kind": "agent", "runtimeAgentId": "claude.alpha"}));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_online_stops_paging_reader_before_mutation_and_blocks_restarts() {
+        use super::super::history::{reader_probe, HistoryCallError};
+        for (detached, fail) in [(false, false), (true, false), (true, true)] {
+            let id = format!("cutex.online-reader-{}", uuid::Uuid::new_v4());
+            let dir = reader_probe::session(&id);
+            let root = std::env::temp_dir().join(format!("cutex-online-reader-events-{}", uuid::Uuid::new_v4()));
+            let repository = EventRepository::open(&root, crate::platform::host::current_host_name()).unwrap();
+            let session = json!({"runtime":{"runtimeGeneration":7,"backend":"host"}});
+            let request = ValidatedCutexRequest {
+                request_id: "reader-online".into(), method: "cutex/runtime/online".into(),
+                params: json!({"expectedRuntimeGeneration":7}),
+            };
+            let mut result = None;
+            let next_page = reader_probe::page_across(&id, || {
+                assert!(!reader_probe::holders(&dir).is_empty(), "an admitted page has a real reader process");
+                if detached { super::super::history::retire_cached_reader(&id); }
+                result = Some(dispatch_runtime_mutation(&repository, |_, _, _| {
+                    // This callback is the runtime launch boundary.
+                    assert!(reader_probe::holders(&dir).is_empty(), "reader must exit before native runtime launch");
+                    assert!(reader_probe::read(&id).is_err(), "the launch fence must also block a new history request");
+                    assert_eq!(reader_probe::spawns(&id), 1);
+                    if fail { Err(invalid_user_input_error("synthetic launch failure")) }
+                    else { Ok(json!({"runtimeGeneration":8,"runtimeAgentId":"runtime-2","status":"online"})) }
+                }, &id, &session, &request));
+            });
+            assert_eq!(result.unwrap().is_err(), fail);
+            assert!(matches!(next_page, Err(HistoryCallError::Unavailable(message)) if message.contains("evicted")));
+            assert_eq!(reader_probe::admitted_count(&id), 0, "completed requests release their fence registrations");
+            assert!(reader_probe::holders(&dir).is_empty());
+            if fail {
+                reader_probe::read(&id).unwrap();
+                assert_eq!(reader_probe::spawns(&id), 2, "failed launches release their fence for an offline retry");
+            }
+            super::super::history::evict_offline_reader(&id);
+            drop(repository);
+            std::fs::remove_dir_all(root).unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[test]
     fn runtime_online_callback_preserves_native_action_and_attach_route() {
         let root =
@@ -8877,3 +8952,7 @@ mod tests {
 #[cfg(test)]
 #[path = "model_overload_retry_server_tests.rs"]
 mod model_overload_retry_server_tests;
+
+#[cfg(test)]
+#[path = "concurrency_scale_tests.rs"]
+mod concurrency_scale;

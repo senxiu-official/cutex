@@ -54,6 +54,7 @@ sqlite_domain!(
     "runtime/management-v2/request-idempotency.sqlite3",
     "request idempotency receipts"
 );
+sqlite_domain!(PAN, "pan", "pan/pan.sqlite", "Pan download tasks and audit entries commit together");
 sqlite_domain!(NAME_TARGET_PINS, "name-target-pins", "runtime/name-target-pins.sqlite3", "immutable action recipient bindings");
 sqlite_domain!(
     INTEGRATION_DEDUPE,
@@ -94,6 +95,7 @@ sqlite_domain!(
 sqlite_domain!(ARCHIVE, "archive", "archive/index-v1.sqlite3", "archive index");
 sqlite_domain!(SUMMARY, "summary", "summary/summary.sqlite3", "summary journal and projections");
 sqlite_domain!(NOTES, "notes", "notes/notes.sqlite3", "notes, pins and nonces");
+sqlite_domain!(OWNER_PINS, "owner-pins", "runtime/owner-pins/owner-pins.sqlite3", "备忘: pins agents put up for the owner, and their action receipts");
 sqlite_domain!(
     NOTIFY_STATES,
     "notify-states",
@@ -164,6 +166,7 @@ pub static DOMAINS: &[&TxDomain] = &[
     &INPUT_LEDGER,
     &REQUEST_IDEMPOTENCY,
     &NAME_TARGET_PINS,
+    &PAN,
     &INTEGRATION_DEDUPE,
     &PENDING_STOPS,
     &PROJECT_EVENTS,
@@ -173,6 +176,7 @@ pub static DOMAINS: &[&TxDomain] = &[
     &ARCHIVE,
     &SUMMARY,
     &NOTES,
+    &OWNER_PINS,
     &NOTIFY_STATES,
     &NOTIFY_OUTBOUND,
     &STORAGE,

@@ -27,6 +27,7 @@ fn projection_tombstone(state: &mut AgentManagementSnapshot, record: &CutexSessi
         project_id: None, created_by_director_session: None, created_by_operator_session: None,
         cutex_session_id: id, native_session_id: record.codex_session_id.clone().unwrap(),
         spec: ManagedAgentSpec {
+            memory_injection: true,
             name: "retired".into(), cwd: record.cwd.clone(), profile: Some("test".into()),
             runtime_backend: "host".into(), model: "test".into(), reasoning: "low".into(),
             permissions: "default".into(), approval_policy: "never".into(),

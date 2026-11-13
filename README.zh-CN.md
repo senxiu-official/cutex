@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
-**0.2.2 — Beautiful World**：Git 状态使用独立线程池，同一仓库的重复读取合并处理，文件系统身份检查使用缓存，避免阻塞其他管理请求。提供原生运行时 0.167.0-r60，保留 Claude claude-r40、DSH dsh-r3 和 Kimi kimi-r3。已有智能体保持所选运行时，直到明确升级。从 0.2.0 升级仍需跨越持久状态迁移，并明确确认单向升级。详见 [CHANGELOG.md](CHANGELOG.md)。
+**0.2.3 — Beautiful World** 改进 Claude 恢复、精确投递及重启就绪检查，提供包含 Agent SDK 0.2.180 与 CLI 2.1.321 的 Claude claude-r46，并保留 Native 0.167.0-r60 及未变化的组件。已有智能体保持固定运行时。旧版无法读取新增的 worker 服务记录：请保留备份并明确确认本次单向升级，不要把包含后台应用记录的数据退回旧版。详见 [CHANGELOG.md](CHANGELOG.md) 和[已知问题](docs/KNOWN-ISSUES.md)。
 
 > **当前限制：**
 > - **手机推送 / 配对手机**：还没有公开的手机应用。

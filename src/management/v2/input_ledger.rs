@@ -25,7 +25,7 @@
 //! touching other stores.
 //!
 //! Lock rule (§2.1 invariant 6, §2.13): the ledger mutex is a LEAF lock. While
-//! it is held this module only runs SQLite statements on its own file; it never
+//! it is held this module only coordinates and accesses its own database file; it never
 //! takes a session lane, the host authority fence, the AskStore lock, or does
 //! runtime / network IO. Callers may hold any of those when they call in
 //! (lane → ledger is the allowed order). Debug builds panic when a thread that
@@ -413,6 +413,9 @@ pub struct InputRecord {
     pub reason: Option<String>,
     pub since: String,
     pub deadline: Option<String>,
+    /// Busy-wake presentation only; independent of state timeout/deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_schedule: Option<super::input_ledger_wake::WakeSchedule>,
     pub stage: Option<Stage>,
     pub surface: Surface,
     pub order: Option<InputOrder>,
@@ -1032,6 +1035,7 @@ fn apply(
                 reason: None,
                 since: now_text.clone(),
                 deadline: None,
+                wake_schedule: None,
                 stage: None,
                 surface: creation_surface(kind, &create.intent),
                 order: None,
@@ -1110,6 +1114,7 @@ fn apply(
     };
 
     record.state = next.state;
+    if next.state.is_settled() || surface == Surface::Timeline { record.wake_schedule = None; }
     record.reason = next.reason.clone();
     record.stage = stage;
     record.surface = surface;
@@ -1233,10 +1238,14 @@ pub fn assert_ledger_lock_not_held(what: &str) {
 
 struct LedgerGuard<'a> {
     connection: MutexGuard<'a, Option<Connection>>,
+    /// Cooperating writers queue outside SQLite's bounded busy handler.
+    writer: Option<std::fs::File>,
 }
 
 impl Drop for LedgerGuard<'_> {
     fn drop(&mut self) {
+        // Closing this operation's handle releases its cross-process lock.
+        drop(self.writer.take());
         LEDGER_LOCK_HELD.with(|held| held.set(false));
     }
 }
@@ -1343,6 +1352,8 @@ pub struct InputLedger {
     sweeper: OnceLock<()>,
     #[cfg(test)]
     clock: Mutex<Option<DateTime<Utc>>>,
+    #[cfg(test)]
+    writer_waiting: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 /// Outbox mode of a ledger. The process ledger follows the switch; a ledger
@@ -1390,6 +1401,8 @@ impl InputLedger {
             sweeper: OnceLock::new(),
             #[cfg(test)]
             clock: Mutex::new(None),
+            #[cfg(test)]
+            writer_waiting: Mutex::new(None),
         }
     }
 
@@ -1452,24 +1465,58 @@ impl InputLedger {
     }
 
     fn lock(&self) -> Result<LedgerGuard<'_>, LedgerError> {
+        self.lock_connection(false)
+    }
+
+    fn lock_write(&self) -> Result<LedgerGuard<'_>, LedgerError> {
+        self.lock_connection(true)
+    }
+
+    fn lock_connection(&self, writing: bool) -> Result<LedgerGuard<'_>, LedgerError> {
         if cfg!(debug_assertions) && thread_holds_ledger_lock() {
             panic!("054 lock protocol: the input ledger lock is not reentrant");
         }
-        let mut connection = self.connection.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let connection = self.connection.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         LEDGER_LOCK_HELD.with(|held| held.set(true));
-        let guard = LedgerGuard { connection: {
-            if connection.is_none() {
-                match open_watched(&self.path) {
-                    Ok(opened) => *connection = Some(opened),
-                    Err(error) => {
-                        LEDGER_LOCK_HELD.with(|held| held.set(false));
-                        return Err(LedgerError::Storage(error));
-                    }
-                }
-            }
-            connection
-        } };
+        let mut guard = LedgerGuard { connection, writer: None };
+        // Opening a connection also initializes schema and the epoch marker.
+        // Serialize that first use; established read connections stay WAL readers.
+        if writing || guard.connection.is_none() {
+            guard.writer = Some(self.writer_lock()?);
+        }
+        if guard.connection.is_none() {
+            *guard.connection = Some(open_watched(&self.path)?);
+        }
         Ok(guard)
+    }
+
+    fn writer_lock_path(&self) -> PathBuf {
+        let mut name = self.path.file_name().map(|name| name.to_os_string()).unwrap_or_default();
+        name.push(".write.lock");
+        self.path.with_file_name(name)
+    }
+
+    fn writer_lock(&self) -> anyhow::Result<std::fs::File> {
+        let path = self.writer_lock_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => {}
+            Err(error) if crate::platform::file_lock::lock_contended(&error) => {
+                #[cfg(test)]
+                if let Some(waiting) = self.writer_waiting.lock().unwrap().take() {
+                    let _ = waiting.send(());
+                }
+                // No SQL transaction is held while waiting. This is separate
+                // from the publication try-lock; appends still run outside the
+                // ledger lock and never wait on a publisher.
+                fs2::FileExt::lock_exclusive(&file)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(file)
     }
 
     /// The only writer. One immediate transaction: read the row, check
@@ -1485,6 +1532,65 @@ impl InputLedger {
         let deadlines = self.deadlines;
         self.write_one(session, input_id, expect, |current, delivery, now| {
             apply(session, input_id, current, &next, now, &deadlines, delivery)
+        })
+    }
+
+    /// Finish a delivery whose source has already accepted the dismissal.
+    /// A queued retry projection may restore default hold metadata meanwhile;
+    /// compare that narrow change inside the write transaction, without a
+    /// read/retry window or holding the ledger lock across source IO.
+    fn discard_settled_delivery(&self, observed: &InputRecord) -> Result<Transition, LedgerError> {
+        let deadlines = self.deadlines;
+        self.write_one(&observed.cutex_session_id, &observed.input_id, Expect::ANY, |current, delivery, now| {
+            let current = current.ok_or(LedgerError::NotFound)?;
+            if current.rev != observed.rev {
+                // The durable source projection can finish this same decision
+                // first. Return its record without another revision/event.
+                if current.kind == observed.kind && current.attempt == observed.attempt
+                    && current.state == InputState::Discarded && current.reason.as_deref() == Some("ownerDiscarded") {
+                    return Ok(current.clone());
+                }
+                let normalize = |record: &InputRecord| {
+                    let mut probe = record.clone();
+                    probe.rev = observed.rev;
+                    probe.state_revision = observed.state_revision;
+                    probe.updated_at = observed.updated_at.clone();
+                    // Actions are derived from the restored hold metadata.
+                    probe.actions = observed.actions.clone();
+                    if let Some(details) = probe.details.as_object_mut() {
+                        details.remove(crate::asks::ledger::SOURCE_VERSION);
+                        if details.get("ownerHold") == Some(&json!(false)) { details.remove("ownerHold"); }
+                    }
+                    probe
+                };
+                let source_version = |record: &InputRecord| record.details[crate::asks::ledger::SOURCE_VERSION].as_u64();
+                if normalize(current) != normalize(observed) || source_version(current) < source_version(observed) {
+                    return Err(LedgerError::Conflict { current_rev: current.rev });
+                }
+            }
+            apply(&observed.cutex_session_id, &observed.input_id, Some(current),
+                &Next::discarded("ownerDiscarded"), now, &deadlines, delivery)
+        })
+    }
+
+    /// Update presentation only, with the same revision/outbox as every input.
+    pub fn annotate_wake_schedule(&self, session: &str, input_id: &str, expect: Expect, schedule: Option<super::input_ledger_wake::WakeSchedule>) -> Result<Transition, LedgerError> {
+        self.write_one(session, input_id, expect, |current, _, _| {
+            let mut record = current.ok_or(LedgerError::NotFound)?.clone();
+            record.wake_schedule = schedule;
+            Ok(record)
+        })
+    }
+
+    /// Monotonic source fence, independent of whether a source state edge is
+    /// applicable. Presentation/lifecycle fields stay exactly as observed.
+    pub(crate) fn note_ask_source_version(&self, session: &str, input_id: &str, expect: Expect, version: u64) -> Result<Transition, LedgerError> {
+        self.write_one(session, input_id, expect, |current, _, _| {
+            let mut record = current.ok_or(LedgerError::NotFound)?.clone();
+            if !record.details.is_object() { record.details = serde_json::json!({}); }
+            let old = record.details[crate::asks::ledger::SOURCE_VERSION].as_u64().unwrap_or(0);
+            record.details[crate::asks::ledger::SOURCE_VERSION] = serde_json::json!(old.max(version));
+            Ok(record)
         })
     }
 
@@ -1543,7 +1649,7 @@ impl InputLedger {
         // 054 S25 timing (switch on only): the whole write incl. outbox rows.
         let _timing = timing::span(timing::Op::Transition, outbox);
         let lock_wait = timing::span(timing::Op::LockWait, outbox);
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_write()?;
         drop(lock_wait);
         let connection = guard.connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1645,7 +1751,7 @@ impl InputLedger {
         // 054 S25 timing (switch on only): the whole write incl. outbox rows.
         let _timing = timing::span(timing::Op::Transition, outbox);
         let lock_wait = timing::span(timing::Op::LockWait, outbox);
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_write()?;
         drop(lock_wait);
         let connection = guard.connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1870,7 +1976,7 @@ impl InputLedger {
     pub fn compact(&self, now: DateTime<Utc>, retention: Duration, limit: usize) -> Result<usize, LedgerError> {
         let cutoff = now.timestamp_millis()
             .saturating_sub(i64::try_from(retention.as_millis()).unwrap_or(i64::MAX));
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_write()?;
         let connection = guard.connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let victims: Vec<(String, String, i64)> = {
@@ -1912,7 +2018,7 @@ impl InputLedger {
         validate_id("cutexSessionId", session)?;
         let now = self.now();
         let outbox = self.outbox_on();
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_write()?;
         let connection = guard.connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let unchanged = |ledger_epoch: String, state_revision: u64, delivery: Value| DeliveryChange {
@@ -1952,7 +2058,7 @@ impl InputLedger {
         // 054 S25 timing (switch on only): the whole write incl. outbox rows.
         let _timing = timing::span(timing::Op::Transition, outbox);
         let lock_wait = timing::span(timing::Op::LockWait, outbox);
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_write()?;
         drop(lock_wait);
         let connection = guard.connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2000,7 +2106,9 @@ fn open_database(path: &Path) -> anyhow::Result<Connection> {
         std::fs::create_dir_all(parent)?;
     }
     let db = Connection::open(path).with_context(|| format!("open input ledger: {}", path.display()))?;
-    // Short: a write must never wait long on another process's ledger write.
+    // Ledger writers queue on .write.lock before BEGIN, not by repeatedly
+    // racing SQLite's busy handler. Keep this bounded for foreign connections
+    // that do not participate in the ledger protocol.
     db.busy_timeout(Duration::from_secs(2))?;
     db.execute_batch(
         "PRAGMA journal_mode=WAL;
@@ -2165,7 +2273,7 @@ impl InputLedger {
     }
 
     pub fn loss_handled(&self, id: i64) -> Result<(), LedgerError> {
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_write()?;
         let connection = guard.connection.as_mut().expect("opened under lock");
         connection.execute("UPDATE input_ledger_losses SET handled = 1 WHERE id = ?1", [id])?;
         Ok(())
@@ -2247,7 +2355,7 @@ impl InputLedger {
         validate_id("cutexSessionId", session)?;
         validate_id("inputId", input_id)?;
         let now = self.now();
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_write()?;
         let connection = guard.connection.as_mut().expect("opened under lock");
         connection.execute(
             "INSERT INTO input_ledger_payloads (session, input_id, payload_json, created_at_ms) VALUES (?1, ?2, ?3, ?4)
@@ -2273,7 +2381,7 @@ impl InputLedger {
     /// Drop retry payloads older than `retention`, at most `limit`.
     pub fn compact_payloads(&self, now: DateTime<Utc>, retention: Duration, limit: usize) -> Result<usize, LedgerError> {
         let cutoff = now.timestamp_millis().saturating_sub(i64::try_from(retention.as_millis()).unwrap_or(i64::MAX));
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_write()?;
         let connection = guard.connection.as_mut().expect("opened under lock");
         Ok(connection.execute(
             // A record that can still go out keeps its text, however old:
@@ -2683,7 +2791,7 @@ impl InputLedger {
     /// Delete the appended rows; count a failed append on `failed` (dropped
     /// after [`MAX_APPEND_ATTEMPTS`]).
     fn outbox_done(&self, appended: &[&OutboxRow], failed: Option<&OutboxRow>) -> Result<(), LedgerError> {
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_write()?;
         let connection = guard.connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
@@ -3002,11 +3110,11 @@ pub fn dismissible(record: &InputRecord) -> bool {
 
 /// Settle the underlying store first (per kind, in the block that owns it),
 /// then the ledger (§2.9: the store is written before the ledger).
-fn dismiss_underlying(record: &InputRecord) -> Result<(), String> {
+fn dismiss_underlying(record: &InputRecord) -> Result<bool, String> {
     match record.kind {
-        InputKind::Owner => super::input_ledger_owner::dismiss(record),
+        InputKind::Owner => super::input_ledger_owner::dismiss(record).map(|_| false),
         InputKind::AgentMessage | InputKind::PeerMessage | InputKind::Alarm | InputKind::SystemNotice => {
-            super::input_ledger_bus::dismiss(record)
+            super::input_ledger_bus::dismiss(record).map(|_| false)
         }
         InputKind::DelegationRequest | InputKind::DelegationResult | InputKind::DelegationQuestion
         | InputKind::DelegationStatus => super::input_ledger_asks::dismiss(record),
@@ -3015,6 +3123,13 @@ fn dismiss_underlying(record: &InputRecord) -> Result<(), String> {
 
 /// One dismiss item → `Ok(transition)` or `Err(failure json)`.
 pub fn dismiss_one(ledger: &InputLedger, session: &str, input_id: &str, expected_rev: u64) -> Result<Transition, Value> {
+    dismiss_one_with(ledger, session, input_id, expected_rev, dismiss_underlying)
+}
+
+fn dismiss_one_with(
+    ledger: &InputLedger, session: &str, input_id: &str, expected_rev: u64,
+    settle: impl FnOnce(&InputRecord) -> Result<bool, String>,
+) -> Result<Transition, Value> {
     let failure = |code: &str, message: String, current: Option<u64>| {
         json!({"inputId": input_id, "code": code, "message": message, "currentRev": current})
     };
@@ -3028,7 +3143,7 @@ pub fn dismiss_one(ledger: &InputLedger, session: &str, input_id: &str, expected
     if !dismissible(&record) {
         return Err(failure("input_not_dismissible", format!("{} {} cannot be dismissed", record.kind, record.state), Some(record.rev)));
     }
-    dismiss_underlying(&record).map_err(|message| failure("dismiss_failed", message, Some(record.rev)))?;
+    let source_settled = settle(&record).map_err(|message| failure("dismiss_failed", message, Some(record.rev)))?;
     let mut expected_rev = expected_rev;
     if owner_stuck(&record) {
         // r274.2 §9.4: the owner stops waiting for the lost runtime.
@@ -3043,8 +3158,11 @@ pub fn dismiss_one(ledger: &InputLedger, session: &str, input_id: &str, expected
         }
         expected_rev = lost.record.rev;
     }
-    let transition = ledger
-        .transition(session, input_id, Expect::rev(expected_rev), Next::discarded("ownerDiscarded"))
+    let transition = if source_settled && matches!(record.kind, InputKind::DelegationResult | InputKind::DelegationQuestion | InputKind::DelegationStatus) {
+        ledger.discard_settled_delivery(&record)
+    } else {
+        ledger.transition(session, input_id, Expect::rev(expected_rev), Next::discarded("ownerDiscarded"))
+    }
         .map_err(|error| match error {
             LedgerError::Conflict { current_rev } => failure("revision_conflict", error.to_string(), Some(current_rev)),
             other => failure("event_persistence_unavailable", other.to_string(), Some(record.rev)),

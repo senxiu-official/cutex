@@ -25,7 +25,7 @@ use std::io::{BufRead, Write};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use rquickjs::promise::PromiseState;
@@ -40,14 +40,11 @@ pub const MAX_ITEMS: usize = 4096;
 
 const PRELUDE: &str = include_str!("prelude.js");
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
 /// A runtime with the sandbox limits and a CPU-slice watchdog.
 struct Sandbox {
     runtime: Runtime,
     context: Context,
+    clock: Instant,
     deadline: Arc<AtomicU64>,
     tripped: Arc<AtomicBool>,
 }
@@ -59,21 +56,23 @@ impl Sandbox {
         runtime.set_max_stack_size(STACK_LIMIT_BYTES);
         let deadline = Arc::new(AtomicU64::new(0));
         let tripped = Arc::new(AtomicBool::new(false));
+        // Host clock corrections must not extend or shorten a CPU slice.
+        let clock = Instant::now();
         let (d, t) = (deadline.clone(), tripped.clone());
         runtime.set_interrupt_handler(Some(Box::new(move || {
             let limit = d.load(Ordering::Relaxed);
-            if limit != 0 && now_ms() > limit {
+            if limit != 0 && clock.elapsed().as_millis() as u64 > limit {
                 t.store(true, Ordering::Relaxed);
                 return true;
             }
             false
         })));
         let context = Context::full(&runtime).context("QuickJS context")?;
-        Ok(Self { runtime, context, deadline, tripped })
+        Ok(Self { runtime, context, clock, deadline, tripped })
     }
 
     fn arm(&self) {
-        self.deadline.store(now_ms() + CPU_SLICE.as_millis() as u64, Ordering::Relaxed);
+        self.deadline.store(self.clock.elapsed().as_millis() as u64 + CPU_SLICE.as_millis() as u64, Ordering::Relaxed);
     }
 
     fn disarm(&self) {
@@ -434,7 +433,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "takes CPU_SLICE (5 s)"]
     fn busy_loops_hit_the_cpu_limit() {
         let (done, _) = run_script(&format!("{HEAD}while (true) {{}}\n"), Json::Null, |_| json!({}));
         assert_eq!(done["error"]["code"], json!("script_cpu_limit"), "{done}");

@@ -183,12 +183,20 @@ pub fn record_owner_stopped_delivery(state: &mut AskState, ask: &AskRecord, now:
 /// which can only be left over from releases before r208.
 pub fn actionable(state: &AskState, delivery: &DeliveryRecord) -> bool {
     delivery.state == DeliveryState::Pending
+        && !stale_passive_state(state, delivery)
         && !delivery.owner_hold
         && !super::lineage::stopped_parent(state,&super::routing_policy::integration::local_host_id(),&delivery.ask_id)
         && !state.asks.get(&delivery.ask_id).is_some_and(|ask| {
             matches!(ask.closed, Some(CloseOutcome::Accepted | CloseOutcome::Abandoned | CloseOutcome::Cancelled))
         })
         && !duplicate_answer(state, delivery)
+}
+
+/// Passive intermediate notices cease to matter after their delegation ends.
+pub fn stale_passive_state(state: &AskState, delivery: &DeliveryRecord) -> bool {
+    delivery.kind == DeliveryKind::State && delivery.passive
+        && matches!(delivery.ref_id.split('@').next(), Some("held" | "blockedBudget" | "paused" | "waitingForEvent"))
+        && state.asks.get(&delivery.ask_id).is_some_and(|ask| !ask.is_open())
 }
 
 /// An answer item whose attempt has a later answer record too. One attempt

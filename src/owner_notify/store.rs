@@ -181,6 +181,12 @@ pub struct SafetyBlock {
     #[serde(default)]
     pub used_at: Option<String>,
     pub grant_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_input_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_read_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_expires_at: Option<String>,
 }
 
 impl SafetyBlock {
@@ -660,7 +666,7 @@ impl OwnerNotifyState {
     pub fn update_safety_block(
         &mut self,
         agent_id: &str,
-        block: SafetyBlock,
+        mut block: SafetyBlock,
         now: DateTime<Utc>,
     ) -> Result<(OwnerNotification, bool), OwnerError> {
         let id = self
@@ -672,6 +678,9 @@ impl OwnerNotifyState {
                 message: format!("no safety block {} for this agent", block.block_id),
             })?;
         let record = self.get_for(agent_id, &id)?;
+        if block.notice_input_id.is_none() {
+            block.notice_input_id = record.safety_block.as_ref().and_then(|old| old.notice_input_id.clone());
+        }
         if record.safety_block.as_ref() == Some(&block) {
             return Ok((record.clone(), false));
         }

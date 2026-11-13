@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.3 "Beautiful World" (2026-11-13)
+
+- Improves Claude runtime observation, exact process adoption and readiness after restart. A failed supplementary status probe no longer prevents delivery through a healthy runtime connection.
+  改进 Claude 运行时观察、精确进程接管及重启后的就绪检查；补充状态探测失败不再阻止通过健康连接投递。
+- Reconciles owner-carried result delivery using bound durable evidence, and fences late callbacks to their original reservation.
+  使用绑定的持久证据核对随主人消息送达的结果，并将迟到回调限制在原预留内。
+- Includes host capabilities for project memory, owner pins, background apps and Baidu Netdisk where supported by the corresponding API. Runtime identities, user permissions and credential handling remain enforced by the host.
+  提供相应接口支持的项目记忆、要处理事项、后台应用及百度网盘主机能力；运行时身份、用户权限和凭据处理继续由主机校验。
+- Adds the Claude claude-r46 component with adapter 0.8.14, Agent SDK 0.2.180 and bundled CLI 2.1.321. Existing agents retain their pinned runtime; Native 0.167.0-r60 and unchanged components remain available.
+  新增 Claude claude-r46 组件，包含适配器 0.8.14、Agent SDK 0.2.180 和 CLI 2.1.321；已有智能体保留运行时固定版本，继续提供 Native 0.167.0-r60 及未变化的组件。
+
 ## 0.2.2 "Beautiful World" (2026-11-09)
 
 - Filesystem root identity checks are cached; Git status uses its own worker pool and coalesces concurrent reads for the same repository. Other management requests remain available while Git is slow.

@@ -6,10 +6,14 @@ use std::io::Read;
 use std::io::Write;
 use std::net::Shutdown;
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde_json::Value;
+
+/// No-progress budget for an ordinary response; also the default socket write
+/// timeout for management's streaming responses.
+pub const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Probe between complete SSE frames without consuming request bytes. Only the
 /// response thread may use the socket while this briefly changes its mode.
@@ -323,12 +327,12 @@ pub fn write_http_response(
         extra_response_headers(),
         if keep { "keep-alive" } else { "close" },
     );
-    stream
-        .write_all(response.as_bytes())
-        .context("Failed to write HTTP response headers")?;
-    stream
-        .write_all(body)
-        .context("Failed to write HTTP response body")?;
+    // The body is built: socket delivery must not retain native-reader capacity.
+    crate::management::v2::control_capacity::response_body_ready();
+    if let Err(error) = write_response_parts(stream, &[response.as_bytes(), body], RESPONSE_WRITE_TIMEOUT) {
+        close_after_response(stream);
+        return Err(error).context("Failed to write HTTP response");
+    }
     if keep {
         set_keep_alive(KeepAlive::Kept);
         stream.flush().ok();
@@ -336,6 +340,44 @@ pub fn write_http_response(
         close_after_response(stream);
     }
     Ok(())
+}
+
+pub(crate) fn write_response_parts(stream: &mut TcpStream, parts: &[&[u8]], budget: Duration) -> std::io::Result<()> {
+    write_response_parts_clock(stream, parts, budget, Instant::now)
+}
+
+fn write_response_parts_clock(stream: &mut TcpStream, parts: &[&[u8]], budget: Duration, mut now: impl FnMut() -> Instant) -> std::io::Result<()> {
+    let previous = stream.write_timeout()?;
+    let stall = previous.map_or(budget, |timeout| timeout.min(budget));
+    let mut last_progress = now();
+    // A timed-out blocking send leaves a Winsock socket indeterminate. Use
+    // nonblocking sends so WouldBlock is retryable and progress is measurable.
+    stream.set_nonblocking(true)?;
+    let result = (|| {
+        for part in parts {
+            let mut remaining = *part;
+            while !remaining.is_empty() {
+                if now().duration_since(last_progress) >= stall {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP response write deadline expired"));
+                }
+                match stream.write(&remaining[..remaining.len().min(16 * 1024)]) {
+                    Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                    Ok(written) => {
+                        remaining = &remaining[written..];
+                        last_progress = now();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    })();
+    let restore = stream.set_nonblocking(false);
+    result.and(restore)
 }
 
 /// End a `Connection: close` response so the client reads EOF now, even while
@@ -362,6 +404,125 @@ pub fn write_json_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nonreading_client_cannot_hold_response_capacity_forever() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        // Also bounds a broken implementation so the regression fails rather
+        // than leaving the test runner stuck in write_all.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            drop(client);
+        });
+        let body = vec![0; 32 * 1024 * 1024];
+        let started = Instant::now();
+        let error = write_response_parts(&mut server, &[b"head", &body], Duration::from_millis(150)).unwrap_err();
+        assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1), "response did not respect its total budget");
+        assert_eq!(server.write_timeout().unwrap(), None);
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn progressing_response_has_no_total_lifetime_cap() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let parts = vec![b"x".as_slice(); 4000];
+        let origin = Instant::now();
+        let mut ticks = 0;
+        write_response_parts_clock(&mut server, &parts, Duration::from_secs(1), || {
+            ticks += 1;
+            origin + Duration::from_millis(ticks * 100)
+        }).unwrap();
+        assert!(ticks * 100 > 600_000, "progress continued beyond the former ten-minute cap");
+        let mut received = vec![0; 4000];
+        client.read_exact(&mut received).unwrap();
+        assert!(received.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[test]
+    fn progressing_download_can_outlive_the_stall_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let body = vec![7; 16 * 1024 * 1024];
+        let size = body.len();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = 0;
+            let mut block = [0; 32 * 1024];
+            while bytes < size {
+                let n = client.read(&mut block).unwrap();
+                assert!(n > 0);
+                bytes += n;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            bytes
+        });
+        let started = Instant::now();
+        write_response_parts(&mut server, &[&body], Duration::from_millis(200)).unwrap();
+        assert!(started.elapsed() > Duration::from_millis(200));
+        assert_eq!(reader.join().unwrap(), size);
+    }
+
+    #[test]
+    fn response_budget_preserves_a_stricter_caller_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let prior = Duration::from_secs(2);
+        server.set_write_timeout(Some(prior)).unwrap();
+        write_response_parts(&mut server, &[b"one", b"two"], Duration::from_secs(30)).unwrap();
+        assert_eq!(server.write_timeout().unwrap(), Some(prior));
+        let mut bytes = [0; 6];
+        client.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"onetwo");
+    }
+
+    #[test]
+    #[ignore = "explicit 30-second nonreading-client management admission experiment; run alone"]
+    fn slow_responses_release_heavy_read_permits() {
+        use crate::management::v2::control_capacity;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut clients = Vec::new();
+        let mut workers = Vec::new();
+        for session in 0..2 {
+            clients.push(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+            let (mut server, _) = listener.accept().unwrap();
+            workers.push(std::thread::spawn(move || {
+                let request = SimpleHttpRequest { method: "GET".into(), path: format!("/v2/sessions/fixture-{session}/history"), headers: Default::default(), body: Vec::new() };
+                let _permit = control_capacity::response_permit_scope(control_capacity::admit_request(&request, None).unwrap());
+                let body = vec![b'x'; 32 * 1024 * 1024];
+                let started = Instant::now();
+                let error = write_http_response(&mut server, 200, "OK", "application/json", &body).unwrap_err();
+                (started.elapsed(), error)
+            }));
+        }
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let watchdog = std::thread::spawn(move || {
+            // Baseline remains finite: a missing write deadline is released by
+            // closing the clients after 35 seconds, and fails the assertions.
+            let _ = wait.recv_timeout(Duration::from_secs(35));
+            drop(clients);
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(control_capacity::snapshot()["heavyReadsActive"], 0, "built bodies release native-reader permits before delivery");
+        assert!(workers.iter().all(|worker| !worker.is_finished()));
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        let _ = release.send(());
+        watchdog.join().unwrap();
+        for (elapsed, error) in results {
+            println!("response release: {:.3}s, {error:#}", elapsed.as_secs_f64());
+            assert!(elapsed < Duration::from_secs(33));
+            let io_error = error.downcast_ref::<std::io::Error>().unwrap();
+            assert!(matches!(io_error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+        }
+        assert_eq!(control_capacity::snapshot()["heavyReadsActive"], 0);
+        let request = SimpleHttpRequest { method: "GET".into(), path: "/v2/sessions/healthy/history".into(), headers: Default::default(), body: Vec::new() };
+        assert!(control_capacity::admit_request(&request, None).is_ok());
+    }
 
     /// A client that half-closes after its request still reads EOF right
     /// after the response, while the handler keeps the stream (macOS:

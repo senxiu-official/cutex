@@ -191,6 +191,7 @@ fn session_findings(store: &CutexSessionStore, running: &dyn Fn(u32) -> bool) ->
                 clear,
             ));
         }
+        if !observed_dead { if let Some(finding) = preboot_finding(record) { result.push(finding); } }
         if let Some(claude) = &record.claude_session {
             let missing: Vec<_> = [
                 &claude.deployment.python,
@@ -402,6 +403,7 @@ fn clear_observed(
     expected: &Finding,
     running: &dyn Fn(u32) -> bool,
 ) -> anyhow::Result<bool> {
+    if expected.code == "claude_preboot_adapter" { return clear_preboot_observed(path, expected); }
     let id = expected
         .cutex_session_id
         .as_deref()
@@ -426,6 +428,39 @@ fn clear_observed(
             .session_mut(id)
             .context("finding session disappeared")?;
         crate::session::runtime_reconciliation::clear_runtime_fields(record, false);
+        rows.commit()?;
+        Ok(true)
+    })
+}
+
+fn preboot_finding(record: &CutexSessionRecord) -> Option<Finding> {
+    if record.runtime_backend != CutexSessionRuntimeBackend::ClaudeSubscription || !local(record) { return None; }
+    let evidence = crate::runtime::claude::preboot_claim_evidence(record).ok().flatten()?;
+    let safe = record.app_server_launch_claim_id.is_none() && record.pending_launch_id.is_none();
+    Some(finding("claude_preboot_adapter", Some(record), json!({"evidence":evidence,
+        "criterion":"exact recorded adapter descriptor predates this OS boot; today's PID occupant is not that adapter"}),
+        safe.then_some("clear_runtime_fields")))
+}
+
+fn clear_preboot_observed(path: &Path, expected: &Finding) -> anyhow::Result<bool> {
+    use crate::session::store::{load_session_row, with_locked_session_rows};
+    let id = expected.cutex_session_id.as_deref().context("finding has no session")?;
+    let Some((key, record)) = load_session_row(path, id)? else { return Ok(false) };
+    // All native/process/descriptor checks precede the store writer lock.
+    if crate::runtime::claude::adapter_is_reachable(&record) { return Ok(false); }
+    let Some(session) = record.claude_session.as_ref() else { return Ok(false) };
+    let _controller = crate::runtime::claude::lock(session)?;
+    let Some((fresh_key, fresh)) = load_session_row(path, &key)? else { return Ok(false) };
+    if fresh_key != key || fresh.cutex_session_id != id || preboot_finding(&fresh).as_ref() != Some(expected) { return Ok(false); }
+    with_locked_session_rows(path, |rows| {
+        // No whole-host scan or process/file IO while the writer is held. The
+        // controller lease fences descriptor writers; the row CAS fences edits.
+        if rows.session(&key) != Some(&fresh) { return Ok(false); }
+        rows.preserve_unmodified_json(&key);
+        let current = rows.session_mut(&key).context("finding session disappeared")?;
+        current.runtime_pid = None;
+        current.current_runtime_agent_id = None;
+        current.updated_at = chrono::Utc::now().to_rfc3339();
         rows.commit()?;
         Ok(true)
     })
@@ -1154,3 +1189,39 @@ mod tests {
 #[cfg(test)]
 #[path = "downgrade_drill.rs"]
 mod downgrade_drill;
+
+#[cfg(test)]
+mod occurrence_preboot_tests {
+    use super::*;
+    use crate::session::store::{load_cutex_session_store_from_path, save_cutex_session_store_to_path};
+    #[test]
+    fn occurrence_preboot_health_rechecks_only_exact_target_and_preserves_foreign_process_and_history() {
+        let root=std::env::temp_dir().join(format!("claude-health-preboot-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(&root).unwrap();
+        let listener=std::net::TcpListener::bind(("127.0.0.1",0)).unwrap();let port=listener.local_addr().unwrap().port();
+        let mut record=CutexSessionRecord::new("cutex.private-preboot".into(),None,crate::platform::host::current_host_name(),root.to_string_lossy().into_owned(),None).unwrap();
+        record.runtime_backend=CutexSessionRuntimeBackend::ClaudeSubscription;record.runtime_generation=34;record.runtime_pid=Some(std::process::id());record.current_runtime_agent_id=Some("claude.original".into());
+        record.claude_session=Some(serde_json::from_value(json!({"deployment":{"python":"unused","adapter_source":"unused","claude_cli":"unused","claude_home":"unused","tui_binary":"unused"},
+            "thread_id":"thread","state_dir":root,"model":"sonnet","instructions":"","connection_id":"original","native_session_id":"history-kept","allow_write":false,"allow_exec":false})).unwrap());
+        std::fs::write(root.join("server.json"),json!({"endpoint":format!("ws://127.0.0.1:{port}"),"runtimeId":"prior-boot-server","pid":std::process::id()}).to_string()).unwrap();
+        std::fs::write(root.join("cutex-mcp-binding.json"),json!({"threadId":"thread","runtimeAgentId":"claude.original","generation":34,"token":"private test only"}).to_string()).unwrap();
+        std::fs::write(root.join("rpc-token"),b"private fixture only").unwrap();
+        let old=crate::platform::process::system_boot_time().unwrap()-chrono::Duration::seconds(30);
+        std::fs::File::options().write(true).open(root.join("server.json")).unwrap().set_times(std::fs::FileTimes::new().set_modified(old.into())).unwrap();
+        std::fs::write(root.join("old-lock-file"),b"must not delete").unwrap();
+        let binding=std::fs::read(root.join("cutex-mcp-binding.json")).unwrap();let ready=std::fs::read(root.join("server.json")).unwrap();
+        let path=root.join("sessions.json");let mut store=CutexSessionStore::default();store.sessions.insert(record.cutex_session_id.clone(),record.clone());
+        let mut other=record.clone();other.cutex_session_id="cutex.unrelated".into();other.runtime_pid=None;other.current_runtime_agent_id=None;store.sessions.insert(other.cutex_session_id.clone(),other.clone());save_cutex_session_store_to_path(&path,&store).unwrap();
+        let finding=preboot_finding(&record).unwrap();assert_eq!(finding.code,"claude_preboot_adapter");assert!(finding.fix.unwrap().safe);
+        let finding=preboot_finding(&record).unwrap();
+        let mut replacement=load_cutex_session_store_from_path(&path).unwrap();replacement.sessions.get_mut(&record.cutex_session_id).unwrap().runtime_generation=35;save_cutex_session_store_to_path(&path,&replacement).unwrap();
+        assert!(!clear_observed(&path,&finding,&|_|true).unwrap(),"changed generation must refuse the old finding");
+        let mut current=load_cutex_session_store_from_path(&path).unwrap();current.sessions.insert(record.cutex_session_id.clone(),record.clone());save_cutex_session_store_to_path(&path,&current).unwrap();
+        let selected=preboot_finding(&load_cutex_session_store_from_path(&path).unwrap().sessions[&record.cutex_session_id]).unwrap();
+        assert!(clear_observed(&path,&selected,&|_|true).unwrap());
+        assert_eq!(crate::platform::process::process_liveness(std::process::id()),Some(true));
+        let after=load_cutex_session_store_from_path(&path).unwrap();let target=&after.sessions[&record.cutex_session_id];
+        assert!(target.runtime_pid.is_none() && target.current_runtime_agent_id.is_none());assert_eq!(target.runtime_generation,34);assert_eq!(target.claude_session,record.claude_session);assert_eq!(after.sessions[&other.cutex_session_id],other);
+        assert_eq!(std::fs::read(root.join("cutex-mcp-binding.json")).unwrap(),binding);assert_eq!(std::fs::read(root.join("server.json")).unwrap(),ready);assert_eq!(std::fs::read(root.join("old-lock-file")).unwrap(),b"must not delete");
+        drop(listener);crate::session::store::close_session_store(&path);std::fs::remove_dir_all(root).unwrap();
+    }
+}

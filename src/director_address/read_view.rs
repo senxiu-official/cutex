@@ -44,6 +44,15 @@ impl<'a> ReadView<'a> {
         self.controller(ask)
     }
 
+    /// Conservative index probes for role-routed notices. These are only
+    /// candidates; mutation still verifies the ask's digest/current recipient.
+    pub(crate) fn notice_ask_candidates(&self, caller: &str) -> Vec<String> {
+        self.ownership.asks.iter().filter(|(_, ownership)| ownership.controller == caller)
+            .map(|(id,_)| id.clone())
+            .chain(self.ownership.question_projects.iter().filter(|(_,project)| self.director(project).is_ok_and(|director| director == caller)).map(|(id,_)| id.clone()))
+            .collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+    }
+
     pub(crate) fn pending_recipient(&self, ask: &AskRecord, delivery: &DeliveryRecord) -> Option<String> {
         debug_assert_eq!(delivery.state, DeliveryState::Pending);
         if delivery.kind == DeliveryKind::Question {

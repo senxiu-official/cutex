@@ -4,6 +4,17 @@ use super::head::Body;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
+// The full suite remembers ports used by previous private control listeners.
+// A new ephemeral service backend must not reuse one of those control ports.
+fn backend_listener() -> TcpListener {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        if !crate::services::control_ports::forbidden(listener.local_addr().unwrap().port()) {
+            return listener;
+        }
+    }
+}
+
 struct TempDir(std::path::PathBuf);
 impl TempDir {
     fn path(&self) -> &std::path::Path {
@@ -47,7 +58,7 @@ fn fixture(port: u16) -> (TempDir, ServiceStore, String) {
     (dir, store, header)
 }
 fn connect(store: ServiceStore) -> (TcpStream, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = backend_listener();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     client
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -103,7 +114,7 @@ fn authenticated_proxy_waits_for_one_idle_start_and_respects_manual_stop() {
     use crate::services::store::{ServiceCommand, UpdateRequest};
     use crate::services::supervisor::Supervisor;
     use std::sync::Arc;
-    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = backend_listener().local_addr().unwrap().port();
     let (_dir, store, cookie) = fixture(port);
     store.update("demo", UpdateRequest {
         runtime: Some("managed".into()), lifetime: Some("persistent".into()),
@@ -115,7 +126,7 @@ fn authenticated_proxy_waits_for_one_idle_start_and_respects_manual_stop() {
     let supervisor = Supervisor::new(store.clone(), Box::new(move |event| { if event.reason == "started" { count.fetch_add(1, Ordering::SeqCst); } }));
     supervisor.start().unwrap();
     let wire = || {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = backend_listener();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         let s = supervisor.clone(); let store = store.clone();
@@ -176,7 +187,7 @@ fn auth_exchange_reserved_paths_and_cookie_isolation() {
 }
 #[test]
 fn streams_framed_bodies_and_rechecks_host_on_keepalive() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = backend_listener();
     let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
     let up = std::thread::spawn(move || {
         for expected in [b"hello".as_slice(), b"3\r\nabc\r\n0\r\n\r\n".as_slice()] {
@@ -219,7 +230,7 @@ fn streams_framed_bodies_and_rechecks_host_on_keepalive() {
 
 #[test]
 fn idle_upstream_close_does_not_fail_next_request_on_same_client() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = backend_listener();
     let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
     let (closed, after_idle) = std::sync::mpsc::channel();
     let backend = std::thread::spawn(move || {
@@ -255,7 +266,7 @@ fn idle_upstream_close_does_not_fail_next_request_on_same_client() {
 
 #[test]
 fn consumed_post_without_response_is_never_replayed() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = backend_listener();
     let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
     let backend = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -295,7 +306,7 @@ fn proxy_error_event_omits_request_content_and_error_text() {
 }
 #[test]
 fn sse_delivers_bytes_before_upstream_finishes() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = backend_listener();
     let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
     let (send, release) = std::sync::mpsc::channel();
     let up = std::thread::spawn(move || {
@@ -327,7 +338,7 @@ fn sse_delivers_bytes_before_upstream_finishes() {
 }
 #[test]
 fn websocket_waits_for_101_then_forwards_buffered_bytes() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = backend_listener();
     let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
     let up = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -349,7 +360,7 @@ fn websocket_waits_for_101_then_forwards_buffered_bytes() {
 }
 #[test]
 fn websocket_browser_disconnect_releases_quiet_upstream() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = backend_listener();
     let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
     let up = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -373,7 +384,7 @@ fn websocket_browser_disconnect_releases_quiet_upstream() {
 }
 #[test]
 fn management_handoff_is_lossless_and_remote_is_untouched() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = backend_listener();
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (mut server, peer) = listener.accept().unwrap();
     let original = b"POST /v2/test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nabc";
@@ -418,7 +429,7 @@ fn management_handoff_is_lossless_and_remote_is_untouched() {
 #[test]
 fn upstream_eof_before_head_is_502_and_no_error_in_partial_body() {
     for partial in [false, true] {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = backend_listener();
         let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
         let up = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -577,7 +588,7 @@ fn ticket_route_settings_and_export_contract() {
 
 #[test]
 fn quiet_sse_releases_connection_after_browser_disconnect() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = backend_listener();
     let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
     let (release, wait) = std::sync::mpsc::channel();
     let upstream = std::thread::spawn(move || {
@@ -617,7 +628,7 @@ fn quiet_sse_releases_connection_after_browser_disconnect() {
 
 #[test]
 fn upstream_rejects_before_browser_finishes_upload() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = backend_listener();
     let (_dir, store, cookie) = fixture(listener.local_addr().unwrap().port());
     let upstream = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();

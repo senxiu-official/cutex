@@ -140,6 +140,7 @@ pub fn set_cutex_session_managed_cwd(
         .get_mut(&key)
         .ok_or_else(|| anyhow::anyhow!("cutex session disappeared while updating cwd: {key}"))?;
     record.managed_cwd = managed_cwd.map(|cwd| super::metadata::normalize_session_cwd(&cwd));
+    crate::agent_management::creator_paths::owner_reapprove(record)?;
     record.bump_durable_revision()?;
     record.updated_at = chrono::Utc::now().to_rfc3339();
     Ok(CutexSessionUpdateOutcome {

@@ -71,6 +71,10 @@ pub fn update_cutex_session_runtime_defaults_by_key(
     if record.is_retired() {
         anyhow::bail!("cutex session is retired: {key}");
     }
+    let owner_paths=patch.managed_cwd!=CutexSessionValueUpdate::Unchanged
+        ||patch.permission_defaults!=CutexSessionValueUpdate::Unchanged
+        ||patch.approval_policy!=CutexSessionValueUpdate::Unchanged
+        ||patch.sandbox_mode!=CutexSessionValueUpdate::Unchanged;
     if let Some(runtime_backend) = patch.runtime_backend {
         record.runtime_backend = runtime_backend;
     }
@@ -81,6 +85,7 @@ pub fn update_cutex_session_runtime_defaults_by_key(
     apply_optional_string_patch(&mut record.approval_policy, patch.approval_policy);
     apply_optional_string_patch(&mut record.sandbox_mode, patch.sandbox_mode);
     crate::runtime::args::reconcile_patched_permissions(record, alias_written, sandbox_written)?;
+    if owner_paths {crate::agent_management::creator_paths::owner_reapprove(record)?;}
     apply_optional_string_patch(&mut record.model_defaults, patch.model_defaults);
     apply_optional_string_patch(&mut record.reasoning_defaults, patch.reasoning_defaults);
     if let Some(args) = patch.default_cli_args {

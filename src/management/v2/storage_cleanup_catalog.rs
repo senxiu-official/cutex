@@ -300,7 +300,7 @@ fn healthy_db(root: &Path, relative: &Path, sessions: bool) -> Result<()> {
             }
         }
     }
-    let db = Connection::open_with_flags(
+    let mut db = Connection::open_with_flags(
         root.join(relative),
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX

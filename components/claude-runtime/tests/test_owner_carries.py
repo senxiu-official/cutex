@@ -7,12 +7,12 @@ import pytest
 
 from cute_claude.busy_delivery import BusyDelivery
 from cute_claude.errors import RpcError
-from cute_claude.external_input import semantic_digest
+from cute_claude.external_input import ExternalInputService, semantic_digest
 from cute_claude.store import dump
 from test_persistent import ph, until  # noqa: F401
 from test_questions_plan import begin
 from test_perms_steer import steer, post_hook, PNG
-from test_r8_services import envelope, install
+from test_r8_services import envelope, install, invoke
 from test_autonomous_turns import started, autonomous
 from test_r35_context_timing import held, proof, write  # noqa: F401
 
@@ -328,3 +328,165 @@ async def test_image_only_carrier_keeps_external_text_verbatim(ph, busy_fallback
     assert shown['type'] == 'userMessage' and shown['clientId'] == client_id
     assert shown['content'] == [image], 'image-only display must not gain external or invented owner text'
     assert service._status(tid, 'notice', value['semanticSha256'])['receipt']['turnId'] == turn
+
+
+def carry_key(value):
+    return {'messageId': value['message']['id'], 'semanticSha256': value['semanticSha256']}
+
+
+async def take_back(ph, service, values):
+    binding = {key: values[0][key] for key in ('ownerId', 'threadId', 'runtimeGeneration')}
+    result, _ = await service.dispatch(ph.peer, 'thread/externalInput/returnCarries',
+                                       {**binding, 'version': 1, 'messages': [carry_key(value) for value in values]})
+    return result['returned']
+
+
+async def test_a_dropped_steer_returns_its_unread_notes_once_and_they_can_go_out_again(ph):
+    tid, turn, bridge = await begin(ph)
+    service = install(ph, subscription=True)
+    assert service.capabilities()['ownerCarryReturn'] == 1
+    value = carried(tid)
+    await ph.call('turn/steer', steer(tid, 'OWNER', ownerCarries=[value]))
+    assert await take_back(ph, service, [value]) == [], 'its steer can still read it'
+    ph.store.drop_unread_steers(tid)
+    await bridge.end_turn()
+    ph.store.finish(tid, turn, 'interrupted')
+    assert await take_back(ph, service, [value]) == ['notice']
+    # A lost answer: asking again gets the same answer, nothing else changes.
+    assert await take_back(ph, service, [value]) == ['notice']
+    assert ph.store.db.execute('SELECT count(*) FROM notes').fetchone()[0] == 0
+    status = service._status(tid, 'notice', value['semanticSha256'])
+    assert status['deliveryState'] == 'unknown' and status['processing']['state'] == 'none'
+    # cutex submits it on its own now, under the same identity: exactly one copy.
+    independent = {**value, 'message': {**value['message'], 'delivery': 'passive'}}
+    independent['semanticSha256'] = semantic_digest(independent)
+    await service.dispatch(ph.peer, 'thread/externalInput/submit', independent)
+    assert ph.store.db.execute("SELECT count(*) FROM notes WHERE message_id='notice'").fetchone()[0] == 1
+    assert await take_back(ph, service, [independent]) == [], 'no longer carried'
+    assert await take_back(ph, service, [value]) == [], 'the old key is no proof any more'
+    following = await ph.turn(tid, 'NEXT')
+    await ph.drain()
+    assert dump(ph.sdk.clients[0].messages).count('NOTICE @not-an-owner-path') == 1
+    assert service._status(tid, 'notice', independent['semanticSha256'])['receipt']['turnId'] == following
+
+
+@pytest.mark.parametrize('case', ['offered', 'completed', 'wrong-digest', 'claimed-as-turn'])
+async def test_a_note_not_proven_unread_stays_where_it_is(ph, case):
+    tid, turn, bridge = await begin(ph)
+    service = install(ph, subscription=True)
+    value = carried(tid)
+    await ph.call('turn/steer', steer(tid, 'OWNER', ownerCarries=[value]))
+    asked = value
+    if case == 'offered':
+        await post_hook(ph, bridge)
+        ph.store.drop_unread_steers(tid)
+        await bridge.end_turn()
+        ph.store.finish(tid, turn, 'interrupted')
+    elif case == 'completed':
+        # The steer waits for the next turn: it can still read the note.
+        await bridge.end_turn()
+        ph.store.finish(tid, turn, 'completed')
+    elif case == 'wrong-digest':
+        ph.store.drop_unread_steers(tid)
+        asked = {**value, 'semanticSha256': '0' * 64}
+    elif case == 'claimed-as-turn':
+        # Its own turn read the note, and that turn was then interrupted.
+        await bridge.end_turn()
+        ph.store.finish(tid, turn, 'completed')
+        claimed = ph.store.claim(tid)
+        ph.store.finish(tid, claimed['turn_id'], 'interrupted')
+    before = [dict(row) for row in ph.store.db.execute('SELECT * FROM notes')]
+    assert await take_back(ph, service, [asked]) == []
+    assert [dict(row) for row in ph.store.db.execute('SELECT * FROM notes')] == before
+    assert service._row(tid, 'notice') is not None
+
+
+async def test_a_restored_steer_cannot_read_a_note_already_returned(ph):
+    tid, turn, bridge = await begin(ph)
+    service = install(ph, subscription=True)
+    value = carried(tid)
+    await ph.call('turn/steer', steer(tid, 'OWNER', ownerCarries=[value]))
+    dropped = ph.store.drop_unread_steers(tid)
+    assert await take_back(ph, service, [value]) == ['notice']
+    # The interrupt failed: the steer waits for its turn again, without the note.
+    ph.store.restore_steers(tid, dropped)
+    context = (await post_hook(ph, bridge))['hookSpecificOutput']['additionalContext']
+    assert context.endswith('OWNER') and 'NOTICE' not in context
+
+
+async def test_the_returned_proof_survives_a_restart(ph):
+    tid, turn, bridge = await begin(ph)
+    service = install(ph, subscription=True)
+    value = carried(tid)
+    await ph.call('turn/steer', steer(tid, 'OWNER', ownerCarries=[value]))
+    ph.store.drop_unread_steers(tid)
+    assert await take_back(ph, service, [value]) == ['notice']
+    await bridge.end_turn()
+    ph.store.finish(tid, turn, 'interrupted')
+    again = ExternalInputService(ph.server)
+    assert again._return_carries(tid, [carry_key(value)]) == ['notice']
+
+
+async def test_resending_a_dropped_steer_alone_runs_it_once_and_returns_its_notes(ph):
+    tid, turn, bridge = await begin(ph)
+    service = install(ph, subscription=True)
+    value = carried(tid)
+    params = steer(tid, 'OWNER', ownerCarries=[value])
+    await ph.call('turn/steer', params)
+    ph.store.drop_unread_steers(tid)
+    alone = {key: item for key, item in params.items() if key != 'ownerCarries'}
+    await ph.call('turn/steer', alone)
+    await ph.call('turn/steer', alone)
+    assert await take_back(ph, service, [value]) == ['notice'], 'the resend took it back'
+    context = (await post_hook(ph, bridge))['hookSpecificOutput']['additionalContext']
+    assert context.count('OWNER') == 1 and 'NOTICE' not in context
+    assert ph.store.db.execute("SELECT count(*) FROM inputs WHERE message_id='steer-c-1'").fetchone()[0] == 1
+
+
+async def test_a_note_this_runtime_never_received_is_not_returned(ph):
+    # A cutex crash after its reservation, before any native request.
+    tid, turn, bridge = await begin(ph)
+    service = install(ph, subscription=True)
+    assert await take_back(ph, service, [carried(tid, 'never-sent')]) == []
+
+
+@pytest.mark.parametrize('case', ['read', 'still-queued'])
+async def test_a_steer_not_proven_dropped_is_never_run_again(ph, case):
+    tid, turn, bridge = await begin(ph)
+    install(ph, subscription=True)
+    params = steer(tid, 'OWNER')
+    await ph.call('turn/steer', params)
+    if case == 'read':
+        await post_hook(ph, bridge)
+        ph.store.drop_unread_steers(tid)
+    await ph.call('turn/steer', params)
+    rows = ph.store.db.execute("SELECT state FROM inputs WHERE message_id='steer-c-1'").fetchall()
+    assert len(rows) == 1 and rows[0][0] == ('injecting' if case == 'read' else 'queued')
+    if case == 'read':
+        assert (await post_hook(ph, bridge, 'second')) == {}
+
+
+async def test_explicit_retry_uses_fresh_native_id_when_old_carry_stays_reserved(ph):
+    """Reproduce native dedup, then the daemon's stable-source/new-attempt retry."""
+    tid, turn, bridge = await begin(ph)
+    service = install(ph, subscription=True)
+    old = carried(tid)
+    await ph.call('turn/steer', steer(tid, 'OWNER', ownerCarries=[old]))
+    ph.store.drop_unread_steers(tid)
+    await bridge.end_turn()
+    ph.store.finish(tid, turn, 'interrupted')
+    # No returnCarries handshake: native still holds this id. Repeating the
+    # original submit cannot turn its reserved carry into an independent input.
+    await invoke(service, ph, 'submit', old)
+    following = await ph.turn(tid, 'NEXT')
+    await ph.drain()
+    assert 'NOTICE @not-an-owner-path' not in dump(ph.sdk.clients[0].messages)
+    assert service._status(tid, 'notice', old['semanticSha256'])['receipt'] is None
+    # Same source content and view; a fresh daemon attempt bypasses that id.
+    retried = {**old, 'message': {**old['message'], 'id': 'bus-retry:11111111111141118111111111111111:notice'}}
+    retried['semanticSha256'] = semantic_digest(retried)
+    await invoke(service, ph, 'submit', retried)
+    await ph.drain()
+    await until(lambda: service._status(tid, retried['message']['id'], retried['semanticSha256'])['receipt'] is not None)
+    assert dump(ph.sdk.clients[0].messages).count('NOTICE @not-an-owner-path') == 1
+    assert service._status(tid, 'notice', old['semanticSha256'])['receipt'] is None

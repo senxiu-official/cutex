@@ -62,8 +62,14 @@ class BusyDelivery:
 
     def client_id(self, tid, mid):
         row = self.store.db.execute('SELECT payload FROM inputs WHERE thread_id=? AND message_id=?', (tid, mid)).fetchone()
-        value = json.loads(row[0]).get('clientId') if row else None
-        return value if isinstance(value, str) and value.strip() else None
+        payload = json.loads(row[0]) if row else {}
+        value = payload.get('clientId')
+        if isinstance(value, str) and value.strip():
+            return value
+        if payload.get('metadata', {}).get('nativeExternalInput') is True:
+            return mid
+        external = self.store.db.execute('SELECT 1 FROM external_inputs WHERE thread_id=? AND message_id=?', (tid, mid)).fetchone()
+        return mid if external else None
 
     def stage(self, tid, mid, turn_id, stage):
         """Commit monotonic progress synchronously with the input/hook claim.

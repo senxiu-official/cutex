@@ -305,6 +305,7 @@ pub fn run_legacy_migration_at(
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<Option<Vec<String>>> {
     use anyhow::Context;
+    let _config_guard = super::store::config_write_lock(&cutex_dir.join("config.json"))?;
     let archive = cutex_dir.join(LEGACY_MIGRATION_ARCHIVE);
     let record_path = archive.join(LEGACY_MIGRATION_RECORD);
     if record_path.exists() {

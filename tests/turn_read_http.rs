@@ -82,6 +82,7 @@ fn context() -> ManagementRequestContext {
         owner_archive_action: |_, _| unreachable!(),
         durable_agent_candidates: |_| unreachable!(),
         import_durable_agent: |_, _| unreachable!(),
+        promote_quick_chat: |_, _, _| panic!("unexpected quick chat promotion"),
         load_registry: || Ok(Default::default()),
         load_runtime_status: |id| {
             Ok(fixtures().get(id).filter(|f| f.online).map(|_| {

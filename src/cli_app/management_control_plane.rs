@@ -24,6 +24,11 @@ pub(super) struct ManagementControlClient {
 }
 
 impl ManagementControlClient {
+    pub(super) fn reapprove_paths(&self, id: &str) -> anyhow::Result<serde_json::Value> {
+        let id: String = url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+        self.request("POST", &format!("/v2/sessions/{id}/reapprove-paths"), Some(b"{}"))
+    }
+
     pub(super) fn native_recovery(
         &self,
         request: &cutex::app_server::external_recovery::RecoveryRequest,

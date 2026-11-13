@@ -10,6 +10,9 @@
 pub mod harness;
 pub mod idle_note;
 pub mod instructions;
+#[cfg(test)]
+#[path = "test_support_switch.rs"]
+pub(crate) mod switch_test_support;
 pub mod scope;
 pub mod store;
 

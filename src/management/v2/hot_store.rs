@@ -121,7 +121,34 @@ fn connection(path: &Path) -> anyhow::Result<Connection> {
         (json_extract(CAST(value_json AS TEXT),'$.canonicalEnvelope.controlType'), json_extract(CAST(value_json AS TEXT),'$.canonicalEnvelope.from'),row_key) WHERE {MANAGEMENT_START_ROWS};
         CREATE INDEX IF NOT EXISTS agent_bus_settlement_outbox ON hot_store_rows(row_key) WHERE {SETTLEMENT_OUTBOX_ROWS};
         CREATE INDEX IF NOT EXISTS agent_bus_finished_time ON hot_store_rows({FINISHED_TIME},row_key) WHERE {FINISHED_ROWS};"))?;
+    db.execute_batch(&format!("CREATE INDEX IF NOT EXISTS asks_pending_notice_requester ON hot_store_rows
+        (json_extract(CAST(value_json AS TEXT),'$.requesterCutexSessionId'),{ASK_NOTICE_TIME},row_key) WHERE {ASK_PENDING_NOTICE};
+        CREATE INDEX IF NOT EXISTS asks_pending_notice_ask ON hot_store_rows
+        (json_extract(CAST(value_json AS TEXT),'$.askId'),{ASK_NOTICE_TIME},row_key) WHERE {ASK_PENDING_NOTICE};"))?;
     Ok(db)
+}
+
+const ASK_PENDING_NOTICE: &str = "store='asks' AND collection='deliveries' AND json_extract(CAST(value_json AS TEXT),'$.state')='pending'";
+// Conservative millisecond prefilter; the caller rechecks exact RFC3339 time.
+const ASK_NOTICE_TIME: &str = "IFNULL(CASE WHEN json_extract(CAST(value_json AS TEXT),'$.createdAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt]*' THEN julianday(json_extract(CAST(value_json AS TEXT),'$.createdAt')) ELSE NULL END,-1.0e100)";
+
+/// Indexed candidate identities only: no delivery bodies or unrelated asks.
+pub(crate) fn pending_notice_keys(db: &Connection, requester: &str, role_asks: &[String], before: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let query_for = |index: &str, field: &str| format!("SELECT row_key FROM hot_store_rows INDEXED BY {index} WHERE {ASK_PENDING_NOTICE}
+        AND json_extract(CAST(value_json AS TEXT),'$.{field}')=?1 AND {ASK_NOTICE_TIME}<=IFNULL(julianday(?2),1.0e100) ORDER BY row_key");
+    let mut ids = std::collections::BTreeSet::new();
+    let mut query = db.prepare(&query_for("asks_pending_notice_requester", "requesterCutexSessionId"))?;
+    let keys=query.query_map(params![requester,before], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut visited=keys.len() as u64;
+    ids.extend(keys);
+    let mut query = db.prepare(&query_for("asks_pending_notice_ask", "askId"))?;
+    for ask in role_asks {
+        let keys=query.query_map(params![ask,before], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        visited+=keys.len() as u64;
+        ids.extend(keys);
+    }
+    crate::store::metrics::note("asks", crate::store::OpCounts { sql_statements: 1 + role_asks.len() as u64, rows_visited: visited, ..Default::default() });
+    Ok(ids.into_iter().collect())
 }
 
 /// Selected owner's frozen IDs, including settled carries, without retaining history.
@@ -663,6 +690,36 @@ pub fn has_store(path: &Path, store: &str) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_notice_keys_use_requester_time_and_role_ask_indexes() {
+        let root = std::env::temp_dir().join(format!("cutex-notice-index-{}", uuid::Uuid::new_v4()));
+        let path = root.join(DATABASE_FILE);
+        let mut rows = Vec::new();
+        for n in 0..500 {
+            rows.push(RowChange::Put { collection:"deliveries".into(), key:format!("unrelated-{n}"),
+                value:serde_json::to_vec(&serde_json::json!({"state":"pending","requesterCutexSessionId":"other","askId":"other-ask","createdAt":"2026-11-09T00:00:00Z"})).unwrap() });
+        }
+        for (id,recipient,ask,state,time) in [
+            ("mine","caller","own","pending","2026-11-09T00:00:00Z"),
+            ("role","former","role-ask","pending","2026-11-09T11:00:00+11:00"),
+            ("queued","caller","own","queuedAsEvent","2026-11-09T00:00:00Z"),
+        ] {
+            rows.push(RowChange::Put {collection:"deliveries".into(),key:id.into(),value:serde_json::to_vec(&serde_json::json!({"state":state,"requesterCutexSessionId":recipient,"askId":ask,"createdAt":time})).unwrap()});
+        }
+        commit(&path,"asks",0,rows).unwrap();
+        let db = connection(&path).unwrap();
+        assert_eq!(pending_notice_keys(&db,"caller",&[],None).unwrap(),vec!["mine"]);
+        assert_eq!(pending_notice_keys(&db,"caller",&["role-ask".into()],Some("2026-11-09T00:00:00.0001Z")).unwrap(),vec!["mine","role"]);
+        assert!(pending_notice_keys(&db,"caller",&["role-ask".into()],Some("2026-11-08T00:00:00Z")).unwrap().is_empty());
+        for (index,field) in [("asks_pending_notice_requester","requesterCutexSessionId"),("asks_pending_notice_ask","askId")] {
+            let sql=format!("EXPLAIN QUERY PLAN SELECT row_key FROM hot_store_rows INDEXED BY {index} WHERE {ASK_PENDING_NOTICE} AND json_extract(CAST(value_json AS TEXT),'$.{field}')=?1 AND {ASK_NOTICE_TIME}<?2");
+            let plan=db.prepare(&sql).unwrap().query_map(params!["caller",1.0e100],|row|row.get::<_,String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap().join(" ");
+            assert!(plan.contains("SEARCH") && plan.contains(index),"{plan}");
+        }
+        drop(db);
+        let _=std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn selected_rows_and_generation_share_one_wal_snapshot() {

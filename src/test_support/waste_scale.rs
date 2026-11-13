@@ -54,6 +54,7 @@ pub fn roster_with_agents() -> crate::agent_management::AgentManagementSnapshot 
                 cutex_session_id: id,
                 native_session_id: format!("native-scale-{n}"),
                 spec: ManagedAgentSpec {
+                    memory_injection: true,
                     name: format!("synthetic-{n}"),
                     cwd: std::env::temp_dir().to_string_lossy().into_owned(),
                     profile: Some("synthetic-profile".into()),

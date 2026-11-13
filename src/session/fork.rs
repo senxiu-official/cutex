@@ -72,6 +72,12 @@ pub fn inherit_fork_avatar(source: &crate::session::model::CutexSessionRecord, t
     };
 }
 
+/// Creation-time preferences inherited by every runtime's same/cross-profile fork.
+pub fn inherit_fork_preferences(source: &crate::session::model::CutexSessionRecord, target: &mut crate::session::model::CutexSessionRecord) {
+    inherit_fork_avatar(source, target);
+    target.memory_injection = source.memory_injection;
+}
+
 /// Account-specific encrypted reasoning / thinking signatures must never be silently stripped.
 pub fn signature_rejection(text: &str) -> bool {
     let text = text.to_ascii_lowercase();

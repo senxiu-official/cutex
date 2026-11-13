@@ -65,6 +65,7 @@ pub fn session_online_resume_plan(
     record: &CutexSessionRecord,
     account: &StoredAccount,
 ) -> anyhow::Result<SessionOnlineResumePlan> {
+    crate::agent_management::creator_paths::before_start(record)?;
     let mut codex_args = session_online_base_codex_args(record, account)?;
     let codex_session_id = record
         .codex_session_id
@@ -201,6 +202,7 @@ pub fn finalize_session_online_launch(
     base_launch: LaunchCommand,
     resume_plan: &SessionOnlineResumePlan,
 ) -> anyhow::Result<SessionOnlineLaunch> {
+    crate::agent_management::creator_paths::before_start(record)?;
     let launch = session_online_agent_identity_env(
         session_online_terminal_color_env(base_launch),
         account,

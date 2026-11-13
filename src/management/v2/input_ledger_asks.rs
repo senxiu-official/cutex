@@ -17,8 +17,17 @@ fn store() -> Result<crate::asks::store::AskStore, String> {
 /// `outcomeUnknown` delegation (delegation-de84ad) is closed without a
 /// retry and without native IO; a pending result / question / status is
 /// settled and never sent.
-pub(crate) fn dismiss(record: &InputRecord) -> Result<(), String> {
-    crate::asks::ledger::dismiss(&store()?, record, chrono::Utc::now())
+pub(crate) fn dismiss(record: &InputRecord) -> Result<bool, String> {
+    let store = store()?;
+    crate::asks::ledger::dismiss(&store, record, chrono::Utc::now())?;
+    // Queued/in-flight deliveries are not withdrawn by the source operation.
+    // Only its durable owner settlement authorizes metadata-tolerant completion.
+    store.project_snapshot(|state| {
+        record.kind != crate::management::v2::input_ledger::InputKind::DelegationRequest
+            && state.deliveries.get(&record.input_id).is_some_and(|delivery|
+                delivery.state == crate::asks::model::DeliveryState::Acknowledged
+                    && delivery.settled_by.as_deref() == Some(crate::asks::ledger::DISMISSED))
+    }).map_err(|error| format!("{error:#}"))
 }
 
 /// `cutex/input/lease/release {expectedLease}` (§2.14): compare-and-delete

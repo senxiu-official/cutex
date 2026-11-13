@@ -646,6 +646,28 @@ class Store:
             dropped.append(row["seq"])
         return dropped
 
+    def steer_dropped_unread(self, tid: str, mid: str) -> bool:
+        """`mid` is a steer `drop_unread_steers` took out and nothing read: no
+        hook offered it (no context turn) and it never started a turn of its own."""
+        row = self.db.execute("SELECT state,turn_id,payload FROM inputs WHERE thread_id=? AND message_id=?", (tid, mid)).fetchone()
+        if row is None or row["state"] != "interrupted":
+            return False
+        payload = json.loads(row["payload"])
+        if payload.get("source", {}).get("kind") != "user" or (payload.get("metadata") or {}).get("steer") is not True:
+            return False
+        if self.db.execute("SELECT 1 FROM turns WHERE id=?", (row["turn_id"],)).fetchone():
+            return False
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='busy_inputs'").fetchone():
+            return True
+        busy = self.db.execute("SELECT context_turn_id FROM busy_inputs WHERE thread_id=? AND message_id=?", (tid, mid)).fetchone()
+        return busy is None or busy[0] is None
+
+    def forget_dropped_steer(self, tid: str, mid: str) -> None:
+        """The owner sends a dropped steer again under its id: a new input."""
+        self.db.execute("DELETE FROM inputs WHERE thread_id=? AND message_id=?", (tid, mid))
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='busy_inputs'").fetchone():
+            self.db.execute("DELETE FROM busy_inputs WHERE thread_id=? AND message_id=?", (tid, mid))
+
     def restore_steers(self, tid: str, seqs: list[int]) -> None:
         """Undo an interrupt-time drop when the interrupt request itself failed
         and the turn keeps running (its steers then still wait for it)."""

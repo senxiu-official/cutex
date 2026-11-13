@@ -79,6 +79,7 @@ fn context() -> ManagementRequestContext {
         owner_archive_action: |_, _| unreachable!(),
         durable_agent_candidates: |_| unreachable!(),
         import_durable_agent: |_, _| unreachable!(),
+        promote_quick_chat: |_, _, _| panic!("unexpected quick chat promotion"),
         load_registry: || Ok(Default::default()),
         load_runtime_status: |id| {
             Ok(fixtures().get(id).filter(|f| f.online).map(|_| {
@@ -255,7 +256,8 @@ fn watches_do_not_starve_reads_and_stream_permits_return_on_disconnect() {
         std::env::var_os("CUTEX_TEST_PRIVATE_HOME").expect("private home required"),
     );
     assert!(parent.join(".cutex-test-private-home").is_file());
-    let home = parent.join("stream-http");
+    // The fixture is also included by example harnesses in the same Cargo run.
+    let home = parent.join(format!("stream-http-{}", uuid::Uuid::new_v4()));
     let workspace = home.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(

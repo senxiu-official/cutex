@@ -245,6 +245,10 @@ fn serve_with_supervisor(
                 break;
             }
         };
+        if let Err(refusal) = record.require_view() {
+            let _ = error(stream, refusal.status, refusal.code);
+            break;
+        }
         if record.archived {
             let _ = error(stream, 409, "service_archived");
             break;

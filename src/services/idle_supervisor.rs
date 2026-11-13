@@ -14,7 +14,7 @@ impl Supervisor {
     pub(super) fn stop_idle_services(self: &Arc<Self>) {
         self.stop_idle_services_at(chrono::Utc::now());
     }
-    fn stop_idle_services_at(self: &Arc<Self>, now: chrono::DateTime<chrono::Utc>) {
+    pub(super) fn stop_idle_services_at(self: &Arc<Self>, now: chrono::DateTime<chrono::Utc>) {
         let slugs: Vec<_> = self
             .inner
             .lock()
@@ -166,7 +166,7 @@ impl Supervisor {
             if !alive || Instant::now() >= deadline {
                 break false;
             }
-            if super::super::health::probe_until(record.port, record.path.as_deref(), deadline) {
+            if record.runtime == ServiceRuntime::Worker || super::super::health::probe_until(record.port, record.path.as_deref(), deadline) {
                 break true;
             }
             std::thread::sleep(Duration::from_millis(100));

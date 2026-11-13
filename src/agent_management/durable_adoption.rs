@@ -216,7 +216,7 @@ impl AgentManagementProvider {
                     apply_creation_defaults(record, defaults)?;
                 }
                 if let Some(source) = fork_source {
-                    crate::session::fork::inherit_fork_avatar(source, record);
+                    crate::session::fork::inherit_fork_preferences(source, record);
                 }
                 record.stamp_created_by_at_creation(created_by)?;
                 let mut candidate=record.clone();

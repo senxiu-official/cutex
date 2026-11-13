@@ -365,6 +365,7 @@ fn every_creation_path_supports_or_explicitly_refuses_each_runtime_kind() {
 
     // 3. Agent-initiated agent_create (configuration check + bootstrap_native).
     let spec = |name: &str, profile: &str| cutex::agent_management::ManagedAgentSpec {
+        memory_injection: true,
         name: name.into(),
         cwd: work.clone(),
         profile: Some(profile.into()),

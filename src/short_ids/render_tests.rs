@@ -187,7 +187,8 @@ fn isolated_rendering_keeps_full_mode_and_raw_content_and_does_not_nest_ask_lock
     assert_eq!(
         full_ask,
         ask_text
-            .replace(&display_short(&ask.ask_id), &agent_id(&ask.ask_id))
+            .replace(&format!("[delegation {} ·", display_short(&ask.ask_id)),
+                &format!("[delegation {} ·", agent_id(&ask.ask_id)))
             .replace("cutex.…0000a1", REQUESTER)
     );
     std::fs::write(home.join("render-evidence.json"),serde_json::to_vec_pretty(&json!({"ask":ask_text,"answer":answer_text,"overlength":notice,"sender":shown,"harness":harness,"fullModeByteEquality":true})).unwrap()).unwrap();

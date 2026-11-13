@@ -155,6 +155,7 @@ pub(super) fn dispatch_session_retire(
     let object = check_retire_fences(session, request)?;
     let result = mutate_session(cutex_session_id, &request.method, request.params.clone())?;
     validate_archive_transition_result(&result, cutex_session_id, "retired")?;
+    super::session_cache_lifecycle::forget(cutex_session_id);
     let mut event_params = json!({
         "cutexSessionId": cutex_session_id,
         "sessionRevision": result["revision"],

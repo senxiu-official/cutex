@@ -21,6 +21,7 @@ fn agent(project_id: Option<&ProjectId>, value: &str) -> ManagedAgentRecord {
         cutex_session_id: session(value),
         native_session_id: format!("native-{value}"),
         spec: ManagedAgentSpec {
+            memory_injection: true,
             name: value.to_string(),
             cwd: format!("/tmp/{value}"),
             profile: Some("default".to_string()),
@@ -73,6 +74,7 @@ fn presentation() -> ProjectPresentationInput {
         display_name: "Optional".to_string(),
         badge_label: "OP".to_string(),
         color: ProjectPaletteColor::Green,
+        icon: None,
     }
 }
 
@@ -537,4 +539,25 @@ fn create_project_creates_a_missing_workspace_root_only_when_asked() {
     // The flag is left out of the request when false (old idempotency digests stay valid).
     let plain = serde_json::to_value(create_kind(None, None)).unwrap();
     assert!(plain.get("create_workspace_root").is_none(), "{plain}");
+}
+
+#[test]
+fn project_icon_is_saved_on_directorless_project_creation() {
+    let fixture = fixture(&[]);
+    let mut operation = create_kind(None, None);
+    if let HumanManagementProjectMutationKind::CreateProject { presentation, .. } = &mut operation {
+        presentation.icon = Some(Some(ProjectIcon { kind: ProjectIconKind::Icon, value: " folder-git ".into() }));
+    }
+    let request = request("create-icon", "icon-project", operation);
+    let receipt = run(&fixture, &request).unwrap();
+    assert_eq!(run(&fixture, &request).unwrap(), receipt);
+    super::super::icon_tests::assert_r281_mutation_records(&fixture.root);
+    let mut changed_icon = request.clone();
+    if let HumanManagementProjectMutationKind::CreateProject { presentation, .. } = &mut changed_icon.operation {
+        presentation.icon = Some(None);
+    }
+    assert!(matches!(run(&fixture, &changed_icon), Err(AgentManagementError::Conflict("action_id_payload_conflict"))));
+    let icon = summary_of(&fixture, "icon-project").presentation.icon.unwrap();
+    assert_eq!(icon.kind, ProjectIconKind::Icon);
+    assert_eq!(icon.value, "folder-git");
 }

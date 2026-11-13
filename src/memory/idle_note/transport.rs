@@ -386,11 +386,12 @@ impl RequestHook for Hook {
 
 pub fn install(handle: &AppServerHandle, session: &str, thread: &str, generation: u64) {
     best_effort(session, || {
+        let record = crate::session::store::shared_session_row(session)?
+            .context("memory session missing")?;
+        if !record.memory_injection { return Ok(()); }
         let Some(snapshot) = Snapshot::current(session)? else {
             return Ok(());
         };
-        let record = crate::session::store::shared_session_row(session)?
-            .context("memory session missing")?;
         let route = if matches!(
             record.runtime_backend,
             CutexSessionRuntimeBackend::Dsh | CutexSessionRuntimeBackend::Kimi

@@ -1931,11 +1931,14 @@ mod tests {
         })
     }
 
-    fn unique_event_context() -> AppServerRuntimeEventContext {
-        AppServerRuntimeEventContext {
+    fn unique_event_context() -> (crate::cli_app::test_home::IsolatedTestHome, AppServerRuntimeEventContext) {
+        let home = crate::cli_app::test_home::IsolatedTestHome::new("runtime-lineage").unwrap();
+        let context = AppServerRuntimeEventContext {
             cutex_session_id: format!("cutex-sink-{}", uuid::Uuid::new_v4()),
             ..event_context()
-        }
+        };
+        home.register_active_session(&context.cutex_session_id, cutex::session::model::CutexSessionRuntimeBackend::CuteAlden, context.runtime_generation);
+        (home, context)
     }
 
     type Published = Vec<(Option<String>, PublishScope)>;
@@ -1980,7 +1983,7 @@ mod tests {
 
     #[test]
     fn runtime_sink_buffers_unknown_threads_and_ignores_rejected_ones() {
-        let context = unique_event_context();
+        let (_home, context) = unique_event_context();
         let (mut published, mut resolves) = (Vec::new(), Vec::new());
 
         assert_eq!(
@@ -2013,7 +2016,7 @@ mod tests {
 
     #[test]
     fn runtime_sink_flushes_subagent_events_with_native_thread_id_after_spawn_item() {
-        let context = unique_event_context();
+        let (_home, context) = unique_event_context();
         let (mut published, mut resolves) = (Vec::new(), Vec::new());
 
         // The child starts emitting before the parent's spawn item completes.
@@ -2057,7 +2060,7 @@ mod tests {
 
     #[test]
     fn runtime_sink_publishes_verified_subagent_server_requests() {
-        let context = unique_event_context();
+        let (_home, context) = unique_event_context();
         let (mut published, mut resolves) = (Vec::new(), Vec::new());
         assert!(subagent_lineage::record_edge(
             &context.cutex_session_id,

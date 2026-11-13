@@ -757,6 +757,7 @@ fn save_editor(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
             display_name: editor.display_name.clone(),
             badge_label: editor.badge_label.clone(),
             color,
+            icon: None,
         },
     };
     model
@@ -800,6 +801,7 @@ fn save_project_create(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
                 display_name: editor.display_name.clone(),
                 badge_label: editor.badge_label.clone(),
                 color: editor.color.parse::<ProjectPaletteColor>()?,
+                icon: None,
             },
         },
     };
@@ -4053,6 +4055,7 @@ mod tests {
                     display_name: "ScPolyA 中文".into(),
                     badge_label: "SP".into(),
                     color: ProjectPaletteColor::Cyan,
+                    icon: None,
                 },
             },
         };
@@ -4837,6 +4840,7 @@ mod tests {
                 cutex_session_id: CutexSessionId::new("cutex.archived").unwrap(),
                 native_session_id: "native-archived".into(),
                 spec: ManagedAgentSpec {
+                    memory_injection: true,
                     name: "Formal Archived Agent".into(),
                     cwd: "/private/archived".into(),
                     profile: Some("orchid".into()),
@@ -4873,6 +4877,7 @@ mod tests {
                 display_name: "Render Lab".into(),
                 badge_label: "CX".into(),
                 color: ProjectPaletteColor::Magenta,
+                icon: None,
                 revision: 2,
                 stored: true,
             },

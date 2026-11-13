@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use serde_json::Value;
@@ -562,13 +562,14 @@ pub fn read_complete_session_turn(
     forward_native: ManagementNativeRequestHandler,
     open_offline: OfflineHistoryEndpointOpener,
 ) -> Result<Option<(CompleteHistoryTurn, LaterTurns)>, HistoryCallError> {
+    let mut offline_reader = OfflineReader::new(cutex_session_id, open_offline);
     let (result, source) = read_complete_session_turn_with(
         cutex_session_id,
         session,
         turn_id,
         later_limit,
         &mut |method, params| live_call(forward_native, cutex_session_id, method, params),
-        &mut |method, params| offline_call(cutex_session_id, open_offline, method, params),
+        &mut |method, params| offline_reader.call(method, params),
     )?;
     if source == "live" {
         evict_offline_reader(cutex_session_id);
@@ -586,11 +587,12 @@ pub fn read_complete_session_turn_paged(
     forward_native: ManagementNativeRequestHandler,
     open_offline: OfflineHistoryEndpointOpener,
 ) -> Result<Option<CompleteHistoryTurn>, HistoryCallError> {
+    let mut offline_reader = OfflineReader::new(cutex_session_id, open_offline);
     let (result, source) = read_complete_session_turn_with(cutex_session_id, session, turn_id, 0,
         &mut |method, params| paged_history_call(method, params,
             &mut |method, params| live_call(forward_native, cutex_session_id, method, params)),
         &mut |method, params| paged_history_call(method, params,
-            &mut |method, params| offline_call(cutex_session_id, open_offline, method, params)),
+            &mut |method, params| offline_reader.call(method, params)),
     )?;
     if source == "live" { evict_offline_reader(cutex_session_id); }
     Ok(result.map(|(turn, _)| turn))
@@ -911,6 +913,56 @@ impl CodexEndpointFactory for SessionReaderFactory {
 }
 
 static READERS: OnceLock<Mutex<HashMap<String, Arc<CodexConfigHost>>>> = OnceLock::new();
+// Inactive sessions share two warm slots; they never repopulate the per-agent
+// active cache. Entries and processes expire after the same idle timeout.
+type ArchivedReader = (Arc<CodexConfigHost>, Instant, Option<u64>);
+static ARCHIVED_READERS: OnceLock<Mutex<HashMap<String, ArchivedReader>>> = OnceLock::new();
+
+fn archived_readers() -> std::sync::MutexGuard<'static, HashMap<String, ArchivedReader>> {
+    ARCHIVED_READERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn archived_reader(session: &str, create: impl FnOnce() -> Arc<CodexConfigHost>) -> Arc<CodexConfigHost> {
+    let (host, evicted) = {
+        let mut pool = archived_readers();
+        let now = Instant::now();
+        let expired: Vec<_> = pool.iter().filter(|(_, (_, used, _))| now.duration_since(*used) >= READER_KEEP_WARM).map(|(id, _)| id.clone()).collect();
+        let mut evicted = Vec::new();
+        for id in expired { evicted.push(pool.remove(&id).unwrap().0); }
+        if !pool.contains_key(session) && pool.len() >= 2 {
+            let oldest = pool.iter().min_by_key(|(_, (_, used, _))| *used).unwrap().0.clone();
+            evicted.push(pool.remove(&oldest).unwrap().0);
+        }
+        let selected = pool.entry(session.to_string()).or_insert_with(|| (create(), now, None));
+        selected.1 = now;
+        (selected.0.clone(), evicted)
+    };
+    for old in evicted { old.retire_when_idle(); }
+    host
+}
+
+fn reap_archived_reader(session: String, host: Arc<CodexConfigHost>, generation: u64) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(10));
+        if !reap_archived_once(&session, &host, generation, Instant::now()) { break; }
+    });
+}
+
+fn reap_archived_once(session: &str, host: &Arc<CodexConfigHost>, generation: u64, now: Instant) -> bool {
+    let observed_use = archived_readers().get(session).map(|entry| entry.1);
+    if host.reap(generation, now) { return true; }
+    let removed = {
+        let mut pool = archived_readers();
+        if pool.get(session).is_some_and(|(known, used, current)| Arc::ptr_eq(known, host) && *current == Some(generation) && Some(*used) == observed_use) {
+            // Revoke selection handles before removing the entry. A request
+            // that refreshed its use stamp while reap ran keeps its binding.
+            host.retire();
+            pool.remove(session)
+        } else { None }
+    };
+    drop(removed);
+    false
+}
 
 fn readers() -> std::sync::MutexGuard<'static, HashMap<String, Arc<CodexConfigHost>>> {
     READERS
@@ -920,13 +972,64 @@ fn readers() -> std::sync::MutexGuard<'static, HashMap<String, Arc<CodexConfigHo
 }
 
 /// Stop a session's warm offline reader, e.g. before its runtime starts.
-/// Returns once the reader process has exited (the endpoint's drop closes
-/// its stdin, waits, kills on timeout and reaps it).
+/// An admitted history request may finish its remaining native pages. Idle
+/// readers exit here; the last admitted request releases a retired process.
 pub fn evict_offline_reader(cutex_session_id: &str) {
-    let host = readers().remove(cutex_session_id);
-    if let Some(host) = host {
-        host.shutdown();
+    for host in take_readers(cutex_session_id) { host.retire_when_idle(); }
+}
+
+pub(super) fn cached_sessions() -> Vec<String> { readers().keys().cloned().collect() }
+
+pub(super) fn retire_cached_reader(session: &str) {
+    for host in take_readers(session) { host.retire(); }
+}
+
+fn take_readers(session: &str) -> Vec<Arc<CodexConfigHost>> {
+    let mut readers = readers();
+    let mut hosts: Vec<_> = readers.remove(session).into_iter().collect();
+    super::session_cache_lifecycle::shrink(&mut readers);
+    drop(readers);
+    if let Some((host, _, _)) = archived_readers().remove(session) { hosts.push(host); }
+    hosts
+}
+
+// Cache retirement can detach a host while an admitted request still owns it.
+// A launch/file fence must also stop those hosts. Registrations last exactly
+// as long as requests; weak host references never keep an idle reader alive.
+type AdmittedReaders = HashMap<String, Vec<(std::sync::Weak<()>, std::sync::Weak<CodexConfigHost>)>>;
+static ADMITTED_READERS: OnceLock<Mutex<AdmittedReaders>> = OnceLock::new();
+
+fn admitted_readers() -> std::sync::MutexGuard<'static, AdmittedReaders> {
+    ADMITTED_READERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct ReaderRegistration {
+    session: String,
+    identity: Arc<()>,
+}
+
+impl ReaderRegistration {
+    fn new(session: &str, host: &Arc<CodexConfigHost>) -> Self {
+        let registration = Self { session: session.to_string(), identity: Arc::new(()) };
+        admitted_readers().entry(session.to_string()).or_default().push((Arc::downgrade(&registration.identity), Arc::downgrade(host)));
+        registration
     }
+}
+
+impl Drop for ReaderRegistration {
+    fn drop(&mut self) {
+        let mut readers = admitted_readers();
+        if let Some(requests) = readers.get_mut(&self.session) {
+            let identity = Arc::downgrade(&self.identity);
+            requests.retain(|(known, _)| !known.ptr_eq(&identity));
+            if requests.is_empty() { readers.remove(&self.session); }
+        }
+        super::session_cache_lifecycle::shrink(&mut readers);
+    }
+}
+
+fn admitted_hosts(session: &str) -> Vec<Arc<CodexConfigHost>> {
+    admitted_readers().get(session).into_iter().flatten().filter_map(|(_, host)| host.upgrade()).collect()
 }
 
 static FENCES: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
@@ -967,10 +1070,15 @@ impl Drop for OfflineReaderFence {
 /// keep it from (re)starting until the guard is dropped. Only this session's
 /// reader: no other process is touched, nothing is timed. An in-flight read
 /// finishes first (`shutdown` takes the host's lock); a read that arrives
-/// later is refused as unavailable instead of spawning a new reader.
+/// later is refused as unavailable instead of spawning a new reader. Unlike
+/// runtime-start eviction this revokes remaining pages of an existing request.
 pub fn fence_offline_reader(cutex_session_id: &str) -> OfflineReaderFence {
     *fences().entry(cutex_session_id.to_string()).or_insert(0) += 1;
-    evict_offline_reader(cutex_session_id);
+    let mut hosts = take_readers(cutex_session_id);
+    for host in admitted_hosts(cutex_session_id) {
+        if !hosts.iter().any(|known| Arc::ptr_eq(known, &host)) { hosts.push(host); }
+    }
+    for host in hosts { host.close(); }
     OfflineReaderFence { cutex_session_id: cutex_session_id.to_string() }
 }
 
@@ -978,47 +1086,62 @@ pub fn fence_offline_reader(cutex_session_id: &str) -> OfflineReaderFence {
 pub fn invalidate_session(cutex_session_id: &str) {
     turn_index::invalidate(cutex_session_id);
     super::history_turns::invalidate(cutex_session_id);
-    evict_offline_reader(cutex_session_id);
+    for host in take_readers(cutex_session_id) { host.close(); }
 }
 
-fn offline_call(
-    cutex_session_id: &str,
+// One request retains one endpoint through all of its native paging calls.
+// An admitted request keeps its lease across native pages even if the runtime
+// comes online. Explicit file-mutation fences still revoke that lease.
+struct OfflineReader<'a> {
+    session: &'a str,
     open: OfflineHistoryEndpointOpener,
-    method: &str,
-    params: Value,
-) -> Result<Value, HistoryCallError> {
-    let host = readers()
-        .entry(cutex_session_id.to_string())
-        .or_insert_with(|| {
-            Arc::new(CodexConfigHost::new(
-                Box::new(SessionReaderFactory {
-                    cutex_session_id: cutex_session_id.to_string(),
-                    open,
-                }),
-                READER_KEEP_WARM,
-            ))
-        })
-        .clone();
-    let called = host.call(method, params);
-    // Evicted (or fenced) while this call ran on its own handle: never leave
-    // a reader warm in a host no one can reach to stop it.
-    let current = readers().get(cutex_session_id).is_some_and(|known| Arc::ptr_eq(known, &host));
-    if !current {
-        host.shutdown();
+    selected: Option<(Arc<CodexConfigHost>, bool, super::codex_config::HostReadLease, ReaderRegistration)>,
+}
+
+impl<'a> OfflineReader<'a> {
+    fn new(session: &'a str, open: OfflineHistoryEndpointOpener) -> Self {
+        Self { session, open, selected: None }
     }
-    let (outcome, started) = called.map_err(|error| HistoryCallError::Unavailable(error.to_string()))?;
-    if let (Some(generation), true) = (started, current) {
-        super::codex_config::spawn_reaper(host, generation);
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, HistoryCallError> {
+        if self.selected.is_none() {
+            let retain = super::session_cache_lifecycle::may_retain(self.session);
+            let create = || Arc::new(CodexConfigHost::new(Box::new(SessionReaderFactory {
+                cutex_session_id:self.session.to_string(), open:self.open,
+            }), READER_KEEP_WARM));
+            let host = if retain { readers().entry(self.session.to_string()).or_insert_with(create).clone() } else { archived_reader(self.session, create) };
+            // Register before checking the fence: a concurrent fence either
+            // sees this request or prevents it from admitting a new lease.
+            let registration = ReaderRegistration::new(self.session, &host);
+            if is_fenced(self.session) { return Err(HistoryCallError::Unavailable("the offline history reader is paused while the session's files change; retry shortly".into())); }
+            let lease = host.read_lease().map_err(|error| HistoryCallError::Unavailable(error.to_string()))?;
+            self.selected = Some((host, retain, lease, registration));
+        }
+        let (host, retain, lease, _) = self.selected.as_ref().unwrap();
+        let called = lease.call(method, params);
+        let (outcome, started) = called.map_err(|error| HistoryCallError::Unavailable(error.to_string()))?;
+        if let Some(generation) = started {
+            if *retain { super::codex_config::spawn_reaper(host.clone(), generation); }
+            else {
+                if let Some((known, _, current)) = archived_readers().get_mut(self.session) {
+                    if Arc::ptr_eq(known, host) { *current = Some(generation); }
+                }
+                reap_archived_reader(self.session.to_string(), host.clone(), generation);
+            }
+        }
+        match outcome.result {
+            Ok(value) => Ok(value),
+            Err(CatalogError::Rpc { error, .. }) => Err(HistoryCallError::Rpc(json!({
+                "code":error.code,"message":error.message,"data":error.data,
+            }))),
+            Err(error) => Err(HistoryCallError::Unavailable(error.to_string())),
+        }
     }
-    match outcome.result {
-        Ok(value) => Ok(value),
-        Err(CatalogError::Rpc { error, .. }) => Err(HistoryCallError::Rpc(json!({
-            "code": error.code,
-            "message": error.message,
-            "data": error.data,
-        }))),
-        Err(error) => Err(HistoryCallError::Unavailable(error.to_string())),
-    }
+}
+
+#[cfg(test)]
+fn offline_call(session: &str, open: OfflineHistoryEndpointOpener, method: &str, params: Value) -> Result<Value, HistoryCallError> {
+    OfflineReader::new(session, open).call(method, params)
 }
 
 fn error(
@@ -1062,6 +1185,7 @@ pub fn respond_shaped(
     forward_native: ManagementNativeRequestHandler,
     open_offline: OfflineHistoryEndpointOpener,
 ) -> HistoryResponse {
+    let mut offline_reader = OfflineReader::new(cutex_session_id, open_offline);
     let response = respond_read_shaped_with(
         cutex_session_id,
         session,
@@ -1069,7 +1193,7 @@ pub fn respond_shaped(
         None,
         shaper,
         &mut |method, params| live_call(forward_native, cutex_session_id, method, params),
-        &mut |method, params| offline_call(cutex_session_id, open_offline, method, params),
+        &mut |method, params| offline_reader.call(method, params),
     );
     if response.body.get("source").and_then(Value::as_str) == Some("live") {
         // The runtime owns the home again; never keep a second process on it.
@@ -1096,13 +1220,14 @@ pub fn respond_turn(
     forward_native: ManagementNativeRequestHandler,
     open_offline: OfflineHistoryEndpointOpener,
 ) -> HistoryResponse {
+    let mut offline_reader = OfflineReader::new(cutex_session_id, open_offline);
     let response = respond_read_with(
         cutex_session_id,
         session,
         None,
         Some(turn_id),
         &mut |method, params| live_call(forward_native, cutex_session_id, method, params),
-        &mut |method, params| offline_call(cutex_session_id, open_offline, method, params),
+        &mut |method, params| offline_reader.call(method, params),
     );
     if response.body.get("source").and_then(Value::as_str) == Some("live") {
         evict_offline_reader(cutex_session_id);
@@ -1267,7 +1392,7 @@ pub(super) mod reader_probe {
 
     static DIRS: Mutex<Vec<(String, PathBuf, usize)>> = Mutex::new(Vec::new());
 
-    fn open(id: &str) -> anyhow::Result<(Box<dyn crate::catalog::CatalogEndpoint>, PathBuf)> {
+    pub(super) fn open(id: &str) -> anyhow::Result<(Box<dyn crate::catalog::CatalogEndpoint>, PathBuf)> {
         let mut dirs = DIRS.lock().unwrap();
         let entry = dirs.iter_mut().find(|(known, _, _)| known == id).expect("probe session registered");
         entry.2 += 1;
@@ -1303,6 +1428,24 @@ pub(super) mod reader_probe {
         super::offline_call(id, open, "thread/read", json!({}))
     }
 
+    pub fn read_pair(id: &str) -> Result<(), HistoryCallError> {
+        let mut reader = super::OfflineReader::new(id, open);
+        reader.call("thread/read", json!({}))?;
+        reader.call("thread/turns/list", json!({}))?;
+        Ok(())
+    }
+
+    pub fn page_across(id: &str, action: impl FnOnce()) -> Result<Value, HistoryCallError> {
+        let mut reader = super::OfflineReader::new(id, open);
+        reader.call("thread/read", json!({}))?;
+        action();
+        reader.call("thread/turns/list", json!({}))
+    }
+
+    pub fn admitted_count(id: &str) -> usize {
+        super::admitted_readers().get(id).map_or(0, Vec::len)
+    }
+
     /// Processes whose cwd or an open file is inside `dir`.
     pub fn holders(dir: &Path) -> Vec<u32> {
         let mut found = Vec::new();
@@ -1321,6 +1464,26 @@ pub(super) mod reader_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archived_reader_pool_keeps_at_most_two_sessions() {
+        let ids: Vec<_> = (0..3).map(|_| format!("cutex.archive-pool-{}", uuid::Uuid::new_v4())).collect();
+        let dirs: Vec<_> = ids.iter().map(|id| reader_probe::session(id)).collect();
+        let mut hosts = Vec::new();
+        for id in &ids {
+            let host = archived_reader(id, || Arc::new(CodexConfigHost::new(Box::new(SessionReaderFactory {
+                cutex_session_id: id.clone(), open: reader_probe::open,
+            }), READER_KEEP_WARM)));
+            host.call("thread/read", json!({})).unwrap();
+            hosts.push(host);
+            assert!(archived_readers().len() <= 2);
+        }
+        assert!(!hosts[0].is_warm());
+        assert!(reader_probe::holders(&dirs[0]).is_empty());
+        for id in &ids { evict_offline_reader(id); }
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
 
     /// The fence stops this session's reader and waits for its process; while
     /// it lives no read restarts one; afterwards reads work again.
@@ -1347,6 +1510,93 @@ mod tests {
         assert!(reader_probe::holders(&dir).is_empty() && reader_probe::holders(&other_dir).is_empty());
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(other_dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn evicted_reader_handle_cannot_restart_after_its_lifecycle_barrier() {
+        let id = format!("cutex.evicted-{}", uuid::Uuid::new_v4());
+        let dir = reader_probe::session(&id);
+        reader_probe::read(&id).unwrap();
+        let old = readers().get(&id).unwrap().clone();
+        evict_offline_reader(&id);
+        assert!(reader_probe::holders(&dir).is_empty());
+        assert!(old.call("thread/read", json!({})).is_err());
+        assert_eq!(reader_probe::spawns(&id), 1);
+        assert!(!cached_sessions().contains(&id));
+        reader_probe::read(&id).unwrap();
+        assert_eq!(reader_probe::spawns(&id), 2);
+        evict_offline_reader(&id);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retired_session_history_reuses_one_of_two_warm_readers_until_idle() {
+        let id = format!("cutex.retired-reader-{}", uuid::Uuid::new_v4());
+        let dir = reader_probe::session(&id);
+        let path = crate::session::store::cutex_sessions_path().unwrap();
+        let record = crate::session::model::CutexSessionRecord::new(id.clone(), Some("thread".into()),
+            crate::platform::host::current_host_name(), dir.display().to_string(), None).unwrap();
+        crate::session::store::with_locked_session_rows(&path, |rows| {
+            rows.insert_session(id.clone(), record);
+            rows.commit()?;
+            Ok(())
+        }).unwrap();
+        reader_probe::read(&id).unwrap();
+        assert!(cached_sessions().contains(&id));
+        crate::session::store::update_session_row(&path, &id, |record| {
+            let revision = record.durable_revision();
+            let generation = record.runtime_generation;
+            crate::session::archive::commit_retire(record, revision, generation, true, "2026-11-11T10:00:00Z".into())?;
+            Ok(())
+        }).unwrap();
+        evict_offline_reader(&id);
+        reader_probe::read_pair(&id).unwrap();
+        assert_eq!(reader_probe::spawns(&id), 2, "one request must reuse its uncached reader for native paging");
+        assert!(!cached_sessions().contains(&id));
+        reader_probe::read_pair(&id).unwrap();
+        assert_eq!(reader_probe::spawns(&id), 2, "a second HTTP page must reuse the archived reader");
+        let (host, _, generation) = archived_readers().get(&id).unwrap().clone();
+        assert!(!reap_archived_once(&id, &host, generation.unwrap(), Instant::now() + READER_KEEP_WARM + Duration::from_secs(1)));
+        assert!(!archived_readers().contains_key(&id));
+        assert!(reader_probe::holders(&dir).is_empty());
+        crate::session::store::with_locked_session_rows(&path, |rows| {
+            rows.remove_session(&id);
+            rows.commit()?;
+            Ok(())
+        }).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn after_the_fact_live_source_eviction_allows_an_admitted_read_to_finish() {
+        let id = format!("cutex.paged-retire-{}", uuid::Uuid::new_v4());
+        let dir = reader_probe::session(&id);
+        let mut request = OfflineReader::new(&id, reader_probe::open);
+        request.call("thread/read", json!({})).unwrap();
+        evict_offline_reader(&id);
+        assert!(!cached_sessions().contains(&id));
+        request.call("thread/turns/list", json!({})).unwrap();
+        assert_eq!(reader_probe::spawns(&id), 1);
+        drop(request);
+        assert!(reader_probe::holders(&dir).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_file_fence_still_revokes_an_admitted_history_request() {
+        let id = format!("cutex.paged-fence-{}", uuid::Uuid::new_v4());
+        let dir = reader_probe::session(&id);
+        let mut request = OfflineReader::new(&id, reader_probe::open);
+        request.call("thread/read", json!({})).unwrap();
+        let fence = fence_offline_reader(&id);
+        assert!(reader_probe::holders(&dir).is_empty());
+        assert!(request.call("thread/turns/list", json!({})).is_err());
+        drop((request, fence));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

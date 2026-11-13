@@ -8,11 +8,14 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
-    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, TcpStream},
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, Weak},
     time::{Duration, Instant},
 };
+
+#[path = "resolver.rs"]
+mod resolver;
 
 type PeerGate = Mutex<()>;
 type PeerGates = BTreeMap<(PathBuf, String), Weak<PeerGate>>;
@@ -40,6 +43,10 @@ pub fn permitted(ip: IpAddr) -> bool {
     }
 }
 pub fn addresses(raw: &str) -> Result<(url::Url, Vec<SocketAddr>)> {
+    addresses_until(raw, Instant::now() + Duration::from_secs(Settings::default().connect_timeout_secs.into()))
+}
+
+fn addresses_until(raw: &str, deadline: Instant) -> Result<(url::Url, Vec<SocketAddr>)> {
     let u = url::Url::parse(raw).map_err(|_| Error::new("peer_url_insecure", 400))?;
     if u.scheme() != "http"
         || !u.username().is_empty()
@@ -59,10 +66,8 @@ pub fn addresses(raw: &str) -> Result<(url::Url, Vec<SocketAddr>)> {
     {
         url::Host::Ipv4(ip) => vec![SocketAddr::new(ip.into(), port)],
         url::Host::Ipv6(ip) => vec![SocketAddr::new(ip.into(), port)],
-        url::Host::Domain(host) => (host, port)
-            .to_socket_addrs()
-            .map_err(|_| Error::new("peer_unreachable", 503))?
-            .collect(),
+        url::Host::Domain(host) => resolver::resolve(host, port, deadline)
+            .map_err(|_| Error::new("peer_unreachable", 503))?,
     };
     if addrs.is_empty() || addrs.iter().any(|a| !permitted(a.ip())) {
         return Err(Error::new("peer_url_insecure", 400));
@@ -88,7 +93,21 @@ pub fn request_with_settings(
     settings: &Settings,
     allow_loopback: bool,
 ) -> Result<Value> {
-    let (url, addrs) = addresses(url)?;
+    let (url, addrs) = addresses_until(url, Instant::now() + Duration::from_secs(settings.connect_timeout_secs.into()))?;
+    request_resolved(url, addrs, method, path, token, body, settings, allow_loopback)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_resolved(
+    url: url::Url,
+    addrs: Vec<SocketAddr>,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&Value>,
+    settings: &Settings,
+    allow_loopback: bool,
+) -> Result<Value> {
     validate_callback_addresses(&addrs, allow_loopback)?;
     if !path.starts_with("/peer/v1/")
         || path.chars().any(|c| c.is_control() || c.is_whitespace())
@@ -98,9 +117,13 @@ pub fn request_with_settings(
     }
     let connect_timeout = Duration::from_secs(settings.connect_timeout_secs.into());
     let read_timeout = Duration::from_secs(settings.read_timeout_secs.into());
+    let deadline = Instant::now() + connect_timeout;
     let mut stream = addrs
         .iter()
-        .find_map(|addr| TcpStream::connect_timeout(addr, connect_timeout).ok())
+        .find_map(|addr| {
+            let left = deadline.checked_duration_since(Instant::now()).filter(|left| !left.is_zero())?;
+            TcpStream::connect_timeout(addr, left).ok()
+        })
         .ok_or_else(|| Error::new("peer_unreachable", 503))?;
     stream
         .set_write_timeout(Some(read_timeout))
@@ -252,10 +275,20 @@ pub fn call(
     path: &str,
     body: Option<&Value>,
 ) -> Result<Value> {
-    // Worker requests and explicit directory / handshake requests share the
-    // same serial lane. Acquire it before reading any store lock.
+    call_with_lookup(store, peer, method, path, body, addresses_until)
+}
+
+fn call_with_lookup(
+    store: &Store,
+    peer: &Peer,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    mut lookup: impl FnMut(&str, Instant) -> Result<(url::Url, Vec<SocketAddr>)>,
+) -> Result<Value> {
+    // Network attempts share a serial lane. DNS runs before acquiring it so
+    // a stuck name cannot prevent an IP-address callback to the same peer.
     let gate = peer_gate(store, peer);
-    let _serial = gate.lock().unwrap_or_else(|poison| poison.into_inner());
     let required = match (method, path) {
         (_, super::names::ROUTE) => Some(super::names::FEATURE),
         (_, "/peer/v1/agents") => Some("agents.list.v1"),
@@ -279,7 +312,6 @@ pub fn call(
             return Err(error);
         }
     }
-    let secret = store.secret(&peer.peer_id)?;
     let settings = store.snapshot()?.settings;
     let mut urls: Vec<_> = peer.urls.iter().collect();
     if let Some(preferred) = &peer.last_successful_url {
@@ -288,17 +320,20 @@ pub fn call(
             urls.insert(0, url);
         }
     }
+    let dns_share = Duration::from_secs(settings.connect_timeout_secs.into()) / urls.len().max(1) as u32;
     let mut result = Err(Error::new("peer_unreachable", 503));
     for url in urls {
-        result = request_with_settings(
-            url,
-            method,
-            path,
-            Some(&secret),
-            body,
-            &settings,
-            peer.allow_loopback,
-        );
+        let resolved = lookup(url, Instant::now() + dns_share);
+        let _serial = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+        // Resolve outside all store locks, then read current credentials and
+        // pin exactly those addresses through policy checking and connect.
+        result = match resolved {
+            Ok((url, addresses)) => {
+                let secret = store.secret(&peer.peer_id)?;
+                request_resolved(url, addresses, method, path, Some(&secret), body, &settings, peer.allow_loopback)
+            }
+            Err(error) => Err(error),
+        };
         match &result {
             Ok(_) => {
                 if peer.last_successful_url.as_ref() != Some(url) {
@@ -333,6 +368,68 @@ pub fn call(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_url_gets_a_fresh_dns_budget() {
+        let (url, server) = test_server(200, 1);
+        let root = std::env::temp_dir().join(format!("peer-dns-fallback-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(root.join("runtime/peers"));
+        let mut peer = super::super::tests::peer();
+        peer.urls = vec!["http://first.invalid".into(), url];
+        store.insert(peer.clone(), &super::super::token::generate()).unwrap();
+        store.with(|state| { state.settings.connect_timeout_secs = 1; Ok(()) }).unwrap();
+        let result = call_with_lookup(&store, &peer, "GET", "/peer/v1/hello", None, |url, deadline| {
+            if url.contains("first.invalid") {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(20));
+                Err(Error::new("peer_unreachable", 503))
+            } else {
+                assert!(deadline.saturating_duration_since(Instant::now()) > Duration::from_millis(400));
+                addresses_until(url, deadline)
+            }
+        });
+        server.join().unwrap();
+        assert!(result.is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_slow_lookup_does_not_hold_its_peers_network_lane() {
+        use std::sync::mpsc;
+        let (url, server) = test_server(200, 1);
+        let root = std::env::temp_dir().join(format!("peer-dns-lane-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(root.join("runtime/peers"));
+        let mut peer = super::super::tests::peer();
+        peer.urls = vec![url];
+        store.insert(peer.clone(), &super::super::token::generate()).unwrap();
+        let (began, ready) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let (slow_store, mut slow_peer) = (store.clone(), peer.clone());
+        slow_peer.urls = vec!["http://stalled.invalid".into()];
+        let slow = std::thread::spawn(move || call_with_lookup(
+            &slow_store, &slow_peer, "GET", "/peer/v1/hello", None,
+            |_, _| {
+                began.send(()).unwrap();
+                let _ = released.recv_timeout(Duration::from_secs(5));
+                Err(Error::new("peer_unreachable", 503))
+            },
+        ));
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done, completed) = mpsc::sync_channel(1);
+        let (fast_store, fast_peer) = (store.clone(), peer.clone());
+        let fast = std::thread::spawn(move || done.send(call(&fast_store, &fast_peer, "GET", "/peer/v1/hello", None)).unwrap());
+        let result = completed.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        assert!(slow.join().unwrap().is_err());
+        fast.join().unwrap();
+        server.join().unwrap();
+        assert!(result.expect("numeric callback was blocked by another caller's DNS").is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn numeric_callbacks_do_not_wait_for_dns_capacity_or_deadline() {
+        assert!(addresses_until("http://127.0.0.1:12345", Instant::now() - Duration::from_secs(1)).is_ok());
+    }
+
     #[test]
     fn closed_without_response_remains_a_transport_uncertainty() {
         let error=super::decode_response(b"").unwrap_err();

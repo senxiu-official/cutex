@@ -276,7 +276,7 @@ impl Ledger {
     /// A bounded VM budget reports a warning on a large or damaged database;
     /// it never repairs, clears, or replaces dedupe evidence.
     #[cfg(test)]
-    pub(super) fn check(&self) -> anyhow::Result<()> {
+    pub(super) fn check(&mut self) -> anyhow::Result<()> {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         self.0
             .progress_handler(1000, Some(move || std::time::Instant::now() >= deadline))
@@ -598,7 +598,7 @@ mod tests {
         legacy.write_all(b"]}").unwrap();
         legacy.flush().unwrap();
         drop(legacy);
-        let ledger = Ledger::open(&root).unwrap();
+        let mut ledger = Ledger::open(&root).unwrap();
         assert_eq!(
             ledger.identity("overlap").unwrap(),
             Some(Identity::Committed)

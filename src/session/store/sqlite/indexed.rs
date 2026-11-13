@@ -213,6 +213,23 @@ pub fn has_prepared_launch_at(path: &Path, session: &str) -> anyhow::Result<bool
     })
 }
 
+/// Startup recovery reads only unfinished rows in the promotion receipt map;
+/// it does not initialize the compatibility snapshot or decode session rows.
+pub(crate) fn pending_quick_chat_promotions_at(
+    path: &Path,
+) -> anyhow::Result<Vec<crate::agent_management::QuickChatPromoteReceipt>> {
+    let Some(db) = ensure_ready(path, false, false)? else {
+        return Ok(Vec::new());
+    };
+    with_connection(&db, |connection| {
+        let mut query = connection.prepare_cached(
+            "SELECT json FROM receipts WHERE map=?1 AND json_extract(json,'$.result.complete')=0 ORDER BY key",
+        )?;
+        let rows = query.query_map([QuickChatPromotion::NAME], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    })
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
     path: PathBuf,

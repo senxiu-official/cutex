@@ -29,11 +29,12 @@ pub use rows::update_session_row;
 pub use rows::with_locked_session_rows;
 pub use rows::SessionRowConflict;
 pub use rows::SessionRows;
+pub(crate) use sqlite::indexed::pending_quick_chat_promotions_at;
 // Every receipt map, for row-level writers (not all have one yet).
 #[allow(unused_imports)]
 pub(crate) use rows::{
     AgentArchiveReceipts, ExplicitLaunchReceipts, ExplicitLaunchTombstones, FormalNameReceipts,
-    HumanAdoptionReceipts, NativeStopReceipts,
+    HumanAdoptionReceipts, NativeStopReceipts, QuickChatPromotionReceipts,
 };
 
 pub use sqlite::is_sentinel as is_session_store_sentinel;
@@ -134,6 +135,26 @@ pub fn load_cutex_session_store() -> anyhow::Result<CutexSessionStore> {
         note_whole_store_copy();
         store.clone()
     })
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "requires an explicitly marked release business copy"]
+fn release_data_copy_sessions_validate_and_reopen() {
+    let home = PathBuf::from(std::env::var_os("CUTEX_RELEASE_DATA_COPY").expect("explicit copy"));
+    assert!(home.is_absolute() && home.join(".cutex-release-data-copy").is_file());
+    assert_eq!(crate::config::paths::config_dir().unwrap().canonicalize().unwrap(), home.canonicalize().unwrap());
+    let path = cutex_sessions_path().unwrap();
+    for pass in 0..2 {
+        close_session_store(&path);
+        let store = load_cutex_session_store().unwrap();
+        // The candidate's complete session decoder includes creator snapshots
+        // and owner reapproval flags. Do not run path resolution or any runtime.
+        let encoded = serde_json::to_vec(&store).unwrap();
+        let _: CutexSessionStore = serde_json::from_slice(&encoded).unwrap();
+        eprintln!("RELEASE DATA COPY sessions pass={pass} decoded=true");
+    }
+    close_session_store(&path);
 }
 
 static WHOLE_STORE_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

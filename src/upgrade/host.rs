@@ -300,6 +300,9 @@ impl Host for RealHost {
     }
 
     fn rollback_prep(&self, migrations: &[Migration]) -> anyhow::Result<Vec<String>> {
+        // Refuse incompatible workers before the runner stops services or backs up.
+        // prepare_older_stores repeats the check after writers have stopped.
+        super::older_stores::preflight_worker_services(&self.home)?;
         // No release so far ships a rollback-preparation step; a one-way
         // migration is the only known hazard.
         Ok(migrations
@@ -395,6 +398,27 @@ pub fn follow_up(layout: &Layout, host: &RealHost, upgrade_run_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_rollback_is_refused_by_production_pre_stop_check() {
+        let root = std::env::temp_dir().join(format!("worker-rollback-pre-stop-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let store = crate::services::store::ServiceStore::new(home.join("services"), "fixture")
+            .with_port_probe(|_| panic!("worker cannot allocate a port"));
+        let request = serde_json::from_value(json!({
+            "slug":"background", "runtime":"worker", "command":["unused-fixture"], "lifetime":"persistent"
+        })).unwrap();
+        store.register(request, &crate::services::store::Caller::Owner).unwrap();
+        let before = std::fs::read(store.registry_path()).unwrap();
+        let real = RealHost { layout: Layout::at(root.join("base")), home,
+            base_url: "http://127.0.0.1:1".into(), token: String::new(), service_manager: "unused".into(),
+            names: ServiceNames::default(), unit_dir: None, cancel_marker: root.join("cancel") };
+        let error = real.rollback_prep(&[]).unwrap_err();
+        assert!(error.to_string().contains("worker services"), "{error:#}");
+        assert_eq!(std::fs::read(store.registry_path()).unwrap(), before);
+        assert!(!root.join("base").exists(), "preflight must not create a run backup");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn synthetic_failed_future_upgrade_rolls_back_through_production_store_preparation() {

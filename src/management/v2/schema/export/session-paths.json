@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cutex:management-v2:session-paths",
+  "title": "Owner session path reapproval",
+  "description": "Capability session-path-reapproval. POST /v2/sessions/{id}/reapprove-paths requires a full-scope owner credential. It re-resolves and approves the current folders; it does not start or stop the runtime.",
+  "anyOf": [{ "$ref": "#/$defs/request" }, { "$ref": "#/$defs/response" }],
+  "$defs": {
+    "request": { "type": "object", "additionalProperties": false },
+    "snapshot": {
+      "type": "object", "required": ["cwd", "writable_roots", "owner_approved"],
+      "properties": {
+        "cwd": { "type": "string" },
+        "writable_roots": { "type": "array", "items": { "type": "string" } },
+        "owner_approved": { "const": true }
+      }
+    },
+    "response": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cutexSessionId", "ownerApproved", "revision", "creatorPathSnapshot"],
+      "properties": {
+        "cutexSessionId": { "type": "string", "minLength": 1 },
+        "ownerApproved": { "const": true },
+        "revision": { "type": "integer", "minimum": 0 },
+        "creatorPathSnapshot": { "$ref": "#/$defs/snapshot" }
+      }
+    },
+    "changedDetails": {
+      "type": "object", "required": ["cutexSessionId"],
+      "properties": { "cutexSessionId": { "type": "string", "minLength": 1 } }
+    }
+  }
+}

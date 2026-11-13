@@ -530,6 +530,7 @@ pub(crate) mod tests {
             project_id:None,created_by_director_session:None,created_by_operator_session:None,
             cutex_session_id:id,native_session_id:"native".into(),created_at:Rfc3339::new("2026-11-05T00:00:00Z").unwrap(),retired_at:None,
             spec:ManagedAgentSpec {
+                memory_injection: true,
                 name:"Worker".into(),cwd:"/workspace".into(),profile:None,runtime_backend:"app_server".into(),
                 model:String::new(),reasoning:String::new(),permissions:"default".into(),approval_policy:"never".into(),sandbox_mode:"workspace-write".into(),
                 groups:Vec::new(),expose_to_im:false,pin:false,

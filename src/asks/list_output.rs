@@ -14,11 +14,11 @@ pub(super) fn pending_notices(state: &AskState, authorized: &[&DeliveryRecord]) 
         "ref_id":delivery.ref_id, "passive":delivery.passive, "created_at":delivery.created_at,
         "title":state.asks.get(&delivery.ask_id).map(|ask| ask.title.chars().take(512).collect::<String>()),
         "read_action":{"tool":"delegation_read","arguments":{"delegation":delivery.ask_id}},
-        "claim_action":{"tool":"delegation_wait","arguments":{"delegations":[delivery.ask_id],"timeout_ms":1}}
+        "claim_action":{"tool":"delegation_notices_read","arguments":{"delivery_ids":[delivery.delivery_id]}}
     })).collect();
     json!({"total":authorized.len(), "counts":counts, "entries":entries,
         "more":authorized.len() > 50,
-        "detail":"Pending notices include answers, questions and state changes. unclaimed_results is the total of all three kinds. Read a delegation with delegation_read; delegation_wait claims pending notices."})
+        "detail":"Pending notices include answers, questions and state changes. unclaimed_results is the total of all three kinds. Read a delegation with delegation_read; delegation_notices_read marks pending notices read without waiting."})
 }
 
 #[cfg(test)]

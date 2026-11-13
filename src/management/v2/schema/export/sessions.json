@@ -5,6 +5,11 @@
   "description": "GET /v2/sessions (and GET /v2/sessions/{id} → one session). Fields not listed may be added in later versions.",
   "anyOf": [{ "$ref": "#/$defs/sessionList" }, { "$ref": "#/$defs/session" }],
   "$defs": {
+    "newAgentMemoryInjection": {
+      "type": "object",
+      "description": "Additive POST /v2/human/agents field. Defaults true independently of the creator. False replaces project memory instructions and index with the one-line disabled notice and disables idle reminders; AGENTS.md remains active.",
+      "properties": { "memoryInjection": { "type": "boolean", "default": true } }
+    },
     "autoRetry": {
       "type": "object",
       "additionalProperties": false,
@@ -153,6 +158,7 @@
         "note": { "type": ["string", "null"] },
         "badge": {"anyOf": [{"$ref": "#/$defs/badge"}, {"type": "null"}]},
         "avatar": { "anyOf": [{ "$ref": "#/$defs/avatar" }, { "type": "null" }] },
+        "memoryInjection": { "type": "boolean", "default": true },
         "avatarMode": { "enum": ["fixed", "inherit", null] },
         "createdBy": { "$ref": "#/$defs/sessionCreatedBy" },
         "claudeAccount": {

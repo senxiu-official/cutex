@@ -292,7 +292,7 @@ fn roster_digest(
     ))
 }
 
-fn candidate(
+pub(super) fn candidate(
     state: &AgentManagementSnapshot,
     key: &str,
     record: &CutexSessionRecord,
@@ -382,6 +382,18 @@ impl AgentManagementProvider {
             .lock()
             .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
         let _mutation = self.store().lock_mutations()?;
+        self.import_durable_agent_locked(_principal, session_path, request)
+    }
+
+    /// Caller retains the provider execution/authority locks (and, for promotion,
+    /// the exact session lane) across the two-store transaction.
+    pub(super) fn import_durable_agent_locked(
+        &self,
+        _principal: &HumanManagementPrincipal,
+        session_path: &Path,
+        request: &DurableImportRequest,
+    ) -> Result<DurableImportReceipt, AgentManagementError> {
+        validate_request(request)?;
         let digest = super::store::request_sha256(request)?;
         let state = self.store().snapshot()?;
         let mut receipt =
@@ -765,6 +777,7 @@ fn imported_record(
             .app_server_thread_id().map(str::to_string)
             .ok_or(conflict("durable_native_session_missing"))?,
         spec: ManagedAgentSpec {
+            memory_injection: record.memory_injection,
             name: name.to_string(),
             cwd: crate::session::service::cutex_session_launch_cwd(record).to_string(),
             // The durable record remains the authoritative effective-next-launch configuration.

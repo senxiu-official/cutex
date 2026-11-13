@@ -187,11 +187,15 @@ impl DocumentStore {
             return Err(DocumentError::TooLarge { bytes: new.bytes.len() });
         }
         let sha256 = crate::asks::sha256_hex(&new.bytes);
-        let connection = self.connection()?;
+        let mut connection = self.connection()?;
+        // Share one writer fence with blob cleanup, from the existence/quota
+        // checks through the metadata commit. An autocommit INSERT alone is
+        // too late: cleanup could unlink the file after our existence check.
+        let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let blob_exists: bool =
-            connection.query_row("SELECT EXISTS(SELECT 1 FROM documents WHERE sha256 = ?1)", [&sha256], |row| row.get(0))?;
+            transaction.query_row("SELECT EXISTS(SELECT 1 FROM documents WHERE sha256 = ?1)", [&sha256], |row| row.get(0))?;
         if !blob_exists {
-            let used = usage_of(&connection)?.used_bytes;
+            let used = usage_of(&transaction)?.used_bytes;
             if used + new.bytes.len() as u64 > quota_bytes {
                 return Err(DocumentError::QuotaFull { used, quota: quota_bytes });
             }
@@ -211,7 +215,7 @@ impl DocumentStore {
             readers: new.readers,
             title: crate::asks::truncate_chars(&new.title, 200),
         };
-        connection.execute(
+        transaction.execute(
             "INSERT INTO documents (document_id, sha256, bytes, media_type, created_at, source_kind, source_id, producer, readers, title)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
@@ -227,6 +231,7 @@ impl DocumentStore {
                 record.title,
             ],
         )?;
+        transaction.commit()?;
         Ok(record)
     }
 
@@ -332,17 +337,38 @@ impl DocumentStore {
             }
         }
         transaction.commit()?;
+        Ok(self.remove_unreferenced_blobs(&mut connection, &orphaned).unwrap_or_else(|error| {
+            // Metadata deletion already committed. Retain extra bytes for
+            // explicit cleanup instead of reporting that deletion failed.
+            eprintln!("cutex documents: orphan bytes retained after cleanup failure: {error:#}");
+            0
+        }))
+    }
+
+    fn remove_unreferenced_blobs(&self, connection: &mut Connection, candidates: &[String]) -> anyhow::Result<u64> {
+        #[cfg(test)]
+        if FAIL_BLOB_CLEANUP.with(|flag| flag.replace(false)) { anyhow::bail!("injected blob cleanup failure"); }
+        // Metadata is already committed. Recheck after taking the writer lock
+        // again; another publisher may have reused the bytes in the meantime.
+        let cleanup = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut freed = 0;
-        for sha in orphaned {
-            let path = self.blob_path(&sha);
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                freed += metadata.len();
+        for sha in candidates {
+            let used: bool = cleanup.query_row("SELECT EXISTS(SELECT 1 FROM documents WHERE sha256 = ?1)", [sha], |row| row.get(0))?;
+            if !used {
+                let path = self.blob_path(sha);
+                let bytes = std::fs::metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
+                if std::fs::remove_file(path).is_ok() {
+                    freed += bytes;
+                }
             }
-            let _ = std::fs::remove_file(path);
         }
+        cleanup.commit()?;
         Ok(freed)
     }
 }
+
+#[cfg(test)]
+thread_local! { static FAIL_BLOB_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 const SELECT: &str =
     "SELECT document_id, sha256, bytes, media_type, created_at, source_kind, source_id, producer, readers, title FROM documents";
@@ -444,6 +470,35 @@ pub fn notify_owner_for_turn(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn committed_document_delete_succeeds_when_blob_cleanup_fails() {
+        let (store, dir) = temp_store("cleanup-failure");
+        let record = store.put(new_doc("retained bytes", &["cutex.a"]), u64::MAX, Utc::now()).unwrap();
+        FAIL_BLOB_CLEANUP.with(|flag| flag.set(true));
+        assert_eq!(store.delete(&[record.document_id.clone()]).unwrap(), 0);
+        assert!(store.get(&record.document_id).unwrap().is_none());
+        assert_eq!(std::fs::read(store.blob_path(&record.sha256)).unwrap(), b"retained bytes");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delayed_document_cleanup_keeps_a_new_reference_to_the_same_bytes() {
+        let (store, dir) = temp_store("delayed-cleanup");
+        let first = store.put(new_doc("shared bytes", &["cutex.a"]), u64::MAX, Utc::now()).unwrap();
+        let mut connection = store.connection().unwrap();
+        // Deletion has committed; pause its physical cleanup while a new
+        // document, potentially from the other daemon process, reuses the blob.
+        connection.execute("DELETE FROM documents WHERE document_id = ?1", [&first.document_id]).unwrap();
+        let second = store.put(new_doc("shared bytes", &["cutex.b"]), u64::MAX, Utc::now()).unwrap();
+        assert_eq!(store.remove_unreferenced_blobs(&mut connection, &[first.sha256.clone()]).unwrap(), 0);
+        assert!(store.get(&second.document_id).unwrap().is_some());
+        assert_eq!(std::fs::read(store.blob_path(&second.sha256)).unwrap(), b"shared bytes");
+        drop(connection);
+        assert_eq!(store.delete(&[second.document_id]).unwrap(), 12);
+        assert!(!store.blob_path(&first.sha256).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     pub fn temp_store(label: &str) -> (DocumentStore, PathBuf) {
         let dir = std::env::temp_dir().join(format!("cutex-documents-{label}-{}", uuid::Uuid::new_v4().simple()));

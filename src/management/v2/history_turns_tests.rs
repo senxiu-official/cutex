@@ -287,6 +287,27 @@ fn invalidation_drops_turns_and_fences_reads_in_flight() {
 }
 
 #[test]
+fn removed_fences_do_not_leave_tombstones_or_allow_aba_publication() {
+    let setup = Setup::new(true);
+    let key = Key::new(&setup.id, "thread-1", "live", 3);
+    let mut old = TurnShaper::new(&setup.id, &setup.store, false);
+    old.begin(&key, true);
+    invalidate(&setup.id);
+    let mut new = TurnShaper::new(&setup.id, &setup.store, false);
+    new.begin(&key, true);
+    assert!(!old.cacheable(&turn(0, "completed"), 0, true));
+    old.shape(turn(0, "completed"), true);
+    assert_eq!(cached_turns(&setup.id), 0);
+    assert!(!cache().settling.contains_key(&key));
+    new.shape(turn(1, "completed"), true);
+    assert_eq!(cached_turns(&setup.id), 1);
+    invalidate(&setup.id);
+    assert!(!cached_sessions().contains(&setup.id));
+    for i in 0..10000 { invalidate(&format!("deleted-{i}")); }
+    assert!(!cache().fences.keys().any(|id| id.starts_with("deleted-")));
+}
+
+#[test]
 fn runtimes_without_not_loaded_and_racing_turns_get_the_plain_read() {
     let setup = Setup::new(true);
     let native = native(4);

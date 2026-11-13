@@ -198,6 +198,7 @@ pub(crate) fn eva_roster(scale: usize) -> AgentManagementSnapshot {
             cutex_session_id: sid(n),
             native_session_id: format!("019a{:028x}", n),
             spec: ManagedAgentSpec {
+                memory_injection: true,
                 name: format!("synthetic-agent-{n}"),
                 cwd: format!("/home/synthetic/projects/p{}/agent-{n}", n % projects),
                 profile: Some(format!("profile-{}", n % 7)),
@@ -751,6 +752,7 @@ fn roster_point_read_page_and_one_row_write_do_equal_work_at_1x_and_10x() {
                     display_name: format!("Equal work {}", round % 2),
                     badge_label: "EW".into(),
                     color: crate::agent_management::ProjectPaletteColor::Magenta,
+                    icon: None,
                 },
             };
             let started = std::time::Instant::now();

@@ -26,6 +26,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -441,12 +442,33 @@ pub struct CodexConfigHost {
     keep_warm: Duration,
     setup_wait: Duration,
     state: Mutex<HostState>,
+    retired: AtomicBool,
+    closed: AtomicBool,
 }
 
 #[derive(Default)]
 struct HostState {
     warm: Option<WarmEndpoint>,
     next_generation: u64,
+    readers: usize,
+}
+
+/// A history request admitted before retirement may finish all native pages.
+/// File-mutation fences still close the endpoint synchronously.
+pub(super) struct HostReadLease(Arc<CodexConfigHost>);
+
+impl HostReadLease {
+    pub(super) fn call(&self, method: &str, params: Value) -> Result<(CodexCallOutcome, Option<u64>), CatalogError> {
+        self.0.call_inner(method, params, true)
+    }
+}
+
+impl Drop for HostReadLease {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.readers -= 1;
+        if state.readers == 0 && self.0.retired.load(Ordering::Acquire) { state.warm = None; }
+    }
 }
 
 #[derive(Debug)]
@@ -462,6 +484,8 @@ impl CodexConfigHost {
             keep_warm,
             setup_wait: WINDOWS_SANDBOX_SETUP_WAIT,
             state: Mutex::new(HostState::default()),
+            retired: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -479,7 +503,21 @@ impl CodexConfigHost {
         method: &str,
         params: Value,
     ) -> Result<(CodexCallOutcome, Option<u64>), CatalogError> {
+        self.call_inner(method, params, false)
+    }
+
+    pub(super) fn read_lease(self: &Arc<Self>) -> Result<HostReadLease, CatalogError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.retired.load(Ordering::Acquire) {
+            return Err(CatalogError::Launch("the offline reader was evicted; retry the history read".into()));
+        }
+        state.readers += 1;
+        Ok(HostReadLease(self.clone()))
+    }
+
+    fn call_inner(&self, method: &str, params: Value, leased: bool) -> Result<(CodexCallOutcome, Option<u64>), CatalogError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if self.closed.load(Ordering::Acquire) || (self.retired.load(Ordering::Acquire) && (!leased || state.warm.is_none())) { return Err(CatalogError::Launch("the offline reader was evicted; retry the history read".into())); }
         let mut started = None;
         if state.warm.is_none() {
             let spawned = self.factory.spawn()?;
@@ -530,12 +568,15 @@ impl CodexConfigHost {
                 state.warm = None;
             }
         }
+        if state.readers == 0 && self.retired.load(Ordering::Acquire) { state.warm = None; }
         Ok((CodexCallOutcome { codex_home, result }, started))
     }
 
     /// Stop the process when idle. Returns false once `generation` is gone.
     pub fn reap(&self, generation: u64, now: Instant) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.readers > 0 && !self.closed.load(Ordering::Acquire) { return true; }
+        if self.retired.load(Ordering::Acquire) { state.warm = None; return false; }
         match &state.warm {
             Some(warm) if warm.generation == generation => {
                 if now >= warm.keep_until {
@@ -555,6 +596,27 @@ impl CodexConfigHost {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .warm = None;
+    }
+
+    /// Permanently revoke this host. Handles selected before cache eviction
+    /// cannot restart a process after the lifecycle barrier has returned.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.retire();
+        self.shutdown();
+    }
+
+    /// Cache reclamation must not wait behind native IO on the catalog watcher.
+    /// A currently executing call closes its endpoint before returning; the
+    /// existing reaper closes an idle endpoint. Never wait or spawn a new worker.
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+    }
+
+    pub(super) fn retire_when_idle(&self) {
+        self.retire();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.readers == 0 { state.warm = None; }
     }
 
     pub fn is_warm(&self) -> bool {
@@ -1602,5 +1664,46 @@ command = \"g\"
         assert!(!host.reap(generation, now + Duration::from_secs(331)));
         // A stale reaper for an old generation stops without touching state.
         assert!(!host.reap(generation, now));
+    }
+
+    #[test]
+    fn retirement_does_not_wait_for_native_state_and_revokes_old_handles() {
+        let factory = FakeFactory::default();
+        let host = Arc::new(CodexConfigHost::new(Box::new(factory.clone()), Duration::from_secs(60)));
+        let (_, started) = host.call("skills/list", json!({})).unwrap();
+        let state = host.state.lock().unwrap();
+        let retired = host.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || { retired.retire(); tx.send(()).unwrap(); });
+        let completed = rx.recv_timeout(Duration::from_secs(1));
+        drop(state);
+        worker.join().unwrap();
+        assert!(completed.is_ok(), "cache reclamation waited behind native IO");
+        assert!(host.call("skills/list", json!({})).is_err());
+        assert!(!host.reap(started.unwrap(), Instant::now()));
+        assert!(!host.is_warm());
+        assert_eq!(factory.spawns.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retirement_preserves_an_admitted_paged_read_but_file_close_revokes_it() {
+        let factory = FakeFactory::default();
+        let host = Arc::new(CodexConfigHost::new(Box::new(factory.clone()), Duration::from_secs(60)));
+        let lease = host.read_lease().unwrap();
+        let (_, started) = lease.call("thread/read", json!({})).unwrap();
+        host.retire();
+        assert!(host.read_lease().is_err());
+        assert!(host.call("thread/read", json!({})).is_err());
+        assert!(host.reap(started.unwrap(), Instant::now() + Duration::from_secs(120)));
+        lease.call("thread/turns/list", json!({})).unwrap();
+        assert_eq!(factory.spawns.load(Ordering::SeqCst), 1);
+        drop(lease);
+        assert!(!host.is_warm());
+
+        let host = Arc::new(CodexConfigHost::new(Box::new(factory), Duration::from_secs(60)));
+        let lease = host.read_lease().unwrap();
+        lease.call("thread/read", json!({})).unwrap();
+        host.close();
+        assert!(lease.call("thread/turns/list", json!({})).is_err());
     }
 }

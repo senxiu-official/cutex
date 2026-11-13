@@ -2045,6 +2045,7 @@ fn run_agent_bus_with_service_root(
         println!("restored {restored} cutex agent registration(s) from registry");
     }
     let state = Arc::new(Mutex::new(initial_state));
+    cutex::agent_bus::claude_occurrence::spawn(&state, handlers.redrive_ordinary_messages)?;
     if let Err(error) = redrive_ordinary_messages(&state) {
         eprintln!(
             "{YELLOW}warning:{RESET} durable ordinary-message startup redrive failed: {error:#}"

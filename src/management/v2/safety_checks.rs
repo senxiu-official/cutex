@@ -86,7 +86,9 @@ fn unavailable(e: anyhow::Error) -> UserInputExecutionError {
 /// The owner input a grant hands to the agent.
 pub fn grant_text(block: &SafetyBlock) -> String {
     let minutes = (block.grant_seconds / 60).max(1);
-    format!("主人已批准一次：{}（{minutes} 分钟内有效，仅此一次）", block.command)
+    if block.hard_expires_at.is_some() {
+        format!("主人已批准一次：{}（读到后 {minutes} 分钟内有效，且不晚于 {}；仅此一次）", block.command, block.hard_expires_at.as_deref().unwrap())
+    } else { format!("主人已批准一次：{}（{minutes} 分钟内有效，仅此一次）", block.command) }
 }
 
 /// A block as the runtime reports it (`block` of the notification or the
@@ -112,6 +114,7 @@ pub fn block_from_wire(runtime: &str, value: &Value) -> Option<SafetyBlock> {
         expires_at: text("expiresAt"),
         used_at: text("usedAt"),
         grant_seconds: value.get("grantSeconds").and_then(Value::as_u64).unwrap_or(1800),
+        notice_input_id: text("noticeInputId"), notice_read_at: text("noticeReadAt"), hard_expires_at: text("hardExpiresAt"),
     })
 }
 
@@ -313,8 +316,8 @@ fn runtime_call(cutex_session_id: &str, block: &SafetyBlock, method: &str, param
 
 /// Session cutex methods (`cutex/safetyCheck/*`).
 pub(super) fn dispatch(
-    event_repository: &super::repository::EventRepository,
-    context: ManagementRequestContext,
+    _event_repository: &super::repository::EventRepository,
+    _context: ManagementRequestContext,
     owner: Option<HumanManagementPrincipal>,
     cutex_session_id: &str,
     session: &Value,
@@ -328,7 +331,13 @@ pub(super) fn dispatch(
         session,
         request,
         |block, method, params| runtime_call(cutex_session_id, block, method, params),
-        |submit| super::offline_submit::dispatch(event_repository, context, owner, cutex_session_id, session, submit),
+        |block| {
+            let key = crate::agent_bus::alarms::safety_notice_key(&block.block_id);
+            let alarm = crate::agent_bus::alarms::set_system_notice(
+                crate::agent_bus::alarms::APPROVAL_NOTICE_OWNER, &key, cutex_session_id, &grant_text(block))
+                .map_err(|e| error("approval_notice_unavailable", format!("{e:#}"), json!({})))?;
+            Ok(json!({"inputId":alarm.message_id,"messageId":alarm.message_id}))
+        },
     )
 }
 
@@ -340,7 +349,7 @@ pub(super) fn dispatch_with(
     _session: &Value,
     request: &ValidatedCutexRequest,
     call_runtime: impl FnOnce(&SafetyBlock, &str, Value) -> Result<Value, RuntimeCallError>,
-    submit: impl FnOnce(&ValidatedCutexRequest) -> Result<Value, UserInputExecutionError>,
+    notice: impl FnOnce(&SafetyBlock) -> Result<Value, UserInputExecutionError>,
 ) -> Result<Value, UserInputExecutionError> {
     if !root {
         return Err(error("cutex_method_denied", "safety check decisions are the owner's (Management root credential)", json!({})));
@@ -361,8 +370,12 @@ pub(super) fn dispatch_with(
             json!({ "notification": record })));
     }
     let now = Utc::now();
-    let params = json!({ "threadId": current.thread_id, "blockId": id, "decidedBy": { "kind": "owner" } });
-    let decided = match call_runtime(&current, if grant { RUNTIME_GRANT } else { RUNTIME_DISMISS }, params) {
+    let mut params = json!({ "threadId": current.thread_id, "blockId": id, "decidedBy": { "kind": "owner" } });
+    if grant {
+        params["noticeInputId"] = json!(crate::agent_bus::alarms::safety_notice_message_id(
+            cutex_session_id, &crate::agent_bus::alarms::safety_notice_key(&id)));
+    }
+    let mut decided = match call_runtime(&current, if grant { RUNTIME_GRANT } else { RUNTIME_DISMISS }, params.clone()) {
         Ok(result) => result
             .get("block")
             .and_then(|block| block_from_wire(&current.runtime, block))
@@ -398,6 +411,9 @@ pub(super) fn dispatch_with(
         }
         Err(RuntimeCallError::Failed(message)) => return Err(error("app_server_unavailable", message, json!({}))),
     };
+    if grant && decided.notice_input_id.is_none() {
+        decided.notice_input_id = params["noticeInputId"].as_str().map(str::to_string);
+    }
     let notification = store
         .edit_record(&record.notification_id, |state| state.update_safety_block(cutex_session_id, decided.clone(), now))
         .map_err(unavailable)?
@@ -405,29 +421,11 @@ pub(super) fn dispatch_with(
         .0;
     let mut result = json!({ "notification": notification, "block": decided });
     if grant {
-        // The agent learns of the grant at once: idle, a turn now; busy, the
-        // note joins the running turn at its next step (`auto` steers, as a
-        // busy wake past its wait is read at the next step). The agent that
-        // hit the block is usually still in that turn and waiting for it; an
-        // after-turn queue (本回合结束后送达) left it without the grant.
-        // A runtime that cannot steer keeps it in the Management queue.
-        let input = ValidatedCutexRequest {
-            request_id: request.request_id.clone(),
-            method: "cutex/userInput/submit".into(),
-            params: json!({
-                "clientUserMessageId": format!("safety-grant-{id}"),
-                "origin": {"kind": "other", "clientId": CLIENT_ID},
-                "strategy": "auto",
-                "input": [{"type": "text", "text": grant_text(&decided), "text_elements": []}],
-                "startIfOffline": true,
-            }),
-        };
-        match submit(&input) {
-            Ok(submitted) => result["submit"] = submitted,
-            // The grant stands (the runtime stored it); say the message failed.
-            Err(failure) => {
-                result["submitError"] = json!({ "code": failure.code, "message": failure.message, "retryable": failure.retryable })
-            }
+        // An authenticated system notice can join an active Ask turn. The grant
+        // stands even if queueing fails; never retry the runtime grant implicitly.
+        match notice(&decided) {
+            Ok(queued) => result["notice"] = queued,
+            Err(failure) => result["noticeError"] = json!({"code":failure.code,"message":failure.message,"retryable":failure.retryable}),
         }
     }
     super::owner_notify::publish_pending_notices(store);

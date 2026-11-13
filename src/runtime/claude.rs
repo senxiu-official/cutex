@@ -26,6 +26,9 @@ pub mod permission_rules;
 pub mod code_sources;
 pub mod skill_catalog;
 pub mod side;
+#[cfg(test)]
+#[path = "claude_occurrence_extra_tests.rs"]
+mod occurrence_extra_tests;
 pub mod structure;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +345,7 @@ impl ClaudeArchiveRuntime {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Ready {
     endpoint: String,
     runtime_id: String,
@@ -350,7 +354,7 @@ pub(super) struct Ready {
 
 /// The adapter's private SQLite writer lease arbitrates server ownership.
 /// This shorter lock serializes local controller operations, not model turns.
-pub(crate) fn lock(session: &ClaudeSession) -> anyhow::Result<File> {
+fn controller_lock_file(session: &ClaudeSession) -> anyhow::Result<File> {
     std::fs::create_dir_all(&session.state_dir)?;
     #[cfg(unix)]
     {
@@ -363,9 +367,28 @@ pub(crate) fn lock(session: &ClaudeSession) -> anyhow::Result<File> {
         .write(true)
         .truncate(false)
         .open(session.state_dir.join("controller.lock"))?;
-    file.try_lock_exclusive()
-        .context("Claude lifecycle operation is already running; retry when it finishes")?;
     Ok(file)
+}
+
+fn try_controller_lock(session: &ClaudeSession) -> anyhow::Result<File> {
+    let file = controller_lock_file(session)?;
+    file.try_lock_exclusive().context("Claude lifecycle operation is already running; retry when it finishes")?;
+    Ok(file)
+}
+
+pub(crate) fn lock(session: &ClaudeSession) -> anyhow::Result<File> {
+    let file = controller_lock_file(session)?;
+    // An owner gesture can overlap a short observer settlement. Native probes
+    // never hold this lock; allow that local commit to finish before refusing.
+    let deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() && Instant::now() < deadline =>
+                std::thread::sleep(Duration::from_millis(5)),
+            Err(error) => return Err(error).context("Claude lifecycle operation is already running; retry when it finishes"),
+        }
+    }
 }
 
 /// The current write / exec rules of a Claude profile (unset = on); a
@@ -554,6 +577,10 @@ pub(super) fn connect(session: &ClaudeSession) -> anyhow::Result<(AppServerClien
 /// (`claudeInteractiveApprovals`); it subscribes to no thread, so it never
 /// receives approval requests itself.
 fn connect_with(session: &ClaudeSession, interactive: bool) -> anyhow::Result<(AppServerClient, Ready)> {
+    connect_with_request_timeout(session, interactive, Duration::from_secs(60))
+}
+
+fn connect_with_request_timeout(session: &ClaudeSession, interactive: bool, request_timeout: Duration) -> anyhow::Result<(AppServerClient, Ready)> {
     let ready: Ready =
         serde_json::from_slice(&std::fs::read(session.state_dir.join("server.json"))?)?;
     let token = std::fs::read_to_string(session.state_dir.join("rpc-token"))?;
@@ -565,7 +592,7 @@ fn connect_with(session: &ClaudeSession, interactive: bool) -> anyhow::Result<(A
         options.extra_capabilities.insert("claudeInteractiveApprovals".to_string(), Value::Bool(true));
     }
     options.connect_timeout = Duration::from_millis(300);
-    options.request_timeout = Duration::from_secs(60);
+    options.request_timeout = request_timeout;
     let client = AppServerClient::connect(options)?;
     let capabilities = client.handle().request("claude/capabilities", json!({}))?;
     ensure!(
@@ -595,7 +622,7 @@ pub enum SafetyDecisionError {
 /// (`thread/safetyCheck/grant|dismiss`, docs/safety-grants.md) to the
 /// agent's running adapter. Management calls this only from its owner-only
 /// route; the adapter accepts it only from an interactive connection.
-pub fn safety_check_decision(id: &str, method: &str, params: Value) -> Result<Value, SafetyDecisionError> {
+pub fn safety_check_decision(id: &str, method: &str, mut params: Value) -> Result<Value, SafetyDecisionError> {
     let record = record(id).map_err(SafetyDecisionError::Failed)?;
     let session = record.claude_session.as_ref().ok_or(SafetyDecisionError::Unsupported)?;
     if adapter_features(&session.deployment.adapter_source)["safetyGrants"] != true {
@@ -605,6 +632,9 @@ pub fn safety_check_decision(id: &str, method: &str, params: Value) -> Result<Va
         return Err(SafetyDecisionError::Offline);
     }
     let (client, _) = connect_with(session, true).map_err(|_| SafetyDecisionError::Offline)?;
+    if adapter_features(&session.deployment.adapter_source)["safetyGrantReadWindow"] != true {
+        if let Some(params) = params.as_object_mut() { params.remove("noticeInputId"); }
+    }
     match client.handle().request(method, params) {
         Ok(result) => Ok(result),
         Err(crate::app_server::client::AppServerClientError::Rpc(error)) => {
@@ -708,7 +738,88 @@ fn mcp_tools_descriptor(executable: &std::path::Path, tools: Value, features: &V
     descriptor
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpClaimIdentity { thread_id: String, runtime_agent_id: String, generation: u64 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OldBootAdapterClaim {
+    adapter_pid: u32, adapter_runtime_id: String, ready_modified: DateTime<Utc>,
+    thread_id: String, connection_id: String, runtime_agent_id: String, generation: u64,
+}
+
+fn same_adapter_claim(current: &CutexSessionRecord, observed: &CutexSessionRecord) -> bool {
+    current.cutex_session_id == observed.cutex_session_id
+        && current.runtime_backend == observed.runtime_backend
+        && current.host_id == observed.host_id
+        && current.runtime_generation == observed.runtime_generation
+        && current.runtime_pid == observed.runtime_pid
+        && current.current_runtime_agent_id == observed.current_runtime_agent_id
+        && current.claude_session == observed.claude_session
+}
+
+/// Positive old-boot evidence is independent of today's occupant of a reused
+/// PID. Unavailable/mismatched files do not prove death. No process is killed,
+/// and stale lock files are left to the adapter's normal OS/SQLite lease.
+pub(crate) fn claim_predates_boot(record: &CutexSessionRecord) -> anyhow::Result<bool> {
+    Ok(preboot_claim_evidence(record)?.is_some())
+}
+
+fn claim_predates_boot_at(record: &CutexSessionRecord, boot: DateTime<Utc>) -> anyhow::Result<bool> {
+    Ok(preboot_claim_evidence_at(record, boot)?.is_some())
+}
+
+pub(crate) fn preboot_claim_evidence(record: &CutexSessionRecord) -> anyhow::Result<Option<OldBootAdapterClaim>> {
+    preboot_claim_evidence_at(record, crate::platform::process::system_boot_time()?)
+}
+
+fn preboot_claim_evidence_at(record: &CutexSessionRecord, boot: DateTime<Utc>) -> anyhow::Result<Option<OldBootAdapterClaim>> {
+    preboot_claim_evidence_with(record, boot, crate::platform::process::process_started_at)
+}
+
+fn preboot_claim_evidence_with(record: &CutexSessionRecord, boot: DateTime<Utc>, birth: impl FnOnce(u32) -> anyhow::Result<DateTime<Utc>>) -> anyhow::Result<Option<OldBootAdapterClaim>> {
+    let Some(session) = &record.claude_session else { return Ok(None) };
+    let Some(pid) = record.runtime_pid.filter(|pid| *pid > 0) else { return Ok(None) };
+    let Some(connection) = session.connection_id.as_deref() else { return Ok(None) };
+    if record.runtime_backend != CutexSessionRuntimeBackend::ClaudeSubscription || record.runtime_generation == 0
+        || record.current_runtime_agent_id.as_deref().and_then(|id| id.strip_prefix("claude.")) != Some(connection) { return Ok(None); }
+    let path = session.state_dir.join("server.json");
+    let before = std::fs::metadata(&path)?.modified()?;
+    // GetTickCount-based Windows boot time has millisecond rounding/jitter.
+    let descriptor_at: DateTime<Utc> = before.into();
+    if descriptor_at + chrono::Duration::seconds(2) >= boot { return Ok(None); }
+    // Utc::now - uptime can move after an RTC/NTP correction. A readable
+    // occupant born before this descriptor may still be its genuine adapter.
+    if birth(pid).is_ok_and(|born| born <= descriptor_at + chrono::Duration::seconds(2)) { return Ok(None); }
+    let ready_bytes = std::fs::read(&path)?;
+    let ready: Ready = serde_json::from_slice(&ready_bytes)?;
+    let binding_path = session.state_dir.join("cutex-mcp-binding.json");
+    let binding_at = std::fs::metadata(&binding_path)?.modified()?;
+    let binding_bytes = std::fs::read(&binding_path)?;
+    let binding: McpClaimIdentity = serde_json::from_slice(&binding_bytes)?;
+    ensure!(before == std::fs::metadata(&path)?.modified()? && ready_bytes == std::fs::read(&path)?
+        && binding_at == std::fs::metadata(&binding_path)?.modified()? && binding_bytes == std::fs::read(&binding_path)?,
+        "Claude adapter evidence changed during old-boot check");
+    let matches = ready.pid == pid && !ready.runtime_id.is_empty() && !ready.endpoint.is_empty()
+        && binding.thread_id == session.thread_id && binding.generation == record.runtime_generation
+        && Some(binding.runtime_agent_id.as_str()) == record.current_runtime_agent_id.as_deref();
+    Ok(matches.then(|| OldBootAdapterClaim { adapter_pid: pid, adapter_runtime_id: ready.runtime_id,
+        ready_modified: descriptor_at, thread_id: binding.thread_id, connection_id: connection.to_owned(),
+        runtime_agent_id: binding.runtime_agent_id, generation: binding.generation }))
+}
+
+fn claim_blocks_start(record: &CutexSessionRecord, liveness: impl FnOnce(u32) -> Option<bool>, old_boot: impl FnOnce() -> bool) -> bool {
+    record.runtime_pid.is_some_and(|pid| liveness(pid) != Some(false) && !old_boot())
+}
+
+pub(crate) fn adapter_is_reachable(record: &CutexSessionRecord) -> bool {
+    record.claude_session.as_ref().is_some_and(|session|
+        connect_with_request_timeout(session, false, Duration::from_secs(3)).is_ok())
+}
+
 fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient, Ready)> {
+    crate::agent_management::creator_paths::before_start(record)?;
     let session = record
         .claude_session
         .as_ref()
@@ -716,8 +827,11 @@ fn ensure_server(record: &CutexSessionRecord) -> anyhow::Result<(AppServerClient
     if let Ok(connected) = connect(session) {
         return Ok(connected);
     }
-    ensure!(!record.runtime_pid.is_some_and(crate::platform::process::process_is_running),
+    ensure!(!claim_blocks_start(record, crate::platform::process::process_liveness,
+        || claim_predates_boot(record).unwrap_or(false)),
         "existing Claude adapter is alive but unreachable; no duplicate server was started");
+    ensure!(same_adapter_claim(&self::record(&record.cutex_session_id)?, record),
+        "Claude occurrence changed before adapter replacement; reload this session");
     session.deployment.validate()?;
     let mcp = std::env::current_exe()?.with_file_name(if cfg!(windows) { "cutex-mcp.exe" } else { "cutex-mcp" });
     ensure!(mcp.is_file(), "Cutex MCP executable missing: {}", mcp.display());
@@ -991,6 +1105,7 @@ pub fn start_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
     let _lock = lock(initial.claude_session.as_ref().unwrap())?;
     let record = record(id)?;
     check_generation(&record, expected_generation)?;
+    crate::agent_management::creator_paths::before_start(&record)?;
     ensure!(
         !crate::agent_management::agent_execution_blocked(&record),
         "restore the archived agent before starting it"
@@ -1150,20 +1265,7 @@ pub fn close_expected(id: &str, expected_generation: Option<u64>) -> anyhow::Res
         status["processExitConfirmed"] == true || status["state"] == "offline",
         "Claude child exit is unconfirmed; retained runtime binding"
     );
-    let path = cutex_sessions_path()?;
-    crate::session::store::update_session_row(&path, id, |current| {
-        ensure!(
-            current.claude_session.as_ref() == Some(session)
-                && current.runtime_generation == record.runtime_generation
-                && current.runtime_pid == record.runtime_pid,
-            "Claude configuration changed during close; reload this session"
-        );
-        current.runtime_pid = None;
-        current.current_runtime_agent_id = None;
-        current.updated_at = chrono::Utc::now().to_rfc3339();
-        Ok(())
-    })?
-    .context("session removed during close")?;
+    ensure!(clear_ended_claim(&cutex_sessions_path()?, &record)?, "Claude occurrence changed during close; reload this session");
     client.handle().request("claude/server/shutdown", json!({"runtimeId":ready.runtime_id}))?;
     Ok(status)
     }, |_| true)
@@ -1181,27 +1283,28 @@ pub(crate) fn clear_dead_adapter_claim(
     observed: &CutexSessionRecord,
     running: impl Fn(u32) -> bool,
 ) -> anyhow::Result<bool> {
+    if observed.pending_launch_id.is_some() || observed.app_server_launch_claim_id.is_some() { return Ok(false); }
     let Some(pid) = observed.runtime_pid else {
         return Ok(false);
     };
-    if pid == 0 || running(pid) {
+    if pid == 0 || (running(pid) && !claim_predates_boot(observed).unwrap_or(false)) {
         return Ok(false);
     }
     with_locked_session_rows(path, |rows| {
         let Some(current) = rows.session(id) else {
             return Ok(false);
         };
-        if current.runtime_pid != Some(pid)
-            || current.runtime_generation != observed.runtime_generation
-            || current.claude_session != observed.claude_session
-            || current.claude_session.is_none()
+        if !same_adapter_claim(current, observed) || current.claude_session.is_none()
+            || current.pending_launch_id.is_some() || current.app_server_launch_claim_id.is_some()
         {
             return Ok(false);
         }
-        crate::session::runtime_reconciliation::clear_runtime_fields(
-            rows.session_mut(id).context("session disappeared")?,
-            true,
-        );
+        if running(pid) && !claim_predates_boot(current).unwrap_or(false) { return Ok(false); }
+        rows.preserve_unmodified_json(id);
+        let current = rows.session_mut(id).context("session disappeared")?;
+        current.runtime_pid = None;
+        current.current_runtime_agent_id = None;
+        current.updated_at = chrono::Utc::now().to_rfc3339();
         rows.commit()?;
         Ok(true)
     })
@@ -1212,6 +1315,15 @@ pub(crate) fn clear_dead_adapter_claim(
 /// offline, so its stale claim is cleared and it stops being observed.
 /// Skipped while a Start / Close holds the controller lock.
 pub fn reconcile_dead_adapter(id: &str) -> anyhow::Result<bool> {
+    let initial = record(id)?;
+    let Some(pid) = initial.runtime_pid else { return Ok(false) };
+    if initial.is_retired() || initial.pending_launch_id.is_some() || initial.app_server_launch_claim_id.is_some()
+        || (crate::platform::process::process_liveness(pid) != Some(false)
+        && !claim_predates_boot(&initial).unwrap_or(false)) { return Ok(false); }
+    if !dead_probe_due(&initial, Instant::now()) { return Ok(false); }
+    // A current adapter with restored/old timestamps can still answer. Probe
+    // before taking lifecycle locks so a slow connection cannot block its owner.
+    if adapter_is_reachable(&initial) { return Ok(false); }
     let lane = crate::management::v2::user_input::session_input_lock(id)?;
     let _operation = match lane.try_lock() {
         Ok(reservation) => reservation,
@@ -1220,18 +1332,11 @@ pub fn reconcile_dead_adapter(id: &str) -> anyhow::Result<bool> {
         Err(crate::management::v2::session_coordination::ReservationError::WouldBlock) => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    let initial = record(id)?;
-    let Some(pid) = initial.runtime_pid else {
-        return Ok(false);
-    };
-    if initial.is_retired() || crate::management::v2::health::process_may_be_running(pid) {
-        return Ok(false);
-    }
-    let Ok(_lock) = lock(initial.claude_session.as_ref().unwrap()) else {
+    let Ok(_lock) = try_controller_lock(initial.claude_session.as_ref().unwrap()) else {
         return Ok(false);
     };
     let record = record(id)?;
-    if connect(record.claude_session.as_ref().unwrap()).is_ok() {
+    if !same_adapter_claim(&record, &initial) {
         return Ok(false);
     }
     clear_dead_adapter_claim(
@@ -1240,6 +1345,93 @@ pub fn reconcile_dead_adapter(id: &str) -> anyhow::Result<bool> {
         &record,
         crate::management::v2::health::process_may_be_running,
     )
+}
+
+fn dead_probe_due(record: &CutexSessionRecord, now: Instant) -> bool {
+    use std::{collections::HashMap, sync::{Mutex, OnceLock}};
+    static LAST: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+    let key = serde_json::to_string(&(record.runtime_generation, record.runtime_pid,
+        &record.current_runtime_agent_id, record.claude_session.as_ref().map(|session| (&session.thread_id, &session.connection_id)))).unwrap_or_default();
+    let mut last = LAST.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    last.retain(|_, (_, at)| now.saturating_duration_since(*at) < Duration::from_secs(60));
+    if last.get(&record.cutex_session_id).is_some_and(|(previous, at)| previous == &key && now.saturating_duration_since(*at) < Duration::from_secs(10)) { return false; }
+    if last.len() >= 512 && !last.contains_key(&record.cutex_session_id) { return false; }
+    last.insert(record.cutex_session_id.clone(), (key, now)); true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaudeOccurrenceCheck { Live, Ended, EndedUnverified, Unknown }
+
+/// Fresh authenticated logical-owner verification, with all native IO outside
+/// lifecycle/authority/Bus locks. Neither status reads nor terminal settlement
+/// can start, stop, replay input, advance generation or rewrite an MCP binding.
+pub(crate) fn verify_occurrence(
+    observed: &CutexSessionRecord,
+    adapter_started_at: DateTime<Utc>,
+    adapter_runtime_id: &str,
+) -> anyhow::Result<ClaudeOccurrenceCheck> {
+    use ClaudeOccurrenceCheck::*;
+    let id = &observed.cutex_session_id;
+    let Some(pid) = observed.runtime_pid else { return Ok(Unknown) };
+    let Some(session) = observed.claude_session.as_ref() else { return Ok(Unknown) };
+    if crate::platform::process::process_started_at(pid)? != adapter_started_at { return Ok(Unknown); }
+    let (client, ready) = connect_with_request_timeout(session, false, Duration::from_secs(3))?;
+    if ready.pid != pid || ready.runtime_id != adapter_runtime_id { return Ok(Unknown); }
+    let status = client.handle().request("claude/runtime/status", json!({"threadId":session.thread_id}))?;
+    drop(client);
+    if crate::platform::process::process_started_at(pid)? != adapter_started_at { return Ok(Unknown); }
+    let current_ready: Ready = serde_json::from_slice(&std::fs::read(session.state_dir.join("server.json"))?)?;
+    if current_ready.pid != pid || current_ready.runtime_id != adapter_runtime_id { return Ok(Unknown); }
+    let result = classify_occurrence_status(observed, &status);
+    if result != Ended { return Ok(result); }
+    let lane = crate::management::v2::user_input::session_input_lock(id)?;
+    let _operation = match lane.try_lock() {
+        Ok(reservation) => reservation,
+        Err(crate::management::v2::session_coordination::ReservationError::WouldBlock) => return Ok(Unknown),
+        Err(error) => return Err(error.into()),
+    };
+    let Ok(_controller_lock) = try_controller_lock(session) else { return Ok(Unknown) };
+    if crate::platform::process::process_started_at(pid)? != adapter_started_at { return Ok(Unknown); }
+    let current_ready: Ready = serde_json::from_slice(&std::fs::read(session.state_dir.join("server.json"))?)?;
+    if current_ready.pid != pid || current_ready.runtime_id != adapter_runtime_id { return Ok(Unknown); }
+    // The shared close CAS advances the session-store revision and invalidates
+    // cached row/shared reads. It does not directly publish an SSE notification.
+    Ok(if clear_ended_claim(&cutex_sessions_path()?, observed)? { Ended } else { Unknown })
+}
+
+fn classify_occurrence_status(record: &CutexSessionRecord, status: &Value) -> ClaudeOccurrenceCheck {
+    use ClaudeOccurrenceCheck::*;
+    let Some(session) = &record.claude_session else { return Unknown };
+    if status["threadId"].as_str() != Some(session.thread_id.as_str())
+        || session.connection_id.is_none()
+        || status["connectionId"].as_str() != session.connection_id.as_deref()
+        || session.native_session_id.as_ref().is_some_and(|native| status["sessionId"].as_str() != Some(native.as_str())) {
+        return Unknown;
+    }
+    match (status["ownerTaskAlive"].as_bool(), status["state"].as_str()) {
+        (Some(true), Some("waiting" | "working" | "interrupting")) => Live,
+        // Keep explicit-close's retained binding while cleanup is uncertain.
+        (Some(false), Some("close_unverified")) => EndedUnverified,
+        (Some(false), Some("closed")) => Ended,
+        (Some(false), Some("failed" | "ended")) if status["processExitConfirmed"] == true => Ended,
+        _ => Unknown,
+    }
+}
+
+fn clear_ended_claim(path: &Path, observed: &CutexSessionRecord) -> anyhow::Result<bool> {
+    with_locked_session_rows(path, |rows| {
+        let Some(current) = rows.session(&observed.cutex_session_id) else { return Ok(false) };
+        if !same_adapter_claim(current, observed) || observed.runtime_pid.is_none() {
+            return Ok(false);
+        }
+        rows.preserve_unmodified_json(&observed.cutex_session_id);
+        let current = rows.session_mut(&observed.cutex_session_id).context("session disappeared")?;
+        current.runtime_pid = None;
+        current.current_runtime_agent_id = None;
+        current.updated_at = chrono::Utc::now().to_rfc3339();
+        rows.commit()?;
+        Ok(true)
+    })
 }
 
 fn check_generation(record: &CutexSessionRecord, expected: Option<u64>) -> anyhow::Result<()> {
@@ -1380,6 +1572,24 @@ impl std::fmt::Display for ClaudeObservationOffline {
 }
 impl std::error::Error for ClaudeObservationOffline {}
 
+#[derive(Debug)]
+pub struct ClaudeObservationRecovering { state: String, detail: String }
+impl std::fmt::Display for ClaudeObservationRecovering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,"Claude native occurrence is temporarily {}: {}",self.state,self.detail)
+    }
+}
+impl std::error::Error for ClaudeObservationRecovering {}
+
+/// Validate a previously authenticated exact observer without another socket.
+pub fn observe_connected(record: &CutexSessionRecord, handle: &crate::app_server::client::AppServerHandle) -> anyhow::Result<()> {
+    let session = record.claude_session.as_ref().context("Claude session missing")?;
+    let status = handle.request_with_timeout("claude/runtime/status", json!({"threadId":session.thread_id}), Duration::from_secs(3))?;
+    validate_status(session, &status)?;
+    validate_observation_occurrence(session.connection_id.as_deref(), record.runtime_pid,
+        record.runtime_pid.context("Claude adapter PID missing")?, &status)
+}
+
 pub fn observation(id: &str) -> anyhow::Result<ClaudeObservation> {
     let record = record(id)?;
     if crate::agent_management::agent_execution_blocked(&record) || record.runtime_pid.is_none() {
@@ -1439,10 +1649,10 @@ fn validate_observation_occurrence(
         // The SDK can replace a failed child under this same adapter lease.
         // Suspending here permanently strands a recovered, still-live runtime:
         // the observer only reactivates a suspended entry on identity change.
-        Some("starting" | "reconnecting") => anyhow::bail!(
-            "Claude native occurrence is temporarily {}: {}",
-            status["state"].as_str().unwrap(), status["lastError"].as_str().unwrap_or("recovery in progress")
-        ),
+        Some("starting" | "reconnecting") => Err(ClaudeObservationRecovering {
+            state:status["state"].as_str().unwrap().into(),
+            detail:status["lastError"].as_str().unwrap_or("recovery in progress").into()
+        }.into()),
         _ => Err(ClaudeObservationOffline::OccurrenceOffline.into()),
     }
 }
@@ -2000,5 +2210,65 @@ mod tests {
             &json!({"threadId":"adapter-thread","state":"offline"})
         )
         .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod occurrence_reconciliation_tests {
+    use super::*;
+    use serde_json::json;
+    fn sample(root: &Path) -> CutexSessionRecord {
+        let mut record = CutexSessionRecord::new("cutex.terminal".into(), None,
+            crate::platform::host::current_host_name(), root.to_string_lossy().into_owned(), None).unwrap();
+        record.runtime_backend = CutexSessionRuntimeBackend::ClaudeSubscription;
+        record.runtime_pid = Some(std::process::id()); record.runtime_generation = 1;
+        record.current_runtime_agent_id = Some("claude.original".into());
+        record.claude_session = Some(serde_json::from_value(json!({
+            "deployment":{"python":"unused","adapter_source":"unused","claude_cli":"unused","claude_home":"unused","tui_binary":"unused"},
+            "thread_id":"thread", "state_dir":root, "model":"sonnet", "instructions":"", "connection_id":"original", "allow_write":false,"allow_exec":false
+        })).unwrap()); record
+    }
+    #[test]
+    fn authenticated_owner_status_distinguishes_live_terminal_and_uncertain() {
+        use ClaudeOccurrenceCheck::*;
+        let record=sample(Path::new("unused"));
+        let base=json!({"threadId":"thread","connectionId":"original","ownerTaskAlive":true,"state":"waiting","nativeConnectionGeneration":1});
+        assert_eq!(classify_occurrence_status(&record,&base),Live);
+        for generation in [2,3,100] { let mut child=base.clone();child["nativeConnectionGeneration"]=json!(generation);assert_eq!(classify_occurrence_status(&record,&child),Live); }
+        for state in ["starting","reconnecting","closing","offline","future"] {
+            let mut unknown=base.clone();unknown["state"]=json!(state);assert_eq!(classify_occurrence_status(&record,&unknown),Unknown);
+        }
+        let mut terminal=base.clone();terminal["ownerTaskAlive"]=json!(false);terminal["state"]=json!("closed");
+        assert_eq!(classify_occurrence_status(&record,&terminal),Ended);
+        terminal["state"]=json!("close_unverified");terminal["processExitConfirmed"]=json!(true);
+        assert_eq!(classify_occurrence_status(&record,&terminal),EndedUnverified);
+        for key in ["connectionId","threadId","ownerTaskAlive"] {
+            let mut missing=terminal.clone();missing.as_object_mut().unwrap().remove(key);assert_eq!(classify_occurrence_status(&record,&missing),Unknown);
+        }
+        terminal["connectionId"]=json!("replacement");assert_eq!(classify_occurrence_status(&record,&terminal),Unknown);
+    }
+    #[test]
+    fn terminal_settlement_cas_cannot_clear_a_replacement_or_advance_generation() {
+        use crate::session::store::{load_cutex_session_store_from_path,save_cutex_session_store_to_path};
+        let root=std::env::temp_dir().join(format!("claude-terminal-cas-{}",uuid::Uuid::new_v4()));
+        for field in ["none","generation","pid","runtime","thread","connection"] {
+            let path=root.join(field).join("sessions.json");let original=sample(&root);
+            let mut store=crate::session::model::CutexSessionStore::default();store.sessions.insert(original.cutex_session_id.clone(),original.clone());
+            save_cutex_session_store_to_path(&path,&store).unwrap();
+            if field != "none" {
+                let mut replacement=load_cutex_session_store_from_path(&path).unwrap();let record=replacement.sessions.get_mut(&original.cutex_session_id).unwrap();
+                match field {"generation"=>record.runtime_generation+=1,"pid"=>record.runtime_pid=Some(1),"runtime"=>record.current_runtime_agent_id=Some("claude.replacement".into()),
+                    "thread"=>record.claude_session.as_mut().unwrap().thread_id="other-thread".into(), _=>record.claude_session.as_mut().unwrap().connection_id=Some("replacement".into())}
+                save_cutex_session_store_to_path(&path,&replacement).unwrap();
+                assert!(!clear_ended_claim(&path,&original).unwrap(),"late terminal after {field}");
+                assert!(load_cutex_session_store_from_path(&path).unwrap().sessions[&original.cutex_session_id].runtime_pid.is_some());
+            } else {
+                assert!(clear_ended_claim(&path,&original).unwrap());
+                let cleared=load_cutex_session_store_from_path(&path).unwrap();let row=&cleared.sessions[&original.cutex_session_id];
+                assert_eq!(row.runtime_generation,1);assert!(row.runtime_pid.is_none() && row.current_runtime_agent_id.is_none());
+                assert_eq!(row.claude_session,original.claude_session);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

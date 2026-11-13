@@ -290,6 +290,7 @@ fn authenticate_with_runtime_fallback(
 /// checks), plus the unfenced toolset lookup.
 pub fn agent_route_allowed(method: &str, path: &str, headers: &HashMap<String, String>) -> bool {
     use crate::agent_bus::mcp::{GENERATION_HEADER, THREAD_HEADER};
+    if method == "POST" && path == crate::pan::api::BUS_PATH { return true; }
     if method == "POST" && path == TOOLSET_PATH {
         return true;
     }

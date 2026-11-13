@@ -100,6 +100,7 @@ fn assert_same(left: &CutexSessionStore, right: &CutexSessionStore) {
     );
     assert_eq!(left.native_stop_receipts, right.native_stop_receipts);
     assert_eq!(left.human_adoption_receipts, right.human_adoption_receipts);
+    assert_eq!(left.quick_chat_promotion_receipts, right.quick_chat_promotion_receipts);
     assert_eq!(left.agent_archive_receipts, right.agent_archive_receipts);
     assert_eq!(left.formal_name_receipts, right.formal_name_receipts);
     assert_eq!(
@@ -157,7 +158,9 @@ fn import_is_verified_keeps_the_original_and_is_idempotent() {
     let (root, path) = temp_store("import");
     let legacy = legacy_store();
     let bytes = write_legacy(&path, &legacy);
+    let import_started = chrono::Utc::now().date_naive();
     let (db, outcome) = ensure_ready_outcome(&path, false, false).unwrap();
+    let import_finished = chrono::Utc::now().date_naive();
     assert_eq!(outcome, OpenOutcome::Imported);
     assert_eq!(db.as_deref(), Some(database_path(&path).as_path()));
     let loaded = load_cutex_session_store_from_path(&path).unwrap();
@@ -165,11 +168,13 @@ fn import_is_verified_keeps_the_original_and_is_idempotent() {
     // The original is kept byte for byte under its reference name.
     let kept = references(&root);
     assert_eq!(kept.len(), 1);
-    let today = chrono::Utc::now().format("%Y%m%d").to_string();
-    assert_eq!(
-        kept[0].file_name().unwrap().to_string_lossy(),
-        format!("cutex-sessions.json.pre-sqlite-{today}")
-    );
+    let reference_name = kept[0].file_name().unwrap().to_string_lossy();
+    let reference_date = chrono::NaiveDate::parse_from_str(
+        reference_name.strip_prefix("cutex-sessions.json.pre-sqlite-").unwrap(),
+        "%Y%m%d",
+    ).unwrap();
+    // The import can cross UTC midnight before this assertion runs.
+    assert!(reference_date >= import_started && reference_date <= import_finished);
     assert_eq!(fs::read(&kept[0]).unwrap(), bytes);
     // Sentinel at the old path, metadata recorded.
     assert!(is_sentinel(&fs::read(&path).unwrap()));
@@ -178,10 +183,7 @@ fn import_is_verified_keeps_the_original_and_is_idempotent() {
     assert_eq!(meta["imported_sessions"], "3");
     assert_eq!(meta["imported_receipts"], "4");
     assert_eq!(meta["store_revision"], "2600000");
-    assert_eq!(
-        meta["imported_from"],
-        format!("cutex-sessions.json.pre-sqlite-{today}")
-    );
+    assert_eq!(meta["imported_from"], reference_name);
     assert!(leftovers(&root).is_empty());
     // Idempotent, in this process and in a fresh one.
     assert_eq!(
@@ -792,4 +794,88 @@ fn only_one_process_imports() {
     assert_eq!(references(&root).len(), 1);
     assert!(leftovers(&root).is_empty());
     fs::remove_dir_all(root).unwrap();
+}
+
+
+#[test]
+fn r281_database_survives_sqlite_library_upgrade_and_extension_migration() {
+    // This fixture was written by the exact r281 release binary, not by the
+    // SQLite library under test. Its provenance and seed are beside the file.
+    const FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sqlite-upgrade/r281-sessions.sqlite3"
+    ));
+    for pending_extension in [false, true] {
+        let (root, path) = temp_store("r281-sqlite-upgrade");
+        let db = database_path(&path);
+        fs::write(&db, FIXTURE).unwrap();
+        if pending_extension {
+            // Exercise the idempotent migration on an older name-ledger shape
+            // as well as the untouched r281 database. These fixture tables are
+            // empty; the session and its durable receipt remain unchanged.
+            let connection = Connection::open(&db).unwrap();
+            for table in [
+                "agent_name_events",
+                "agent_name_claims",
+                "agent_name_outbox",
+            ] {
+                let count: i64 = connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+            connection
+                .execute_batch(
+                    "DROP TABLE agent_name_events; DROP TABLE agent_name_claims;
+                 DROP TABLE agent_name_outbox; DELETE FROM meta WHERE key='agent_names_v1';",
+                )
+                .unwrap();
+        }
+        let mut current = load_cutex_session_store_from_path(&path).unwrap();
+        let id = "cutex.sqlite-upgrade-fixture";
+        assert_eq!(current.store_revision.get(), 42);
+        let row = current.sessions.get(id).unwrap();
+        assert_eq!(row.revision, 7);
+        assert_eq!(
+            row.note.as_deref(),
+            Some("r281 persisted row: SQLite upgrade 中文")
+        );
+        assert_eq!(row.formal_agent_name.as_deref(), Some("sqlite-fixture"));
+        assert_eq!(row.model_defaults.as_deref(), Some("fixture-model"));
+        let receipt = current.native_stop_receipts.get(id).unwrap().clone();
+        assert_eq!(receipt.native_id.as_deref(), Some("fixture-native"));
+        assert_eq!(receipt.generation, 3);
+        let row = current.sessions.get_mut(id).unwrap();
+        row.note = Some("candidate committed after r281".into());
+        row.revision += 1;
+        save_cutex_session_store_to_path(&path, &current).unwrap();
+        let reopened = load_cutex_session_store_from_path(&path).unwrap();
+        assert_eq!(reopened.sessions.get(id).unwrap().revision, 8);
+        assert_eq!(
+            reopened.sessions.get(id).unwrap().note.as_deref(),
+            Some("candidate committed after r281")
+        );
+        assert_eq!(reopened.native_stop_receipts.get(id), Some(&receipt));
+        let connection = Connection::open(&db).unwrap();
+        let integrity: String = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let installed: String = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='agent_names_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(installed, "1");
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

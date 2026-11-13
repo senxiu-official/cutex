@@ -16,7 +16,7 @@ use std::net::TcpStream;
 
 use serde_json::{json, Value};
 
-use crate::config::store::{load_codez_config_checked, save_codez_config};
+use crate::config::store::{load_codez_config_checked, update_codez_config};
 use crate::http::server::{write_json_response, SimpleHttpRequest};
 use crate::notification_levels::{registry, view, Evaluator, Scope, PATH};
 
@@ -118,19 +118,22 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
             ) {
                 return bad_request(stream, "invalid_request", &message);
             }
-            let mut config = match load_codez_config_checked() {
-                Ok(config) => config,
-                Err(error) => return unavailable(stream, error),
-            };
-            let next = match config.notification_levels.patched(&value, &registry(), &config.owner_notify.effective()) {
-                Ok(next) => next,
-                Err(message) => return bad_request(stream, "invalid_request", &message),
-            };
-            let changed = config.notification_levels != next;
-            if changed {
+            let mut invalid_patch = None;
+            let (config, changed) = match update_codez_config(|config| {
+                let next = config.notification_levels.patched(&value, &registry(), &config.owner_notify.effective()).map_err(|message| {
+                    invalid_patch = Some(message.clone());
+                    anyhow::Error::msg(message)
+                })?;
+                let changed = config.notification_levels != next;
                 config.notification_levels = next;
-                save_codez_config(&config)?;
-            }
+                Ok(changed)
+            }) {
+                Ok(result) => result,
+                Err(error) => return match invalid_patch {
+                    Some(message) => bad_request(stream, "invalid_request", &message),
+                    None => unavailable(stream, error),
+                },
+            };
             let mut body = resource(&config);
             body["changed"] = json!(changed);
             write_json_response(stream, 200, "OK", &body)
@@ -158,6 +161,21 @@ pub fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patch_rejected_against_existing_state_is_still_a_400() {
+        let _env = crate::config::paths::test_home_env_lock();
+        let original = crate::config::store::load_codez_config_checked().unwrap();
+        let mut config = original.clone();
+        for index in 0..crate::config::notification_levels::MAX_PROJECT_OVERRIDES {
+            config.notification_levels.project_overrides.insert(format!("project-{index}"), "mute".into());
+        }
+        crate::config::store::save_codez_config(&config).unwrap();
+        let response = http("PATCH", PATH, r#"{"projectOverrides":{"another-project":"mute"}}"#);
+        crate::config::store::save_codez_config(&original).unwrap();
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("invalid_request"));
+    }
     use crate::config::notification_levels::NotificationLevelSettings;
     use crate::config::owner_notify::OwnerNotifySettings;
 

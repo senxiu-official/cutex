@@ -111,6 +111,27 @@ impl IsolatedTestHome {
         &self.root
     }
 
+    /// Native-event fixtures need the same durable active identity as a real
+    /// runtime. The library's unknown-session cache refusal also applies when
+    /// it is linked into this separate binary test crate.
+    pub(crate) fn register_active_session(
+        &self,
+        id: &str,
+        backend: cutex::session::model::CutexSessionRuntimeBackend,
+        generation: u64,
+    ) {
+        use cutex::session::model::{CutexSessionRecord, CutexSessionStore};
+        let mut record = CutexSessionRecord::new(
+            id.into(), None, cutex::platform::host::current_host_name(),
+            self.root.to_string_lossy().into_owned(), None,
+        ).unwrap();
+        record.runtime_backend = backend;
+        record.runtime_generation = generation;
+        let mut store = CutexSessionStore::default();
+        store.sessions.insert(id.into(), record);
+        cutex::session::store::save_cutex_session_store(&store).unwrap();
+    }
+
     pub(crate) fn retain_root(&mut self) {
         self.remove_root_on_drop = false;
     }

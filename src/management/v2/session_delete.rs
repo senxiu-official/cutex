@@ -95,6 +95,7 @@ pub(super) fn dispatch(
     drop(fence);
     let result = result?;
     validate_receipt(&result, cutex_session_id)?;
+    super::session_cache_lifecycle::forget(cutex_session_id);
     super::attachments::remove_session_attachments(cutex_session_id);
     append_deleted_event(event_repository, cutex_session_id, session, request, &result, false)?;
     Ok(result)
@@ -132,6 +133,7 @@ pub(super) fn dispatch_retire(
         match deleted {
             Ok(result) if result.get("deleted").and_then(Value::as_bool) == Some(true) => {
                 validate_receipt(&result, cutex_session_id)?;
+                super::session_cache_lifecycle::forget(cutex_session_id);
                 super::attachments::remove_session_attachments(cutex_session_id);
                 append_deleted_event(event_repository, cutex_session_id, session, request, &result, true)?;
                 return Ok(result);

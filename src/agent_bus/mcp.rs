@@ -180,6 +180,8 @@ pub fn tools() -> Value {
     tools.extend(crate::asks::tools::definitions());
     // Agent → owner messages (served on the delegation route).
     tools.push(crate::owner_notify::tool::definition());
+    // 备忘: owner_pin / owner_pins (served on the delegation route).
+    tools.extend(crate::owner_pins::tool::definitions());
     // Artifacts (served on the delegation route too).
     tools.extend(crate::artifacts::tools::definitions(crate::asks::tools::ToolRuntime::Codex));
     tools.extend(super::mcp_browser::definitions());
@@ -511,7 +513,7 @@ pub fn run() -> anyhow::Result<()> {
                     }
                 }
                 if let Some(trace) = timing.as_mut() { trace.stage(crate::management::v2::control_timing::Stage::Dispatch); }
-                let mut result = if crate::asks::tools::is_tool(name) || name == crate::owner_notify::tool::OWNER_NOTIFY || crate::workflows::tools::is_tool(name) {
+                let mut result = if crate::asks::tools::is_tool(name) || name == crate::owner_notify::tool::OWNER_NOTIFY || crate::owner_pins::tool::is_tool(name) || crate::workflows::tools::is_tool(name) {
                     let action_id = args["action_id"].as_str().map(str::to_owned).unwrap_or_else(||
                         derive_action_id(&message["params"], &rpc_call_key(&process, id), &runtime, generation, &fence.thread_id, name, &args));
                     action_reply(&action_id, crate::agent_bus::client::submit_mcp_control(

@@ -748,6 +748,7 @@ fn legacy_director_ownership_evidence_from_record(
             "durable_director_runtime_backend_invalid",
         ))?;
     let spec = ManagedAgentSpec {
+        memory_injection: record.memory_injection,
         name: name.to_string(),
         cwd: cwd.to_string(),
         profile: Some(
@@ -1536,6 +1537,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
         if record.formal_agent_name.is_none() {
             record.formal_agent_name = Some(spec.name.clone());
         }
+        record.memory_injection = spec.memory_injection;
         record.managed_cwd = Some(spec.cwd.clone());
         record.profile = spec.profile.clone();
         record.runtime_backend = if record.claude_session.is_some() {
@@ -1864,8 +1866,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
             dsh_bus_endpoints(&state, &record)
         } else if record.claude_session.is_some() {
             let state = self.state.lock().map_err(|_| LifecycleFailure::outcome_unknown("bus_lock_failed", "Agent Bus unavailable"))?;
-            state.agents.values().filter(|a| a.cutex_session_id.as_deref() == Some(cutex_session_id.as_str())
-                && record.current_runtime_agent_id.as_deref() == Some(a.id.as_str())).map(|a| a.id.clone()).collect()
+            claude_readiness_endpoints(&state, cutex_session_id, record.current_runtime_agent_id.as_deref())
         } else if let Some(entry) = coding_registration_from_cutex_session_record(&record) {
             let config = cutex::config::store::load_codez_config();
             management_lifecycle::try_live_agents_for_management_entry(&config, &entry)
@@ -1929,6 +1930,78 @@ impl AgentLifecycle for CutexAgentLifecycle {
         })
     }
 
+    fn readiness_claim(&self, id: &CutexSessionId) -> Result<Option<RuntimeOccurrenceFence>, LifecycleFailure> {
+        let record = cutex::session::store::shared_session_row(id.as_str())
+            .map_err(unknown("session_store_unavailable"))?
+            .ok_or_else(|| LifecycleFailure::definite("session_not_found", "managed Agent missing"))?;
+        if record.claude_session.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(cutex::session::offline_reconciliation::durable_offline_occurrence(&record)))
+    }
+
+    fn observe_ready(
+        &self,
+        id: &CutexSessionId,
+    ) -> Result<AgentRuntimeObservation, LifecycleFailure> {
+        let initial = cutex::session::store::shared_session_row(id.as_str())
+            .map_err(unknown("session_store_unavailable"))?
+            .ok_or_else(|| LifecycleFailure::definite("session_not_found", "managed Agent missing"))?;
+        if initial.claude_session.is_none() {
+            return self.observe(id);
+        }
+        let expected = cutex::agent_bus::claude_occurrence::Occurrence::from_record(&initial)
+            .ok_or_else(|| LifecycleFailure::outcome_unknown(
+                "claude_readiness_unavailable", "Claude has no current occurrence to await"))?;
+        let started = std::time::Instant::now();
+        let baseline = self.observe(id)?;
+        cutex::agent_management::wait_for_claude_registration_with(
+            std::time::Duration::from_secs(30),
+            || {
+                let check = || -> Result<(), LifecycleFailure> {
+                    let record = cutex::session::store::shared_session_row(id.as_str())
+                        .map_err(unknown("session_store_unavailable"))?
+                        .ok_or_else(|| LifecycleFailure::definite("session_not_found", "managed Agent missing"))?;
+                    if cutex::agent_management::agent_execution_blocked(&record)
+                        || cutex::agent_bus::claude_occurrence::Occurrence::from_record(&record).as_ref() != Some(&expected)
+                    {
+                        return Err(LifecycleFailure::outcome_unknown(
+                            "claude_readiness_occurrence_changed", "Claude durable occurrence changed while awaiting registration"));
+                    }
+                    Ok(())
+                };
+                check()?;
+                let status = super::claude_runtime::manager().status(id.as_str())
+                    .map_err(unknown("app_server_observation_failed"))?;
+                if status.as_ref().is_some_and(|status|
+                    status.runtime_generation != expected.generation || status.thread_id != expected.thread_id)
+                {
+                    return Err(LifecycleFailure::outcome_unknown(
+                        "claude_readiness_occurrence_changed", "Claude observer belongs to a different occurrence"));
+                }
+                // Poll shared row/manager/roster projections only. Rebuilding
+                // the full directory observation on every wait would clone
+                // the host's entire session store at the polling frequency.
+                let mut observed = baseline.clone();
+                observed.app_server_runtime = status.is_some_and(|status| status.connected);
+                observed.agent_bus_endpoint_ids = {
+                    let state = self.state.lock().map_err(|_| LifecycleFailure::outcome_unknown(
+                        "bus_lock_failed", "Agent Bus unavailable"))?;
+                    claude_readiness_endpoints(&state, id, Some(expected.runtime_agent_id.as_str()))
+                };
+                if observed.agent_bus_endpoint_ids.as_slice() == [expected.runtime_agent_id.clone()] {
+                    // Refresh every spec field before the unchanged full
+                    // readiness validator decides whether a task may run.
+                    observed = self.observe(id)?;
+                }
+                check()?;
+                Ok(observed)
+            },
+            || started.elapsed(),
+            std::thread::sleep,
+        )
+    }
+
     fn send_message(
         &self,
         system: &cutex::agent_bus::identity::AgentManagementSystemPrincipal,
@@ -1982,6 +2055,46 @@ fn agent_message_source_binding(
         .as_ref()
         .map(|_| from_director.as_str().to_string());
     (current_runtime_agent_id, from_session_id)
+}
+
+/// Readiness concerns the currently claimed occurrence. A stale foreign ID
+/// for the same session is not its endpoint; duplicate exact entries remain
+/// visible so the sole-endpoint validator rejects them.
+fn claude_readiness_endpoints(
+    state: &cutex::agent_bus::store::AgentBusState,
+    id: &CutexSessionId,
+    runtime: Option<&str>,
+) -> Vec<String> {
+    state.agents.values().filter(|agent|
+        agent.cutex_session_id.as_deref() == Some(id.as_str()) && runtime == Some(agent.id.as_str()))
+        .map(|agent| agent.id.clone()).collect()
+}
+
+#[cfg(test)]
+mod readiness_projection_tests {
+    use super::*;
+
+    #[test]
+    fn claude_readiness_projection_ignores_foreign_but_preserves_duplicate_exact_entries() {
+        let id = CutexSessionId::new("cutex.projection").unwrap();
+        let mut state = cutex::agent_bus::store::AgentBusState::default();
+        let make = |runtime: &str| {
+            let request = serde_json::from_value(serde_json::json!({
+                "id":runtime,"name":"projection","profile":"fake","cwd":".","pid":1
+            })).unwrap();
+            let mut agent = cutex::agent_bus::groups::agent_from_register_request(request, 1);
+            agent.cutex_session_id = Some(id.as_str().to_string());
+            agent
+        };
+        state.agents.insert("claude.old".into(), make("claude.old"));
+        assert!(claude_readiness_endpoints(&state, &id, Some("claude.current")).is_empty());
+        state.agents.insert("claude.current".into(), make("claude.current"));
+        assert_eq!(claude_readiness_endpoints(&state, &id, Some("claude.current")), vec!["claude.current"]);
+        // A malformed roster with two exact values must not be collapsed by
+        // the production projection before validate_ready sees its cardinality.
+        state.agents.insert("malformed-alias".into(), make("claude.current"));
+        assert_eq!(claude_readiness_endpoints(&state, &id, Some("claude.current")).len(), 2);
+    }
 }
 
 fn load_record(
@@ -2066,6 +2179,8 @@ pub(super) fn validate_managed_recovery_record(
         Some("groups")
     } else if record.registration_class != AgentRegistrationClass::Persistent {
         Some("registration_class")
+    } else if record.memory_injection != spec.memory_injection {
+        Some("memoryInjection")
     } else if record.quick_action != quick_action {
         Some("pin")
     } else if record.permission_defaults.as_deref().unwrap_or_default() != spec.permissions {
@@ -2423,6 +2538,27 @@ pub(super) fn bootstrap_with_creator_for_test(spec: &ManagedAgentSpec, creator: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_injection_create_configuration_persists_false_and_recovery_checks_it() {
+        let _home = crate::cli_app::test_home::IsolatedTestHome::new("memory-create-configure").unwrap();
+        let mut desired = spec();
+        desired.memory_injection = false;
+        let mut record = managed_recovery_record(&desired);
+        record.memory_injection = true;
+        let id = CutexSessionId::new(record.cutex_session_id.clone()).unwrap();
+        let native = record.codex_session_id.clone().unwrap();
+        let mut store = load_cutex_session_store().unwrap();
+        store.sessions.insert(record.cutex_session_id.clone(),record);
+        cutex::session::store::save_cutex_session_store(&store).unwrap();
+        let lifecycle = CutexAgentLifecycle { state: std::sync::Arc::new(std::sync::Mutex::new(Default::default())) };
+        lifecycle.configure(&id,&native,&desired).unwrap();
+        let saved=cutex::session::store::shared_session_row(id.as_str()).unwrap().unwrap();
+        assert!(!saved.memory_injection);
+        validate_managed_recovery_record(&saved,&id,&native,&desired).unwrap();
+        desired.memory_injection=true;
+        assert!(validate_managed_recovery_record(&saved,&id,&native,&desired).unwrap_err().detail.contains("memoryInjection"));
+    }
+
     use super::*;
 
     #[test]
@@ -2677,6 +2813,7 @@ mod tests {
 
     fn spec() -> ManagedAgentSpec {
         ManagedAgentSpec {
+            memory_injection: true,
             name: "worker-r1".to_string(),
             cwd: if cfg!(windows) {
                 r"C:\tmp\project\agent-home\worker-r1"
@@ -2735,6 +2872,7 @@ mod tests {
             "2026-08-29T00:00:00Z".to_string(),
         )
         .expect("managed recovery record");
+        record.memory_injection = spec.memory_injection;
         record.managed_cwd = Some(spec.cwd.clone());
         record.runtime_backend =
             parse_cutex_session_runtime_backend(&spec.runtime_backend).unwrap();

@@ -554,6 +554,7 @@ impl AgentManagementProvider {
                     && before_execution.runtime_generation == review.subject.runtime_generation
                     && current_configuration(&before_execution)? == review.configuration,
                     "stock confirmation stale before execution; owner unchanged");
+                super::creator_paths::before_start(&before_execution)?;
                 if review.restart {
                     crate::session::runtime_stop::RequestedStop::run(
                         &before_execution.cutex_session_id, before_execution.runtime_generation,
@@ -604,6 +605,7 @@ impl AgentManagementProvider {
                     && current.runtime_generation == review.subject.runtime_generation
                     && current.revision == review.subject.revision,
                     "publication conflict: claim/configuration or runtime changed; no spawn");
+                super::creator_paths::before_start(&current)?;
                 let binding = match runtime.spawn(&current, &bundle, &receipt) {
                     Ok(binding) => binding,
                     Err(error) => {

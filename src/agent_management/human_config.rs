@@ -273,6 +273,8 @@ pub fn human_config_action(
             .after
             .iter()
             .any(|(key, value)| current.get(key) != Some(value))
+            || (matches!(record.created_by,Some(crate::session::model::SessionCreatedBy::Agent{..}))
+                && receipt.after.keys().any(|key|matches!(key.as_str(),"cwd"|"sandbox"|"approval")))
         {
             ensure!(
                 receipt
@@ -283,6 +285,9 @@ pub fn human_config_action(
             );
             let mut candidate = record.clone();
             apply(&mut candidate, &receipt.after)?;
+            if receipt.after.keys().any(|key|matches!(key.as_str(),"cwd"|"sandbox"|"approval")) {
+                super::creator_paths::owner_reapprove(&mut candidate)?;
+            }
             validate_candidate(&candidate, receipt.after.contains_key("bundle_manifest"))?;
             candidate.revision = candidate
                 .revision

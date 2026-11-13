@@ -60,6 +60,10 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COMMAND_CAPACITY: usize = 128;
 const DEFAULT_EVENT_CAPACITY: usize = 512;
 const MAX_COMMANDS_PER_TICK: usize = 64;
+// Timed-out observed calls remain until a late reply or disconnect. Bound new
+// admissions so an otherwise connected, nonreplying runtime cannot grow them
+// forever; never discard an observer for a request already sent to native.
+const MAX_PENDING_REQUESTS: usize = 128;
 
 /// Counts event ownership, not payload bytes. Independent atomics make a
 /// concurrent snapshot approximate; after quiescence the lifecycle balances.
@@ -670,7 +674,7 @@ impl AppServerClient {
         let (event_tx, event_rx) = event_channel(options.event_capacity, native_event_metrics());
         let disconnect_reason = Arc::new(Mutex::new(None));
         let actor_disconnect_reason = disconnect_reason.clone();
-        let actor = thread::spawn(move || run_actor(socket, command_rx, event_tx, actor_disconnect_reason));
+        let actor = thread::spawn(move || run_actor(socket, command_rx, event_tx, actor_disconnect_reason, MAX_PENDING_REQUESTS));
         let handle = AppServerHandle {
             initialize_response: Default::default(),
             request_hook: Default::default(),
@@ -1192,6 +1196,7 @@ fn run_actor(
     command_rx: Receiver<ActorCommand>,
     event_tx: EventSender,
     connection_failure: Arc<Mutex<Option<String>>>,
+    max_pending_requests: usize,
 ) {
     let mut pending = HashMap::<RpcRequestIdKey, PendingRequest>::new();
     let mut notification_observer: Option<Box<dyn Fn(&AppServerEvent) + Send>> = None;
@@ -1228,6 +1233,15 @@ fn run_actor(
                         let _ = response_tx.try_send(Err(AppServerClientError::RequestIdInUse(
                             format!("app-server request id {} is already pending", id),
                         )));
+                        continue;
+                    }
+                    // Preserve the observer bound while reserving admission
+                    // for interruption of a stalled turn. An observer-free
+                    // interrupt is removed at its own deadline, never retained.
+                    expire_pending_requests(&mut pending);
+                    let interrupt = method == "turn/interrupt" && response_observer.is_none();
+                    if pending.len() >= max_pending_requests && !interrupt {
+                        let _ = response_tx.try_send(Err(AppServerClientError::Backpressure("pending requests")));
                         continue;
                     }
                     pending.insert(
@@ -1470,6 +1484,69 @@ fn emit_event(event_tx: &EventSender, event: AppServerEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_observers_are_bounded_without_losing_late_replies() {
+        fn read_json(socket: &mut WebSocket<TcpStream>) -> Value {
+            let Message::Text(text) = socket.read().unwrap() else { panic!("expected JSON request") };
+            serde_json::from_str(text.as_ref()).unwrap()
+        }
+        fn write_json(socket: &mut WebSocket<TcpStream>, value: Value) {
+            socket.send(Message::Text(value.to_string().into())).unwrap();
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let first = read_json(&mut socket);
+            let second = read_json(&mut socket);
+            assert_eq!(first["id"], 1);
+            assert_eq!(second["id"], 2);
+            seen_tx.send(()).unwrap();
+            let control = read_json(&mut socket);
+            assert_eq!(control["method"], "turn/interrupt");
+            write_json(&mut socket, json!({"id":5,"result":{"interrupted":true}}));
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            write_json(&mut socket, json!({"id":1,"result":{"late":true}}));
+            let after = read_json(&mut socket);
+            assert_eq!(after["id"], 4, "the rejected third call must never reach native");
+            write_json(&mut socket, json!({"id":4,"result":{"ok":true}}));
+            let _ = socket.read();
+        });
+        let endpoint = AppServerEndpoint::LoopbackWebSocket { url:format!("ws://127.0.0.1:{port}/"), bearer_token:None };
+        let socket = connect_websocket(&endpoint, Duration::from_secs(2)).unwrap();
+        let (command_tx, command_rx) = mpsc::sync_channel(8);
+        let (event_tx, event_rx) = event_channel(4, Arc::new(EventQueueMetrics::default()));
+        let disconnect_reason = Arc::new(Mutex::new(None));
+        let actor_reason = disconnect_reason.clone();
+        let actor = thread::spawn(move || run_actor(socket, command_rx, event_tx, actor_reason, 2));
+        let handle = AppServerHandle { command_tx, request_hook:Default::default(), initialize_response:Default::default(),
+            next_id:Arc::new(AtomicU64::new(1)), default_timeout:Duration::from_secs(1), disconnect_reason };
+        let (observed_tx, observed_rx) = mpsc::sync_channel(2);
+        for id in 1..=2 {
+            let observed = observed_tx.clone();
+            let result = handle.request_rpc_message_observed(json!({"id":id,"method":"fixture/no-reply","params":{}}),
+                Duration::from_millis(50), Some(Box::new(move |_| { observed.send(id).unwrap(); })));
+            assert!(matches!(result, Err(AppServerClientError::Timeout { .. })));
+        }
+        seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let rejected = handle.request_rpc_message_observed(json!({"id":3,"method":"fixture/refused","params":{}}), Duration::from_secs(1), Some(Box::new(|_| panic!("rejected request cannot complete"))));
+        assert!(matches!(rejected, Err(AppServerClientError::Backpressure("pending requests"))));
+        let control = handle.request_raw_message_with_timeout(json!({"id":5,"method":"turn/interrupt","params":{}}), Duration::from_secs(1)).unwrap();
+        assert_eq!(control["result"]["interrupted"], true);
+        release_tx.send(()).unwrap();
+        assert_eq!(observed_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        let after = handle.request_raw_message_with_timeout(json!({"id":4,"method":"fixture/after-late","params":{}}), Duration::from_secs(1)).unwrap();
+        assert_eq!(after["result"]["ok"], true);
+        handle.shutdown().unwrap();
+        drop(event_rx);
+        actor.join().unwrap();
+        peer.join().unwrap();
+    }
 
     // Synthetic peer: r52.4 normally queues initialize's response before its
     // initial notifications. Deliberately permit the opposite order here to
