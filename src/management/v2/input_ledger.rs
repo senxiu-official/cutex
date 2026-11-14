@@ -615,6 +615,12 @@ pub fn edge_allowed(kind: InputKind, from: Option<InputState>, to: &Next) -> boo
         return matches!(to.state, Received | Held | Waiting | Sending | Rejected | Failed);
     };
     let reverted = to.state == Discarded && to.reason.as_deref() == Some(HISTORY_REVERTED);
+    if to.state==Discarded && to.reason.as_deref()==Some("settlementClosed")
+        && to.details.as_ref().is_some_and(|details|details["recipientTransferred"]==true)
+        && matches!(kind,InputKind::DelegationResult|InputKind::DelegationQuestion|InputKind::DelegationStatus) {
+        return matches!(from,Received|Held|Waiting|Sending|Accepted|Uncertain|Failed);
+    }
+
     match (from, to.state) {
         // r274.2 §9.6: a confirmed history revert removed the record's turn.
         // Only this reason takes these edges; and it takes no other edge
@@ -625,6 +631,8 @@ pub fn edge_allowed(kind: InputKind, from: Option<InputState>, to: &Next) -> boo
         (Waiting, Discarded) if reverted => false,
         // Same state: reason / stage / turn / stalled / order updates.
         (Received | Held | Waiting | Sending | Accepted | Uncertain, same) if same == from => true,
+        (Received | Held, Uncertain) if to.reason.as_deref() == Some("outcomeUnknown")
+            && to.details.as_ref().is_some_and(|details| details["absoluteDeadlineElapsed"] == true || details["sourceRecoveryUnconfirmed"] == true) => true,
         (Received, Held | Waiting | Sending | Rejected | Failed) => true,
         (Held, Sending | Waiting | Failed) => true,
         (Waiting, Sending | Discarded | Superseded | Rejected) => true,
@@ -647,10 +655,10 @@ pub fn edge_allowed(kind: InputKind, from: Option<InputState>, to: &Next) -> boo
         // r274.2 §9.4: an owner resend (`waiting{ownerRetry}`) refused before
         // any native IO (the runtime is still away): failed again, with its
         // actions; never left waiting with none.
-        (Waiting, Failed) => owner,
+        (Waiting, Failed) => owner || to.details.as_ref().is_some_and(|details| details["retryRefused"] == true),
         // The same for a resend whose first outcome stays unknown (an earlier
         // send is unresolved): back to `uncertain`, with its actions.
-        (Waiting, Uncertain) => owner,
+        (Waiting, Uncertain) => owner || to.details.as_ref().is_some_and(|details| details["retryRefused"] == true),
         (Uncertain, InContext | Discarded) => true,
         (Accepted | Uncertain, Waiting) if carrier_unread_return(kind, to) => true,
         // r274.2 §9.4: the owner discards a failed message of theirs.
@@ -890,13 +898,12 @@ pub fn actions_with_delivery(
 /// Owner actions cutex offers for a record (§2.2 `actions`, §2.14).
 pub fn actions_for(kind: InputKind, state: InputState, reason: Option<&str>) -> Vec<Action> {
     match state {
-        InputState::Failed if kind == InputKind::Owner => vec![Action::Retry, Action::Dismiss],
-        InputState::Failed => vec![Action::Retry],
+        InputState::Failed => vec![Action::Retry, Action::Dismiss],
         InputState::Uncertain => vec![Action::Retry, Action::Dismiss],
         InputState::Waiting if kind == InputKind::Owner && reason == Some("explicitQueue") => {
-            vec![Action::Cancel, Action::SendNow, Action::Edit]
+            vec![Action::Cancel, Action::SendNow, Action::Edit, Action::Dismiss]
         }
-        InputState::Waiting if kind != InputKind::Owner && kind != InputKind::DelegationRequest => {
+        InputState::Waiting | InputState::Held | InputState::Accepted => {
             vec![Action::Dismiss]
         }
         _ => Vec::new(),
@@ -1202,6 +1209,32 @@ fn apply(
             None => record.deadline.clone(),
         }
     };
+    // Only transport before admission has an absolute budget. Accepted,
+    // held and queued input can normally wait for a turn; Dismiss is its exit.
+    let transport = matches!(record.state, InputState::Received | InputState::Sending)
+        && matches!(record.surface, Surface::NextUp | Surface::PendingNotes);
+    let previous_transport = current.filter(|old|
+        matches!(old.state, InputState::Received | InputState::Sending));
+    let prior = previous_transport.and_then(|old| old.details["observationDeadline"].as_str())
+        .and_then(|text| DateTime::parse_from_rfc3339(text).ok()).map(|at|at.with_timezone(&Utc));
+    if let Some(details)=record.details.as_object_mut(){details.remove("observationDeadline");}
+    if transport {
+        if !record.details.is_object(){record.details=json!({});}
+        // Seed only an in-scope transport observation. Never back-date held or
+        // accepted rows using their old since, including during an upgrade.
+        let start=previous_transport
+            .and_then(|old|DateTime::parse_from_rfc3339(&old.since).ok()).map(|at|at.with_timezone(&Utc)).unwrap_or(now);
+        let bound=prior.unwrap_or(start+chrono::Duration::seconds(60));
+        record.details["observationDeadline"]=json!(timestamp(bound));
+        let requested=record.deadline.as_deref().and_then(|text|DateTime::parse_from_rfc3339(text).ok()).map(|at|at.with_timezone(&Utc));
+        record.deadline=Some(timestamp(requested.map_or(bound,|at|at.min(bound))));
+    } else if !state_changed && current.is_some_and(|old|
+        old.details["observationDeadline"].as_str()==old.deadline.as_deref()
+            && old.deadline.is_some()) && next.deadline.is_none() {
+        // Remove the previous build's injected cap when metadata next changes.
+        // Preserve independently requested receipt/admission deadlines.
+        record.deadline=None;
+    }
     record.actions = record_actions(&record, delivery);
     Ok(record)
 }
@@ -1240,12 +1273,14 @@ struct LedgerGuard<'a> {
     connection: MutexGuard<'a, Option<Connection>>,
     /// Cooperating writers queue outside SQLite's bounded busy handler.
     writer: Option<std::fs::File>,
+    disposition: Option<super::input_disposal::Guard>,
 }
 
 impl Drop for LedgerGuard<'_> {
     fn drop(&mut self) {
         // Closing this operation's handle releases its cross-process lock.
         drop(self.writer.take());
+        drop(self.disposition.take());
         LEDGER_LOCK_HELD.with(|held| held.set(false));
     }
 }
@@ -1476,9 +1511,13 @@ impl InputLedger {
         if cfg!(debug_assertions) && thread_holds_ledger_lock() {
             panic!("054 lock protocol: the input ledger lock is not reentrant");
         }
+        let disposition=if writing {Some(super::input_disposal::Guard::open_notifying(&self.path,false,|| {
+            #[cfg(test)]
+            if let Some(waiting)=self.writer_waiting.lock().unwrap().take(){let _=waiting.send(());}
+        }).map_err(LedgerError::Storage)?)} else {None};
         let connection = self.connection.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         LEDGER_LOCK_HELD.with(|held| held.set(true));
-        let mut guard = LedgerGuard { connection, writer: None };
+        let mut guard = LedgerGuard { connection, writer: None, disposition };
         // Opening a connection also initializes schema and the epoch marker.
         // Serialize that first use; established read connections stay WAL readers.
         if writing || guard.connection.is_none() {
@@ -1651,18 +1690,23 @@ impl InputLedger {
         let lock_wait = timing::span(timing::Op::LockWait, outbox);
         let mut guard = self.lock_write()?;
         drop(lock_wait);
-        let connection = guard.connection.as_mut().expect("opened under lock");
+        let decision=guard.disposition.as_ref().expect("write fence").get(session,input_id).map_err(LedgerError::Storage)?;
+        let LedgerGuard {connection,disposition,..}=&mut guard;
+        let connection = connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = read_record(&tx, session, input_id)?;
         let current_rev = current.as_ref().map_or(0, |record| record.rev);
-        if let Some(expected) = expect.rev {
+        if let Some(expected) = expect.rev.filter(|_|decision.is_none()) {
             if expected != current_rev {
                 return Err(LedgerError::Conflict { current_rev });
             }
         }
         let session_row = session_row(&tx, session)?;
         let delivery = parse_delivery(session_row.as_ref())?;
-        let mut record = next_record(current.as_ref(), delivery.as_ref(), now)?;
+        let mut record=if let Some(decision)=&decision {
+            let candidate=match &current {Some(record)=>record.clone(),None=>next_record(None,delivery.as_ref(),now)?};
+            super::input_disposal::suppress(candidate,decision)
+        } else {next_record(current.as_ref(),delivery.as_ref(),now)?};
         let changed = current.as_ref().is_none_or(|before| observably_changed(before, &record));
         if !changed {
             let record = current.expect("unchanged implies existing");
@@ -1753,7 +1797,12 @@ impl InputLedger {
         let lock_wait = timing::span(timing::Op::LockWait, outbox);
         let mut guard = self.lock_write()?;
         drop(lock_wait);
-        let connection = guard.connection.as_mut().expect("opened under lock");
+        let decisions:std::collections::BTreeMap<_,_>=items.iter().filter_map(|(id,_,_)|
+            match guard.disposition.as_ref().expect("write fence").get(session,id) {
+                Ok(Some(decision))=>Some(Ok((id.clone(),decision))),Ok(None)=>None,Err(error)=>Some(Err(LedgerError::Storage(error)))
+            }).collect::<Result<_,_>>()?;
+        let LedgerGuard {connection,disposition,..}=&mut guard;
+        let connection = connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let session_row = session_row(&tx, session)?;
         let stored_delivery = parse_delivery(session_row.as_ref())?;
@@ -1765,12 +1814,15 @@ impl InputLedger {
         for (input_id, expect, next) in &items {
             let current = read_record(&tx, session, input_id)?;
             let current_rev = current.as_ref().map_or(0, |record| record.rev);
-            if let Some(expected) = expect.rev {
+            if let Some(expected) = expect.rev.filter(|_|!decisions.contains_key(input_id)) {
                 if expected != current_rev {
                     return Err(LedgerError::Conflict { current_rev });
                 }
             }
-            let record = apply(session, input_id, current.as_ref(), next, now, &self.deadlines, delivery)?;
+            let record=if let Some(decision)=decisions.get(input_id) {
+                let candidate=match &current {Some(record)=>record.clone(),None=>apply(session,input_id,None,next,now,&self.deadlines,delivery)?};
+                super::input_disposal::suppress(candidate,decision)
+            } else {apply(session,input_id,current.as_ref(),next,now,&self.deadlines,delivery)?};
             let changed = current.as_ref().is_none_or(|before| observably_changed(before, &record));
             applied.push((input_id.as_str(), current, record, changed));
         }
@@ -1837,7 +1889,7 @@ impl InputLedger {
         let mut refreshed = Vec::new();
         if let Some((delivery, true)) = &change {
             let skip: Vec<&str> = items.iter().map(|(id, _, _)| id.as_str()).collect();
-            refreshed = refresh_actions(&tx, session, &row.epoch, delivery, state_revision, now, outbox, &skip, seq, true)?;
+            refreshed = refresh_actions(&tx, disposition.as_ref().expect("write fence"), session, &row.epoch, delivery, state_revision, now, outbox, &skip, seq, true)?;
         }
         commit_timed(tx, outbox)?;
         let change = change.map(|(delivery, changed)| DeliveryChange {
@@ -1969,6 +2021,23 @@ impl InputLedger {
         Ok(due)
     }
 
+    pub(crate) fn absolute_due(&self,now:DateTime<Utc>,limit:usize)->Result<Vec<DueInput>,LedgerError> {
+        let mut guard=self.lock()?;let connection=guard.connection.as_mut().expect("opened under lock");
+        let mut query=connection.prepare_cached("SELECT session,input_id,state,rev,observation_deadline_ms FROM input_ledger WHERE observation_deadline_ms IS NOT NULL AND observation_deadline_ms<=?1 AND state IN ('received','sending') AND surface IN ('nextUp','pendingNotes') ORDER BY observation_deadline_ms LIMIT ?2")?;
+        let rows=query.query_map(params![now.timestamp_millis(),i64::try_from(limit).unwrap_or(i64::MAX)],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?)))?;
+        let mut due=Vec::new();
+        for row in rows {let (session,id,state,rev,deadline_ms)=row?;
+            let state=InputState::parse(&state).ok_or_else(||LedgerError::Invalid("unknown observed state".into()))?;
+            due.push(DueInput{cutex_session_id:session,input_id:id,state,rev:rev as u64,deadline_ms});
+        }Ok(due)
+    }
+    fn unbudgeted(&self,limit:usize)->Result<Vec<InputRecord>,LedgerError> {
+        let mut guard=self.lock()?;let connection=guard.connection.as_mut().expect("opened under lock");
+        let mut query=connection.prepare_cached("SELECT record_json FROM input_ledger WHERE observation_deadline_ms IS NULL AND state IN ('received','sending') AND surface IN ('nextUp','pendingNotes') ORDER BY updated_revision LIMIT ?1")?;
+        let rows=query.query_map([i64::try_from(limit).unwrap_or(i64::MAX)],|row|row.get::<_,String>(0))?;
+        let mut records=Vec::new();for row in rows {records.push(decode_record(&row?)?);}Ok(records)
+    }
+
     /// Delete terminal records (never `uncertain`: owner decision 9) last
     /// changed before `now - retention`, at most
     /// `limit` per call; raise each touched session's compaction floor so an
@@ -1977,7 +2046,8 @@ impl InputLedger {
         let cutoff = now.timestamp_millis()
             .saturating_sub(i64::try_from(retention.as_millis()).unwrap_or(i64::MAX));
         let mut guard = self.lock_write()?;
-        let connection = guard.connection.as_mut().expect("opened under lock");
+        let LedgerGuard {connection,disposition,..}=&mut guard;
+        let connection = connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let victims: Vec<(String, String, i64)> = {
             let mut statement = tx.prepare_cached(
@@ -1992,6 +2062,11 @@ impl InputLedger {
         };
         let mut floors = std::collections::BTreeMap::<String, i64>::new();
         for (session, input_id, revision) in &victims {
+            if let Some(record)=read_record(&tx,session,input_id)? {
+                if matches!(record.state,InputState::Discarded|InputState::Superseded|InputState::Rejected) {
+                    disposition.as_mut().expect("write fence").request(session,input_id,now).map_err(LedgerError::Storage)?;
+                }
+            }
             tx.execute("DELETE FROM input_ledger WHERE session = ?1 AND input_id = ?2", params![session, input_id])?;
             let floor = floors.entry(session.clone()).or_insert(0);
             *floor = (*floor).max(*revision);
@@ -2019,7 +2094,8 @@ impl InputLedger {
         let now = self.now();
         let outbox = self.outbox_on();
         let mut guard = self.lock_write()?;
-        let connection = guard.connection.as_mut().expect("opened under lock");
+        let LedgerGuard {connection,disposition,..}=&mut guard;
+        let connection = connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let unchanged = |ledger_epoch: String, state_revision: u64, delivery: Value| DeliveryChange {
             delivery, changed: false, ledger_epoch, state_revision, outboxed: false, records: Vec::new(),
@@ -2034,7 +2110,7 @@ impl InputLedger {
             .filter(|revision| *revision <= super::model::MAX_SAFE_SEQUENCE)
             .ok_or_else(|| LedgerError::Storage(anyhow::anyhow!("session stateRevision exhausted")))?;
         let stored = store_delivery(&tx, session, &row, &delivery, state_revision, now, outbox)?;
-        let records = refresh_actions(&tx, session, &row.epoch, &stored, state_revision, now, outbox, &[], 1, false)?;
+        let records = refresh_actions(&tx, disposition.as_ref().expect("write fence"), session, &row.epoch, &stored, state_revision, now, outbox, &[], 1, false)?;
         if records.is_empty() {
             // Dropped: the delivery write above rolls back.
             return Ok(unchanged(row.epoch, row.state_revision, delivery));
@@ -2060,7 +2136,8 @@ impl InputLedger {
         let lock_wait = timing::span(timing::Op::LockWait, outbox);
         let mut guard = self.lock_write()?;
         drop(lock_wait);
-        let connection = guard.connection.as_mut().expect("opened under lock");
+        let LedgerGuard {connection,disposition,..}=&mut guard;
+        let connection = connection.as_mut().expect("opened under lock");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row = match session_row(&tx, session)? {
             Some(row) => row,
@@ -2081,7 +2158,7 @@ impl InputLedger {
         let stored = store_delivery(&tx, session, &row, delivery, state_revision, now, outbox)?;
         // `interruptSend` depends on the running turn: the open owner
         // records' actions follow the delivery at the same revision.
-        let records = refresh_actions(&tx, session, &row.epoch, &stored, state_revision, now, outbox, &[], 1, true)?;
+        let records = refresh_actions(&tx, disposition.as_ref().expect("write fence"), session, &row.epoch, &stored, state_revision, now, outbox, &[], 1, true)?;
         commit_timed(tx, outbox)?;
         Ok(DeliveryChange { delivery: stored, changed: true, ledger_epoch: row.epoch, state_revision, outboxed: outbox, records })
     }
@@ -2168,6 +2245,13 @@ fn open_database(path: &Path) -> anyhow::Result<Connection> {
            PRIMARY KEY (session, state_revision, seq)
          ) WITHOUT ROWID;",
     )?;
+    let has_observation={
+        let mut columns=db.prepare("PRAGMA table_info(input_ledger)")?;
+        let names=columns.query_map([],|row|row.get::<_,String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        names.iter().any(|name|name=="observation_deadline_ms")
+    };
+    if !has_observation {db.execute_batch("ALTER TABLE input_ledger ADD COLUMN observation_deadline_ms INTEGER;")?;}
+    db.execute_batch("DROP INDEX IF EXISTS input_ledger_observation; CREATE INDEX IF NOT EXISTS input_ledger_transport_observation ON input_ledger(observation_deadline_ms) WHERE observation_deadline_ms IS NOT NULL AND state IN ('received','sending');")?;
     let version: Option<i64> = db
         .query_row("SELECT format_version FROM input_ledger_meta WHERE singleton = 1", [], |row| row.get(0))
         .optional()?;
@@ -2447,6 +2531,7 @@ fn store_delivery(
 #[allow(clippy::too_many_arguments)]
 fn refresh_actions(
     tx: &rusqlite::Transaction<'_>,
+    disposition: &super::input_disposal::Guard,
     session: &str,
     epoch: &str,
     delivery: &Value,
@@ -2470,8 +2555,12 @@ fn refresh_actions(
         if record.kind != InputKind::Owner || skip.contains(&record.input_id.as_str()) {
             continue;
         }
+        let before=record.clone();
+        if let Some(decision)=disposition.get(session,&record.input_id).map_err(LedgerError::Storage)? {
+            record=super::input_disposal::suppress(record,&decision);
+        }
         let actions = record_actions(&record, Some(delivery));
-        if actions == record.actions {
+        if actions == record.actions && !observably_changed(&before,&record) {
             continue;
         }
         record.actions = actions;
@@ -2557,7 +2646,27 @@ pub fn run_deadline_pass(
 ) -> Result<usize, LedgerError> {
     let mut count = 0;
     for due in ledger.due(now, limit)? {
-        let Some(next) = decide(&due) else { continue };
+        // Expiry must not wait for a runtime check that can hang.
+        let observed = ledger.get(&due.cutex_session_id, &[due.input_id.clone()])?.records.pop();
+        let expired = observed.as_ref().filter(|record|matches!(record.state,InputState::Received|InputState::Sending)).and_then(|record| record.details["observationDeadline"].as_str())
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok()).is_some_and(|at| at <= now);
+        let legacy_cap=observed.as_ref().filter(|record|
+            matches!(record.state,InputState::Held|InputState::Accepted)
+                && record.deadline.is_some()
+                && record.details["observationDeadline"].as_str()==record.deadline.as_deref());
+        let next = if let Some(record)=legacy_cap {
+            // Do not reinterpret the previous build's artificial cap as a
+            // source receipt deadline (which could query a missing runtime
+            // and invent uncertainty on upgrade). Retire metadata only.
+            let mut details=record.details.clone();
+            if let Some(object)=details.as_object_mut(){object.remove("observationDeadline");}
+            let mut next=Next::to(record.state).details(details).deadline(None);
+            next.reason=record.reason.clone();next.stage=record.stage;next
+        } else if expired {
+            Next::uncertain("outcomeUnknown").details(json!({"absoluteDeadlineElapsed":true}))
+        } else {
+            let Some(next) = decide(&due) else { continue }; next
+        };
         match ledger.transition(&due.cutex_session_id, &due.input_id, Expect::rev(due.rev), next) {
             Ok(transition) => {
                 if transition.changed {
@@ -2574,6 +2683,21 @@ pub fn run_deadline_pass(
 
 /// Time of the next deadline (`None`: nothing pending). The loop sleeps until
 /// then instead of polling (051 B8).
+/// Pure storage/clock pass, run on its own thread independently of native IO.
+pub(crate) fn expire_observations(ledger:&InputLedger,now:DateTime<Utc>,limit:usize)->Result<usize,LedgerError> {
+    for record in ledger.unbudgeted(limit)? {
+        let mut next=Next::to(record.state).details(record.details.clone());next.reason=record.reason.clone();next.stage=record.stage;
+        let _=ledger.transition(&record.cutex_session_id,&record.input_id,Expect::rev(record.rev),next)?;
+    }
+    let mut count=0;
+    for due in ledger.absolute_due(now,limit)? {
+        match ledger.transition(&due.cutex_session_id,&due.input_id,Expect::rev(due.rev),Next::uncertain("outcomeUnknown").details(json!({"absoluteDeadlineElapsed":true}))) {
+            Ok(done)=>{if done.changed {count+=1;let _=publish(&done);}},
+            Err(LedgerError::Conflict{..})=>{},Err(error)=>return Err(error),
+        }
+    }Ok(count)
+}
+
 pub fn next_deadline(ledger: &InputLedger) -> Result<Option<DateTime<Utc>>, LedgerError> {
     let mut guard = ledger.lock()?;
     let connection = guard.connection.as_mut().expect("opened under lock");
@@ -3010,16 +3134,23 @@ fn upsert_record(
     let deadline_ms = record.deadline.as_deref()
         .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
         .map(|at| at.timestamp_millis());
+    let observation_ms=record.details["observationDeadline"].as_str()
+        .and_then(|text|DateTime::parse_from_rfc3339(text).ok()).map(|at|at.timestamp_millis());
     tx.execute(
-        "INSERT INTO input_ledger (session, input_id, rev, state, surface, terminal, updated_revision, updated_at_ms, deadline_ms, record_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO input_ledger (session, input_id, rev, state, surface, terminal, updated_revision, updated_at_ms, deadline_ms, record_json, observation_deadline_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(session, input_id) DO UPDATE SET rev = excluded.rev, state = excluded.state,
            surface = excluded.surface, terminal = excluded.terminal, updated_revision = excluded.updated_revision,
-           updated_at_ms = excluded.updated_at_ms, deadline_ms = excluded.deadline_ms, record_json = excluded.record_json",
+           updated_at_ms = excluded.updated_at_ms, deadline_ms = excluded.deadline_ms,
+           observation_deadline_ms = CASE
+             WHEN excluded.state NOT IN ('received','sending') THEN NULL
+             WHEN input_ledger.state NOT IN ('received','sending') THEN excluded.observation_deadline_ms
+             ELSE COALESCE(input_ledger.observation_deadline_ms,excluded.observation_deadline_ms) END,
+           record_json = excluded.record_json",
         params![
             session, input_id, record.rev as i64, record.state.as_str(), record.surface.as_str(),
             record.state.is_terminal(), state_revision as i64, now.timestamp_millis(), deadline_ms,
-            stored_record_json(record)?,
+            stored_record_json(record)?, observation_ms,
         ],
     )?;
     Ok(())
@@ -3088,24 +3219,15 @@ pub fn record(session: &str, input_id: &str, expect: Expect, next: Next) -> Opti
 // `cutex/input/lease/release`, HTTP)
 
 pub fn is_method(method: &str) -> bool {
-    matches!(method, GET_METHOD | LIST_METHOD | DISMISS_METHOD | LEASE_RELEASE_METHOD | RETRY_METHOD | HOLD_METHOD)
+    matches!(method, GET_METHOD | LIST_METHOD | DISMISS_METHOD | LEASE_RELEASE_METHOD | RETRY_METHOD | HOLD_METHOD | super::input_disposal::METHOD)
 }
 
-/// Which records the owner may dismiss (§2.14, owner decision 9): anything
-/// `uncertain`, and waiting bus notes / delegation results (owner queue items
-/// leave through `queue/remove`, delegation requests through ask close).
+/// Unread tracking that can be disposed by logical identity. Native read evidence
+/// and terminal history remain truthful; source cleanup runs independently.
 /// r274.2 §9.4: also an owner record that `failed`, or that a lost runtime
 /// left stuck ([`owner_stuck`]).
 pub fn dismissible(record: &InputRecord) -> bool {
-    if owner_stuck(record) {
-        return true;
-    }
-    match record.state {
-        InputState::Uncertain => true,
-        InputState::Failed => record.kind == InputKind::Owner,
-        InputState::Waiting => !matches!(record.kind, InputKind::Owner | InputKind::DelegationRequest),
-        _ => false,
-    }
+    !matches!(record.state, InputState::InContext | InputState::Discarded | InputState::Superseded | InputState::Rejected)
 }
 
 /// Settle the underlying store first (per kind, in the block that owns it),
@@ -3133,40 +3255,14 @@ fn dismiss_one_with(
     let failure = |code: &str, message: String, current: Option<u64>| {
         json!({"inputId": input_id, "code": code, "message": message, "currentRev": current})
     };
-    let record = ledger.get(session, &[input_id.to_string()])
-        .map_err(|error| failure("event_persistence_unavailable", error.to_string(), None))?
-        .records.pop()
-        .ok_or_else(|| failure("input_not_found", "no such input".into(), None))?;
-    if record.rev != expected_rev {
-        return Err(failure("revision_conflict", format!("expected rev {expected_rev}"), Some(record.rev)));
-    }
-    if !dismissible(&record) {
-        return Err(failure("input_not_dismissible", format!("{} {} cannot be dismissed", record.kind, record.state), Some(record.rev)));
-    }
-    let source_settled = settle(&record).map_err(|message| failure("dismiss_failed", message, Some(record.rev)))?;
-    let mut expected_rev = expected_rev;
-    if owner_stuck(&record) {
-        // r274.2 §9.4: the owner stops waiting for the lost runtime.
-        let lost = ledger
-            .transition(session, input_id, Expect::rev(expected_rev), Next::uncertain(stuck_uncertain_reason(&record)).stalled(None))
-            .map_err(|error| match error {
-                LedgerError::Conflict { current_rev } => failure("revision_conflict", error.to_string(), Some(current_rev)),
-                other => failure("event_persistence_unavailable", other.to_string(), Some(record.rev)),
-            })?;
-        if let Err(error) = publish(&lost) {
-            eprintln!("cutex input ledger: publish {session}/{input_id}: {error:#}");
-        }
-        expected_rev = lost.record.rev;
-    }
-    let transition = if source_settled && matches!(record.kind, InputKind::DelegationResult | InputKind::DelegationQuestion | InputKind::DelegationStatus) {
-        ledger.discard_settled_delivery(&record)
-    } else {
-        ledger.transition(session, input_id, Expect::rev(expected_rev), Next::discarded("ownerDiscarded"))
-    }
-        .map_err(|error| match error {
-            LedgerError::Conflict { current_rev } => failure("revision_conflict", error.to_string(), Some(current_rev)),
-            other => failure("event_persistence_unavailable", other.to_string(), Some(record.rev)),
-        })?;
+    // Persist first, independently of the source lane and the projected rev.
+    // expectedRev remains a compatibility field; an owner decision is not
+    // invalidated by a late receipt or another metadata update.
+    let _ = (expected_rev, settle);
+    super::input_disposal::request_at(&ledger.path,session,input_id,ledger.now())
+        .map_err(|error|failure("event_persistence_unavailable",error.to_string(),None))?;
+    let transition=ledger.transition(session,input_id,Expect::ANY,Next::discarded("ownerDiscarded"))
+        .map_err(|error|failure("event_persistence_unavailable",error.to_string(),None))?;
     if let Err(error) = publish(&transition) {
         eprintln!("cutex input ledger: publish {session}/{input_id}: {error:#}");
     }
@@ -3223,6 +3319,13 @@ pub(super) fn dispatch(
     params: &Value,
     owner: bool,
 ) -> Result<Value, super::user_input::UserInputExecutionError> {
+    if method == super::input_disposal::METHOD {
+        if !owner {return Err(route_error("owner_required", "disposing an input requires the owner's credential".into(),false));}
+        let id=super::input_disposal::parse_request(params).map_err(|error|route_error("invalid_request",error.to_string(),false))?;
+        let receipt=super::input_disposal::request(cutex_session_id,id).map_err(|error|route_error("event_persistence_unavailable",error.to_string(),true))?;
+        super::input_disposal::ensure_started();
+        return Ok(serde_json::to_value(receipt).expect("serializable disposition"));
+    }
     if !enabled() {
         return Err(disabled_error());
     }

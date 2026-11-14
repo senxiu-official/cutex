@@ -411,6 +411,8 @@ pub fn busy_refusal_reason(error: &anyhow::Error) -> Option<String> {
 /// No credentials or caller-chosen endpoint. Obtained only from a current Ready
 /// receipt in the caller's explicitly selected store. A socket is not a writer.
 pub struct ExternalInputClient {
+    #[cfg(test)]
+    test_loopback: bool,
     path: PathBuf,
     binding: ExternalInputBinding,
     runtime: CutexAppServerRuntimeBinding,
@@ -673,6 +675,8 @@ impl ExternalInputClient {
             "ingress capability unavailable/mismatched"
         );
         let result = Self {
+            #[cfg(test)]
+            test_loopback: false,
             path: path.into(),
             binding,
             runtime,
@@ -698,6 +702,10 @@ impl ExternalInputClient {
         self.fence()
     }
     pub(crate) fn fence(&self) -> anyhow::Result<()> {
+        // Dispatch regressions supply a real private RPC peer without a
+        // reviewed release bundle. Only that test constructor skips custody.
+        #[cfg(test)]
+        if self.test_loopback { return Ok(()); }
         ensure!(
             occurrence(
                 &self.path,
@@ -1007,6 +1015,30 @@ impl ExternalInputClient {
             }
         }
         anyhow::bail!("ingress event drain bound reached; reconnect and reconcile")
+    }
+}
+
+#[cfg(test)]
+impl ExternalInputClient {
+    /// Real RPC transport for dispatch tests; release custody is exercised by
+    /// the stock-launch suite, independently of these owner-disposal races.
+    pub(crate) fn disposal_loopback(binding: ExternalInputBinding, client: AppServerClient) -> Self {
+        let hash = crate::role_revision::Sha256::new("a".repeat(64)).unwrap();
+        let file = crate::launch::stock::VerifiedFile { path: PathBuf::from("unused-test-artifact"), sha256: hash.clone() };
+        let contract = crate::agent_management::ExplicitLaunchContract {
+            version: 1, migration_action_id: None, native_id: binding.thread_id.clone(),
+            native_home: PathBuf::new(), bundle_manifest: file.path.clone(), bundle_sha256: hash,
+        };
+        let bundle = StockBundle { version: 2, upstream_commit: String::new(), native_patch_commit: None,
+            executable: file.clone(), cli: None, code_mode_host: file.clone(), facade: file.clone(),
+            schema: file.clone(), shared_config: file, launch_config_sha256: None };
+        let runtime = serde_json::from_value(serde_json::json!({
+            "transport":"loopback_web_socket", "endpoint":"unused", "pid":std::process::id(),
+            "runtime_dir":"unused", "diagnostic_journal_path":"unused", "schema_version":"test",
+            "schema_sha256":"a".repeat(64), "started_at":chrono::Utc::now().to_rfc3339()
+        })).unwrap();
+        Self { test_loopback: true, path: PathBuf::new(), binding, runtime, client,
+            artifacts: PinnedArtifacts { contract, bundle, stamps: vec![] } }
     }
 }
 

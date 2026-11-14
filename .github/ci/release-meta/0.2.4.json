@@ -1,0 +1,29 @@
+{
+  "_comment": "Public0.2.4 composed from accepted backend and runtime sources; independent public version map recorded privately.",
+  "mode": "full",
+  "packageRunRecommended": true,
+  "migrations": [
+    {
+      "id": "durable-state-sqlite",
+      "class": "one-way",
+      "since": "0.2.1",
+      "notes": {
+        "en": "Moves durable session, communication and usage state to SQLite-backed stores. Retain an offline backup; automatic rollback across this migration is unavailable.",
+        "zh-CN": "会话、通信及用量的持久状态迁入 SQLite。请保留离线备份；无法跨过本次迁移自动回退。"
+      }
+    },
+    {
+      "id": "background-service-records",
+      "class": "one-way",
+      "since": "0.2.3",
+      "notes": {
+        "en": "Adds persisted worker service records that older cutex versions cannot read. Keep a backup and do not downgrade a store containing worker services to an older release.",
+        "zh-CN": "新增旧版 cutex 无法读取的 worker 服务持久记录。请保留备份，不要把包含后台应用记录的数据退回旧版。"
+      }
+    }
+  ],
+  "notes": {
+    "en": "Reliable queued-input disposal, bounded file reads, alarm wake timing, Native0.167.0-r61 and Claude claude-r48.",
+    "zh-CN": "改进排队输入处置、分段文件读取与闹钟唤醒时机，提供 Native0.167.0-r61 和 Claude claude-r48。"
+  }
+}

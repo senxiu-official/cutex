@@ -1152,6 +1152,7 @@ fn deliver_polled_messages_with(
             let prepared_turn = starts_turn.then(|| crate::management::v2::admission::prepare_turn(cutex_session_id, "delivery", None));
             // 054 §2.9: native IO starts now (A2 submission next).
             agent_bus_message_repository()?.input_ledger_sending(cutex_session_id, &message.id);
+            if crate::management::v2::input_disposal::requested(cutex_session_id,&message.id)? {continue;}
             match submitter.submit_inter_agent_message(params) {
                 Ok(submission_id) => {
                     if let Some(prepared) = prepared_turn { prepared.submitted(); }

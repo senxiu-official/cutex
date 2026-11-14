@@ -820,7 +820,7 @@ fn an_orphan_accepted_owner_record_is_stuck_only_when_nothing_will_read_or_settl
     f.go("o", Next::sending());
     let record = f.go("o", Next { runtime_generation: Some(7), ..Next::accepted().stage(il::Stage::Registered) }).record;
     let idle = connected(7, None);
-    assert_eq!(owner_stuck_case(&record, &idle, None, false, later(31), QUIET), Some("orphan"));
+    assert_eq!(owner_stuck_case(&record, &idle, None, false, later(31), QUIET), Some("orphan"),"an unbound idle registration retains its original orphan diagnosis");
     // Never a record about to be read or settled:
     assert_eq!(owner_stuck_case(&record, &idle, None, false, later(5), QUIET), None, "just accepted");
     assert_eq!(owner_stuck_case(&record, &connected(7, Some("t2")), None, false, later(31), QUIET), None, "a turn runs");
@@ -841,7 +841,7 @@ fn an_orphan_accepted_owner_record_is_stuck_only_when_nothing_will_read_or_settl
 fn a_stuck_mark_gives_retry_and_dismiss_and_clears_when_the_record_can_move_again() {
     let f = Fixture::new();
     let record = steered(&f, "g", "t1", Some(3));
-    assert!(record.actions.is_empty() && !il::owner_stuck(&record) && !il::dismissible(&record));
+    assert!(record.actions.contains(&il::Action::Dismiss) && !il::owner_stuck(&record) && il::dismissible(&record));
     let mark = owner_stuck_next(&record, Some("generationChanged"), later(1)).expect("mark");
     let stuck = f.go("g", mark).record;
     assert_eq!(stuck.stalled.as_ref().map(|s| s.reason.as_str()), Some("noProgress"));
@@ -852,10 +852,10 @@ fn a_stuck_mark_gives_retry_and_dismiss_and_clears_when_the_record_can_move_agai
     // Idempotent; and cleared once the case no longer holds.
     assert_eq!(owner_stuck_next(&stuck, Some("generationChanged"), later(2)), None);
     let cleared = f.go("g", owner_stuck_next(&stuck, None, later(3)).expect("clear")).record;
-    assert!(cleared.stalled.is_none() && cleared.actions.is_empty() && il::stuck_case(&cleared).is_none());
+    assert!(cleared.stalled.is_none() && cleared.actions.contains(&il::Action::Dismiss) && il::stuck_case(&cleared).is_none());
     // A noProgress stall without a known case gives no actions.
     let bare = f.go("g", Next::accepted().stalled(Some(Stalled { reason: "noProgress".into(), since: "2026-11-03T00:00:00.000Z".into() }))).record;
-    assert!(bare.actions.is_empty() && !il::owner_stuck(&bare));
+    assert!(bare.actions.contains(&il::Action::Dismiss) && !il::owner_stuck(&bare));
     // Never for another kind.
     f.go("n", Next::sending().create(note_input()));
     let note = f.go("n", Next::accepted()).record;
@@ -875,7 +875,7 @@ fn dismiss_and_retry_of_each_stuck_case_go_through_uncertain() {
         let states: Vec<String> = events.iter()
             .map(|(_, _, p)| format!("{}{{{}}}", p["record"]["state"].as_str().unwrap(), p["record"]["reason"].as_str().unwrap_or("")))
             .collect();
-        assert_eq!(states, [format!("uncertain{{{unknown}}}"), "discarded{ownerDiscarded}".to_string()], "{case}");
+        assert_eq!(states,["discarded{ownerDiscarded}".to_string()],"{case}");
         // Retry: the same way, then waiting{ownerRetry}. Nothing resends it
         // before the owner asks (no auto-redelivery).
         let f = Fixture::new();
@@ -1023,7 +1023,7 @@ fn a_stranded_owner_resend_can_be_retried_or_dismissed() {
     f.go("c", Next::received().create(owner_input()));
     f.go("c", Next::sending());
     f.go("c", Next::uncertain("outcomeUnknown"));
-    assert!(f.go("c", Next::waiting("ownerRetry")).record.actions.is_empty());
+    assert!(f.go("c", Next::waiting("ownerRetry")).record.actions.contains(&il::Action::Dismiss));
 }
 
 #[test]
@@ -1175,4 +1175,25 @@ fn late_terminal_check_binds_the_proven_native_retry_item_and_receipt_turn() {
     assert_eq!(row.state,InputState::InContext);
     assert_eq!(row.timeline_item_id.as_deref(),Some(native));
     assert_eq!(row.turn_id.as_deref(),Some("new-turn"));
+}
+
+#[test]
+fn rebuild_owner_source_preserves_placement_and_never_invents_explicit_queue() {
+    use super::super::input_ledger_owner::SourceAdmission;
+    use super::super::user_input::UserInputStrategy;
+    let f=Fixture::new();
+    let timeline=SourceAdmission{strategy:UserInputStrategy::Auto,surface:Surface::Timeline,reason:Some("hostBusy".into())};
+    let nextup=SourceAdmission{strategy:UserInputStrategy::Interrupt,surface:Surface::NextUp,reason:Some("turnRunning".into())};
+    let (_,events)=il::capture_events(|| {
+        assert!(rebuild_owner_source(&f.ledger,"s1","idle-host",&[],Some(&timeline),None,true));
+        assert!(rebuild_owner_source(&f.ledger,"s1","busy-host",&[],Some(&nextup),None,true));
+        assert!(rebuild_owner_source(&f.ledger,"s1","legacy-unknown",&[],None,None,false));
+    });
+    assert!(!events.is_empty());
+    assert_eq!(f.ledger.get("s1",&["idle-host".into()]).unwrap().records[0].surface,Surface::Timeline);
+    assert_eq!(f.ledger.get("s1",&["busy-host".into()]).unwrap().records[0].surface,Surface::NextUp);
+    let unknown=f.ledger.get("s1",&["legacy-unknown".into()]).unwrap().records.remove(0);
+    assert_eq!(unknown.state,InputState::Uncertain);
+    assert_eq!(unknown.reason.as_deref(),Some("outcomeUnknown"));
+    assert!(unknown.actions.contains(&il::Action::Dismiss));
 }

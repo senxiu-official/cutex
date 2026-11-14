@@ -26,6 +26,8 @@ const FILE_NAME: &str = "owner-held-inputs.json";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeldOwnerInput {
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub admission:Option<super::input_ledger_owner::SourceAdmission>,
     pub cutex_session_id: String,
     pub client_user_message_id: String,
     pub management_request_id: String,
@@ -55,6 +57,7 @@ impl HeldOwnerInput {
     ) -> Self {
         let deadline = now + chrono::Duration::from_std(HELD_BUDGET).expect("held budget");
         Self {
+            admission:super::input_ledger_owner::source_admission(cutex_session_id,client_user_message_id),
             cutex_session_id: cutex_session_id.into(),
             client_user_message_id: client_user_message_id.into(),
             management_request_id: management_request_id.into(),
@@ -152,6 +155,7 @@ pub fn held_claude_backend() -> bool {
 /// Record `input` (idempotent by session + clientUserMessageId). Returns the
 /// stored record, which is the earlier one for a repeated identity.
 pub fn hold(input: HeldOwnerInput) -> anyhow::Result<HeldOwnerInput> {
+    super::input_disposal::check(&input.cutex_session_id,[input.client_user_message_id.as_str()])?;
     with_file(true, |file| {
         if let Some(existing) = file.inputs.iter().find(|held| {
             held.cutex_session_id == input.cutex_session_id
@@ -237,6 +241,12 @@ pub fn claim_head(session: &str) -> anyhow::Result<Option<HeldOwnerInput>> {
         head.claimed = true;
         Some(head.clone())
     })
+}
+
+pub(crate) fn remember_admission(session:&str,id:&str,facts:&super::input_ledger_owner::SourceAdmission)->anyhow::Result<()> {
+    let needs=find(session,id)?.is_some_and(|held|held.admission.as_ref()!=Some(facts));
+    if !needs{return Ok(());}
+    with_file(true,|file|if let Some(held)=file.inputs.iter_mut().find(|held|held.cutex_session_id==session&&held.client_user_message_id==id){held.admission=Some(facts.clone());})
 }
 
 /// Replace the params of a held input (`cutex/input/interruptSend` while

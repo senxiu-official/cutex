@@ -125,6 +125,9 @@ pub(crate) fn submit(session: &str, generation: u64, submission: &Submission) ->
     let Ok(_guard) = lock.lock() else {
         return SubmitOutcome::Unsupported("session input lock poisoned".into());
     };
+    if let Err(error)=cutex::management::v2::input_disposal::check_submission(session,submission) {
+        return SubmitOutcome::Unsupported(format!("{error:#}"));
+    }
     // r266: a project or agent pause may have committed after the scheduler
     // persisted this admission and released the store (or while this submit
     // waited for the lane). Re-check inside the lane, like native and Claude;
@@ -144,6 +147,9 @@ pub(crate) fn submit(session: &str, generation: u64, submission: &Submission) ->
         Ok(handle) => handle,
         Err(error) => return SubmitOutcome::Unsupported(format!("{error:#}")),
     };
+    if let Err(error)=cutex::management::v2::input_disposal::check_submission(session,submission) {
+        return SubmitOutcome::Unsupported(format!("{error:#}"));
+    }
     super::asks_claude::submit_outcome(handle.request("dsh/input/submit", submit_params(&thread_id, submission)))
 }
 

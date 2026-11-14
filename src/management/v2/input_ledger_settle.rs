@@ -938,6 +938,7 @@ fn take_dirty() -> BTreeSet<String> {
 /// Install the management process hooks and start `cutex-input-settle`
 /// (once). The thread idles while the switch is off.
 pub fn ensure_started(status: StatusLoader, forward: NativeForward) {
+    super::input_disposal::ensure_started();
     if HOOKS.get().is_some() {
         return;
     }
@@ -1749,14 +1750,18 @@ pub fn rebuild(ledger: &InputLedger, sessions: &[String]) -> usize {
                     _ => super::user_input::UserInputStrategy::Auto,
                 };
                 let items = input.params.get("input").and_then(Value::as_array).cloned().unwrap_or_default();
-                let create = super::input_ledger_owner::new_input(strategy, &items);
-                rebuilt += usize::from(create_missing(ledger, session, &input.client_user_message_id, Next::held("hostBusy").create(create)));
+                let mut facts=input.admission.clone();
+                if facts.is_none() && strategy==super::user_input::UserInputStrategy::Queue {
+                    facts=Some(super::input_ledger_owner::SourceAdmission{strategy,surface:Surface::NextUp,reason:Some("hostBusy".into())});
+                }
+                let delivery=repository.delivery(session,&input.client_user_message_id).ok().flatten();
+                rebuilt+=usize::from(rebuild_owner_source(ledger,session,&input.client_user_message_id,&items,facts.as_ref(),delivery.as_ref(),true));
             }
             let Ok((_, items)) = repository.list(session) else { continue };
             for item in items {
-                let create = super::input_ledger_owner::new_input(super::user_input::UserInputStrategy::Queue, &item.input);
-                let next = Next::waiting("explicitQueue").create(create).surface(Surface::NextUp);
-                rebuilt += usize::from(create_missing(ledger, session, &item.client_user_message_id, next));
+                let facts=repository.source_admission(session,&item.client_user_message_id).ok().flatten();
+                let delivery=repository.delivery(session,&item.client_user_message_id).ok().flatten();
+                rebuilt+=usize::from(rebuild_owner_source(ledger,session,&item.client_user_message_id,&item.input,facts.as_ref(),delivery.as_ref(),false));
             }
         }
     }
@@ -1769,6 +1774,43 @@ pub fn rebuild(ledger: &InputLedger, sessions: &[String]) -> usize {
         Err(error) => eprintln!("cutex input ledger (settle): asks rebuild: {error:#}"),
     }
     rebuilt
+}
+
+/// Restore recorded placement; missing legacy facts become explicitly
+/// unconfirmed rather than pretending every queue entry was an explicit Queue.
+/// This function never sends, removes a source, or clears C-010 evidence.
+fn rebuild_owner_source(
+    ledger:&InputLedger,session:&str,id:&str,input:&[Value],
+    facts:Option<&super::input_ledger_owner::SourceAdmission>,
+    delivery:Option<&super::user_input::InputDelivery>,held:bool,
+)->bool {
+    use super::user_input::{UserInputStrategy,InputDelivery};
+    let strategy=facts.map(|facts|facts.strategy).unwrap_or(UserInputStrategy::Auto);
+    let surface=facts.map(|facts|facts.surface).filter(|surface|matches!(surface,Surface::Timeline|Surface::NextUp)).unwrap_or(Surface::NextUp);
+    let create=super::input_ledger_owner::new_input(strategy,input);
+    let unknown= facts.is_none() || matches!(delivery,Some(InputDelivery::Sending{..}|InputDelivery::Unknown{..}));
+    let next=if unknown {
+        Next::received().create(create).surface(surface)
+    } else if matches!(delivery,Some(InputDelivery::Accepted{..})) {
+        Next::sending().create(create).surface(surface)
+    } else if held {
+        Next::held("hostBusy").create(create).surface(surface)
+    } else if let Some(reason)=facts.and_then(|facts|facts.reason.as_deref()).filter(|reason|il::WAITING_REASONS.contains(reason)) {
+        Next::waiting(reason).create(create).surface(surface)
+    } else {
+        Next::received().create(create).surface(surface)
+    };
+    let Ok(first)=ledger.transition(session,id,Expect::NEW,next) else {return false;};
+    if !first.created {return false;}
+    let _=il::publish(&first);
+    if first.record.state==InputState::Discarded{return true;}
+    let next=if unknown||first.record.state==InputState::Received {
+        Some(Next::uncertain("outcomeUnknown").details(json!({"sourceRecoveryUnconfirmed":true,"originalPlacementRetained":facts.is_some(),"recoveryDescription":"Original admission details cannot be fully confirmed. The source input is retained. Rebuilding this row does not send it again."})))
+    } else if let Some(InputDelivery::Accepted{turn_id,..})=delivery {
+        Some(match turn_id {Some(turn)=>Next::accepted().turn(turn),None=>Next::accepted()})
+    } else {None};
+    if let Some(next)=next {if let Ok(done)=ledger.transition(session,id,Expect::rev(first.record.rev),next){let _=il::publish(&done);}}
+    true
 }
 
 fn create_missing(ledger: &InputLedger, session: &str, id: &str, next: Next) -> bool {
@@ -1879,6 +1921,13 @@ fn redelivery_precheck(session: &str, record: &InputRecord) -> Result<(), UserIn
     let unavailable = |error: anyhow::Error| UserInputExecutionError { retryable: true,
         ..retry_error("store_unavailable", format!("{error:#}"), json!({"inputId": record.input_id})) };
     match record.kind {
+        InputKind::DelegationRequest=> {
+            let valid=crate::asks::store::AskStore::open_default().and_then(|store|store.project_snapshot(|state|
+                state.asks.get(record.ask_id.as_deref().unwrap_or(&record.input_id)).is_some_and(|ask|
+                    ask.request_input_id()==record.input_id&&ask.is_open()&&ask.execution==crate::asks::model::ExecutionState::Interrupted)))
+                .map_err(unavailable)?;
+            if valid {Ok(())} else {Err(refuse(("request_occurrence_changed","the request occurrence is no longer retryable; it can still be dismissed".into())))}
+        }
         kind if is_bus(kind) => super::agent_bus_state::agent_bus_message_repository()
             .and_then(|repository| repository.input_ledger_redeliverable(session, &record.input_id))
             .map_err(unavailable)?
@@ -1984,6 +2033,9 @@ pub fn retry_transition_checked(
             LedgerError::Conflict { current_rev } => retry_error("revision_conflict", error.to_string(), json!({"inputId": id, "currentRev": current_rev})),
             other => il::ledger_error(other),
         })?;
+    if transition.record.state!=InputState::Waiting || transition.record.reason.as_deref()!=Some("ownerRetry") {
+        return Err(retry_error("input_disposed","this input was disposed while retry admission was checked".into(),json!({"inputId":id})));
+    }
     if let Err(error) = il::publish(&transition) {
         eprintln!("cutex input ledger (settle): publish {session}/{id}: {error:#}");
     }
@@ -2052,10 +2104,19 @@ fn retry_on(
         }
         InputKind::DelegationRequest => {
             let result = crate::asks::store::AskStore::open_default().and_then(|store| {
-                store.with_state(|state| crate::asks::lifecycle::retry(state, &id, None, Utc::now()).map(|_| ()))
+                store.with_state(|state| crate::asks::lifecycle::retry(state, transition.record.ask_id.as_deref().unwrap_or(&id), None, Utc::now()).map(|_| ()))
             });
             match result {
-                Ok(Ok(())) => json!({"path": "delegationRequeue", "ok": true, "error": null}),
+                Ok(Ok(())) => {
+                    if let Ok(store)=crate::asks::store::AskStore::open_default() {
+                        if let Ok(Some(new_id))=store.project_snapshot(|state|state.asks.get(transition.record.ask_id.as_deref().unwrap_or(&id)).map(|ask|ask.request_input_id())) {
+                            if new_id!=id {
+                                if let Ok(done)=ledger.transition(session,&id,Expect::rev(transition.record.rev),Next::superseded("revised").superseded_by(new_id)) {let _=il::publish(&done);}
+                            }
+                        }
+                    }
+                    json!({"path":"delegationRequeue","ok":true,"error":null})
+                },
                 Ok(Err(error)) => json!({"path": "delegationRequeue", "ok": false, "error": {"code": error.code, "message": error.detail, "retryable": false, "details": error.extra}}),
                 Err(error) => json!({"path": "delegationRequeue", "ok": false, "error": {"code": "asks_unavailable", "message": format!("{error:#}"), "retryable": true, "details": {}}}),
             }
@@ -2063,6 +2124,11 @@ fn retry_on(
         kind if is_bus(kind) => redeliver_bus(session, &id),
         _ => redeliver_result(session, &id),
     };
+    if redelivery["ok"] == false && transition.record.kind != InputKind::Owner {
+        if let Some(before)=&before {
+            refused_resend_returns(ledger,session,&id,before);
+        }
+    }
     mark_dirty(session);
     let latest = ledger.get(session, &[id.clone()]).map_err(il::ledger_error)?;
     let record = latest.records.into_iter().next().unwrap_or(transition.record);
@@ -2126,11 +2192,13 @@ fn refused_resend_returns(ledger: &InputLedger, session: &str, id: &str, before:
             None
         }
     };
-    let Some(current) = current.filter(|record| record.state == InputState::Waiting && record.reason.as_deref() == Some("ownerRetry")) else {
+    let Some(current) = current.filter(|record| record.state == InputState::Waiting && record.reason.as_deref() == Some("ownerRetry") && record.attempt == before.attempt + 1) else {
         return false;
     };
     let reason = before.reason.as_deref();
-    let mut back = if before.state == InputState::Failed {
+    let mut back = if before.kind != InputKind::Owner {
+        Next::uncertain("outcomeUnknown")
+    } else if before.state == InputState::Failed {
         let mut failed = Next::failed(reason.unwrap_or("notDelivered"));
         failed.error = before.error.clone();
         failed
@@ -2142,6 +2210,10 @@ fn refused_resend_returns(ledger: &InputLedger, session: &str, id: &str, before:
     if !il::owner_stuck(before) {
         back = back.details(before.details.clone());
     }
+    let mut details=back.details.take().unwrap_or_else(||json!({}));
+    if !details.is_object(){details=json!({});}
+    details["retryRefused"]=json!(true);
+    back=back.details(details);
     match ledger.transition(session, id, Expect::rev(current.rev), back) {
         Ok(transition) => {
             if let Err(error) = il::publish(&transition) {

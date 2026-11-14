@@ -675,6 +675,8 @@ pub(crate) fn interrupt_send_v2(
     _thread: &str,
     request: &InterruptSendRequest,
 ) -> Result<Outcome, UserInputExecutionError> {
+    cutex::management::v2::input_disposal::check(session,[request.input_id.as_str()])
+        .map_err(|error|execution_error("route","input_disposed",error,false,false))?;
     let lane = session_input_lock(session)
         .map_err(|error| execution_error("route", "internal_error", error, true, false))?;
     let _lane = lane.lock().map_err(|_| {

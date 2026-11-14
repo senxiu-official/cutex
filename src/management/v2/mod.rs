@@ -144,6 +144,7 @@ mod offline_submit;
 pub mod queue_pause;
 pub mod queue_order;
 pub mod input_ledger;
+pub mod input_disposal;
 pub mod input_ledger_wake;
 mod input_ledger_owner;
 mod input_ledger_bus;

@@ -707,6 +707,8 @@ mod tests {
         for method in [
             "cutex/userInput/submit",
             "cutex/turn/stop",
+            "cutex/input/dispose",
+            "cutex/input/dismiss",
             "cutex/asks/send",
         ] {
             assert_eq!(
@@ -974,6 +976,11 @@ mod tests {
         assert_eq!(refused.reason, RefusalReason::ControlConnectionReserve);
         assert_eq!(refused.details()["capacity"]["bulkConnections"], MAX_CONNECTIONS - CONTROL_CONNECTION_RESERVE);
         drop(admit_request(&request("POST", "/v2/sessions/a/cutex/requests", r#"{"method":"cutex/turn/stop"}"#), Some(&mut reserved)).unwrap());
+        for method in ["cutex/input/dispose", "cutex/input/dismiss"] {
+            drop(admit_request(&request("POST", "/v2/sessions/a/cutex/requests",
+                &format!(r#"{{"method":"{method}","params":{{"inputId":"absent"}}}}"#)), Some(&mut reserved))
+                .expect("owner disposition keeps reserved control capacity"));
+        }
         drop(bulk.pop());
         drop(admit_request(&request("GET", "/v2/sessions", ""), Some(&mut reserved)).unwrap());
         drop((bulk, reserved));

@@ -2,7 +2,7 @@
 //! client token), e.g. previewing a report an agent linked by absolute path
 //! outside its workspace root.
 //!
-//! `GET /v2/fs/file?path=<absolute path>&maxBytes=<n>` → the workspace
+//! `GET /v2/fs/file?path=<absolute path>&maxBytes=<n>&offset=<n>` → the workspace
 //! `fs/file` body: `{path, size, modifiedAt, encoding: "utf8" | "base64",
 //! content, truncated, mime}`.
 //!
@@ -14,8 +14,10 @@
 //!   `permission_denied`.
 //! - At most `maxBytes` (default 2 MiB, 1..=10 MiB, else 400
 //!   `invalid_request`) are returned; `truncated: true` when the file is
-//!   larger. Binary content (NUL bytes, invalid UTF-8, images, PDF) comes
-//!   back base64 with its mime.
+//!   larger. `offset` (capability `fs-file-window`) reads the window starting
+//!   at that byte, with the window checks of `workspace_fs::file_window_value`;
+//!   the body echoes it with a `revision`. Binary content (NUL bytes, invalid
+//!   UTF-8, images, PDF) comes back base64 with its mime.
 //!
 //! - The host's Management root credential file (`<cutex home>/config.json`)
 //!   and profile-link storage (`<cutex home>/runtime/profile-link/`, including
@@ -68,6 +70,7 @@ pub fn read_host_file(params: &HashMap<String, String>) -> WorkspaceResult<Value
         ));
     }
     let max_bytes = super::workspace_fs::max_bytes_param(params)?;
+    let offset = super::workspace_fs::offset_param(params)?;
     let canonical = std::fs::canonicalize(&requested).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => {
             WorkspaceError::new(404, "path_not_found", "the path does not exist")
@@ -91,7 +94,7 @@ pub fn read_host_file(params: &HashMap<String, String>) -> WorkspaceResult<Value
         ));
     }
     let display = super::workspace::display_path(&canonical);
-    super::workspace_fs::file_content_value(&canonical, &display, &meta, max_bytes)
+    super::workspace_fs::file_window_value(&canonical, &display, offset, max_bytes)
 }
 
 /// 403 `owner_local_only` (`readRootCredential`) when `path` is the root
@@ -1051,6 +1054,27 @@ mod tests {
         let dotted = root.join("dir").join("..").join("report.md");
         let value = read_host_file(&params(dotted.to_str().unwrap(), None)).unwrap();
         assert_eq!(value["path"], canonical);
+    }
+
+    #[test]
+    fn reads_a_window_at_an_offset() {
+        let root = tree();
+        let file = root.join("report.md");
+        let mut query = params(file.to_str().unwrap(), Some("4"));
+        query.insert("offset".to_string(), "2".to_string());
+        let value = read_host_file(&query).unwrap();
+        assert_eq!(value["content"], "Issu");
+        assert_eq!(value["offset"], 2);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["size"], 15);
+        query.insert("offset".to_string(), "8".to_string());
+        query.insert("maxBytes".to_string(), "100".to_string());
+        let value = read_host_file(&query).unwrap();
+        assert_eq!(value["content"], "line 2
+");
+        assert_eq!(value["truncated"], false);
+        query.insert("offset".to_string(), "16".to_string());
+        assert_eq!(read_host_file(&query).unwrap_err().code, "invalid_request");
     }
 
     #[test]

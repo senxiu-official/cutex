@@ -386,8 +386,11 @@ pub fn acknowledge_event(state: &mut AskState, event_id: &str, turn_id: &str, no
     event.acknowledged = true;
     for id in event.delivery_ids.clone() {
         if let Some(delivery) = state.deliveries.get_mut(&id) {
-            delivery.state = DeliveryState::Acknowledged;
-            delivery.updated_at = now_rfc3339(now);
+            if delivery.state == DeliveryState::QueuedAsEvent
+                && delivery.event_id.as_deref() == Some(event_id) {
+                delivery.state = DeliveryState::Acknowledged;
+                delivery.updated_at = now_rfc3339(now);
+            }
         }
     }
 }

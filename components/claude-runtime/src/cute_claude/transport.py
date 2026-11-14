@@ -79,8 +79,8 @@ class Outbox:
 async def stdio(server: Server) -> None:
     async def write(raw: str) -> None:
         def emit():
-            sys.stdout.write(raw + "\n")
-            sys.stdout.flush()
+            sys.stdout.buffer.write((raw + "\n").encode("utf-8"))
+            sys.stdout.buffer.flush()
         await asyncio.to_thread(emit)
     outbox = Outbox(write)
     peer = server.connect(outbox.send)

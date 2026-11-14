@@ -10,13 +10,12 @@ pub(super) fn timing(age: Duration, wait: Option<Duration>, busy: Option<bool>, 
 }
 
 /// Whether a bus message may be held for / read at a busy recipient's next
-/// step. System alarms are always after-turn, as on Codex, except approval
-/// decision notices (023: next step, no wait). Without `soon` in the adapter's
-/// capabilities (older adapters) everything stays after-turn.
+/// step. Alarms follow the same busy-wake wait as other messages; approval
+/// decision notices retain their zero-wait exception (023). Without `soon`
+/// in the adapter capabilities everything stays after-turn.
 pub(super) fn candidate(message: &cutex::agent_bus::model::AgentBusMessage, offers_soon: bool) -> bool {
     offers_soon
         && message.delivery_mode == cutex::agent_bus::delivery::AgentDeliveryMode::AfterTurn
-        && !cutex::agent_bus::delivery::always_after_turn(message)
 }
 
 fn observations() -> &'static Mutex<HashMap<String, Value>> {
@@ -77,35 +76,29 @@ mod tests {
         assert_eq!(path(None, "following"), "idle_turn");
     }
 
-    /// 01 + 07: an alarm to a busy Claude agent past the busy wait (also with
-    /// `wake_busy_wait_secs = 0`) stays after-turn; an agent wake does not.
     #[test]
-    fn alarms_stay_after_turn_on_busy_claude_agents() {
-        use cutex::agent_bus::model::{AgentBusMessage, AgentMessageKind};
-        let wake: AgentBusMessage = serde_json::from_value(json!({"id":"m","from":"Eva","to":"runtime",
-            "fromCutexSessionId":"cutex.11111111-1111-4111-8111-111111111111",
-            "toCutexSessionId":"cutex.22222222-2222-4222-8222-222222222222",
-            "content":"hi","deliveryMode":"after_turn","triggerTurn":true,"createdAtEpochSecs":1})).unwrap();
-        let mut alarm = wake.clone();
-        alarm.sender_kind = AgentMessageKind::AlarmSystem;
-        alarm.from = cutex::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
-        let mut legacy_alarm = wake.clone();
-        legacy_alarm.from = cutex::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
-        for wait in [Some(Duration::from_secs(120)), Some(Duration::ZERO)] {
-            let at = |message: &AgentBusMessage| timing(Duration::from_secs(600), wait, Some(true), candidate(message, true));
-            assert_eq!(at(&wake), WakeTiming::NextStep);
-            assert_eq!(at(&alarm), WakeTiming::AfterTurn);
-            assert_eq!(at(&legacy_alarm), WakeTiming::AfterTurn);
-            // Never held either.
-            let young = |message: &AgentBusMessage| timing(Duration::ZERO, wait, Some(true), candidate(message, true));
-            assert_ne!(young(&alarm), WakeTiming::Hold);
+    fn alarms_follow_busy_wake_timing_on_claude() {
+        use cutex::agent_bus::model::{AgentBusMessage,AgentMessageKind};
+        let wake:AgentBusMessage=serde_json::from_value(json!({"id":"alarm-policy","from":"Eva","to":"runtime",
+            "toCutexSessionId":"cutex.22222222-2222-4222-8222-222222222222","content":"hi",
+            "deliveryMode":"after_turn","triggerTurn":true,"createdAtEpochSecs":1})).unwrap();
+        let mut alarm=wake.clone();alarm.sender_kind=AgentMessageKind::AlarmSystem;alarm.from=cutex::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
+        let mut legacy=wake.clone();legacy.from=cutex::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
+        for message in [&wake,&alarm,&legacy] {
+            let wait=Some(Duration::from_secs(120));
+            assert!(candidate(message,true));
+            assert_eq!(timing(Duration::from_secs(119),wait,Some(true),candidate(message,true)),WakeTiming::Hold);
+            assert_eq!(timing(Duration::from_secs(120),wait,Some(true),candidate(message,true)),WakeTiming::NextStep);
+            assert_eq!(timing(Duration::ZERO,wait,Some(false),candidate(message,true)),WakeTiming::AfterTurn,"idle starts a clean new turn");
+            assert_eq!(timing(Duration::from_secs(3600),None,Some(true),candidate(message,true)),WakeTiming::AfterTurn);
+            assert_eq!(timing(Duration::ZERO,Some(Duration::ZERO),Some(true),candidate(message,true)),WakeTiming::NextStep);
+            assert!(!candidate(message,false));
         }
-        assert!(!candidate(&wake, false));
     }
 
     /// 023: an approval decision notice is read at a busy Claude agent's next
-    /// step with no wait (adapter with `soon`); the agent's own reminders stay
-    /// after-turn; an adapter without `soon` gets it after the turn.
+    /// step with no wait (adapter with `soon`); ordinary reminders use the
+    /// configured wait. An adapter without `soon` gets it after the turn.
     #[test]
     fn approval_notices_are_next_step_on_busy_claude_agents() {
         use cutex::agent_bus::model::{AgentBusMessage, AgentMessageKind};
@@ -123,7 +116,8 @@ mod tests {
         assert_eq!(timing(Duration::ZERO, wait, Some(true), candidate(&approval, true)), WakeTiming::NextStep);
         assert_eq!(timing(Duration::ZERO, wait, Some(false), candidate(&approval, true)), WakeTiming::NextStep);
         let reminder_wait = cutex::agent_bus::delivery::busy_wait_for(&reminder);
-        assert_eq!(timing(Duration::from_secs(600), reminder_wait, Some(true), candidate(&reminder, true)), WakeTiming::AfterTurn);
+        assert_eq!(timing(Duration::ZERO, reminder_wait, Some(true), candidate(&reminder, true)), WakeTiming::Hold);
+        assert_eq!(timing(Duration::from_secs(600), reminder_wait, Some(true), candidate(&reminder, true)), WakeTiming::NextStep);
         // Older adapter (no `soon`): after the turn, as before.
         assert_eq!(timing(Duration::ZERO, wait, Some(true), candidate(&approval, false)), WakeTiming::AfterTurn);
     }

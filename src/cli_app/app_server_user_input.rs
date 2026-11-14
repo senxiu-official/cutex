@@ -69,6 +69,8 @@ pub(crate) fn submit_v2_with_image_settings(
     command: UserInputSubmitCommand,
     image_settings: ImageInputSettings,
 ) -> Result<UserInputSubmitExecution, UserInputExecutionError> {
+    cutex::management::v2::input_disposal::check(&command.cutex_session_id,[command.params.client_user_message_id.as_str()])
+        .map_err(|error|execution_error("route","input_disposed",error,false,false))?;
     let mut trace = ControlTrace::new(TimingPath::InputSubmit);
     trace.stage(TimingStage::LockWait);
     let session_lock = session_input_lock(&command.cutex_session_id)
@@ -1302,6 +1304,8 @@ fn send_user_input_native_request(
             })?)
     } else { None };
     if let Some(carries) = &carries { carries.attach(&mut params); }
+    if let Some(carries)=&carries {carries.check_dispositions()
+        .map_err(|error|execution_error("native_request","input_disposed",error,false,false))?;}
     let result = send_user_input_native_request_inner(command, method, params, disposition, generation);
     if let Some(carries) = &carries {
         match &result {
@@ -1340,6 +1344,16 @@ fn send_user_input_native_request_inner(
     // caller (`send_recorded`, every owner native request) just made under
     // the host fence, which re-checked the pause (r274 decision 1).
     let send = |native_request_id: &str, reserved: bool| {
+        cutex::management::v2::input_disposal::check(&command.cutex_session_id,[command.params.client_user_message_id.as_str()])
+            .map_err(|error|execution_error("native_request","input_disposed",error,false,false))?;
+        if let Some(carries)=params.get("ownerCarries").and_then(Value::as_array) {
+            for envelope in carries {
+                if let Some(id)=envelope.pointer("/message/id").and_then(Value::as_str) {
+                    cutex::management::v2::input_disposal::check(&command.cutex_session_id,[id])
+                        .map_err(|error|execution_error("native_request","input_disposed",error,false,false))?;
+                }
+            }
+        }
         ensure_native_input_open_after(repository_for_retry()?, &command.cutex_session_id, reserved)?;
         // r271: the owner admission worker held the host fence only for the
         // re-check and the durable `sending` reservation. Never native IO.

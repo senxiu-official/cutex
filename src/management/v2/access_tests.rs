@@ -293,6 +293,7 @@ fn cutex_and_native_method_tables_are_reviewed_snapshots() {
             "cutex/safetyCheck/grant",
             "cutex/safetyCheck/dismiss",
             "cutex/input/dismiss",
+            "cutex/input/dispose",
             "cutex/input/lease/release",
             "cutex/input/retry",
             "cutex/input/interruptSend",

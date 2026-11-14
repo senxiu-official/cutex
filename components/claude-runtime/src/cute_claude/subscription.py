@@ -159,16 +159,38 @@ class SdkResponseError(ProviderError):
         known = {'authentication_failed', 'billing_error', 'rate_limit', 'server_error', 'invalid_request'}
         code = field(message, 'error')
         code = code if isinstance(code, str) and code in known else 'unknown'
+        self.native_code = code
         self.codex_error_info = {
             'authentication_failed': 'unauthorized', 'billing_error': 'usageLimitExceeded',
             'rate_limit': 'rateLimitExceeded' if account else 'usageLimitExceeded',
             'server_error': 'internalServerError', 'invalid_request': 'badRequest',
         }.get(code, 'other')
         texts = [field(block, 'text', '') for block in field(message, 'content', [])]
-        if code == 'server_error' and any(isinstance(text, str) and re.search(r'\b529\b|overloaded', text, re.I) for text in texts):
-            self.codex_error_info = 'serverOverloaded'
+        from .error_diagnostics import diagnose
+        self.diagnostic = diagnose(message, texts)
+        self.additional_details = json.dumps(self.diagnostic.details(), separators=(',', ':'))
+        status = self.diagnostic.http_status
+        connection = code in {'server_error', 'unknown'} and self.diagnostic.category in {'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT'}
+        if code in {'server_error', 'unknown'}:
+            if connection:
+                self.codex_error_info = {'httpConnectionFailed': {'httpStatusCode': None}}
+            elif self.diagnostic.category == 'overloaded':
+                self.codex_error_info = 'serverOverloaded'
+            elif status is not None and status >= 500:
+                self.codex_error_info = 'internalServerError'
+            elif status in (401, 403):
+                self.codex_error_info = 'unauthorized'
+            elif status == 429:
+                self.codex_error_info = 'rateLimitExceeded' if account else 'usageLimitExceeded'
+            elif status is not None:
+                self.codex_error_info = 'badRequest'
+            else:
+                self.codex_error_info = 'other'
         if code == 'invalid_request' and history_signature_rejected(texts):
             text = HISTORY_SIGNATURE_REJECTION
+        elif connection:
+            subject = api_error_subject(account) if account else 'Official Claude'
+            text = f'{subject} connection failed ({self.diagnostic.category}). You may submit a fresh instruction.'
         elif account:
             hint = ' Check the API key and base URL.' if code == 'authentication_failed' else ''
             text = f'{api_error_subject(account)} rejected the request ({code}).{hint}'
@@ -189,6 +211,11 @@ class SdkResponseError(ProviderError):
             # The prefix is what cutex's quota detection matches (quota_continue::quota_error_text).
             text = (f'Official Claude returned an error ({code}). You may submit a fresh instruction. This runtime '
                     'does not retry it itself; cutex may requeue delegations once the limit resets.')
+            if code in {'server_error', 'unknown'} and (self.diagnostic.category == 'overloaded' or status is not None and status >= 500):
+                text = (f'Official Claude returned an error ({code}). Limited retries apply only before any '
+                        'output, tool activity or context receipt. You may submit a fresh instruction.')
+        if status is not None:
+            text += f' Upstream HTTP status: {status}.'
         super().__init__(text)
 
 
@@ -510,6 +537,9 @@ class OfficialSdkDriver:
             stderr=lambda line: None,  # Do not inherit raw CLI diagnostics on public stderr.
 
         )
+        from .retry_settings import hooks_configured
+        bridge.settings_hooks_configured = hooks_configured(engine.settings.workspace, self.config_dir,
+            engine.settings.setting_sources, engine.flag_settings_dict(tid))
         return RecoveringSdkClient(self.sdk.ClaudeSDKClient(options=options)), bridge
 
 
@@ -722,6 +752,7 @@ class SdkToolBridge:
             return self.denied(NO_TURN_TOOLS)
         if not self.callback_valid(data):
             return self.denied('Native session or child context identity mismatch')
+        self.engine.retry_blocked.add(binding[0])
         full_name = data.get('tool_name', '')
         call_id = tool_use_id or data.get('tool_use_id')
         if not isinstance(call_id, str) or not call_id:
@@ -914,6 +945,9 @@ class SubscriptionEngine(Engine):
         super().__init__(settings, store, driver, tools)
         self.driver = driver
         self.open_tools: dict[str, dict[str, dict]] = {}
+        self.retry_blocked: set[str] = set()
+        self.retry_turns: dict[str, str] = {}
+        self.retry_waiting: set[str] = set()
         self.native_tool_inventory = {}
         self.offline_threads: set[str] = set()
         self.plan_state = PlanState(store)
@@ -933,6 +967,36 @@ class SubscriptionEngine(Engine):
         store.db.execute('CREATE TABLE IF NOT EXISTS thread_launch_models(thread_id TEXT PRIMARY KEY REFERENCES threads(id), model TEXT NOT NULL)')
         # Claude Code fast mode per thread (a `fastMode` flag setting at connect).
         store.db.execute('CREATE TABLE IF NOT EXISTS thread_fast_mode(thread_id TEXT PRIMARY KEY REFERENCES threads(id), enabled INTEGER NOT NULL)')
+
+    async def emit(self, tid: str, method: str, params: dict, *, durable: bool = True) -> None:
+        turn_id = self.retry_turns.get(tid)
+        # Sticky for the entire turn, including non-durable deltas and receipts.
+        # A later native message cannot reset this evidence by reusing block indices.
+        if turn_id and (method.startswith('item/') or method in {
+                'claude/input/contextPersisted', 'thread/presentation/appended',
+                'turn/plan/updated', 'turn/diff/updated'}):
+            self.retry_blocked.add(turn_id)
+        await super().emit(tid, method, params, durable=durable)
+
+    def _loaded_settings_hooks(self, tid: str) -> bool:
+        from .retry_settings import hooks_configured
+        owner = getattr(self.driver, 'owners', {}).get(tid)
+        bridge = getattr(owner, 'bridge', None)
+        if getattr(bridge, 'settings_hooks_configured', False):
+            return True
+        config_dir = getattr(self.driver, 'config_dir', None)
+        if config_dir is None and 'user' in self.settings.setting_sources:
+            return True
+        return hooks_configured(self.settings.workspace, Path(config_dir or self.settings.state_dir),
+                                self.settings.setting_sources, self.flag_settings_dict(tid))
+
+    def _check_retry_cancelled(self, tid: str, turn_id: str) -> None:
+        owner = getattr(self.driver, 'owners', {}).get(tid)
+        active = getattr(owner, 'active', None)
+        if (self.closing or tid in self.offline_threads
+                or turn_id in getattr(owner, 'cancelled_turns', ())
+                or active is not None and active.turn_id == turn_id and active.interrupted):
+            raise TurnInterrupted('Turn interrupted before retry submission.')
 
     async def add_task_usage(self, tid: str, turn_id: str, task_id: str, usage: dict) -> None:
         """G9, best effort: a background subagent's model usage (its messages' usage,
@@ -1178,6 +1242,10 @@ class SubscriptionEngine(Engine):
                 self.workers.pop(tid, None)
 
     async def interrupt(self, tid: str, turn_id: str) -> None:
+        if turn_id in self.retry_waiting:
+            # The native query already returned its explicit terminal result.
+            # Interrupt the worker's cancellable backoff, not the idle CLI mailbox.
+            return await super().interrupt(tid, turn_id)
         if not getattr(self.driver, 'persistent', False):
             return await super().interrupt(tid, turn_id)
         row = self.store.db.execute("SELECT id FROM turns WHERE thread_id=? AND reverted=0 AND state='inProgress'", (tid,)).fetchone()
@@ -1307,6 +1375,15 @@ class SubscriptionEngine(Engine):
         async def on_message(message: Any) -> None:
             nonlocal got_result, last_item, terminal_failure, last_call
             typ = message_type(message)
+            # A content block (even an empty thinking/tool block) is enough to
+            # forbid replay. Error diagnostics themselves are not model output.
+            if typ in {'AssistantMessage', 'assistant'} and not field(message, 'error') and field(message, 'content', []):
+                self.retry_blocked.add(turn_id)
+            if typ in {'StreamEvent', 'stream_event'} and field(message, 'event', {}).get('type') in {
+                    'content_block_start', 'content_block_delta'}:
+                self.retry_blocked.add(turn_id)
+            if field(message, 'subtype') in {'hook_started', 'hook_response'}:
+                self.retry_blocked.add(turn_id)
             sid = field(message, 'session_id')
             if typ in {'SystemMessage', 'system'}:
                 data = field(message, 'data', {})
@@ -1431,6 +1508,8 @@ class SubscriptionEngine(Engine):
                 if sid != session['session_id']:
                     raise ProviderError('Terminal result omitted the expected native session ID')
                 counts = usage_counts(field(message, 'usage') or {})
+                if counts.get('output_tokens', 0) or (field(message, 'num_turns') or 0) > 1:
+                    self.retry_blocked.add(turn_id)
                 usage_calls[-1].update(outcome='received', usage=counts,
                     sdkNumTurns=field(message, 'num_turns'), billingScope='sdk-main-loop-reported-not-an-invoice')
                 # Background subagents of this turn that already ended (add_task_usage).
@@ -1500,34 +1579,88 @@ class SubscriptionEngine(Engine):
             if side is not None and not compact and side.boundary_pending(tid):
                 notes = [*SIDE_BOUNDARY_BLOCKS, *notes]
             message = sdk_user_message(prompt, payload.get('attachments') or [], verbatim=verbatim, preceding=notes)
-            delays, attempt = refresh_retry_delays(), 0
+            # Initial input presentation is not model output or a context receipt.
+            # Start the sticky observation barrier before submitting to the CLI.
+            self.retry_turns[tid] = turn_id
+            if self._loaded_settings_hooks(tid):
+                self.retry_blocked.add(turn_id)
+            delays, attempt, transient_attempt = refresh_retry_delays(), 0, 0
             while True:
+                self._check_retry_cancelled(tid, turn_id)
                 await self.driver.run(engine=self, tid=tid, turn_id=turn_id,
                     session_id=session['session_id'], resume=bool(session['attempted']),
                     prompt=prompt, message=message, on_message=on_message)
+                self._check_retry_cancelled(tid, turn_id)
                 silent = last_item is None and not pending and not reasoning and not self.open_tools.get(turn_id)
+                from .transient_retry import RETRY_CONTINUATION, retry_delay
+                delay = retry_delay(terminal_failure, transient_attempt) if (
+                    not getattr(self.driver, 'api_account', None) and got_result and silent
+                    and turn_id not in self.retry_blocked
+                    and not self._loaded_settings_hooks(tid)
+                    and not self.store.db.execute('SELECT 1 FROM tool_calls WHERE turn_id=? LIMIT 1', (turn_id,)).fetchone()
+                ) else None
+                if delay is not None:
+                    transient_attempt += 1
+                    self.retry_waiting.add(turn_id)
+                    try:
+                        await self.emit(tid, 'error', {'threadId': tid, 'turnId': turn_id, 'willRetry': True, 'error': {
+                            'message': f'Claude connection/request failed before any output or tool activity; '
+                                       f'retrying in {delay:.1f} s ({transient_attempt}/2).',
+                            'codexErrorInfo': terminal_failure.codex_error_info,
+                            'additionalDetails': terminal_failure.additional_details}}, durable=False)
+                        self._check_retry_cancelled(tid, turn_id)
+                        await asyncio.sleep(delay)
+                        self._check_retry_cancelled(tid, turn_id)
+                    finally:
+                        self.retry_waiting.discard(turn_id)
+                    # Receipt/output callbacks during the wait still veto another query.
+                    if turn_id in self.retry_blocked or self._loaded_settings_hooks(tid):
+                        break
+                    # The CLI saved the failed user message in native history.
+                    # Resending it duplicates text, notes, side blocks and images.
+                    prompt = RETRY_CONTINUATION
+                    message = sdk_user_message(prompt, [], verbatim=True)
+                    terminal_failure, got_result = None, False
+                    usage_calls.append({'kind': 'sdk-turn', 'outcome': 'requested', 'usage': None,
+                                        'retry': transient_attempt, 'retryReason': 'silent-transient'})
+                    self._usage(turn_id, usage_calls)
+                    continue
                 if not (isinstance(terminal_failure, SdkResponseError) and terminal_failure.transient_refresh
-                        and silent and attempt < len(delays)):
+                        and got_result and silent and turn_id not in self.retry_blocked
+                        and not self._loaded_settings_hooks(tid) and attempt < len(delays)):
                     break
                 # The OAuth refresh lock was held (another Claude Code process on this
                 # login was refreshing an expired token). Claude produced nothing, so
-                # the same input is sent again in this turn once the lock is free. The
-                # native transcript keeps the failed copy of the message.
+                # a fixed continuation is sent once the lock is free. The native
+                # transcript already keeps the failed copy of the original input.
                 delay = delays[attempt]
                 attempt += 1
-                await self.emit(tid, 'error', {'threadId': tid, 'turnId': turn_id, 'willRetry': True, 'error': {
+                self.retry_waiting.add(turn_id)
+                try:
+                    self._check_retry_cancelled(tid, turn_id)
+                    await self.emit(tid, 'error', {'threadId': tid, 'turnId': turn_id, 'willRetry': True, 'error': {
                     'message': f'Claude is waiting for its login token refresh (another Claude Code process holds it); '
                                f'retrying in {delay:g} s ({attempt}/{len(delays)}).',
-                    'codexErrorInfo': 'other', 'additionalDetails': None}}, durable=False)
-                await asyncio.sleep(delay)
+                        'codexErrorInfo': 'other', 'additionalDetails': None}}, durable=False)
+                    self._check_retry_cancelled(tid, turn_id)
+                    await asyncio.sleep(delay)
+                    self._check_retry_cancelled(tid, turn_id)
+                finally:
+                    self.retry_waiting.discard(turn_id)
+                if turn_id in self.retry_blocked or self._loaded_settings_hooks(tid):
+                    break
+                prompt = RETRY_CONTINUATION
+                message = sdk_user_message(prompt, [], verbatim=True)
                 terminal_failure, got_result = None, False
                 usage_calls.append({'kind': 'sdk-turn', 'outcome': 'requested', 'usage': None, 'retry': attempt})
                 self._usage(turn_id, usage_calls)
             if attempt and isinstance(terminal_failure, SdkResponseError) and terminal_failure.transient_refresh:
                 terminal_failure.args = (
                     f'Official Claude could not refresh its login token: another Claude Code process using this account '
-                    f'kept the refresh lock. The input was sent again {attempt} time(s) without success; send it again '
+                    f'kept the refresh lock. A continuation was sent {attempt} time(s) without success; send a new instruction '
                     f'later or check the login (cutex human claude account status).',)
+            if transient_attempt and isinstance(terminal_failure, SdkResponseError):
+                terminal_failure.args = (f'{terminal_failure} Silent transient retries used: {transient_attempt}/2.',)
             if terminal_failure:
                 raise terminal_failure if isinstance(terminal_failure, SdkResponseError) else ProviderError(terminal_failure)
             if not got_result:
@@ -1541,8 +1674,12 @@ class SubscriptionEngine(Engine):
             fallback = (f'{api_error_subject(account)} turn failed ({type(exc).__name__}). Check the API account configuration.'
                         if account else f'Subscription turn failed ({type(exc).__name__}). Inspect official login/seat access; no API fallback.')
             msg = str(exc) if isinstance(exc, (RpcError, ProviderError)) else fallback
-            error = {'message': msg, 'codexErrorInfo': exc.codex_error_info if isinstance(exc, SdkResponseError) else 'other', 'additionalDetails': None}
+            error = {'message': msg, 'codexErrorInfo': exc.codex_error_info if isinstance(exc, SdkResponseError) else 'other',
+                     'additionalDetails': exc.additional_details if isinstance(exc, SdkResponseError) else None}
         finally:
+            self.retry_turns.pop(tid, None)
+            self.retry_waiting.discard(turn_id)
+            self.retry_blocked.discard(turn_id)
             for item in list(pending.values()) + list(reasoning.values()):
                 self.store.put_item(turn_id, item)
                 await self.emit(tid, 'item/completed', {'threadId': tid, 'turnId': turn_id, 'item': item})

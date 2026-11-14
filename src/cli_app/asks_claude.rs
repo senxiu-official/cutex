@@ -232,6 +232,9 @@ pub(crate) fn submit(session: &str, generation: u64, submission: &Submission) ->
     let Ok(_guard) = lock.lock() else {
         return SubmitOutcome::Unsupported("session input lock poisoned".into());
     };
+    if let Err(error)=cutex::management::v2::input_disposal::check_submission(session,submission) {
+        return SubmitOutcome::Unsupported(format!("{error:#}"));
+    }
     if let Some(outcome)=super::asks_runtime::pause_admission_outcome_in_lane(session){return outcome;}
     let next_step = cutex::asks::returns::is_next_step_event(&submission.message_id);
     if next_step && (submission.source_agent.is_some() || !matches!(submission.event_type, "ANSWER" | "QUESTION")
@@ -258,6 +261,9 @@ pub(crate) fn submit(session: &str, generation: u64, submission: &Submission) ->
     let views = adapter_capabilities(session, generation).is_some_and(|capabilities| offers_agent_messages_v2(&capabilities));
     let params = submit_params(&thread_id, session, submission, views);
     let digest = legacy_digest(&params);
+    if let Err(error)=cutex::management::v2::input_disposal::check_submission(session,submission) {
+        return SubmitOutcome::Unsupported(format!("{error:#}"));
+    }
     let result = handle.request("claude/input/submit", params);
     if next_step { next_step_submit_outcome(result, &thread_id, &submission.message_id, &digest) } else { submit_outcome(result) }
 }
@@ -408,7 +414,7 @@ fn owner_note_status(session: &str, generation: u64, submission: &Submission) ->
     let Some(record) = super::asks_runtime::record(session) else {
         return NativeMessageStatus::Unavailable("session missing".into());
     };
-    let durable = (|| -> anyhow::Result<Option<String>> {
+    let durable = (|| -> anyhow::Result<owner_note_evidence::Evidence> {
         let thread = record.app_server_thread_id().ok_or_else(|| anyhow::anyhow!("thread missing"))?;
         let envelope = owner_note_envelope(session, thread, generation, submission)?;
         let adapter = record.claude_session.as_ref().ok_or_else(|| anyhow::anyhow!("Claude binding missing"))?;
@@ -420,14 +426,18 @@ fn owner_note_status(session: &str, generation: u64, submission: &Submission) ->
                 .and_then(|delivery| delivery.owner_input_id.clone())).collect::<std::collections::BTreeSet<_>>())
             .unwrap_or_default();
         let owner = (owners.len() == 1).then(|| owners.first().expect("one owner").as_str());
-        let proof = owner_note_evidence::persisted_turn(&adapter.state_dir.join("state.sqlite3"), &envelope, owner)?;
+        let proof = owner_note_evidence::observe(&adapter.state_dir.join("state.sqlite3"), &envelope, owner)?;
         let current = super::asks_runtime::record(session).ok_or_else(|| anyhow::anyhow!("session removed"))?;
         anyhow::ensure!(current.claude_session == record.claude_session
             && current.app_server_thread_id() == record.app_server_thread_id()
             && current.runtime_generation == record.runtime_generation, "Claude binding changed during evidence read");
         Ok(proof)
     })();
-    if let Ok(Some(turn_id)) = durable { return NativeMessageStatus::Persisted { turn_id }; }
+    let failed_turn = match durable {
+        Ok(owner_note_evidence::Evidence::Persisted(turn_id)) => return NativeMessageStatus::Persisted { turn_id },
+        Ok(owner_note_evidence::Evidence::FailedUnconfirmed(turn_id)) => Some(turn_id),
+        _ => None,
+    };
     if record.runtime_generation != generation {
         // Never ask a current adapter to attest to an old generation's key.
         return NativeMessageStatus::Unavailable("old owner carry has no verified durable context evidence".into());
@@ -438,18 +448,58 @@ fn owner_note_status(session: &str, generation: u64, submission: &Submission) ->
         let envelope = owner_note_envelope(session, thread, generation, submission)?;
         super::claude_ingress::status(&handle(session, generation)?, &envelope, generation)
     })();
+    // Do not publish evidence captured for an occurrence that changed during IO.
+    if !super::asks_runtime::record(session).is_some_and(|current|
+        current.claude_session == record.claude_session
+            && current.app_server_thread_id() == record.app_server_thread_id()
+            && current.runtime_generation == generation) {
+        return NativeMessageStatus::Unavailable("Claude binding changed during status read".into());
+    }
     match result {
-        Ok(status) => {
-            if let Some(turn_id) = super::claude_ingress::persisted_turn(&status) {
-                NativeMessageStatus::Persisted { turn_id: turn_id.into() }
-            } else if status.delivery_state == cutex::app_server::external_input::DeliveryState::Pending {
-                NativeMessageStatus::Pending
-            } else {
-                // Never infer absence or replay an owner-bound passive note.
-                NativeMessageStatus::Unavailable("owner result context receipt is unconfirmed".into())
-            }
-        }
+        Ok(status) => owner_note_receipt_status(&status, failed_turn.as_deref()),
+        Err(_) if failed_turn.is_some() => failed_owner_carry_status(failed_turn.as_deref().expect("failed proof")),
         Err(error) => NativeMessageStatus::Unavailable(format!("{error:#}")),
+    }
+}
+
+fn failed_owner_carry_status(turn: &str) -> NativeMessageStatus {
+    NativeMessageStatus::Held {
+        reason: cutex::asks::returns::OWNER_CARRY_CONTEXT_UNCONFIRMED.into(),
+        turn_id: Some(turn.into()),
+    }
+}
+
+fn owner_note_receipt_status(
+    status: &cutex::app_server::external_input::Status,
+    failed_turn: Option<&str>,
+) -> NativeMessageStatus {
+    if let Some(turn_id) = super::claude_ingress::persisted_turn(status) {
+        NativeMessageStatus::Persisted { turn_id: turn_id.into() }
+    } else if status.delivery_state == cutex::app_server::external_input::DeliveryState::Pending {
+        failed_turn.map(failed_owner_carry_status).unwrap_or(NativeMessageStatus::Pending)
+    } else {
+        NativeMessageStatus::Unavailable("owner result context receipt is unconfirmed".into())
+    }
+}
+
+#[cfg(test)]
+mod failed_owner_carry_regressions {
+    use super::*;
+
+    #[test]
+    fn failed_owner_carry_held_uncertain_is_not_perpetual_pending() {
+        let status = serde_json::from_value(json!({
+            "messageId":"cutex-ask-owner-rover", "semanticSha256":"a".repeat(64),
+            "deliveryState":"pending", "receipt":null,
+            "processing":{"state":"held","attemptId":null,"reason":"request_uncertain"}
+        })).unwrap();
+        assert_eq!(owner_note_receipt_status(&status, Some("failed-carrier-turn")),
+            NativeMessageStatus::Held {
+                reason:"owner_carry_context_unconfirmed".into(),
+                turn_id:Some("failed-carrier-turn".into()),
+            });
+        assert_eq!(owner_note_receipt_status(&status, None), NativeMessageStatus::Pending,
+            "a status alone cannot prove that its exact carrier finished");
     }
 }
 

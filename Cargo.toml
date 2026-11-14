@@ -1,6 +1,6 @@
 [package]
 name = "cutex"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/senxiu-official/cutex"
@@ -81,3 +81,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemServices",
     "Win32_System_SystemInformation",
 ] }
+
+[dev-dependencies]
+# Parse production module graphs for the closed Next Up producer gate.
+syn = { version = "2.0.117", features = ["full", "visit"] }
+proc-macro2 = "1"

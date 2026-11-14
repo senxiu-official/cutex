@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -139,6 +140,40 @@ async def test_stdio_subprocess_clean_jsonl(tmp_path):
         await asyncio.wait_for(proc.wait(), 5)
         assert proc.returncode == 0
         assert 'provider=MOCK' in (await proc.stderr.read()).decode()
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+
+@pytest.mark.parametrize('encoding', ['cp1252', 'ascii'])
+async def test_stdio_unicode_frames_ignore_host_output_encoding(tmp_path, encoding):
+    workspace = tmp_path / 'workspace-中文·é'
+    workspace.mkdir()
+    env = {**os.environ, 'PYTHONPATH': str(Path(__file__).parents[1] / 'src'),
+           'PYTHONUTF8': '0', 'PYTHONIOENCODING': encoding}
+    proc = await asyncio.create_subprocess_exec(sys.executable, '-m', 'cute_claude', '--mock',
+        '--workspace', str(workspace), '--state-dir', str(tmp_path / 'state'), env=env,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+    async def call(identifier, method):
+        proc.stdin.write((json.dumps({'id': identifier, 'method': method, 'params': {}}) + '\n').encode('utf-8'))
+        await proc.stdin.drain()
+        while True:
+            raw = await asyncio.wait_for(proc.stdout.readline(), 30)
+            assert raw, (await proc.stderr.read()).decode('utf-8', errors='replace')
+            message = json.loads(raw.decode('utf-8'))
+            if message.get('id') == identifier:
+                return message
+    try:
+        assert (await call(1, 'initialize'))['id'] == 1
+        proc.stdin.write(b'{"method":"initialized"}\n')
+        await proc.stdin.drain()
+        result = await call(2, 'thread/start')
+        assert result['result']['thread']['cwd'] == str(workspace)
+        proc.stdin.close()
+        await asyncio.wait_for(proc.wait(), 10)
+        assert proc.returncode == 0
     finally:
         if proc.returncode is None:
             proc.kill()

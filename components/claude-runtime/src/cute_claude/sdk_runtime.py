@@ -602,6 +602,11 @@ class RuntimeOwner:
     async def _event(self, message: Any) -> None:
         self._check_identity(message)
         typ = message_type(message)
+        if self.active and (field(message, 'subtype') in {'hook_started', 'hook_response'}
+                            or typ in {'TaskStartedMessage', 'TaskProgressMessage', 'TaskNotificationMessage'}):
+            # These events bypass the ordinary turn callback, but may describe
+            # effects that make a silent-turn retry unsafe.
+            self.engine.retry_blocked.add(self.active.turn_id)
         self._observe_autonomous(message, typ)
         await self._publish_notification_hold()
         if await self.tasks.observe(message, self.active.turn_id if self.active else None):

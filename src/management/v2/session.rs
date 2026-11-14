@@ -96,6 +96,7 @@ pub const CUTEX_METHOD_REGISTRY_METHODS: &[&str] = &[
     "cutex/input/get",
     "cutex/input/list",
     "cutex/input/dismiss",
+    "cutex/input/dispose",
     "cutex/input/lease/release",
     "cutex/userInput/queue/merge",
     "cutex/input/retry",

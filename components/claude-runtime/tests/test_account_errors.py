@@ -10,7 +10,7 @@ from test_persistent import ph
     ('authentication_failed', 'unauthorized', 'unauthorized'),
     ('billing_error', 'usageLimitExceeded', 'usageLimitExceeded'),
     ('rate_limit', 'usageLimitExceeded', 'rateLimitExceeded'),
-    ('server_error', 'internalServerError', 'internalServerError'),
+    ('server_error', 'other', 'other'),
     ('invalid_request', 'badRequest', 'badRequest'),
     ('unknown', 'other', 'other'),
     ('unsafe key-in-error-code', 'other', 'other'),

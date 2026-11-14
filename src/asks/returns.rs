@@ -525,6 +525,26 @@ fn settle_unreconcilable_event(
     Ok(())
 }
 
+/// The owner settled one member while the native batch may still exist.
+/// With its lease retired there is no receipt reconciliation path for its
+/// siblings. Retire them atomically as passive unknowns, never as unsent work.
+pub(super) fn retire_event_after_dismiss(state: &mut AskState, session: &str, event_id: &str, now: DateTime<Utc>) {
+    let event = state.events.get(event_id).filter(|event| event.cutex_session_id == session).cloned();
+    remove_event_lease(state, session, event_id);
+    let Some(event) = event else { return; };
+    let siblings: Vec<String> = event.delivery_ids.iter().filter(|id| state.deliveries.get(*id).is_some_and(|d|
+        d.state == DeliveryState::QueuedAsEvent && d.event_id.as_deref() == Some(event_id)))
+        .cloned().collect();
+    let asks = event_asks(state, &event);
+    state.events.remove(event_id);
+    if siblings.is_empty() { return; }
+    make_passive_with(state, session, &siblings, asks, super::RESULTS_OUTCOME_UNKNOWN,
+        "native batch retired after owner dismissal; remaining results have unconfirmed delivery".into(), now);
+    for id in siblings {
+        state.deliveries.get_mut(&id).expect("selected sibling").settled_by = Some(super::RESULTS_OUTCOME_UNKNOWN.into());
+    }
+}
+
 /// Results that can never be sent as an event: passive (delegation_wait
 /// and agent_list still return them), and the owner is told once.
 fn make_passive(
@@ -684,6 +704,8 @@ fn refund_result_turn(state:&mut AskState,key:&str,now:DateTime<Utc>) {
 fn unsent_event_open(store:&AskStore,session:&str,event_id:&str)->anyhow::Result<bool> {
     // This is used only before the first native submit, never to release an
     // event whose native outcome is unknown. Receipt recovery remains ungated.
+    let ids=store.project_snapshot(|state|state.events.get(event_id).map(|event|event.delivery_ids.clone()).unwrap_or_default())?;
+    if crate::management::v2::input_disposal::check(session,ids.iter().map(String::as_str)).is_err() {return Ok(false);}
     let host=super::routing_policy::integration::local_host_id();
     Ok(match super::pause_admission::try_with_authority(|roster|store.inspect(|state| {
         !super::pause_admission::is_paused_in(state,roster,session)
@@ -711,6 +733,10 @@ fn same_event_reservation(state: &AskState, snapshot: &AskState, lease: &Admissi
                 && d.state == DeliveryState::QueuedAsEvent && d.event_id.as_deref() == Some(event.event_id.as_str())))
 }
 
+/// Internal status emitted only after proving the original carrier failed.
+/// It is not a context receipt, even though its original turn is known.
+pub const OWNER_CARRY_CONTEXT_UNCONFIRMED: &str = "owner_carry_context_unconfirmed";
+
 fn abandon_owner_event(store: &AskStore, snapshot: &AskState, lease: &AdmissionLease,
     event: &EventOutboxRecord, now: DateTime<Utc>) -> anyhow::Result<bool> {
     store.with_state(|current| {
@@ -718,7 +744,7 @@ fn abandon_owner_event(store: &AskStore, snapshot: &AskState, lease: &AdmissionL
         current.events.remove(&event.event_id);
         remove_event_lease(current, &lease.cutex_session_id, &event.event_id);
         make_passive_with(current, &lease.cutex_session_id, &event.delivery_ids, event_asks(snapshot,event),
-            super::RESULTS_OUTCOME_UNKNOWN, "owner carry runtime lost; context unconfirmed".into(), now);
+            super::RESULTS_OUTCOME_UNKNOWN, "owner carry ended or runtime lost; context unconfirmed".into(), now);
         true
     })
 }
@@ -816,6 +842,18 @@ pub fn admit_events(
             // is uncertainty, not permission to deliver the text again.
             let settled = abandon_owner_event(store,&state,lease,event,now)?;
             if settled {
+                forget_next_step(&event_id);
+                forget_unavailable(&event_id);
+                report.released.push(session.clone());
+            }
+            continue;
+        }
+        if owner_carry && matches!(&status, NativeMessageStatus::Held { reason, turn_id: Some(_) }
+            if reason == OWNER_CARRY_CONTEXT_UNCONFIRMED) {
+            let lane = runtime.result_admission_lane(&session)?;
+            let reservation = lane.as_ref().map(|lane| lane.try_lock());
+            if matches!(reservation, Some(Err(_))) { continue; }
+            if abandon_owner_event(store, &state, lease, event, now)? {
                 forget_next_step(&event_id);
                 forget_unavailable(&event_id);
                 report.released.push(session.clone());
@@ -1477,6 +1515,246 @@ mod tests {
     /// A target answered an ask of REQUESTER at `now` (one pending answer).
     fn answered(world: &crate::asks::scheduler::tests::FakeWorld, runtime: &FakeRuntime, store: &AskStore, now: DateTime<Utc>) -> String {
         answered_named(world, runtime, store, now, "a")
+    }
+
+    #[test]
+    fn failed_owner_carry_is_uncertain_without_blocking_later_results() {
+        let (world, world_dir) = world("rover-failed-carry");
+        let (store, dir) = temp_store("rover-failed-carry");
+        let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+        let now = Utc::now();
+        answered(&world, &runtime, &store, now);
+        let bundle = crate::asks::owner_carries::reserve_owner_results(
+            &store, REQUESTER, "rover-owner", 1,
+            crate::app_server::external_input::size::ReceiverLimit::Off, world.documents(), now,
+        ).unwrap().unwrap();
+        runtime.native.borrow_mut().insert(bundle.submission.message_id.clone(), NativeMessageStatus::Held {
+            reason:"owner_carry_context_unconfirmed".into(), turn_id:Some("failed-carrier".into()),
+        });
+        admit_events(&world, &runtime, &store, &mut TickReport::default(), now).unwrap();
+        let state = store.snapshot().unwrap();
+        assert!(!state.next_step_leases.contains_key(REQUESTER));
+        for id in &bundle.input_ids {
+            assert!(state.deliveries[id].passive, "unknown is never automatically resent");
+            assert_eq!(state.deliveries[id].state, DeliveryState::Pending,
+                "a failed carrier is not proof of model context");
+        }
+        assert_eq!(results_admissible(&state, REQUESTER), Some(None));
+        // A crash between source commit and the ledger writer still rebuilds
+        // exactly one uncertain item, preserving its original content.
+        let ledger = crate::management::v2::input_ledger::InputLedger::open(dir.join("failed-carry-ledger.sqlite3"));
+        for job in super::super::ledger::submitted_jobs_in(&state, REQUESTER, &bundle.input_ids,
+            &bundle.event_id, Some(&bundle.submission.message_id), None, false) {
+            super::super::ledger::apply_job(&ledger,&job);
+        }
+        for record in ledger.get(REQUESTER,&bundle.input_ids).unwrap().records {
+            let job = super::super::ledger::drift_job(&state,&record).unwrap();
+            super::super::ledger::apply_job(&ledger,&job);
+            let updated = ledger.get(REQUESTER,&[record.input_id.clone()]).unwrap().records.pop().unwrap();
+            assert_eq!(updated.state,crate::management::v2::input_ledger::InputState::Uncertain);
+            assert_eq!(updated.reason.as_deref(),Some("outcomeUnknown"));
+            assert_eq!(updated.preview,record.preview);
+            assert!(super::super::ledger::apply_job(&ledger,&job).is_empty());
+        }
+        for _ in 0..3 { admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap(); }
+        assert_eq!(ledger.get(REQUESTER,&bundle.input_ids).unwrap().records.len(),bundle.input_ids.len());
+        let before = runtime.submitted.borrow().len();
+        answered_named(&world, &runtime, &store, now, "new-result");
+        admit_events(&world, &runtime, &store, &mut TickReport::default(), now).unwrap();
+        assert_eq!(runtime.submitted.borrow().len(), before + 2, "new ask and new result both run");
+        assert!(!runtime.submitted.borrow().iter().any(|(_, s)| s.message_id == bundle.submission.message_id));
+        for path in [dir, world_dir] { let _ = std::fs::remove_dir_all(path); }
+    }
+
+    #[test]
+    fn failed_owner_carry_waits_for_inflight_owner_lane() {
+        let (world, world_dir) = world("failed-carry-lane");
+        let (store, dir) = temp_store("failed-carry-lane");
+        let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+        let now = Utc::now();
+        answered(&world, &runtime, &store, now);
+        let bundle = crate::asks::owner_carries::reserve_owner_results(&store,REQUESTER,"lane-owner",1,
+            crate::app_server::external_input::size::ReceiverLimit::Off,world.documents(),now).unwrap().unwrap();
+        runtime.native.borrow_mut().insert(bundle.submission.message_id.clone(), NativeMessageStatus::Held {
+            reason:OWNER_CARRY_CONTEXT_UNCONFIRMED.into(),turn_id:Some("failed-carrier".into()),
+        });
+        let lane = std::sync::Arc::new(crate::management::v2::session_coordination::OperationLane::new());
+        *runtime.result_lane.borrow_mut() = Some(lane.clone());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _reservation = lane.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        });
+        ready_rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        let before = store.snapshot().unwrap();
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        let held = store.snapshot().unwrap();
+        assert_eq!(held.next_step_leases,before.next_step_leases);
+        assert_eq!(held.events,before.events);
+        assert_eq!(held.deliveries,before.deliveries);
+        release_tx.send(()).unwrap(); holder.join().unwrap();
+        admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+        assert!(!store.snapshot().unwrap().next_step_leases.contains_key(REQUESTER));
+        for path in [dir,world_dir] { let _ = std::fs::remove_dir_all(path); }
+    }
+
+    #[test]
+    fn queued_dismiss_review_siblings_become_unknown_through_production_reconcile() {
+        use crate::management::v2::input_ledger::{InputLedger, InputState, Expect, Next};
+        for owner in [false, true] {
+            let (world, world_dir) = world("dismiss-review-siblings");
+            let (store, dir) = temp_store("dismiss-review-siblings");
+            let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+            let now = Utc::now();
+            runtime.set(REQUESTER,|s|s.active_turn_id=Some("hold-while-producing".into()));
+            answered_named(&world,&runtime,&store,now,"a");
+            answered_named(&world,&runtime,&store,now,"b");
+            runtime.set(REQUESTER,|s|s.active_turn_id=None);
+            let (event_id, message, ids) = if owner {
+                let bundle = crate::asks::owner_carries::reserve_owner_results(&store,REQUESTER,"review-owner",1,
+                    crate::app_server::external_input::size::ReceiverLimit::Off,world.documents(),now).unwrap().unwrap();
+                (bundle.event_id,bundle.submission.message_id,bundle.input_ids)
+            } else {
+                let event_id = store.with_state(|state| {
+                    let id = super::super::delivery::coalesce_into_event(state,REQUESTER,"cutex-ask-soon-review",now).unwrap();
+                    state.next_step_leases.insert(REQUESTER.into(),AdmissionLease {
+                        cutex_session_id:REQUESTER.into(),holder:LeaseHolder::Event {event_id:id.clone()},
+                        native_message_id:"cutex-ask-soon-review".into(),runtime_generation:1,turn_id:None,since:now_rfc3339(now),
+                    }); id
+                }).unwrap();
+                let ids = store.snapshot().unwrap().events[&event_id].delivery_ids.clone();
+                (event_id,"cutex-ask-soon-review".into(),ids)
+            };
+            assert_eq!(ids.len(),2);
+            let before = store.snapshot().unwrap();
+            let ledger = InputLedger::open(dir.join("review-ledger.sqlite3"));
+            for job in super::super::ledger::submitted_jobs_in(&before,REQUESTER,&ids,&event_id,Some(&message),None,false) {
+                super::super::ledger::apply_job(&ledger,&job);
+            }
+            let selected = ledger.transition(REQUESTER,&ids[0],Expect::ANY,Next::uncertain("outcomeUnknown")).unwrap().record;
+            let sibling = ledger.get(REQUESTER,&[ids[1].clone()]).unwrap().records.pop().unwrap();
+            assert_eq!(sibling.state,InputState::Sending);
+            super::super::ledger::dismiss(&store,&selected,now).unwrap();
+            let after = store.snapshot().unwrap();
+            assert!(after.deliveries[&ids[1]].passive,"orphan must never be resent");
+            assert_eq!(after.deliveries[&ids[1]].state,DeliveryState::Pending);
+            let changes = super::super::store::ask_state_changes(&before,&after).unwrap();
+            for job in super::super::ledger::store_jobs(&before,&after,&changes) {super::super::ledger::apply_job(&ledger,&job);}
+            let unknown = ledger.get(REQUESTER,&[ids[1].clone()]).unwrap().records.pop().unwrap();
+            assert_eq!(unknown.state,InputState::Uncertain);
+            assert_eq!(unknown.reason.as_deref(),Some("outcomeUnknown"));
+            assert_eq!(unknown.preview,sibling.preview);
+            assert_ne!(unknown.surface,crate::management::v2::input_ledger::Surface::None);
+            assert_eq!(ledger.get(REQUESTER,&[ids[0].clone()]).unwrap().records[0].state,InputState::Discarded);
+            // Reopen the durable source. No handwritten ack is used: the
+            // scheduler visits the real reconciliation/admission path instead.
+            drop(store);
+            let store = AskStore::at(&dir);
+            runtime.native.borrow_mut().insert(message.clone(),NativeMessageStatus::Persisted {turn_id:"late-old-turn".into()});
+            for _ in 0..3 {admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();}
+            assert_eq!(store.snapshot().unwrap().deliveries[&ids[1]],after.deliveries[&ids[1]]);
+            let fresh = InputLedger::open(dir.join("rebuilt-ledger.sqlite3"));
+            let job = super::super::ledger::delivery_job(&after,&after,None,&after.deliveries[&ids[1]]).unwrap();
+            super::super::ledger::apply_job(&fresh,&job);
+            assert_eq!(fresh.get(REQUESTER,&[ids[1].clone()]).unwrap().records[0].state,InputState::Uncertain,
+                "a crash or complete ledger rebuild must not strand the sibling");
+            answered_named(&world,&runtime,&store,now,"later-result");
+            admit_events(&world,&runtime,&store,&mut TickReport::default(),now).unwrap();
+            assert!(runtime.submitted.borrow().iter().any(|(session,_)|session==REQUESTER));
+            assert!(!runtime.submitted.borrow().iter().any(|(_,s)|s.message_id==message));
+            assert!(!runtime.steered.borrow().iter().any(|(_,s)|s.message_id==message));
+            let current=store.snapshot().unwrap();
+            assert_ne!(current.leases[REQUESTER].native_message_id,message);
+            // Explicit owner retry authorizes a fresh attempt. It must clear
+            // the durable unknown marker; unrelated future passive policies
+            // must not inherit an obsolete batch outcome.
+            store.with_state(|state| super::super::ledger::retry_result(state,REQUESTER,&ids[1],now).unwrap()).unwrap();
+            let retried=store.snapshot().unwrap();
+            assert!(!retried.deliveries[&ids[1]].passive);
+            assert!(retried.deliveries[&ids[1]].settled_by.is_none());
+            assert_eq!(retried.deliveries[&ids[0]].settled_by.as_deref(),Some(super::super::ledger::DISMISSED));
+            for path in [dir,world_dir] {let _=std::fs::remove_dir_all(path);}
+        }
+    }
+
+    #[test]
+    fn queued_dismiss_review_refuses_during_exclusive_and_steer_submit() {
+        use crate::management::v2::input_ledger::InputLedger;
+        for soon in [false,true] {
+            let (world,world_dir)=world("dismiss-review-inflight");
+            let (store,dir)=temp_store("dismiss-review-inflight");
+            let runtime=FakeRuntime::idle(&[TARGET,REQUESTER]);
+            let now=Utc::now();
+            answered(&world,&runtime,&store,now);
+            let initial=store.snapshot().unwrap();
+            let delivery=initial.deliveries.values().next().unwrap();
+            let ledger=InputLedger::open(dir.join("inflight-ledger.sqlite3"));
+            super::super::ledger::apply_job(&ledger,&super::super::ledger::delivery_job(&initial,&initial,None,delivery).unwrap());
+            let record=ledger.get(REQUESTER,&[delivery.delivery_id.clone()]).unwrap().records.pop().unwrap();
+            let retry_record=record.clone();
+            *runtime.result_lane.borrow_mut()=Some(crate::management::v2::session_coordination::session_lane(REQUESTER).unwrap());
+            if soon {
+                runtime.next_step.set(true);
+                runtime.set(REQUESTER,|s|s.active_turn_id=Some("busy-turn".into()));
+            }
+            let path=dir.clone();
+            *runtime.submit_hook.borrow_mut()=Some(Box::new(move || {
+                // The submitting scheduler thread owns the lane; the owner
+                // action arrives concurrently on a different request thread.
+                let result=std::thread::spawn(move || {
+                    let store=AskStore::at(&path);
+                    let before=store.snapshot().unwrap();
+                    assert!(before.leases.contains_key(REQUESTER)||before.next_step_leases.contains_key(REQUESTER));
+                    let outcome=super::super::ledger::dismiss(&store,&record,now);
+                    let after=store.snapshot().unwrap();
+                    assert_eq!(before,after,"busy dismissal must not mutate source or ledger projection");
+                    outcome
+                }).join().unwrap();
+                assert!(result.unwrap_err().contains("busy"));
+            }));
+            admit_events(&world,&runtime,&store,&mut TickReport::default(),now+chrono::Duration::minutes(10)).unwrap();
+            assert!(runtime.submit_hook.borrow().is_none(),"production submit hook must execute");
+            let after=store.snapshot().unwrap();
+            let lease=after.leases.get(REQUESTER).or_else(||after.next_step_leases.get(REQUESTER)).unwrap();
+            let LeaseHolder::Event {event_id}= &lease.holder else {panic!("result event lease")};
+            assert!(after.events.contains_key(event_id));
+            if soon {
+                assert!(lease.turn_id.is_none());
+                super::super::ledger::dismiss(&store,&retry_record,now).unwrap();
+                let settled=store.snapshot().unwrap();
+                assert_eq!(settled.deliveries[&delivery.delivery_id].settled_by.as_deref(),Some(super::super::ledger::DISMISSED));
+                assert!(!settled.leases.contains_key(REQUESTER)&&!settled.next_step_leases.contains_key(REQUESTER));
+            } else {assert!(lease.turn_id.is_some());}
+            for path in [dir,world_dir] {let _=std::fs::remove_dir_all(path);}
+        }
+    }
+
+    #[test]
+    fn failed_owner_carry_settlement_requires_unchanged_reservation() {
+        for mutation in 0..4 {
+            let (world, world_dir) = world("failed-carry-cas");
+            let (store, dir) = temp_store("failed-carry-cas");
+            let runtime = FakeRuntime::idle(&[TARGET, REQUESTER]);
+            let now = Utc::now();
+            answered(&world, &runtime, &store, now);
+            let bundle = crate::asks::owner_carries::reserve_owner_results(&store,REQUESTER,"cas-owner",1,
+                crate::app_server::external_input::size::ReceiverLimit::Off,world.documents(),now).unwrap().unwrap();
+            let old = store.snapshot().unwrap();
+            let lease = &old.next_step_leases[REQUESTER];
+            let event = &old.events[&bundle.event_id];
+            store.with_state(|state| match mutation {
+                0 => state.next_step_leases.get_mut(REQUESTER).unwrap().runtime_generation += 1,
+                1 => state.events.get_mut(&bundle.event_id).unwrap().acknowledged = true,
+                2 => state.deliveries.get_mut(&bundle.input_ids[0]).unwrap().owner_input_id = Some("another-owner".into()),
+                _ => { super::super::delivery::acknowledge_event(state,&bundle.event_id,"read-turn",now); },
+            }).unwrap();
+            let changed = store.snapshot().unwrap();
+            assert!(!abandon_owner_event(&store,&old,lease,event,now).unwrap());
+            assert_eq!(store.snapshot().unwrap(),changed);
+            for path in [dir,world_dir] { let _ = std::fs::remove_dir_all(path); }
+        }
     }
 
     fn answered_named(world: &crate::asks::scheduler::tests::FakeWorld, runtime: &FakeRuntime, store: &AskStore, now: DateTime<Utc>, action: &str) -> String {

@@ -11,21 +11,29 @@ use std::path::Path;
 #[path = "copied_state_tests.rs"]
 mod copied_state_tests;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Evidence { Unknown, Persisted(String), FailedUnconfirmed(String) }
+
+#[cfg(test)]
 pub(super) fn persisted_turn(path: &Path, expected: &Envelope, owner: Option<&str>) -> anyhow::Result<Option<String>> {
+    Ok(match observe(path, expected, owner)? { Evidence::Persisted(turn) => Some(turn), _ => None })
+}
+
+pub(super) fn observe(path: &Path, expected: &Envelope, owner: Option<&str>) -> anyhow::Result<Evidence> {
     expected.validate()?;
     let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     db.busy_timeout(std::time::Duration::from_millis(100))?;
     let tx = db.transaction()?;
     let row = tx.query_row(
-        "SELECT e.envelope, n.turn_id, i.payload, e.receipt, i.seq, n.payload FROM external_inputs e
+        "SELECT e.envelope, n.turn_id, i.payload, e.receipt, i.seq, n.payload, t.state FROM external_inputs e
          JOIN notes n ON n.thread_id=e.thread_id AND n.message_id=e.message_id
          JOIN items i ON i.id=e.message_id AND i.turn_id=n.turn_id
          JOIN turns t ON t.id=n.turn_id AND t.thread_id=e.thread_id AND t.reverted=0
          WHERE e.thread_id=?1 AND e.message_id=?2 AND n.state='injected'",
         [&expected.thread_id, &expected.message.id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, i64>(4)?, row.get::<_, String>(5)?)),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, i64>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?)),
     ).optional()?;
-    let Some((raw, turn, raw_item, receipt, input_seq, raw_note)) = row else { return Ok(None); };
+    let Some((raw, turn, raw_item, receipt, input_seq, raw_note, turn_state)) = row else { return Ok(Evidence::Unknown); };
     // Compare the complete known envelope shape, including original generation
     // and the re-derived digest. Extra stored fields do not change identity.
     let stored: Value = serde_json::from_str(&raw)?;
@@ -54,24 +62,24 @@ pub(super) fn persisted_turn(path: &Path, expected: &Envelope, owner: Option<&st
             version: 1, owner_id: expected.owner_id.clone(), thread_id: expected.thread_id.clone(),
             runtime_generation: expected.runtime_generation, canonical_byte_limit: Default::default(),
         }, &[expected.key()])?;
-        return Ok(Some(turn));
+        return Ok(Evidence::Persisted(turn));
     }
     // Missing receipts can only be inferred for a carrier's own start. Busy
     // hook items are staged before the next model request; even a later tool
     // output could belong to the request preceding that hook.
-    let Some(owner) = owner else { return Ok(None); };
+    let Some(owner) = owner else { return Ok(Evidence::Unknown); };
     use sha2::{Digest, Sha256};
     let suffix = if owner.len() <= 200 { owner.to_string() } else { format!("{:x}",Sha256::digest(owner.as_bytes())) };
     let carrier_id = format!("owner-{suffix}");
     let note: Value = serde_json::from_str(&raw_note)?;
-    if note["metadata"]["ownerCarrier"] != carrier_id { return Ok(None); }
+    if note["metadata"]["ownerCarrier"] != carrier_id { return Ok(Evidence::Unknown); }
     ensure!(note["source"] == expected_json["message"]["source"]
         && note["eventType"] == expected.message.event_type && note["text"] == expected.message.text
         && note.get("view") == expected_json.get("view"), "durable injected note content mismatch");
-    let carrier: Option<String> = tx.query_row(
-        "SELECT payload FROM inputs WHERE thread_id=?1 AND message_id=?2 AND turn_id=?3",
-        rusqlite::params![expected.thread_id, carrier_id, turn], |row| row.get(0)).optional()?;
-    let Some(carrier) = carrier else { return Ok(None); };
+    let carrier: Option<(String, String)> = tx.query_row(
+        "SELECT payload,state FROM inputs WHERE thread_id=?1 AND message_id=?2 AND turn_id=?3",
+        rusqlite::params![expected.thread_id, carrier_id, turn], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+    let Some((carrier, carrier_state)) = carrier else { return Ok(Evidence::Unknown); };
     let carrier: Value = serde_json::from_str(&carrier)?;
     ensure!(carrier["source"]["kind"] == "user" && carrier["source"]["id"] == "local-controller"
         && carrier["eventType"] == "user.message" && carrier["clientId"] == owner
@@ -84,7 +92,13 @@ pub(super) fn persisted_turn(path: &Path, expected: &Envelope, owner: Option<&st
         "SELECT EXISTS(SELECT 1 FROM items WHERE turn_id=?1 AND seq>?2
          AND json_extract(payload,'$.type') IN ('agentMessage','reasoning','mcpToolCall','commandExecution'))",
         rusqlite::params![turn, input_seq], |row| row.get(0))?;
-    Ok(answered.then_some(turn))
+    if answered { return Ok(Evidence::Persisted(turn)); }
+    // Only the exact original owner input's durable terminal failure releases
+    // admission. A busy/staged input or an unrelated failed turn is not proof.
+    if turn_state == "failed" && carrier_state == "failed" {
+        return Ok(Evidence::FailedUnconfirmed(turn));
+    }
+    Ok(Evidence::Unknown)
 }
 
 #[cfg(test)]
@@ -109,13 +123,13 @@ mod tests {
             db.execute_batch("CREATE TABLE external_inputs(thread_id TEXT,message_id TEXT,envelope TEXT,receipt TEXT,last_status TEXT,PRIMARY KEY(thread_id,message_id));
                 CREATE TABLE notes(thread_id TEXT,message_id TEXT,turn_id TEXT,state TEXT,payload TEXT,UNIQUE(thread_id,message_id));
                 CREATE TABLE turns(id TEXT PRIMARY KEY,thread_id TEXT,state TEXT,reverted INTEGER DEFAULT 0);
-                CREATE TABLE inputs(thread_id TEXT,message_id TEXT,turn_id TEXT,payload TEXT);
+                CREATE TABLE inputs(thread_id TEXT,message_id TEXT,turn_id TEXT,payload TEXT,state TEXT DEFAULT 'completed');
                 CREATE TABLE items(seq INTEGER PRIMARY KEY AUTOINCREMENT,turn_id TEXT,id TEXT UNIQUE,payload TEXT);").unwrap();
             db.execute("INSERT INTO turns(id,thread_id,state) VALUES('carrier-turn','thread-original','interrupted')", []).unwrap();
             db.execute("INSERT INTO external_inputs VALUES(?1,?2,?3,NULL,?4)", rusqlite::params![envelope.thread_id, envelope.message.id,
                 serde_json::to_string(&envelope).unwrap(), "{\"deliveryState\":\"pending\",\"processing\":{\"state\":\"held\",\"reason\":\"interrupted\"}}"] ).unwrap();
             db.execute("INSERT INTO notes VALUES(?1,?2,'carrier-turn','injected',?3)", rusqlite::params![envelope.thread_id,envelope.message.id,json!({"metadata":{"ownerCarrier":"owner-carrier"},"source":envelope.message.source,"eventType":envelope.message.event_type,"text":envelope.message.text,"view":envelope.view}).to_string()]).unwrap();
-            db.execute("INSERT INTO inputs VALUES(?1,'owner-carrier','carrier-turn',?2)", rusqlite::params![envelope.thread_id,json!({"source":{"kind":"user","id":"local-controller"},"eventType":"user.message","clientId":"carrier","metadata":{"ownerCarries":[envelope]}}).to_string()]).unwrap();
+            db.execute("INSERT INTO inputs(thread_id,message_id,turn_id,payload) VALUES(?1,'owner-carrier','carrier-turn',?2)", rusqlite::params![envelope.thread_id,json!({"source":{"kind":"user","id":"local-controller"},"eventType":"user.message","clientId":"carrier","metadata":{"ownerCarries":[envelope]}}).to_string()]).unwrap();
             let item = json!({"id":envelope.message.id,"type":"functionCallOutput","name":"external_event","namespace":"external",
                 "externalInputView":envelope.view,"output":serde_json::to_string(&json!({"source":envelope.message.source,
                     "type":envelope.message.event_type,"text":envelope.message.text})).unwrap()});
@@ -181,6 +195,61 @@ mod tests {
         assert_eq!(persisted_turn(&f.path,&f.envelope,Some("carrier")).unwrap(),Some("carrier-turn".into()));
         db.execute("UPDATE external_inputs SET receipt=json_set(receipt,'$.receiptId','forged')",[]).unwrap();
         assert!(persisted_turn(&f.path,&f.envelope,Some("carrier")).is_err());
+    }
+
+    #[test]
+    fn failed_owner_carry_exact_failed_input_is_unknown_not_read() {
+        let f = Fixture::new();
+        f.change("DELETE FROM items WHERE id='model-proof'; UPDATE turns SET state='failed'; UPDATE inputs SET state='failed';");
+        let before = std::fs::read(&f.path).unwrap();
+        assert_eq!(observe(&f.path, &f.envelope, Some("carrier")).unwrap(),
+            Evidence::FailedUnconfirmed("carrier-turn".into()));
+        assert_eq!(persisted_turn(&f.path, &f.envelope, Some("carrier")).unwrap(), None);
+        assert_eq!(std::fs::read(&f.path).unwrap(), before);
+    }
+
+    #[test]
+    fn failed_owner_carry_inflight_rebound_and_forged_evidence_cannot_unlock() {
+        for mutation in [
+            "UPDATE turns SET state='inProgress'",
+            "UPDATE inputs SET state='processing'",
+            "UPDATE inputs SET state='queued'",
+            "UPDATE inputs SET turn_id='another-turn'",
+            "UPDATE inputs SET payload=json_set(payload,'$.clientId','another-owner')",
+            "UPDATE inputs SET payload=json_set(payload,'$.metadata.ownerCarries',json('[]'))",
+            "UPDATE notes SET payload=json_set(payload,'$.metadata.ownerCarrier','owner-other')",
+            "UPDATE turns SET reverted=1",
+            "UPDATE turns SET thread_id='another-thread'",
+            "UPDATE external_inputs SET envelope=json_set(envelope,'$.runtimeGeneration',30)",
+            "UPDATE external_inputs SET envelope=json_set(envelope,'$.semanticSha256','forged')",
+            "UPDATE notes SET state='reserved'",
+            "DELETE FROM external_inputs",
+        ] {
+            let f = Fixture::new();
+            f.change("DELETE FROM items WHERE id='model-proof'; UPDATE turns SET state='failed'; UPDATE inputs SET state='failed';");
+            f.change(mutation);
+            assert!(!matches!(observe(&f.path, &f.envelope, Some("carrier")), Ok(Evidence::FailedUnconfirmed(_))), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn failed_owner_carry_actual_read_proof_still_wins() {
+        let f = Fixture::new();
+        f.change("UPDATE turns SET state='failed'; UPDATE inputs SET state='failed';");
+        assert_eq!(observe(&f.path, &f.envelope, Some("carrier")).unwrap(), Evidence::Persisted("carrier-turn".into()));
+    }
+
+    #[test]
+    fn failed_owner_carry_copied_rover_evidence_optional_read_only_probe() {
+        let Ok(path) = std::env::var("CUTEX_TEST_FAILED_OWNER_COPY") else { return; };
+        let before = std::fs::read(&path).unwrap();
+        let db = Connection::open_with_flags(&path,OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let raw:String = db.query_row("SELECT envelope FROM external_inputs WHERE message_id='cutex-ask-owner-5632d1277cb942a891b7d6932837ff15'",[],|row|row.get(0)).unwrap();
+        let expected:Envelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(expected.runtime_generation,2);
+        assert_eq!(observe(Path::new(&path),&expected,Some("127fda09-7b81-45c0-9591-324e96d9ff68")).unwrap(),
+            Evidence::FailedUnconfirmed("b4ff1bb1-0ce8-48ef-8f69-a7879963419c".into()));
+        assert_eq!(std::fs::read(&path).unwrap(),before);
     }
 
     #[test]

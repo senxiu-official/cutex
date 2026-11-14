@@ -2935,7 +2935,7 @@ fn handle_cutex_request(
     // Keep UI projections and their shared activity/pending/cache reads out
     // of this session's serialized submit path. A changing/offline binding
     // falls back to the existing full resource used by offline start plans.
-    let online_submit = if matches!(cutex_request.method.as_str(),"cutex/userInput/queue/list"|"cutex/focus/get"|"cutex/input/get"|"cutex/input/list") {
+    let online_submit = if matches!(cutex_request.method.as_str(),"cutex/userInput/queue/list"|"cutex/focus/get"|"cutex/input/get"|"cutex/input/list"|"cutex/input/dispose"|"cutex/input/dismiss") {
         super::session::read_route_resource(cutex_session_id,&registry,
             !request_may_resolve_hidden_session(&cutex_request.method,owner.is_some()))?
     } else if cutex_request.method == "cutex/userInput/submit" {
@@ -6145,6 +6145,10 @@ fn write_sse_stream_changed(
     stream.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path="input_disposal_http_tests.rs"]
+mod input_disposal_http_tests;
 
 #[cfg(test)]
 mod tests {

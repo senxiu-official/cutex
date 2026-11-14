@@ -17,7 +17,7 @@ pub struct WakeSchedule {
 }
 
 fn pending_wake(record: &InputRecord) -> bool {
-    matches!(record.kind, InputKind::AgentMessage | InputKind::PeerMessage)
+    matches!(record.kind, InputKind::AgentMessage | InputKind::PeerMessage | InputKind::Alarm)
         && record.intent.delivery_mode.is_some_and(|mode| mode != il::DeliveryMode::Passive)
         && !record.state.is_settled() && !il::shown_to_agent(record)
 }

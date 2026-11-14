@@ -1,5 +1,22 @@
 // Exercises the real management callback and durable queue against a private
 // managed transport. This is an embedded integration test, not a live daemon.
+#[test]
+fn disposed_owner_input_never_reaches_the_real_native_send_closure() {
+    if test_runs_in_private_home("disposed_owner_input_never_reaches_the_real_native_send_closure") { return; }
+    let root = std::path::PathBuf::from(std::env::var_os("CUTEX_TEST_PRIVATE_HOME").unwrap());
+    let native = crate::cli_app::asks_runtime::disposal_dispatch_tests::NativeProbe::connect(&root, false);
+    let session = &native.record.cutex_session_id;
+    let repository = user_input_repository().unwrap();
+    let mut command = queue_command(session, "disposed-owner-dispatch");
+    command.params.strategy = UserInputStrategy::Auto;
+    cutex::management::v2::input_disposal::request(session, &command.params.client_user_message_id).unwrap();
+    let error = submit_v2_with_repository(command, repository, |_, _| Some(None), no_history,
+        send_user_input_native_request, no_flush).unwrap_err();
+    assert_eq!(error.code, "input_disposed");
+    assert!(!error.outcome_unknown);
+    assert_eq!(native.submits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 fn callback_flush_probe(inline_baseline: bool) {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;

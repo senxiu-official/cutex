@@ -2777,7 +2777,7 @@
             "cutex/userInput/queue/flush",
             "cutex/userInput/queue/pause",
             "cutex/userInput/queue/resume",
-            "cutex/turn/stop", "cutex/ask/create", "cutex/ask/stop", "cutex/ask/close", "cutex/ask/retry", "cutex/ask/respond", "cutex/ask/resume", "cutex/ask/reopen", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume", "cutex/agent/pause", "cutex/agent/resume", "cutex/ownerNotify/ack", "cutex/ownerNotify/reply", "cutex/ownerNotify/dismiss", "cutex/ownerNotify/delete", "cutex/safetyCheck/grant", "cutex/safetyCheck/dismiss", "cutex/input/get", "cutex/input/list", "cutex/input/dismiss", "cutex/input/lease/release", "cutex/userInput/queue/merge", "cutex/input/retry", "cutex/input/interruptSend", "cutex/input/hold"
+            "cutex/turn/stop", "cutex/ask/create", "cutex/ask/stop", "cutex/ask/close", "cutex/ask/retry", "cutex/ask/respond", "cutex/ask/resume", "cutex/ask/reopen", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume", "cutex/agent/pause", "cutex/agent/resume", "cutex/ownerNotify/ack", "cutex/ownerNotify/reply", "cutex/ownerNotify/dismiss", "cutex/ownerNotify/delete", "cutex/safetyCheck/grant", "cutex/safetyCheck/dismiss", "cutex/input/get", "cutex/input/list", "cutex/input/dismiss", "cutex/input/dispose", "cutex/input/lease/release", "cutex/userInput/queue/merge", "cutex/input/retry", "cutex/input/interruptSend", "cutex/input/hold"
           ]
         },
         "params": { "type": "object" }
@@ -2819,6 +2819,7 @@
         { "if": { "properties": { "method": { "const": "cutex/input/get" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/inputGet" } } } },
         { "if": { "properties": { "method": { "const": "cutex/input/list" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/inputList" } } } },
         { "if": { "properties": { "method": { "const": "cutex/input/dismiss" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/inputDismiss" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/input/dispose" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/inputDispose" } } } },
         { "if": { "properties": { "method": { "const": "cutex/input/lease/release" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/inputLeaseRelease" } } } },
         { "if": { "properties": { "method": { "const": "cutex/userInput/queue/merge" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/queueMerge" } } } },
         { "if": { "properties": { "method": { "const": "cutex/input/retry" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/inputRetry" } } } },
@@ -2875,7 +2876,7 @@
                 "cutex/userInput/queue/flush",
                 "cutex/userInput/queue/pause",
                 "cutex/userInput/queue/resume",
-                "cutex/turn/stop", "cutex/ask/create", "cutex/ask/stop", "cutex/ask/close", "cutex/ask/retry", "cutex/ask/respond", "cutex/ask/resume", "cutex/ask/reopen", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume", "cutex/agent/pause", "cutex/agent/resume", "cutex/ownerNotify/ack", "cutex/ownerNotify/reply", "cutex/ownerNotify/dismiss", "cutex/ownerNotify/delete", "cutex/safetyCheck/grant", "cutex/safetyCheck/dismiss", "cutex/input/get", "cutex/input/list", "cutex/input/dismiss", "cutex/input/lease/release", "cutex/userInput/queue/merge", "cutex/input/retry", "cutex/input/interruptSend", "cutex/input/hold"
+                "cutex/turn/stop", "cutex/ask/create", "cutex/ask/stop", "cutex/ask/close", "cutex/ask/retry", "cutex/ask/respond", "cutex/ask/resume", "cutex/ask/reopen", "cutex/agentBus/wake", "cutex/asks/pause", "cutex/asks/resume", "cutex/agent/pause", "cutex/agent/resume", "cutex/ownerNotify/ack", "cutex/ownerNotify/reply", "cutex/ownerNotify/dismiss", "cutex/ownerNotify/delete", "cutex/safetyCheck/grant", "cutex/safetyCheck/dismiss", "cutex/input/get", "cutex/input/list", "cutex/input/dismiss", "cutex/input/dispose", "cutex/input/lease/release", "cutex/userInput/queue/merge", "cutex/input/retry", "cutex/input/interruptSend", "cutex/input/hold"
               ]
             },
             "result": true
@@ -2914,6 +2915,7 @@
             { "if": { "properties": { "method": { "const": "cutex/input/get" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/inputGetResult" } } } },
             { "if": { "properties": { "method": { "const": "cutex/input/list" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/inputListResult" } } } },
             { "if": { "properties": { "method": { "const": "cutex/input/dismiss" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/inputDismissResult" } } } },
+            { "if": { "properties": { "method": { "const": "cutex/input/dispose" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/inputDisposeResult" } } } },
             { "if": { "properties": { "method": { "const": "cutex/input/lease/release" } } }, "then": { "properties": { "result": { "type": "object" } } } },
             { "if": { "properties": { "method": { "const": "cutex/userInput/queue/merge" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/queueMergeResult" } } } },
             { "if": { "properties": { "method": { "const": "cutex/input/retry" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/inputRetryResult" } } } },
@@ -2944,6 +2946,8 @@
     "inputHold": {"description":"057: hold or release one queued notice until explicitly released.","type":"object","additionalProperties":false,"required":["inputId","expectedRev","held"],"properties":{"inputId":{"$ref":"#/$defs/nonEmptyString"},"expectedRev":{"$ref":"#/$defs/positiveSafeInteger"},"held":{"type":"boolean"}}},
     "inputHoldResult": {"type":"object","additionalProperties":false,"required":["ledgerEpoch","stateRevision","record"],"properties":{"ledgerEpoch":{"$ref":"#/$defs/nonEmptyString"},"stateRevision":{"$ref":"#/$defs/safeInteger"},"record":{"$ref":"#/$defs/inputRecord"}}},
     "inputRetry": {"description":"cutex/input/retry params (054 §2.14; registered with C5).","type":"object","additionalProperties":false,"required":["inputId","expectedRev"],"properties":{"inputId":{"$ref":"#/$defs/nonEmptyString"},"expectedRev":{"$ref":"#/$defs/positiveSafeInteger"}}},
+    "inputDispose": {"type":"object","additionalProperties":false,"required":["inputId"],"properties":{"inputId":{"type":"string","minLength":1,"maxLength":4096}}},
+    "inputDisposeResult": {"type":"object","additionalProperties":false,"required":["inputId","cutexSessionId","dispositionId","requestedAt","appliedAt","effect"],"properties":{"inputId":{"type":"string"},"cutexSessionId":{"type":"string"},"dispositionId":{"type":"string"},"requestedAt":{"type":"string"},"appliedAt":{"type":["string","null"]},"effect":{"type":"string"}}},
     "inputDismiss": {"description":"cutex/input/dismiss params (054 §2.14, owner decision 9): one {inputId, expectedRev} or {items: [...]} (1..100).","oneOf":[{"type":"object","additionalProperties":false,"required":["inputId","expectedRev"],"properties":{"inputId":{"$ref":"#/$defs/nonEmptyString"},"expectedRev":{"$ref":"#/$defs/positiveSafeInteger"}}},{"type":"object","additionalProperties":false,"required":["items"],"properties":{"items":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","additionalProperties":false,"required":["inputId","expectedRev"],"properties":{"inputId":{"$ref":"#/$defs/nonEmptyString"},"expectedRev":{"$ref":"#/$defs/positiveSafeInteger"}}}}}}]},
     "inputDismissResult": {"type":"object","additionalProperties":false,"required":["ledgerEpoch","stateRevision","records","failed"],"properties":{"ledgerEpoch":{"$ref":"#/$defs/nonEmptyString"},"stateRevision":{"$ref":"#/$defs/safeInteger"},"records":{"type":"array","items":{"$ref":"#/$defs/inputRecord"}},"failed":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["inputId","code","message","currentRev"],"properties":{"inputId":{"type":"string"},"code":{"enum":["input_not_found","revision_conflict","input_not_dismissible","dismiss_failed","event_persistence_unavailable"]},"message":{"type":"string"},"currentRev":{"oneOf":[{"$ref":"#/$defs/positiveSafeInteger"},{"type":"null"}]}}}}}},
     "inputLeaseRelease": {"description":"cutex/input/lease/release params (054 §2.14; registered with C4).","type":"object","additionalProperties":false,"required":["expectedLease"],"properties":{"expectedLease":{"$ref":"#/$defs/inputLease"}}},

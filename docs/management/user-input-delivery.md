@@ -138,8 +138,8 @@ If ridealongs have blocked waiting owner input for 30 seconds while idle, admiss
 retries owner flush and lets remaining ridealongs join according to their delivery timing.
 The timeout does not override a native turn or an admission lease. Held bus records are skipped. Busy wakes wait `agentBus.wakeBusyWaitSecs`: `afterTurn`
 with `nextStepAt` while waiting, `nextStep` after the deadline. Zero is immediate;
-negative/null waits after the turn indefinitely. Alarms always use `afterTurn` without
-a deadline, except approval decision notices (023: alarm message id `alarm-approval-…`, owner
+negative/null keeps ordinary wakes after the turn indefinitely. Alarms use this same
+deadline and `nextStep` policy, except approval decision notices (023: alarm message id `alarm-approval-…`, owner
 `cutex.approvals`): they wait zero (`nextStep`; older Claude adapters without `soon`: after the
 turn). A frozen native envelope reports its actual frozen timing.
 

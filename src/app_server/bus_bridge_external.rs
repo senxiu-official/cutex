@@ -1042,11 +1042,10 @@ pub(super) fn deliver_presentations(
 /// whether it goes passive (`asks::awaits::note_job_completion`). Any
 /// failure keeps today's `after_turn` delivery.
 /// A wake that may be held for, or read at, a busy recipient's next step.
-/// Awaited job completions are passive, alarms always after-turn except
-/// approval decision notices (023: next step, no wait).
+/// Awaited job completions are passive. Alarms share the configured busy-wake
+/// wait; approval decision notices retain zero-wait delivery (023).
 fn busy_wake_candidate(message: &AgentBusMessage, job_passive: bool) -> bool {
     !job_passive
-        && !crate::agent_bus::delivery::always_after_turn(message)
         && message.delivery_mode == crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn
 }
 
@@ -1286,6 +1285,7 @@ pub(super) fn deliver(
                 Err(crate::management::v2::session_coordination::ReservationError::WouldBlock) => return Ok(false),
                 Err(error) => return Err(error.into()),
             };
+            if crate::management::v2::input_disposal::requested(&options.cutex_session_id,&message.id)? {return Ok(false);}
             let wake_wait = crate::agent_bus::delivery::busy_wait_for(&message);
             let wake_age = std::time::Duration::from_secs(
                 (Utc::now().timestamp().max(0) as u64).saturating_sub(message.created_at_epoch_secs),
@@ -1392,6 +1392,7 @@ pub(super) fn deliver(
                 let prepared_turn = starts_turn.then(|| crate::management::v2::admission::prepare_turn(&options.cutex_session_id, "delivery", None));
                 // 054 §2.9: frozen, native IO starts now.
                 repository.input_ledger_sending(&options.cutex_session_id, &message.id);
+                crate::management::v2::input_disposal::check_envelope(&options.cutex_session_id,&current)?;
                 observed = match client.submit(&current) {
                     Ok(mut submitted) => submitted.statuses.remove(0),
                     Err(error) if refused(&error) => {
@@ -1406,7 +1407,7 @@ pub(super) fn deliver(
                         current.runtime_generation = generation;
                         // The first RPC was definitely refused. This second
                         // submit is a fresh opportunity, not receipt recovery.
-                        match retry_known_unsent(&crate::asks::store::AskStore::open_default()?,&options.cutex_session_id,||client.submit(&current)) {
+                        match retry_known_unsent(&crate::asks::store::AskStore::open_default()?,&options.cutex_session_id,||{crate::management::v2::input_disposal::check_envelope(&options.cutex_session_id,&current)?;client.submit(&current)}) {
                             Ok(Some(mut submitted)) => submitted.statuses.remove(0),
                             Ok(None)=>{held_wakes+=1;return Ok(false);},
                             Err(error) if refused(&error) => {
@@ -1692,6 +1693,8 @@ pub(super) fn deliver_test_fake(
 mod tests {
     use super::*;
 
+    include!("bus_disposal_dispatch_tests.rs");
+
     #[test]
     fn size_refusal_retry_rechecks_pause_and_lifecycle_without_changing_identity() {
         let (store,dir)=crate::asks::store::tests::temp_store("bus-size-retry-pause");
@@ -1716,39 +1719,35 @@ mod tests {
     }
 
     #[test]
-    fn alarms_are_never_busy_wake_candidates_on_codex() {
-        if super::super::tests::test_runs_in_private_home("app_server::bus_bridge::external::tests::alarms_are_never_busy_wake_candidates_on_codex") { return; }
-        use crate::agent_bus::delivery::{wake_timing, AgentDeliveryMode, WakeTiming};
-        let wake = message();
-        assert_eq!(wake.delivery_mode, AgentDeliveryMode::AfterTurn);
-        assert!(busy_wake_candidate(&wake, false));
-        assert!(!busy_wake_candidate(&wake, true));
-        let mut alarm = wake.clone();
-        alarm.sender_kind = crate::agent_bus::model::AgentMessageKind::AlarmSystem;
-        alarm.from = crate::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
-        assert!(!busy_wake_candidate(&alarm, false));
-        let mut legacy = wake.clone();
-        legacy.from = crate::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
-        assert!(!busy_wake_candidate(&legacy, false));
-        // The gate the bridge applies: only a candidate is held / read early.
-        let timing = |message: &AgentBusMessage| {
-            if busy_wake_candidate(message, false) {
-                wake_timing(std::time::Duration::from_secs(600), Some(std::time::Duration::ZERO), || Some(true))
-            } else {
-                WakeTiming::AfterTurn
-            }
+    fn alarms_follow_busy_wake_timing_on_codex() {
+        if super::super::tests::test_runs_in_private_home("app_server::bus_bridge::external::tests::alarms_follow_busy_wake_timing_on_codex") { return; }
+        use crate::agent_bus::delivery::{wake_timing,AgentDeliveryMode,WakeTiming};
+        use std::time::Duration;
+        let wake=message();assert_eq!(wake.delivery_mode,AgentDeliveryMode::AfterTurn);
+        let mut alarm=wake.clone();alarm.sender_kind=AgentMessageKind::AlarmSystem;
+        alarm.from=crate::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
+        let mut legacy=wake.clone();legacy.from=crate::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
+        let timing=|message:&AgentBusMessage,age,wait,busy| {
+            if busy_wake_candidate(message,false) {wake_timing(age,wait,||Some(busy))} else {WakeTiming::AfterTurn}
         };
-        assert_eq!(timing(&wake), WakeTiming::NextStep);
-        assert_eq!(timing(&alarm), WakeTiming::AfterTurn);
-        assert_eq!(timing(&legacy), WakeTiming::AfterTurn);
+        for message in [&wake,&alarm,&legacy] {
+            assert!(busy_wake_candidate(message,false));
+            assert!(!busy_wake_candidate(message,true),"awaited job/passive path stays passive");
+            let wait=Some(Duration::from_secs(120));
+            assert_eq!(timing(message,Duration::from_secs(119),wait,true),WakeTiming::Hold);
+            assert_eq!(timing(message,Duration::from_secs(120),wait,true),WakeTiming::NextStep);
+            assert_eq!(timing(message,Duration::ZERO,wait,false),WakeTiming::AfterTurn,"idle gets a clean new turn");
+            assert_eq!(timing(message,Duration::from_secs(3600),None,true),WakeTiming::AfterTurn);
+            assert_eq!(timing(message,Duration::ZERO,Some(Duration::ZERO),true),WakeTiming::NextStep);
+        }
     }
 
     /// 023: an approval decision notice is a next-step candidate with no wait
     /// on Codex (busy: read at the next step at once; idle: a turn now); the
-    /// agent's own reminders stay after-turn.
+    /// ordinary reminders use the configured busy-wake wait.
     #[test]
-    fn approval_notices_are_next_step_and_reminders_stay_after_turn_on_codex() {
-        if super::super::tests::test_runs_in_private_home("app_server::bus_bridge::external::tests::approval_notices_are_next_step_and_reminders_stay_after_turn_on_codex") { return; }
+    fn approval_notices_keep_zero_wait_on_codex() {
+        if super::super::tests::test_runs_in_private_home("app_server::bus_bridge::external::tests::approval_notices_keep_zero_wait_on_codex") { return; }
         use crate::agent_bus::delivery::{busy_wait_for, wake_timing, WakeTiming};
         let mut reminder = message();
         reminder.sender_kind = crate::agent_bus::model::AgentMessageKind::AlarmSystem;
@@ -1761,7 +1760,7 @@ mod tests {
         forged.external_message_id = approval.external_message_id.clone();
         assert!(!crate::agent_bus::delivery::is_approval_notice(&forged));
         assert!(busy_wake_candidate(&approval, false));
-        assert!(!busy_wake_candidate(&reminder, false));
+        assert!(busy_wake_candidate(&reminder, false));
         assert_eq!(busy_wait_for(&approval), Some(std::time::Duration::ZERO));
         // The bridge's gate, with the per-message wait, for a just-queued message.
         let timing = |message: &AgentBusMessage, busy: bool| {
@@ -1773,15 +1772,13 @@ mod tests {
         };
         assert_eq!(timing(&approval, true), WakeTiming::NextStep, "busy: next step, no wait");
         assert_eq!(timing(&approval, false), WakeTiming::NextStep, "idle: delivered now (starts a turn)");
-        assert_eq!(timing(&reminder, true), WakeTiming::AfterTurn);
-        // What the bridge freezes: `soon` only for the approval notice.
+        assert_eq!(timing(&reminder, true), WakeTiming::Hold);
+        // A fresh approval is immediately eligible for native `soon`;
+        // the fresh ordinary reminder is still held, not submitted.
         let base = envelope(&message(), &binding()).unwrap();
         let mut e = base.clone();
         wake_at_next_step(&mut e, timing(&approval, true) == WakeTiming::NextStep).unwrap();
         assert_eq!(e.message.delivery, Delivery::Soon);
-        let mut e = base.clone();
-        wake_at_next_step(&mut e, timing(&reminder, true) == WakeTiming::NextStep).unwrap();
-        assert_eq!(e.message.delivery, Delivery::AfterTurn);
     }
 
     #[test]
@@ -1824,7 +1821,16 @@ mod tests {
             delivery_mode: "after_turn".into(), content: m.content.clone(), queued_at: Utc::now(),
             canonical_envelope: m.clone(), semantic_sha256: inter_agent_semantic_sha256(&projected),
         }).unwrap();
-        let frozen = repository.freeze_external_input(&bind.owner_id, &m.id, |m| envelope(m, &bind)).unwrap();
+        let idle=envelope(&m,&bind).unwrap();
+        assert_eq!(idle.message.delivery,Delivery::AfterTurn,"idle alarm starts a clean new turn");
+        let frozen = repository.freeze_external_input(&bind.owner_id, &m.id, |m| {
+            let mut frozen=envelope(m,&bind)?;
+            let timing=crate::agent_bus::delivery::wake_timing(std::time::Duration::from_secs(120),
+                Some(std::time::Duration::from_secs(120)),||Some(true));
+            wake_at_next_step(&mut frozen,busy_wake_candidate(m,false)&&timing==crate::agent_bus::delivery::WakeTiming::NextStep)?;
+            Ok(frozen)
+        }).unwrap();
+        assert_eq!(frozen.message.delivery,Delivery::Soon,"busy alarm is admitted at the shared deadline");
         assert_eq!(frozen.message.source.kind, SourceKind::Service);
         assert_eq!(frozen.message.source.id, "Cutex Alarm");
         assert_eq!(frozen.message.event_type, "alarm");

@@ -7,7 +7,7 @@ subscription login or an Anthropic-compatible API key.
 
 ## Public component
 
-**claude-r46** contains adapter **0.8.14**, Claude Agent SDK **0.2.180**,
+**claude-r48** contains adapter **0.8.14**, Claude Agent SDK **0.2.180**,
 Claude Code **2.1.321** and bundled CPython **3.13.17**. Release archives are
 provided for Linux x64 and Windows x64. macOS uses the desktop as a client
 of a supported host; the source component also declares Darwin arm64.
@@ -75,7 +75,7 @@ From this public source checkout, with Git, GNU tar, gzip, sha256sum and a
 bootstrap Python 3.11 or newer:
 
 ```sh
-bash components/claude-runtime/build.sh linux-x64 claude-r46 /path/to/output
+bash components/claude-runtime/build.sh linux-x64 claude-r48 /path/to/output
 ```
 
 Use `windows-x64` for the Windows package. The builder checks that
@@ -88,13 +88,6 @@ the repository's GitHub Actions pipeline.
 Each published component identity is immutable. Any later payload change
 requires another unused component number.
 
-## Direct stdio on non-UTF-8 locales
-
-Direct stdio uses Python stdout encoding. A non-UTF-8 locale can produce non-UTF-8
-JSON frames containing non-ASCII text. Set `PYTHONIOENCODING=utf-8` when launching
-direct stdio. Normal cutex-managed sessions use a loopback WebSocket and do not
-use this stdio writer.
-
 ## Approval notices and background tasks
 
 On a matching host, approval-notice delivery receipts can bound the approval read
@@ -102,3 +95,7 @@ window. The component uses Agent SDK 0.2.180 and its unmodified bundled CLI.
 Background children remain active while the SDK inventory reports them running;
 their terminal task events and completion notifications settle them. Existing
 sessions retain their selected runtime until explicitly upgraded.
+
+## Transient request recovery
+
+The adapter bounds automatic retries of recoverable connection and provider failures. It resumes saved input at most once for a completed failure, preserving the existing permission checks and active request identity. Authentication, account, permission and cancellation errors do not enter transient retry. Direct stdio writes UTF-8 JSON independently of the process locale. Provider availability and network connectivity still determine whether a request succeeds.

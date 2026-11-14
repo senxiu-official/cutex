@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.4 "Beautiful World" (2026-11-14)
+
+- Adds authoritative disposal receipts for queued input and reconciles ended approval requests, preventing stale actions and stuck deliveries.
+  新增排队输入处置回执并核对已结束的审批请求，避免失效操作和投递卡住。
+- Adds bounded filesystem read windows for large file views.
+  新增分段文件读取接口，用于大型文件查看。
+- Applies configured busy-wake timing to alarms.
+  闹钟投递遵循配置的忙碌唤醒时机。
+- Includes Native 0.167.0-r61 with connection retry handling and Claude claude-r48 with bounded transient retries, recovery of saved input and UTF-8 direct stdio output. Existing agents retain their selected runtime.
+  提供改进连接重试的 Native 0.167.0-r61，以及支持有界临时故障重试、恢复已保存输入和 UTF-8 标准输出的 Claude claude-r48；已有智能体保留运行时选择。
+
 ## 0.2.3 "Beautiful World" (2026-11-13)
 
 - Improves Claude runtime observation, exact process adoption and readiness after restart. A failed supplementary status probe no longer prevents delivery through a healthy runtime connection.

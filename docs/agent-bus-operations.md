@@ -398,12 +398,13 @@ available for explicit reading rather than being replayed.
 ## 4. Wake timing for a busy recipient
 
 A wake (`after_turn` bus message: agent_tell wakes, owner wakes, alarms, Job
-completions, watchdogs) or delegation results for a **busy** Codex recipient
+completions, watchdogs) or delegation results for a **busy** Codex or Claude recipient
 that takes native `soon` wait for its running turn to end; once they have been
 pending `wake_busy_wait_secs` they are read at the recipient's next step
 instead (native `soon`, no turn of their own). An idle recipient still gets a
-turn at once; Claude runtimes and natives without `soon` keep waiting for the
-turn end. Capability `wake-busy-wait`.
+turn at once; runtimes without `soon` keep waiting for the turn end. Ordinary alarms
+follow the same configured wait; approval decision notices retain their zero-wait exception.
+Capability `wake-busy-wait`.
 
 `config.json`:
 

@@ -8,7 +8,7 @@ from test_r8_services import install, envelope, binding
 from cute_claude.external_input import semantic_digest
 
 
-async def test_overload_then_new_continue_preserves_failed_turn_and_never_replays_input(ph):
+async def test_overload_after_output_then_new_continue_preserves_failed_turn_without_replay(ph):
     install(ph, subscription=True)
     tid = await ph.thread()
     await ph.engine.start_runtime(tid)
@@ -18,6 +18,8 @@ async def test_overload_then_new_continue_preserves_failed_turn_and_never_replay
     async def overloaded(prompt):
         client.query_count += 1
         sid = ph.engine.session(tid)['session_id']
+        await client.events.put({'type': 'assistant', 'content': [
+            {'type': 'text', 'text': 'A long reply already finished before the connection failed.'}]})
         await client.events.put({'type': 'assistant', 'error': 'server_error',
                                  'content': [{'type': 'text', 'text': 'HTTP 529 overloaded_error'}]})
         await client.events.put({'type': 'result', 'session_id': sid, 'subtype': 'error_during_execution',

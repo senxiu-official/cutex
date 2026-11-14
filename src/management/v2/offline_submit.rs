@@ -124,6 +124,10 @@ pub(super) fn dispatch_owner_submit(
     session: &Value,
     request: &ValidatedCutexRequest,
 ) -> Result<Value, UserInputExecutionError> {
+    if let Some(id)=request.params.get("clientUserMessageId").and_then(Value::as_str) {
+        super::input_disposal::check(cutex_session_id,[id])
+            .map_err(|error|super::input_ledger::route_error("input_disposed",error.to_string(),false))?;
+    }
     let request = owner_starts_offline(owner.is_some() && super::input_ledger::enabled(), request);
     dispatch(event_repository, context, owner, cutex_session_id, session, &request)
 }

@@ -28,6 +28,10 @@ mod client_cache;
 #[cfg(test)]
 mod pause_tests;
 
+#[cfg(test)]
+#[path = "disposal_dispatch_tests.rs"]
+pub(crate) mod disposal_dispatch_tests;
+
 use super::app_server_runtime;
 use super::app_server_user_input;
 
@@ -345,6 +349,9 @@ impl AskRuntime for ManagementAskRuntime {
         let Ok(_guard) = lock.lock() else {
             return SubmitOutcome::Unsupported("session input lock poisoned".into());
         };
+        if let Err(error)=cutex::management::v2::input_disposal::check_submission(session,submission) {
+            return SubmitOutcome::Unsupported(format!("{error:#}"));
+        }
         if let Some(outcome)=pause_admission_outcome_in_lane(session){return outcome;}
         if let Ok(Some(status)) = app_server_runtime::runtime_manager().status(session) {
             if status.active_turn_id.is_some() {
@@ -360,6 +367,7 @@ impl AskRuntime for ManagementAskRuntime {
             if !client.supports_exclusive_turn() {
                 return Ok(None);
             }
+            cutex::management::v2::input_disposal::check_submission(session,submission)?;
             let envelope = envelope(client, submission)?;
             size = (Some(model_item_bytes(&envelope)), canonical_limit(client));
             client.submit_exclusive(&envelope).map(Some)
@@ -695,6 +703,10 @@ impl AskRuntime for ManagementAskRuntime {
     }
 
     fn steer_note(&self, session: &str, generation: u64, submission: &Submission) -> SubmitOutcome {
+        if let Err(error)=cutex::management::v2::input_disposal::check_submission(session,submission) {
+            return SubmitOutcome::Unsupported(format!("{error:#}"));
+        }
+
         // Bounded retry like the ACP/native/Claude exclusive paths: a brief
         // fence hold must not refuse (and requeue) the note `authority_busy`.
         if let Some(outcome)=pause_admission_outcome_in_lane(session){return outcome;}
@@ -713,6 +725,7 @@ impl AskRuntime for ManagementAskRuntime {
         }
         let mut size = (None, None);
         let result = self.with_client_policy(session, generation, |client| {
+            cutex::management::v2::input_disposal::check_submission(session,submission)?;
             let mut envelope = envelope(client, submission)?;
             envelope.message.delivery = Delivery::Soon;
             envelope.semantic_sha256 = envelope.digest();

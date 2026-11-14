@@ -624,6 +624,7 @@ impl AskState {
         let gated = !new.requester.is_owner() && new.gate.as_ref().is_some_and(|gate| gate.required);
         let now_text = now_rfc3339(now);
         AskRecord {
+            admission_occurrence: 0,
             routing_approval_id: None,
             routing_request: None,
             routing_grant_id: None,
@@ -777,6 +778,13 @@ impl AskState {
         let extras_before = (ask.jobs.clone(), ask.awaiting.clone(), ask.resume.clone(), ask.revisions.clone());
         let before_value = serde_json::to_value(&*ask).ok();
         let result = mutate(ask);
+        // Source admission intent, never a projection/retry callback. Busy
+        // native requeue (Admitted -> Queued) retains the same occurrence.
+        if (before.0.is_terminal() && ask.execution==ExecutionState::Queued)
+            || (extras_before.2.is_none() && ask.resume.is_some()) {
+            ask.admission_occurrence=ask.admission_occurrence.checked_add(1).expect("admission occurrence exhausted");
+        }
+
         if serde_json::to_value(&*ask).ok() == before_value {
             return Some(result);
         }

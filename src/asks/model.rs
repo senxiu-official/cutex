@@ -341,6 +341,8 @@ pub enum StopDispatchOutcome { Pending, Claimed, Submitted, Unknown, Unsupported
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttemptRecord {
+    #[serde(default, skip_serializing_if = "occurrence_zero")]
+    pub admission_occurrence: u64,
     /// 1-based; the attempt id is `<askId>#<n>`.
     pub n: u32,
     /// Native message id, chosen by cutex before submission.
@@ -692,6 +694,7 @@ impl AttemptRecord {
     pub fn submitting(n: u32, native_message_id: String, runtime_generation: u64, submitted_at: String) -> Self {
         Self {
             n,
+            admission_occurrence: 0,
             native_message_id,
             event_artifact: None,
             runtime_generation,
@@ -735,6 +738,9 @@ impl AttemptRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskRecord {
+    /// Owner/Director decision 2026-11-14: an explicit new admission is a new input.
+    #[serde(default, skip_serializing_if = "occurrence_zero")]
+    pub admission_occurrence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_request: Option<super::routing_policy::RoutingRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -861,7 +867,15 @@ pub struct SubmitRetry {
     pub last_error: String,
 }
 
+fn occurrence_zero(value:&u64)->bool {*value==0}
+
+pub fn request_occurrence_id(ask_id:&str,occurrence:u64)->String {
+    if occurrence==0 {ask_id.to_string()} else {format!("{ask_id}::input-{occurrence}")}
+}
+
 impl AskRecord {
+    pub fn request_input_id(&self)->String {request_occurrence_id(&self.ask_id,self.admission_occurrence)}
+
     pub fn current_attempt(&self) -> Option<&AttemptRecord> {
         self.attempts.last()
     }
@@ -1188,7 +1202,9 @@ pub struct DeliveryRecord {
     /// `read` (`delegation_read` of that revision) or `closed`
     /// (`delegation_close` / `delegation_stop`), or `superseded` (obsolete,
     /// proved unsubmitted blocked-owner notification). The state stays
-    /// `acknowledged` so older releases read the record unchanged.
+    /// `acknowledged` so older releases read the record unchanged. Exception:
+    /// `results_outcome_unknown` on Pending/passive durably records a retired
+    /// native batch's uncertain member; only explicit retry clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_by: Option<String>,
     /// The session this item actually went to (a wait claimed it or an event

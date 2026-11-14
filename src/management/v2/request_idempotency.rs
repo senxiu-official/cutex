@@ -114,10 +114,14 @@ pub const READ_ONLY_METHODS: &[&str] = &[
     "cutex/input/list",
 ];
 
+/// Owner dispositions have their own durable per-input identity. They cannot
+/// queue behind a hung native request or consume its request-cache budget.
+pub const SELF_IDEMPOTENT_METHODS:&[&str]=&["cutex/input/dispose","cutex/input/dismiss"];
+
 /// Whether a request of `method` is recorded for `requestId` replay.
 /// Unknown methods are recorded (safe default).
 pub fn method_needs_idempotency(method: &str) -> bool {
-    !READ_ONLY_METHODS.contains(&method)
+    !READ_ONLY_METHODS.contains(&method) && !SELF_IDEMPOTENT_METHODS.contains(&method)
 }
 
 #[derive(Debug, Clone, Copy)]

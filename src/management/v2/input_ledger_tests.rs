@@ -438,7 +438,7 @@ fn owner_queue_moves_once_and_only_the_owner_retry_returns_to_next_up() {
     let f = Fixture::new();
     let queued = f.go("q", Next::waiting("explicitQueue").create(owner(Strategy::Queue))).unwrap();
     assert_eq!(queued.record.surface, Surface::NextUp);
-    assert_eq!(queued.record.actions, vec![Action::Cancel, Action::SendNow, Action::Edit]);
+    assert_eq!(queued.record.actions, vec![Action::Cancel, Action::SendNow, Action::Edit, Action::Dismiss]);
     f.go("q", Next::sending()).unwrap();
     // r274.2: an accepted steer (sendNow) is not read yet: still nextUp.
     assert_eq!(f.go("q", Next::accepted().turn("t1")).unwrap().record.surface, Surface::NextUp);
@@ -562,7 +562,7 @@ fn delegation_request_reaches_the_timeline_when_its_turn_starts() {
     let mut request = note(InputKind::DelegationRequest, Timing::AfterTurn);
     request.ask_id = Some("ask-1".into());
     let created = f.go("ask-1", Next::waiting("reviewPending").create(request)).unwrap();
-    assert!(created.record.actions.is_empty());
+    assert!(created.record.actions.contains(&Action::Dismiss));
     f.go("ask-1", Next::waiting("targetBusy")).unwrap();
     f.go("ask-1", Next::sending()).unwrap();
     let running = f.go("ask-1", Next::in_context(Evidence::TurnStartInput)).unwrap();
@@ -644,22 +644,16 @@ fn deadline_pass_applies_the_table_and_skips_records_that_moved() {
     f.at(31);
     let mut applied = Vec::new();
     let moved_meanwhile = std::cell::Cell::new(false);
-    let count = run_deadline_pass(&f.ledger, t0() + chrono::Duration::seconds(61), 10, |due| {
-        if due.input_id == "x" && !moved_meanwhile.replace(true) {
-            // Another writer moves the record between read and apply.
-            f.go("x", Next::accepted().turn("t")).unwrap();
-        }
-        let record = f.ledger.get(&due.cutex_session_id, std::slice::from_ref(&due.input_id)).unwrap().records.remove(0);
-        deadline_next(&InputRecord { state: due.state, ..record })
-    }, |transition| applied.push((transition.record.input_id.clone(), transition.record.state, transition.record.reason.clone()))).unwrap();
-    applied.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(count, 3);
-    assert_eq!(applied, vec![
-        ("h".to_string(), InputState::Failed, Some("admission_timeout".to_string())),
-        ("n".to_string(), InputState::Waiting, Some("autoRetry".to_string())),
-        ("r".to_string(), InputState::Failed, Some("routeLost".to_string())),
-    ]);
-    assert_eq!(f.ledger.get("s1", &["x".into()]).unwrap().records[0].state, InputState::Accepted);
+    let count = run_deadline_pass(&f.ledger,t0()+chrono::Duration::seconds(31),10,|due| {
+        if due.input_id=="x"&&!moved_meanwhile.replace(true) {f.go("x",Next::accepted().turn("t")).unwrap();}
+        let record=f.ledger.get(&due.cutex_session_id,&[due.input_id.clone()]).unwrap().records.remove(0);
+        deadline_next(&InputRecord{state:due.state,..record})
+    },|transition|applied.push((transition.record.input_id.clone(),transition.record.state,transition.record.reason.clone()))).unwrap();
+    applied.sort_by(|a,b|a.0.cmp(&b.0));
+    assert_eq!(count,2);
+    assert_eq!(applied,vec![("n".into(),InputState::Waiting,Some("autoRetry".into())),("r".into(),InputState::Failed,Some("routeLost".into()))]);
+    assert_eq!(f.ledger.get("s1",&["x".into()]).unwrap().records[0].state,InputState::Accepted);
+
 }
 
 // --- lock guard --------------------------------------------------------------
@@ -937,22 +931,18 @@ fn owner_dismiss_settles_one_or_many_with_cas() {
     f.go("u", Next::uncertain("outcomeUnknown")).unwrap();
     f.go("w", Next::waiting("afterTurn").create(note(InputKind::AgentMessage, Timing::AfterTurn))).unwrap();
     f.go("o", Next::waiting("explicitQueue").create(owner(Strategy::Queue))).unwrap();
-    let (results, events) = capture_events(|| {
-        vec![
-            dismiss_one(&f.ledger, "s1", "u", 1).map(|_| ()).unwrap_err(),
-            dismiss_one(&f.ledger, "s1", "o", 1).map(|_| ()).unwrap_err(),
-            dismiss_one(&f.ledger, "s1", "zz", 1).map(|_| ()).unwrap_err(),
-        ]
-    });
-    assert!(events.is_empty());
-    let codes: Vec<&str> = results.iter().map(|failure| failure["code"].as_str().unwrap()).collect();
-    assert_eq!(codes, vec!["revision_conflict", "input_not_dismissible", "input_not_found"]);
-    assert_eq!(results[0]["currentRev"], 2);
-    let (done, events) = capture_events(|| (dismiss_one(&f.ledger, "s1", "u", 2).unwrap(), dismiss_one(&f.ledger, "s1", "w", 1).unwrap()));
-    assert_eq!((done.0.record.state, done.0.record.reason.as_deref(), done.0.record.surface), (InputState::Discarded, Some("ownerDiscarded"), Surface::None));
-    assert_eq!(done.1.record.state, InputState::Discarded);
-    assert_eq!(events.iter().map(|(session, method, _)| (session.as_str(), method.as_str())).collect::<Vec<_>>(),
-        vec![("s1", STATE_CHANGED_EVENT), ("s1", STATE_CHANGED_EVENT)]);
+    // Revisions are advisory compatibility fields for an unconditional owner
+    // disposition. Missing ledger metadata is handled by input/dispose.
+    let (done,events)=capture_events(|| (
+        dismiss_one(&f.ledger,"s1","u",1).unwrap(),
+        dismiss_one(&f.ledger,"s1","o",1).unwrap(),
+        dismiss_one(&f.ledger,"s1","w",1).unwrap()));
+    assert_eq!(done.0.record.state,InputState::Discarded);
+    assert_eq!(done.1.record.state,InputState::Discarded);
+    assert_eq!(done.2.record.state,InputState::Discarded);
+    assert_eq!(events.len(),3);
+    assert!(!dismiss_one(&f.ledger,"s1","u",1).unwrap().changed,"lost response is idempotent");
+    let results=vec![dismiss_one(&f.ledger,"s1","missing",1).unwrap_err()];
     // Bulk params.
     let bulk = json!({"items": [{"inputId": "a", "expectedRev": 1}, {"inputId": "b", "expectedRev": 2}]});
     assert_eq!(parse_dismiss_items(bulk.as_object().unwrap()).unwrap(), vec![("a".into(), 1), ("b".into(), 2)]);
@@ -1347,7 +1337,7 @@ fn stuck_owner_records_offer_retry_and_dismiss() {
     let stalled = || Some(Stalled { reason: "runtimeDisconnected".into(), since: "2026-11-03T00:00:00.000Z".into() });
     f.go("a", Next::sending().surface(Surface::NextUp).create(owner(Strategy::Auto))).unwrap();
     let accepted = f.go("a", Next::accepted().turn("t1")).unwrap().record;
-    assert!(accepted.actions.is_empty() && !owner_stuck(&accepted) && !dismissible(&accepted));
+    assert!(accepted.actions.contains(&Action::Dismiss) && !owner_stuck(&accepted) && dismissible(&accepted));
     let stuck = f.go("a", Next::accepted().stalled(stalled()).deadline(None)).unwrap().record;
     assert_eq!((stuck.surface, stuck.actions.clone()), (Surface::NextUp, vec![Action::Retry, Action::Dismiss]));
     assert!(owner_stuck(&stuck) && dismissible(&stuck));
@@ -1356,13 +1346,13 @@ fn stuck_owner_records_offer_retry_and_dismiss() {
     assert_eq!(sending.actions, vec![Action::Retry, Action::Dismiss]);
     // The runtime came back (§2.12 reconnect clears the stall): no actions.
     let back = f.go("a", Next::accepted().stalled(None)).unwrap().record;
-    assert!(back.actions.is_empty() && !owner_stuck(&back));
+    assert!(back.actions.contains(&Action::Dismiss) && !owner_stuck(&back));
     // The delivery refresh keeps them (same rule, `record_actions`).
     assert_eq!(record_actions(&stuck, Some(&json!({"state": "disconnected", "turn": null}))), vec![Action::Retry, Action::Dismiss]);
     // A note stalled the same way: unchanged.
     f.go("n", Next::sending().create(note(InputKind::AgentMessage, Timing::AfterTurn))).unwrap();
     let note_stalled = f.go("n", Next::sending().stalled(stalled())).unwrap().record;
-    assert!(note_stalled.actions.is_empty() && !dismissible(&note_stalled));
+    assert!(note_stalled.actions.is_empty() && dismissible(&note_stalled));
     // Failed: the owner's is dismissible (retry, dismiss), a note's is not.
     let failed = f.go("s", Next::failed("notDelivered")).unwrap().record;
     assert_eq!(failed.actions, vec![Action::Retry, Action::Dismiss]);
@@ -1414,57 +1404,290 @@ fn refresh_open_actions_fixes_stored_actions_and_writes_nothing_otherwise() {
 
 
 #[test]
-fn dismiss_finishes_when_retry_projection_lands_after_source_settlement() {
-    let f = Fixture::new();
-    let before = f.go("result", Next::waiting("ownerRetry")
-        .create(note(InputKind::DelegationResult, Timing::AfterTurn))).unwrap().record;
-    let dismissed = dismiss_one_with(&f.ledger, "s1", "result", before.rev, |_| {
-        // The source settlement has completed. Its older, queued retry job
-        // now restores hold metadata before the owner's final ledger commit.
-        f.go("result", Next::waiting("ownerRetry")
-            .details(json!({"ownerHold": false, "askSourceVersion": 23}))).unwrap();
-        Ok(true)
-    });
-    eprintln!("deterministic dismiss reply failed[]: {:?}", dismissed.as_ref().err());
-    assert_eq!(dismissed.unwrap().record.state, InputState::Discarded);
-}
-
-
-#[test]
-fn dismiss_keeps_conflicts_for_native_progress_or_owner_hold_decision() {
-    for advance in [Next::sending(), Next::waiting("ownerRetry").details(json!({"ownerHold": true}))] {
-        let f = Fixture::new();
-        let before = f.go("result", Next::waiting("ownerRetry")
-            .create(note(InputKind::DelegationResult, Timing::AfterTurn))).unwrap().record;
-        let failure = dismiss_one_with(&f.ledger, "s1", "result", before.rev, |_| {
-            f.go("result", advance).unwrap();
-            Ok(true)
-        }).unwrap_err();
-        assert_eq!(failure["code"], "revision_conflict");
-        assert_ne!(f.ledger.get("s1", &["result".into()]).unwrap().records[0].state, InputState::Discarded);
+fn dismiss_is_durable_before_any_source_or_runtime_callback() {
+    let f=Fixture::new();
+    let before=f.go("result",Next::waiting("ownerRetry").create(note(InputKind::DelegationResult,Timing::AfterTurn))).unwrap().record;
+    let done=dismiss_one_with(&f.ledger,"s1","result",before.rev,|_|panic!("receipt must not wait for source IO")).unwrap();
+    assert_eq!(done.record.state,InputState::Discarded);
+    for callback in [Next::sending(),Next::waiting("ownerRetry").details(json!({"ownerHold":true,"askSourceVersion":23})),Next::accepted()] {
+        let late=f.ledger.transition("s1","result",Expect::rev(before.rev),callback).unwrap();
+        assert_eq!(late.record.state,InputState::Discarded);
+        assert!(!late.changed);
     }
-    let f = Fixture::new();
-    let before = f.go("result", Next::waiting("ownerRetry")
-        .create(note(InputKind::DelegationResult, Timing::AfterTurn))).unwrap().record;
-    let done = dismiss_one_with(&f.ledger, "s1", "result", before.rev, |_| {
-        f.go("result", Next::discarded("ownerDiscarded")).unwrap();
-        Ok(true)
-    }).unwrap();
-    assert_eq!(done.record.state, InputState::Discarded);
-    assert!(!done.changed, "source projection already published this decision");
 }
 
+// Independent owner contract: no runtime progress and arbitrarily late writers.
+#[test]
+fn disposal_intent_survives_pruning_late_writes_and_epoch_rebuild() {
+    let f=Fixture::new();
+    let path=f.root.join(DATABASE_FILE);
+    f.go("note",Next::waiting("afterTurn").create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap();
+    let first=super::super::input_disposal::request_at(&path,"s1","note",t0()).unwrap();
+    let again=super::super::input_disposal::request_at(&path,"s1","note",t0()+chrono::Duration::days(1)).unwrap();
+    assert_eq!(first,again,"a lost response must replay the same durable receipt");
+    let late=f.ledger.transition("s1","note",Expect::rev(9999),Next::sending()).unwrap().record;
+    assert_eq!(late.state,InputState::Discarded);
+    f.ledger.compact(t0()+chrono::Duration::days(2),Duration::ZERO,100).unwrap();
+    assert!(f.ledger.get("s1",&["note".into()]).unwrap().records.is_empty());
+    let replay=f.go("note",Next::waiting("afterTurn").create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap().record;
+    assert_eq!((replay.state,replay.surface),(InputState::Discarded,Surface::None));
+    let rebuilt=InputLedger::open(f.root.join("rebuilt.sqlite3"));
+    let row=rebuilt.transition("s1","note",Expect::ANY,Next::sending().create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap().record;
+    assert_eq!((row.state,row.surface),(InputState::Discarded,Surface::None));
+    // Identical IDs in another recipient are independent content.
+    let row=rebuilt.transition("s2","note",Expect::ANY,Next::sending().create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap().record;
+    assert_eq!(row.state,InputState::Sending);
+}
 
 #[test]
-fn dismiss_does_not_relax_revision_when_the_source_has_not_settled() {
-    let f = Fixture::new();
-    let before = f.go("result", Next::waiting("ownerRetry")
-        .create(note(InputKind::DelegationResult, Timing::AfterTurn))).unwrap().record;
-    let failure = dismiss_one_with(&f.ledger, "s1", "result", before.rev, |_| {
-        f.go("result", Next::waiting("ownerRetry")
-            .details(json!({"ownerHold": false, "askSourceVersion": 23}))).unwrap();
-        Ok(false)
-    }).unwrap_err();
-    assert_eq!(failure["code"], "revision_conflict");
-    assert_eq!(f.ledger.get("s1", &["result".into()]).unwrap().records[0].state, InputState::Waiting);
+fn disposal_absolute_deadline_cannot_be_cleared_or_renewed_without_runtime_progress() {
+    let f=Fixture::new();
+    f.go("note",Next::sending().create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap();
+    let first=f.go("note",Next::sending()).unwrap().record;
+    for seconds in [10,20,40,59] {
+        f.at(seconds);
+        let row=f.go("note",Next::sending().deadline(None).details(json!({"source":"late"}))).unwrap().record;
+        assert_eq!(row.details["observationDeadline"],first.details["observationDeadline"]);
+    }
+    f.at(61);
+    let changed=run_deadline_pass(&f.ledger,t0()+chrono::Duration::seconds(61),100,
+        |_|panic!("absolute expiry must not call a stuck runtime"), |_|{}).unwrap();
+    assert_eq!(changed,1);
+    let row=f.ledger.get("s1",&["note".into()]).unwrap().records.pop().unwrap();
+    assert_eq!(row.state,InputState::Uncertain);
+    assert!(row.actions.contains(&Action::Dismiss));
+}
+
+#[test]
+fn disposal_accepts_intent_while_admission_lane_is_busy() {
+    let f=Fixture::new();
+    let lane=super::super::session_coordination::session_lane("s1").unwrap();
+    let guard=lane.try_lock().unwrap();
+    let path=f.root.join(DATABASE_FILE);
+    let receipt=super::super::input_disposal::request_at(&path,"s1","pre-ledger",t0()).unwrap();
+    assert_eq!(receipt.input_id,"pre-ledger");
+    let row=f.go("pre-ledger",Next::received().create(owner(Strategy::Queue))).unwrap().record;
+    assert_eq!(row.state,InputState::Discarded);
+    drop(guard);
+}
+
+#[test]
+fn disposal_protocol_compatibility_tuples_have_exit_without_runtime_progress() {
+    // Protocol compatibility coverage (not a production-reachability claim).
+    // This contract is independent of actions_for/record_actions:
+    // queue/blocked/unconfirmed/failed/accepted all have owner D. Transient
+    // transport states may instead expire within a fixed minute.
+    let f=Fixture::new();
+    let mut count=0;
+    for &kind in InputKind::ALL {
+        for timing in [Timing::AfterTurn,Timing::Passive] {
+            if kind==InputKind::Owner && timing==Timing::Passive {continue;}
+            let make=||if kind==InputKind::Owner {owner(Strategy::Queue)} else {note(kind,timing)};
+            let mut cases=vec![Next::received(),Next::sending()];
+            cases.extend(WAITING_REASONS.iter().map(|reason|Next::waiting(*reason)));
+            cases.extend(HELD_REASONS.iter().map(|reason|Next::held(*reason)));
+            cases.extend(FAILED_REASONS.iter().map(|reason|Next::failed(*reason)));
+            for next in cases {
+                let id=format!("tuple-{count}");count+=1;
+                let row=f.go(&id,next.create(make())).unwrap().record;
+                if matches!(row.surface,Surface::NextUp|Surface::PendingNotes) {
+                    assert!(row.actions.contains(&Action::Dismiss)||row.deadline.as_deref().and_then(|s|DateTime::parse_from_rfc3339(s).ok()).is_some_and(|at|at<=t0()+chrono::Duration::seconds(60)),"no independent exit: {row:?}");
+                    let decision=super::super::input_disposal::request_at(&f.root.join(DATABASE_FILE),"s1",&id,t0()).unwrap();
+                    let discarded=f.ledger.transition("s1",&id,Expect::rev(0),Next::sending()).unwrap().record;
+                    assert_eq!(discarded.state,InputState::Discarded,"{decision:?}");
+                }
+            }
+        }
+    }
+    assert!(count>500);
+}
+
+#[test]
+fn disposal_pending_worker_survives_busy_lane_failure_and_lost_response() {
+    let f=Fixture::new();let path=f.root.join(DATABASE_FILE);
+    f.go("pending",Next::waiting("explicitQueue").create(owner(Strategy::Queue))).unwrap();
+    let (held,ready)=std::sync::mpsc::channel();let (release,resume)=std::sync::mpsc::channel();
+    let holder=std::thread::spawn(move|| {
+        let lane=super::super::session_coordination::session_lane("disposal-pending").unwrap();
+        let _guard=lane.try_lock().unwrap();held.send(()).unwrap();resume.recv().unwrap();
+    });ready.recv().unwrap();
+    let receipt=super::super::input_disposal::request_at(&path,"s1","pending",t0()).unwrap();
+    let mut source_present=true;
+    let lane=super::super::session_coordination::session_lane("disposal-pending").unwrap();
+    let (first,_)=capture_events(||super::super::input_disposal::drain_on(&f.ledger,&path,|_| {
+        let _guard=lane.try_lock().map_err(|_|"busy".to_string())?;
+        source_present=false;Ok(())
+    }));assert_eq!(first.unwrap(),0);assert!(source_present);
+    assert_eq!(f.ledger.get("s1",&["pending".into()]).unwrap().records[0].state,InputState::Discarded);
+    assert!(super::super::input_disposal::check_at(&path,"s1",["pending"]).is_err(),"native dispatch is forbidden while cleanup is pending");
+    release.send(()).unwrap();holder.join().unwrap();
+    super::super::input_disposal::request_at(&path,"s1","pending",t0()).unwrap();
+    let (failure,_)=capture_events(||super::super::input_disposal::drain_on(&f.ledger,&path,|_|Err("source storage unavailable".into())));
+    assert_eq!(failure.unwrap(),0);
+    assert_eq!(super::super::input_disposal::request_at(&path,"s1","pending",t0()).unwrap(),receipt);
+    let (second,_)=capture_events(||super::super::input_disposal::drain_on(&f.ledger,&path,|_|{source_present=false;Ok(())}));
+    assert_eq!(second.unwrap(),1);assert!(!source_present);
+    assert!(super::super::input_disposal::check_at(&path,"s1",["pending"]).is_err(),"source cleanup does not remove the permanent fence");
+    let (third,_)=capture_events(||super::super::input_disposal::drain_on(&f.ledger,&path,|_|panic!("completed cleanup replayed")));
+    assert_eq!(third.unwrap(),0);
+}
+
+#[test]
+fn disposal_id_only_protocol_needs_no_record_kind_or_payload() {
+    let f=Fixture::new();
+    let receipt=super::super::input_disposal::request_at(&f.root.join(DATABASE_FILE),"s1","no-ledger-record",t0()).unwrap();
+    assert!(f.ledger.get("s1",&[receipt.input_id.clone()]).unwrap().records.is_empty());
+    use super::super::contract_validation::{validate_cutex_request,validate_cutex_response};
+    let method=super::super::input_disposal::METHOD;
+    validate_cutex_request(&json!({"requestId":"r","method":method,"params":{"inputId":receipt.input_id}})).unwrap();
+    validate_cutex_response(&json!({"contractVersion":2,"requestId":"r","cutexSessionId":"s1","cutex":{"method":method,"result":receipt}})).unwrap();
+    assert!(super::super::input_disposal::parse_request(&json!({"inputId":"x","kind":"futureKind"})).is_err());
+    assert_eq!(dispatch("s1",method,&json!({"inputId":"x"}),false).unwrap_err().code,"owner_required");
+}
+
+#[test]
+fn source_discard_then_compact_cannot_be_revived_by_a_late_constructor() {
+    let f=Fixture::new();
+    f.go("closed",Next::waiting("afterTurn").create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap();
+    f.go("closed",Next::discarded("settlementClosed")).unwrap();
+    f.ledger.compact(t0()+chrono::Duration::days(1),Duration::ZERO,100).unwrap();
+    let row=f.go("closed",Next::sending().create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap().record;
+    assert_eq!(row.state,InputState::Discarded);
+}
+
+#[test]
+fn absolute_expiry_is_independent_of_native_lane_and_starts_after_admission_wait() {
+    let f=Fixture::new();
+    f.go("bounded",Next::sending().create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap();
+    let original=f.ledger.get("s1",&["bounded".into()]).unwrap().records.remove(0).details["observationDeadline"].clone();
+    f.at(20);f.go("bounded",Next::waiting("returned").details(json!({"source":"refused"}))).unwrap();
+    f.at(25);let resent=f.go("bounded",Next::sending().details(json!({"replacement":"details"}))).unwrap().record;
+    assert_ne!(resent.details["observationDeadline"],original);
+    let (entered,ready)=std::sync::mpsc::channel();let (release,blocked)=std::sync::mpsc::channel();
+    let native=std::thread::spawn(move|| {let lane=super::super::session_coordination::session_lane("s1").unwrap();let _guard=lane.try_lock().unwrap();entered.send(()).unwrap();blocked.recv().unwrap();});ready.recv().unwrap();
+    f.at(86);
+    let (expired,_)=capture_events(||expire_observations(&f.ledger,t0()+chrono::Duration::seconds(86),100));
+    assert_eq!(expired.unwrap(),1,"the native lane is still blocked but expiry must complete");
+    assert_eq!(f.ledger.get("s1",&["bounded".into()]).unwrap().records[0].state,InputState::Uncertain);
+    release.send(()).unwrap();native.join().unwrap();
+}
+
+#[test]
+fn older_projection_writer_cannot_clear_the_absolute_sql_budget() {
+    let f=Fixture::new();f.go("legacy-writer",Next::sending().create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap();
+    {
+        let mut guard=f.ledger.lock_write().unwrap();
+        guard.connection.as_mut().unwrap().execute("UPDATE input_ledger SET deadline_ms=NULL,record_json=json_remove(record_json,'$.details.observationDeadline') WHERE input_id='legacy-writer'",[]).unwrap();
+    }
+    f.at(61);
+    let (done,_)=capture_events(||expire_observations(&f.ledger,t0()+chrono::Duration::seconds(61),100));
+    assert_eq!(done.unwrap(),1);
+    assert_eq!(f.ledger.get("s1",&["legacy-writer".into()]).unwrap().records[0].state,InputState::Uncertain);
+}
+
+#[test]
+fn rolled_back_terminal_projection_is_not_an_owner_disposition() {
+    let f=Fixture::new();let path=f.root.join(DATABASE_FILE);
+    f.go("rollback",Next::waiting("afterTurn").create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap();
+    {
+        let mut guard=f.ledger.lock_write().unwrap();
+        guard.connection.as_mut().unwrap().execute_batch("CREATE TRIGGER refuse_terminal BEFORE UPDATE ON input_ledger WHEN NEW.state='discarded' BEGIN SELECT RAISE(ABORT,'injected projection failure'); END;").unwrap();
+    }
+    assert!(f.go("rollback",Next::discarded("settlementClosed")).is_err());
+    assert!(super::super::input_disposal::check_at(&path,"s1",["rollback"]).is_ok(),"a failed projection is not authority to stop the source");
+    assert_eq!(f.ledger.get("s1",&["rollback".into()]).unwrap().records[0].state,InputState::Waiting);
+    super::super::input_disposal::request_at(&path,"s1","rollback",t0()).unwrap();
+    assert!(super::super::input_disposal::check_at(&path,"s1",["rollback"]).is_err(),"explicit owner intent is independently durable even when projection cannot commit");
+    let mut source_removed=false;
+    let (drain,_)=capture_events(||super::super::input_disposal::drain_on(&f.ledger,&path,|_|{source_removed=true;Ok(())}));
+    assert_eq!(drain.unwrap(),0);assert!(source_removed,"projection failure cannot block source cleanup");
+}
+
+#[test]
+fn id_only_disposal_cleans_a_source_even_if_no_ledger_row_ever_existed() {
+    let session=format!("source-only-{}",uuid::Uuid::new_v4());let id=format!("input-{}",uuid::Uuid::new_v4());
+    let repository=super::super::user_input::user_input_repository().unwrap();
+    let params=super::super::user_input::parse_user_input_submit_params(&json!({"clientUserMessageId":id,"strategy":"queue","origin":{"kind":"other","clientId":"disposal-test"},"input":[{"type":"text","text":"source body"}]})).unwrap();
+    repository.enqueue(&session,"thread","request",&params).unwrap();
+    let ledger=default_ledger().unwrap();
+    assert!(ledger.get(&session,&[id.clone()]).unwrap().records.is_empty());
+    let path=super::super::input_disposal::default_ledger_path().unwrap();
+    super::super::input_disposal::request_at(&path,&session,&id,Utc::now()).unwrap();
+    let (done,_)=capture_events(||super::super::input_disposal::drain_on(ledger,&path,|_|panic!("must not require a typed record or its payload")));
+    assert!(done.unwrap()>=1);
+    assert!(repository.list(&session).unwrap().1.is_empty());
+    assert!(repository.enqueue(&session,"thread","replay",&params).is_err());
+    assert!(ledger.get(&session,&[id]).unwrap().records.is_empty(),"source-only cleanup must not fabricate ledger revisions");
+}
+
+#[path="input_disposal_contract_tests.rs"]
+mod disposal_contract_tests;
+
+#[test]
+fn r47_admitted_rows_with_legacy_caps_never_expire_or_invent_owner_retry() {
+    use super::super::input_ledger_owner::{plan,Step};
+    for held in [false,true] {
+        let f=Fixture::new();
+        if held {f.go("owner",Next::held("hostBusy").create(owner(Strategy::Queue))).unwrap();}
+        else {
+            f.go("owner",Next::sending().create(owner(Strategy::Queue))).unwrap();
+            f.go("owner",Next::accepted()).unwrap();
+        }
+        // Model the previous executable's persisted, already old accepted/held cap.
+        let mut old=f.ledger.get("s1",&["owner".into()]).unwrap().records.remove(0);
+        old.since=timestamp(t0()-chrono::Duration::days(1));
+        old.details["observationDeadline"]=json!(timestamp(t0()+chrono::Duration::seconds(60)));
+        old.deadline=Some(timestamp(t0()+chrono::Duration::seconds(60)));
+        {
+            let mut guard=f.ledger.lock_write().unwrap();
+            guard.connection.as_mut().unwrap().execute("UPDATE input_ledger SET record_json=?1,deadline_ms=?2,observation_deadline_ms=?2 WHERE input_id='owner'",params![serde_json::to_string(&old).unwrap(),(t0()+chrono::Duration::seconds(60)).timestamp_millis()]).unwrap();
+        }
+        f.at(3661);
+        let (expired,_)=capture_events(||expire_observations(&f.ledger,t0()+chrono::Duration::seconds(3661),100));
+        assert_eq!(expired.unwrap(),0);
+        assert_eq!(run_deadline_pass(&f.ledger,t0()+chrono::Duration::seconds(3661),100,
+            |_|panic!("legacy cap must not query a runtime or make a receipt decision"),
+            |change|assert_eq!(change.record.state,if held {InputState::Held} else {InputState::Accepted})).unwrap(),1);
+        let row=f.ledger.get("s1",&["owner".into()]).unwrap().records.remove(0);
+        assert_eq!(row.state,if held {InputState::Held} else {InputState::Accepted});
+        assert!(row.actions.contains(&Action::Dismiss));assert!(!row.actions.contains(&Action::Retry));
+        let next=if held {Next::held("hostBusy")} else {Next::accepted()};
+        let updated=f.go("owner",next).unwrap().record;
+        assert!(updated.deadline.is_none());assert!(updated.details.get("observationDeadline").is_none());
+        let steps=plan(Some(&updated),&Step::Started{turn_id:Some("actual-start".into())},None);
+        assert!(!steps.iter().any(|step|step.reason.as_deref()==Some("ownerRetry")));
+        for step in steps {f.go("owner",step).unwrap();}
+        let started=f.ledger.get("s1",&["owner".into()]).unwrap().records.remove(0);
+        assert_eq!(started.state,InputState::InContext);assert_eq!(started.attempt,old.attempt);
+    }
+}
+
+#[test]
+fn r47_after_turn_note_remains_admitted_after_sixty_one_seconds() {
+    let f=Fixture::new();
+    f.go("note",Next::waiting("afterTurn").create(note(InputKind::AgentMessage,Timing::AfterTurn))).unwrap();
+    for accepted in [false,true] {
+        if accepted {f.at(0);f.go("note",Next::sending()).unwrap();f.go("note",Next::accepted()).unwrap();}
+        f.at(600);
+        let (expired,_)=capture_events(||expire_observations(&f.ledger,t0()+chrono::Duration::seconds(600),100));
+        assert_eq!(expired.unwrap(),0);
+        let row=f.ledger.get("s1",&["note".into()]).unwrap().records.remove(0);
+        assert_eq!(row.state,if accepted {InputState::Accepted} else {InputState::Waiting});
+        assert!(!row.actions.contains(&Action::Retry));assert!(row.actions.contains(&Action::Dismiss));
+    }
+}
+
+#[test]
+fn r47_drain_once_reaches_real_settle_local_and_removes_owner_source() {
+    let session=format!("drain-real-{}",uuid::Uuid::new_v4());let id="real-queued-owner";
+    let repository=super::super::user_input::user_input_repository().unwrap();
+    let params=super::super::user_input::parse_user_input_submit_params(&json!({"clientUserMessageId":id,"strategy":"queue","origin":{"kind":"other","clientId":"r47-real-cleanup"},"input":[{"type":"text","text":"private test"}]})).unwrap();
+    repository.enqueue(&session,"private-thread","private-request",&params).unwrap();
+    let ledger=default_ledger().unwrap();
+    ledger.transition(&session,id,Expect::NEW,Next::waiting("explicitQueue").create(owner(Strategy::Queue))).unwrap();
+    super::super::input_disposal::request(&session,id).unwrap();
+    let (done,_)=capture_events(super::super::input_disposal::drain_once);done.unwrap();
+    assert!(repository.list(&session).unwrap().1.is_empty());
+    assert_eq!(ledger.get(&session,&[id.into()]).unwrap().records[0].state,InputState::Discarded);
+    assert!(super::super::input_disposal::request(&session,id).unwrap().applied_at.is_some());
 }

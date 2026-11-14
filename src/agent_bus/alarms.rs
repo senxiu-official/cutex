@@ -349,8 +349,8 @@ fn validate_director_alarm_creator(owner:&str,project:&str,sessions:&crate::sess
     ensure!(crate::asks::directory::Directory::director_projects(roster,owner)==vec![project.to_owned()],"Director alarm creator no longer belongs to its original project");Ok(())
 }
 /// A cutex system notice to one agent through the alarm scheduler (durable,
-/// a few seconds from now; after-turn like any alarm, except approval
-/// notices, which a busy agent reads at its next step: 023). `owner` is a reserved non-session owner (e.g.
+/// a few seconds from now; ordinary notices follow the busy-wake wait,
+/// while approval notices reach a busy agent's next step with no wait: 023). `owner` is a reserved non-session owner (e.g.
 /// [`APPROVAL_NOTICE_OWNER`]); `notice_id` makes a repeat idempotent. The
 /// store lock is contended briefly by the scheduler, so this retries a few
 /// times.
@@ -369,8 +369,8 @@ pub fn safety_notice_message_id(to: &str, key: &str) -> String {
 }
 
 /// Bus message id prefix of an approval decision notice (023): the Agent Bus
-/// reads it at a busy recipient's next step with no wait, while every other
-/// alarm stays after-turn. Still an `alarm-` id, so a release before 023
+/// reads it at a busy recipient's next step with no wait, while ordinary
+/// alarms follow the configured busy-wake wait. Still an `alarm-` id, so a release before 023
 /// delivers it as an ordinary after-turn alarm. Only notices of
 /// [`APPROVAL_NOTICE_OWNER`] get it (checked again at authentication).
 pub const APPROVAL_NOTICE_MESSAGE_PREFIX: &str = "alarm-approval-";
@@ -581,7 +581,7 @@ pub fn spawn() -> anyhow::Result<()> {
 }
 pub fn tools() -> Vec<Value> {
     vec![
-        json!({"name":"alarm_set","description":"Schedule a one-shot reminder message to yourself or another agent you may reach. The Cutex service delivers it after_turn at the requested time, including after service restarts.","inputSchema":{"type":"object","properties":{"alarm_id":{"type":"string","description":"Stable ID; reuse for an unchanged retry."},"to":{"type":"string","description":"ID, exact agent name, or director. A director reminder captures your project and resolves its current Director when due; retired creators cannot send. IDs accept a unique prefix or suffix of at least 6 hex characters."},"message":{"type":"string"},"at":{"type":"string","description":"RFC3339 with timezone, or local YYYY-MM-DD HH:MM. Use at OR delay_seconds."},"delay_seconds":{"type":"integer","minimum":1}},"required":["alarm_id","to","message"],"additionalProperties":false}}),
+        json!({"name":"alarm_set","description":"Schedule a one-shot reminder message to yourself or another agent you may reach. At the requested time it follows the recipient's busy-wake policy: idle recipients start a new turn; busy recipients wait the configured interval, then read it at the next tool gap. Survives service restarts.","inputSchema":{"type":"object","properties":{"alarm_id":{"type":"string","description":"Stable ID; reuse for an unchanged retry."},"to":{"type":"string","description":"ID, exact agent name, or director. A director reminder captures your project and resolves its current Director when due; retired creators cannot send. IDs accept a unique prefix or suffix of at least 6 hex characters."},"message":{"type":"string"},"at":{"type":"string","description":"RFC3339 with timezone, or local YYYY-MM-DD HH:MM. Use at OR delay_seconds."},"delay_seconds":{"type":"integer","minimum":1}},"required":["alarm_id","to","message"],"additionalProperties":false}}),
         json!({"name":"alarm_list","description":"List alarms created by this Agent, including delivery state.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
         json!({"name":"alarm_cancel","description":"Cancel a pending alarm created by this Agent.","inputSchema":{"type":"object","properties":{"alarm_id":{"type":"string"}},"required":["alarm_id"],"additionalProperties":false}}),
     ]

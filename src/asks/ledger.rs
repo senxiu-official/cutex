@@ -518,7 +518,7 @@ pub fn request_job(before_state: &AskState, after_state: &AskState, before: Opti
     if ask.remote.is_some() {
         return None;
     }
-    if before.is_some_and(|before| request_signature(before_state, before) == request_signature(after_state, ask)
+    if before.is_some_and(|before| before.admission_occurrence == ask.admission_occurrence && request_signature(before_state, before) == request_signature(after_state, ask)
         && before.current_attempt().map(|a| (a.n, &a.native_message_id, &a.turn_id, a.runtime_generation))
             == ask.current_attempt().map(|a| (a.n, &a.native_message_id, &a.turn_id, a.runtime_generation))) {
         return None;
@@ -544,6 +544,9 @@ pub fn request_job(before_state: &AskState, after_state: &AskState, before: Opti
     };
     let was_terminal = before.is_some_and(|before| before.execution.is_terminal());
     let mut steps = Vec::new();
+    if ask.resume_pending() {
+        steps.push(step(n(Next::waiting("targetBusy")), &[ABSENT, WAITING]));
+    } else {
     match ask.execution {
         ExecutionState::PendingReview => steps.push(step(n(Next::waiting("reviewPending")), &[ABSENT, WAITING])),
         ExecutionState::Queued => {
@@ -589,17 +592,19 @@ pub fn request_job(before_state: &AskState, after_state: &AskState, before: Opti
         ExecutionState::Rejected => steps.push(step(n(Next::rejected("askRejected")), &[ABSENT, WAITING])),
         ExecutionState::Cancelled => steps.push(step(n(Next::discarded("askCancelled")), &[WAITING])),
     }
+    }
     // Positive facts of the current attempt also heal a timed-out send. An
     // old row/attempt is never proof for the current one; the job carries the
     // same store revision as this binding and apply_job rejects older jobs.
-    if matches!(ask.execution, ExecutionState::Running | ExecutionState::Answered | ExecutionState::Failed | ExecutionState::Interrupted)
+    if !ask.resume_pending() && matches!(ask.execution, ExecutionState::Running | ExecutionState::Answered | ExecutionState::Failed | ExecutionState::Interrupted)
+        && ask.current_attempt().is_some_and(|attempt|attempt.admission_occurrence==ask.admission_occurrence)
         && ran(before, ask)
         && ask.current_attempt().is_some_and(|attempt| attempt.turn_id.as_ref().is_some_and(|turn| !turn.is_empty()) && !attempt.native_message_id.is_empty()) {
         steps.push(step(in_context(), &[UNCERTAIN]));
     }
     (!steps.is_empty()).then(|| Job {
         session: ask.target_cutex_session_id.clone(),
-        input_id: ask.ask_id.clone(),
+        input_id: ask.request_input_id(),
         steps,
         source_version: Some(after_state.revision),
     })
@@ -671,7 +676,11 @@ pub fn delivery_job(
     before: Option<&DeliveryRecord>,
     delivery: &DeliveryRecord,
 ) -> Option<Job> {
-    if before.is_some_and(|before| before.state == delivery.state && before.passive == delivery.passive && before.owner_hold == delivery.owner_hold && before.owner_input_id == delivery.owner_input_id) {
+    // A moved delivery has no prior projection in its new recipient. Preserve
+    // its source state, but use the normal initial-admission path there.
+    let before = before.filter(|previous|
+        delivery_session(before_state,previous)==delivery_session(after_state,delivery));
+    if before.is_some_and(|before| delivery_session(before_state,before)==delivery_session(after_state,delivery) && before.state == delivery.state && before.passive == delivery.passive && before.owner_hold == delivery.owner_hold && before.owner_input_id == delivery.owner_input_id && before.settled_by == delivery.settled_by) {
         return None;
     }
     let input = delivery_input(after_state, delivery).or_else(|| delivery_input(before_state, delivery))?;
@@ -690,6 +699,16 @@ pub fn delivery_job(
     let read_by_tool = if delivery.passive { created.clone().surface(il::Surface::None) } else { created.clone() };
     let mut steps = Vec::new();
     match delivery.state {
+        // A discarded queued batch has no lease left to reconcile its other
+        // members. Their explicit source marker makes uncertainty durable,
+        // including ordinary `soon` events with no owner_input_id and a full
+        // ledger rebuild after a source-only commit.
+        DeliveryState::Pending if delivery.passive
+            && delivery.settled_by.as_deref() == Some(super::RESULTS_OUTCOME_UNKNOWN) => {
+            steps.push(step(created.clone(), &[ABSENT]));
+            steps.push(step(n(Next::sending()), &[WAITING]));
+            steps.push(step(n(Next::uncertain("outcomeUnknown")), &[SENDING, ACCEPTED]));
+        }
         // An abandoned owner reservation: unreconcilable native outcome or
         // explicit lease release. Normal carries remain QueuedAsEvent; a
         // proven-unsent release/retry clears owner_input_id. This source fact
@@ -811,6 +830,17 @@ pub fn store_jobs(before: &AskState, after: &AskState, changes: &[crate::managem
             }
             "deliveries" => {
                 if let Some(delivery) = after.deliveries.get(key) {
+                    if let Some(previous)=before.deliveries.get(key) {
+                        let old_session=delivery_session(before,previous);
+                        let new_session=delivery_session(after,delivery);
+                        if old_session!=new_session {
+                            jobs.push(Job {
+                                session:old_session,input_id:delivery.delivery_id.clone(),source_version:Some(after.revision),
+                                steps:vec![step(Next::discarded("settlementClosed").details(json!({"recipientTransferred":true,"recipient":new_session})),
+                                    &[Some(InputState::Received),Some(InputState::Held),WAITING,SENDING,ACCEPTED,UNCERTAIN,Some(InputState::Failed)])],
+                            });
+                        }
+                    }
                     jobs.extend(delivery_job(before, after, before.deliveries.get(key), delivery));
                 }
             }
@@ -1034,7 +1064,7 @@ fn holder_name(holder: &LeaseHolder) -> &'static str {
 
 fn lease_input_ids(state: &AskState, lease: &AdmissionLease) -> Vec<String> {
     match &lease.holder {
-        LeaseHolder::Ask { ask_id, .. } => vec![ask_id.clone()],
+        LeaseHolder::Ask { ask_id, .. } => state.asks.get(ask_id).map(|ask|vec![ask.request_input_id()]).unwrap_or_default(),
         LeaseHolder::Event { event_id } => state.events.get(event_id).map(|event| event.delivery_ids.clone()).unwrap_or_default(),
         // Owner inputs are block C2's records (clientUserMessageId).
         LeaseHolder::Owner => Vec::new(),
@@ -1190,7 +1220,7 @@ pub fn lease_release(store: &AskStore, session: &str, expected: &Value, now: Dat
                 flush(Duration::from_secs(5));
                 apply_now(&[Job {
                     session: session.to_string(),
-                    input_id: ask_id.clone(),
+                    input_id: ids.first().cloned().unwrap_or_else(||ask_id.clone()),
                     steps: vec![step(Next::uncertain("leaseReleased").create(input), &[SENDING, ACCEPTED])],
                     source_version: None,
                 }])
@@ -1281,49 +1311,122 @@ pub fn lease_release(store: &AskStore, session: &str, expected: &Value, now: Dat
 // ---------------------------------------------------------------------------
 // Dismiss (owner decision 9)
 
-/// The owner dismisses an `uncertain` (or waiting) delegation record: settle
-/// the store side WITHOUT a retry and without native IO, before the ledger
-/// marks it `discarded{ownerDiscarded}`.
-/// - request (`askId`): an interrupted / failed delegation still open
-///   (e.g. `interrupted{outcomeUnknown}`, delegation-de84ad) is closed
-///   `stopped`, exactly as `cutex/ask/stop` closes a finished one; a
-///   running one is left alone (stop it first);
-/// - result / question / status (`deliveryId`): a pending item is settled
-///   (`acknowledged`, `settledBy: dismissed`, never sent); its delegation
-///   is closed like above when it ended `outcomeUnknown`.
+/// Apply the durable owner disposition without native IO. Current unsubmitted
+/// requests are cancelled; current interrupted/failed requests close as Stopped
+/// regardless of reason. Results close only outcomeUnknown work (decision 9).
+/// Running or different-occurrence work is kept.
 pub fn dismiss(store: &AskStore, record: &InputRecord, now: DateTime<Utc>) -> Result<(), String> {
     let ask_id = match record.kind {
         InputKind::DelegationRequest => Some(record.ask_id.clone().unwrap_or_else(|| record.input_id.clone())),
         _ => record.ask_id.clone(),
     };
     let delivery_id = (record.kind != InputKind::DelegationRequest).then(|| record.input_id.clone());
+    // Share the scheduler/owner submission lane before reading source state.
+    // Cover Pending -> QueuedAsEvent as well as already queued items. Never
+    // remove a reservation while its native submit or callback is in flight.
+    let lane = Some(crate::management::v2::session_coordination::session_lane(&record.cutex_session_id))
+        .transpose().map_err(|error| format!("result admission unavailable: {error:#}"))?;
+    let _reservation = lane.as_ref().map(|lane| lane.try_lock()).transpose().map_err(|error| {
+        if error == crate::management::v2::session_coordination::ReservationError::WouldBlock {
+            "result admission busy; try again".to_string()
+        } else { format!("result admission unavailable: {error}") }
+    })?;
     let ids: Vec<&str> = ask_id.iter().map(String::as_str).collect();
     store
         .with_records(&ids, |state| {
             if let Some(id) = &delivery_id {
-                if let Some(delivery) = state.deliveries.get_mut(id) {
-                    if delivery.state == DeliveryState::Pending {
-                        delivery.state = DeliveryState::Acknowledged;
-                        delivery.settled_by = Some(DISMISSED.to_string());
-                        delivery.updated_at = super::now_rfc3339(now);
+                let queued = state.deliveries.get(id).filter(|d|
+                    delivery_session(state, d) == record.cutex_session_id
+                        && matches!(d.state, DeliveryState::Pending | DeliveryState::QueuedAsEvent))
+                    .map(|d| d.event_id.clone());
+                if let Some(event_id) = queued {
+                    let delivery = state.deliveries.get_mut(id).expect("checked delivery");
+                    delivery.state = DeliveryState::Acknowledged;
+                    delivery.settled_by = Some(DISMISSED.to_string());
+                    delivery.updated_at = super::now_rfc3339(now);
+                    if let Some(event_id) = event_id {
+                        super::returns::retire_event_after_dismiss(state, &record.cutex_session_id, &event_id, now);
                     }
                 }
             }
             let Some(ask_id) = &ask_id else { return };
             let Some(ask) = state.asks.get(ask_id) else { return };
-            let outcome_unknown = ask.current_attempt().and_then(|attempt| attempt.interrupt_reason) == Some(InterruptReason::OutcomeUnknown);
-            let close = ask.is_open()
-                && ask.execution.is_terminal()
-                && ask.remote.is_none()
-                && (record.kind == InputKind::DelegationRequest || outcome_unknown);
-            if close {
-                state.update_ask(ask_id, now, |ask| {
-                    ask.closed = Some(CloseOutcome::Stopped);
-                    ask.closed_at = Some(super::now_rfc3339(now));
-                });
+            // Unsubmitted requests can be cancelled locally. An in-flight or
+            // remote task is only detached from future admission; its actual
+            // runtime obligation and lease remain for truthful reconciliation.
+            let cancel_unsubmitted = record.kind == InputKind::DelegationRequest
+                && ask.target_cutex_session_id == record.cutex_session_id
+                && ask.request_input_id() == record.input_id
+                && matches!(ask.execution,ExecutionState::PendingReview|ExecutionState::Queued)
+                && ask.remote.is_none();
+            let cancel_resume=record.kind==InputKind::DelegationRequest && ask.target_cutex_session_id==record.cutex_session_id
+                && ask.request_input_id()==record.input_id && ask.resume_pending();
+            if cancel_resume {
+                state.update_ask(ask_id,now,|ask| {ask.resume=None;ask.hold=None;ask.execution=ExecutionState::Interrupted;});
+                close_disposed_terminal(state,ask_id,true,now);
+                return;
             }
+            if cancel_unsubmitted {
+                state.update_ask(ask_id,now,|ask| {
+                    ask.execution=ExecutionState::Cancelled;
+                    ask.closed=Some(CloseOutcome::Stopped);
+                    ask.closed_at=Some(super::now_rfc3339(now));
+                });
+                return;
+            }
+            let same_input = if record.kind==InputKind::DelegationRequest {
+                ask.target_cutex_session_id==record.cutex_session_id && ask.request_input_id()==record.input_id
+            } else {
+                state.deliveries.get(&record.input_id).is_some_and(|delivery|
+                    delivery_session(state,delivery)==record.cutex_session_id)
+            };
+            if same_input {close_disposed_terminal(state,ask_id,record.kind==InputKind::DelegationRequest,now);}
+
         })
         .map_err(|error| format!("{error:#}"))
+}
+
+fn close_disposed_terminal(state:&mut AskState,ask_id:&str,request:bool,now:DateTime<Utc>) {
+    let close=state.asks.get(ask_id).is_some_and(|ask|ask.is_open() && ask.remote.is_none()
+        && !ask.resume_pending() && matches!(ask.execution,ExecutionState::Interrupted|ExecutionState::Failed)
+        && (request || ask.current_attempt().is_some_and(|attempt|attempt.interrupt_reason==Some(InterruptReason::OutcomeUnknown))));
+    if close {
+        state.update_ask(ask_id,now,|ask| {
+            ask.closed=Some(CloseOutcome::Stopped);ask.closed_at=Some(super::now_rfc3339(now));
+        });
+    }
+}
+
+pub fn dismiss_input_id(store:&AskStore,session:&str,id:&str,now:DateTime<Utc>)->Result<bool,String> {
+    let lane=crate::management::v2::session_coordination::session_lane(session).map_err(|e|format!("{e:#}"))?;
+    let _lane=lane.try_lock().map_err(|_|"admission busy; durable disposition pending".to_string())?;
+    let base=id.rsplit_once("::input-").filter(|(_,sequence)|sequence.parse::<u64>().is_ok()).map_or(id,|(base,_)|base);
+    let target=store.project_snapshot(|state| {
+        if let Some(delivery)=state.deliveries.get(id).filter(|delivery|delivery_session(state,delivery)==session) {return Some((delivery.ask_id.clone(),false));}
+        state.asks.get(id).or_else(||state.asks.get(base)).filter(|ask|ask.remote.is_none()&&ask.target_cutex_session_id==session&&ask.request_input_id()==id).map(|ask|(ask.ask_id.clone(),true))
+    }).map_err(|e|format!("{e:#}"))?;
+    let Some((ask_id,request))=target else{return Ok(false)};
+    store.with_records(&[ask_id.as_str()],|state| {
+        if request {
+            let Some(ask)=state.asks.get(&ask_id) else{return};
+            if ask.remote.is_some()||ask.target_cutex_session_id!=session||ask.request_input_id()!=id{return;}
+            let cancel=matches!(ask.execution,ExecutionState::PendingReview|ExecutionState::Queued);
+            let resume=ask.resume_pending();
+            if cancel||resume {
+                state.update_ask(&ask_id,now,|ask| {
+                    ask.resume=None;ask.hold=None;
+                    if resume {ask.execution=ExecutionState::Interrupted;}
+                    else {ask.execution=ExecutionState::Cancelled;ask.closed=Some(CloseOutcome::Stopped);ask.closed_at=Some(super::now_rfc3339(now));}
+                });
+            }
+        } else if let Some(event)=state.deliveries.get(id).filter(|d|delivery_session(state,d)==session&&matches!(d.state,DeliveryState::Pending|DeliveryState::QueuedAsEvent)).map(|d|d.event_id.clone()) {
+            let delivery=state.deliveries.get_mut(id).expect("checked delivery");
+            delivery.state=DeliveryState::Acknowledged;delivery.settled_by=Some(DISMISSED.into());delivery.updated_at=super::now_rfc3339(now);
+            if let Some(event)=event {super::returns::retire_event_after_dismiss(state,session,&event,now);}
+        }
+        close_disposed_terminal(state,&ask_id,request,now);
+    }).map_err(|e|format!("{e:#}"))?;
+    Ok(true)
 }
 
 /// `settledBy` of a delegation item the owner dismissed.
@@ -1378,6 +1481,7 @@ pub fn retry_result(state: &mut AskState, session: &str, delivery_id: &str, now:
     delivery.state = DeliveryState::Pending;
     delivery.event_id = None;
     delivery.owner_input_id = None;
+    delivery.settled_by = None;
     delivery.routed_to = None;
     delivery.passive = false;
     delivery.updated_at = super::now_rfc3339(now);
@@ -1395,8 +1499,8 @@ pub fn retry_result(state: &mut AskState, session: &str, delivery_id: &str, now:
 pub fn drift_job(state: &AskState, record: &InputRecord) -> Option<Job> {
     match record.kind {
         InputKind::DelegationRequest => {
-            let ask = state.asks.get(&record.input_id)?;
-            (ask.target_cutex_session_id == record.cutex_session_id).then(|| request_job(state, state, None, ask)).flatten()
+            let ask = state.asks.get(record.ask_id.as_deref().unwrap_or(&record.input_id))?;
+            (ask.target_cutex_session_id == record.cutex_session_id && ask.request_input_id()==record.input_id).then(|| request_job(state, state, None, ask)).flatten()
         }
         InputKind::DelegationResult | InputKind::DelegationQuestion | InputKind::DelegationStatus => {
             let delivery = state.deliveries.get(&record.input_id)?;
@@ -1450,11 +1554,12 @@ pub fn backfill_request_item(state: &AskState, record: &InputRecord) -> Option<S
     }
     let turn = record.turn_id.as_deref()?;
     let ask = state.asks.get(record.ask_id.as_deref().unwrap_or(&record.input_id))?;
-    if ask.ask_id != record.input_id || ask.remote.is_some() || ask.target_cutex_session_id != record.cutex_session_id {
+    if ask.remote.is_some() || ask.target_cutex_session_id != record.cutex_session_id {
         return None;
     }
     let mut ran = ask.attempts.iter().filter(|attempt| {
-        attempt.turn_id.as_deref() == Some(turn)
+        super::model::request_occurrence_id(&ask.ask_id,attempt.admission_occurrence)==record.input_id
+            && attempt.turn_id.as_deref() == Some(turn)
             && (attempt.started_at.is_some()
                 || matches!(attempt.state, AttemptState::Running | AttemptState::Answered | AttemptState::Yielded))
     });
@@ -1516,7 +1621,7 @@ pub fn backfill_outcome_unknown(store: &AskStore) -> anyhow::Result<usize> {
                 let input = request_input(ask);
                 Job {
                     session: ask.target_cutex_session_id.clone(),
-                    input_id: ask.ask_id.clone(),
+                    input_id: ask.request_input_id(),
                     steps: vec![
                         step(Next::sending().create(input.clone()), &[ABSENT]),
                         step(Next::uncertain("outcomeUnknown").create(input), &[SENDING]),

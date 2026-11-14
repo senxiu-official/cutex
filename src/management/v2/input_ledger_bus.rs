@@ -770,8 +770,18 @@ pub(crate) fn dismiss_with(
     record: &InputRecord,
     now: DateTime<Utc>,
 ) -> Result<bool, String> {
+    dismiss_id_with(repository,&record.cutex_session_id,&record.input_id,now)
+}
+
+pub(crate) fn dismiss_id_with(
+    repository:&super::agent_bus_state::AgentBusMessageRepository,session:&str,id:&str,now:DateTime<Utc>,
+)->Result<bool,String> {
+    if repository.snapshot_by_message_id(id).map_err(|error|format!("{error:#}"))?
+        .is_some_and(|snapshot|snapshot.to_cutex_session_id!=session) {
+        return Ok(false);
+    }
     let outcome = suppressed(|| {
-        repository.owner_discard(&record.input_id, None, "dismissed by the owner (cutex/input/dismiss)", true, now)
+        repository.owner_discard(id, None, "dismissed by the owner (cutex/input/dismiss)", true, now)
     })
     .map_err(|error| format!("{error:#}"))?;
     match outcome {

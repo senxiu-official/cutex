@@ -123,7 +123,7 @@ async def test_refresh_lock_retries_are_bounded_and_reported(ph, monkeypatch):
     await ph.drain()
     result = ph.store.turn(turn)
     assert result['status'] == 'failed' and client.query_count == 3
-    assert 'sent again 2 time(s)' in result['error']['message']
+    assert 'continuation was sent 2 time(s)' in result['error']['message']
 
 
 async def test_refresh_lock_retry_can_be_disabled(ph, monkeypatch):

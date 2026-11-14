@@ -20,8 +20,9 @@ fn store() -> Result<crate::asks::store::AskStore, String> {
 pub(crate) fn dismiss(record: &InputRecord) -> Result<bool, String> {
     let store = store()?;
     crate::asks::ledger::dismiss(&store, record, chrono::Utc::now())?;
-    // Queued/in-flight deliveries are not withdrawn by the source operation.
-    // Only its durable owner settlement authorizes metadata-tolerant completion.
+    // Native IO cannot be withdrawn. The source settles this exact pending or
+    // queued delivery and releases only its event's registration. Its durable
+    // owner settlement authorizes metadata-tolerant ledger completion.
     store.project_snapshot(|state| {
         record.kind != crate::management::v2::input_ledger::InputKind::DelegationRequest
             && state.deliveries.get(&record.input_id).is_some_and(|delivery|

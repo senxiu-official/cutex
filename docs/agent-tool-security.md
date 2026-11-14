@@ -423,7 +423,7 @@ After a decision on a request the agent retries itself (`managed_service`,
 message through the alarm scheduler (owner `cutex.approvals`, a cutex system notice; since 023 a
 busy agent reads it at its **next step** with no wait, in decision order, one notice per approval
 and outcome; Claude adapters without `soon` and releases before 023: after the turn; the agent's
-own alarms stay after-turn): approved → retry the same call now; denied →
+ordinary alarms follow the configured busy-wake wait): approved → retry the same call now; denied →
 do not retry (with the owner's note). Capability `approval-decision-notice`. Ask deliveries,
 workflow runs and browser claims act on the decision themselves and get no such message.
 

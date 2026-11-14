@@ -295,6 +295,7 @@ impl OwnerCarries {
         let ledger = il::default_ledger()?;
         let mut ids = vec![self.owner.clone()];
         ids.extend(self.ids.iter().cloned());
+        cutex::management::v2::input_disposal::check(&self.session,ids.iter().map(String::as_str))?;
         let records = ledger.get(&self.session, &ids)?;
         anyhow::ensure!(
             records.missing.is_empty(),
@@ -317,6 +318,10 @@ impl OwnerCarries {
             il::publish(&transition)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn check_dispositions(&self)->Result<()> {
+        cutex::management::v2::input_disposal::check(&self.session,self.ids.iter().map(String::as_str))
     }
 
     pub(crate) fn attach(&self, params: &mut Value) {

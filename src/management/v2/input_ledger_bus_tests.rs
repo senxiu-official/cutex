@@ -254,12 +254,12 @@ fn unbound_acceptance_deadline_hands_off_to_its_carrying_turn_once() {
     assert!(f.record("unbound").unwrap().deadline.is_some());
     let bound = Target::Accepted { turn:Some("carrying-turn".into()) };
     f.on(|| drive(TO, "unbound", &input, &bound));
-    assert!(f.record("unbound").unwrap().deadline.is_none());
+    assert!(f.record("unbound").unwrap().deadline.is_none(),"a carrying turn owns receipt grace, not a transport timeout");
     let grace = Utc::now() + chrono::Duration::seconds(60);
     f.on(|| f.ledger.transition(TO, "unbound", input_ledger::Expect::ANY,
         Next::accepted().deadline(Some(grace))).unwrap());
     f.on(|| drive(TO, "unbound", &input, &bound));
-    assert_eq!(f.record("unbound").unwrap().deadline.as_deref(), Some(grace.to_rfc3339_opts(chrono::SecondsFormat::Millis, true).as_str()));
+    assert_eq!(f.record("unbound").unwrap().deadline.as_deref(),Some(grace.to_rfc3339_opts(chrono::SecondsFormat::Millis,true).as_str()),"repeated acceptance preserves explicit turn-end receipt grace");
 }
 
 #[test]
@@ -379,7 +379,8 @@ fn native_statuses_after_submit_are_not_awaiting_receipt() {
         }
     });
     assert_eq!(path(&events, "h").0, ["waiting{afterTurn}", "sending", "waiting{nativeHeld}"]);
-    assert_eq!(f.record("h").unwrap().details, json!({"nativeReason": "plan_mode"}));
+    assert_eq!(f.record("h").unwrap().details["nativeReason"],"plan_mode");
+    assert!(f.record("h").unwrap().details.get("observationDeadline").is_none());
     assert_eq!(path(&events, "r").0, ["waiting{afterTurn}", "sending", "waiting{nativeRetry}"]);
     assert_eq!(path(&events, "c").0, ["waiting{afterTurn}", "sending", "uncertain{nativeConflict}"]);
 }

@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::Path;
@@ -258,7 +260,8 @@ pub fn file_resource(
         ));
     }
     super::host_files::refuse_root_credential_file(&file)?;
-    file_content_value(&file, &rel, &meta, max_bytes)
+    let offset = offset_param(params)?;
+    file_window_value(&file, &rel, offset, max_bytes)
 }
 
 /// `maxBytes` query parameter (default [`DEFAULT_MAX_FILE_BYTES`], at most
@@ -278,26 +281,112 @@ pub fn max_bytes_param(params: &HashMap<String, String>) -> WorkspaceResult<u64>
     }
 }
 
+/// `offset` query parameter (capability `fs-file-window`): the byte the
+/// returned window starts at, at most the file size. `None` = not given (the
+/// plain read: from byte 0, no window checks).
+pub fn offset_param(params: &HashMap<String, String>) -> WorkspaceResult<Option<u64>> {
+    match params.get("offset") {
+        None => Ok(None),
+        Some(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| WorkspaceError::bad_request("offset must be a non-negative integer")),
+    }
+}
+
 /// The shared `fs/file` body for a resolved regular file: `{path, size,
-/// modifiedAt, encoding: utf8|base64, content, truncated, mime}`. `label` is
-/// the reported `path`; its extension picks the mime.
+/// modifiedAt, encoding: utf8|base64, content, truncated, mime, offset,
+/// revision}`. `label` is the reported `path`; its extension picks the mime.
+/// `meta` is the caller's path check; the body reports the opened handle's.
 pub fn file_content_value(
     file: &Path,
     label: &str,
-    meta: &std::fs::Metadata,
+    _meta: &std::fs::Metadata,
+    max_bytes: u64,
+) -> WorkspaceResult<Value> {
+    file_window_value(file, label, None, max_bytes)
+}
+
+/// The file's revision as the opened handle reports it: size and the full
+/// precision modification time (on Unix also the inode and change time). Equal
+/// revisions across windows mean no change a stat can see; it is not an atomic
+/// snapshot.
+fn file_revision(meta: &std::fs::Metadata) -> String {
+    let nanos = |time: std::io::Result<std::time::SystemTime>| match time {
+        Ok(time) => match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(after) => after.as_nanos().to_string(),
+            Err(before) => format!("-{}", before.duration().as_nanos()),
+        },
+        Err(_) => "-".to_string(),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        format!(
+            "{}:{}:{}:{}.{}",
+            meta.len(),
+            nanos(meta.modified()),
+            meta.ino(),
+            meta.ctime(),
+            meta.ctime_nsec()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        format!("{}:{}", meta.len(), nanos(meta.modified()))
+    }
+}
+
+/// One window of a file: at most `max_bytes` from byte `offset`. `truncated`
+/// = bytes follow the window. A UTF-8 window ends at a character boundary (its
+/// `content` may be a few bytes shorter than `max_bytes`); the next window
+/// starts at `offset` + the UTF-8 length of `content`. A window that starts
+/// inside a character is not text (base64).
+///
+/// With an explicit `offset` (capability `fs-file-window`) the read is checked:
+/// the opened handle's revision before and after the read must match (else 409
+/// `file_changed`), and a UTF-8 window in which not even one whole character
+/// fits is 400 `window_too_small` (a client would never advance). Without one
+/// it is the plain read it always was.
+pub fn file_window_value(
+    file: &Path,
+    label: &str,
+    offset: Option<u64>,
     max_bytes: u64,
 ) -> WorkspaceResult<Value> {
     super::host_files::refuse_root_credential_file(file)?;
-    let mut bytes = Vec::with_capacity(meta.len().min(max_bytes) as usize);
-    std::fs::File::open(file)
-        .and_then(|handle| handle.take(max_bytes).read_to_end(&mut bytes))
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::PermissionDenied => {
-                WorkspaceError::new(403, "permission_denied", "the file cannot be read")
-            }
-            _ => WorkspaceError::internal(error),
-        })?;
-    let truncated = meta.len() > bytes.len() as u64;
+    let windowed = offset.is_some();
+    let offset = offset.unwrap_or(0);
+    let read_error = |error: std::io::Error| match error.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            WorkspaceError::new(403, "permission_denied", "the file cannot be read")
+        }
+        _ => WorkspaceError::internal(error),
+    };
+    let mut handle = std::fs::File::open(file).map_err(read_error)?;
+    let meta = handle.metadata().map_err(read_error)?;
+    if offset > meta.len() {
+        return Err(WorkspaceError::bad_request(
+            "offset is past the end of the file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity((meta.len() - offset).min(max_bytes) as usize);
+    if offset > 0 {
+        handle.seek(SeekFrom::Start(offset)).map_err(read_error)?;
+    }
+    (&mut handle)
+        .take(max_bytes)
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    let revision = file_revision(&meta);
+    if windowed && file_revision(&handle.metadata().map_err(read_error)?) != revision {
+        return Err(WorkspaceError::new(
+            409,
+            "file_changed",
+            "the file changed while it was read",
+        ));
+    }
+    let truncated = meta.len() > offset + bytes.len() as u64;
     let mime_hint = mime_for(label);
     let text = if always_binary(mime_hint) || bytes[..bytes.len().min(8192)].contains(&0) {
         None
@@ -306,6 +395,13 @@ pub fn file_content_value(
             Ok(text) => Some(text.to_string()),
             // A multi-byte character cut by the size cap is still text.
             Err(error) if truncated && error.error_len().is_none() => {
+                if windowed && error.valid_up_to() == 0 {
+                    return Err(WorkspaceError::new(
+                        400,
+                        "window_too_small",
+                        "no whole character fits in maxBytes at this offset",
+                    ));
+                }
                 Some(String::from_utf8_lossy(&bytes[..error.valid_up_to()]).into_owned())
             }
             Err(_) => None,
@@ -327,6 +423,8 @@ pub fn file_content_value(
         "content": content,
         "truncated": truncated,
         "mime": mime,
+        "offset": offset,
+        "revision": revision,
     }))
 }
 
@@ -1155,6 +1253,121 @@ mod tests {
                 .code,
             "invalid_request"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_windows_assemble_the_whole_file_at_character_boundaries() {
+        let (dir, root) = temp_root("window");
+        // 'é' is two bytes: a 5-byte window cuts inside one every other time.
+        let text = "<p>héllo wörld é é é</p>".repeat(3);
+        std::fs::write(dir.join("p.html"), &text).unwrap();
+        let plain =
+            file_resource(&root, &params(&[("path", "p.html"), ("maxBytes", "5")])).unwrap();
+        assert_eq!(plain["offset"], 0);
+        assert!(plain["revision"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{}:", text.len())));
+        let mut assembled = String::new();
+        let mut offset = 0u64;
+        loop {
+            let at = offset.to_string();
+            let window = file_resource(
+                &root,
+                &params(&[
+                    ("path", "p.html"),
+                    ("maxBytes", "5"),
+                    ("offset", at.as_str()),
+                ]),
+            )
+            .unwrap();
+            assert_eq!(window["encoding"], "utf8");
+            assert_eq!(window["offset"], offset);
+            assert_eq!(window["size"], text.len() as u64);
+            assert_eq!(window["mime"], "text/html");
+            assert_eq!(window["revision"], plain["revision"]);
+            let content = window["content"].as_str().unwrap();
+            assert!(!content.is_empty());
+            assembled.push_str(content);
+            offset += content.len() as u64;
+            assert_eq!(window["truncated"], offset < text.len() as u64);
+            if window["truncated"] == false {
+                break;
+            }
+        }
+        assert_eq!(assembled, text);
+        // At the end: empty and not truncated; past it: refused.
+        let end = text.len().to_string();
+        let tail = file_resource(
+            &root,
+            &params(&[("path", "p.html"), ("offset", end.as_str())]),
+        )
+        .unwrap();
+        assert_eq!(tail["content"], "");
+        assert_eq!(tail["truncated"], false);
+        let past = (text.len() + 1).to_string();
+        for bad in [past.as_str(), "-1", "x"] {
+            assert_eq!(
+                file_resource(&root, &params(&[("path", "p.html"), ("offset", bad)]))
+                    .unwrap_err()
+                    .code,
+                "invalid_request"
+            );
+        }
+        // A window starting inside 'é' is not text.
+        let inside = file_resource(&root, &params(&[("path", "p.html"), ("offset", "5")])).unwrap();
+        assert_eq!(inside["encoding"], "base64");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_window_too_small_for_one_character_is_refused_not_empty() {
+        let (dir, root) = temp_root("tiny");
+        std::fs::write(dir.join("e.txt"), "\u{1F600}x").unwrap();
+        for max in ["1", "2", "3"] {
+            let error = file_resource(
+                &root,
+                &params(&[("path", "e.txt"), ("maxBytes", max), ("offset", "0")]),
+            )
+            .unwrap_err();
+            assert_eq!((error.status, error.code), (400, "window_too_small"));
+            // The plain read (no offset) keeps its old answer: an empty cut.
+            let plain =
+                file_resource(&root, &params(&[("path", "e.txt"), ("maxBytes", max)])).unwrap();
+            assert_eq!(
+                (plain["content"].as_str(), plain["truncated"].as_bool()),
+                (Some(""), Some(true))
+            );
+        }
+        let four = file_resource(
+            &root,
+            &params(&[("path", "e.txt"), ("maxBytes", "4"), ("offset", "0")]),
+        )
+        .unwrap();
+        assert_eq!(four["content"], "\u{1F600}");
+        assert_eq!(four["truncated"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_revision_tracks_same_length_rewrites() {
+        let (dir, root) = temp_root("revision");
+        let path = dir.join("r.html");
+        std::fs::write(&path, "aaaa").unwrap();
+        let first = file_resource(&root, &params(&[("path", "r.html"), ("offset", "0")])).unwrap();
+        // Same length, new content and a later full-precision mtime: the revision differs, even
+        // when the millisecond modifiedAt cannot tell them apart.
+        std::fs::write(&path, "bbbb").unwrap();
+        let handle = std::fs::File::options().write(true).open(&path).unwrap();
+        let later = std::fs::metadata(&path).unwrap().modified().unwrap()
+            + std::time::Duration::from_nanos(300);
+        handle.set_modified(later).unwrap();
+        drop(handle);
+        let second = file_resource(&root, &params(&[("path", "r.html"), ("offset", "0")])).unwrap();
+        assert_eq!(second["content"], "bbbb");
+        assert_eq!(first["size"], second["size"]);
+        assert_ne!(first["revision"], second["revision"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

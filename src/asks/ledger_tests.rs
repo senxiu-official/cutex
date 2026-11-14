@@ -363,7 +363,7 @@ fn request_rejected_and_cancelled_leave_next_up() {
 }
 
 #[test]
-fn request_outcome_unknown_is_uncertain_and_dismiss_closes_it_without_a_retry() {
+fn request_outcome_unknown_disposal_closes_stopped_without_retry() {
     let mut run = Run::new();
     let ask = create(&mut run, "u");
     set(&mut run, &ask, |ask| ask.execution = ExecutionState::Queued);
@@ -382,13 +382,14 @@ fn request_outcome_unknown_is_uncertain_and_dismiss_closes_it_without_a_retry() 
     assert!(il::dismissible(&record));
     assert_eq!(record.deadline, None, "uncertain never expires (decision 9)");
 
-    // dismiss: the open delegation closes `stopped`; no command, no retry.
+    // Owner decision 9: close the interrupted unknown-outcome request without
+    // issuing native stop or inventing a retry.
     let (store, dir) = temp_store("ledger-dismiss");
     let state = run.state.clone();
     store.with_state(|stored| *stored = state).unwrap();
     dismiss(&store, &record, now()).unwrap();
     let after = store.snapshot().unwrap();
-    assert_eq!(after.asks[&ask].closed, Some(CloseOutcome::Stopped));
+    assert_eq!(after.asks[&ask].closed,Some(CloseOutcome::Stopped));
     assert_eq!(after.asks[&ask].execution, ExecutionState::Interrupted, "no retry");
     assert_eq!(after.asks[&ask].attempts.len(), 1);
     assert!(after.commands.is_empty(), "no native stop");
@@ -762,6 +763,105 @@ fn lease_view_and_release_need_a_stale_unchanged_lease() {
     assert!(unread_after.state == DeliveryState::Pending && unread_after.passive, "never sent again");
     assert!(crate::asks::delivery::requesters_with_pending(&after).is_empty());
     assert_eq!(lease_release(&store, REQUESTER, &stale, now()).unwrap_err().code, "lease_changed");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn failed_owner_carry_discard_queued_event_releases_source_and_slot() {
+    use crate::asks::model::{AdmissionLease, LeaseHolder};
+    let mut run = Run::new();
+    let (_, id) = answered(&mut run, "rover-queued-discard");
+    let record = run.record(REQUESTER, &id);
+    let (store, dir) = temp_store("rover-queued-discard");
+    store.with_state(|state| {
+        *state = run.state.clone();
+        let event = crate::asks::delivery::coalesce_into_event(state, REQUESTER,
+            "cutex-ask-owner-rover", now()).unwrap();
+        state.next_step_leases.insert(REQUESTER.into(), AdmissionLease {
+            cutex_session_id: REQUESTER.into(), holder: LeaseHolder::Event { event_id:event },
+            native_message_id:"cutex-ask-owner-rover".into(), turn_id:None,
+            runtime_generation:1, since:crate::asks::now_rfc3339(now()),
+        });
+    }).unwrap();
+    dismiss(&store, &record, now()).unwrap();
+    let after = store.snapshot().unwrap();
+    assert_eq!(after.deliveries[&id].state, DeliveryState::Acknowledged);
+    assert_eq!(after.deliveries[&id].settled_by.as_deref(), Some(DISMISSED));
+    assert!(after.events.is_empty());
+    let changes = crate::asks::store::ask_state_changes(&run.state, &after).unwrap();
+    run.apply(store_jobs(&run.state.clone(), &after, &changes));
+    assert_eq!(run.record(REQUESTER, &id).state, InputState::Discarded);
+    store.with_state(|state| crate::asks::delivery::acknowledge_event(state,
+        "old-removed-event", "late-turn", now())).unwrap();
+    assert_eq!(store.snapshot().unwrap().deliveries[&id], after.deliveries[&id]);
+    assert!(!after.next_step_leases.contains_key(REQUESTER));
+    assert_eq!(crate::asks::returns::results_admissible(&after, REQUESTER), Some(None));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn failed_owner_carry_discard_mixed_batch_marks_unknown_and_fences_late_receipts() {
+    use crate::asks::model::{AdmissionLease, LeaseHolder};
+    let mut run = Run::new();
+    let (_, dismissed) = answered(&mut run, "mixed-discard");
+    let (_, sibling) = answered(&mut run, "mixed-sibling");
+    let record = run.record(REQUESTER, &dismissed);
+    let (store, dir) = temp_store("mixed-discard");
+    let event_id = store.with_state(|state| {
+        *state = run.state.clone();
+        let event = crate::asks::delivery::coalesce_into_event(state, REQUESTER, "cutex-ask-owner-mixed", now()).unwrap();
+        state.next_step_leases.insert(REQUESTER.into(), AdmissionLease {
+            cutex_session_id: REQUESTER.into(), holder: LeaseHolder::Event {event_id:event.clone()},
+            native_message_id:"cutex-ask-owner-mixed".into(), turn_id:None, runtime_generation:1,
+            since:crate::asks::now_rfc3339(now()),
+        });
+        event
+    }).unwrap();
+    let artifact = store.put_artifact(b"original frozen batch", "text/plain", &[], None, now()).unwrap();
+    store.with_state(|state| {
+        let event = state.events.get_mut(&event_id).unwrap();
+        event.event_artifact = Some(artifact);
+        event.view = Some(serde_json::json!({"schema":"cutex.delegation-results.v1","data":{
+            "items":[{"kind":"answer","askId":"mixed-a"},{"kind":"answer","askId":"mixed-b"}]}}));
+    }).unwrap();
+    let before = store.snapshot().unwrap();
+    let original = crate::asks::returns::event_submission(&before,&before.events[&event_id],"original frozen batch".into());
+    dismiss(&store, &record, now()).unwrap();
+    let after = store.snapshot().unwrap();
+    assert!(!after.events.contains_key(&event_id));
+    assert_eq!(store.read_artifact(before.events[&event_id].event_artifact.as_deref().unwrap(),None).unwrap().unwrap().1,
+        b"original frozen batch");
+    assert_eq!(original.message_id,"cutex-ask-owner-mixed");
+    assert_eq!(after.deliveries[&sibling].state,DeliveryState::Pending);
+    assert!(after.deliveries[&sibling].passive,"unknown sibling must never be resent");
+    assert_eq!(after.deliveries[&sibling].settled_by.as_deref(),Some(crate::asks::RESULTS_OUTCOME_UNKNOWN));
+    assert!(!after.next_step_leases.contains_key(REQUESTER));
+    let changes = crate::asks::store::ask_state_changes(&before, &after).unwrap();
+    run.apply(store_jobs(&before, &after, &changes));
+    assert_eq!(run.record(REQUESTER, &dismissed).state, InputState::Discarded);
+    let replacement = AdmissionLease {
+        cutex_session_id:REQUESTER.into(), holder:LeaseHolder::Event {event_id:"new-event".into()},
+        native_message_id:"cutex-ask-owner-new-message".into(), turn_id:None, runtime_generation:2,
+        since:crate::asks::now_rfc3339(now()),
+    };
+    store.with_state(|state| {
+        let mut new_event = before.events[&event_id].clone();
+        new_event.event_id = "new-event".into();
+        new_event.native_message_id = replacement.native_message_id.clone();
+        new_event.delivery_ids.clear();
+        state.events.insert(new_event.event_id.clone(), new_event);
+        state.next_step_leases.insert(REQUESTER.into(),replacement.clone());
+        crate::asks::delivery::acknowledge_event(state,&event_id,"late-old-turn",now());
+        crate::asks::returns::remove_event_lease(state,REQUESTER,&event_id);
+    }).unwrap();
+    let late = store.snapshot().unwrap();
+    assert_eq!(late.deliveries[&dismissed], after.deliveries[&dismissed]);
+    assert_eq!(late.deliveries[&sibling],after.deliveries[&sibling]);
+    assert_eq!(late.next_step_leases[REQUESTER], replacement);
+    let changes = crate::asks::store::ask_state_changes(&after, &late).unwrap();
+    run.apply(store_jobs(&after, &late, &changes));
+    assert_eq!(run.record(REQUESTER, &dismissed).state, InputState::Discarded);
+    assert_eq!(run.record(REQUESTER, &sibling).state, InputState::Uncertain);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1584,4 +1684,157 @@ fn dismissed_result_recovers_after_late_retry_metadata_and_on_rebuild() {
     run.apply(dismissed);
     run.apply(delayed);
     assert_eq!(run.record(REQUESTER, &id), done, "replay cannot resurrect the dismissed attempt");
+}
+
+#[test]
+fn disposed_request_occurrence_stays_closed_but_explicit_new_work_enters_normally() {
+    let mut run=Run::new();
+    let ask_id=create(&mut run,"occurrence");
+    let old=run.record(TARGET,&ask_id);
+    crate::management::v2::input_disposal::request_at(&run.root.join(il::DATABASE_FILE),TARGET,&old.input_id,Utc::now()).unwrap();
+    let discarded=run.ledger.transition(TARGET,&old.input_id,Expect::ANY,Next::discarded("ownerDiscarded")).unwrap();
+    assert_eq!(discarded.record.state,InputState::Discarded);
+    set(&mut run,&ask_id,|ask| {ask.execution=ExecutionState::Interrupted;});
+    let mut newer=None;
+    run.write(|state| {newer=Some(super::super::lifecycle::retry(state,&ask_id,None,Utc::now()).unwrap());});
+    let newer=newer.unwrap();
+    assert_ne!(newer.request_input_id(),old.input_id);
+    assert_eq!(newer.ask_id,ask_id);
+    let row=run.record(TARGET,&newer.request_input_id());
+    assert_eq!(row.state,InputState::Waiting);
+    assert_eq!(row.ask_id.as_deref(),Some(ask_id.as_str()));
+    let old_row=run.record(TARGET,&old.input_id);
+    assert_eq!(old_row.state,InputState::Discarded);
+    // A stale source job for occurrence zero cannot reopen either identity.
+    let before=AskState::default();
+    let old_ask=AskState::provisional(&new_ask("stale","unused"),Utc::now());
+    let mut old_ask=old_ask;old_ask.ask_id=ask_id.clone();
+    if let Some(job)=request_job(&before,&run.state,None,&old_ask){run.apply(vec![job]);}
+    assert_eq!(run.record(TARGET,&old.input_id).state,InputState::Discarded);
+    assert_eq!(run.record(TARGET,&newer.request_input_id()).state,InputState::Waiting);
+}
+
+#[test]
+fn delivery_recipient_transfer_retires_old_tracking_without_acknowledging_new_recipient() {
+    let mut run=Run::new();
+    let (ask,id)=answered(&mut run,"transfer");
+    assert_eq!(run.record(REQUESTER,&id).state,InputState::Waiting);
+    run.write(|state| {state.deliveries.get_mut(&id).unwrap().routed_to=Some(TARGET.into());});
+    let old=run.record(REQUESTER,&id);
+    assert_eq!((old.state,old.surface),(InputState::Discarded,Surface::None));
+    assert_eq!(run.record(TARGET,&id).state,InputState::Waiting);
+    let (store,_dir)=temp_store("recipient-scope");
+    store.with_state(|state|*state=run.state.clone()).unwrap();
+    dismiss(&store,&old,now()).unwrap();
+    let after=store.snapshot().unwrap();
+    assert_eq!(after.deliveries[&id].state,DeliveryState::Pending);
+    assert_eq!(after.deliveries[&id].routed_to.as_deref(),Some(TARGET));
+    assert_eq!(after.asks[&ask].closed,run.state.asks[&ask].closed);
+}
+
+#[test]
+fn r47_unknown_terminal_request_and_result_disposal_keep_stopped_semantics() {
+    for failed in [false,true] {
+        for raw in [false,true] {
+            for result in [false,true] {
+                let mut run=Run::new();
+                let (ask,id)=if result {answered(&mut run,"unknown-result")} else {
+                    let ask=create(&mut run,"unknown-request");(ask.clone(),ask)
+                };
+                set(&mut run,&ask,|ask| {
+                    ask.execution=if failed {ExecutionState::Failed} else {ExecutionState::Interrupted};
+                    let mut unknown=attempt(AttemptState::Interrupted,None);
+                    unknown.interrupt_reason=Some(InterruptReason::OutcomeUnknown);ask.attempts=vec![unknown];
+                });
+                let session=if result {REQUESTER} else {TARGET};
+                let record=run.record(session,&id);
+                let (store,_dir)=temp_store("decision9-restored");
+                store.with_state(|state|*state=run.state.clone()).unwrap();
+                if raw {assert!(dismiss_input_id(&store,session,&id,now()).unwrap());}
+                else {dismiss(&store,&record,now()).unwrap();}
+                let source=store.snapshot().unwrap();
+                assert_eq!(source.asks[&ask].closed,Some(CloseOutcome::Stopped));
+                assert_eq!(source.asks[&ask].execution,if failed {ExecutionState::Failed} else {ExecutionState::Interrupted});
+                assert!(source.commands.is_empty());assert_eq!(source.asks[&ask].attempts.len(),1);
+                if result {assert_eq!(source.deliveries[&id].settled_by.as_deref(),Some(DISMISSED));}
+            }
+        }
+    }
+}
+
+#[test]
+fn r47_disposal_does_not_close_running_work_or_a_different_request_occurrence() {
+    for raw in [false,true] {
+        let mut run=Run::new();let (ask,id)=answered(&mut run,"new-running-work");
+        set(&mut run,&ask,|ask| {
+            ask.execution=ExecutionState::Running;
+            let mut next=attempt(AttemptState::Submitting,None);next.admission_occurrence=1;
+            ask.admission_occurrence=1;ask.attempts=vec![next];
+        });
+        let record=run.record(REQUESTER,&id);
+        let (store,_dir)=temp_store("running-not-stopped");
+        store.with_state(|state|*state=run.state.clone()).unwrap();
+        if raw {dismiss_input_id(&store,REQUESTER,&id,now()).unwrap();} else {dismiss(&store,&record,now()).unwrap();}
+        let source=store.snapshot().unwrap();
+        assert_eq!(source.asks[&ask].execution,ExecutionState::Running);assert_eq!(source.asks[&ask].closed,None);
+
+        let mut run=Run::new();let ask=create(&mut run,"old-request-occurrence");
+        let old=run.record(TARGET,&ask);
+        set(&mut run,&ask,|ask| {
+            ask.execution=ExecutionState::Interrupted;ask.admission_occurrence=1;
+            let mut next=attempt(AttemptState::Interrupted,None);next.admission_occurrence=1;
+            next.interrupt_reason=Some(InterruptReason::OutcomeUnknown);ask.attempts=vec![next];
+        });
+        let (store,_dir)=temp_store("old-occurrence-not-stopped");
+        store.with_state(|state|*state=run.state.clone()).unwrap();
+        if raw {assert!(!dismiss_input_id(&store,TARGET,&old.input_id,now()).unwrap());} else {dismiss(&store,&old,now()).unwrap();}
+        let source=store.snapshot().unwrap();assert_eq!(source.asks[&ask].closed,None);
+        assert_eq!(source.asks[&ask].admission_occurrence,1);
+    }
+}
+
+#[test]
+fn r1_current_terminal_requests_close_for_restart_or_peer_removal_but_results_do_not() {
+    for reason in [InterruptReason::RuntimeRestart,InterruptReason::PeerRemoved] {
+        for failed in [false,true] {
+            for raw in [false,true] {
+                for result in [false,true] {
+                    let mut run=Run::new();
+                    let (ask,id)=if result {answered(&mut run,"known-interruption-result")} else {
+                        let ask=create(&mut run,"known-interruption-request");(ask.clone(),ask)
+                    };
+                    if !result {
+                        // Reproduce submitted but never ran: admission receipt
+                        // first, then interruption without started_at/turn.
+                        set(&mut run,&ask,|ask| {
+                            ask.execution=ExecutionState::Admitted;
+                            ask.attempts=vec![attempt(AttemptState::Admitted,None)];
+                        });
+                        assert_eq!(run.record(TARGET,&id).state,InputState::Sending);
+                    }
+                    set(&mut run,&ask,|ask| {
+                        ask.execution=if failed {ExecutionState::Failed} else {ExecutionState::Interrupted};
+                        let mut ended=attempt(AttemptState::Interrupted,None);
+                        ended.interrupt_reason=Some(reason);ask.attempts=vec![ended];
+                    });
+                    let session=if result {REQUESTER} else {TARGET};
+                    let record=run.record(session,&id);
+                    if !result && !failed {
+                        assert_eq!(record.state,InputState::Uncertain);
+                        assert_eq!(record.reason.as_deref(),Some("turnInterrupted"));
+                        assert!(il::dismissible(&record));
+                    }
+                    let (store,_dir)=temp_store("terminal-request-reason");
+                    store.with_state(|state|*state=run.state.clone()).unwrap();
+                    if raw {assert!(dismiss_input_id(&store,session,&id,now()).unwrap());}
+                    else {dismiss(&store,&record,now()).unwrap();}
+                    let source=store.snapshot().unwrap();
+                    assert_eq!(source.asks[&ask].closed,if result {None} else {Some(CloseOutcome::Stopped)});
+                    assert_eq!(source.asks[&ask].execution,if failed {ExecutionState::Failed} else {ExecutionState::Interrupted});
+                    assert!(source.commands.is_empty());assert_eq!(source.asks[&ask].attempts.len(),1);
+                    if result {assert_eq!(source.deliveries[&id].settled_by.as_deref(),Some(DISMISSED));}
+                }
+            }
+        }
+    }
 }

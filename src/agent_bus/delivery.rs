@@ -72,15 +72,12 @@ pub fn wake_busy_wait() -> Option<std::time::Duration> {
     crate::config::agent_bus::current().wake_busy_wait()
 }
 
-/// System alarms always reach a busy recipient after its running turn
-/// (task 01): an agent's own reminders are never held for, or upgraded to,
-/// the busy-wake next-step timing on either runtime. Legacy alarms carry only
-/// the sender. The exception is an approval decision notice (023,
-/// [`is_approval_notice`]): it is read at the next step with no wait.
-pub fn always_after_turn(message: &crate::agent_bus::model::AgentBusMessage) -> bool {
-    (message.sender_kind.is_alarm_system()
-        || message.from == crate::agent_bus::alarms::ALARM_SYSTEM_SENDER)
-        && !is_approval_notice(message)
+/// Alarm identity, including legacy messages identified only by their sender.
+/// This is a display/provenance classification, not a delivery timing rule:
+/// ordinary alarms follow the same configured busy-wake wait as other wakes.
+pub fn is_alarm(message: &crate::agent_bus::model::AgentBusMessage) -> bool {
+    message.sender_kind.is_alarm_system()
+        || message.from == crate::agent_bus::alarms::ALARM_SYSTEM_SENDER
 }
 
 /// An owner-approval decision notice (023): a system alarm of the

@@ -259,13 +259,13 @@ fn late_native_evidence_after_the_retraction_is_a_no_op() {
         // Claude contextPersisted, Codex clientId echo, A4 receipt, history read.
         for evidence in [Evidence::ContextPersisted, Evidence::ClientIdEcho, Evidence::A4Receipt, Evidence::HistoryRead] {
             let late = f.ledger.transition("s1", id, Expect::ANY, Next::in_context(evidence).turn("t2"));
-            assert!(matches!(late, Err(LedgerError::ForbiddenEdge { .. })), "{id} {evidence}: {late:?}");
+            assert!(matches!(&late,Err(LedgerError::ForbiddenEdge{..}))||late.as_ref().is_ok_and(|done|!done.changed),"{id} {evidence}: {late:?}");
         }
         let accepted = f.ledger.transition("s1", id, Expect::ANY, Next::accepted().stage(Stage::Offered));
-        assert!(matches!(accepted, Err(LedgerError::ForbiddenEdge { .. })), "{id}: {accepted:?}");
+        assert!(matches!(&accepted,Err(LedgerError::ForbiddenEdge{..}))||accepted.as_ref().is_ok_and(|done|!done.changed),"{id}: {accepted:?}");
         // r274.1 timeline-id backfill / native item bind.
         let bind = f.ledger.bind_timeline_item("s1", id, Expect::ANY, "late-item", None);
-        assert!(matches!(bind, Err(LedgerError::Invalid(_))), "{id}: {bind:?}");
+        assert!(matches!(&bind,Err(LedgerError::Invalid(_)))||bind.as_ref().is_ok_and(|done|!done.changed),"{id}: {bind:?}");
         assert!(!super::super::input_ledger_bind::candidate(&record));
         // Owner native item / turn start / steer echo / history read: no write.
         for step in [
@@ -285,7 +285,7 @@ fn late_native_evidence_after_the_retraction_is_a_no_op() {
         assert!(record.actions.is_empty());
         assert!(!il::dismissible(&record));
         assert!(!super::super::input_ledger_settle::retryable(&record));
-        assert!(il::dismiss_one(&f.ledger, "s1", id, record.rev).is_err());
+        assert!(!il::dismiss_one(&f.ledger,"s1",id,record.rev).unwrap().changed,"already disposed is idempotent");
         assert_eq!(f.get(id), record);
         assert_eq!(f.head("s1"), head);
     }

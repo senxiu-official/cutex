@@ -3135,7 +3135,7 @@ fn ridealong_detail(
     use super::admission::ridealong_preview;
     let display_source = || message.display_source.as_deref().map(str::trim).filter(|name| !name.is_empty())
         .map(str::to_string);
-    if crate::agent_bus::delivery::always_after_turn(message) || crate::agent_bus::delivery::is_approval_notice(message) {
+    if crate::agent_bus::delivery::is_alarm(message) {
         // A legacy alarm envelope carries the old `[message from …] ` prefix.
         let legacy = format!("[message from {}] ", crate::agent_bus::alarms::ALARM_SYSTEM_SENDER);
         let preview = ridealong_preview(message.content.strip_prefix(&legacy).unwrap_or(&message.content));
@@ -3212,9 +3212,8 @@ fn ridealong_detail(
 /// Bootstrap fields of a message no agent sent (alarm, Job Service, owner …;
 /// no `fromCutexSessionId`): `sender` = the canonical sender id (e.g.
 /// `Cutex Alarm`, `cutex-job-service`), `senderKind` (`alarm_service`,
-/// `job_service`, …), `queuedAt`, and `afterTurnOnly: true` for a message a
-/// busy recipient reads only after its running turn (system alarms are never
-/// read early at the next step, whatever `agent_bus.wake_busy_wait_secs`).
+/// `job_service`, …) and `queuedAt`. Alarms use the common busy-wake policy;
+/// admission and wakeSchedule report its current timing/deadline.
 fn system_sender_fields(canonical: &AgentBusMessage) -> serde_json::Map<String, Value> {
     let mut fields = serde_json::Map::new();
     fields.insert("sender".into(), json!({ "id": canonical.from, "name": null, "runtime": null }));
@@ -3223,9 +3222,6 @@ fn system_sender_fields(canonical: &AgentBusMessage) -> serde_json::Map<String, 
         .filter(|_| canonical.created_at_epoch_secs > 0)
     {
         fields.insert("queuedAt".into(), json!(at.to_rfc3339()));
-    }
-    if crate::agent_bus::delivery::always_after_turn(canonical) {
-        fields.insert("afterTurnOnly".into(), json!(true));
     }
     fields
 }
@@ -4487,9 +4483,6 @@ fn bus_admission_timing(
     wait: Option<std::time::Duration>,
 ) -> (String, Option<String>) {
     use crate::app_server::external_input::Delivery;
-    if crate::agent_bus::delivery::always_after_turn(message) {
-        return ("afterTurn".into(), None);
-    }
     // An approval decision notice waits for nothing (023).
     let wait = if crate::agent_bus::delivery::is_approval_notice(message) { Some(std::time::Duration::ZERO) } else { wait };
     if let Some(frozen) = frozen {
@@ -5483,7 +5476,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_timing_matches_busy_wake_deadline_and_alarm_exception() {
+    fn admission_timing_matches_busy_wake_deadline_for_alarms() {
         use std::time::Duration;
         let mut message = system_queued_message("private").canonical_envelope;
         message.created_at_epoch_secs = 100;
@@ -5497,8 +5490,91 @@ mod tests {
             ("nextStep".into(), None));
         assert_eq!(bus_admission_timing(&message, None, due, None), ("afterTurn".into(), None));
         message.sender_kind = crate::agent_bus::model::AgentMessageKind::AlarmSystem;
+        message.from = crate::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
+        assert_eq!(bus_admission_timing(&message, None, before, Some(Duration::from_secs(120))),
+            ("afterTurn".into(), Some(due.to_rfc3339())));
+        assert_eq!(bus_admission_timing(&message, None, due, Some(Duration::from_secs(120))),
+            ("nextStep".into(), None));
         assert_eq!(bus_admission_timing(&message, None, due, Some(Duration::ZERO)),
-            ("afterTurn".into(), None));
+            ("nextStep".into(), None));
+        assert_eq!(bus_admission_timing(&message, None, due, None), ("afterTurn".into(), None));
+        // Existing native submissions are immutable: a policy change must
+        // not alter an accepted delivery mode or its digest.
+        let mut frozen: crate::app_server::external_input::Envelope=serde_json::from_value(json!({
+            "version":1,"ownerId":"owner","threadId":"thread","runtimeGeneration":1,
+            "message":{"id":"frozen-alarm","source":{"kind":"service","id":"Cutex Alarm"},
+                "type":"alarm","delivery":"after_turn","text":"reminder"},"semanticSha256":"0".repeat(64)
+        })).unwrap();
+        frozen.semantic_sha256=frozen.digest();frozen.validate().unwrap();
+        let original=frozen.clone();
+        assert_eq!(bus_admission_timing(&message,Some(&frozen),due,Some(Duration::ZERO)),("afterTurn".into(),None));
+        assert_eq!(frozen,original);
+        frozen.message.id="frozen-soon-alarm".into();
+        frozen.message.delivery=crate::app_server::external_input::Delivery::Soon;
+        frozen.semantic_sha256=frozen.digest();frozen.validate().unwrap();
+        assert_eq!(bus_admission_timing(&message,Some(&frozen),due,None),("nextStep".into(),None));
+        message.external_message_id = Some(format!("{}fixture", crate::agent_bus::alarms::APPROVAL_NOTICE_MESSAGE_PREFIX));
+        assert_eq!(bus_admission_timing(&message, None, before, Some(Duration::from_secs(120))),
+            ("nextStep".into(), None), "023 approval notices retain their zero-wait exception");
+        assert_eq!(bus_admission_timing(&message, None, before, None), ("nextStep".into(), None));
+    }
+
+    #[test]
+    fn alarm_busy_wake_projection_carries_deadline_into_input_ledger() {
+        use crate::management::v2::{input_ledger as il, input_ledger_bus, input_ledger_wake};
+        use crate::agent_bus::busy_delivery::Capability;
+        use std::time::Duration;
+        let root=std::env::temp_dir().join(format!("alarm-wake-ledger-{}",uuid::Uuid::new_v4()));
+        let repository=AgentBusMessageRepository::open(&root).unwrap();
+        let mut queued=system_queued_message("private reminder");
+        queued.canonical_envelope.sender_kind=crate::agent_bus::model::AgentMessageKind::AlarmSystem;
+        queued.canonical_envelope.from=crate::agent_bus::alarms::ALARM_SYSTEM_SENDER.into();
+        queued.canonical_envelope.control_type=None;
+        queued.canonical_envelope.created_at_epoch_secs=100;
+        let target=queued.to_cutex_session_id.clone();
+        repository.record_queued_isolated(queued).unwrap();
+        let stored=persisted_store(&root).messages.into_values().next().unwrap();
+        let message=stored.canonical_envelope.as_ref().unwrap();
+        let ledger=il::InputLedger::open(root.join("alarm-ledger.sqlite3"));
+        let input=input_ledger_bus::new_input(Some(message),&message.id,None,"after_turn",&message.content,None);
+        assert_eq!(input.kind,il::InputKind::Alarm);
+        let record=ledger.transition(&target,&message.id,il::Expect::NEW,il::Next::waiting("afterTurn").create(input)).unwrap().record;
+        let asks=crate::asks::store::AskState::default();
+        let project=|seconds,wait| AgentBusMessageRepository::project_pending_admission(&stored,&target,&asks,
+            DateTime::<Utc>::from_timestamp(seconds,0).unwrap(),wait,&|_|false).unwrap();
+        let wait=Some(Duration::from_secs(120));
+        let before=project(219,wait);
+        assert_eq!(before.delivery_kind,"alarm");
+        assert_eq!(before.timing,"afterTurn");
+        assert_eq!(before.next_step_at,Some(DateTime::<Utc>::from_timestamp(220,0).unwrap().to_rfc3339()));
+        let schedule=input_ledger_wake::project(&record,true,Capability::Soon,Some(&before),wait,None).unwrap();
+        assert_eq!(schedule.next_step_at,before.next_step_at);
+        let change=ledger.annotate_wake_schedule(&target,&message.id,il::Expect::rev(record.rev),Some(schedule)).unwrap();
+        assert_eq!(change.record.kind,il::InputKind::Alarm);
+        assert_eq!(change.record.intent,record.intent);
+        assert_eq!(change.record.deadline,record.deadline,"wake deadline is metadata, never an expiry");
+        let event=il::state_changed_event(&change);
+        crate::management::v2::contract_validation::validate_cutex_event_message(&event).unwrap();
+        assert_eq!(event["params"]["record"]["kind"],"alarm");
+        assert_eq!(event["params"]["record"]["wakeSchedule"]["nextStepAt"],before.next_step_at.clone().unwrap());
+        let due=project(220,wait);
+        assert_eq!(due.timing,"nextStep");assert!(due.next_step_at.is_none());
+        let schedule=input_ledger_wake::project(&change.record,true,Capability::Soon,Some(&due),wait,None).unwrap();
+        assert_eq!(schedule.timing,"nextStep");assert!(schedule.next_step_at.is_none());
+        let latest=ledger.annotate_wake_schedule(&target,&message.id,il::Expect::rev(change.record.rev),Some(schedule.clone())).unwrap();
+        assert_eq!(serde_json::to_value(&latest.record).unwrap()["wakeSchedule"]["timing"],"nextStep");
+        let reopened=il::InputLedger::open(root.join("alarm-ledger.sqlite3"));
+        assert_eq!(reopened.get(&target,&[message.id.clone()]).unwrap().records[0].wake_schedule,Some(schedule));
+        assert!(input_ledger_wake::project(&latest.record,false,Capability::Soon,Some(&due),wait,None).is_none(),"idle alarms do not need a countdown");
+        let forever=project(3600,None);
+        let schedule=input_ledger_wake::project(&latest.record,true,Capability::Soon,Some(&forever),None,None).unwrap();
+        assert_eq!(schedule.timing,"afterTurn");assert!(schedule.next_step_at.is_none());
+        assert_eq!(schedule.wait_secs,None);
+        for capability in [Capability::AfterTurn,Capability::None] {
+            let schedule=input_ledger_wake::project(&latest.record,true,capability,Some(&before),wait,None).unwrap();
+            assert_eq!(schedule.timing,"afterTurn");assert!(schedule.next_step_at.is_none());
+        }
+        drop(reopened);drop(ledger);drop(repository);fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6406,7 +6482,7 @@ mod tests {
         let alarm = by_id("alarm-1");
         assert_eq!(alarm["sender"]["id"], "Cutex Alarm");
         assert_eq!(alarm["senderKind"], "alarm_service");
-        assert_eq!(alarm["afterTurnOnly"], true);
+        assert!(alarm.get("afterTurnOnly").is_none(), "alarms use the common busy-wake policy");
         assert_eq!(alarm["queuedAt"], "2026-10-11T00:00:30+00:00");
         fs::remove_dir_all(root).unwrap();
     }

@@ -51,34 +51,37 @@ use super::user_input::{
 // Dismiss (C1 calls this before `discarded{ownerDiscarded}`)
 
 /// Settle the owner input's own store before the ledger marks it
-/// `discarded{ownerDiscarded}`. Owner inputs are only dismissible while
-/// `uncertain` (`input_ledger::dismissible`). An `uncertain` owner input can
-/// still sit in the Management queue (a queue steer / flush whose native
-/// outcome is unknown keeps the item, and the flush never resends it, so it
-/// would block every item behind it): dismissing removes that item, with the
-/// usual `cutex/userInput/queueRemoved`. The C-010 delivery record stays: it
-/// keeps blocking a blind resend of the same id until history settles it.
+/// `discarded{ownerDiscarded}`. Local queued or held owner input is removed by
+/// identity without querying native state. C-010 delivery evidence is retained
+/// to prevent a blind resend when an already claimed dispatch is uncertain.
 pub(crate) fn dismiss(record: &InputRecord) -> Result<(), String> {
     if record.kind != InputKind::Owner {
         return Ok(());
     }
-    let session = &record.cutex_session_id;
+    dismiss_id(&record.cutex_session_id,&record.input_id).map(|_|())
+}
+/// Source cleanup by logical identity, including pre-ledger owner outbox IDs.
+/// C-010 is retained; no native/query progress or original payload is needed.
+pub(crate) fn dismiss_id(session:&str,id:&str)->Result<bool,String> {
     let fail = |error: anyhow::Error| format!("{error:#}");
     let lane = super::user_input::session_input_lock(session).map_err(fail)?;
-    let _lane = lane.lock().map_err(|_| "session input lock poisoned".to_string())?;
+    let _lane = lane.try_lock().map_err(|_| "session input busy; durable disposition pending".to_string())?;
+    let held=super::owner_held::find(session,id).map_err(fail)?.is_some();
+    if held {super::owner_held::finish(session,id).map_err(fail)?;}
     let repository = super::user_input::user_input_repository().map_err(fail)?;
+    let native=repository.delivery(session,id).map_err(fail)?.is_some();
     let (_, items) = repository.list(session).map_err(fail)?;
-    let Some(item) = items.into_iter().find(|item| item.client_user_message_id == record.input_id) else {
-        return Ok(());
+    let Some(item) = items.into_iter().find(|item| item.client_user_message_id == id) else {
+        return Ok(held||native);
     };
     let Some(removed) = repository.remove(session, &item.queue_id, item.revision).map_err(fail)? else {
-        return Ok(());
+        return Err("queue changed; durable disposition cleanup remains pending".into());
     };
     let (queue_revision, _) = repository.list(session).map_err(fail)?;
     super::repository::management_v2_repository()
         .and_then(|events| {
             events.append(super::model::PendingEvent {
-                cutex_session_id: session.clone(),
+                cutex_session_id: session.to_string(),
                 host_id: crate::platform::host::current_host_name(),
                 source: super::model::EventSource::Cutex,
                 schema: None,
@@ -101,8 +104,35 @@ pub(crate) fn dismiss(record: &InputRecord) -> Result<(), String> {
                 }),
             })
         })
-        .map(|_| ())
+        .map(|_| true)
         .map_err(fail)
+}
+
+/// Source-owned routing facts survive ledger loss. They are not instructions
+/// to send and are never inferred from the current runtime during rebuild.
+#[derive(Debug,Clone,PartialEq,serde::Serialize,serde::Deserialize)]
+#[serde(rename_all="camelCase")]
+pub struct SourceAdmission {
+    pub strategy:UserInputStrategy,
+    pub surface:Surface,
+    pub reason:Option<String>,
+}
+pub fn source_admission(session:&str,id:&str)->Option<SourceAdmission> {
+    if !ledger::enabled(){return None;}
+    let record=current_record(session,id)?;
+    let strategy=match record.intent.strategy? {Strategy::Queue=>UserInputStrategy::Queue,Strategy::Interrupt=>UserInputStrategy::Interrupt,Strategy::Auto=>UserInputStrategy::Auto};
+    Some(SourceAdmission{strategy,surface:record.surface,reason:record.reason})
+}
+fn remember_admission(session:&str,id:&str,next:&Next,current:Option<&InputRecord>) {
+    if !matches!(next.state,InputState::Received|InputState::Held|InputState::Waiting){return;}
+    let strategy=next.create.as_ref().and_then(|create|create.intent.strategy).or_else(||current.and_then(|record|record.intent.strategy));
+    let Some(strategy)=strategy else{return};
+    let strategy=match strategy {Strategy::Queue=>UserInputStrategy::Queue,Strategy::Interrupt=>UserInputStrategy::Interrupt,Strategy::Auto=>UserInputStrategy::Auto};
+    let facts=SourceAdmission{strategy,surface:next.surface.or_else(||current.map(|record|record.surface)).unwrap_or(Surface::NextUp),reason:next.reason.clone()};
+    if let Err(error)=super::user_input::user_input_repository().and_then(|repository|repository.remember_admission(session,id,&facts)) {
+        eprintln!("cutex owner admission facts: {error:#}");
+    }
+    if let Err(error)=super::owner_held::remember_admission(session,id,&facts) {eprintln!("cutex held admission facts: {error:#}");}
 }
 
 // ---------------------------------------------------------------------------
@@ -216,9 +246,15 @@ pub fn plan(current: Option<&InputRecord>, step: &Step, create: Option<&NewInput
             sent(&mut out, state);
         }
         Step::Started { turn_id } => {
-            let state = reopened(&mut out);
-            if sent(&mut out, state) || state == Accepted {
+            if state == Uncertain {
+                // A late positive receipt proves the original dispatch ran;
+                // it is not a new owner retry or another native attempt.
                 out.push(with_turn(Next::in_context(Evidence::TurnStartInput), turn_id));
+            } else {
+                let state = reopened(&mut out);
+                if sent(&mut out, state) || state == Accepted {
+                    out.push(with_turn(Next::in_context(Evidence::TurnStartInput), turn_id));
+                }
             }
         }
         Step::Steered { turn_id, stage, generation } => {
@@ -566,6 +602,7 @@ fn run_bound(session: &str, client_user_message_id: &str, step: Step, create: Op
         None => plan(current.as_ref(), &step, create.as_ref()),
     };
     for next in with_item(nexts, item) {
+        remember_admission(session,client_user_message_id,&next,latest.as_ref());
         match ledger::record(session, client_user_message_id, Expect::ANY, next) {
             Some(transition) => latest = Some(transition.record),
             None => break,

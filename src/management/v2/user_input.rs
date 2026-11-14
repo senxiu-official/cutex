@@ -291,6 +291,8 @@ pub enum ClientIdentityDecision {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct StoredQueueItem {
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    admission:Option<super::input_ledger_owner::SourceAdmission>,
     management_request_id: String,
     thread_id: String,
     item: UserInputQueueItem,
@@ -650,6 +652,7 @@ impl UserInputRepository {
         management_request_id: &str,
         params: &UserInputSubmitParams,
     ) -> anyhow::Result<QueueEnqueueDecision> {
+        super::input_disposal::check(cutex_session_id,[params.client_user_message_id.as_str()])?;
         let identity_sha256 = input_identity_sha256(params)?;
         let mut recorded_input = params.input.clone();
         record_image_dimensions(&mut recorded_input);
@@ -699,6 +702,7 @@ impl UserInputRepository {
                 delivery: None,
             };
             state.items.push(StoredQueueItem {
+                admission:None,
                 management_request_id: management_request_id.to_string(),
                 thread_id: thread_id.to_string(),
                 item: item.clone(),
@@ -755,6 +759,20 @@ impl UserInputRepository {
             }
             identity.delivery = new;
             Ok(true)
+        })
+    }
+
+    pub(crate) fn source_admission(&self,session:&str,id:&str)->anyhow::Result<Option<super::input_ledger_owner::SourceAdmission>> {
+        self.read_session(session,&[],true,|store|Ok(store.sessions.get(session).and_then(|state|
+            state.items.iter().find(|stored|stored.item.client_user_message_id==id).and_then(|stored|stored.admission.clone()))))
+    }
+    pub(crate) fn remember_admission(&self,session:&str,id:&str,facts:&super::input_ledger_owner::SourceAdmission)->anyhow::Result<()> {
+        let present=self.read_session(session,&[],true,|store|Ok(store.sessions.get(session).is_some_and(|state|
+            state.items.iter().any(|stored|stored.item.client_user_message_id==id&&stored.admission.as_ref()!=Some(facts)))))?;
+        if !present{return Ok(());}
+        self.mutate_session(session,&[],true,|store| {
+            if let Some(item)=store.sessions.get_mut(session).and_then(|state|state.items.iter_mut().find(|stored|stored.item.client_user_message_id==id)) {item.admission=Some(facts.clone());}
+            Ok(())
         })
     }
 

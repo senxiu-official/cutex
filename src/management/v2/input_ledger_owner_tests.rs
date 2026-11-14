@@ -1048,3 +1048,18 @@ fn a_resend_refused_before_native_io_fails_again() {
     f.step("q1", Step::Waiting("explicitQueue"), Queue);
     assert!(f.step_no_create("q1", Step::Failed("session_offline")).is_empty());
 }
+
+#[test]
+fn r47_late_actual_start_heals_original_dispatch_without_inventing_owner_retry() {
+    let f=Fixture::new();
+    f.step("late",Step::Received{surface:Surface::NextUp},Auto);
+    f.step("late",Step::Sending{steer:false},Auto);
+    f.step("late",Step::Uncertain("outcomeUnknown"),Auto);
+    let before=f.record("late").unwrap();
+    let healed=f.step("late",Step::Started{turn_id:Some("original-actual-start".into())},Auto);
+    assert_eq!(healed.len(),1);
+    assert_eq!(healed[0].record.state,InputState::InContext);
+    assert_eq!(healed[0].record.attempt,before.attempt);
+    assert_ne!(healed[0].record.reason.as_deref(),Some("ownerRetry"));
+    assert_eq!(healed[0].record.turn_id.as_deref(),Some("original-actual-start"));
+}

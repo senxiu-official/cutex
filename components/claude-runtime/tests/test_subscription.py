@@ -544,6 +544,10 @@ def test_api_account_config_rejects_unsafe_settings_without_printing_values(tmp_
 
 
 async def test_api_account_key_reaches_only_the_official_runtime_env(sh, monkeypatch, tmp_path):
+    # This process may inherit a developer's unrelated provider environment.
+    # Establish the API-account fixture's clean baseline instead of assuming it.
+    for name in CONFLICTING_ENV:
+        monkeypatch.delenv(name, raising=False)
     from fake_sdk import install_fake_sdk
     from cute_claude.subscription_auth import load_api_account
     import cute_claude.subscription as sub

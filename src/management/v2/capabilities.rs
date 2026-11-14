@@ -418,6 +418,14 @@ pub const MANAGEMENT_FEATURES: &[(&str, &str)] = &[
     // GET /v2/fs/file?path=<absolute>&maxBytes= : host file read (owner
     // only: root credential or a client token), workspace fs/file body.
     ("fs-file-read", "fsFileRead"),
+    // `offset=<n>` on GET /v2/fs/file and {scope}/fs/file: the window of at
+    // most maxBytes starting at that byte (400 past the end); the body echoes
+    // `offset` and a `revision` (size + full-precision mtime). UTF-8 windows
+    // end at a character boundary, so the next one starts at offset + the
+    // UTF-8 length of `content`; 400 `window_too_small` when no whole
+    // character fits, 409 `file_changed` when the opened file changed during
+    // the read. Lets a client assemble a file larger than one read (10 MiB).
+    ("fs-file-window", "fsFileWindow"),
     #[cfg(any(windows, target_os = "linux"))]
     ("fs-file-transfer-v1", "fsFileTransferV1"),
     // Asks (委托, cutex-desktop docs/cutex-agent-asks.md P1): /v2/asks,
@@ -1579,12 +1587,15 @@ fn add_input_ledger_feature(value: &mut Value, enabled: bool) {
         return;
     }
     if let Some(features) = value.get_mut("features").and_then(Value::as_object_mut) {
+        features.insert("inputDisposalV1".into(),Value::Bool(true));
+        features.insert("requestAdmissionOccurrencesV1".into(),Value::Bool(true));
         features.insert("inputLedgerV1".into(), Value::Bool(true));
         features.insert("ownerInputNextupV1".into(), Value::Bool(true));
         features.insert("ownerIdleBusyTimelineV1".into(), Value::Bool(true));
         features.insert("ownerCarriesV1".into(), Value::Bool(true));
     }
     if let Some(list) = value.get_mut("featureList").and_then(Value::as_array_mut) {
+        list.push(Value::String("input-disposal-v1".into()));
         list.push(Value::String(super::input_ledger::CAPABILITY.into()));
         list.push(Value::String(super::input_ledger::OWNER_INPUT_NEXTUP_CAPABILITY.into()));
         list.push(Value::String(super::input_ledger::OWNER_CARRIES_CAPABILITY.into()));

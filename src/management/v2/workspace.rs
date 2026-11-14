@@ -6,7 +6,7 @@
 //!
 //! Routes (all require the Management root credential):
 //! - `GET  {scope}/fs/dir?path=`             directory listing
-//! - `GET  {scope}/fs/file?path=&maxBytes=`  file content (utf8 or base64)
+//! - `GET  {scope}/fs/file?path=&maxBytes=&offset=`  file content (utf8 or base64)
 //! - `GET  {scope}/fs/search?q=&limit=`      fuzzy file-name search
 //! - `GET  {scope}/fs/watch`                 SSE change notifications
 //! - `GET  {scope}/git/status`               branch + changed files

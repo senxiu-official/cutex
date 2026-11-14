@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "release": "claude-r46",
+  "release": "claude-r48",
   "comment": "Feature switches cutex reads before it starts or talks to this adapter (components/claude-runtime/README.md). Catalog entries do not confirm account access.",
   "features": {
     "systemAppendFile": true,

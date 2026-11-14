@@ -911,6 +911,7 @@ fn deliver_messages_with(
         } else { None };
         let input_lock = cutex::management::v2::user_input::session_input_lock(id)?;
         let _input_guard = input_lock.lock().map_err(|_| anyhow::anyhow!("session input lock poisoned"))?;
+        if cutex::management::v2::input_disposal::requested(id,&message.id)? {continue;}
         if repository.owner_delivery_blocked(id, &message.id)? {
             // A carried identity belongs to its owner's atomic request. The
             // observer may recover genuine native proof, but must never submit
@@ -1005,6 +1006,7 @@ fn deliver_messages_with(
             ensure!(envelope.owner_id == id && envelope.thread_id == thread, "frozen Claude input binding changed");
             // 054 §2.9: frozen, native IO starts now.
             repository.input_ledger_sending(id, &message.id);
+            cutex::management::v2::input_disposal::check_envelope(id,&envelope)?;
             let submitted = super::claude_ingress::submit(&handle, &envelope, record.runtime_generation);
             // 054 RC8 (S12): the local inbox receipt says nothing about a
             // native hold / retry / conflict. With the ledger on, read the
@@ -1017,7 +1019,7 @@ fn deliver_messages_with(
                 }
             }
             submitted?
-        } else { repository.input_ledger_sending(id, &message.id); match handle.request("claude/input/submit", payload) {
+        } else { cutex::management::v2::input_disposal::check(id,[message.id.as_str()])?; repository.input_ledger_sending(id, &message.id); match handle.request("claude/input/submit", payload) {
             Ok(receipt) => receipt,
             // The id is known with other content (a retry after an upgrade
             // changed the projection): its first acceptance stands.
@@ -1770,6 +1772,8 @@ fn reconcile_native_message(id: &str, generation: u64, envelope: &cutex::app_ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("claude_disposal_dispatch_tests.rs");
 
     #[test]
     fn reconnect_history_replays_only_exact_terminal_bound_turn() {

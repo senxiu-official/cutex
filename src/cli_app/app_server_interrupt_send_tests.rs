@@ -320,7 +320,7 @@ fn an_unprovable_steer_is_never_resent_blindly() {
 fn a_queued_input_goes_first_and_leaves_the_queue() {
     let f = Fake::new();
     let record = queued(&f, "q1");
-    assert_eq!(record.actions, vec![cutex::management::v2::input_ledger::Action::InterruptSend]);
+    assert_eq!(record.actions, vec![cutex::management::v2::input_ledger::Action::Dismiss, cutex::management::v2::input_ledger::Action::InterruptSend]);
     let outcome = run(&f, SESSION, &request(&record)).unwrap();
     assert_eq!(outcome, Outcome::Interrupted { turn_id: "t1".into(), started: true });
     // Never in the runtime: no item check.

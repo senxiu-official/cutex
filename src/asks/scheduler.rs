@@ -339,7 +339,9 @@ pub enum NativeMessageStatus {
     /// Persisted in a turn (receipt).
     Persisted { turn_id: String },
     /// Held by the runtime (`PlanMode`, `Interrupted`, `RequestUncertain`,
-    /// `CanonicalSizePolicy`, ...).
+    /// `CanonicalSizePolicy`, ...). The internal failed owner-carry reason in
+    /// `returns::OWNER_CARRY_CONTEXT_UNCONFIRMED` names the original failed
+    /// turn, not a context receipt; its event must never be acknowledged.
     Held { reason: String, turn_id: Option<String> },
     /// The status query itself failed.
     Unavailable(String),
@@ -1774,6 +1776,7 @@ fn admit(
             ask.gate = Some(gate.clone());
             ask.admission_failure = None;
             let mut record = AttemptRecord::submitting(attempt_n, message_id.clone(), status.runtime_generation, now_rfc3339(now));
+            record.admission_occurrence=ask.admission_occurrence;
             record.event_artifact = Some(event_artifact.clone());
             record.view = Some(ask_view.clone());
             record.render = Some(render_info.clone());
@@ -2007,6 +2010,7 @@ fn admit_continuation(
         );
         state.update_ask(ask_id, now, |ask| {
             let mut record = AttemptRecord::submitting(attempt_n, message_id.clone(), status.runtime_generation, now_rfc3339(now));
+            record.admission_occurrence=ask.admission_occurrence;
             record.event_artifact = Some(event_artifact.clone());
             record.view = Some(view.clone());
             record.render = Some(render_info.clone());
@@ -3203,10 +3207,12 @@ pub(crate) mod tests {
         pub status_queries: RefCell<usize>,
         /// Native message ids `return_owner_carry` gives back.
         pub carries_returned: RefCell<std::collections::BTreeSet<String>>,
+        pub result_lane: RefCell<Option<std::sync::Arc<crate::management::v2::session_coordination::OperationLane>>>,
         /// r217h2: the runtime takes `soon` (results at the next step).
         pub next_step: std::cell::Cell<bool>,
         pub durable_next_step: std::cell::Cell<bool>,
         pub status_hook: RefCell<Option<Box<dyn FnOnce()>>>,
+        pub submit_hook: RefCell<Option<Box<dyn FnOnce()>>>,
         pub read_turn_hook: RefCell<Option<Box<dyn FnOnce()>>>,
         pub reminder_fence: std::cell::Cell<bool>,
         pub end_before_reminder: std::cell::Cell<bool>,
@@ -3230,6 +3236,9 @@ pub(crate) mod tests {
     }
 
     impl AskRuntime for FakeRuntime {
+        fn result_admission_lane(&self, _session: &str) -> anyhow::Result<Option<std::sync::Arc<crate::management::v2::session_coordination::OperationLane>>> {
+            Ok(self.result_lane.borrow().clone())
+        }
         fn result_window_context(&self, session: &str) -> Option<crate::asks::result_coalescing::Context> {
             self.result_context.borrow().get(session).copied()
         }
@@ -3245,6 +3254,8 @@ pub(crate) mod tests {
             status
         }
         fn submit_exclusive(&self, session: &str, _generation: u64, submission: &Submission) -> SubmitOutcome {
+            let hook = self.submit_hook.borrow_mut().take();
+            if let Some(hook) = hook { hook(); }
             self.call_order.borrow_mut().push(format!("submit:{session}"));
             self.submitted.borrow_mut().push((session.to_string(), submission.clone()));
             let outcome = if self.outcomes.borrow().is_empty() {
@@ -3306,6 +3317,8 @@ pub(crate) mod tests {
             Ok(())
         }
         fn steer_note(&self, session: &str, _generation: u64, submission: &Submission) -> SubmitOutcome {
+            let hook = self.submit_hook.borrow_mut().take();
+            if let Some(hook) = hook { hook(); }
             self.steered.borrow_mut().push((session.to_string(), submission.clone()));
             // Accepted, not read yet (a test sets the receipt).
             self.native

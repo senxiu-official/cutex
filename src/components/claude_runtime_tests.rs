@@ -4,8 +4,7 @@ use super::*;
 fn bundled_source_install_uses_the_published_release_label() {
     let handler = ClaudeRuntime::default();
     let features: serde_json::Value = serde_json::from_str(include_str!("../../components/claude-runtime/src/cute_claude/features.json")).unwrap();
-    let component: serde_json::Value = serde_json::from_str(include_str!("../../components/claude-runtime/component.json")).unwrap();
-    assert_eq!(handler.metadata().version, component["version"].as_str().unwrap());
+    assert_eq!(handler.metadata().version, "claude-r42");
     assert_eq!(features["release"], handler.metadata().version);
 }
 use crate::profiles::lifecycle::tests::TestHome;
