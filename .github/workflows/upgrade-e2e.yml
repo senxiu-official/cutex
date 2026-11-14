@@ -386,7 +386,7 @@ jobs:
           root = Path(os.environ["RUNNER_TEMP"])
           for name, path, commit in [("formal-build-run.json", ".github/workflows/build-binaries.yml", product_commit),
                                      ("formal-sign-run.json", ".github/workflows/sign-release.yml", sign_commit)]:
-              run = json.loads((root / name).read_text())
+              run = json.loads((root / name).read_text(encoding="utf-8"))
               if (run["status"] != "completed" or run["conclusion"] != "success" or
                       run["head_sha"] != commit or run["path"] != path or
                       run["repository"]["full_name"] != os.environ["GITHUB_REPOSITORY"]):
@@ -459,11 +459,11 @@ jobs:
           import json, os
           from pathlib import Path
           root = Path(os.environ["RUNNER_TEMP"])
-          run = json.loads((root / "formal-native-run.json").read_text())
+          run = json.loads((root / "formal-native-run.json").read_text(encoding="utf-8"))
           manifests = list((root / "formal-sign").rglob("manifest.json"))
           if len(manifests) != 1:
               raise SystemExit("Expected exactly one signed target manifest")
-          native = json.loads(manifests[0].read_text())["native"]
+          native = json.loads(manifests[0].read_text(encoding="utf-8"))["native"]
           import importlib.util, sys
           spec = importlib.util.spec_from_file_location("formal_upgrade", ".github/ci/upgrade-e2e.py")
           helper = importlib.util.module_from_spec(spec)
