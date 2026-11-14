@@ -169,8 +169,8 @@
     },
     {
       "path": ".github/ci/upgrade-e2e.py",
-      "sha256": "2d3464d00f6fa1dd1c97f1c57e94e1dd77f27426253c9c945d976ac9f4582b17",
-      "size": 116994
+      "sha256": "1f0ddfaab7f52c2151ea10d50182b1180794b1b52c2ddbb6740b1f5908e7fc6f",
+      "size": 118015
     },
     {
       "path": ".github/ci/upgrade-manifest.py",
@@ -204,8 +204,8 @@
     },
     {
       "path": ".github/workflows/upgrade-e2e.yml",
-      "sha256": "69c54d9d19b930c9bbcba38874229620204fa1924db6a3caa1ac80be6843393f",
-      "size": 27679
+      "sha256": "4d6d78d43c8b794fc007a0bde04557b905b12b77007f6aa5877f64fed8a13e78",
+      "size": 24049
     },
     {
       "path": ".gitignore",

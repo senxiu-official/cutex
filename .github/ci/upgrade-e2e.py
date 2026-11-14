@@ -1362,6 +1362,20 @@ def verify_formal_artifact(path: Path, artifact: dict) -> None:
     require(ce.sha256(path) == artifact.get("sha256"), f"signed artifact hash mismatch: {path.name}")
 
 
+def formal_native_build_provenance(run: dict, product_commit: str, workflow_commit: str = "") -> None:
+    """Pin the reviewed build workflow independently from the signed payload source commit."""
+    expected = workflow_commit or product_commit
+    if not re.fullmatch(r"[a-f0-9]{40}", product_commit) or not re.fullmatch(r"[a-f0-9]{40}", expected):
+        raise ValueError("Native provenance requires exact product and workflow commits")
+    if (run.get("status") != "completed" or run.get("conclusion") != "success" or
+            run.get("repository", {}).get("full_name") != "senxiu-official/cute-codex" or
+            run.get("path") != ".github/workflows/cute-codex-build-binaries.yml" or
+            run.get("head_sha") != expected):
+        raise ValueError("Native build run does not match reviewed workflow provenance")
+    # prepare_formal_mirror verifies production signatures and binds archive payload metadata
+    # to product_commit from the signed manifest. A reviewed workflow may build source_ref.
+
+
 def formal_expected_class(target: dict, from_release: str = FORMAL_FROM_RELEASE, to_release: str = FORMAL_TO_RELEASE) -> str:
     def version(label):
         require(isinstance(label, str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", label) is not None,

@@ -77,6 +77,11 @@ on:
         required: false
         default: ""
         type: string
+      native_workflow_ref:
+        description: "Exact reviewed canonical Native workflow commit, if different from its product source commit"
+        required: false
+        default: ""
+        type: string
       new_native:
         description: "Native the new release brings: stub, none, or a published cute-codex release tag (cute-codex-v<version> of senxiu-official/cute-codex)"
         required: false
@@ -382,87 +387,12 @@ jobs:
           for name, path, commit in [("formal-build-run.json", ".github/workflows/build-binaries.yml", product_commit),
                                      ("formal-sign-run.json", ".github/workflows/sign-release.yml", sign_commit)]:
               run = json.loads((root / name).read_text())
-              if (run["status"] != "completed" or run["conclusion"] != "success" or
-                      run["head_sha"] != commit or run["path"] != path or
-                      run["repository"]["full_name"] != os.environ["GITHUB_REPOSITORY"]):
-                  raise SystemExit("Workflow run does not match successful candidate build/sign provenance")
-          PY
-      - name: Original build archives (no rebuild)
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          github-token: ${{ github.token }}
-          run-id: ${{ inputs.build_run }}
-          path: ${{ runner.temp }}/formal-build
-      - name: Formal dry-run documents and detached signatures
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          github-token: ${{ github.token }}
-          run-id: ${{ inputs.sign_run }}
-          name: sign-release-${{ inputs.sign_run }}
-          path: ${{ runner.temp }}/formal-sign
-      - name: Validate product BUILD-INFO independently of CI head
-        env:
-          TO_RELEASE: ${{ inputs.to_release }}
-        run: |
-          set -euo pipefail
-          "$E2E_PYTHON" - <<'PY'
-          import json, os, subprocess
-          from pathlib import Path
-          product_commit = os.environ["FORMAL_PRODUCT_COMMIT"]
-          root = Path(os.environ["RUNNER_TEMP"]) / "formal-build"
-          records = sorted(root.rglob("BUILD-INFO-*.json"))
-          if not records:
-              raise SystemExit("Missing product BUILD-INFO")
-          core_platforms = set()
-          for path in records:
-              info = json.loads(path.read_text(encoding="utf-8"))
-              if info.get("commit") != product_commit:
-                  raise SystemExit("BUILD-INFO does not match product source: " + path.name)
-              if not path.name.startswith("BUILD-INFO-component-"):
-                  if info.get("release") != os.environ["TO_RELEASE"]:
-                      raise SystemExit("BUILD-INFO release label mismatch")
-                  core_platforms.add(info.get("platform"))
-          if core_platforms != {"linux-x64", "windows-x64"}:
-              raise SystemExit("Both product platform BUILD-INFO records are required")
-          PY
-      - name: Retained canonical unpublished native archives
-        if: inputs.native_build_run != ''
-        env:
-          PLATFORM: ${{ matrix.platform }}
-          NATIVE_VERSION: ${{ inputs.new_native_version }}
-        run: |
-          set -euo pipefail
-          "$E2E_PYTHON" - <<'PY'
-          import os
-          from pathlib import Path
-          root=Path(os.environ['RUNNER_TEMP'])/'formal-sign'
-          name='native-'+os.environ['NATIVE_VERSION']+'-'+os.environ['PLATFORM']+'.tar.gz'
-          if len(list(root.rglob(name)))!=1:
-              raise SystemExit('Signing run must retain exactly one canonical '+name)
-          PY
-      - name: Validate canonical native build provenance
-        if: inputs.native_build_run != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NATIVE_BUILD_RUN: ${{ inputs.native_build_run }}
-        run: |
-          set -euo pipefail
-          [[ "$NATIVE_BUILD_RUN" =~ ^[1-9][0-9]*$ ]] || exit 1
-          gh api "repos/senxiu-official/cute-codex/actions/runs/$NATIVE_BUILD_RUN" > "$RUNNER_TEMP/formal-native-run.json"
-          "$E2E_PYTHON" - <<'PY'
-          import json, os
-          from pathlib import Path
-          root = Path(os.environ["RUNNER_TEMP"])
-          run = json.loads((root / "formal-native-run.json").read_text())
-          manifests = list((root / "formal-sign").rglob("manifest.json"))
-          if len(manifests) != 1:
-              raise SystemExit("Expected exactly one signed target manifest")
-          native = json.loads(manifests[0].read_text())["native"]
-          if (run["status"] != "completed" or run["conclusion"] != "success" or
-                  run["repository"]["full_name"] != "senxiu-official/cute-codex" or
-                  run["path"] != ".github/workflows/cute-codex-build-binaries.yml" or
-                  run["head_sha"] != native["commit"]):
-              raise SystemExit("Native build run does not match signed candidate provenance")
+              import importlib.util, sys
+          spec = importlib.util.spec_from_file_location("formal_upgrade", ".github/ci/upgrade-e2e.py")
+          helper = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = helper
+          spec.loader.exec_module(helper)
+          helper.formal_native_build_provenance(run, native["commit"], os.environ["NATIVE_WORKFLOW_REF"])
           # The formal helper independently verifies every archive with the unchanged production key
           # and compares its payload metadata and SHA256 with this signed manifest.
           PY
