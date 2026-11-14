@@ -204,8 +204,8 @@
     },
     {
       "path": ".github/workflows/upgrade-e2e.yml",
-      "sha256": "475e768ae7ce0ed059ab741c7774266f01398b208c0754cf114bfc3ce8707729",
-      "size": 25071
+      "sha256": "d8b154e83b7b0647c605b9a7fce0752d133c6d122c9c4d6bf2ef6c7833c8c9ff",
+      "size": 27547
     },
     {
       "path": ".gitignore",

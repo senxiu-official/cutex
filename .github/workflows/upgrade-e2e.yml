@@ -72,6 +72,11 @@ on:
         required: false
         default: "0.167.0-r60"
         type: string
+      native_build_run:
+        description: "Optional successful canonical Native Actions run for an unpublished signed candidate (formal-assets only)"
+        required: false
+        default: ""
+        type: string
       new_native:
         description: "Native the new release brings: stub, none, or a published cute-codex release tag (cute-codex-v<version> of senxiu-official/cute-codex)"
         required: false
@@ -420,20 +425,57 @@ jobs:
           if core_platforms != {"linux-x64", "windows-x64"}:
               raise SystemExit("Both product platform BUILD-INFO records are required")
           PY
+      - name: Canonical unpublished native build archives
+        if: inputs.native_build_run != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ secrets.NATIVE_ARTIFACTS_TOKEN || github.token }}
+          repository: senxiu-official/cute-codex
+          run-id: ${{ inputs.native_build_run }}
+          pattern: natives-${{ matrix.platform }}
+          path: ${{ runner.temp }}/formal-native
+      - name: Validate canonical native build provenance
+        if: inputs.native_build_run != ''
+        env:
+          GH_TOKEN: ${{ secrets.NATIVE_ARTIFACTS_TOKEN || github.token }}
+          NATIVE_BUILD_RUN: ${{ inputs.native_build_run }}
+        run: |
+          set -euo pipefail
+          [[ "$NATIVE_BUILD_RUN" =~ ^[1-9][0-9]*$ ]] || exit 1
+          gh api "repos/senxiu-official/cute-codex/actions/runs/$NATIVE_BUILD_RUN" > "$RUNNER_TEMP/formal-native-run.json"
+          "$E2E_PYTHON" - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          run = json.loads((root / "formal-native-run.json").read_text())
+          manifests = list((root / "formal-sign").rglob("manifest.json"))
+          if len(manifests) != 1:
+              raise SystemExit("Expected exactly one signed target manifest")
+          native = json.loads(manifests[0].read_text())["native"]
+          if (run["status"] != "completed" or run["conclusion"] != "success" or
+                  run["repository"]["full_name"] != "senxiu-official/cute-codex" or
+                  run["path"] != ".github/workflows/cute-codex-build-binaries.yml" or
+                  run["head_sha"] != native["commit"]):
+              raise SystemExit("Native build run does not match signed candidate provenance")
+          # The formal helper independently verifies every archive with the unchanged production key
+          # and compares its payload metadata and SHA256 with this signed manifest.
+          PY
       - name: Original published backend and native signed assets
         env:
           FROM_REPO: ${{ inputs.from_repo }}
           FROM_RELEASE: ${{ inputs.from_release }}
           NATIVE_TAG: ${{ inputs.new_native }}
+          NATIVE_BUILD_RUN: ${{ inputs.native_build_run }}
           NATIVE_VERSION: ${{ inputs.new_native_version }}
           PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
           [[ "$FROM_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || exit 1
           [[ "$FROM_RELEASE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || exit 1
-          [[ "$NATIVE_TAG" =~ ^cute-codex-v[0-9][A-Za-z0-9._-]{0,63}$ && "$NATIVE_VERSION" =~ ^[0-9][A-Za-z0-9._-]{0,63}$ ]] || exit 1
+          [[ "$NATIVE_VERSION" =~ ^[0-9][A-Za-z0-9._-]{0,63}$ ]] || exit 1
+          if [ -z "$NATIVE_BUILD_RUN" ]; then [[ "$NATIVE_TAG" =~ ^cute-codex-v[0-9][A-Za-z0-9._-]{0,63}$ ]] || exit 1; fi
           tmp="$RUNNER_TEMP"; if [ "$RUNNER_OS" = Windows ]; then tmp="$(cygpath -u "$tmp")"; fi
-          mkdir "$tmp/formal-old" "$tmp/formal-native"
+          mkdir -p "$tmp/formal-old" "$tmp/formal-native"
           base="https://github.com/$FROM_REPO/releases/download/cutex-$FROM_RELEASE"
           for name in manifest.json capabilities.json "cutex-$FROM_RELEASE-$PLATFORM.tar.gz"; do
             curl -fsSL --retry 3 -o "$tmp/formal-old/$name" "$base/$name"
@@ -442,11 +484,13 @@ jobs:
           base="https://github.com/$FROM_REPO/releases/download/v$FROM_RELEASE"
           curl -fsSL --retry 3 -o "$tmp/formal-old/SHA256SUMS" "$base/SHA256SUMS"
           curl -fsSL --retry 3 -o "$tmp/formal-old/SHA256SUMS.minisig" "$base/SHA256SUMS.minisig"
+          if [ -z "$NATIVE_BUILD_RUN" ]; then
           base="https://github.com/senxiu-official/cute-codex/releases/download/$NATIVE_TAG"
           for name in SHA256SUMS "native-$NATIVE_VERSION-$PLATFORM.tar.gz"; do
             curl -fsSL --retry 3 -o "$tmp/formal-native/$name" "$base/$name"
             curl -fsSL --retry 3 -o "$tmp/formal-native/$name.minisig" "$base/$name.minisig"
           done
+          fi
       - name: Hosted Linux user service manager
         if: runner.os == 'Linux'
         run: |
@@ -483,5 +527,6 @@ jobs:
             ${{ runner.temp }}/formal upgrade/logs/
             ${{ runner.temp }}/formal-build-run.json
             ${{ runner.temp }}/formal-sign-run.json
+            ${{ runner.temp }}/formal-native-run.json
           if-no-files-found: ignore
           retention-days: 14
