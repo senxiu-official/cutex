@@ -672,6 +672,33 @@ mod tests {
     }
 
     #[test]
+    fn input_dispositions_backup_keeps_wal_and_existing_schema_and_rollback_keeps_new_decisions() {
+        let home=temp("disposition-home");let dest=temp("disposition-backup");let displaced=temp("disposition-displaced");
+        let relative="runtime/management-v2/input-dispositions.sqlite3";
+        let ledger=home.join("runtime/management-v2/input-ledger.sqlite3");
+        let first=crate::management::v2::input_disposal::request_at(&ledger,"recipient","old-input",chrono::Utc::now()).unwrap();
+        // Keep a connection open so subsequent commits remain in the WAL.
+        let source=rusqlite::Connection::open(home.join(relative)).unwrap();
+        source.execute_batch("BEGIN;").unwrap();
+        assert_eq!(source.query_row("SELECT COUNT(*) FROM owner_dispositions",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+        let second=crate::management::v2::input_disposal::request_at(&ledger,"recipient","wal-input",chrono::Utc::now()).unwrap();
+        assert!(home.join(format!("{relative}-wal")).metadata().unwrap().len()>0);
+        assert_eq!(source.pragma_query_value(None,"user_version",|row|row.get::<_,i64>(0)).unwrap(),1);
+        let manifest=backup(&home,&dest).unwrap();
+        assert!(manifest.files.iter().any(|file|file.path==relative&&file.sqlite));
+        assert!(!manifest.files.iter().any(|file|file.path.ends_with("-wal")||file.path.ends_with("-shm")));
+        verify_manifest(&dest,&manifest).unwrap();
+        let copied=dest.join("home/runtime/management-v2/input-ledger.sqlite3");
+        assert_eq!(crate::management::v2::input_disposal::request_at(&copied,"recipient","old-input",chrono::Utc::now()).unwrap().disposition_id,first.disposition_id);
+        assert_eq!(crate::management::v2::input_disposal::request_at(&copied,"recipient","wal-input",chrono::Utc::now()).unwrap().disposition_id,second.disposition_id);
+        let newest=crate::management::v2::input_disposal::request_at(&ledger,"recipient","after-backup",chrono::Utc::now()).unwrap();
+        restore_selection(&dest,&home,&displaced).unwrap();
+        assert_eq!(crate::management::v2::input_disposal::request_at(&ledger,"recipient","after-backup",chrono::Utc::now()).unwrap().disposition_id,newest.disposition_id,"binary rollback never overwrites newer disposition authority");
+        drop(source);
+        for path in [home,dest,displaced] {if path.exists(){std::fs::remove_dir_all(path).unwrap();}}
+    }
+
+    #[test]
     fn new_state_snapshots_and_worker_rollback_refusal_preserve_all_data() {
         let home = temp("r282-state");
         let dest = temp("r282-backup");

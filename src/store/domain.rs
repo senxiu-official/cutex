@@ -52,7 +52,7 @@ sqlite_domain!(
     INPUT_DISPOSITIONS,
     "input-dispositions",
     "runtime/management-v2/input-dispositions.sqlite3",
-    "durable owner disposal decisions; independent of the rebuildable input ledger"
+    "durable owner disposal authority; independent of the rebuildable input ledger; standalone user_version=1, retained without expiry"
 );
 sqlite_domain!(
     REQUEST_IDEMPOTENCY,

@@ -302,13 +302,18 @@ pub static MANIFEST: &[StoreSpec] = &[
         Sqlite { file: "runtime/management-v2/input-ledger.sqlite3", tables: &["input_ledger", "input_ledger_meta", "input_ledger_sessions", "input_ledger_payloads", "input_ledger_outbox", "input_ledger_losses"] },
         MutableState, &domain::INPUT_LEDGER)
         .key("input_id", &[K::Session]).grows(0, 0, "owner inputs (054)"),
+    // Source authority, not cache: never expire/prune business decisions. The
+    // generic change_retention is only the layer change journal, not row TTL.
+    // Like input-ledger this is standalone SQLite (schema_version=0 means not
+    // StoreDb-managed); input_disposal::configure owns transactional user_version=1.
+    // R0 is additive: the preceding r284 writer already uses this exact format.
+    // Backup/data-copy roots include runtime/management-v2; keep DB + WAL snapshot.
     base("input-dispositions", &["src/management/v2/input_disposal.rs"],
         Sqlite { file: "runtime/management-v2/input-dispositions.sqlite3", tables: &["owner_dispositions"] },
         MutableState, &domain::INPUT_DISPOSITIONS)
-        .key("session,input_id", &[K::Session])
-        .indexes(&["session,input_id", "owner_dispositions_pending"])
-        .grows(0, 0, "durable owner input disposal decisions; pending scan is limited to 1000 rows")
-        .layer(1),
+        .key("session,input_id", &[K::Host, K::Session])
+        .indexes(&["PRIMARY KEY(session,input_id)", "owner_dispositions_pending(next_check_ms,requested_at) WHERE applied_at IS NULL"])
+        .grows(0, 0, "permanent owner decisions; no row TTL or automatic pruning; standalone schema user_version=1"),
     base("request-idempotency", &["src/management/v2/request_idempotency.rs"],
         Sqlite { file: "runtime/management-v2/request-idempotency.sqlite3", tables: &["requests"] },
         MutableState, &domain::REQUEST_IDEMPOTENCY)
@@ -711,16 +716,19 @@ pub fn validate(repo_root: Option<&std::path::Path>) -> Vec<String> {
 mod tests {
     use super::*;
 
-
     #[test]
-    fn input_dispositions_have_an_independent_durable_domain_and_backup_coverage() {
-        let entry = spec("input-dispositions");
-        assert_eq!(entry.owner, &["src/management/v2/input_disposal.rs"]);
-        assert_eq!(entry.domain.path, "runtime/management-v2/input-dispositions.sqlite3");
-        assert_ne!(entry.domain.id, spec("input-ledger").domain.id);
-        assert_eq!(entry.access, Access::Keyed);
-        assert_eq!(entry.class, StoreClass::MutableState);
-        assert!(crate::upgrade::backup::STATE_DIRS.iter().any(|dir| std::path::Path::new(entry.domain.path).starts_with(dir)));
+    fn owner_dispositions_are_registered_as_permanent_source_authority() {
+        let entry=spec("input-dispositions");
+        assert_eq!(entry.owner,&["src/management/v2/input_disposal.rs"]);
+        assert!(matches!(entry.canonical,Canonical::Sqlite{file:"runtime/management-v2/input-dispositions.sqlite3",tables} if tables==["owner_dispositions"]));
+        assert_eq!(entry.class,StoreClass::MutableState);
+        assert_eq!(entry.domain.path,"runtime/management-v2/input-dispositions.sqlite3");
+        assert_eq!(entry.access,Access::Keyed);assert_eq!(entry.key,"session,input_id");
+        assert_eq!(entry.rollback,Rollback::R0);assert!(entry.previous_exporter.is_none());
+        assert_eq!(entry.schema_version,0,"schema is standalone PRAGMA user_version, not StoreDb layer");
+        assert!(entry.growth.with.contains("no row TTL"));
+        assert!(crate::upgrade::backup::STATE_DIRS.iter().any(|root|
+            entry.domain.path.starts_with(&format!("{root}/"))));
     }
 
     #[test]

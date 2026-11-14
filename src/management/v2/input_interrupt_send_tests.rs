@@ -127,7 +127,7 @@ fn legality_follows_the_contract() {
     assert_eq!(il::actions_with_delivery(owner, Waiting, Some("turnRunning"), None, false, Some(&turn)), vec![Action::Dismiss, Action::InterruptSend]);
     assert_eq!(il::actions_with_delivery(owner, Waiting, Some("explicitQueue"), None, false, Some(&turn)),
         vec![Action::Cancel, Action::SendNow, Action::Edit, Action::Dismiss]);
-    assert_eq!(il::actions_with_delivery(owner, Accepted, None, Some("t1"), false, Some(&idle)), vec![Action::Dismiss]);
+    assert_eq!(il::actions_with_delivery(owner, Accepted, None, Some("t1"), false, Some(&idle)),vec![Action::Dismiss]);
 }
 
 #[test]
@@ -245,7 +245,7 @@ fn a_delivery_change_refreshes_the_actions_at_the_same_revision() {
     assert_eq!(change.records.len(), 1);
     let refreshed = &change.records[0];
     assert_eq!((refreshed.input_id.as_str(), refreshed.rev, refreshed.state_revision), ("m1", record.rev + 1, change.state_revision));
-    assert_eq!(refreshed.actions, vec![Action::Dismiss]);
+    assert_eq!(refreshed.actions,vec![Action::Dismiss]);
     assert_eq!(refreshed.state, InputState::Accepted);
     let stored = f.ledger.get("s1", &["m1".into()]).unwrap().records.pop().unwrap();
     assert_eq!(&stored, refreshed);

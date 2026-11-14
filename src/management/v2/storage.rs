@@ -302,6 +302,13 @@ stores![
         "json"
     ),
     (
+        "input-dispositions",
+        "management",
+        "runtime/management-v2/input-dispositions.sqlite3",
+        "forever",
+        "sqlite"
+    ),
+    (
         "request-idempotency",
         "management",
         "runtime/management-v2/request-idempotency.sqlite3",
@@ -1105,6 +1112,15 @@ mod tests {
             .iter()
             .find(|v| v["id"] == id)
             .unwrap()
+    }
+
+    #[test]
+    fn input_dispositions_and_wal_are_reported_as_permanent_management_state() {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let store=classify(&format!("runtime/management-v2/input-dispositions.sqlite3{suffix}"));
+            assert_eq!(store.id,"input-dispositions");assert_eq!(store.rule,"forever");
+            assert_eq!(store.group,"management");assert_eq!(store.kind,"sqlite");
+        }
     }
 
     #[test]

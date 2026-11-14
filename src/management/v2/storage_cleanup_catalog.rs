@@ -1065,6 +1065,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_owner_dispositions_and_sidecars_are_not_cleanup_candidates() {
+        let f=Fixture::new();
+        let paths=["runtime/management-v2/input-dispositions.sqlite3", "runtime/management-v2/input-dispositions.sqlite3-wal", "runtime/management-v2/input-dispositions.sqlite3-shm", "runtime/management-v2/input-dispositions.lock"];
+        for path in paths {f.file(path,365);}
+        for action in ["old-backups","old-logs"] {
+            let found=candidates(&f.root,action,30,f.now,None,&[]).unwrap();
+            assert!(!found.iter().any(|item|paths.iter().any(|path|item.relative==Path::new(path))));
+        }
+        for path in paths {assert!(f.root.join(path).is_file());}
+    }
+
+    #[test]
     fn fork_copy_receipts_are_visible_but_never_external_delete_authority() {
         let f = Fixture::new();
         let path = format!("{FORK_RECEIPTS}/550e8400-e29b-41d4-a716-446655440000.json");

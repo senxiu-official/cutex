@@ -4069,8 +4069,8 @@
     },
     {
       "path": "src/components/claude_runtime_tests.rs",
-      "sha256": "77bb4dfff9f218a3dcdafbd7ae6ee5d2fd1e8d2f276153fdd1f43b2a7c7966cf",
-      "size": 37845
+      "sha256": "f6dee9026c7a83b4460f6c4a1db076bd39a152aa5b80a31df96f11c243d62a4e",
+      "size": 37827
     },
     {
       "path": "src/components/dsh_runtime.rs",
@@ -5219,8 +5219,8 @@
     },
     {
       "path": "src/management/v2/input_interrupt_send_tests.rs",
-      "sha256": "fdf07effc7fe601179ecfa1ee1ff67aef2636582c0706ec1a1d128e4c7f7cf77",
-      "size": 16870
+      "sha256": "c27c81d2dcfc4cded748eb6129c617aff40330352febfbfb9a4cfa04d474a77c",
+      "size": 16868
     },
     {
       "path": "src/management/v2/input_ledger.rs",
@@ -6049,8 +6049,8 @@
     },
     {
       "path": "src/management/v2/storage.rs",
-      "sha256": "5b74df9d70196b3d28c4f3e4518f99a6698631fda9c35b6793b54b48894b1d7c",
-      "size": 56898
+      "sha256": "18d2afa111252dd6b74c7f1c19247c4acce641907aaf438891a266874c135996",
+      "size": 57498
     },
     {
       "path": "src/management/v2/storage_cleanup.rs",
@@ -6064,8 +6064,8 @@
     },
     {
       "path": "src/management/v2/storage_cleanup_catalog.rs",
-      "sha256": "96214c466614a6295e2277aaf8d8e3f31e2553f1b9c0e808c907c9b582dd1267",
-      "size": 59583
+      "sha256": "75d23b6ccfca9ff3523f87041c76c0a7738ebda66ef4f429d8f292ed54eff2ce",
+      "size": 60294
     },
     {
       "path": "src/management/v2/storage_cleanup_fs.rs",
@@ -7619,8 +7619,8 @@
     },
     {
       "path": "src/store/domain.rs",
-      "sha256": "78fad9abedbdb2f45ba04dda4bdc9325ce5718bb1e88e331d07adc63eee74b45",
-      "size": 6334
+      "sha256": "56cfd78d850d56604ee5db1658b00db42432d1f4821808801952065d840db5f5",
+      "size": 6386
     },
     {
       "path": "src/store/keyed.rs",
@@ -7634,8 +7634,8 @@
     },
     {
       "path": "src/store/manifest.rs",
-      "sha256": "e9a14220ed186c8e1fd3ff9fad1430fddb2bdc2cbf58939d33d83845e3c6a4b3",
-      "size": 46457
+      "sha256": "3ecf365e68b37fbeb508bf43c9b9dc3eb6e3b40174f9eedfd2f213b449599338",
+      "size": 47398
     },
     {
       "path": "src/store/metrics.rs",
@@ -7709,8 +7709,8 @@
     },
     {
       "path": "src/upgrade/backup.rs",
-      "sha256": "fcdf7a35dc65c59ce35220288fc3cc9a0dc173fc052087ec18530bfbf983139d",
-      "size": 44498
+      "sha256": "54f3db94cd839d410041115bce92039fd1f819c93e20e58efbaafc164f03db49",
+      "size": 46924
     },
     {
       "path": "src/upgrade/blake2b.rs",
