@@ -23,7 +23,7 @@
     }
   ],
   "notes": {
-    "en": "Reliable queued-input disposal, bounded file reads, alarm wake timing, Native0.167.0-r61 and Claude claude-r48.",
-    "zh-CN": "改进排队输入处置、分段文件读取与闹钟唤醒时机，提供 Native0.167.0-r61 和 Claude claude-r48。"
+    "en": "Reliable queued-input disposal, bounded file reads, alarm wake timing, Native0.167.0-r61 and Claude claude-r48. On a manual return to 0.2.3, dismissals still waiting to apply are not applied there; dismiss those rows again in that version. The records are retained and used again after returning to 0.2.4.",
+    "zh-CN": "改进排队输入处置、分段文件读取与闹钟唤醒时机，提供 Native0.167.0-r61 和 Claude claude-r48。 若手动退回 0.2.3，当时尚未执行完的放弃操作不会由旧版执行，请在旧版重新放弃相应行。记录仍会保留，回到 0.2.4 后继续使用。"
   }
 }

@@ -17,3 +17,7 @@ no HTTP response. Check host connectivity and provider status before retrying.
 
 This release provides Windows x64 and Linux x64 hosts. macOS is a desktop client.
 No public phone app is included; cutex-mobile remains a separate private dependency.
+
+## Manual return to 0.2.3
+
+On a manual return to 0.2.3, dismissals still waiting to apply are not applied there; dismiss those rows again in that version. The records are retained and used again after returning to 0.2.4.

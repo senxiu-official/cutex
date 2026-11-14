@@ -94,8 +94,8 @@
     },
     {
       "path": ".github/ci/release-meta/0.2.4.json",
-      "sha256": "f2525d02f6be3f5dc58126c010c2a6f050c12d0985c3a93ce9d9f055a1827078",
-      "size": 1398
+      "sha256": "79b4bdbce69d8438dafc01ff26871c616830c70ee6bef5a907347ac9f14a67fc",
+      "size": 1765
     },
     {
       "path": ".github/ci/release-meta/capabilities-0.1.0.json",
@@ -214,8 +214,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "4e36060a647f4b4bd4eb14743ce4902181c581da2642b530f31c930443789389",
-      "size": 11681
+      "sha256": "040dd10bb8cbef3da93b6e7f55d95f4349c57efcaadf78d9630f2003d6ee8533",
+      "size": 12086
     },
     {
       "path": "Cargo.lock",
@@ -1744,8 +1744,8 @@
     },
     {
       "path": "docs/KNOWN-ISSUES.md",
-      "sha256": "f78c8c52dbd454f8b9972652bc436213f26ed66e7aa4c99a6a690a5eb4c38d45",
-      "size": 865
+      "sha256": "aae208a2d96dc36c99aed903668015620dd6f84239f1d97fb193ac39562e36dd",
+      "size": 1087
     },
     {
       "path": "docs/LOCAL-RUNTIME-DEPLOYMENT.md",

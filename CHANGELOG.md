@@ -11,6 +11,9 @@
 - Includes Native 0.167.0-r61 with connection retry handling and Claude claude-r48 with bounded transient retries, recovery of saved input and UTF-8 direct stdio output. Existing agents retain their selected runtime.
   提供改进连接重试的 Native 0.167.0-r61，以及支持有界临时故障重试、恢复已保存输入和 UTF-8 标准输出的 Claude claude-r48；已有智能体保留运行时选择。
 
+- Known limitation: On a manual return to 0.2.3, dismissals still waiting to apply are not applied there; dismiss those rows again in that version. The records are retained and used again after returning to 0.2.4.
+  已知限制：若手动退回 0.2.3，当时尚未执行完的放弃操作不会由旧版执行，请在旧版重新放弃相应行。记录仍会保留，回到 0.2.4 后继续使用。
+
 ## 0.2.3 "Beautiful World" (2026-11-13)
 
 - Improves Claude runtime observation, exact process adoption and readiness after restart. A failed supplementary status probe no longer prevents delivery through a healthy runtime connection.
