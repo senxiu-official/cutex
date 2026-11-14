@@ -214,8 +214,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "040dd10bb8cbef3da93b6e7f55d95f4349c57efcaadf78d9630f2003d6ee8533",
-      "size": 12086
+      "sha256": "df96278c12c30c804da05a6894686dafb2f55cdb6d6bfcb1dd4b588189c62bab",
+      "size": 12401
     },
     {
       "path": "Cargo.lock",

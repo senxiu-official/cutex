@@ -2,8 +2,10 @@
 
 ## 0.2.4 "Beautiful World" (2026-11-14)
 
-- Adds authoritative disposal receipts for queued input and reconciles ended approval requests, preventing stale actions and stuck deliveries.
-  新增排队输入处置回执并核对已结束的审批请求，避免失效操作和投递卡住。
+- Adds authoritative disposal receipts for queued input and closes ended delegation requests as Stopped when dismissed, preventing stale actions and stuck deliveries.
+  新增排队输入处置回执；放弃时将已结束的委托请求标记为已停止，避免失效操作和投递卡住。
+- A row still sending after its fixed 60-second deadline becomes delivery-unconfirmed, allowing its delivery state to be checked before retrying.
+  消息发送达到固定 60 秒期限仍未确认时，会转为投递未确认，重试前可先核对投递状态。
 - Adds bounded filesystem read windows for large file views.
   新增分段文件读取接口，用于大型文件查看。
 - Applies configured busy-wake timing to alarms.
