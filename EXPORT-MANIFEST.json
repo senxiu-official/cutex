@@ -94,8 +94,8 @@
     },
     {
       "path": ".github/ci/release-meta/0.2.4.json",
-      "sha256": "79b4bdbce69d8438dafc01ff26871c616830c70ee6bef5a907347ac9f14a67fc",
-      "size": 1765
+      "sha256": "14533f876fce7329b10a91de5aed04fe3d2569e6ac9dd8ab54fb3df5e139f956",
+      "size": 2027
     },
     {
       "path": ".github/ci/release-meta/capabilities-0.1.0.json",
