@@ -144,8 +144,8 @@
     },
     {
       "path": ".github/ci/sign-and-upload.sh",
-      "sha256": "8fa5cb496a25840b5bbbb88be36c41dff36680c8e4a6bbb37b5846592b92be06",
-      "size": 31875
+      "sha256": "6273a25799bdaf7c9eb2f400544c9c346c2039f5c646a8b1db09ccd3f5c6c272",
+      "size": 32206
     },
     {
       "path": ".github/ci/sign-component-kit.py",
