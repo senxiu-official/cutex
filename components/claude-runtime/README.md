@@ -7,7 +7,7 @@ subscription login or an Anthropic-compatible API key.
 
 ## Public component
 
-**claude-r48** contains adapter **0.8.14**, Claude Agent SDK **0.2.180**,
+**claude-r48** contains adapter **0.8.15**, Claude Agent SDK **0.2.180**,
 Claude Code **2.1.321** and bundled CPython **3.13.17**. Release archives are
 provided for Linux x64 and Windows x64. macOS uses the desktop as a client
 of a supported host; the source component also declares Darwin arm64.

@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
-**0.2.4 — Beautiful World** 改进 Claude 恢复、精确投递及重启就绪检查，提供包含 Agent SDK 0.2.180 与 CLI 2.1.321 的 Claude claude-r48，并保留 Native 0.167.0-r61 及未变化的组件。已有智能体保持固定运行时。旧版无法读取新增的 worker 服务记录：请保留备份并明确确认本次单向升级，不要把包含后台应用记录的数据退回旧版。详见 [CHANGELOG.md](CHANGELOG.md) 和[已知问题](docs/KNOWN-ISSUES.md)。
+**0.2.4 — Beautiful World** 新增主机确认的排队输入处置、分段文件读取和可配置的闹钟唤醒时机。提供改进连接重试的 Native 0.167.0-r61，以及支持有界临时故障重试和 UTF-8 标准输出的 Claude claude-r48（适配器 0.8.15、Agent SDK 0.2.180、CLI 2.1.321）。已有智能体保留运行时固定版本。0.2.3 引入的 worker 记录要求保留备份并明确确认单向升级；不要把包含后台应用记录的数据退回旧版。详见 [CHANGELOG.md](CHANGELOG.md) 和[已知问题](docs/KNOWN-ISSUES.md)。
 
 > **当前限制：**
 > - **手机推送 / 配对手机**：还没有公开的手机应用。

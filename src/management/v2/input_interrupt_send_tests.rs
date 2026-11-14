@@ -124,10 +124,10 @@ fn legality_follows_the_contract() {
     assert!(!legal(InputKind::AgentMessage, Accepted, None, Some("t1"), &turn));
     assert!(!legal(InputKind::AgentMessage, Waiting, Some("turnRunning"), None, &turn));
     // actions = the base actions plus interruptSend.
-    assert_eq!(il::actions_with_delivery(owner, Waiting, Some("turnRunning"), None, false, Some(&turn)), vec![Action::InterruptSend]);
+    assert_eq!(il::actions_with_delivery(owner, Waiting, Some("turnRunning"), None, false, Some(&turn)), vec![Action::Dismiss, Action::InterruptSend]);
     assert_eq!(il::actions_with_delivery(owner, Waiting, Some("explicitQueue"), None, false, Some(&turn)),
-        vec![Action::Cancel, Action::SendNow, Action::Edit]);
-    assert!(il::actions_with_delivery(owner, Accepted, None, Some("t1"), false, Some(&idle)).is_empty());
+        vec![Action::Cancel, Action::SendNow, Action::Edit, Action::Dismiss]);
+    assert_eq!(il::actions_with_delivery(owner, Accepted, None, Some("t1"), false, Some(&idle)), vec![Action::Dismiss]);
 }
 
 #[test]
@@ -206,10 +206,10 @@ fn the_first_transition_and_the_delivery_share_one_revision() {
     let f = Fixture::new();
     f.ledger.delivery_changed("s1", &delivery("turn", Some("t1"), 7)).unwrap();
     let record = steered(&f, "m1");
-    assert_eq!(record.actions, vec![Action::InterruptSend], "computed from the stored delivery");
+    assert_eq!(record.actions, vec![Action::Dismiss, Action::InterruptSend], "computed from the stored delivery");
     // Another owner input queued behind the turn.
     let queued = f.ledger.transition("s1", "q1", Expect::NEW, Next::waiting("turnRunning").create(owner(Strategy::Auto))).unwrap();
-    assert_eq!(queued.record.actions, vec![Action::InterruptSend]);
+    assert_eq!(queued.record.actions, vec![Action::Dismiss, Action::InterruptSend]);
     let before = f.ledger.get("s1", &["m1".into()]).unwrap().state_revision;
     let (transitions, change) = f.ledger
         .transition_batch_with_delivery(
@@ -239,13 +239,13 @@ fn a_delivery_change_refreshes_the_actions_at_the_same_revision() {
     let f = Fixture::new();
     f.ledger.delivery_changed("s1", &delivery("turn", Some("t1"), 7)).unwrap();
     let record = steered(&f, "m1");
-    assert_eq!(record.actions, vec![Action::InterruptSend]);
+    assert_eq!(record.actions, vec![Action::Dismiss, Action::InterruptSend]);
     // The turn ended: the steer is no longer interruptible.
     let change = f.ledger.delivery_changed("s1", &delivery("idle", None, 7)).unwrap();
     assert_eq!(change.records.len(), 1);
     let refreshed = &change.records[0];
     assert_eq!((refreshed.input_id.as_str(), refreshed.rev, refreshed.state_revision), ("m1", record.rev + 1, change.state_revision));
-    assert!(refreshed.actions.is_empty());
+    assert_eq!(refreshed.actions, vec![Action::Dismiss]);
     assert_eq!(refreshed.state, InputState::Accepted);
     let stored = f.ledger.get("s1", &["m1".into()]).unwrap().records.pop().unwrap();
     assert_eq!(&stored, refreshed);

@@ -49,6 +49,12 @@ sqlite_domain!(
     "054 input ledger with its own outbox"
 );
 sqlite_domain!(
+    INPUT_DISPOSITIONS,
+    "input-dispositions",
+    "runtime/management-v2/input-dispositions.sqlite3",
+    "durable owner disposal decisions; independent of the rebuildable input ledger"
+);
+sqlite_domain!(
     REQUEST_IDEMPOTENCY,
     "request-idempotency",
     "runtime/management-v2/request-idempotency.sqlite3",
@@ -164,6 +170,7 @@ pub static DOMAINS: &[&TxDomain] = &[
     &MANAGEMENT_STATE,
     &SESSIONS,
     &INPUT_LEDGER,
+    &INPUT_DISPOSITIONS,
     &REQUEST_IDEMPOTENCY,
     &NAME_TARGET_PINS,
     &PAN,

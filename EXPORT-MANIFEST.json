@@ -239,13 +239,13 @@
     },
     {
       "path": "README.md",
-      "sha256": "e854893b2993cae1bb154684228ed6885fb654c25609433582d18d1c921fda12",
-      "size": 14272
+      "sha256": "a43a977887d42b66448ab12f2d3d3905b62a562118a4e59f4cf1161c718b0ffe",
+      "size": 14337
     },
     {
       "path": "README.zh-CN.md",
-      "sha256": "45bceb8df04a07de4d16258edc605a773fbcf271042b77ffdc65977042c02c39",
-      "size": 14359
+      "sha256": "85c8897ba76f33817975093a04fd4a222f6f4200600a4af3cb72a27c4a60cbfd",
+      "size": 14441
     },
     {
       "path": "assets/logo.png",
@@ -294,7 +294,7 @@
     },
     {
       "path": "components/claude-runtime/README.md",
-      "sha256": "52a99b11c4ca563e67a1bd8db644cba9d9addf9ab0c44addc8f9f47331887234",
+      "sha256": "e8705936b1aa48260095c2fed746edb042e49b6e31b38c97b3c308b918984f65",
       "size": 4565
     },
     {
@@ -4069,8 +4069,8 @@
     },
     {
       "path": "src/components/claude_runtime_tests.rs",
-      "sha256": "6fdb1d5d35e474fe477aac49a0e964b8487c5a6fec7a108db2aa7b75b193dda0",
-      "size": 37685
+      "sha256": "77bb4dfff9f218a3dcdafbd7ae6ee5d2fd1e8d2f276153fdd1f43b2a7c7966cf",
+      "size": 37845
     },
     {
       "path": "src/components/dsh_runtime.rs",
@@ -5219,8 +5219,8 @@
     },
     {
       "path": "src/management/v2/input_interrupt_send_tests.rs",
-      "sha256": "7619fdd9636ff548850b7d6c94e62b2cb2b4aa6c1b73703652b9e22001bb53bb",
-      "size": 16755
+      "sha256": "fdf07effc7fe601179ecfa1ee1ff67aef2636582c0706ec1a1d128e4c7f7cf77",
+      "size": 16870
     },
     {
       "path": "src/management/v2/input_ledger.rs",
@@ -7619,8 +7619,8 @@
     },
     {
       "path": "src/store/domain.rs",
-      "sha256": "9cf8b7522e400f6d110e163e2af1f67c799c1f93c8b952180dcbcd7d655da5a6",
-      "size": 6100
+      "sha256": "78fad9abedbdb2f45ba04dda4bdc9325ce5718bb1e88e331d07adc63eee74b45",
+      "size": 6334
     },
     {
       "path": "src/store/keyed.rs",
@@ -7634,8 +7634,8 @@
     },
     {
       "path": "src/store/manifest.rs",
-      "sha256": "0a5d90d0efd99e806a02e8ab1f93c0377ed46fac35ab5090dde4234b0c449659",
-      "size": 45361
+      "sha256": "e9a14220ed186c8e1fd3ff9fad1430fddb2bdc2cbf58939d33d83845e3c6a4b3",
+      "size": 46457
     },
     {
       "path": "src/store/metrics.rs",
@@ -7664,8 +7664,8 @@
     },
     {
       "path": "src/store/ratchet_allowlist.rs",
-      "sha256": "1e90ac332fb6f1043a27d262f15f45dabba2e9a9eea7667dfc4e2eeb72b7c408",
-      "size": 21979
+      "sha256": "99147dcf5d92c7f983a05127a0ea9f6ccea692c6070539cdceb8c12e0ff6aed8",
+      "size": 23029
     },
     {
       "path": "src/store/scale_tests.rs",

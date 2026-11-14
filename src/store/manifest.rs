@@ -302,6 +302,13 @@ pub static MANIFEST: &[StoreSpec] = &[
         Sqlite { file: "runtime/management-v2/input-ledger.sqlite3", tables: &["input_ledger", "input_ledger_meta", "input_ledger_sessions", "input_ledger_payloads", "input_ledger_outbox", "input_ledger_losses"] },
         MutableState, &domain::INPUT_LEDGER)
         .key("input_id", &[K::Session]).grows(0, 0, "owner inputs (054)"),
+    base("input-dispositions", &["src/management/v2/input_disposal.rs"],
+        Sqlite { file: "runtime/management-v2/input-dispositions.sqlite3", tables: &["owner_dispositions"] },
+        MutableState, &domain::INPUT_DISPOSITIONS)
+        .key("session,input_id", &[K::Session])
+        .indexes(&["session,input_id", "owner_dispositions_pending"])
+        .grows(0, 0, "durable owner input disposal decisions; pending scan is limited to 1000 rows")
+        .layer(1),
     base("request-idempotency", &["src/management/v2/request_idempotency.rs"],
         Sqlite { file: "runtime/management-v2/request-idempotency.sqlite3", tables: &["requests"] },
         MutableState, &domain::REQUEST_IDEMPOTENCY)
@@ -703,6 +710,18 @@ pub fn validate(repo_root: Option<&std::path::Path>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn input_dispositions_have_an_independent_durable_domain_and_backup_coverage() {
+        let entry = spec("input-dispositions");
+        assert_eq!(entry.owner, &["src/management/v2/input_disposal.rs"]);
+        assert_eq!(entry.domain.path, "runtime/management-v2/input-dispositions.sqlite3");
+        assert_ne!(entry.domain.id, spec("input-ledger").domain.id);
+        assert_eq!(entry.access, Access::Keyed);
+        assert_eq!(entry.class, StoreClass::MutableState);
+        assert!(crate::upgrade::backup::STATE_DIRS.iter().any(|dir| std::path::Path::new(entry.domain.path).starts_with(dir)));
+    }
 
     #[test]
     fn manifest_is_valid() {
