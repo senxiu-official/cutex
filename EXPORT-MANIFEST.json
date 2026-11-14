@@ -199,13 +199,13 @@
     },
     {
       "path": ".github/workflows/sign-release.yml",
-      "sha256": "8052737ad24cc275caff190e3a8a659eecc1fce07a0d66f45d3c61fed2990787",
-      "size": 12014
+      "sha256": "3b11715055d222be78d7fc41cb077ba1d6f15c4135cd4c1f353071f884c997db",
+      "size": 12066
     },
     {
       "path": ".github/workflows/upgrade-e2e.yml",
-      "sha256": "d8b154e83b7b0647c605b9a7fce0752d133c6d122c9c4d6bf2ef6c7833c8c9ff",
-      "size": 27547
+      "sha256": "69c54d9d19b930c9bbcba38874229620204fa1924db6a3caa1ac80be6843393f",
+      "size": 27679
     },
     {
       "path": ".gitignore",

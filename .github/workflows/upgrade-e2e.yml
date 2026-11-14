@@ -425,19 +425,25 @@ jobs:
           if core_platforms != {"linux-x64", "windows-x64"}:
               raise SystemExit("Both product platform BUILD-INFO records are required")
           PY
-      - name: Canonical unpublished native build archives
+      - name: Retained canonical unpublished native archives
         if: inputs.native_build_run != ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          github-token: ${{ secrets.NATIVE_ARTIFACTS_TOKEN || github.token }}
-          repository: senxiu-official/cute-codex
-          run-id: ${{ inputs.native_build_run }}
-          pattern: natives-${{ matrix.platform }}
-          path: ${{ runner.temp }}/formal-native
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          NATIVE_VERSION: ${{ inputs.new_native_version }}
+        run: |
+          set -euo pipefail
+          "$E2E_PYTHON" - <<'PY'
+          import os
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])/'formal-sign'
+          name='native-'+os.environ['NATIVE_VERSION']+'-'+os.environ['PLATFORM']+'.tar.gz'
+          if len(list(root.rglob(name)))!=1:
+              raise SystemExit('Signing run must retain exactly one canonical '+name)
+          PY
       - name: Validate canonical native build provenance
         if: inputs.native_build_run != ''
         env:
-          GH_TOKEN: ${{ secrets.NATIVE_ARTIFACTS_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
           NATIVE_BUILD_RUN: ${{ inputs.native_build_run }}
         run: |
           set -euo pipefail

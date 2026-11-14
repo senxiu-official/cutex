@@ -226,6 +226,7 @@ jobs:
             ${{ runner.temp }}/sign/release/SHA256SUMS
             ${{ runner.temp }}/sign/release/*.minisig
             ${{ runner.temp }}/sign/native/**/*.minisig
+            ${{ runner.temp }}/sign/native/*.tar.gz
             ${{ runner.temp }}/sign/components/**/*.minisig
             ${{ runner.temp }}/sign/channel/channel.json
             ${{ runner.temp }}/sign/channel/channel.json.minisig
